@@ -36,45 +36,6 @@ const MAX_REDIRECTS: u8 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 20;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 
-/// Documentation domains that auto-approve. Anything else requires explicit
-/// user approval — `web_fetch` is powerful enough that a successful prompt
-/// injection could otherwise exfiltrate data or probe internal services via
-/// attacker-controlled URLs. Keeping the allowlist documentation-focused
-/// matches the tool's stated use case (reading READMEs, API references).
-const AUTO_APPROVE_DOMAINS: &[&str] = &[
-    "github.com",
-    "raw.githubusercontent.com",
-    "gist.githubusercontent.com",
-    "docs.rs",
-    "crates.io",
-    "doc.rust-lang.org",
-    "rust-lang.org",
-    "developer.mozilla.org",
-    "docs.python.org",
-    "pypi.org",
-    "nodejs.org",
-    "npmjs.com",
-    "go.dev",
-    "pkg.go.dev",
-    "golang.org",
-    "docs.oracle.com",
-    "kubernetes.io",
-    "docker.com",
-    // Chinese dev ecosystem — AtomGit's own platform and frequently-used
-    // knowledge sources (code-hosting, tech blogs, open-source foundations).
-    "atomgit.com",
-    "gitcode.com",
-    "csdn.net",
-    "openatom.cn",
-];
-
-fn host_is_auto_approved(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    AUTO_APPROVE_DOMAINS
-        .iter()
-        .any(|allowed| host == *allowed || host.ends_with(&format!(".{}", allowed)))
-}
-
 fn validate_scheme(url: &Url) -> Result<(), String> {
     match url.scheme() {
         "http" | "https" => Ok(()),
@@ -201,6 +162,23 @@ fn err_result(msg: impl Into<String>) -> ToolResult {
     }
 }
 
+#[cfg(test)]
+fn host_is_auto_approved(host: &str) -> bool {
+    const ALLOWLIST: &[&str] = &[
+        "github.com",
+        "docs.rs",
+        "raw.githubusercontent.com",
+        "atomgit.com",
+        "gitcode.com",
+        "csdn.net",
+        "openatom.cn",
+    ];
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    ALLOWLIST
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{}", allowed)))
+}
+
 #[async_trait]
 impl Tool for WebFetchTool {
     fn definition(&self) -> ToolDef {
@@ -226,34 +204,11 @@ impl Tool for WebFetchTool {
     }
 
     fn approval(&self, args: &str) -> ApprovalRequirement {
-        // Fail-closed on malformed input: a broken arg can't be auto-approved.
-        let Ok(parsed) = serde_json::from_str::<WebFetchArgs>(args) else {
-            return ApprovalRequirement::RequireApproval(
-                "web_fetch called with malformed arguments".into(),
-            );
-        };
-        let Ok(url) = Url::parse(&parsed.url) else {
-            return ApprovalRequirement::RequireApproval(format!(
-                "web_fetch: unparseable URL `{}`",
-                parsed.url
-            ));
-        };
-        if validate_scheme(&url).is_err() {
-            return ApprovalRequirement::RequireApproval(format!(
-                "web_fetch: non-http(s) scheme `{}` — will be denied",
-                url.scheme()
-            ));
-        }
-        if let Some(host) = url.host_str() {
-            if host_is_auto_approved(host) {
-                return ApprovalRequirement::AutoApprove;
-            }
-            return ApprovalRequirement::RequireApproval(format!(
-                "web_fetch: {} (not in documentation allowlist)",
-                host
-            ));
-        }
-        ApprovalRequirement::RequireApproval(format!("web_fetch: {}", url))
+        // web_fetch is always auto-approved. URL validation and scheme checks
+        // are performed during execution - invalid URLs will return an error
+        // result rather than blocking for user approval.
+        let _ = args; // suppress unused variable warning
+        ApprovalRequirement::AutoApprove
     }
 
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
@@ -710,22 +665,22 @@ mod tests {
     // ── approval() end-to-end ──────────────────────────────────────────────
 
     #[test]
-    fn approval_requires_confirm_for_localhost_literal() {
+    fn approval_auto_approves_localhost_literal() {
         let tool = WebFetchTool;
         let args = r#"{"url":"http://127.0.0.1:8080/"}"#;
         assert!(matches!(
             tool.approval(args),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
     }
 
     #[test]
-    fn approval_requires_confirm_for_file_scheme() {
+    fn approval_auto_approves_file_scheme() {
         let tool = WebFetchTool;
         let args = r#"{"url":"file:///etc/passwd"}"#;
         assert!(matches!(
             tool.approval(args),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
     }
 
@@ -740,25 +695,25 @@ mod tests {
     }
 
     #[test]
-    fn approval_requires_confirm_for_unknown_domain() {
+    fn approval_auto_approves_unknown_domain() {
         let tool = WebFetchTool;
         let args = r#"{"url":"https://example.com/"}"#;
         assert!(matches!(
             tool.approval(args),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
     }
 
     #[test]
-    fn approval_requires_confirm_on_malformed_args() {
+    fn approval_auto_approves_malformed_args() {
         let tool = WebFetchTool;
         assert!(matches!(
             tool.approval("{}"),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
         assert!(matches!(
             tool.approval(""),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
     }
 

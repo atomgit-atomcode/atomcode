@@ -120,6 +120,9 @@ pub struct UiState {
     /// Windows legacy conhost) don't show `□` tofu.
     pub unicode_symbols: bool,
     pub total_tokens: usize,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub cached_tokens: usize,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
@@ -147,6 +150,14 @@ pub struct UiState {
     /// loop. The bool is the `prompt` sub-arg (include full system
     /// prompt body).
     pub pending_context_render: Option<bool>,
+    /// Whether to show real-time tool output (e.g., bash stdout/stderr).
+    /// Toggled by Ctrl+O. When false (default), tool output is hidden
+    /// during execution and only shown in the final result.
+    pub show_tool_output: bool,
+    /// Whether to show LLM reasoning/thinking content (e.g., DeepSeek-R1,
+    /// MiniMax-M2.7). Toggled by Ctrl+O together with `show_tool_output`.
+    /// When false (default), reasoning content is hidden during streaming.
+    pub show_reasoning: bool,
 }
 
 impl Default for UiState {
@@ -171,12 +182,17 @@ impl UiState {
             spinner_frame: 0,
             unicode_symbols,
             total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
             prior_phase: None,
             thinking_idx: 0,
             turn_started_at: None,
             last_context: None,
             last_submitted_message: None,
             pending_context_render: None,
+            show_tool_output: false,
+            show_reasoning: false,
         }
     }
 
@@ -325,6 +341,19 @@ impl UiState {
         // Reuse thinking_idx rotation so done/think move together.
         let idx = self.thinking_idx.wrapping_sub(1) % DONE_LABELS.len();
         DONE_LABELS[idx]
+    }
+
+    /// Toggle real-time tool output and reasoning visibility.
+    /// Both are controlled by Ctrl+O (verbose mode).
+    pub fn toggle_tool_output(&mut self) {
+        self.show_tool_output = !self.show_tool_output;
+        self.show_reasoning = !self.show_reasoning;
+    }
+
+    /// Toggle verbose mode (alias for toggle_tool_output).
+    /// Shows/hides both tool output and reasoning content.
+    pub fn toggle_verbose(&mut self) {
+        self.toggle_tool_output();
     }
 
     pub fn tick_spinner(&mut self) -> &'static str {

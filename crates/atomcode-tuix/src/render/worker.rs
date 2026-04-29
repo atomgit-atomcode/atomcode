@@ -55,6 +55,19 @@ enum RenderCmd {
     Resize(u16, u16),
     /// Remove the tail ApprovalPrompt body row (fire-and-forget).
     PopApprovalPrompt,
+    /// Scroll the body viewport by `delta` rows. Negative = up,
+    /// positive = down. AltScreenRenderer mutates viewport_top;
+    /// other renderers default to no-op.
+    ScrollBody(i32),
+    /// Jump body viewport to absolute top / bottom of scrollback.
+    ScrollBodyToTop,
+    ScrollBodyToBottom,
+    /// Mouse-drag selection lifecycle. Forwarded to the inner renderer;
+    /// only AltScreenRenderer acts on these. `(col, row)` are 0-indexed
+    /// terminal cells.
+    BeginSelection(u16, u16),
+    UpdateSelection(u16, u16),
+    EndSelection,
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -165,6 +178,30 @@ impl Renderer for TaskRenderer {
     fn pop_approval_prompt(&mut self) {
         let _ = self.cmd_tx.send(RenderCmd::PopApprovalPrompt);
     }
+
+    fn scroll_body(&mut self, delta: i32) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollBody(delta));
+    }
+
+    fn scroll_body_to_top(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToTop);
+    }
+
+    fn scroll_body_to_bottom(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToBottom);
+    }
+
+    fn begin_selection(&mut self, col: u16, row: u16) {
+        let _ = self.cmd_tx.send(RenderCmd::BeginSelection(col, row));
+    }
+
+    fn update_selection(&mut self, col: u16, row: u16) {
+        let _ = self.cmd_tx.send(RenderCmd::UpdateSelection(col, row));
+    }
+
+    fn end_selection(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::EndSelection);
+    }
 }
 
 impl Drop for TaskRenderer {
@@ -224,6 +261,24 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             RenderCmd::PopApprovalPrompt => {
                 inner.pop_approval_prompt();
             }
+            RenderCmd::ScrollBody(delta) => {
+                inner.scroll_body(delta);
+            }
+            RenderCmd::ScrollBodyToTop => {
+                inner.scroll_body_to_top();
+            }
+            RenderCmd::ScrollBodyToBottom => {
+                inner.scroll_body_to_bottom();
+            }
+            RenderCmd::BeginSelection(col, row) => {
+                inner.begin_selection(col, row);
+            }
+            RenderCmd::UpdateSelection(col, row) => {
+                inner.update_selection(col, row);
+            }
+            RenderCmd::EndSelection => {
+                inner.end_selection();
+            }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();
                 match op {
@@ -262,11 +317,12 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
     match l {
         UiLine::Welcome { .. } => "Welcome",
         UiLine::User(_) => "User",
-        UiLine::AssistantText(_) => "AssistantText",
-        UiLine::AssistantLineBreak => "AssistantLineBreak",
+            UiLine::AssistantText(_) => "AssistantText",
+            UiLine::ReasoningText(_) => "ReasoningText",
+            UiLine::AssistantLineBreak => "AssistantLineBreak",
         UiLine::ToolCall { .. } => "ToolCall",
-        UiLine::ToolCallInFlight { .. } => "ToolCallInFlight",
-        UiLine::ToolCallCommit => "ToolCallCommit",
+            UiLine::ToolCallInFlight { .. } => "ToolCallInFlight",
+            UiLine::ToolCallCommit { .. } => "ToolCallCommit",
         UiLine::ToolResult { .. } => "ToolResult",
         UiLine::DiffLine { .. } => "DiffLine",
         UiLine::DiffBlock(_) => "DiffBlock",

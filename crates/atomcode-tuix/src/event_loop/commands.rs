@@ -41,6 +41,7 @@ fn build_oauth_provider() -> ProviderConfig {
         reasoning_history: None,
         thinking_enabled: None,
         thinking_budget: None,
+        skip_tls_verify: false,
         ephemeral: false,
     }
 }
@@ -89,7 +90,31 @@ pub(super) fn execute_slash_command(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         "help" => {
-            renderer.render(UiLine::CommandOutput(ctx.commands.help_text()));
+            if arg.trim() == "commands" {
+                let config_dir = Config::config_dir();
+                let cmds = ctx.custom_commands.list();
+                let mut out = String::from("  Custom commands:\n");
+                for cmd in &cmds {
+                    let source_label = if cmd.source.starts_with(&config_dir) {
+                        "global"
+                    } else {
+                        "project"
+                    };
+                    out.push_str(&format!(
+                        "    /{}  — {} ({})\n",
+                        cmd.name, cmd.description, source_label
+                    ));
+                }
+                if cmds.is_empty() {
+                    out.push_str("    (none)\n\n");
+                    out.push_str(
+                        "  Create: ~/.atomcode/commands/<name>.md or .atomcode/commands/<name>.md\n",
+                    );
+                }
+                renderer.render(UiLine::CommandOutput(out));
+            } else {
+                renderer.render(UiLine::CommandOutput(ctx.commands.help_text()));
+            }
             renderer.flush();
         }
         "plan" => {
@@ -194,6 +219,9 @@ pub(super) fn execute_slash_command(
             // brand-new session. Ports `/session` from the legacy TUI.
             ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
             state.total_tokens = 0;
+            state.prompt_tokens = 0;
+            state.completion_tokens = 0;
+            state.cached_tokens = 0;
             state.thinking_idx = 0;
             state.on_turn_complete();
             // New session = new session file on disk. Old session
@@ -304,9 +332,24 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "cost" => {
+            let total = state.prompt_tokens + state.completion_tokens;
+            let cache_rate = if state.prompt_tokens > 0 {
+                ((state.cached_tokens as f64 / state.prompt_tokens as f64 * 100.0) + 0.5) as usize
+            } else {
+                0
+            };
+            let cost = atomcode_core::pricing::calculate_cost(
+                &ctx.model_name, state.prompt_tokens, state.completion_tokens, state.cached_tokens,
+            );
+            let cost_str = atomcode_core::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(format!(
-                "  Session tokens: {}\n",
-                state.total_tokens
+                "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
+                state.prompt_tokens,
+                state.completion_tokens,
+                state.cached_tokens,
+                cache_rate,
+                total,
+                cost_str,
             )));
             renderer.flush();
         }
@@ -341,6 +384,37 @@ pub(super) fn execute_slash_command(
             // Don't pre-render a placeholder — the agent's reply could
             // contradict it when the conversation is too short.
             ctx.agent.cmd_tx.send(AgentCommand::Compact { prompt }).ok();
+        }
+        "remember" => {
+            let text = arg.trim();
+            if text.is_empty() {
+                renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                renderer.flush();
+            } else {
+                let (content, global) = if text.starts_with("--global ") {
+                    (text[9..].trim().to_string(), true)
+                } else {
+                    (text.to_string(), false)
+                };
+                if content.is_empty() {
+                    renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                    renderer.flush();
+                } else {
+                    ctx.agent.cmd_tx.send(AgentCommand::Remember { content, global }).ok();
+                }
+            }
+        }
+        "forget" => {
+            let keyword = arg.trim();
+            if keyword.is_empty() {
+                renderer.render(UiLine::Error("Usage: /forget <keyword>".to_string()));
+                renderer.flush();
+            } else {
+                ctx.agent.cmd_tx.send(AgentCommand::Forget { keyword: keyword.to_string() }).ok();
+            }
+        }
+        "memory" => {
+            ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
         }
         "login" => {
             run_login_flow(renderer, ctx)?;
@@ -795,12 +869,102 @@ pub(super) fn execute_slash_command(
                 }
             }
         }
+        "skills" => {
+            // Gateway command. With no arg, list user-invocable skills
+            // so the user knows what's available without opening the
+            // menu (useful in non-TTY transcripts and copy/paste).
+            // With an arg, treat the first word as a skill name and
+            // dispatch its expanded template as a user message — same
+            // path the menu's sub-mode submission lands on.
+            let arg_trim = arg.trim();
+            if arg_trim.is_empty() {
+                let lines: Vec<String> = ctx
+                    .skill_registry
+                    .read()
+                    .ok()
+                    .map(|r| {
+                        let mut v: Vec<String> = r
+                            .user_invocable()
+                            .map(|s| {
+                                let bare = s
+                                    .name
+                                    .split_once(':')
+                                    .map(|(_, x)| x)
+                                    .unwrap_or(s.name.as_str());
+                                format!("  /skills {:<24}  {}", bare, s.description)
+                            })
+                            .collect();
+                        v.sort();
+                        v
+                    })
+                    .unwrap_or_default();
+                if lines.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  No user-invocable skills loaded.\n".into(),
+                    ));
+                } else {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  Available skills:\n{}\n",
+                        lines.join("\n")
+                    )));
+                }
+                renderer.flush();
+            } else {
+                let mut parts = arg_trim.splitn(2, char::is_whitespace);
+                let skill_name = parts.next().unwrap_or("");
+                let skill_args = parts.next().unwrap_or("").trim_start();
+                let registry_key = format!("skills:{}", skill_name);
+                if let Some(rendered) = expand_skill(ctx, &registry_key, skill_args) {
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage(rendered))
+                        .ok();
+                    state.on_submit();
+                } else {
+                    renderer.render(UiLine::Error(format!(
+                        "Unknown skill: {} (try /skills to list)",
+                        skill_name
+                    )));
+                    renderer.flush();
+                }
+            }
+        }
         other => {
-            renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
-            renderer.flush();
+            // Before reporting "unknown", check user-defined custom commands,
+            // then user-invocable skills (loaded from .claude/skills,
+            // .atomcode/skills, etc.). Both expand to a prompt and dispatch
+            // as a regular user message.
+            if let Some(rendered) = ctx.custom_commands.render(other, arg) {
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::SendMessage(rendered))
+                    .ok();
+                state.on_submit();
+            } else if let Some(rendered) = expand_skill(ctx, other, arg) {
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::SendMessage(rendered))
+                    .ok();
+                state.on_submit();
+            } else {
+                renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
+                renderer.flush();
+            }
         }
     }
     Ok(())
+}
+
+/// Look up a user-invocable skill by name and expand it with the current
+/// session id. Returns the rendered prompt to send as a user message, or
+/// `None` if no matching skill exists.
+fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<String> {
+    let reg = ctx.skill_registry.read().ok()?;
+    let skill = reg.get(name)?;
+    if !skill.user_invocable {
+        return None;
+    }
+    Some(skill.expand(arg, ctx.current_session.id.as_str()))
 }
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.
@@ -1370,47 +1534,84 @@ fn resolve_cd(
     Ok(canon)
 }
 
-/// Drop out of raw mode, run the (blocking) OAuth login flow so the user
-/// can interact with the browser callback in a normal terminal, then
-/// re-enter raw mode and redraw the welcome screen. OAuth uses stdout
-/// prints + opens a browser — mixing that with our footer-managing
-/// raw-mode renderer would collide on stdin/stdout, so we suspend.
+/// Render the OAuth URL block + ESC affordance into scrollback, then
+/// drive the auth/check poll loop without leaving raw mode. ESC is read
+/// from `ctx.input_rx` (the same channel the main event loop uses) so
+/// no termios manipulation is needed and the input box stays visible
+/// alongside the URL — same UX as any other slash command.
+///
+/// Earlier revisions suspended `renderer` for the OAuth window and let
+/// `auth::login()` println straight to stdout. That collapsed the input
+/// box and (worse) wrote URL bytes on top of existing scrollback because
+/// the cursor was wherever the last paint left it. The renderer-driven
+/// path here avoids both problems.
+fn run_oauth_with_renderer(
+    renderer: &mut dyn Renderer,
+    ctx: &mut LoopCtx,
+) -> Result<atomcode_core::auth::AuthInfo> {
+    use crossterm::event::KeyCode;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    let session = atomcode_core::auth::start_login()?;
+
+    // URL + ESC affordance go through the body via UiLine::CommandOutput
+    // — same channel as `Auth saved to:` etc., so they sit in scrollback
+    // above the input box exactly like any other slash-command output.
+    renderer.render(UiLine::CommandOutput(format!(
+        "  Browser didn't open? Open the URL below in any browser to sign in:\n  {}\n\n  Press ESC to cancel\n",
+        session.url()
+    )));
+    renderer.flush();
+
+    session.open_browser_best_effort();
+
+    // Poll loop. We stay in raw mode and consume keyboard events from
+    // the existing reader thread via `input_rx`. The main event loop is
+    // blocked while we run, so non-ESC events queue harmlessly — we
+    // drain them here so they don't fire as stale input the moment
+    // we return.
+    loop {
+        match session.poll_once()? {
+            atomcode_core::auth::PollOutcome::Authorized => break,
+            atomcode_core::auth::PollOutcome::Pending => {}
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match ctx.input_rx.try_recv() {
+                Ok(crate::input::InputEvent::Key(k)) if k.code == KeyCode::Esc => {
+                    anyhow::bail!("login cancelled by user");
+                }
+                Ok(_) => {
+                    // Non-ESC events during OAuth are silently dropped:
+                    // typing in the input box wouldn't render anyway
+                    // (main thread blocked) and processing them after
+                    // the loop would replay stale state.
+                    continue;
+                }
+                Err(TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    anyhow::bail!("input channel closed");
+                }
+            }
+        }
+    }
+
+    session.finish(Some(&ctx.telemetry))
+}
+
+/// Run the OAuth login flow with the URL rendered into scrollback and
+/// the input box preserved. ESC cancels via `ctx.input_rx`. See
+/// `run_oauth_with_renderer` for the rationale.
 pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
-    // Pause the reader thread BEFORE disabling raw mode so it stops
-    // calling `event::poll` / `event::read`. Without this, the reader
-    // would keep consuming bytes from stdin in cooked mode (keystrokes
-    // the user made after the browser handoff, stray bytes from the
-    // callback handshake, FocusGained/Lost) and those events would
-    // either starve the OAuth child or land in `input_rx` as stale
-    // events that eat the first real keystroke after login.
-    //
-    // `pause_blocking` waits for ack so the reader is guaranteed idle
-    // before `suspend_for_external` flips raw mode.
-    if let Some(reader) = ctx.reader.as_ref() {
-        let _ = reader.pause_blocking();
-    }
-
-    // Suspend: disables bracketed paste (otherwise the callback URL
-    // paste would arrive wrapped in `\x1b[200~ ... \x1b[201~` and
-    // corrupt the CSRF state parameter) and raw mode, then flushes.
-    // The OAuth flow owns the terminal until it returns.
-    renderer.suspend_for_external();
-
-    let result = atomcode_core::auth::login(Some(&ctx.telemetry))
+    let result = run_oauth_with_renderer(renderer, ctx)
         .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|()| auth));
-
-    // Resume: re-enable raw + bracketed-paste AND reset cached state
-    // (the cooked-mode child wrote to stdout, so our cursor tracking
-    // is lying — next render must anchor against a fresh screen).
-    renderer.resume_from_external();
-
-    // Unpause the reader AFTER raw mode is back on. The reader skipped
-    // the entire OAuth window so `input_rx` has no stale events to
-    // drain — the first keystroke the user presses after login lands
-    // cleanly.
-    if let Some(reader) = ctx.reader.as_ref() {
-        reader.resume();
-    }
 
     match result {
         Ok(auth) => {
@@ -1462,27 +1663,32 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 
 /// Run the full CodingPlan setup flow: login (if needed) → claim →
 /// fetch models + register providers → fetch status. Shares the
-/// orchestrator with `atomcode codingplan` (CLI). Suspends raw mode so
-/// the OAuth browser callback and any stdout from `auth::login()` don't
-/// collide with the footer-managing renderer.
+/// orchestrator with `atomcode codingplan` (CLI).
+///
+/// When the user isn't already logged in we pre-flight the OAuth via
+/// `run_oauth_with_renderer` so the URL/ESC UI integrates with the TUI
+/// (input box stays visible). The subsequent `coding_plan::run` call
+/// then sees `is_logged_in() == true` and skips its own `auth::login`
+/// path — that path prints to stdout and is reserved for CLI callers.
 pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
-    // Same pause / suspend / resume / unpause choreography as /login —
-    // the orchestrator may call `auth::login()` which prints to stdout
-    // and spawns a browser; that needs cooked stdout + no reader racing
-    // for stdin. We suspend unconditionally here (even when already
-    // logged in) because the tiny cost of the raw-mode cycle is
-    // invisible to the user next to the HTTP round-trips that follow.
-    if let Some(reader) = ctx.reader.as_ref() {
-        let _ = reader.pause_blocking();
+    // Phase 1: pre-flight login if needed.
+    if !atomcode_core::auth::is_logged_in() {
+        if let Err(e) = run_oauth_with_renderer(renderer, ctx)
+            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+        {
+            // Login failed/cancelled. Surface as a top-level error;
+            // skip the rest of setup since claim/models/status all
+            // need a token.
+            renderer.render(UiLine::Error(format!("codingplan setup failed: {}", e)));
+            renderer.flush();
+            return Ok(());
+        }
     }
-    renderer.suspend_for_external();
 
+    // Phase 2: claim/models/status. Pure HTTP + config mutation — no
+    // stdin / stdout interaction, so we don't need to suspend the
+    // renderer. `step_login` short-circuits via `is_logged_in()`.
     let report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
-
-    renderer.resume_from_external();
-    if let Some(reader) = ctx.reader.as_ref() {
-        reader.resume();
-    }
 
     match report {
         Ok(report) => {

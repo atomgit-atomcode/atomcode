@@ -31,6 +31,20 @@ fn uri_to_path(uri: &str) -> PathBuf {
     }
 }
 
+/// Tracks the state of an open document for didOpen/didChange versioning.
+#[derive(Debug, Clone)]
+pub struct OpenDocumentState {
+    pub uri: String,
+    pub language_id: String,
+    pub version: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DocumentSyncAction {
+    DidOpen,
+    DidChange { version: i32 },
+}
+
 /// A running language server client.
 pub struct LspClient {
     /// Next JSON-RPC request id.
@@ -48,6 +62,8 @@ pub struct LspClient {
     /// The project root URI used during initialize.
     #[allow(dead_code)]
     root_uri: String,
+    /// Tracks open documents for proper didOpen/didChange versioning.
+    opened_documents: Arc<RwLock<HashMap<PathBuf, OpenDocumentState>>>,
 }
 
 impl LspClient {
@@ -80,6 +96,8 @@ impl LspClient {
             Arc::new(RwLock::new(HashMap::new()));
         let diagnostics_cache: Arc<RwLock<HashMap<PathBuf, Vec<Diagnostic>>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let opened_documents: Arc<RwLock<HashMap<PathBuf, OpenDocumentState>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         let root_uri = format!("file://{}", project_root.display());
 
@@ -91,6 +109,7 @@ impl LspClient {
             child: Mutex::new(child),
             reader_handle: Mutex::new(None),
             root_uri: root_uri.clone(),
+            opened_documents: opened_documents.clone(),
         };
 
         // Spawn background reader BEFORE the initialize handshake so the
@@ -197,6 +216,43 @@ impl LspClient {
         .await
     }
 
+    /// Notify the server that a file was closed.
+    pub async fn did_close(&self, path: &Path) -> Result<()> {
+        let uri = format!("file://{}", path.display());
+        self.send_notification(
+            "textDocument/didClose",
+            Some(json!({
+                "textDocument": { "uri": uri }
+            })),
+        )
+        .await
+    }
+
+    /// Sync a document with the server, using didOpen for first open and didChange for updates.
+    /// This is the preferred method for notifying the server about file changes.
+    pub async fn sync_document(&self, path: &Path, content: &str, language_id: &str) -> Result<()> {
+        match Self::next_sync_action(&self.opened_documents, path, language_id).await {
+            DocumentSyncAction::DidOpen => {
+                self.did_open(path, content, language_id).await?;
+            }
+            DocumentSyncAction::DidChange { version } => {
+                self.did_change(path, content, version).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Close a document, sending didClose and removing from tracking.
+    pub async fn close_document(&self, path: &Path) -> Result<()> {
+        let mut opened = self.opened_documents.write().await;
+        if opened.remove(path).is_some() {
+            drop(opened); // Release lock before async call.
+            self.did_close(path).await?;
+        }
+        Ok(())
+    }
+
     /// Graceful shutdown: send shutdown request, then exit notification, then kill.
     pub async fn shutdown(&self) -> Result<()> {
         // Try to send shutdown request (ignore errors — server may already be dead).
@@ -225,6 +281,31 @@ impl LspClient {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    async fn next_sync_action(
+        opened_documents: &RwLock<HashMap<PathBuf, OpenDocumentState>>,
+        path: &Path,
+        language_id: &str,
+    ) -> DocumentSyncAction {
+        let mut opened = opened_documents.write().await;
+
+        if let Some(state) = opened.get_mut(path) {
+            state.version += 1;
+            return DocumentSyncAction::DidChange {
+                version: state.version,
+            };
+        }
+
+        opened.insert(
+            path.to_path_buf(),
+            OpenDocumentState {
+                uri: format!("file://{}", path.display()),
+                language_id: language_id.to_string(),
+                version: 1,
+            },
+        );
+        DocumentSyncAction::DidOpen
+    }
 
     /// Send a JSON-RPC request and wait for the response (30s timeout).
     async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value> {
@@ -550,5 +631,35 @@ mod tests {
     fn uri_to_path_handles_windows_path() {
         let path = uri_to_path("file:///C:/Users/test.rs");
         assert_eq!(path, PathBuf::from("C:/Users/test.rs"));
+    }
+
+    #[test]
+    fn open_document_state_tracks_version() {
+        let state = OpenDocumentState {
+            uri: "file:///tmp/test.rs".to_string(),
+            language_id: "rust".to_string(),
+            version: 1,
+        };
+        assert_eq!(state.version, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_action_uses_did_open_then_did_change_versions() {
+        let opened: RwLock<HashMap<PathBuf, OpenDocumentState>> =
+            RwLock::new(HashMap::new());
+        let path = PathBuf::from("/tmp/test.rs");
+
+        let first = LspClient::next_sync_action(&opened, &path, "rust").await;
+        assert_eq!(first, DocumentSyncAction::DidOpen);
+
+        let second = LspClient::next_sync_action(&opened, &path, "rust").await;
+        assert_eq!(second, DocumentSyncAction::DidChange { version: 2 });
+
+        let third = LspClient::next_sync_action(&opened, &path, "rust").await;
+        assert_eq!(third, DocumentSyncAction::DidChange { version: 3 });
+
+        let state = opened.read().await.get(&path).cloned().unwrap();
+        assert_eq!(state.version, 3);
+        assert_eq!(state.language_id, "rust");
     }
 }

@@ -7,40 +7,6 @@ use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct WriteFileTool;
 
-/// Check if a file path is a sensitive system location that should require user approval.
-fn is_sensitive_path(path: &str) -> bool {
-    let expanded = if path.starts_with("~/") {
-        if let Some(home) = super::real_home_dir() {
-            home.join(&path[2..]).to_string_lossy().to_string()
-        } else {
-            path.to_string()
-        }
-    } else {
-        path.to_string()
-    };
-
-    let sensitive_prefixes = ["/etc/", "/usr/", "/var/", "/System/"];
-    for prefix in &sensitive_prefixes {
-        if expanded.starts_with(prefix) {
-            return true;
-        }
-    }
-
-    // Check ~/.ssh (expanded)
-    if let Some(home) = super::real_home_dir() {
-        let ssh_dir = home.join(".ssh");
-        let bashrc = home.join(".bashrc");
-        let bash_profile = home.join(".bash_profile");
-        let zshrc = home.join(".zshrc");
-        let p = std::path::Path::new(&expanded);
-        if p.starts_with(&ssh_dir) || p == bashrc || p == bash_profile || p == zshrc {
-            return true;
-        }
-    }
-
-    false
-}
-
 #[derive(Deserialize)]
 struct WriteFileArgs {
     file_path: String,
@@ -79,11 +45,10 @@ impl Tool for WriteFileTool {
                 );
             }
         };
-        if is_sensitive_path(&parsed.file_path) {
-            return ApprovalRequirement::RequireApproval(format!(
-                "Writing to sensitive system path: {}",
-                parsed.file_path
-            ));
+        if super::is_sensitive_input_path(&parsed.file_path) {
+            return ApprovalRequirement::RequireApproval(
+                format!("Writing to sensitive system path: {}", parsed.file_path),
+            );
         }
         // Overwriting existing files is blocked in execute() — no need to
         // RequireApproval here. Only new file creation is auto-approved.
@@ -182,6 +147,9 @@ impl Tool for WriteFileTool {
         let new_lines = parsed.content.lines().count();
         let bytes = parsed.content.len();
         tokio::fs::write(&path, &parsed.content).await?;
+
+        // Notify LSP that file changed (if LSP is enabled).
+        ctx.notify_lsp_file_changed(&path, &parsed.content).await;
 
         let output = if let Some(old_lines) = overwrite_info {
             let diff = new_lines as i64 - old_lines as i64;

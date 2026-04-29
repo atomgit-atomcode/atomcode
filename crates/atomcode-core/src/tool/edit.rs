@@ -89,6 +89,7 @@ async fn validate_write_check(
     new_string: &str,
     original_content: &str,
     result: ToolResult,
+    ctx: &ToolContext,
 ) -> Result<(ToolResult, String)> {
     if !result.success {
         return Ok((result, content.to_string()));
@@ -114,6 +115,10 @@ async fn validate_write_check(
     }
 
     atomic_write(file_path, &validated.fixed_content).await?;
+
+    // Notify LSP that file changed (if LSP is enabled).
+    let path = std::path::Path::new(file_path);
+    ctx.notify_lsp_file_changed(path, &validated.fixed_content).await;
 
     // 4. Post-write syntax check (needs file on disk)
     let syntax_warn = auto_fix::post_edit_syntax_check(file_path).await;
@@ -237,7 +242,22 @@ impl Tool for EditFileTool {
         }
     }
 
-    fn approval(&self, _args: &str) -> ApprovalRequirement {
+    fn approval(&self, args: &str) -> ApprovalRequirement {
+        let parsed = match serde_json::from_str::<EditFileArgs>(args) {
+            Ok(p) => p,
+            Err(_) => {
+                return ApprovalRequirement::RequireApproval(
+                    "Could not parse edit_file arguments for safety check.".to_string(),
+                );
+            }
+        };
+
+        if super::is_sensitive_input_path(&parsed.file_path) {
+            return ApprovalRequirement::RequireApproval(
+                format!("Editing sensitive system path: {}", parsed.file_path),
+            );
+        }
+
         ApprovalRequirement::AutoApprove
     }
 
@@ -299,7 +319,7 @@ impl Tool for EditFileTool {
                 });
             }
             return self
-                .execute_multi_edit(&file_path_str, &content, edits)
+                .execute_multi_edit(&file_path_str, &content, edits, ctx)
                 .await;
         }
 
@@ -437,6 +457,7 @@ impl Tool for EditFileTool {
                 &new_string,
                 &content,
                 result,
+                ctx,
             )
             .await?;
             return Ok(result);
@@ -524,6 +545,7 @@ impl Tool for EditFileTool {
                     &new_string,
                     &content,
                     result,
+                    ctx,
                 )
                 .await?;
                 // Invalidate AST cache for this file
@@ -579,6 +601,7 @@ impl Tool for EditFileTool {
                     &new_string,
                     &content,
                     result,
+                    ctx,
                 )
                 .await?;
                 return Ok(result);
@@ -674,6 +697,7 @@ impl Tool for EditFileTool {
                 &new_string,
                 &content,
                 result,
+                ctx,
             )
             .await?;
             Ok(result)
@@ -721,6 +745,7 @@ impl Tool for EditFileTool {
                             &new_string,
                             &content,
                             result,
+                            ctx,
                         )
                         .await?;
                         return Ok(result);
@@ -757,6 +782,7 @@ impl Tool for EditFileTool {
                 &new_string,
                 &content,
                 result,
+                ctx,
             )
             .await?;
             Ok(result)
@@ -772,6 +798,7 @@ impl EditFileTool {
         file_path: &str,
         content: &str,
         edits: Vec<SingleEdit>,
+        ctx: &ToolContext,
     ) -> Result<ToolResult> {
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
@@ -959,7 +986,7 @@ impl EditFileTool {
             success: true,
         };
         let (result, _final_content) =
-            validate_write_check(&new_content, file_path, &all_new_strings, content, result)
+            validate_write_check(&new_content, file_path, &all_new_strings, content, result, ctx)
                 .await?;
         Ok(result)
     }
@@ -1500,4 +1527,47 @@ fn find_closest_match_inner(
          The content may have changed. Use read_file to re-read the file.",
         content_lines.len()
     )
+}
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use crate::tool::{ApprovalRequirement, Tool};
+
+    #[test]
+    fn edit_file_requires_approval_for_sensitive_paths() {
+        let tool = EditFileTool;
+        let args = serde_json::json!({
+            "file_path": "/etc/hosts",
+            "old_string": "old",
+            "new_string": "new"
+        })
+        .to_string();
+
+        assert!(matches!(
+            tool.approval(&args),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn edit_file_auto_approves_regular_paths() {
+        let tool = EditFileTool;
+        let args = serde_json::json!({
+            "file_path": "src/main.rs",
+            "old_string": "old",
+            "new_string": "new"
+        })
+        .to_string();
+
+        assert!(matches!(tool.approval(&args), ApprovalRequirement::AutoApprove));
+    }
+
+    #[test]
+    fn edit_file_requires_approval_when_args_do_not_parse() {
+        let tool = EditFileTool;
+        assert!(matches!(
+            tool.approval("{not valid json"),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+    }
 }

@@ -82,7 +82,10 @@ impl TerminalGuard {
         // without it, every 30ms autorepeat tick reports as `KeyEventKind::Press`,
         // so holding Shift+Enter for a normal 150ms press-down inserts 5-10
         // newlines instead of one. With it enabled, autorepeats report as
-        // `KeyEventKind::Repeat` and are filtered out in `event_loop/mod.rs`.
+        // `KeyEventKind::Repeat`, which `event_loop/mod.rs` treats the same
+        // as `Press` so navigation keys (Left/Right/Backspace) auto-repeat
+        // when held — Submit-on-Enter still fires only once because Submit
+        // transitions phases.
         //
         // `execute!` is best-effort — terminals that don't support CSI u
         // (notably Apple Terminal.app, some Linux terminals) ignore the
@@ -172,7 +175,144 @@ pub async fn run(
     mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> Result<()> {
-    let caps = TerminalCaps::probe();
+    let mut caps = TerminalCaps::probe();
+
+    // Decide force_plain BEFORE activating TerminalGuard. Plain mode
+    // is incompatible with raw-mode setup: PlainRenderer emits `\n`
+    // (LF only) via `writeln!`, but raw mode disables the kernel's
+    // ONLCR translation, so LF moves down without returning to col 1.
+    // Result: every printed line stair-steps diagonally to the right,
+    // exactly matching the bug observed in JediTerm where the welcome
+    // banner ends near col 68 and subsequent MCP status lines start
+    // there instead of at col 0.
+    //
+    // `ATOMCODE_PLAIN=1` (or any non-empty value) is the user-facing
+    // escape hatch — forces PlainRenderer even on a TTY for terminals
+    // where the retained path's DECSTBM scroll region / cursor
+    // positioning misbehaves (legacy Windows conhost: footer scrolls
+    // off-screen, content duplicated, viewport drifts upward on each
+    // redraw).
+    //
+    // JetBrains' JediTerm (Android Studio, IntelliJ, PyCharm, GoLand —
+    // all share the same emulator) doesn't fully honour DECSTBM scroll
+    // regions or LF-within-region semantics in raw mode, so we treat
+    // `TERMINAL_EMULATOR=JetBrains-JediTerm` the same as
+    // `ATOMCODE_PLAIN=1`. `ATOMCODE_RETAIN=1` overrides the auto-fall-back
+    // for users who'd rather try the retained path.
+    //
+    // The trade-off when force_plain is on: no pinned input box, no
+    // live spinner, no slash-menu palette — but text + commands +
+    // agent flow all work, which is the floor.
+    let force_plain_env = std::env::var("ATOMCODE_PLAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    let force_retain = std::env::var("ATOMCODE_RETAIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    // `ATOMCODE_ALT=1` is the user-explicit opt-in to the alt-screen
+    // renderer. Phase 5: JediTerm / legacy-conhost auto-detection now
+    // also routes here (was: PlainRenderer). ATOMCODE_PLAIN=1 still
+    // wins over both — it's the informed-user choice for the bare
+    // CI-style baseline.
+    let force_alt_env = std::env::var("ATOMCODE_ALT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
+    let is_jediterm = std::env::var("TERMINAL_EMULATOR")
+        .map(|v| v == "JetBrains-JediTerm")
+        .unwrap_or(false);
+
+    // Legacy Windows console (cmd.exe / classic conhost) detection.
+    // Windows conhost has supported VT processing since the 2016
+    // Anniversary Update — but its DECSTBM scroll-region implementation
+    // diverges from xterm in ways that break our retained renderer:
+    // body rows that scroll out of the region get re-emitted into
+    // scrollback on the next paint, so users see the SAME content
+    // pair-up TWICE when they Page-Up. terminal.rs already names this
+    // for the unicode-symbols fallback; we use it here to route to
+    // alt-screen (DECSTBM-free).
+    //
+    // Distinguishing legacy conhost from modern Windows terminals:
+    //   * Windows Terminal sets `WT_SESSION` (well-behaved, retained OK)
+    //   * VS Code / Hyper / WezTerm / mintty / etc. set `TERM_PROGRAM`
+    //   * Plain cmd.exe / PowerShell-in-conhost set neither → legacy
+    //
+    // Skip when JediTerm is already detected — JetBrains' embedded
+    // terminal on Windows would otherwise match BOTH heuristics
+    // (no TERM_PROGRAM either) and we'd print two hints.
+    let is_legacy_conhost = cfg!(windows)
+        && !is_jediterm
+        && std::env::var("WT_SESSION").is_err()
+        && std::env::var("TERM_PROGRAM").is_err();
+
+    // Phase 5 routing matrix:
+    //   ATOMCODE_PLAIN=1                              → PlainRenderer (user opt-in)
+    //   ATOMCODE_RETAIN=1                             → RetainedRenderer (user opt-in)
+    //   ATOMCODE_ALT=1                                → AltScreenRenderer (user opt-in)
+    //   JediTerm / legacy conhost (no opt-in)         → AltScreenRenderer (auto)
+    //   default tty                                   → RetainedRenderer
+    //
+    // `force_plain` survives only as a route to PlainRenderer when
+    // explicitly asked for via ATOMCODE_PLAIN=1. The auto-detect
+    // path no longer routes there (Phase 4 made plain-on-tty work,
+    // Phase 5 upgrades the auto-fallback to alt-screen so users
+    // get the full UI).
+    let force_plain = force_plain_env;
+    let auto_alt_screen = !force_plain_env
+        && !force_retain
+        && (is_jediterm || is_legacy_conhost);
+
+    // Marker env vars so the event loop can render a one-line hint
+    // explaining what just happened and how to recover. Only set
+    // when the auto-fallback fired — if the user explicitly opted
+    // in via ATOMCODE_PLAIN they already know; lecturing would be
+    // noise. Mutually exclusive (legacy_conhost is gated on
+    // !is_jediterm above) so at most one hint fires.
+    if is_jediterm && !force_retain && !force_plain_env {
+        std::env::set_var("ATOMCODE_JEDITERM_FALLBACK", "1");
+    }
+    if is_legacy_conhost && !force_retain && !force_plain_env {
+        std::env::set_var("ATOMCODE_LEGACY_CONHOST_FALLBACK", "1");
+    }
+
+    // Capture whether stdout was a real TTY BEFORE we mutate caps.
+    // PlainRenderer needs this to know whether the kernel will echo
+    // user input (cooked-mode, real TTY) or not (pipe / CI). Used
+    // below when constructing PlainRenderer so the User-line render
+    // doesn't duplicate cooked-mode echoes on JediTerm / conhost /
+    // ATOMCODE_PLAIN=1 force_plain paths.
+    let was_real_tty = caps.tty;
+
+    // `want_alt_screen` is decided AFTER force_plain so a user who
+    // sets both ATOMCODE_PLAIN=1 and ATOMCODE_ALT=1 lands on plain
+    // (informed-choice priority — they explicitly opted into the
+    // bare baseline). Also requires a real TTY: alt-screen on a
+    // pipe / CI sink is meaningless.
+    //
+    // Phase 5: auto-detection (JediTerm / conhost) also lands here,
+    // so JetBrains-IDE / cmd.exe users get the full UI without
+    // setting any env var. Manual `ATOMCODE_RETAIN=1` still bypasses
+    // (lets the curious try retained on those terminals despite the
+    // known DECSTBM issues).
+    let want_alt_screen =
+        (force_alt_env || auto_alt_screen) && !force_plain_env && was_real_tty;
+
+    // When force_plain wins, strip raw-mode-related capabilities so
+    // every downstream branch (TerminalGuard activate, reader spawn,
+    // renderer choice) consistently picks the cooked-mode / Plain
+    // path. `tty=false` also skips Kitty enhancement push and the
+    // startup screen clear (both emit CSI sequences that JediTerm
+    // mishandles, and PlainRenderer doesn't need either). Skip the
+    // mutation when alt-screen is winning — alt-screen needs raw
+    // mode + bracketed paste + tty intact for full UI.
+    if force_plain && !want_alt_screen {
+        caps.raw_mode = false;
+        caps.bracketed_paste = false;
+        caps.tty = false;
+    }
+
     let (_guard, kbd_enhanced) = TerminalGuard::activate(caps)?;
 
     // If the terminal doesn't support Kitty keyboard protocol (CSI u),
@@ -189,27 +329,31 @@ pub async fn run(
     // no longer block the event loop — the event loop sends `UiLine`s
     // through a channel and moves on.
     // TTY → retained-mode Ink-style cell-diff renderer.
-    // Non-TTY (pipe, CI, dumb terminal) → PlainRenderer, which
-    // just writes plain text without ANSI cursor positioning.
-    //
-    // `ATOMCODE_PLAIN=1` (or any non-empty value) forces PlainRenderer
-    // even on a TTY — escape hatch for terminals where the retained
-    // path's DECSTBM scroll region / cursor positioning misbehaves
-    // (notably reported on legacy Windows conhost: the fixed footer
-    // scrolls off-screen, content appears duplicated, viewport drifts
-    // upward on each redraw). PlainRenderer does no cursor positioning
-    // and no scroll-region tricks, so it works on any terminal that
-    // can print bytes — at the cost of losing the pinned input box,
-    // live spinner, and slash-menu palette. All commands and agent
-    // functionality are unchanged.
-    let force_plain = std::env::var("ATOMCODE_PLAIN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .is_some();
-    let inner: Box<dyn Renderer> = if caps.tty && !force_plain {
+    // Non-TTY (pipe, CI, dumb terminal, force_plain) → PlainRenderer,
+    // which just writes plain text without ANSI cursor positioning.
+    let inner: Box<dyn Renderer> = if want_alt_screen {
+        // Alt-screen renderer: takes over the alternate screen buffer
+        // (`\x1b[?1049h`) so it can use absolute cursor positioning
+        // without depending on DECSTBM scroll regions. Trade-off:
+        // host terminal's native scrollback is unavailable while the
+        // app runs (in-app PageUp/PageDown ships in Phase 2).
+        Box::new(crate::render::alt_screen::AltScreenRenderer::new(caps))
+    } else if caps.tty {
         Box::new(RetainedRenderer::new(caps))
     } else {
-        Box::new(PlainRenderer::new())
+        // Pass caps + the ORIGINAL tty value so PlainRenderer can:
+        // (a) gate colours / unicode / spinner on caps.{colors,
+        //     unicode_symbols, spinner} (these survive the force_plain
+        //     mutation; JediTerm supports all three, CI / pipe don't);
+        // (b) decide whether to suppress UiLine::User echo based on
+        //     `was_real_tty` — true means the kernel does cooked-mode
+        //     echo for us (so re-rendering would duplicate the line),
+        //     false means we're piping and need to render it ourselves.
+        Box::new(PlainRenderer::with_writer_caps_and_interactive(
+            std::io::BufWriter::new(std::io::stdout()),
+            caps,
+            was_real_tty,
+        ))
     };
     let mut renderer: Box<dyn Renderer> = Box::new(TaskRenderer::new(inner));
 
@@ -325,6 +469,13 @@ pub async fn run(
         dirs
     };
 
+    let custom_commands =
+        atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+    // Same Arc the agent loop holds — reload() calls there propagate
+    // here automatically, so the slash menu reflects newly-installed
+    // skills without re-plumbing.
+    let skill_registry = agent_handle.skill_registry.clone();
+
     let ctx = LoopCtx {
         config,
         model_name,
@@ -357,6 +508,8 @@ pub async fn run(
         mcp_reload: None,
         telemetry,
         worktree_original_dir: None,
+        custom_commands,
+        skill_registry,
         caps,
     };
 

@@ -19,6 +19,7 @@ pub enum Action {
     HistoryNext,
     Backspace,
     DeleteForward,
+    ToggleToolOutput,
     NoOp,
 }
 
@@ -38,6 +39,8 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
         // promise these in site/docs/keybindings.html.
         (KeyCode::Char('a'), true) => Action::LineStart,
         (KeyCode::Char('e'), true) => Action::LineEnd,
+        // Ctrl+O toggles real-time tool output visibility.
+        (KeyCode::Char('o'), true) => Action::ToggleToolOutput,
         // Ctrl+H is the POSIX / readline alias for Backspace. MobaXterm,
         // PuTTY and other Windows SSH clients often ship with "Backspace
         // sends ^H" turned on by default, so the physical Backspace key

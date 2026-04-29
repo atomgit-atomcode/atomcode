@@ -87,6 +87,9 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "cost",    desc: "Show token cost", needs_args: false },
     Command { name: "context", desc: "Show context budget breakdown", needs_args: false },
     Command { name: "compact", desc: "Compact conversation history", needs_args: false },
+    Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true },
+    Command { name: "forget", desc: "Remove matching memories", needs_args: true },
+    Command { name: "memory", desc: "Show all saved memories", needs_args: false },
     Command { name: "mcp",     desc: "Show MCP server status (subcommand: reload)", needs_args: false },
     Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
     Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
@@ -97,7 +100,54 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
+    // Gateway entry that opens a second-level palette listing all
+    // user-invocable skills. needs_args=true so Enter rewrites the
+    // buffer to `/skills ` and lets the sub-mode menu render the
+    // skill list. Selecting a skill commits as `/skills <name>` →
+    // dispatched by the `skills` arm in execute_slash_command.
+    Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
 ];
+
+/// A completion candidate for slash-command Tab completion, merging built-in
+/// and user-defined custom commands.
+#[derive(Debug, Clone)]
+pub struct CompletionCandidate {
+    pub name: String,
+    pub description: String,
+    pub is_custom: bool,
+}
+
+/// Merge built-in and custom command completions for a given prefix.
+/// Results are sorted with built-ins first, then custom commands, each
+/// group sorted by name. Custom commands whose names collide with a
+/// built-in are suppressed.
+pub fn complete_commands(
+    prefix: &str,
+    custom_names: &[(String, String)],
+) -> Vec<CompletionCandidate> {
+    let prefix = prefix.strip_prefix('/').unwrap_or(prefix);
+    let mut candidates = Vec::new();
+    for cmd in BUILTIN_COMMANDS {
+        if cmd.name.starts_with(prefix) {
+            candidates.push(CompletionCandidate {
+                name: cmd.name.to_string(),
+                description: cmd.desc.to_string(),
+                is_custom: false,
+            });
+        }
+    }
+    for (name, desc) in custom_names {
+        if name.starts_with(prefix) && !candidates.iter().any(|c| c.name == *name) {
+            candidates.push(CompletionCandidate {
+                name: name.clone(),
+                description: desc.clone(),
+                is_custom: true,
+            });
+        }
+    }
+    candidates.sort_by_key(|c| (c.is_custom, c.name.clone()));
+    candidates
+}
 
 /// Parse `"/cmd args..."` into `(cmd, args)` when the leading `/` is a
 /// command invocation. Returns `None` when the `/` is actually part of a
@@ -110,8 +160,13 @@ const BUILTIN_COMMANDS: &[Command] = &[
 /// agent dispatch.
 pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
     let rest = s.strip_prefix('/')?;
+    // Allow `:` in command names so namespaced skills like
+    // `/skills:brainstorming` (loose skill, atomcode prefix) and
+    // `/superpowers:writing-plans` (Claude Code plugin convention)
+    // parse as a single command name. Paths like `/Users/me/...` are
+    // still rejected by the non-whitespace follow-on check below.
     let name_end = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':'))
         .unwrap_or(rest.len());
     if name_end == 0 {
         return None;
@@ -121,7 +176,7 @@ pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
     match after.chars().next() {
         None => Some((name, "")),
         Some(c) if c.is_whitespace() => Some((name, after.trim_start())),
-        // Non-space follow-on (`/`, `.`, `:`, etc.) means the `/` was
+        // Non-space follow-on (`/`, `.`, etc.) means the `/` was
         // a literal character in a path / URL — not a command.
         _ => None,
     }
@@ -181,6 +236,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_accepts_colon_namespaced_command() {
+        // Skills load under a `skills:` namespace; plugins (future) use
+        // their manifest name. The parser must keep the colon segment as
+        // part of the command name, not split on it.
+        let (cmd, arg) = parse_slash_line("/skills:brainstorming").unwrap();
+        assert_eq!(cmd, "skills:brainstorming");
+        assert_eq!(arg, "");
+
+        let (cmd, arg) = parse_slash_line("/skills:brainstorming why is X").unwrap();
+        assert_eq!(cmd, "skills:brainstorming");
+        assert_eq!(arg, "why is X");
+
+        let (cmd, _) = parse_slash_line("/superpowers:writing-plans").unwrap();
+        assert_eq!(cmd, "superpowers:writing-plans");
+    }
+
+    #[test]
     fn parse_rejects_url_starting_with_slash() {
         assert!(parse_slash_line("/https://example.com/x").is_none());
     }
@@ -221,6 +293,74 @@ mod tests {
         let help = reg.help_text();
         for c in reg.all() {
             assert!(help.contains(c.name), "help missing {}", c.name);
+        }
+    }
+
+    #[test]
+    fn complete_builtin_commands() {
+        let candidates = complete_commands("mo", &[]);
+        assert!(
+            candidates.iter().any(|c| c.name == "model"),
+            "\"mo\" should match built-in \"model\""
+        );
+        assert!(
+            candidates.iter().all(|c| !c.is_custom),
+            "built-in-only query should have no custom candidates"
+        );
+    }
+
+    #[test]
+    fn complete_custom_commands() {
+        let custom = vec![("review".to_string(), "Code review".to_string())];
+        let candidates = complete_commands("rev", &custom);
+        assert!(
+            candidates.iter().any(|c| c.name == "review" && c.is_custom),
+            "\"rev\" should match custom \"review\""
+        );
+    }
+
+    #[test]
+    fn builtin_takes_precedence() {
+        // Custom "help" should NOT appear because built-in "help" exists.
+        let custom = vec![("help".to_string(), "Custom help".to_string())];
+        let candidates = complete_commands("help", &custom);
+        let help_count = candidates.iter().filter(|c| c.name == "help").count();
+        assert_eq!(
+            help_count, 1,
+            "custom \"help\" must not duplicate built-in \"help\""
+        );
+        assert!(
+            !candidates.iter().any(|c| c.name == "help" && c.is_custom),
+            "the surviving \"help\" must be the built-in, not custom"
+        );
+    }
+
+    #[test]
+    fn empty_prefix_returns_all() {
+        let custom = vec![
+            ("review".to_string(), "Code review".to_string()),
+            ("deploy".to_string(), "Deploy app".to_string()),
+        ];
+        let candidates = complete_commands("", &custom);
+        // At least all 25 built-in commands + 2 custom
+        assert!(
+            candidates.len() >= 20,
+            "empty prefix should return at least 20 results, got {}",
+            candidates.len()
+        );
+        // Custom commands should be present
+        assert!(candidates.iter().any(|c| c.name == "review"));
+        assert!(candidates.iter().any(|c| c.name == "deploy"));
+    }
+
+    #[test]
+    fn complete_commands_strips_leading_slash() {
+        // Calling with "/mo" should behave identically to "mo".
+        let with_slash = complete_commands("/mo", &[]);
+        let without_slash = complete_commands("mo", &[]);
+        assert_eq!(with_slash.len(), without_slash.len());
+        for (a, b) in with_slash.iter().zip(without_slash.iter()) {
+            assert_eq!(a.name, b.name);
         }
     }
 }
