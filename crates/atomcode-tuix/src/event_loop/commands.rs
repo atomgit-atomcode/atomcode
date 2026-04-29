@@ -1539,55 +1539,44 @@ fn resolve_cd(
 /// affordance; renders a QR code above the URL when the terminal can
 /// display it and the rendered block fits the current width.
 ///
-/// Style selection (Unicode-capable terminals only):
-/// * Default → `Dense1x2` half-block `▀▄█` (≈ 45 cols). Universally
-///   compatible because U+2580–U+259F are Unicode-Neutral width — no
-///   terminal renders them at double width, so QR aspect stays 1:1
-///   and scanners decode reliably.
-/// * `ATOMCODE_QR_BRAILLE=1` → braille (≈ 23 cols). About half size,
-///   but Braille (U+2800–U+28FF) is Unicode-Ambiguous width and gets
-///   stretched 2× horizontally on any terminal that defaults
-///   ambiguous-width to double (notably iTerm2's "Treat
-///   ambiguous-width characters as double width" preference, which is
-///   on by default in many profiles). Opt-in only when you know your
-///   terminal renders braille at single cell width.
+/// Style selection (Unicode-capable terminals):
+/// * `ATOMCODE_QR_DENSE=1` → force `Dense1x2` half-block (≈ 45 cols).
+///   Override for users on terminals where braille mis-renders.
+/// * `ATOMCODE_QR_BRAILLE=1` → force braille (≈ 23 cols). Opt-in for
+///   users who know their terminal renders braille at single cell
+///   width and don't add line spacing.
+/// * JediTerm (Android Studio / IntelliJ / GoLand / any JetBrains IDE
+///   embedded terminal) → no QR. JediTerm renders rows with extra
+///   line spacing, vertically stretching every text-based QR beyond
+///   scanner aspect tolerance. URLs are clickable in JediTerm
+///   anyway, so URL-only is actually a better UX.
+/// * Otherwise → `Dense1x2`. Block elements (U+2580–U+259F) are
+///   Unicode-Neutral width and render at single cell on every
+///   terminal — universally scannable.
 ///
 /// On terminals without Unicode block-glyph support
 /// (`TerminalCaps::unicode_symbols == false` — POSIX locale, dumb
-/// TERM, legacy Windows conhost) we skip the QR entirely: the only
+/// TERM, legacy Windows conhost) we likewise skip the QR: the only
 /// scannable ASCII form is ≈ 90 columns wide, which doesn't fit any
-/// realistic terminal window, and these environments are typically
-/// keyboard-driven anyway. The body becomes URL-only.
+/// realistic terminal window, and those environments are typically
+/// keyboard-driven anyway.
 fn compose_login_chrome(url: &str, unicode: bool) -> String {
-    let qr_block = if unicode {
-        use crate::render::qr::QrStyle;
-        let style = if std::env::var("ATOMCODE_QR_BRAILLE")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-        {
-            QrStyle::Braille
-        } else {
-            QrStyle::Dense1x2
-        };
+    let qr_block = pick_qr_style(unicode).and_then(|style| {
+        let s = crate::render::qr::render_login_qr(url, style)?;
+        let cols = crate::render::qr::block_cols(&s);
         let term_cols = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
-        crate::render::qr::render_login_qr(url, style).and_then(|s| {
-            let cols = crate::render::qr::block_cols(&s);
-            // Reserve 2 cols for the leading indent + 2 cols breathing room.
-            if (cols as u16).saturating_add(4) <= term_cols {
-                Some(
-                    s.lines()
-                        .map(|l| format!("  {}", l))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            } else {
-                None
-            }
-        })
-    } else {
-        None
-    };
+        // Reserve 2 cols for the leading indent + 2 cols breathing room.
+        if (cols as u16).saturating_add(4) <= term_cols {
+            Some(
+                s.lines()
+                    .map(|l| format!("  {}", l))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        } else {
+            None
+        }
+    });
 
     let mut out = String::new();
     if let Some(block) = qr_block {
@@ -1601,6 +1590,116 @@ fn compose_login_chrome(url: &str, unicode: bool) -> String {
     }
     out.push_str("\n\n  Press ESC to cancel\n");
     out
+}
+
+/// Choose a QR rendering style for the current environment, or return
+/// `None` to skip the QR entirely (URL-only output).
+///
+/// Pure function — env vars / TERMINAL_EMULATOR are read once and
+/// passed through `decide_qr_style` so the decision logic stays unit
+/// testable.
+fn pick_qr_style(unicode: bool) -> Option<crate::render::qr::QrStyle> {
+    let env_flag = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+    };
+    let is_jediterm = std::env::var("TERMINAL_EMULATOR")
+        .map(|v| v == "JetBrains-JediTerm")
+        .unwrap_or(false);
+    decide_qr_style(
+        unicode,
+        env_flag("ATOMCODE_QR_DENSE"),
+        env_flag("ATOMCODE_QR_BRAILLE"),
+        is_jediterm,
+    )
+}
+
+/// Pure decision table for `pick_qr_style`. Explicit overrides win
+/// over auto-detection; auto-detection only suppresses the QR when
+/// no override is set.
+fn decide_qr_style(
+    unicode: bool,
+    force_dense: bool,
+    force_braille: bool,
+    is_jediterm: bool,
+) -> Option<crate::render::qr::QrStyle> {
+    use crate::render::qr::QrStyle;
+    if !unicode {
+        return None;
+    }
+    if force_dense {
+        return Some(QrStyle::Dense1x2);
+    }
+    if force_braille {
+        return Some(QrStyle::Braille);
+    }
+    if is_jediterm {
+        // JediTerm adds line spacing — every text-based QR vertically
+        // stretches past scanner tolerance. URL-only is the better UX.
+        return None;
+    }
+    Some(QrStyle::Dense1x2)
+}
+
+#[cfg(test)]
+mod qr_style_tests {
+    use super::*;
+    use crate::render::qr::QrStyle;
+
+    #[test]
+    fn no_unicode_means_no_qr() {
+        assert_eq!(decide_qr_style(false, false, false, false), None);
+        // overrides do not bring back QR when terminal can't render unicode
+        assert_eq!(decide_qr_style(false, true, false, false), None);
+        assert_eq!(decide_qr_style(false, false, true, false), None);
+    }
+
+    #[test]
+    fn jediterm_default_skips_qr() {
+        assert_eq!(decide_qr_style(true, false, false, true), None);
+    }
+
+    #[test]
+    fn jediterm_with_braille_override_renders_braille() {
+        assert_eq!(
+            decide_qr_style(true, false, true, true),
+            Some(QrStyle::Braille)
+        );
+    }
+
+    #[test]
+    fn jediterm_with_dense_override_renders_dense() {
+        assert_eq!(
+            decide_qr_style(true, true, false, true),
+            Some(QrStyle::Dense1x2)
+        );
+    }
+
+    #[test]
+    fn dense_override_wins_over_braille_override() {
+        assert_eq!(
+            decide_qr_style(true, true, true, false),
+            Some(QrStyle::Dense1x2)
+        );
+    }
+
+    #[test]
+    fn braille_override_picks_braille_outside_jediterm() {
+        assert_eq!(
+            decide_qr_style(true, false, true, false),
+            Some(QrStyle::Braille)
+        );
+    }
+
+    #[test]
+    fn default_is_dense1x2() {
+        assert_eq!(
+            decide_qr_style(true, false, false, false),
+            Some(QrStyle::Dense1x2)
+        );
+    }
 }
 
 /// Render the OAuth URL block + ESC affordance into scrollback, then
