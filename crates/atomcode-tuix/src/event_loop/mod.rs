@@ -704,6 +704,37 @@ mod menu_tests {
     }
 
     #[test]
+    fn bare_suffix_search_matches_namespaced_skill() {
+        // Regression — once skills load under `skills:<name>`, a naive
+        // prefix match would require the user to type `skills:bra` to
+        // surface `/skills:brainstorming`. We want `/bra` to still find
+        // it (display-only namespace), so the menu matches against both
+        // the full name and the bare suffix after the first `:`.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        // /bra → matches `brainstorming` via the bare suffix; the
+        // displayed entry retains the full `skills:` prefix.
+        let items = build_menu_items("/bra", &reg, &custom, Some(&lock))
+            .expect("/bra should surface the namespaced skill");
+        assert!(
+            items.iter().any(|(n, _)| n == "skills:brainstorming"),
+            "menu must include the prefixed display name, got {:?}",
+            items
+        );
+        // Sibling skill whose suffix doesn't start with `bra` must NOT
+        // appear (no false positives from the looser match).
+        assert!(
+            !items.iter().any(|(n, _)| n == "skills:web-access"),
+            "non-matching skill must not leak via bare-suffix search"
+        );
+    }
+
+    #[test]
     fn colon_namespaced_skill_filters_correctly() {
         // Production loader prefixes loose skills with `skills:` so they
         // are visually distinct from built-ins. The menu must filter them
@@ -2054,10 +2085,25 @@ fn build_menu_items(
     // filters out skills marked hidden from the `/` menu (the
     // `disable_model_invocation: true` ones — those are exposed only
     // through the use_skill tool to the LLM).
+    //
+    // Skills are stored under a namespace like `skills:brainstorming`
+    // (loose) or `superpowers:brainstorming` (plugin) so the displayed
+    // name visibly distinguishes skills from built-ins. To keep search
+    // friction-free, match the prefix against BOTH the full name and
+    // the bare suffix after the first `:` — so `/bra` still surfaces
+    // `/skills:brainstorming`, while `/skills:` and `/skills:bra`
+    // continue to work as full-name prefix matches.
     if let Some(reg) = skill_registry {
         if let Ok(reg) = reg.read() {
             for skill in reg.user_invocable() {
-                if skill.name.to_ascii_lowercase().starts_with(&prefix_lower)
+                let name_lower = skill.name.to_ascii_lowercase();
+                let bare_suffix = name_lower
+                    .split_once(':')
+                    .map(|(_, s)| s)
+                    .unwrap_or(name_lower.as_str());
+                let matches_full = name_lower.starts_with(&prefix_lower);
+                let matches_bare = bare_suffix.starts_with(&prefix_lower);
+                if (matches_full || matches_bare)
                     && !matches.iter().any(|(n, _)| n.eq_ignore_ascii_case(&skill.name))
                 {
                     matches.push((skill.name.clone(), skill.description.clone()));
