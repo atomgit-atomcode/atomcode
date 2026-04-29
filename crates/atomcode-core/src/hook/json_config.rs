@@ -59,6 +59,18 @@ pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
         }
     }
 
+    // Plugin layer — each installed plugin's hooks.json is loaded with the
+    // hook key prefixed by `<plugin>:` to avoid cross-plugin collisions.
+    for assets in crate::plugin::loader::iter_installed_plugin_assets() {
+        let path = assets.hooks_file();
+        if let Ok(hooks) = load_hooks_file(&path) {
+            for (name, hook) in hooks {
+                let key = format!("{}:{}", assets.plugin, name);
+                merged.insert(key, hook);
+            }
+        }
+    }
+
     // Load project hooks — override global by name.
     if let Ok(hooks) = load_hooks_file(&project_path) {
         for (name, hook) in hooks {
@@ -328,5 +340,31 @@ mod tests {
         }"#;
         let raw: HooksFile = serde_json::from_str(json).unwrap();
         assert_eq!(raw.hooks["fast"].timeout_ms, 500);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_hooks_are_loaded_with_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+
+        let plugin_dir = tmp.path().join(".atomcode/plugins/marketplaces/p");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("hooks.json"),
+            r#"{"hooks":{"on_pre":{"event":"PreToolUse","command":"echo hi"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".atomcode/plugins/installed_plugins.json"),
+            r#"{"version":1,"plugins":{"p@p":{"marketplace":"p","plugin":"p","plugin_dir":"marketplaces/p","installed_at":"x"}}}"#,
+        )
+        .unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let hooks = load_hooks_config(working.path());
+        assert!(hooks.iter().any(|h| h.command == "echo hi"));
+
+        std::env::remove_var("ATOMCODE_HOME");
     }
 }
