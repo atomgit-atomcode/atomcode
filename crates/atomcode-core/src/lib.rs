@@ -19,6 +19,7 @@ pub mod provider;
 pub mod self_update;
 pub mod semantic;
 pub mod session;
+pub mod plugin;
 pub mod skill;
 pub mod stream;
 pub mod telemetry_bootstrap;
