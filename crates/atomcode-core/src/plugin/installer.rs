@@ -1,10 +1,12 @@
 use anyhow::{anyhow, bail, Result};
+use std::path::{Component, Path};
 
 use super::manifest::PluginEntry;
+use super::marketplace::sanitize_name;
 use super::paths;
 use super::state::{
     load_installed_plugins_file, load_marketplaces_file, plugin_id, save_installed_plugins_file,
-    InstalledPluginEntry, InstalledPluginsFile,
+    InstalledPluginEntry,
 };
 
 #[derive(Debug, Clone)]
@@ -12,6 +14,33 @@ pub struct InstalledPluginInfo {
     pub plugin: String,
     pub marketplace: String,
     pub plugin_dir: String,
+}
+
+/// Validate that a plugin source path (declared in marketplace.json) only
+/// contains plain forward components. Reject `..`, absolute paths, and any
+/// other non-`Normal` component to prevent escaping the marketplace root.
+fn validate_plugin_source(source: &str) -> Result<()> {
+    if source.is_empty() {
+        return Ok(());
+    }
+    let p = Path::new(source);
+    for comp in p.components() {
+        match comp {
+            Component::Normal(s) => {
+                let s = s.to_string_lossy();
+                if s.is_empty() || s == ".." || s.contains('\0') {
+                    bail!("plugin source path '{}' contains disallowed components", source);
+                }
+            }
+            Component::CurDir => {
+                // "./" is fine; skip.
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("plugin source path '{}' contains disallowed components", source);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
@@ -32,7 +61,7 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
         Some(m) => m
             .plugins
             .into_iter()
-            .find(|p| p.name == plugin)
+            .find(|p| sanitize_name(&p.name) == plugin || p.name == plugin)
             .ok_or_else(|| anyhow!("plugin `{}` missing from manifest", plugin))?,
         None => PluginEntry {
             name: plugin.to_string(),
@@ -40,6 +69,10 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
             description: None,
         },
     };
+
+    // Reject path traversal in PluginEntry.source.
+    validate_plugin_source(&plugin_entry.source)?;
+
     let normalized_source = plugin_entry.source.trim_start_matches("./");
     let plugin_dir_rel = if normalized_source.is_empty() {
         mp_root_rel.clone()
@@ -47,7 +80,13 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
         format!("{}/{}", mp_root_rel, normalized_source.trim_end_matches('/'))
     };
 
-    let id = plugin_id(plugin, marketplace);
+    // Sanitize the plugin name component of the canonical id; the marketplace
+    // is already a sanitized key (enforced in add_marketplace).
+    let plugin_key = sanitize_name(plugin);
+    if plugin_key.is_empty() {
+        bail!("plugin name `{}` sanitized to empty string", plugin);
+    }
+    let id = plugin_id(&plugin_key, marketplace);
     let installed_path = paths::installed_plugins_file().unwrap();
     let mut installed = load_installed_plugins_file(&installed_path)?;
     if installed.plugins.contains_key(&id) {
@@ -57,7 +96,7 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
         id.clone(),
         InstalledPluginEntry {
             marketplace: marketplace.to_string(),
-            plugin: plugin.to_string(),
+            plugin: plugin_key.clone(),
             plugin_dir: plugin_dir_rel.clone(),
             installed_at: chrono::Utc::now().to_rfc3339(),
         },
@@ -65,14 +104,15 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
     save_installed_plugins_file(&installed_path, &installed)?;
 
     Ok(InstalledPluginInfo {
-        plugin: plugin.to_string(),
+        plugin: plugin_key,
         marketplace: marketplace.to_string(),
         plugin_dir: plugin_dir_rel,
     })
 }
 
 pub fn uninstall(plugin: &str, marketplace: &str) -> Result<()> {
-    let id = plugin_id(plugin, marketplace);
+    let plugin_key = sanitize_name(plugin);
+    let id = plugin_id(&plugin_key, marketplace);
     let installed_path = paths::installed_plugins_file().unwrap();
     let mut installed = load_installed_plugins_file(&installed_path)?;
     if installed.plugins.remove(&id).is_none() {
@@ -100,8 +140,8 @@ mod tests {
     use super::*;
     use crate::plugin::marketplace::add_marketplace;
     use crate::plugin::test_support::isolated_home;
-    use std::process::Command;
     use std::path::PathBuf;
+    use std::process::Command;
 
     fn make_repo(name: &str, manifest: Option<&str>) -> PathBuf {
         let work = tempfile::tempdir().unwrap().into_path();
@@ -165,5 +205,35 @@ mod tests {
         add_marketplace(&format!("file://{}", repo.display())).unwrap();
         let info = install("sub", "mp").unwrap();
         assert_eq!(info.plugin_dir, "marketplaces/mp/plugins/sub");
+    }
+
+    /// B2 regression: a plugin whose `source` contains `..` must be
+    /// rejected, otherwise the resulting `plugin_dir` could escape the
+    /// marketplace root.
+    #[test]
+    #[serial_test::serial]
+    fn install_rejects_traversal_in_plugin_source() {
+        let _home = isolated_home();
+        let manifest = r#"{"name":"mp2","plugins":[{"name":"esc","source":"../../etc"}]}"#;
+        let repo = make_repo("mp2", Some(manifest));
+        add_marketplace(&format!("file://{}", repo.display())).unwrap();
+        let err = install("esc", "mp2").unwrap_err();
+        assert!(
+            err.to_string().contains("disallowed components"),
+            "expected traversal rejection, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_plugin_source_unit() {
+        assert!(validate_plugin_source("").is_ok());
+        assert!(validate_plugin_source("./").is_ok());
+        assert!(validate_plugin_source("plugins/foo").is_ok());
+        assert!(validate_plugin_source("./plugins/foo").is_ok());
+        assert!(validate_plugin_source("../etc").is_err());
+        assert!(validate_plugin_source("plugins/../etc").is_err());
+        assert!(validate_plugin_source("/etc/passwd").is_err());
+        assert!(validate_plugin_source("plugins/foo/../bar").is_err());
     }
 }

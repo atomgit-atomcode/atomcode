@@ -1,16 +1,14 @@
 use anyhow::{anyhow, bail, Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use super::manifest::{load_marketplace_manifest, MarketplaceManifest};
 use super::paths;
-use super::state::{
-    load_marketplaces_file, save_marketplaces_file, MarketplaceEntry, MarketplacesFile,
-};
+use super::state::{load_marketplaces_file, save_marketplaces_file, MarketplaceEntry};
 use super::url::{infer_marketplace_name_from_url, validate_git_url};
 
 /// Sanitize a name into a path-safe segment (CC convention).
-fn sanitize_name(name: &str) -> String {
+pub(super) fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect()
@@ -28,32 +26,82 @@ pub struct MarketplaceInfo {
 /// Caller is responsible for showing UX (spinner). This call blocks on git.
 pub fn add_marketplace(url: &str) -> Result<MarketplaceInfo> {
     validate_git_url(url)?;
-    let raw_name = infer_marketplace_name_from_url(url)?;
-    let name = sanitize_name(&raw_name);
+    let url_tail = infer_marketplace_name_from_url(url)?;
 
     let mp_root = paths::marketplaces_root().ok_or_else(|| anyhow!("no plugin home"))?;
-    let target = mp_root.join(&name);
+    std::fs::create_dir_all(&mp_root).ok();
 
-    // Idempotency: refuse to overwrite existing marketplace.
+    // Clone into a temp directory inside marketplaces/ so we can read the
+    // manifest, then determine the canonical (sanitized) name and rename to
+    // its final location atomically. This avoids the prior key/dir mismatch
+    // when manifest.name differs from the URL tail.
+    let tmp_suffix: u128 = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    };
+    let tmp_dir = mp_root.join(format!(".tmp-{}-{}", std::process::id(), tmp_suffix));
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    let cleanup = |p: &Path| {
+        if p.exists() {
+            std::fs::remove_dir_all(p).ok();
+        }
+    };
+
+    if let Err(e) = git_clone(url, &tmp_dir) {
+        cleanup(&tmp_dir);
+        return Err(e).with_context(|| format!("clone {}", url));
+    }
+
+    let commit = match git_rev_parse(&tmp_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup(&tmp_dir);
+            return Err(e);
+        }
+    };
+
+    let manifest = match load_marketplace_manifest(&tmp_dir) {
+        Ok(m) => m,
+        Err(e) => {
+            cleanup(&tmp_dir);
+            return Err(e);
+        }
+    };
+
+    let (raw_mp_name, plugins) = resolve_marketplace_identity(&manifest, &url_tail);
+    // Sanitize the chosen name so a hostile manifest cannot escape the
+    // marketplaces/ directory via "..", "/" or absolute paths.
+    let mp_name = sanitize_name(&raw_mp_name);
+    if mp_name.is_empty() {
+        cleanup(&tmp_dir);
+        bail!("marketplace name `{}` sanitized to empty string", raw_mp_name);
+    }
+
+    let target = mp_root.join(&mp_name);
+
     let mp_file = paths::marketplaces_file().unwrap();
     let mut state = load_marketplaces_file(&mp_file)?;
-    if state.marketplaces.contains_key(&name) {
-        bail!("marketplace `{}` already exists; remove first", name);
+    if state.marketplaces.contains_key(&mp_name) {
+        cleanup(&tmp_dir);
+        bail!("marketplace `{}` already exists; remove first", mp_name);
     }
     if target.exists() {
+        cleanup(&tmp_dir);
         bail!(
             "directory {} already exists but is not registered; remove it manually",
             target.display()
         );
     }
 
-    std::fs::create_dir_all(&mp_root).ok();
-    git_clone(url, &target).with_context(|| format!("clone {}", url))?;
-    let commit = git_rev_parse(&target)?;
+    if let Err(e) = std::fs::rename(&tmp_dir, &target) {
+        cleanup(&tmp_dir);
+        return Err(anyhow!("rename {} -> {}: {}", tmp_dir.display(), target.display(), e));
+    }
 
-    let manifest = load_marketplace_manifest(&target)?;
-    let (mp_name, plugins) = resolve_marketplace_identity(&manifest, &name);
-    let plugins_list = plugins.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    let plugins_list = plugins.iter().map(|p| sanitize_name(&p.name)).collect::<Vec<_>>();
 
     state.marketplaces.insert(
         mp_name.clone(),
@@ -171,7 +219,7 @@ pub fn update_marketplace(name: &str) -> Result<MarketplaceInfo> {
     let commit = git_rev_parse(&target)?;
     let manifest = load_marketplace_manifest(&target)?;
     let (_mp_name, plugins) = resolve_marketplace_identity(&manifest, name);
-    let plugins_list: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
+    let plugins_list: Vec<String> = plugins.iter().map(|p| sanitize_name(&p.name)).collect();
     state.marketplaces.insert(
         name.to_string(),
         MarketplaceEntry {
@@ -209,6 +257,7 @@ pub fn list_marketplaces() -> Result<Vec<MarketplaceInfo>> {
 mod tests {
     use super::*;
     use crate::plugin::test_support::isolated_home;
+    use std::path::PathBuf;
 
     fn make_bare_repo_with_manifest(name: &str, manifest: Option<&str>) -> PathBuf {
         let work = tempfile::tempdir().unwrap().into_path();
@@ -285,5 +334,55 @@ mod tests {
         let list = list_marketplaces().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "list-mp");
+    }
+
+    /// B1 regression: when manifest.name differs from the URL tail, the
+    /// directory must be renamed so the registered key matches the on-disk
+    /// path. Otherwise update_marketplace cannot find the working tree.
+    #[test]
+    #[serial_test::serial]
+    fn add_marketplace_canonical_name_differs_from_url_tail() {
+        let _home = isolated_home();
+        // Repo on disk is "url-tail-name", but manifest declares
+        // "canonical-name".
+        let repo = make_bare_repo_with_manifest(
+            "url-tail-name",
+            Some(r#"{"name":"canonical-name","plugins":[{"name":"canonical-name","source":"./"}]}"#),
+        );
+        let url = format!("file://{}", repo.display());
+        let info = add_marketplace(&url).unwrap();
+        assert_eq!(info.name, "canonical-name");
+
+        // Directory must be at marketplaces/canonical-name, not
+        // marketplaces/url-tail-name. update_marketplace exercises this:
+        // it computes the working directory from the registered key.
+        let updated = update_marketplace("canonical-name").unwrap();
+        assert_eq!(updated.name, "canonical-name");
+
+        let mp_root = paths::marketplaces_root().unwrap();
+        assert!(mp_root.join("canonical-name").exists());
+        assert!(!mp_root.join("url-tail-name").exists());
+    }
+
+    /// B2 regression: a manifest whose `name` contains traversal or
+    /// separators must be sanitized; the marketplace must land inside
+    /// `marketplaces/`, not somewhere else on disk.
+    #[test]
+    #[serial_test::serial]
+    fn add_marketplace_sanitizes_traversal_in_manifest_name() {
+        let _home = isolated_home();
+        let repo = make_bare_repo_with_manifest(
+            "evil-source",
+            Some(r#"{"name":"../evil","plugins":[{"name":"p","source":"./"}]}"#),
+        );
+        let url = format!("file://{}", repo.display());
+        let info = add_marketplace(&url).unwrap();
+        // "../evil" -> "---evil" after sanitize_name (3 specials become 3 dashes).
+        assert_eq!(info.name, "---evil");
+
+        let mp_root = paths::marketplaces_root().unwrap();
+        assert!(mp_root.join("---evil").exists());
+        // Crucially: nothing landed in the parent of mp_root.
+        assert!(!mp_root.parent().unwrap().join("evil").exists());
     }
 }
