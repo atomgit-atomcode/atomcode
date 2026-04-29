@@ -2966,11 +2966,14 @@ mod classifier_tests {
 
     #[test]
     fn stream_timeout_is_summarized() {
+        // public_error_message defers to ATOMCODE_SHOW_RAW_API_ERROR (raw by
+        // default), so the user-facing string can't be tested deterministically
+        // without env-var manipulation that races other parallel tests.
+        // public_error_reason covers the routing logic regardless of env state.
         assert_eq!(
             public_error_reason("Stream timeout: no event for 300s"),
             "模型响应超时"
         );
-        assert!(public_error_message("Stream timeout: no event for 300s").contains("超时"));
     }
 
     #[test]

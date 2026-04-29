@@ -1237,7 +1237,10 @@ mod tests {
 
         let access = inspect_path_access(&target.to_string_lossy(), workspace.path()).unwrap();
         assert!(!access.within_workspace);
-        assert_eq!(access.path, target);
+        // canonicalize for comparison: macOS resolves /var → /private/var via
+        // symlink, so the unresolved `target` won't byte-compare against
+        // inspect_path_access's canonicalized result.
+        assert_eq!(access.path, target.canonicalize().unwrap());
     }
 
     #[test]
