@@ -411,6 +411,12 @@ pub struct AgentHandle {
     pub event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     /// Shared tool registry for dynamic MCP tool registration.
     pub tool_registry: std::sync::Arc<ToolRegistry>,
+    /// Loaded skills, shared with the agent loop. The TUI uses this
+    /// to populate the slash-command palette with `user_invocable()`
+    /// entries, and to expand the template when a user picks one.
+    /// Same `Arc` the agent loop holds — reload(...) calls there are
+    /// visible here without extra plumbing.
+    pub skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 }
 
 impl AgentLoop {
@@ -615,6 +621,7 @@ impl AgentLoop {
             cmd_tx,
             event_rx,
             tool_registry: shared_tools.clone(),
+            skill_registry: agent.skill_registry.clone(),
         };
 
         (agent, handle)

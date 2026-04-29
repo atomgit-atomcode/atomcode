@@ -471,6 +471,10 @@ pub async fn run(
 
     let custom_commands =
         atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+    // Same Arc the agent loop holds — reload() calls there propagate
+    // here automatically, so the slash menu reflects newly-installed
+    // skills without re-plumbing.
+    let skill_registry = agent_handle.skill_registry.clone();
 
     let ctx = LoopCtx {
         config,
@@ -505,6 +509,7 @@ pub async fn run(
         telemetry,
         worktree_original_dir: None,
         custom_commands,
+        skill_registry,
         caps,
     };
 

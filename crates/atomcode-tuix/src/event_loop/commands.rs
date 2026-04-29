@@ -854,8 +854,17 @@ pub(super) fn execute_slash_command(
             }
         }
         other => {
-            // Before reporting "unknown", check user-defined custom commands.
+            // Before reporting "unknown", check user-defined custom commands,
+            // then user-invocable skills (loaded from .claude/skills,
+            // .atomcode/skills, etc.). Both expand to a prompt and dispatch
+            // as a regular user message.
             if let Some(rendered) = ctx.custom_commands.render(other, arg) {
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::SendMessage(rendered))
+                    .ok();
+                state.on_submit();
+            } else if let Some(rendered) = expand_skill(ctx, other, arg) {
                 ctx.agent
                     .cmd_tx
                     .send(AgentCommand::SendMessage(rendered))
@@ -868,6 +877,18 @@ pub(super) fn execute_slash_command(
         }
     }
     Ok(())
+}
+
+/// Look up a user-invocable skill by name and expand it with the current
+/// session id. Returns the rendered prompt to send as a user message, or
+/// `None` if no matching skill exists.
+fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<String> {
+    let reg = ctx.skill_registry.read().ok()?;
+    let skill = reg.get(name)?;
+    if !skill.user_invocable {
+        return None;
+    }
+    Some(skill.expand(arg, ctx.current_session.id.as_str()))
 }
 
 /// Handle `/worktree` subcommands: create, list, done, cleanup.
