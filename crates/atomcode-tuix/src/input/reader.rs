@@ -386,7 +386,10 @@ fn run(
                     }
                     Event::Paste(p) => InputEvent::Paste(p),
                     Event::Resize(w, h) => InputEvent::Resize(w, h),
-                    Event::Mouse(_) => continue,
+                    Event::Mouse(m) => match mouse_input_event(m) {
+                        Some(ev) => ev,
+                        None => continue,
+                    },
                     Event::FocusGained => {
                         atomcode_core::notify::set_terminal_focus_state(Some(true));
                         continue;
@@ -416,9 +419,10 @@ fn run(
                 crate::tuix_trace!("RD", "resize {}x{}", w, h);
                 InputEvent::Resize(w, h)
             }
-            Event::Mouse(_) => {
-                continue;
-            }
+            Event::Mouse(m) => match mouse_input_event(m) {
+                Some(ev) => ev,
+                None => continue,
+            },
             Event::FocusGained => {
                 atomcode_core::notify::set_terminal_focus_state(Some(true));
                 continue;
@@ -431,6 +435,35 @@ fn run(
         if tx.send(msg).is_err() {
             return;
         }
+    }
+}
+
+fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
+    match m.kind {
+        crossterm::event::MouseEventKind::ScrollUp => {
+            crate::tuix_trace!("RD", "mouse scroll up");
+            Some(InputEvent::MouseScroll(-3))
+        }
+        crossterm::event::MouseEventKind::ScrollDown => {
+            crate::tuix_trace!("RD", "mouse scroll down");
+            Some(InputEvent::MouseScroll(3))
+        }
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            Some(InputEvent::MouseDown {
+                col: m.column,
+                row: m.row,
+            })
+        }
+        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            Some(InputEvent::MouseDrag {
+                col: m.column,
+                row: m.row,
+            })
+        }
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            Some(InputEvent::MouseUp)
+        }
+        _ => None,
     }
 }
 

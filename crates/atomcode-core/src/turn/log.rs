@@ -2,7 +2,15 @@ use crate::conversation::message::Message;
 use crate::tool::{ToolCall, ToolDef};
 use std::path::{Path, PathBuf};
 
-/// Per-round LLM log files live under `<working_dir>/datalog/llm/`.
+/// Per-round LLM log files live under `<datalog_dir>/llm/` where
+/// `<datalog_dir>` is the per-project directory resolved by
+/// `DatalogWriter::resolve_log_dir` (typically
+/// `~/.atomcode/datalog/<project-slug>/`). The caller is responsible for
+/// passing in the resolved dir — see `runner.rs`. This keeps the JSONL dump
+/// in lockstep with the markdown writer's `[datalog].dir` config; the prior
+/// hard-coded `<working_dir>/datalog/llm/` would silently ignore the user's
+/// `dir` override.
+///
 /// One file per LLM round-trip, containing both `request` and `response`
 /// sections. Filename = timestamp. calls.log is a one-line-per-round index.
 ///
@@ -18,12 +26,12 @@ use std::path::{Path, PathBuf};
 /// that bled across sessions).
 
 /// Log the LLM request. Writes a JSON file containing the `request` section
-/// under `<working_dir>/datalog/llm/<timestamp>.json`.
+/// under `<datalog_dir>/llm/<timestamp>.json`.
 ///
 /// Returns the path so the caller can pass it to `log_llm_response` for
 /// in-place merge. Returns `None` if `enabled` is false or the write failed.
 pub fn log_llm_request(
-    working_dir: &Path,
+    datalog_dir: &Path,
     messages: &[Message],
     tool_defs: &[ToolDef],
     model: &str,
@@ -36,7 +44,7 @@ pub fn log_llm_request(
     }
     use std::io::Write;
 
-    let log_dir = working_dir.join("datalog").join("llm");
+    let log_dir = datalog_dir.join("llm");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let ts = timestamp();
@@ -98,7 +106,7 @@ pub fn log_llm_request(
 ///
 /// If `enabled` is false, this function is a no-op.
 pub fn log_llm_response(
-    working_dir: &Path,
+    datalog_dir: &Path,
     pending_request: Option<PathBuf>,
     text: &str,
     tool_calls: &[ToolCall],
@@ -113,7 +121,7 @@ pub fn log_llm_response(
     }
     use std::io::Write;
 
-    let log_dir = working_dir.join("datalog").join("llm");
+    let log_dir = datalog_dir.join("llm");
     let _ = std::fs::create_dir_all(&log_dir);
 
     let path = pending_request;
@@ -263,7 +271,7 @@ mod tests {
             true,
         );
 
-        let log_dir = tmp.path().join("datalog").join("llm");
+        let log_dir = tmp.path().join("llm");
         let json_files: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -308,7 +316,7 @@ mod tests {
             true,
         );
 
-        let log_dir = tmp.path().join("datalog").join("llm");
+        let log_dir = tmp.path().join("llm");
         let orphans: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -366,7 +374,7 @@ mod tests {
         );
 
         let read_merged = |dir: &Path| -> serde_json::Value {
-            let log_dir = dir.join("datalog").join("llm");
+            let log_dir = dir.join("llm");
             let files: Vec<_> = std::fs::read_dir(&log_dir)
                 .unwrap()
                 .filter_map(|e| e.ok().map(|e| e.path()))

@@ -387,23 +387,31 @@ impl SkillRegistry {
             .map(PathBuf::from)
             .or_else(|| system_home.clone());
 
+        // All "loose" skills (i.e. not loaded through a plugin manifest)
+        // share the synthetic `skills:` namespace so they're visually
+        // distinguishable from built-in slash commands in the `/` menu —
+        // e.g. `/skills:brainstorming`. Plugin loaders (future) will pass
+        // their own namespace derived from the plugin manifest, matching
+        // Claude Code's `<plugin>:<skill>` convention (`superpowers:foo`).
+        const LOOSE_NS: Option<&str> = Some("skills");
+
         // Load Claude Code compat paths from system home (always)
         if let Some(ref home) = system_home {
-            self.load_flat_commands(&home.join(".claude").join("commands"), None);
-            self.load_skills_dir(&home.join(".claude").join("skills"), None);
+            self.load_flat_commands(&home.join(".claude").join("commands"), LOOSE_NS);
+            self.load_skills_dir(&home.join(".claude").join("skills"), LOOSE_NS);
         }
 
         // Load atomcode native paths from ATOMCODE_HOME (or system home as fallback)
         if let Some(ref home) = atomcode_home {
-            self.load_flat_commands(&home.join(".atomcode").join("commands"), None);
-            self.load_skills_dir(&home.join(".atomcode").join("skills"), None);
+            self.load_flat_commands(&home.join(".atomcode").join("commands"), LOOSE_NS);
+            self.load_skills_dir(&home.join(".atomcode").join("skills"), LOOSE_NS);
         }
 
         // Project-level skills (always from working dir)
-        self.load_flat_commands(&working_dir.join(".claude").join("commands"), None);
-        self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), None);
-        self.load_skills_dir(&working_dir.join(".claude").join("skills"), None);
-        self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), None);
+        self.load_flat_commands(&working_dir.join(".claude").join("commands"), LOOSE_NS);
+        self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), LOOSE_NS);
+        self.load_skills_dir(&working_dir.join(".claude").join("skills"), LOOSE_NS);
+        self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), LOOSE_NS);
     }
 
     /// Register a pre-built skill directly (used by plugin system).
@@ -626,5 +634,52 @@ mod tests {
     fn test_replace_positional_short_boundary() {
         // $1 should not touch $10
         assert_eq!(replace_positional_short("$10 $1", 1, "Y"), "$10 Y");
+    }
+
+    // --- namespace prefix on disk-loaded skills ---
+
+    #[test]
+    fn test_load_skills_dir_applies_namespace() {
+        // A skill loaded with namespace = Some("skills") must be stored
+        // under the prefixed name `skills:<base>` and lookup by the bare
+        // base name must miss. This pins the loader contract that the
+        // TUI relies on for the visual `/skills:foo` distinction.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("brainstorming");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: \"Test\"\n---\nTemplate body.\n",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        reg.load_skills_dir(tmp.path(), Some("skills"));
+
+        assert!(
+            reg.get("skills:brainstorming").is_some(),
+            "namespaced lookup must succeed"
+        );
+        assert!(
+            reg.get("brainstorming").is_none(),
+            "bare name must not resolve when loaded with a namespace"
+        );
+    }
+
+    #[test]
+    fn test_load_flat_commands_applies_namespace() {
+        // Same contract for flat `.md` commands (legacy layout).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("commit.md"),
+            "---\ndescription: \"Commit\"\n---\nDo a commit.\n",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        reg.load_flat_commands(tmp.path(), Some("skills"));
+
+        assert!(reg.get("skills:commit").is_some());
+        assert!(reg.get("commit").is_none());
     }
 }

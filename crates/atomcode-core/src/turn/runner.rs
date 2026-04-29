@@ -54,6 +54,8 @@ pub struct TurnRunner {
     /// treated as a panic loop (typical of Office binaries, encoding mismatches,
     /// or the model cycling offset/limit on an unreadable file).
     pub file_read_counts: std::collections::HashMap<(String, u64), u32>,
+    /// Hook executor — runs user-configured lifecycle hooks at tool execution boundaries.
+    pub hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
 }
 
 /// Line-granularity of the read-region bucket used in `file_read_counts`.
@@ -211,11 +213,17 @@ impl TurnRunner {
             }
         }
 
-        // Log the request to <working_dir>/datalog/llm/<ts>.json right
-        // before send. `pending_request_log` holds the path so the
-        // response call below can merge into the same file — passed
-        // explicitly to avoid the old process-wide-static approach that
-        // bled across concurrent daemon sessions.
+        // Log the request to <datalog_dir>/llm/<ts>.json right before send.
+        // `pending_request_log` holds the path so the response call below
+        // can merge into the same file — passed explicitly to avoid the old
+        // process-wide-static approach that bled across concurrent daemon
+        // sessions.
+        //
+        // `datalog_dir` is resolved from `[datalog].dir` (default
+        // `~/.atomcode/datalog/<project-slug>/`) — the same root the
+        // markdown writer uses, so request JSON, response JSON, calls.log,
+        // and the markdown summary all live next to each other for any
+        // given project.
         let pending_request_log = {
             let wd = self
                 .context
@@ -223,8 +231,12 @@ impl TurnRunner {
                 .try_read()
                 .map(|g| g.clone())
                 .unwrap_or_default();
-            super::log::log_llm_request(
+            let datalog_dir = crate::turn::datalog::DatalogWriter::resolve_log_dir(
                 &wd,
+                self.config.datalog.dir.as_deref(),
+            );
+            super::log::log_llm_request(
+                &datalog_dir,
                 &messages,
                 &tool_defs,
                 self.provider.model_name(),
@@ -384,10 +396,10 @@ impl TurnRunner {
                                     }
                                     Some(Ok(StreamEvent::Reasoning(text))) => {
                                         got_any_event = true;
-                                        // Accumulate only. Don't push into conversation / emit
-                                        // TextDelta here — default UX is to hide reasoning.
-                                        // If `content` ends up empty, the `Done` arm below
-                                        // promotes `reasoning_buf` to the answer.
+                                        // Emit to UI for verbose mode (Ctrl+O) display.
+                                        // Still accumulate for the fallback case where
+                                        // content ends up empty.
+                                        let _ = event_tx.send(TurnEvent::ReasoningDelta(text.clone()));
                                         reasoning_buf.push_str(&text);
                                     }
                                     Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
@@ -559,7 +571,9 @@ impl TurnRunner {
                         }
         }
 
-        // Log LLM response (text + tool calls) to <working_dir>/datalog/llm/
+        // Log LLM response (text + tool calls) into the same per-project
+        // datalog dir as the request — see comment on the matching
+        // `log_llm_request` call above.
         let response_duration = stream_start.elapsed().as_millis() as u64;
         let wd = self
             .context
@@ -567,8 +581,12 @@ impl TurnRunner {
             .try_read()
             .map(|g| g.clone())
             .unwrap_or_default();
-        super::log::log_llm_response(
+        let datalog_dir = crate::turn::datalog::DatalogWriter::resolve_log_dir(
             &wd,
+            self.config.datalog.dir.as_deref(),
+        );
+        super::log::log_llm_response(
+            &datalog_dir,
             pending_request_log,
             &text_buf,
             &tool_calls_buf,
@@ -936,12 +954,49 @@ impl TurnRunner {
             }
         }
 
+        // --- PreToolUse Hook ---
+        if self.hook_executor.has_hooks() {
+            let hook_ctx = self.build_hook_context(
+                "pre_tool_use",
+                Some(&call.name),
+                Some(&call.arguments),
+                None,
+                None,
+            );
+            let pre_result = self.hook_executor.run_pre_tool_use(&call.name, &hook_ctx).await;
+            match pre_result {
+                crate::hook::PreHookResult::Block { reason } => {
+                    let output = format!("Blocked by hook: {}", reason);
+                    let _ = event_tx.send(TurnEvent::ToolCallResult {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        output: output.clone(),
+                        success: false,
+                        duration: std::time::Duration::ZERO,
+                    });
+                    return ToolResult {
+                        call_id: call.id.clone(),
+                        output,
+                        success: false,
+                    };
+                }
+                crate::hook::PreHookResult::Modify { .. } => {
+                    // Modify support deferred — treat as Allow
+                }
+                crate::hook::PreHookResult::Allow => {}
+            }
+        }
+
         // Snapshot the shared working directory before executing. Tools like
         // `change_dir` and `bash` (when the command starts with `cd`) mutate
         // `ctx.working_dir` in place; we compare before/after to emit a
         // `WorkingDirChanged` event so the TUI footer can track the cwd
         // without polling the `Arc<RwLock<PathBuf>>` every frame.
         let wd_before = self.context.working_dir.read().await.clone();
+
+        // Set up event sender for real-time tool output streaming
+        self.context.event_tx = Some(std::sync::Arc::new(event_tx.clone()));
+        self.context.current_call_id = Some(call.id.clone());
 
         // Execute the tool. Race against `cancel` so Ctrl+C aborts a
         // long-running tool future instead of waiting for it to finish.
@@ -953,6 +1008,10 @@ impl TurnRunner {
         let result = tokio::select! {
             r = tool.execute(&call.arguments, &self.context) => r,
             _ = cancel.cancelled() => {
+                // Clean up event sender
+                self.context.event_tx = None;
+                self.context.current_call_id = None;
+
                 let duration = start.elapsed();
                 let output = "[Cancelled by user]".to_string();
                 let _ = event_tx.send(TurnEvent::ToolCallResult {
@@ -969,6 +1028,11 @@ impl TurnRunner {
                 };
             }
         };
+
+        // Clean up event sender after tool execution
+        self.context.event_tx = None;
+        self.context.current_call_id = None;
+
         let duration = start.elapsed();
 
         // If the tool mutated the shared working directory, surface it as
@@ -992,6 +1056,18 @@ impl TurnRunner {
             },
         };
 
+        // --- PostToolUse Hook ---
+        if self.hook_executor.has_hooks() {
+            let hook_ctx = self.build_hook_context(
+                "post_tool_use",
+                Some(&call.name),
+                Some(&call.arguments),
+                Some(&tool_result.output),
+                Some(tool_result.success),
+            );
+            self.hook_executor.run_post_tool_use(&call.name, &hook_ctx).await;
+        }
+
         let _ = event_tx.send(TurnEvent::ToolCallResult {
             call_id: call.id.clone(),
             name: call.name.clone(),
@@ -1001,6 +1077,31 @@ impl TurnRunner {
         });
 
         tool_result
+    }
+
+    fn build_hook_context(
+        &self,
+        event: &str,
+        tool_name: Option<&str>,
+        tool_args: Option<&str>,
+        tool_result: Option<&str>,
+        tool_success: Option<bool>,
+    ) -> crate::hook::HookContext {
+        let wd = self
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.display().to_string())
+            .unwrap_or_default();
+        crate::hook::HookContext {
+            event: event.into(),
+            tool_name: tool_name.map(String::from),
+            tool_args: tool_args.and_then(|a| serde_json::from_str(a).ok()),
+            tool_result: tool_result.map(String::from),
+            tool_success,
+            session_id: String::new(),
+            working_dir: wd,
+        }
     }
 
     /// Detect tool-call loops and return a recovery message when one should be
@@ -1041,6 +1142,9 @@ impl TurnRunner {
                         return Some(format!(
                             "BLOCKED: read_file '{}' hit its {}-call cap for the SAME region of this file. \
                              You keep requesting the same slice and getting the same output. \
+                             First, check that the path itself is right — if you're using a relative \
+                             or basename-only path, the user may have mentioned a specific absolute \
+                             path (e.g. ~/some/dir/file) that you should be using instead. \
                              If you need more of this file, pass a different offset to jump elsewhere. \
                              If you're stuck because the file is unreadable (Office binary, PDF, \
                              encoding mismatch), switch to a bash converter \

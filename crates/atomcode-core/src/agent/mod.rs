@@ -3,6 +3,7 @@
 //! via channels. Decoupled from any TUI concerns.
 
 pub mod background;
+pub mod git_auto_commit;
 pub mod git_checkpoint;
 pub mod sub_agent;
 pub mod subtask_driver;
@@ -64,6 +65,9 @@ pub enum AgentCommand {
     /// forward-compat with an eventual LLM-backed summarize-with-instruction
     /// path; currently unused — this is the mechanical path only.
     Compact { prompt: Option<String> },
+    Remember { content: String, global: bool },
+    Forget { keyword: String },
+    ShowMemory,
     /// Run a one-shot task in an isolated background context (read-only-ish
     /// tool subset, independent conversation, capped turns + timeout).
     /// Result is returned via `AgentEvent::BackgroundComplete`.
@@ -113,6 +117,10 @@ impl TurnStopReason {
 pub enum AgentEvent {
     /// LLM text delta (streaming).
     TextDelta(String),
+    /// LLM reasoning/thinking content (e.g., DeepSeek-R1, MiniMax-M2.7, o1-series).
+    /// Emitted when the model produces thinking content separately from the final response.
+    /// UI can optionally display this in verbose mode (Ctrl+O).
+    ReasoningDelta(String),
     /// LLM has started emitting a tool call — only the name is known so far,
     /// arguments are still streaming. UI uses this to display the tool name
     /// immediately instead of waiting for the full args.
@@ -124,6 +132,12 @@ pub enum AgentEvent {
         id: String,
         name: String,
         arguments: String,
+    },
+    /// Real-time output chunk from a running tool (e.g., bash command).
+    /// Sent during tool execution before ToolCallResult.
+    ToolOutputChunk {
+        call_id: String,
+        chunk: String,
     },
     /// A tool call completed with a result.
     ToolCallResult {
@@ -380,6 +394,9 @@ pub struct AgentLoop {
     // Skill registry — provides descriptions for system prompt and powers use_skill tool
     skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 
+    /// Hook executor for lifecycle events.
+    hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
+
     // Code graph background indexer channel
     reindex_tx: Option<mpsc::UnboundedSender<PathBuf>>,
 
@@ -397,6 +414,12 @@ pub struct AgentHandle {
     pub event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     /// Shared tool registry for dynamic MCP tool registration.
     pub tool_registry: std::sync::Arc<ToolRegistry>,
+    /// Loaded skills, shared with the agent loop. The TUI uses this
+    /// to populate the slash-command palette with `user_invocable()`
+    /// entries, and to expand the template when a user picks one.
+    /// Same `Arc` the agent loop holds — reload(...) calls there are
+    /// visible here without extra plumbing.
+    pub skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 }
 
 impl AgentLoop {
@@ -449,27 +472,6 @@ impl AgentLoop {
             tool_registry.register_sync(Box::new(UseSkillTool {
                 registry: skill_registry.clone(),
             }));
-        }
-
-        // LSP integration: create manager and register diagnostics tool.
-        let lsp_manager = {
-            let mut registry = if config.lsp.auto_detect {
-                crate::lsp::registry::LspServerRegistry::with_defaults()
-            } else {
-                crate::lsp::registry::LspServerRegistry::empty()
-            };
-            registry.merge_user_config(config.lsp.servers.clone());
-            let mgr = crate::lsp::manager::LspManager::new(
-                working_dir.clone(),
-                registry,
-                config.lsp.enabled,
-                config.lsp.diagnostics_settle_delay_ms,
-            );
-            std::sync::Arc::new(mgr)
-        };
-        tool_context.lsp = Some(lsp_manager.clone());
-        if internal_enabled("diagnostics") {
-            tool_registry.register_sync(Box::new(crate::tool::diagnostics::DiagnosticsTool));
         }
 
         // Graph query tools: not exposed to model (adds 5 tool definitions that
@@ -543,9 +545,15 @@ impl AgentLoop {
                     reasoning_history: None,
                     thinking_enabled: None,
                     thinking_budget: None,
+                    skip_tls_verify: false,
                     ephemeral: true,
                 }),
             };
+
+        let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
+        let hook_executor = std::sync::Arc::new(
+            crate::hook::executor::HookExecutor::new(hooks)
+        );
 
         let turn_runner = TurnRunner {
             provider,
@@ -557,6 +565,7 @@ impl AgentLoop {
             recently_edited_files: Vec::new(),
             recent_calls: Vec::new(),
             file_read_counts: std::collections::HashMap::new(),
+            hook_executor: hook_executor.clone(),
         };
 
         // Capture session-start env snapshot (git status, branch, HEAD).
@@ -604,6 +613,7 @@ impl AgentLoop {
             plan_text: None,
             session_files: std::collections::HashMap::new(),
             skill_registry,
+            hook_executor,
             reindex_tx: None,
             datalog,
             cmd_rx,
@@ -614,6 +624,7 @@ impl AgentLoop {
             cmd_tx,
             event_rx,
             tool_registry: shared_tools.clone(),
+            skill_registry: agent.skill_registry.clone(),
         };
 
         (agent, handle)
@@ -654,6 +665,22 @@ impl AgentLoop {
             self.reindex_tx = Some(reindex_tx);
         }
 
+        // --- SessionStart Hook ---
+        if self.hook_executor.has_hooks() {
+            let wd = self.turn_runner.context.working_dir
+                .try_read()
+                .map(|g| g.display().to_string())
+                .unwrap_or_default();
+            let ctx = crate::hook::HookContext {
+                event: "session_start".into(),
+                tool_name: None, tool_args: None,
+                tool_result: None, tool_success: None,
+                session_id: String::new(),
+                working_dir: wd,
+            };
+            self.hook_executor.run_session_event(crate::hook::HookEvent::SessionStart, &ctx).await;
+        }
+
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 AgentCommand::SendMessage { text, images } => {
@@ -686,6 +713,16 @@ impl AgentLoop {
                         .get(&old_provider_name)
                         .map(|p| p.provider_type.clone());
                     self.config = new_config;
+                    // Rebuild hook executor from JSON config files.
+                    let wd = self.turn_runner.context.working_dir
+                        .try_read()
+                        .map(|g| g.clone())
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
+                    self.hook_executor = std::sync::Arc::new(
+                        crate::hook::executor::HookExecutor::new(hooks)
+                    );
+                    self.turn_runner.hook_executor = self.hook_executor.clone();
                     let new_provider_name = self.config.default_provider.clone();
                     let new_type = self
                         .config
@@ -778,6 +815,84 @@ impl AgentLoop {
                 AgentCommand::Compact { prompt } => {
                     self.run_compact(prompt).await;
                 }
+                AgentCommand::Remember { content, global } => {
+                    use crate::config::memory::MemoryStore;
+                    let store = if global {
+                        MemoryStore::global()
+                    } else {
+                        let wd = self.turn_runner.context.working_dir.try_read()
+                            .map(|g| g.clone()).unwrap_or_default();
+                        MemoryStore::project(&wd)
+                    };
+                    match store.append(&content) {
+                        Ok(_) => {
+                            let scope = if global { "global" } else { "project" };
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                format!("(remembered in {} memory: {})\n", scope, content)
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(
+                                format!("(failed to save memory: {})\n", e)
+                            ));
+                        }
+                    }
+                }
+                AgentCommand::Forget { keyword } => {
+                    use crate::config::memory::MemoryStore;
+                    let wd = self.turn_runner.context.working_dir.try_read()
+                        .map(|g| g.clone()).unwrap_or_default();
+                    let global = MemoryStore::global();
+                    let project = MemoryStore::project(&wd);
+                    let g_matches = global.find_matching(&keyword);
+                    let p_matches = project.find_matching(&keyword);
+                    if g_matches.is_empty() && p_matches.is_empty() {
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            format!("(no memory entries matching '{}')\n", keyword)
+                        ));
+                    } else {
+                        let mut msg = String::new();
+                        for entry in &g_matches {
+                            msg.push_str(&format!("  [global] - {}\n", entry));
+                        }
+                        for entry in &p_matches {
+                            msg.push_str(&format!("  [project] - {}\n", entry));
+                        }
+                        let g_result = global.remove_matching(&keyword);
+                        let p_result = project.remove_matching(&keyword);
+                        if g_result.is_err() || p_result.is_err() {
+                            msg.push_str("(warning: some entries could not be removed from disk)\n");
+                        }
+                        let total = g_matches.len() + p_matches.len();
+                        msg.push_str(&format!("(removed {} matching entr{})\n", total, if total == 1 { "y" } else { "ies" }));
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
+                    }
+                }
+                AgentCommand::ShowMemory => {
+                    use crate::config::memory::MemoryStore;
+                    let wd = self.turn_runner.context.working_dir.try_read()
+                        .map(|g| g.clone()).unwrap_or_default();
+                    let global = MemoryStore::global();
+                    let project = MemoryStore::project(&wd);
+                    let g_entries = global.load();
+                    let p_entries = project.load();
+                    if g_entries.is_empty() && p_entries.is_empty() {
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(
+                            "(no memories saved yet — use /remember <fact> to add one)\n".to_string()
+                        ));
+                    } else {
+                        let mut msg = String::new();
+                        if !g_entries.is_empty() {
+                            msg.push_str(&format!("  [Global] ({})\n", global.path().display()));
+                            for e in &g_entries { msg.push_str(&format!("    - {}\n", e)); }
+                        }
+                        if !p_entries.is_empty() {
+                            msg.push_str(&format!("  [Project] ({})\n", project.path().display()));
+                            for e in &p_entries { msg.push_str(&format!("    - {}\n", e)); }
+                        }
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
+                    }
+                }
                 AgentCommand::Background { task } => {
                     // AcqRel: pair with the spawned task's Release store on
                     // completion so the next dispatcher sees the cleared flag.
@@ -789,6 +904,7 @@ impl AgentLoop {
                         let provider = self.turn_runner.provider.clone();
                         let tools = self.turn_runner.tools.clone();
                         let context = self.turn_runner.context.clone();
+                        let context_for_commit = context.clone();
                         let config = self.config.clone();
                         let ctx = self.ctx.clone();
                         let event_tx = self.event_tx.clone();
@@ -804,6 +920,37 @@ impl AgentLoop {
                                 event_tx.clone(),
                             )
                             .await;
+                            if let AgentEvent::BackgroundComplete {
+                                files_edited,
+                                success: true,
+                                ..
+                            } = &result
+                            {
+                                if !files_edited.is_empty() {
+                                    let wd = context_for_commit
+                                        .working_dir
+                                        .try_read()
+                                        .map(|g| g.clone())
+                                        .unwrap_or_default();
+                                    match git_auto_commit::auto_commit_edited_files(&wd, files_edited)
+                                    {
+                                        git_auto_commit::AutoCommitOutcome::Committed {
+                                            sha,
+                                            message,
+                                        } => {
+                                            let _ = event_tx.send(AgentEvent::TextDelta(format!(
+                                                "\n[auto-commit {sha}] {message}\n"
+                                            )));
+                                        }
+                                        git_auto_commit::AutoCommitOutcome::Failed { reason } => {
+                                            let _ = event_tx.send(AgentEvent::TextDelta(format!(
+                                                "\n[auto-commit skipped] {reason}\n"
+                                            )));
+                                        }
+                                        git_auto_commit::AutoCommitOutcome::Skipped { .. } => {}
+                                    }
+                                }
+                            }
                             let _ = event_tx.send(result);
                             flag.store(false, Ordering::Release);
                         });
@@ -816,7 +963,24 @@ impl AgentLoop {
                         .build_messages(&self.conversation, &system_prompt, "");
                     self.emit_rich_context_stats(&self.conversation, &msgs).await;
                 }
-                AgentCommand::Shutdown => break,
+                AgentCommand::Shutdown => {
+                    // --- SessionEnd Hook ---
+                    if self.hook_executor.has_hooks() {
+                        let wd = self.turn_runner.context.working_dir
+                            .try_read()
+                            .map(|g| g.display().to_string())
+                            .unwrap_or_default();
+                        let ctx = crate::hook::HookContext {
+                            event: "session_end".into(),
+                            tool_name: None, tool_args: None,
+                            tool_result: None, tool_success: None,
+                            session_id: String::new(),
+                            working_dir: wd,
+                        };
+                        self.hook_executor.run_session_event(crate::hook::HookEvent::SessionEnd, &ctx).await;
+                    }
+                    break;
+                }
             }
         }
     }
@@ -1153,6 +1317,7 @@ impl AgentLoop {
                 let file_read_counts = &mut self.discipline_state.file_read_counts;
                 let consecutive_reads = &mut self.discipline_state.consecutive_reads;
                 let targeted_read_count = &mut self.discipline_state.targeted_read_count;
+                let last_bash_cmd = &mut self.discipline_state.last_bash_cmd;
                 let session_files = &mut self.session_files;
                 let reindex_tx = &self.reindex_tx;
 
@@ -1207,6 +1372,9 @@ impl AgentLoop {
                                     datalog_text_accum.push_str(&text);
                                     let _ = event_tx.send(AgentEvent::TextDelta(text));
                                 }
+                                TurnEvent::ReasoningDelta(text) => {
+                                    let _ = event_tx.send(AgentEvent::ReasoningDelta(text));
+                                }
                                 TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
                                     // Forward tool name immediately for UI spinner
                                     let _ = event_tx.send(AgentEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
@@ -1220,6 +1388,16 @@ impl AgentLoop {
                                     *current_tool_name = name.clone();
                                     *phase = AgentPhase::CallingTool(name.clone());
                                     let _ = event_tx.send(AgentEvent::PhaseChange(phase.clone()));
+
+                                    if name == "bash" {
+                                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
+                                            *last_bash_cmd = args
+                                                .get("command")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                        }
+                                    }
 
                                     // Track files for Working Set + read counts
                                     if matches!(name.as_str(), "read_file" | "edit_file" | "create_file" | "search_replace" | "glob" | "grep") {
@@ -1255,6 +1433,10 @@ impl AgentLoop {
 
                                     let _ = event_tx.send(AgentEvent::ToolCallStarted { id: id.clone(), name: name.clone(), arguments: arguments.clone() });
                                 }
+                                TurnEvent::ToolOutputChunk { call_id, chunk } => {
+                                    // Forward real-time tool output to UI
+                                    let _ = event_tx.send(AgentEvent::ToolOutputChunk { call_id, chunk });
+                                }
                                 TurnEvent::ToolCallResult { call_id, name, output, success, duration } => {
                                     // Track files for discipline
                                     if let Some(pos) = output.find("Edited ") {
@@ -1264,8 +1446,8 @@ impl AgentLoop {
                                         if !fp.is_empty() {
                                             *active_file = Some(PathBuf::from(fp));
                                         }
-                                        if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
-                                            let file = short_path(&rest[..end]);
+                                        if !fp.is_empty() {
+                                            let file = fp.to_string();
                                             if !files_edited_this_turn.contains(&file) {
                                                 files_edited_this_turn.push(file);
                                             }
@@ -1281,12 +1463,20 @@ impl AgentLoop {
                                         if !fp.is_empty() {
                                             *active_file = Some(PathBuf::from(fp));
                                         }
-                                        if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
-                                            let file = short_path(&rest[..end]);
+                                        if !fp.is_empty() {
+                                            let file = fp.to_string();
                                             if !files_edited_this_turn.contains(&file) {
                                                 files_edited_this_turn.push(file);
                                             }
                                         }
+                                    }
+                                    if success {
+                                        track_tool_modified_files(
+                                            &name,
+                                            last_bash_cmd,
+                                            &output,
+                                            files_edited_this_turn,
+                                        );
                                     }
                                     if matches!(name.as_str(), "read_file" | "list_directory" | "glob" | "grep") {
                                         *consecutive_reads += 1;
@@ -1780,13 +1970,8 @@ impl AgentLoop {
     // forward_turn_event → tool_dispatch.rs
     // post_process_tool_results → tool_dispatch.rs
 
-    /// Auto-summarize old turns when context exceeds 70% of budget.
-    /// Makes a lightweight LLM call to compress old turn content into a
-    /// short summary, so the model retains awareness of prior work without
-    /// the full message cost.
-    /// Compress old turns when context > 70% budget.
-    /// Pauses the task, calls LLM to summarize, stores in cold zone.
-    /// Falls back to mechanical compression if LLM fails.
+    /// Compress old turns when context > threshold.
+    /// Uses LLM to summarize, falls back to mechanical compression.
     async fn maybe_compress_history(&mut self, system_prompt: &str) {
         let sys_tokens = system_prompt.len() / 4 + 4;
         if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
@@ -1798,56 +1983,12 @@ impl AgentLoop {
             None => return,
         };
 
-        // Try LLM compression
-        let summarize_prompt = format!(
-            "Summarize this conversation history in 3-5 concise sentences. \
-             Keep: file names, what was changed, key decisions, errors encountered. \
-             Drop: exact code content, tool arguments, line numbers.\n\n{}",
-            content
-        );
+        let summarize_prompt = Self::default_summarize_prompt(&content);
 
-        let mut mini_conv = crate::conversation::Conversation::new();
-        mini_conv.add_user_message(&summarize_prompt);
-        let msgs = mini_conv
-            .to_provider_messages("You are a conversation summarizer. Output ONLY the summary.");
+        let summary = self.run_llm_summary(&summarize_prompt).await;
+        let final_summary = if summary.trim().is_empty() { content } else { summary };
 
-        let mut summary = String::new();
-        if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
-            use futures::StreamExt;
-            // 30s first token + 30s between tokens. OpenRouter can be slow.
-            let first_timeout = std::time::Duration::from_secs(30);
-            let stream_timeout = std::time::Duration::from_secs(30);
-            let mut got_token = false;
-            loop {
-                let timeout = if got_token {
-                    stream_timeout
-                } else {
-                    first_timeout
-                };
-                match tokio::time::timeout(timeout, stream.next()).await {
-                    Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
-                        got_token = true;
-                        // Strip model thinking tags (compression doesn't go through TurnRunner)
-                        let clean = text
-                            .replace("<think>", "")
-                            .replace("</think>", "")
-                            .replace("<|im_start|>", "")
-                            .replace("<|im_end|>", "");
-                        summary.push_str(&clean);
-                    }
-                    Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
-                    Ok(Some(Ok(_))) => continue,
-                    _ => break,
-                }
-            }
-        }
-
-        // Fallback: if LLM failed, use mechanical compression
-        if summary.trim().is_empty() {
-            summary = content; // mechanical one-liners from build_compression_content
-        }
-
-        self.conversation.apply_compression(n_turns, summary);
+        self.conversation.apply_compression(n_turns, final_summary);
         self.inject_post_compress_state();
     }
 
@@ -1932,12 +2073,6 @@ impl AgentLoop {
     /// projection was tried first but too many render-pipeline branches
     /// made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
-        if prompt.is_some() {
-            let _ = self.event_tx.send(AgentEvent::TextDelta(
-                "(note: custom compaction prompt accepted but not yet implemented — running mechanical compact)\n"
-                    .to_string(),
-            ));
-        }
         let system_prompt = self.build_system_prompt();
         let before_msg_count = self.conversation.messages.len();
         let before_tokens: usize = self
@@ -1947,17 +2082,37 @@ impl AgentLoop {
             .iter()
             .map(|m| m.estimate_tokens())
             .sum();
-        let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
+        let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 "(nothing to compact — conversation is short)\n".to_string(),
             ));
             return;
         };
 
-        // Rollback snapshot. Only the three fields `apply_compression` +
-        // `inject_post_compress_state` mutate need to survive — the
-        // stream / tool_call buffers are ephemeral and always None
-        // between turns, so we skip them.
+        let _ = self.event_tx.send(AgentEvent::TextDelta(
+            "(compacting with LLM summary...)\n".to_string(),
+        ));
+
+        // Try LLM summarization (with optional custom prompt)
+        let summarize_prompt = if let Some(ref custom) = prompt {
+            format!(
+                "Summarize this conversation history, focusing on: {}.\n\
+                 Keep: file names, what was changed, key decisions, errors encountered.\n\
+                 Drop: exact code content, tool arguments, line numbers.\n\n{}",
+                custom, mechanical_content
+            )
+        } else {
+            Self::default_summarize_prompt(&mechanical_content)
+        };
+
+        let summary = self.run_llm_summary(&summarize_prompt).await;
+        let content = if summary.trim().is_empty() {
+            mechanical_content
+        } else {
+            summary
+        };
+
+        // Rollback snapshot
         let msgs_snapshot = self.conversation.messages.clone();
         let cold_snapshot = self.conversation.cold_summaries.clone();
         let turns_snapshot = self.conversation.turn_tracker.clone();
@@ -1982,9 +2137,6 @@ impl AgentLoop {
                 fmt_k_tokens(before_tokens),
                 fmt_k_tokens(after_tokens),
             )));
-            // Still refresh stats so `/context` reports the current
-            // (unchanged, now-correct) state and the user doesn't think
-            // the abort left them with stale numbers.
             let (msgs, _) =
                 self.ctx
                     .build_messages(&self.conversation, &system_prompt, "");
@@ -1992,9 +2144,6 @@ impl AgentLoop {
             return;
         }
 
-        // Report the actually-removed count measured from before/after,
-        // not from n_msgs, so the UI count stays accurate if
-        // apply_compression's clamping or retention policy changes.
         let removed = before_msg_count.saturating_sub(self.conversation.messages.len());
         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
             "(compacted — dropped {} message{}, {} → {} tokens)\n",
@@ -2004,13 +2153,53 @@ impl AgentLoop {
             fmt_k_tokens(after_tokens),
         )));
 
-        // Refresh the cached ContextStats so `/context` reflects the new
-        // post-compaction shape. Without this, TUI still shows the
-        // pre-compact numbers until the next user turn fires build_messages.
         let (msgs, _) = self
             .ctx
             .build_messages(&self.conversation, &system_prompt, "");
         self.emit_rich_context_stats(&self.conversation, &msgs).await;
+    }
+
+    fn default_summarize_prompt(content: &str) -> String {
+        format!(
+            "Summarize this conversation history in 3-5 concise sentences. \
+             Keep: file names, what was changed, key decisions, errors encountered. \
+             Drop: exact code content, tool arguments, line numbers.\n\n{}",
+            content
+        )
+    }
+
+    /// Run a lightweight LLM call to summarize content. Returns empty string on failure.
+    async fn run_llm_summary(&self, prompt: &str) -> String {
+        let mut mini_conv = crate::conversation::Conversation::new();
+        mini_conv.add_user_message(prompt);
+        let msgs = mini_conv
+            .to_provider_messages("You are a conversation summarizer. Output ONLY the summary.");
+
+        let mut summary = String::new();
+        if let Ok(mut stream) = self.turn_runner.provider.chat_stream(&msgs, None) {
+            use futures::StreamExt;
+            let first_timeout = std::time::Duration::from_secs(30);
+            let stream_timeout = std::time::Duration::from_secs(30);
+            let mut got_token = false;
+            loop {
+                let timeout = if got_token { stream_timeout } else { first_timeout };
+                match tokio::time::timeout(timeout, stream.next()).await {
+                    Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
+                        got_token = true;
+                        let clean = text
+                            .replace("<think>", "")
+                            .replace("</think>", "")
+                            .replace("<|im_start|>", "")
+                            .replace("<|im_end|>", "");
+                        summary.push_str(&clean);
+                    }
+                    Ok(Some(Ok(crate::stream::StreamEvent::Done { .. }))) => break,
+                    Ok(Some(Ok(_))) => continue,
+                    _ => break,
+                }
+            }
+        }
+        summary
     }
 
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
@@ -2031,6 +2220,36 @@ impl AgentLoop {
             self.conversation.cancel_current_turn();
         } else {
             self.conversation.turn_tracker.complete_current();
+        }
+
+        // Auto-commit edited files if enabled
+        if self.config.auto_commit
+            && !matches!(stop_reason, TurnStopReason::Error)
+            && !self.files_edited_this_turn.is_empty()
+        {
+            let wd = self
+                .turn_runner
+                .context
+                .working_dir
+                .try_read()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            match git_auto_commit::auto_commit_edited_files(&wd, &self.files_edited_this_turn) {
+                git_auto_commit::AutoCommitOutcome::Committed { sha, message } => {
+                    let notice = format!("\n[auto-commit {sha}] {message}\n");
+                    self.datalog.log_model_text(&notice);
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(notice));
+                }
+                git_auto_commit::AutoCommitOutcome::Failed { reason } => {
+                    let notice = format!("\n[auto-commit skipped] {reason}\n");
+                    self.datalog.log_error(&notice);
+                    let _ = self.event_tx.send(AgentEvent::TextDelta(notice));
+                }
+                git_auto_commit::AutoCommitOutcome::Skipped { reason } => {
+                    self.datalog
+                        .log_model_text(&format!("[auto-commit skipped] {reason}"));
+                }
+            }
         }
 
         // Flush datalog with final stats
@@ -2202,12 +2421,8 @@ impl AgentLoop {
             }
             // Track edited files
             if r.success {
-                let short_name = std::path::Path::new(&r.file_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if !self.files_edited_this_turn.contains(&short_name) {
-                    self.files_edited_this_turn.push(short_name);
+                if !self.files_edited_this_turn.contains(&r.file_path) {
+                    self.files_edited_this_turn.push(r.file_path.clone());
                 }
             }
         }
@@ -2359,13 +2574,143 @@ fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBu
     None
 }
 
-fn short_path(path: &str) -> String {
-    let parts: Vec<&str> = path.rsplitn(3, '/').collect();
-    match parts.len() {
-        0 | 1 => path.to_string(),
-        2 => format!("{}/{}", parts[1], parts[0]),
-        _ => format!(".../{}/{}", parts[1], parts[0]),
+fn track_tool_modified_files(
+    tool_name: &str,
+    bash_command: &str,
+    output: &str,
+    edited_files: &mut Vec<String>,
+) {
+    if tool_name == "bash" {
+        track_bash_modified_files(bash_command, output, edited_files);
+    } else if tool_name == "search_replace" {
+        track_search_replace_files(output, edited_files);
     }
+}
+
+fn track_bash_modified_files(command: &str, output: &str, edited_files: &mut Vec<String>) {
+    let Some(cwd) = bash_output_cwd(output) else {
+        return;
+    };
+
+    for file in rm_file_targets(command, &cwd) {
+        push_edited_file(edited_files, file);
+    }
+    for file in bash_workspace_modified_files(output, &cwd) {
+        push_edited_file(edited_files, file);
+    }
+}
+
+fn bash_output_cwd(output: &str) -> Option<PathBuf> {
+    output.lines().rev().find_map(|line| {
+        line.strip_prefix("[cwd: ")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .map(PathBuf::from)
+    })
+}
+
+fn bash_workspace_modified_files(output: &str, cwd: &std::path::Path) -> Vec<String> {
+    let Some(line) = output
+        .lines()
+        .find(|line| line.starts_with("[workspace modified via bash: "))
+    else {
+        return Vec::new();
+    };
+    let Some(rest) = line.strip_prefix("[workspace modified via bash: ") else {
+        return Vec::new();
+    };
+    let changed = rest.split(". If ").next().unwrap_or(rest);
+    changed
+        .split(',')
+        .map(str::trim)
+        .filter(|file| !file.is_empty() && !file.starts_with('+'))
+        .map(|file| {
+            let path = std::path::Path::new(file);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            }
+            .to_string_lossy()
+            .to_string()
+        })
+        .collect()
+}
+
+fn track_search_replace_files(output: &str, edited_files: &mut Vec<String>) {
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        let Some((path, _summary)) = trimmed.split_once(" (") else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        push_edited_file(edited_files, path.to_string());
+    }
+}
+
+fn rm_file_targets(command: &str, cwd: &std::path::Path) -> Vec<String> {
+    let tokens = shell_words(command);
+    let mut targets = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] != "rm" {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        let mut rm_targets = Vec::new();
+        let mut recursive = false;
+        while i < tokens.len() {
+            let token = &tokens[i];
+            if matches!(token.as_str(), "&&" | "||" | ";" | "|") {
+                break;
+            }
+            if token.starts_with('-') {
+                if token.contains('r') || token.contains('R') {
+                    recursive = true;
+                }
+                i += 1;
+                continue;
+            }
+
+            let path = std::path::Path::new(token);
+            let full_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            rm_targets.push(full_path.to_string_lossy().to_string());
+            i += 1;
+        }
+
+        if !recursive {
+            targets.extend(rm_targets);
+        }
+    }
+    targets
+}
+
+fn push_edited_file(edited_files: &mut Vec<String>, file: String) {
+    if !edited_files.contains(&file) {
+        edited_files.push(file);
+    }
+}
+
+fn shell_words(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
+        .map(|token| {
+            token.trim_matches(|c| {
+                matches!(
+                    c,
+                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ','
+                )
+            })
+        })
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect()
 }
 
 /// Whether a `ReloadConfig` should wipe the existing conversation history.
@@ -2794,5 +3139,69 @@ mod fmt_k_tokens_tests {
         assert_eq!(fmt_k_tokens(3700), "3.7K");
         assert_eq!(fmt_k_tokens(9800), "9.8K");
         assert_eq!(fmt_k_tokens(64000), "64.0K");
+    }
+}
+
+#[cfg(test)]
+mod bash_deleted_file_tracking_tests {
+    use super::{
+        bash_workspace_modified_files, rm_file_targets, track_search_replace_files,
+        track_tool_modified_files,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn tracks_simple_rm_target_from_cwd() {
+        let targets = rm_file_targets("rm numbers.txt", Path::new("/tmp/project"));
+        assert_eq!(targets, vec!["/tmp/project/numbers.txt"]);
+    }
+
+    #[test]
+    fn skips_recursive_rm_targets() {
+        let targets = rm_file_targets("rm -rf dist", Path::new("/tmp/project"));
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn tracks_successful_bash_rm_from_output_cwd() {
+        let mut edited = Vec::new();
+        track_tool_modified_files(
+            "bash",
+            "rm numbers.txt",
+            "[elapsed: 0.0s, exit: 0]\n[cwd: /tmp/project]",
+            &mut edited,
+        );
+        assert_eq!(edited, vec!["/tmp/project/numbers.txt"]);
+    }
+
+    #[test]
+    fn tracks_workspace_modified_bash_output() {
+        let files = bash_workspace_modified_files(
+            "[workspace modified via bash: src/a.rs, /tmp/project/b.txt. If you meant to edit source, use edit_file next time]\n[cwd: /tmp/project]",
+            Path::new("/tmp/project"),
+        );
+        assert_eq!(
+            files,
+            vec![
+                "/tmp/project/src/a.rs".to_string(),
+                "/tmp/project/b.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn tracks_search_replace_output_files() {
+        let mut edited = Vec::new();
+        track_search_replace_files(
+            "Replaced 'old' -> 'new': 2 replacements across 2 files.\n  /tmp/project/a.rs (1 replacements)\n  /tmp/project/b.rs (1 replacements)",
+            &mut edited,
+        );
+        assert_eq!(
+            edited,
+            vec![
+                "/tmp/project/a.rs".to_string(),
+                "/tmp/project/b.rs".to_string()
+            ]
+        );
     }
 }

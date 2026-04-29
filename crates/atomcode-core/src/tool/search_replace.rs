@@ -183,6 +183,8 @@ impl Tool for SearchReplaceTool {
                         success: false,
                     });
                 }
+                // Notify LSP that file changed (if LSP is enabled).
+                ctx.notify_lsp_file_changed(file_path, &new_content).await;
                 total_replacements += count;
                 files_modified.push(format!(
                     "  {} ({} replacements)",

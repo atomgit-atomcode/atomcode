@@ -177,6 +177,17 @@ pub struct LoopCtx {
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
     pub worktree_original_dir: Option<PathBuf>,
+    /// User-defined custom commands loaded from `~/.atomcode/commands/` and
+    /// `<project>/.atomcode/commands/`. Queried by the slash-command
+    /// dispatcher as a fallback when the entered name doesn't match a
+    /// built-in command.
+    pub custom_commands: atomcode_core::commands::CustomCommandRegistry,
+    /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). Same `Arc`
+    /// the agent loop holds, so `reload(...)` there is visible here
+    /// without extra plumbing. Used by the slash-command palette to
+    /// surface user-invocable skills, and by the dispatcher to expand
+    /// `/skill_name [args]` into a SendMessage.
+    pub skill_registry: std::sync::Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
     /// Snapshot of the terminal's rendering capabilities. Probed once at
     /// startup in `lib.rs`; threaded into `App::new` so `UiState` knows
     /// whether to use Unicode or ASCII fallbacks for the spinner glyph
@@ -497,6 +508,7 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::NoOp => BufferResult::NoOp,
+            Action::ToggleToolOutput => BufferResult::NoOp,
         }
     }
 }
@@ -577,25 +589,29 @@ mod buffer_tests {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
+    use atomcode_core::commands::CustomCommandRegistry;
 
     #[test]
     fn non_slash_input_returns_no_menu() {
         let reg = CommandRegistry::builtin();
-        assert!(build_menu_items("hello world", &reg).is_none());
+        let custom = CustomCommandRegistry::empty();
+        assert!(build_menu_items("hello world", &reg, &custom, None).is_none());
     }
 
     #[test]
     fn slash_prefix_returns_all_commands() {
         let reg = CommandRegistry::builtin();
-        let items = build_menu_items("/", &reg).expect("menu should show for '/'");
+        let custom = CustomCommandRegistry::empty();
+        let items = build_menu_items("/", &reg, &custom, None).expect("menu should show for '/'");
         assert!(!items.is_empty(), "builtin registry should have commands");
     }
 
     #[test]
     fn slash_with_filter_narrows_list() {
         let reg = CommandRegistry::builtin();
-        let all = build_menu_items("/", &reg).unwrap();
-        let filtered = build_menu_items("/he", &reg).unwrap_or_default();
+        let custom = CustomCommandRegistry::empty();
+        let all = build_menu_items("/", &reg, &custom, None).unwrap();
+        let filtered = build_menu_items("/he", &reg, &custom, None).unwrap_or_default();
         assert!(
             filtered.len() < all.len(),
             "prefix '/he' should filter builtin commands"
@@ -615,14 +631,157 @@ mod menu_tests {
         // Once the user types args, menu goes away so arrow keys don't
         // start navigating a stale palette.
         let reg = CommandRegistry::builtin();
-        assert!(build_menu_items("/cd ", &reg).is_none());
-        assert!(build_menu_items("/cd /tmp", &reg).is_none());
+        let custom = CustomCommandRegistry::empty();
+        assert!(build_menu_items("/cd ", &reg, &custom, None).is_none());
+        assert!(build_menu_items("/cd /tmp", &reg, &custom, None).is_none());
     }
 
     #[test]
     fn slash_with_no_matches_returns_none() {
         let reg = CommandRegistry::builtin();
-        assert!(build_menu_items("/zzznomatch", &reg).is_none());
+        let custom = CustomCommandRegistry::empty();
+        assert!(build_menu_items("/zzznomatch", &reg, &custom, None).is_none());
+    }
+
+    fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_core::skill::Skill {
+        atomcode_core::skill::Skill {
+            name: name.to_string(),
+            description: desc.to_string(),
+            template: "do thing".to_string(),
+            disable_model_invocation: false,
+            user_invocable,
+            argument_hint: None,
+            allowed_tools: vec![],
+            skill_dir: std::path::PathBuf::new(),
+            source_path: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn top_level_hides_individual_skills() {
+        // Regression for the two-level palette: typing /bra or any
+        // bare-name prefix must NOT surface skills. They live behind
+        // the `/skills` gateway so the top palette stays uncluttered.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        // /bra — no skill should appear; /bra falls through to "no
+        // matches" since no built-in starts with bra either.
+        assert!(
+            build_menu_items("/bra", &reg, &custom, Some(&lock)).is_none(),
+            "individual skills must not leak into the top-level menu"
+        );
+
+        // /skills — only the built-in gateway entry, never the
+        // individual skills.
+        let items = build_menu_items("/skills", &reg, &custom, Some(&lock))
+            .expect("/skills must include the built-in gateway");
+        assert!(items.iter().any(|(n, _)| n == "skills"));
+        for (n, _) in &items {
+            assert!(
+                !n.contains(':'),
+                "namespaced skill leaked into top-level: {}",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn skills_sub_mode_lists_skills_under_bare_names() {
+        // Once the user has typed `/skills ` (trailing space, normally
+        // injected by the needs_args path on Enter), the palette
+        // switches to second-level: bare skill names, ready to commit
+        // as `/skills <name>`.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        let items = build_menu_items("/skills ", &reg, &custom, Some(&lock))
+            .expect("/skills (with space) must list skills");
+        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "web-access"));
+        for (n, _) in &items {
+            assert!(!n.contains(':'), "sub-mode names must be bare: {}", n);
+        }
+    }
+
+    #[test]
+    fn skills_sub_mode_filters_by_bare_prefix() {
+        // /skills bra narrows to brainstorming. /skills web narrows
+        // to web-access. /skills zz returns no menu at all.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        let bra = build_menu_items("/skills bra", &reg, &custom, Some(&lock))
+            .expect("filter must produce a result");
+        assert_eq!(bra.len(), 1);
+        assert_eq!(bra[0].0, "brainstorming");
+
+        let web = build_menu_items("/skills web", &reg, &custom, Some(&lock))
+            .expect("filter must produce a result");
+        assert_eq!(web.len(), 1);
+        assert_eq!(web[0].0, "web-access");
+
+        assert!(build_menu_items("/skills zz", &reg, &custom, Some(&lock)).is_none());
+    }
+
+    #[test]
+    fn skills_sub_mode_hides_after_skill_name() {
+        // /skills brainstorming why X — user is typing skill args now,
+        // menu should disappear so arrow keys don't navigate stale entries.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        assert!(build_menu_items("/skills brainstorming why", &reg, &custom, Some(&lock)).is_none());
+    }
+
+    #[test]
+    fn skills_sub_mode_excludes_hidden_skills() {
+        // user_invocable=false skills must not surface in the sub-menu
+        // either — they're LLM-only via the use_skill tool.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:visible", "shown", true));
+        skills.register(skill_fixture("skills:hidden", "hidden", false));
+        let lock = std::sync::RwLock::new(skills);
+
+        let items = build_menu_items("/skills ", &reg, &custom, Some(&lock))
+            .expect("at least one visible skill should produce a menu");
+        assert!(items.iter().any(|(n, _)| n == "visible"));
+        assert!(
+            !items.iter().any(|(n, _)| n == "hidden"),
+            "user_invocable=false skill leaked into sub-menu"
+        );
+    }
+
+    #[test]
+    fn no_skill_registry_is_no_op() {
+        // Ensures the legacy call path (None) keeps working.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let with_none = build_menu_items("/", &reg, &custom, None).unwrap();
+        let empty_skills = std::sync::RwLock::new(atomcode_core::skill::SkillRegistry::new());
+        let with_empty = build_menu_items("/", &reg, &custom, Some(&empty_skills)).unwrap();
+        assert_eq!(
+            with_none.len(),
+            with_empty.len(),
+            "empty registry must produce same menu as None"
+        );
     }
 
     // Regression: HistoryPrev used to leave the cursor at end-of-text,
@@ -744,22 +903,73 @@ mod tool_format_tests {
 
     #[test]
     fn summarise_single_line_returned_as_is() {
-        assert_eq!(summarise("ok"), "ok");
+        assert_eq!(summarise("ok", true), "ok");
     }
 
     #[test]
     fn summarise_multi_line_adds_line_count() {
-        let out = summarise("first line\nsecond line\nthird line");
+        let out = summarise("first line\nsecond line\nthird line", true);
         assert!(out.starts_with("first line"));
         assert!(out.contains("(3 lines)"));
     }
 
     #[test]
     fn summarise_empty_string_has_fallback() {
-        let out = summarise("");
+        let out = summarise("", true);
         // Empty input: `lines()` yields nothing, so first falls back
         // to "(no output)" and n==0 means no " (N lines)" suffix.
         assert!(out.contains("(no output)"), "got: {}", out);
+    }
+
+    /// Reproduces the bug: a long error message ending in a deep WSL
+    /// path used to silently truncate to 80 cols, leaving `f_stor`
+    /// instead of `f_store` with no `…` to indicate the cut. Failures
+    /// now get a 200-col budget so the path stays intact, and any
+    /// truncation that does happen is visibly marked with `…`.
+    #[test]
+    fn summarise_failure_keeps_long_path_intact() {
+        let err = "Error: old_string not found in \
+                   /mnt/d/docs/work/cangjie/projects/fountain/f_store.";
+        let out = summarise(err, false);
+        assert!(
+            out.contains("/mnt/d/docs/work/cangjie/projects/fountain/f_store"),
+            "the full path must survive the summary. got: {}",
+            out
+        );
+        assert!(
+            !out.contains("f_stor "),
+            "must not produce mid-token truncation like `f_stor ` (note the \
+             trailing space — that's where (N lines) would attach). got: {}",
+            out
+        );
+    }
+
+    /// Sanity check: success summaries still respect the tighter
+    /// 80-col cap (we don't want to flood the body with full status
+    /// output on every successful tool call). When that cap *does*
+    /// truncate, the ellipsis must appear — that was the second leg
+    /// of the fix beyond just enlarging the budget.
+    #[test]
+    fn summarise_success_truncates_with_ellipsis_at_80() {
+        let long: String = "x".repeat(200);
+        let out = summarise(&long, true);
+        // 80 col cap means at most 80 chars of x, plus the ellipsis.
+        assert!(
+            out.ends_with('…'),
+            "ellipsis is the visible-truncation marker. got: {}",
+            out
+        );
+        assert!(out.chars().count() <= 80);
+    }
+
+    /// Failure summaries keep the line-count suffix when the original
+    /// was multi-line — the budget bump shouldn't change that behaviour.
+    #[test]
+    fn summarise_failure_multi_line_still_appends_count() {
+        let err = "Error: foo\nbar\nbaz";
+        let out = summarise(err, false);
+        assert!(out.starts_with("Error: foo"));
+        assert!(out.contains("(3 lines)"));
     }
 }
 
@@ -835,6 +1045,9 @@ pub struct App {
     /// fixissue turn, verbatim. Sent as the AtomGit comment body on
     /// successful completion.
     pub fixissue_buffer: String,
+    /// Accumulates reasoning/thinking content for display in verbose mode.
+    /// Flushed on newline or when buffer exceeds threshold.
+    pub reasoning_buffer: String,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -853,6 +1066,7 @@ impl App {
             exit_pending: None,
             fixissue_pending: None,
             fixissue_buffer: String::new(),
+            reasoning_buffer: String::new(),
         }
     }
 }
@@ -911,6 +1125,50 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         #[cfg(not(target_os = "macos"))]
         renderer.render(UiLine::CommandOutput(
             "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+        ));
+    }
+
+    // JediTerm auto-fallback hint: lib.rs detected
+    // `TERMINAL_EMULATOR=JetBrains-JediTerm` (Android Studio, IntelliJ,
+    // PyCharm, etc.) and routed to AltScreenRenderer because the
+    // retained renderer's DECSTBM-pinned footer misaligns there.
+    // Tell the user about the trade-off — alt-screen owns the
+    // viewport so the host terminal's native scrollback isn't
+    // available; the app provides its own (PageUp / Shift+Up /
+    // mouse wheel). Only set by lib.rs when the user did NOT
+    // explicitly opt in via ATOMCODE_PLAIN / ATOMCODE_ALT —
+    // informed choices don't get lectured.
+    if std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok() {
+        std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
+        renderer.render(UiLine::CommandOutput(
+            "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
+             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+             Native terminal scrollback is unavailable while atomcode runs;\n    \
+             on exit your host terminal restores its pre-atomcode state.\n    \
+             Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
+             ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
+                .into(),
+        ));
+    }
+
+    // Legacy Windows console (cmd.exe / classic conhost) auto-fallback
+    // hint: lib.rs detected Windows + neither WT_SESSION nor
+    // TERM_PROGRAM, which means the user is on stock conhost where
+    // DECSTBM misbehaves (rows duplicate in scrollback on Page-Up).
+    // Phase 5: now routes to AltScreenRenderer. Mutually exclusive
+    // with the JediTerm hint (lib.rs gates legacy_conhost on
+    // `!is_jediterm`).
+    if std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok() {
+        std::env::remove_var("ATOMCODE_LEGACY_CONHOST_FALLBACK");
+        renderer.render(UiLine::CommandOutput(
+            "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
+             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+             Native terminal scrollback is unavailable while atomcode runs.\n    \
+             For full host-terminal scrollback support, install Windows Terminal\n    \
+             (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
+             Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
+             bypass this fallback (may show duplicated content on scroll).\n\n"
+                .into(),
         ));
     }
 
@@ -1207,7 +1465,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -1407,7 +1665,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             maybe = ctx.agent.event_rx.recv() => {
                 let Some(ev) = maybe else { break };
                 let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer);
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
@@ -1515,10 +1773,33 @@ fn handle_input(
             InputEvent::Eof => "eof".into(),
             InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
             InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
+            InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
+            InputEvent::MouseDown { col, row } => format!("mouse_down({},{})", col, row),
+            InputEvent::MouseDrag { col, row } => format!("mouse_drag({},{})", col, row),
+            InputEvent::MouseUp => "mouse_up".into(),
         }
     );
 
     match ev {
+        InputEvent::MouseScroll(delta) => {
+            // Mouse wheel — only the alt-screen renderer takes action;
+            // retained / plain default to no-op (host terminal handles
+            // their scrollback natively, mouse capture isn't enabled
+            // for them anyway).
+            renderer.scroll_body(delta);
+        }
+        InputEvent::MouseDown { col, row } => {
+            // Anchor a new selection. Only AltScreenRenderer responds
+            // (it owns mouse capture); other backends no-op since the
+            // host terminal still does native drag-to-select for them.
+            renderer.begin_selection(col, row);
+        }
+        InputEvent::MouseDrag { col, row } => {
+            renderer.update_selection(col, row);
+        }
+        InputEvent::MouseUp => {
+            renderer.end_selection();
+        }
         InputEvent::Resize(cols, rows) => {
             // Forward to the renderer so DECSTBM-based backends can
             // re-issue their scroll region and repaint the footer at
@@ -1581,15 +1862,25 @@ fn handle_input(
             }
         }
         InputEvent::Eof => {}
-        // Only act on Press events. On Unix tty crossterm only emits Press
-        // so this guard is a no-op there; on Windows crossterm emits all
-        // three kinds (Press / Repeat / Release). Without filtering to
-        // Press we double-fired on every keystroke (Press + Release both
-        // ran the handler) and a held-down key fired again on every
-        // Repeat tick, producing "ghost characters" / runaway backspace
-        // the moment the OS autorepeat kicked in.
+        // Act on Press AND Repeat. Release is dropped (it would double-fire
+        // every handler on Windows, where crossterm emits all three kinds
+        // per keystroke).
+        //
+        // Repeat is what the Kitty protocol's `REPORT_EVENT_TYPES` bit
+        // (enabled in lib.rs) turns OS key autorepeat into — without
+        // accepting it, holding Left/Right/Backspace only moves one step
+        // because every autorepeat tick gets dropped here. Accepting it
+        // also doesn't cause runaway Submit on a held Enter: Submit
+        // transitions to Streaming phase, and Streaming's Enter handler
+        // doesn't submit again.
+        //
+        // Terminals that don't support `REPORT_EVENT_TYPES` (iTerm2 3.5+,
+        // Apple Terminal) leak autorepeat as repeated Press events
+        // instead; the reader-level `MODIFIER_ENTER_DEDUP` handles the
+        // one case where that's harmful (modifier+Enter → spurious
+        // newlines).
         InputEvent::Key(KeyEvent {
-            kind: KeyEventKind::Press,
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
             code,
             modifiers,
             ..
@@ -1667,18 +1958,96 @@ fn handle_input(
                     return Ok(());
                 }
             }
+            // PageUp / PageDown / Home / End: scroll the body
+            // viewport. Universal across phases — same as a terminal's
+            // own scrollback navigation. Only AltScreenRenderer
+            // implements these (it owns the alt-screen buffer and
+            // host-terminal scrollback is unavailable while we're
+            // in alt-screen); other renderers default to no-op so
+            // these keys do nothing in retained / plain modes (as
+            // before — those rely on the host terminal's native
+            // scrollback). We intercept BEFORE phase dispatch so
+            // scrolling works in Idle / Streaming alike.
+            if let Some(handled) =
+                handle_scroll_key(code, modifiers, renderer, &app.buf)
+            {
+                if handled {
+                    return Ok(());
+                }
+            }
             match app.state.phase {
                 UiPhase::Idle => handle_idle_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Streaming => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
-                UiPhase::Approval => handle_approval_key(code, &mut app.state, ctx, renderer)?,
+                UiPhase::Approval => handle_approval_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Suspended => {}
             }
         }
-        // Release / Repeat key events: drop on the floor. Press is handled
-        // above; everything else is noise on Windows.
+        // Release key events: drop on the floor. Press / Repeat are handled
+        // above; Release is noise on Windows.
         InputEvent::Key(_) => {}
     }
     Ok(())
+}
+
+/// Try handling a scroll-related key (PageUp/PageDown/Home/End).
+/// Returns:
+///   - `Some(true)`  → key consumed; caller should skip phase dispatch
+///   - `Some(false)` → key was a scroll key but not consumed (e.g.
+///     Home/End with text in input buffer, where they should move
+///     cursor instead)
+///   - `None`        → not a scroll key at all
+///
+/// AltScreenRenderer is the only renderer that does anything with
+/// these calls; the trait defaults are no-op so retained / plain
+/// silently fall through and let the existing phase dispatch handle
+/// the key (e.g. End-of-line cursor movement during input).
+fn handle_scroll_key(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    renderer: &mut dyn crate::render::Renderer,
+    buf: &Buffer,
+) -> Option<bool> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    // Don't intercept Home/End when the user is editing a non-empty
+    // buffer — those should move the cursor, not jump scrollback.
+    // PageUp/PageDown and Shift+Up/Shift+Down always scroll regardless
+    // (they're explicit scroll commands, not in-line editing keys).
+    let buf_empty = buf.text.is_empty();
+    let has_shift = modifiers.contains(KeyModifiers::SHIFT);
+    match code {
+        // Page-step. macOS keyboards: Fn+Up / Fn+Down generate
+        // PageUp / PageDown. iTerm2 / Windows have dedicated keys.
+        KeyCode::PageUp => {
+            renderer.scroll_body(-10);
+            Some(true)
+        }
+        KeyCode::PageDown => {
+            renderer.scroll_body(10);
+            Some(true)
+        }
+        // Line-step. Shift+Up / Shift+Down is the cross-keyboard
+        // alternative for users without a dedicated PageUp/Down key.
+        // Bare Up/Down stays bound to input-history navigation
+        // (Action::HistoryPrev/Next via key_action::map) for backward
+        // compat with retained mode.
+        KeyCode::Up if has_shift => {
+            renderer.scroll_body(-1);
+            Some(true)
+        }
+        KeyCode::Down if has_shift => {
+            renderer.scroll_body(1);
+            Some(true)
+        }
+        KeyCode::Home if buf_empty && modifiers.is_empty() => {
+            renderer.scroll_body_to_top();
+            Some(true)
+        }
+        KeyCode::End if buf_empty && modifiers.is_empty() => {
+            renderer.scroll_body_to_bottom();
+            Some(true)
+        }
+        _ => None,
+    }
 }
 
 /// Slash-command palette state. Active whenever buf starts with '/'.
@@ -1708,20 +2077,76 @@ pub use crate::modals::ProviderWizard;
 /// Filter the command registry by the buf's prefix after '/'. Returns the
 /// (name, desc) pairs matching, or None if menu shouldn't show (buf doesn't
 /// start with '/' or has whitespace, meaning the user has moved on to args).
-fn build_menu_items(buf: &str, commands: &CommandRegistry) -> Option<Vec<(String, String)>> {
+/// Custom commands are appended after built-in matches; duplicates (custom
+/// command with the same name as a built-in) are suppressed.
+fn build_menu_items(
+    buf: &str,
+    commands: &CommandRegistry,
+    custom: &atomcode_core::commands::CustomCommandRegistry,
+    skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+) -> Option<Vec<(String, String)>> {
     if !buf.starts_with('/') {
         return None;
     }
+
+    // Two-level palette for skills.
+    //
+    // Level 1 (top): the built-in `/skills` entry acts as a gateway —
+    // it does NOT expand into individual skills here, so it cannot
+    // crowd or collide with built-in / custom commands.
+    //
+    // Level 2 (sub-mode): once the user has typed `/skills ` (with a
+    // trailing space, usually injected by the needs_args path on
+    // Enter), this branch fires and lists user-invocable skills under
+    // their bare names. Submission rewrites the committed line back
+    // to `/skills <name>` so the `skills` arm in execute_slash_command
+    // looks up `skills:<name>` in the registry and dispatches.
+    if let Some(after) = buf.strip_prefix("/skills ") {
+        // Beyond the skill name (user typing skill args) — close menu.
+        if after.contains(char::is_whitespace) {
+            return None;
+        }
+        let prefix_lower = after.to_ascii_lowercase();
+        let mut items: Vec<(String, String)> = Vec::new();
+        if let Some(reg) = skill_registry {
+            if let Ok(reg) = reg.read() {
+                for skill in reg.user_invocable() {
+                    let bare = skill
+                        .name
+                        .split_once(':')
+                        .map(|(_, s)| s)
+                        .unwrap_or(skill.name.as_str());
+                    if bare.to_ascii_lowercase().starts_with(&prefix_lower) {
+                        items.push((bare.to_string(), skill.description.clone()));
+                    }
+                }
+            }
+        }
+        // Stable order so navigation feels predictable across runs.
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        return if items.is_empty() { None } else { Some(items) };
+    }
+
     let rest = &buf[1..];
     // Once a space appears (user is typing args), stop showing menu.
     if rest.contains(char::is_whitespace) {
         return None;
     }
-    let matches: Vec<(String, String)> = commands
+    let prefix_lower = rest.to_ascii_lowercase();
+    // Top-level: built-ins (which now include the `/skills` gateway)
+    // followed by custom commands. Individual skills are intentionally
+    // hidden from this level — users access them via `/skills <name>`.
+    let mut matches: Vec<(String, String)> = commands
         .matching_prefix(rest)
         .into_iter()
         .map(|c| (c.name.to_string(), c.desc.to_string()))
         .collect();
+    for (name, desc) in custom.command_names_and_descriptions() {
+        if name.starts_with(&prefix_lower) && !matches.iter().any(|(n, _)| *n == name) {
+            matches.push((name, desc));
+        }
+    }
+    let _ = skill_registry; // referenced only inside the sub-mode branch above
     if matches.is_empty() {
         None
     } else {
@@ -1742,7 +2167,7 @@ fn handle_idle_key(
     let menu_items = if app.buf.is_in_history() {
         None
     } else {
-        build_menu_items(&app.buf.text, &ctx.commands)
+        build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry))
     };
     if let Some(items) = &menu_items {
         // Clamp selection in range.
@@ -1810,11 +2235,47 @@ fn handle_idle_key(
                     // so build_menu_items correctly hides the menu.
                     app.buf.text = format!("/{} ", name);
                     app.buf.cursor = app.buf.text.len();
+
+                    // The `/skills` gateway is special: build_menu_items
+                    // recognises the `/skills ` prefix and returns the
+                    // second-level palette of skills. Render that
+                    // immediately so the user doesn't see the menu blink
+                    // out and reappear.
+                    if name == "skills" {
+                        if let Some(items) = build_menu_items(
+                            &app.buf.text,
+                            &ctx.commands,
+                            &ctx.custom_commands,
+                            Some(&ctx.skill_registry),
+                        ) {
+                            app.menu.selected = 0;
+                            redraw_with_menu(
+                                &app.buf,
+                                &items,
+                                0,
+                                &app.state,
+                                ctx,
+                                renderer,
+                            );
+                            return Ok(());
+                        }
+                    }
+
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
 
-                let committed = format!("/{}", name);
+                // Sub-mode submit: items in the skills palette carry
+                // bare names (e.g. "brainstorming"). Re-prefix with
+                // `/skills ` so dispatch routes through the `skills`
+                // arm in execute_slash_command, which performs the
+                // registry lookup + expand.
+                let in_skills_sub_mode = app.buf.text.starts_with("/skills ");
+                let committed = if in_skills_sub_mode {
+                    format!("/skills {}", name)
+                } else {
+                    format!("/{}", name)
+                };
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
                 app.buf.text.clear();
@@ -1894,7 +2355,7 @@ fn handle_idle_key(
             let items = if app.buf.is_in_history() {
                 None
             } else {
-                build_menu_items(&app.buf.text, &ctx.commands)
+                build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry))
             };
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
@@ -1929,8 +2390,16 @@ fn handle_idle_key(
             // `/test`, or just `/test` as a question) falls through to
             // the regular message path — better than the old
             // "Unknown command: /foo" dead-end.
-            let as_slash =
-                parse_slash_line(&line).filter(|(cmd, _)| ctx.commands.find(cmd).is_some());
+            let as_slash = parse_slash_line(&line).filter(|(cmd, _)| {
+                ctx.commands.find(cmd).is_some()
+                    || ctx.custom_commands.get(&cmd.to_ascii_lowercase()).is_some()
+                    || ctx
+                        .skill_registry
+                        .read()
+                        .ok()
+                        .and_then(|r| r.get(cmd).map(|s| s.user_invocable))
+                        .unwrap_or(false)
+            });
             if let Some((cmd, arg)) = as_slash {
                 execute_slash_command(
                     cmd,
@@ -2109,6 +2578,28 @@ fn handle_streaming_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // Ctrl+O toggles verbose mode (real-time tool output + reasoning visibility)
+    if code == KeyCode::Char('o') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        app.state.toggle_tool_output();
+        // Show feedback to the user about the current state
+        let status = if app.state.show_tool_output {
+            "  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+O to hide)\n"
+        } else {
+            "  ◯ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
+        };
+        renderer.render(UiLine::CommandOutput(status.to_string()));
+        renderer.flush();
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+        return Ok(());
+    }
+
     // Ctrl+C always cancels the running turn — highest priority so
     // users have a reliable escape hatch even mid-edit. Also drops
     // the type-ahead queue: a user yanking the escape cord doesn't
@@ -2133,7 +2624,7 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(&app.buf.text, &ctx.commands);
+    let menu_items = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry));
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -2189,7 +2680,7 @@ fn handle_streaming_key(
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(&app.buf.text, &ctx.commands) {
+            if let Some(items) = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry)) {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
@@ -2264,11 +2755,38 @@ fn handle_streaming_key(
 }
 
 fn handle_approval_key(
-    code: KeyCode,
-    state: &mut UiState,
+    app: &mut App,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // Ctrl+C: first press denies the tool and arms exit confirmation;
+    // second press within the window actually exits.
+    if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        let now = std::time::Instant::now();
+        let armed = app
+            .exit_pending
+            .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
+        if armed {
+            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+        } else {
+            // First Ctrl+C: deny the tool and arm the exit confirmation
+            app.exit_pending = Some(now);
+            renderer.pop_approval_prompt();
+            ctx.agent.cmd_tx.send(AgentCommand::DenyTool).ok();
+            app.state.on_approval_resolved();
+            renderer.render(UiLine::CommandOutput(
+                "  (press Ctrl+C again to exit)\n".into(),
+            ));
+            renderer.flush();
+        }
+        return Ok(());
+    }
+
+    // Any other key resets the exit confirmation
+    app.exit_pending = None;
+
     let cmd = match code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => AgentCommand::ApproveTool,
         KeyCode::Char('a') | KeyCode::Char('A') => AgentCommand::ApproveToolAlways,
@@ -2280,7 +2798,7 @@ fn handle_approval_key(
     // the tool result, creating visual noise.
     renderer.pop_approval_prompt();
     ctx.agent.cmd_tx.send(cmd).ok();
-    state.on_approval_resolved();
+    app.state.on_approval_resolved();
     Ok(())
 }
 
@@ -2367,6 +2885,7 @@ fn handle_agent_event(
     ctx: &mut LoopCtx,
     fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
     fixissue_buffer: &mut String,
+    reasoning_buffer: &mut String,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -2379,6 +2898,20 @@ fn handle_agent_event(
                 renderer.flush();
             }
         }
+        AgentEvent::ReasoningDelta(text) => {
+            // Display reasoning/thinking content in verbose mode (Ctrl+O)
+            // Only show when the user has enabled it
+            if state.show_reasoning {
+                reasoning_buffer.push_str(&text);
+                // Flush on newline or when buffer gets large
+                if reasoning_buffer.contains('\n') || reasoning_buffer.len() > 80 {
+                    let output = std::mem::take(reasoning_buffer);
+                    // Render as gray/dimmed text with automatic line wrapping
+                    renderer.render(UiLine::ReasoningText(output));
+                    renderer.flush();
+                }
+            }
+        }
         AgentEvent::ToolCallStreaming { name, .. } => {
             state.on_tool_call_streaming(&display_tool_name(&name));
         }
@@ -2387,23 +2920,33 @@ fn handle_agent_event(
             name,
             arguments,
         } => {
-            // Push an animated ▸ line immediately via `ToolCallInFlight`
-            // so the user sees exactly what's running during long-blocking
-            // tools (bash with multi-minute commands, large write_file
-            // streams, etc.). The retained renderer parks it in the
-            // live-row slot, so the row's leading icon ticks in lockstep
-            // with the spinner; `ToolCallCommit` (emitted on the matching
-            // result) freezes it to a static `▸`. `call_rendered=true` so
-            // ApprovalNeeded / ToolCallResult won't double-emit the line.
+            // Emit the ▸ line immediately so users can see what command
+            // is running, especially for long-running bash commands.
+            // The line will be shown before the command completes.
             let detail = format_tool_detail(&name, &arguments);
             let display = display_tool_name(&name);
+
+            // Close any in-flight assistant line before emitting the tool call.
+            renderer.render(UiLine::AssistantLineBreak);
             renderer.render(UiLine::ToolCallInFlight {
+                id: id.clone(),
                 name: display.clone(),
                 detail: detail.clone(),
             });
             renderer.flush();
+
+            // Mark as rendered so ToolCallResult doesn't emit it again.
             pending_tools.insert(id, (display.clone(), detail, true));
             state.on_tool_call_started(&display);
+        }
+        AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
+            // Display real-time tool output (e.g., bash stdout/stderr)
+            // Only show when the user has enabled it via Ctrl+O
+            if state.show_tool_output {
+                // Append to the scrollback as command output
+                renderer.render(UiLine::CommandOutput(chunk));
+                renderer.flush();
+            }
         }
         AgentEvent::ToolCallResult {
             call_id,
@@ -2416,9 +2959,12 @@ fn handle_agent_event(
             renderer.render(UiLine::AssistantLineBreak);
             // Freeze the animated in-flight tool-call row to its final
             // static `▸` icon before the `⎿ result` body row lands beneath
-            // it. No-op when nothing is in flight (plain mode, or the
-            // matching Start never fired).
-            renderer.render(UiLine::ToolCallCommit);
+            // it. Pass the call_id so we only freeze if the inflight_tool matches.
+            // This prevents freezing a different tool's spinner when multiple
+            // tools are in flight (e.g., WriteFile result arrives while Bash spinner is active).
+            renderer.render(UiLine::ToolCallCommit {
+                call_id: Some(call_id.clone()),
+            });
 
             // Prefer the display-name we stored at ToolCallStarted time;
             // fall back to converting the raw name if we missed the Start
@@ -2444,7 +2990,7 @@ fn handle_agent_event(
                     detail: detail.clone(),
                 });
             }
-            let summary = summarise(&output);
+            let summary = summarise(&output, success);
             renderer.render(UiLine::ToolResult { success, summary });
             // Collect diff lines into a single batch — N individual
             // DiffLine renders each trigger a full footer redraw and
@@ -2472,6 +3018,13 @@ fn handle_agent_event(
             if !diff_entries.is_empty() {
                 renderer.render(UiLine::DiffBlock(diff_entries));
             }
+            // Show hint for bash commands if real-time output is disabled
+            // Display AFTER the result so user sees the command first
+            if name == "bash" && !state.show_tool_output {
+                renderer.render(UiLine::CommandOutput(
+                    "  ◯ Press Ctrl+O to show real-time output\n".to_string()
+                ));
+            }
             renderer.flush();
             let _ = name;
         }
@@ -2479,17 +3032,24 @@ fn handle_agent_event(
             tool_name, call, ..
         } => {
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
-            // so the user sees what they're approving. If the matching
-            // ToolCallStarted already populated pending_tools, reuse
-            // its stored display/detail and flag the entry as rendered
-            // so ToolCallResult won't re-emit. If not (race condition
-            // where Approval arrives first), fall back to deriving
-            // display/detail from the event itself.
+            // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
             let detail = format_tool_detail(&tool_name, &call.arguments);
+            
+            // Check if ToolCallStarted already rendered this tool call as a
+            // dynamic ToolCallInFlight spinner. If so, we need to freeze it
+            // to a static `▸` row before showing the approval prompt.
             if let Some(entry) = pending_tools.get_mut(&call.id) {
                 let (disp, det, rendered) = entry;
-                if !*rendered {
+                if *rendered {
+                    // ToolCallInFlight is animating — commit it to a static row
+                    // so the approval prompt appears below a frozen `▸ Bash(...)`.
+                    // Pass the call_id to ensure we only freeze the matching tool.
+                    renderer.render(UiLine::ToolCallCommit {
+                        call_id: Some(call.id.clone()),
+                    });
+                } else {
+                    // Not yet rendered, emit it now
                     renderer.render(UiLine::ToolCall {
                         name: disp.clone(),
                         detail: det.clone(),
@@ -2497,15 +3057,17 @@ fn handle_agent_event(
                     *rendered = true;
                 }
             } else {
+                // No entry from ToolCallStarted, render and insert
                 renderer.render(UiLine::ToolCall {
                     name: display.clone(),
                     detail: detail.clone(),
                 });
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
+            
             renderer.render(UiLine::ApprovalPrompt {
-                tool: display,
-                detail,
+                tool: display.clone(),
+                detail: detail.clone(),
             });
             renderer.flush();
             atomcode_core::notify::notify(
@@ -2566,6 +3128,9 @@ fn handle_agent_event(
             // TextDelta of the NEXT turn — user sees blank assistant bubbles
             // while datalog proves the model did return text.
             think.reset();
+
+            // Clear reasoning buffer between turns
+            reasoning_buffer.clear();
 
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
@@ -2656,6 +3221,9 @@ fn handle_agent_event(
             think.reset();
         }
         AgentEvent::TokenUsage(u) => {
+            state.prompt_tokens += u.prompt_tokens;
+            state.completion_tokens += u.completion_tokens;
+            state.cached_tokens += u.cached_tokens;
             state.total_tokens += u.completion_tokens;
         }
         AgentEvent::WorkingDirChanged(new_dir) => {
@@ -2851,7 +3419,7 @@ fn draw_spinner_now(
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
-    let menu = build_menu_items(&buf.text, &ctx.commands).map(|items| {
+    let menu = build_menu_items(&buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry)).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
         crate::render::MenuPayload { items, selected }
     });
@@ -2984,10 +3552,21 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
     }
 }
 
-pub(crate) fn summarise(output: &str) -> String {
+pub(crate) fn summarise(output: &str, success: bool) -> String {
     let first = output.lines().next().unwrap_or("(no output)");
     let n = output.lines().count();
-    let trimmed = crate::width::truncate_to_width(first, 80);
+    // Failures get a larger budget because the first line is usually
+    // diagnostic ("Error: old_string not found in /mnt/d/.../f_store.")
+    // and the path is the load-bearing piece of info — silently
+    // chopping it at 80 cols turned `f_store` into `f_stor` and made
+    // the agent loop on the wrong file. 200 cols comfortably fits a
+    // typical WSL-style absolute path; anything beyond that probably
+    // is too long to read inline anyway.
+    let budget = if success { 80 } else { 200 };
+    // `truncate_with_ellipsis` (instead of bare `truncate_to_width`)
+    // so that whenever the budget IS exceeded, the user / agent sees
+    // a `…` marker — silent mid-token chops were the actual UX bug.
+    let trimmed = crate::width::truncate_with_ellipsis(first, budget);
     if n > 1 {
         format!("{} ({} lines)", trimmed, n)
     } else {

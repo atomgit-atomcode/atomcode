@@ -72,14 +72,19 @@ pub trait LlmProvider: Send + Sync {
 /// `ua_override` comes from `ProviderConfig::user_agent`; falls back to the
 /// workspace-wide `ATOMCODE_USER_AGENT` (`atomcode/<version>`) — see the
 /// constant's doc-comment for why lowercasing matters on the LLM gateway.
-pub(super) fn build_http_client(ua_override: Option<&str>) -> reqwest::Client {
+/// `skip_tls_verify` disables TLS certificate verification when true.
+pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool) -> reqwest::Client {
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(300))
-        .user_agent(ua)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .user_agent(ua);
+
+    if skip_tls_verify {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Factory: create the right provider from config.
@@ -337,6 +342,7 @@ mod tests {
             reasoning_history: None,
             thinking_enabled: None,
             thinking_budget: None,
+            skip_tls_verify: false,
             ephemeral: false,
         }
     }

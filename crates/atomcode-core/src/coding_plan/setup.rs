@@ -550,6 +550,7 @@ fn build_codingplan_provider(model: &str) -> ProviderConfig {
         reasoning_history: None,
         thinking_enabled: None,
         thinking_budget: None,
+        skip_tls_verify: false,
         ephemeral: false,
     }
 }
@@ -570,6 +571,7 @@ mod tests {
             notifications: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),
+            auto_commit: false,
         }
     }
 

@@ -1,26 +1,40 @@
 //! Per-turn logging: writes each user request and agent response to a markdown
-//! file in a configurable directory (default: `<working_dir>/datalog/`).
+//! file under a configurable root, with one subdirectory per project so multiple
+//! projects don't pile their logs into a single bucket.
 //!
-//! File naming: `<dir>/YYYY-MM-DD_HH-MM-SS.md`
+//! Default layout:
+//!   ~/.atomcode/datalog/<project-slug>/YYYY-MM-DD_HH-MM-SS.md
+//!   ~/.atomcode/datalog/<project-slug>/llm/YYYY-MM-DD_HH-MM-SS_sss.json
+//!
+//! Project slug = sanitized cwd basename + 8-char sha256 prefix of the canonical
+//! cwd path. The hash suffix prevents collisions when two unrelated projects
+//! share a basename (e.g. `~/work/foo` vs `~/personal/foo`).
+//!
 //! Content mirrors what the user sees on screen.
 //! Every write operation flushes immediately so logs survive crashes.
 //!
 //! Configured via `[datalog]` in `~/.atomcode/config.toml`:
-//! - `enabled = false` — disables logging entirely (writer becomes a no-op)
-//! - `dir = "<path>"` — redirects output; supports absolute, `~/…`, or relative paths
+//! - `enabled = false`     — disables logging entirely (writer becomes a no-op)
+//! - `dir = "<path>"`      — root directory; project slug is always appended
+//!   underneath. Accepts absolute, `~/…`, or relative paths. Default
+//!   `"~/.atomcode/datalog"`.
 
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use sha2::{Digest, Sha256};
+
 use crate::config::DatalogConfig;
 
 /// Accumulates log entries for a single turn, flushing to disk after each operation.
 pub struct DatalogWriter {
-    /// Current working directory — used when `configured_dir` is None or relative.
+    /// Current working directory — used to derive the per-project slug, and to
+    /// resolve `configured_dir` when it's relative.
     base_dir: PathBuf,
-    /// Raw user-configured dir (pre-resolution). `None` → default to
-    /// `<base_dir>/datalog`. Otherwise can be absolute, `~/…`, or relative.
+    /// Raw user-configured root (pre-resolution). `None` → default to
+    /// `~/.atomcode/datalog`. Otherwise absolute, `~/…`, or relative. The
+    /// project slug is always appended underneath whichever value resolves.
     configured_dir: Option<String>,
     /// When false, all methods are no-ops and no files are created.
     enabled: bool,
@@ -62,10 +76,16 @@ impl DatalogWriter {
 
     /// Resolve the actual directory to write datalog files into, given the
     /// current `base_dir` and `configured_dir`. Pure function — used by
-    /// `begin_turn` and covered by unit tests.
-    fn resolve_log_dir(base_dir: &Path, configured: Option<&str>) -> PathBuf {
-        match configured {
-            None => base_dir.join("datalog"),
+    /// `begin_turn`, by `runner.rs` to decide where `log_llm_request` writes
+    /// the JSONL request dump (so both writers stay in sync), and covered by
+    /// unit tests.
+    ///
+    /// The result is always `<root>/<project-slug>` so multiple projects don't
+    /// collide. `<root>` is `~/.atomcode/datalog` by default, or whatever the
+    /// user configured (absolute / `~/…` / relative-to-cwd).
+    pub fn resolve_log_dir(base_dir: &Path, configured: Option<&str>) -> PathBuf {
+        let root = match configured {
+            None => Self::default_root(),
             Some(s) if s.starts_with("~/") || s == "~" => {
                 let rest = s.strip_prefix("~/").unwrap_or("");
                 crate::tool::real_home_dir()
@@ -80,7 +100,18 @@ impl DatalogWriter {
                     base_dir.join(p)
                 }
             }
-        }
+        };
+        root.join(project_slug(base_dir))
+    }
+
+    /// `~/.atomcode/datalog` — the built-in root used when `[datalog].dir`
+    /// is unset. Falls back to a CWD-relative path on the (vanishingly rare)
+    /// platforms where `$HOME` can't be resolved.
+    fn default_root() -> PathBuf {
+        crate::tool::real_home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".atomcode")
+            .join("datalog")
     }
 
     /// Clear the current turn log state and delete the log file if it exists.
@@ -494,44 +525,131 @@ fn format_timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Per-project slug derived from `working_dir`. Shape: `<basename>-<hash8>`.
+///
+/// - `<basename>`: the last path component, with anything outside
+///   `[A-Za-z0-9_-]` collapsed to `_` (filesystem-safe on every OS).
+/// - `<hash8>`: first 8 hex chars of sha256 over the canonical absolute path.
+///   Disambiguates same-name projects (`~/work/foo` vs `~/personal/foo`) and
+///   keeps the slug stable across atomcode releases (sha2 is a fixed algorithm,
+///   unlike `DefaultHasher` whose output the std reserves the right to change).
+///
+/// `canonicalize` may fail on freshly-deleted dirs / weird permissions; in that
+/// case we hash the as-given path so the slug is still deterministic and
+/// non-canonical paths just get their own bucket (acceptable — beats panicking).
+fn project_slug(working_dir: &Path) -> String {
+    let canonical = working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| working_dir.to_path_buf());
+    let basename = canonical
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "root".to_string());
+    let safe: String = basename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "{}-{:02x}{:02x}{:02x}{:02x}",
+        safe, digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn make_log(dir: &Path) -> DatalogWriter {
-        let mut log = DatalogWriter::new(dir, &DatalogConfig::default());
+        // Pin `dir` explicitly so tests write under the temp root, not the
+        // real `~/.atomcode/datalog/` (the new default). Slug subdir still
+        // gets appended underneath — file_path lookups in the test go via
+        // `log.file_path`, so the exact slugged path is opaque to callers.
+        let cfg = DatalogConfig {
+            enabled: true,
+            dir: Some(dir.to_string_lossy().to_string()),
+        };
+        let mut log = DatalogWriter::new(dir, &cfg);
         log.begin_turn("test", "test-model", 16000);
         log.log_llm_call();
         log
     }
 
     #[test]
-    fn resolve_log_dir_default_uses_working_dir() {
+    fn resolve_log_dir_default_lands_under_home() {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, None);
-        assert_eq!(p, PathBuf::from("/tmp/work/datalog"));
+        let expected_root = crate::tool::real_home_dir()
+            .unwrap()
+            .join(".atomcode")
+            .join("datalog");
+        assert!(
+            p.starts_with(&expected_root),
+            "{:?} should start with {:?}",
+            p,
+            expected_root
+        );
+        // Slug = basename + 8-hex hash. `/tmp/work` may not exist on the test
+        // host (canonicalize fails → we hash the as-given path), so just
+        // assert the shape: starts with "work-" and ends with 8 hex chars.
+        let slug = p.file_name().unwrap().to_string_lossy().to_string();
+        assert!(slug.starts_with("work-"), "slug {:?}", slug);
+        let hex_tail = slug.rsplit('-').next().unwrap();
+        assert_eq!(hex_tail.len(), 8, "hash tail should be 8 hex chars");
+        assert!(hex_tail.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn resolve_log_dir_absolute_ignores_working_dir() {
+    fn resolve_log_dir_absolute_uses_configured_root_with_slug() {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("/var/logs/atomcode"));
-        assert_eq!(p, PathBuf::from("/var/logs/atomcode"));
+        assert!(p.starts_with("/var/logs/atomcode"));
+        assert!(p.file_name().unwrap().to_string_lossy().starts_with("work-"));
     }
 
     #[test]
-    fn resolve_log_dir_relative_joins_working_dir() {
+    fn resolve_log_dir_relative_joins_working_dir_then_slug() {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("logs/ac"));
-        assert_eq!(p, PathBuf::from("/tmp/work/logs/ac"));
+        assert!(p.starts_with("/tmp/work/logs/ac"));
+        assert!(p.file_name().unwrap().to_string_lossy().starts_with("work-"));
     }
 
     #[test]
     fn resolve_log_dir_tilde_expands_home() {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("~/.atomcode/logs"));
-        let expected = crate::tool::real_home_dir().unwrap().join(".atomcode/logs");
-        assert_eq!(p, expected);
+        let expected_root = crate::tool::real_home_dir().unwrap().join(".atomcode/logs");
+        assert!(p.starts_with(&expected_root));
+        assert!(p.file_name().unwrap().to_string_lossy().starts_with("work-"));
+    }
+
+    #[test]
+    fn project_slug_is_stable_for_same_path() {
+        let p = PathBuf::from("/tmp/repeatable-path");
+        let s1 = project_slug(&p);
+        let s2 = project_slug(&p);
+        assert_eq!(s1, s2, "slug must be deterministic");
+    }
+
+    #[test]
+    fn project_slug_disambiguates_same_basename() {
+        let a = PathBuf::from("/tmp/dup-test-a/foo");
+        let b = PathBuf::from("/tmp/dup-test-b/foo");
+        let sa = project_slug(&a);
+        let sb = project_slug(&b);
+        assert!(sa.starts_with("foo-"));
+        assert!(sb.starts_with("foo-"));
+        assert_ne!(sa, sb, "different parents must yield different slugs");
     }
 
     #[test]
@@ -566,11 +684,14 @@ mod tests {
 
     #[test]
     fn disabled_writer_never_creates_files() {
+        // Point `dir` at a temp subdir so this test doesn't depend on (or
+        // pollute) the real `~/.atomcode/datalog/`. With enabled=false the
+        // writer should still create nothing under that root.
         let dir = std::env::temp_dir().join("atomcode_test_datalog_disabled");
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = DatalogConfig {
             enabled: false,
-            dir: None,
+            dir: Some(dir.to_string_lossy().to_string()),
         };
         let mut log = DatalogWriter::new(&dir, &cfg);
         log.begin_turn("hello", "m", 1000);
@@ -578,7 +699,7 @@ mod tests {
         log.log_text("response");
         log.end_turn(0, 0);
         assert!(log.file_path.is_none());
-        assert!(!dir.join("datalog").exists());
+        assert!(!dir.exists(), "disabled writer must not create the root dir");
     }
 
     #[test]

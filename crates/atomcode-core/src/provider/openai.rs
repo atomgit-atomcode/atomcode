@@ -54,7 +54,7 @@ impl OpenAiProvider {
             },
         };
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref()),
+            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
             api_key,
             model: config.model.clone(),
             base_url: config
@@ -549,14 +549,19 @@ impl LlmProvider for OpenAiProvider {
                                         }
                                         let entry = &mut tool_calls[idx];
                                         if let Some(id) = &tc.id {
-                                            entry.0 = id.clone();
-                                            if let Some(func) = &tc.function {
-                                                entry.1 = func.name.clone().unwrap_or_default();
+                                            // Some providers (e.g., ModelScope) send empty string id
+                                            // in incremental tool call chunks. Only emit ToolCallStart
+                                            // for non-empty ids.
+                                            if !id.is_empty() {
+                                                entry.0 = id.clone();
+                                                if let Some(func) = &tc.function {
+                                                    entry.1 = func.name.clone().unwrap_or_default();
+                                                }
+                                                let _ = tx.send(Ok(StreamEvent::ToolCallStart {
+                                                    id: entry.0.clone(),
+                                                    name: entry.1.clone(),
+                                                }));
                                             }
-                                            let _ = tx.send(Ok(StreamEvent::ToolCallStart {
-                                                id: entry.0.clone(),
-                                                name: entry.1.clone(),
-                                            }));
                                         }
                                         if let Some(func) = &tc.function {
                                             if let Some(args) = &func.arguments {
@@ -905,6 +910,7 @@ mod tests {
             reasoning_history: Some("exclude".into()),
             thinking_enabled: None,
             thinking_budget: None,
+            skip_tls_verify: false,
             ephemeral: false,
         };
         let p = OpenAiProvider::new(&cfg).expect("provider builds");
@@ -942,6 +948,7 @@ mod tests {
             reasoning_history: Some("always".into()),
             thinking_enabled: None,
             thinking_budget: None,
+            skip_tls_verify: false,
             ephemeral: false,
         };
         let err = match OpenAiProvider::new(&cfg) {

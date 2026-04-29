@@ -1,4 +1,5 @@
 // crates/atomcode-tuix/src/render/mod.rs
+pub mod alt_screen;
 pub mod cell;
 pub mod plain;
 pub mod retained;
@@ -20,6 +21,8 @@ pub enum UiLine {
     },
     User(String),
     AssistantText(String),
+    /// LLM reasoning/thinking content (displayed in gray/dimmed style)
+    ReasoningText(String),
     AssistantLineBreak,
     ToolCall {
         name: String,
@@ -33,6 +36,7 @@ pub enum UiLine {
     /// static `▸` icon by `ToolCallCommit` once the matching result
     /// lands, freeing the live-row slot for the spinner to resume.
     ToolCallInFlight {
+        id: String,
         name: String,
         detail: String,
     },
@@ -40,7 +44,10 @@ pub enum UiLine {
     /// static `▸` icon. Emitted right before `ToolResult` so the
     /// bottom body row stops animating exactly when the result is
     /// about to be appended below it.
-    ToolCallCommit,
+    /// If `call_id` is provided, only commits if the inflight_tool matches.
+    ToolCallCommit {
+        call_id: Option<String>,
+    },
     ToolResult {
         success: bool,
         summary: String,
@@ -168,6 +175,29 @@ pub trait Renderer: Send {
     /// Default is no-op — backends that don't care about geometry
     /// (Plain, tests) don't need to override.
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
+
+    /// Scroll the body viewport up (negative `delta`) or down
+    /// (positive `delta`) by `delta` rows. Used by AltScreenRenderer
+    /// to support PageUp / PageDown / arrow-up scrollback navigation
+    /// inside the alt-screen (where the host terminal's native
+    /// scrollback is unavailable).
+    ///
+    /// Default no-op for renderers that delegate scrollback to the
+    /// host terminal (RetainedRenderer's DECSTBM path; PlainRenderer
+    /// streaming to stdout).
+    fn scroll_body(&mut self, _delta: i32) {}
+
+    /// Jump the body viewport to the absolute top / bottom of
+    /// scrollback. Used for Home / End key handling.
+    fn scroll_body_to_top(&mut self) {}
+    fn scroll_body_to_bottom(&mut self) {}
+
+    /// Mouse text-selection hooks. Backends that own mouse capture can
+    /// override these; streaming/native-scrollback backends keep host
+    /// terminal selection behavior and no-op here.
+    fn begin_selection(&mut self, _col: u16, _row: u16) {}
+    fn update_selection(&mut self, _col: u16, _row: u16) {}
+    fn end_selection(&mut self) {}
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.

@@ -246,6 +246,9 @@ pub async fn execute_instructions(
                 TurnEvent::TextDelta(text) => {
                     let _ = event_tx.send(AgentEvent::TextDelta(text));
                 }
+                TurnEvent::ReasoningDelta(text) => {
+                    let _ = event_tx.send(AgentEvent::ReasoningDelta(text));
+                }
                 _ => {}
             }
         }

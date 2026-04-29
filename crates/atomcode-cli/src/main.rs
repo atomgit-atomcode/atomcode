@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
@@ -19,7 +19,7 @@ use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::mcp::{merge_stdio_mcp_server_into_json_file, McpRegistry, register_mcp_tools};
+use atomcode_core::mcp::{merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpRegistry};
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::bash::BashTool;
@@ -33,7 +33,9 @@ use atomcode_core::tool::search_replace::SearchReplaceTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
 use atomcode_core::tool::web_search::WebSearchTool;
 use atomcode_core::tool::write::WriteFileTool;
+use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
+use atomcode_core::lsp::manager::build_lsp_manager;
 
 use atomcode_core::auth;
 use atomcode_telemetry::{
@@ -468,6 +470,12 @@ enum Commands {
     /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
     #[command(subcommand)]
     Mcp(McpCli),
+    /// Start the HTTP daemon for IDE integration (VS Code extension connects to this)
+    Daemon {
+        /// Port to listen on (default: 13456)
+        #[arg(long, default_value = "13456")]
+        port: u16,
+    },
     /// Telemetry controls
     Telemetry {
         #[command(subcommand)]
@@ -721,12 +729,16 @@ async fn run() -> Result<i32> {
                     match result {
                         Ok(report) => {
                             print!("{}", report);
-                            telemetry.shutdown(std::time::Duration::from_millis(500)).await;
+                            telemetry
+                                .shutdown(std::time::Duration::from_millis(500))
+                                .await;
                             Ok::<i32, anyhow::Error>(0)
                         }
                         Err(e) => {
                             eprintln!("codingplan failed: {:#}", e);
-                            telemetry.shutdown(std::time::Duration::from_millis(500)).await;
+                            telemetry
+                                .shutdown(std::time::Duration::from_millis(500))
+                                .await;
                             Ok(1)
                         }
                     }
@@ -762,6 +774,38 @@ async fn run() -> Result<i32> {
                     }
                 }
             }
+            Commands::Daemon { port } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                eprintln!("Starting AtomCode daemon on port {}...", port);
+                eprintln!("Press Ctrl+C to stop.");
+                // Re-exec into the atomcode-daemon binary with matching port.
+                // This keeps the daemon as a separate compilation unit while
+                // providing a user-friendly `atomcode daemon` subcommand.
+                let daemon_bin = std::env::current_exe().ok().and_then(|p| {
+                    let dir = p.parent()?;
+                    let daemon = dir.join("atomcode-daemon");
+                    if daemon.exists() {
+                        Some(daemon)
+                    } else {
+                        None
+                    }
+                });
+                match daemon_bin {
+                    Some(bin) => {
+                        let status = std::process::Command::new(bin)
+                            .arg("--port")
+                            .arg(port.to_string())
+                            .status()
+                            .context("Failed to start atomcode-daemon")?;
+                        return Ok(if status.success() { 0 } else { 1 });
+                    }
+                    None => {
+                        eprintln!("Error: atomcode-daemon binary not found next to atomcode.");
+                        eprintln!("Make sure both binaries are installed together.");
+                        return Ok(1);
+                    }
+                }
+            }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 let config_file_path = Config::default_path();
@@ -770,7 +814,9 @@ async fn run() -> Result<i32> {
                         telemetry_cmd::status(&atomcode_dir, &telemetry_cfg)?
                     }
                     TelemetryAction::Enable => telemetry_cmd::enable(&config_file_path)?,
-                    TelemetryAction::Disable => telemetry_cmd::disable(&config_file_path, &telemetry).await?,
+                    TelemetryAction::Disable => {
+                        telemetry_cmd::disable(&config_file_path, &telemetry).await?
+                    }
                     TelemetryAction::Dump { last, pretty } => {
                         telemetry_cmd::dump(&atomcode_dir, last, pretty)?
                     }
@@ -801,6 +847,7 @@ async fn run() -> Result<i32> {
                 reflection_cadence: 7,
                 telemetry: Default::default(),
                 lsp: Default::default(),
+                auto_commit: false,
             }
         })
     } else {
@@ -815,6 +862,7 @@ async fn run() -> Result<i32> {
             reflection_cadence: 7,
             telemetry: Default::default(),
             lsp: Default::default(),
+            auto_commit: false,
         }
     };
 
@@ -840,6 +888,7 @@ async fn run() -> Result<i32> {
                 reasoning_history: None,
                 thinking_enabled: None,
                 thinking_budget: None,
+                skip_tls_verify: false,
                 ephemeral: false,
             },
             String::new(),
@@ -938,21 +987,50 @@ async fn run() -> Result<i32> {
     let enabled = |name: &str| !disabled_tools.contains(name);
 
     let mut tool_registry = ToolRegistry::new();
-    if enabled("read_file")      { tool_registry.register_sync(Box::new(ReadFileTool)); }
-    if enabled("write_file")     { tool_registry.register_sync(Box::new(WriteFileTool)); }
-    if enabled("edit_file")      { tool_registry.register_sync(Box::new(EditFileTool)); }
-    if enabled("bash")           { tool_registry.register_sync(Box::new(BashTool)); }
-    if enabled("change_dir")     { tool_registry.register_sync(Box::new(CdTool)); }
-    if enabled("grep")           { tool_registry.register_sync(Box::new(GrepTool)); }
-    if enabled("glob")           { tool_registry.register_sync(Box::new(GlobTool)); }
-    if enabled("list_directory") { tool_registry.register_sync(Box::new(ListDirTool)); }
-    if enabled("web_search")     { tool_registry.register_sync(Box::new(WebSearchTool)); }
-    if enabled("web_fetch")      { tool_registry.register_sync(Box::new(WebFetchTool)); }
-    if enabled("search_replace") { tool_registry.register_sync(Box::new(SearchReplaceTool)); }
+    if enabled("read_file") {
+        tool_registry.register_sync(Box::new(ReadFileTool));
+    }
+    if enabled("write_file") {
+        tool_registry.register_sync(Box::new(WriteFileTool));
+    }
+    if enabled("edit_file") {
+        tool_registry.register_sync(Box::new(EditFileTool));
+    }
+    if enabled("bash") {
+        tool_registry.register_sync(Box::new(BashTool));
+    }
+    // change_dir is opt-in: weak models (e.g. deepseek-v4-flash) repeatedly
+    // emit empty `arguments: {}` for it, looping the same broken call until
+    // the identical-args guard blocks it. Bash with `cd` already covers the
+    // legitimate use case (atomcode tracks `cd` in bash and mutates
+    // `working_dir` accordingly), and `/cd` lets the user switch manually.
+    // Set ATOMCODE_ENABLE_CD=1 to re-expose the tool to the LLM.
+    if enabled("change_dir") && std::env::var("ATOMCODE_ENABLE_CD").is_ok() {
+        tool_registry.register_sync(Box::new(CdTool));
+    }
+    if enabled("grep") {
+        tool_registry.register_sync(Box::new(GrepTool));
+    }
+    if enabled("glob") {
+        tool_registry.register_sync(Box::new(GlobTool));
+    }
+    if enabled("list_directory") {
+        tool_registry.register_sync(Box::new(ListDirTool));
+    }
+    if enabled("web_search") {
+        tool_registry.register_sync(Box::new(WebSearchTool));
+    }
+    if enabled("web_fetch") {
+        tool_registry.register_sync(Box::new(WebFetchTool));
+    }
+    if enabled("search_replace") {
+        tool_registry.register_sync(Box::new(SearchReplaceTool));
+    }
 
     // Determine if we're running in headless mode BEFORE loading MCP.
     // Headless mode requires MCP tools immediately; TUI can load them in background.
-    let is_headless = cli.prompt.is_some() || cli.prompt_file.is_some() || fixissue_prompt.is_some();
+    let is_headless =
+        cli.prompt.is_some() || cli.prompt_file.is_some() || fixissue_prompt.is_some();
 
     // Load MCP tools from .mcp.json (project) and ~/.atomcode/mcp.json (user).
     // For TUI mode, start connections in background to avoid blocking startup.
@@ -981,9 +1059,16 @@ async fn run() -> Result<i32> {
         (Some(mcp_registry), Some(rx))
     };
 
+    // Build LSP manager from config and inject into ToolContext.
+    let lsp_manager = build_lsp_manager(&config.lsp, &working_dir);
+    if lsp_manager.is_some() && enabled("diagnostics") {
+        tool_registry.register_sync(Box::new(DiagnosticsTool));
+    }
+
     // Pass the already-initialized telemetry handle into ToolContext.
-    let tool_context =
+    let mut tool_context =
         ToolContext::with_telemetry(working_dir.clone(), "default", telemetry.clone());
+    tool_context.lsp = lsp_manager;
 
     // Auto-continue the latest session for this working directory.
     // Same behavior as Claude Code: re-entering a project resumes where you left off.
@@ -1212,6 +1297,12 @@ async fn run_headless(
                 print!("{}", text);
                 io::stdout().flush()?;
             }
+            AgentEvent::ReasoningDelta(text) => {
+                // In CLI verbose mode, show reasoning/thinking content
+                if verbose {
+                    eprintln!("[thinking] {}", text);
+                }
+            }
             AgentEvent::ToolCallStreaming { name, hint } => {
                 if verbose {
                     let detail = if hint.is_empty() {
@@ -1230,6 +1321,11 @@ async fn run_headless(
                 if verbose {
                     let args = truncate_log_line(&arguments, 200);
                     eprintln!("[tool→ {} args={}]", name, args);
+                }
+            }
+            AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
+                if verbose {
+                    eprint!("{}", chunk);
                 }
             }
             AgentEvent::ToolCallResult {
@@ -1349,7 +1445,12 @@ async fn run_headless(
                     eprintln!("[sub-agent] {} {}", file, status);
                 }
             }
-            AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
+            AgentEvent::BackgroundComplete {
+                summary,
+                files_edited,
+                turns,
+                success,
+            } => {
                 let status = if success { "ok" } else { "fail" };
                 eprintln!("[background {} turns={}] {}", status, turns, summary);
                 if verbose && !files_edited.is_empty() {
@@ -1419,6 +1520,9 @@ async fn handle_command(cmd: Commands) -> Result<()> {
         }
         Commands::Telemetry { .. } => {
             unreachable!("Telemetry is handled inline in run() before handle_command")
+        }
+        Commands::Daemon { .. } => {
+            unreachable!("Daemon is handled inline in run() before handle_command")
         }
         Commands::Mcp(McpCli::Add {
             name,
@@ -1567,6 +1671,7 @@ fn run_codingplan_core(
             notifications: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),
+            auto_commit: false,
         },
     };
 
