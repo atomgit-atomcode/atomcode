@@ -954,20 +954,23 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
 
     // JediTerm auto-fallback hint: lib.rs detected
     // `TERMINAL_EMULATOR=JetBrains-JediTerm` (Android Studio, IntelliJ,
-    // PyCharm, etc.) and dropped to PlainRenderer because retained
-    // mode misrenders DECSTBM-pinned footers there (verified empirically:
-    // input box ends up offset from the status bar by ~20 rows of
-    // dead space). Tell the user what happened and how to get the
-    // full UI back. Only set by lib.rs when the user did NOT explicitly
-    // opt in via ATOMCODE_PLAIN — informed choices don't get lectured.
+    // PyCharm, etc.) and routed to AltScreenRenderer because the
+    // retained renderer's DECSTBM-pinned footer misaligns there.
+    // Tell the user about the trade-off — alt-screen owns the
+    // viewport so the host terminal's native scrollback isn't
+    // available; the app provides its own (PageUp / Shift+Up /
+    // mouse wheel). Only set by lib.rs when the user did NOT
+    // explicitly opt in via ATOMCODE_PLAIN / ATOMCODE_ALT —
+    // informed choices don't get lectured.
     if std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok() {
         std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
         renderer.render(UiLine::CommandOutput(
-            "  ⓘ JetBrains IDE terminal detected — running in plain mode.\n    \
-             The full UI (input box, slash menu, spinner) needs a more capable\n    \
-             terminal. Run atomcode in iTerm2, Terminal.app, Alacritty, WezTerm,\n    \
-             or Windows Terminal for the complete experience.\n    \
-             Set ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
+            "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
+             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+             Native terminal scrollback is unavailable while atomcode runs;\n    \
+             on exit your host terminal restores its pre-atomcode state.\n    \
+             Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
+             ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
                 .into(),
         ));
     }
@@ -975,20 +978,20 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     // Legacy Windows console (cmd.exe / classic conhost) auto-fallback
     // hint: lib.rs detected Windows + neither WT_SESSION nor
     // TERM_PROGRAM, which means the user is on stock conhost where
-    // DECSTBM scroll regions misbehave — rows that scroll out of the
-    // region get re-emitted into scrollback, so Page-Up shows the
-    // same content twice (verified by user report). Plain mode
-    // sidesteps that entirely. Mutually exclusive with the JediTerm
-    // hint (lib.rs gates legacy_conhost on `!is_jediterm`).
+    // DECSTBM misbehaves (rows duplicate in scrollback on Page-Up).
+    // Phase 5: now routes to AltScreenRenderer. Mutually exclusive
+    // with the JediTerm hint (lib.rs gates legacy_conhost on
+    // `!is_jediterm`).
     if std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok() {
         std::env::remove_var("ATOMCODE_LEGACY_CONHOST_FALLBACK");
         renderer.render(UiLine::CommandOutput(
-            "  ⓘ Legacy Windows console detected — running in plain mode.\n    \
-             The full UI (input box, slash menu, spinner) needs a more capable\n    \
-             terminal. Install Windows Terminal (free, Microsoft Store) or\n    \
-             use ConEmu / Alacritty / WezTerm for the complete experience.\n    \
-             Set ATOMCODE_RETAIN=1 to bypass this fallback (may show duplicated\n    \
-             content on Page-Up).\n\n"
+            "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
+             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+             Native terminal scrollback is unavailable while atomcode runs.\n    \
+             For full host-terminal scrollback support, install Windows Terminal\n    \
+             (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
+             Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
+             bypass this fallback (may show duplicated content on scroll).\n\n"
                 .into(),
         ));
     }
@@ -1594,10 +1597,18 @@ fn handle_input(
             InputEvent::Eof => "eof".into(),
             InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
             InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
+            InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
         }
     );
 
     match ev {
+        InputEvent::MouseScroll(delta) => {
+            // Mouse wheel — only the alt-screen renderer takes action;
+            // retained / plain default to no-op (host terminal handles
+            // their scrollback natively, mouse capture isn't enabled
+            // for them anyway).
+            renderer.scroll_body(delta);
+        }
         InputEvent::Resize(cols, rows) => {
             // Forward to the renderer so DECSTBM-based backends can
             // re-issue their scroll region and repaint the footer at
@@ -1737,6 +1748,23 @@ fn handle_input(
                     return Ok(());
                 }
             }
+            // PageUp / PageDown / Home / End: scroll the body
+            // viewport. Universal across phases — same as a terminal's
+            // own scrollback navigation. Only AltScreenRenderer
+            // implements these (it owns the alt-screen buffer and
+            // host-terminal scrollback is unavailable while we're
+            // in alt-screen); other renderers default to no-op so
+            // these keys do nothing in retained / plain modes (as
+            // before — those rely on the host terminal's native
+            // scrollback). We intercept BEFORE phase dispatch so
+            // scrolling works in Idle / Streaming alike.
+            if let Some(handled) =
+                handle_scroll_key(code, modifiers, renderer, &app.buf)
+            {
+                if handled {
+                    return Ok(());
+                }
+            }
             match app.state.phase {
                 UiPhase::Idle => handle_idle_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Streaming => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
@@ -1749,6 +1777,67 @@ fn handle_input(
         InputEvent::Key(_) => {}
     }
     Ok(())
+}
+
+/// Try handling a scroll-related key (PageUp/PageDown/Home/End).
+/// Returns:
+///   - `Some(true)`  → key consumed; caller should skip phase dispatch
+///   - `Some(false)` → key was a scroll key but not consumed (e.g.
+///     Home/End with text in input buffer, where they should move
+///     cursor instead)
+///   - `None`        → not a scroll key at all
+///
+/// AltScreenRenderer is the only renderer that does anything with
+/// these calls; the trait defaults are no-op so retained / plain
+/// silently fall through and let the existing phase dispatch handle
+/// the key (e.g. End-of-line cursor movement during input).
+fn handle_scroll_key(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    renderer: &mut dyn crate::render::Renderer,
+    buf: &Buffer,
+) -> Option<bool> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    // Don't intercept Home/End when the user is editing a non-empty
+    // buffer — those should move the cursor, not jump scrollback.
+    // PageUp/PageDown and Shift+Up/Shift+Down always scroll regardless
+    // (they're explicit scroll commands, not in-line editing keys).
+    let buf_empty = buf.text.is_empty();
+    let has_shift = modifiers.contains(KeyModifiers::SHIFT);
+    match code {
+        // Page-step. macOS keyboards: Fn+Up / Fn+Down generate
+        // PageUp / PageDown. iTerm2 / Windows have dedicated keys.
+        KeyCode::PageUp => {
+            renderer.scroll_body(-10);
+            Some(true)
+        }
+        KeyCode::PageDown => {
+            renderer.scroll_body(10);
+            Some(true)
+        }
+        // Line-step. Shift+Up / Shift+Down is the cross-keyboard
+        // alternative for users without a dedicated PageUp/Down key.
+        // Bare Up/Down stays bound to input-history navigation
+        // (Action::HistoryPrev/Next via key_action::map) for backward
+        // compat with retained mode.
+        KeyCode::Up if has_shift => {
+            renderer.scroll_body(-1);
+            Some(true)
+        }
+        KeyCode::Down if has_shift => {
+            renderer.scroll_body(1);
+            Some(true)
+        }
+        KeyCode::Home if buf_empty && modifiers.is_empty() => {
+            renderer.scroll_body_to_top();
+            Some(true)
+        }
+        KeyCode::End if buf_empty && modifiers.is_empty() => {
+            renderer.scroll_body_to_bottom();
+            Some(true)
+        }
+        _ => None,
+    }
 }
 
 /// Slash-command palette state. Active whenever buf starts with '/'.

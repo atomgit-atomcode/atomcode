@@ -19,4 +19,10 @@ pub enum InputEvent {
     /// scroll region can re-flow to the new height (footer stays
     /// pinned at `[H - footer_rows + 1, H]`).
     Resize(u16, u16),
+    /// Mouse scroll wheel. `delta` lines: negative = up (older
+    /// content), positive = down (newer). Only emitted when the
+    /// active renderer has enabled mouse capture (currently
+    /// AltScreenRenderer only — RetainedRenderer relies on host-
+    /// terminal scrollback, PlainRenderer doesn't pin a UI).
+    MouseScroll(i32),
 }

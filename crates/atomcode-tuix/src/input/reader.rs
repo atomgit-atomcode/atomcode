@@ -386,7 +386,19 @@ fn run(
                     }
                     Event::Paste(p) => InputEvent::Paste(p),
                     Event::Resize(w, h) => InputEvent::Resize(w, h),
-                    Event::Mouse(_) => continue,
+                    Event::Mouse(m) => {
+                        // Only mouse-scroll events route through;
+                        // clicks / drags are still dropped.
+                        match m.kind {
+                            crossterm::event::MouseEventKind::ScrollUp => {
+                                InputEvent::MouseScroll(-3)
+                            }
+                            crossterm::event::MouseEventKind::ScrollDown => {
+                                InputEvent::MouseScroll(3)
+                            }
+                            _ => continue,
+                        }
+                    }
                     Event::FocusGained => {
                         atomcode_core::notify::set_terminal_focus_state(Some(true));
                         continue;
@@ -416,9 +428,17 @@ fn run(
                 crate::tuix_trace!("RD", "resize {}x{}", w, h);
                 InputEvent::Resize(w, h)
             }
-            Event::Mouse(_) => {
-                continue;
-            }
+            Event::Mouse(m) => match m.kind {
+                crossterm::event::MouseEventKind::ScrollUp => {
+                    crate::tuix_trace!("RD", "mouse scroll up");
+                    InputEvent::MouseScroll(-3)
+                }
+                crossterm::event::MouseEventKind::ScrollDown => {
+                    crate::tuix_trace!("RD", "mouse scroll down");
+                    InputEvent::MouseScroll(3)
+                }
+                _ => continue,
+            },
             Event::FocusGained => {
                 atomcode_core::notify::set_terminal_focus_state(Some(true));
                 continue;

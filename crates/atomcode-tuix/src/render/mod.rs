@@ -1,4 +1,5 @@
 // crates/atomcode-tuix/src/render/mod.rs
+pub mod alt_screen;
 pub mod cell;
 pub mod plain;
 pub mod retained;
@@ -174,6 +175,22 @@ pub trait Renderer: Send {
     /// Default is no-op — backends that don't care about geometry
     /// (Plain, tests) don't need to override.
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
+
+    /// Scroll the body viewport up (negative `delta`) or down
+    /// (positive `delta`) by `delta` rows. Used by AltScreenRenderer
+    /// to support PageUp / PageDown / arrow-up scrollback navigation
+    /// inside the alt-screen (where the host terminal's native
+    /// scrollback is unavailable).
+    ///
+    /// Default no-op for renderers that delegate scrollback to the
+    /// host terminal (RetainedRenderer's DECSTBM path; PlainRenderer
+    /// streaming to stdout).
+    fn scroll_body(&mut self, _delta: i32) {}
+
+    /// Jump the body viewport to the absolute top / bottom of
+    /// scrollback. Used for Home / End key handling.
+    fn scroll_body_to_top(&mut self) {}
+    fn scroll_body_to_bottom(&mut self) {}
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.

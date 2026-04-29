@@ -211,6 +211,15 @@ pub async fn run(
         .ok()
         .filter(|v| !v.is_empty())
         .is_some();
+    // `ATOMCODE_ALT=1` is the user-explicit opt-in to the alt-screen
+    // renderer. Phase 5: JediTerm / legacy-conhost auto-detection now
+    // also routes here (was: PlainRenderer). ATOMCODE_PLAIN=1 still
+    // wins over both — it's the informed-user choice for the bare
+    // CI-style baseline.
+    let force_alt_env = std::env::var("ATOMCODE_ALT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
     let is_jediterm = std::env::var("TERMINAL_EMULATOR")
         .map(|v| v == "JetBrains-JediTerm")
         .unwrap_or(false);
@@ -221,9 +230,9 @@ pub async fn run(
     // diverges from xterm in ways that break our retained renderer:
     // body rows that scroll out of the region get re-emitted into
     // scrollback on the next paint, so users see the SAME content
-    // pair-up TWICE when they Page-Up. Same comment block in
-    // terminal.rs already names this for the unicode-symbols fallback;
-    // we now also use it to gate retained vs plain.
+    // pair-up TWICE when they Page-Up. terminal.rs already names this
+    // for the unicode-symbols fallback; we use it here to route to
+    // alt-screen (DECSTBM-free).
     //
     // Distinguishing legacy conhost from modern Windows terminals:
     //   * Windows Terminal sets `WT_SESSION` (well-behaved, retained OK)
@@ -238,9 +247,22 @@ pub async fn run(
         && std::env::var("WT_SESSION").is_err()
         && std::env::var("TERM_PROGRAM").is_err();
 
-    let force_plain = force_plain_env
-        || (is_jediterm && !force_retain)
-        || (is_legacy_conhost && !force_retain);
+    // Phase 5 routing matrix:
+    //   ATOMCODE_PLAIN=1                              → PlainRenderer (user opt-in)
+    //   ATOMCODE_RETAIN=1                             → RetainedRenderer (user opt-in)
+    //   ATOMCODE_ALT=1                                → AltScreenRenderer (user opt-in)
+    //   JediTerm / legacy conhost (no opt-in)         → AltScreenRenderer (auto)
+    //   default tty                                   → RetainedRenderer
+    //
+    // `force_plain` survives only as a route to PlainRenderer when
+    // explicitly asked for via ATOMCODE_PLAIN=1. The auto-detect
+    // path no longer routes there (Phase 4 made plain-on-tty work,
+    // Phase 5 upgrades the auto-fallback to alt-screen so users
+    // get the full UI).
+    let force_plain = force_plain_env;
+    let auto_alt_screen = !force_plain_env
+        && !force_retain
+        && (is_jediterm || is_legacy_conhost);
 
     // Marker env vars so the event loop can render a one-line hint
     // explaining what just happened and how to recover. Only set
@@ -263,13 +285,29 @@ pub async fn run(
     // ATOMCODE_PLAIN=1 force_plain paths.
     let was_real_tty = caps.tty;
 
+    // `want_alt_screen` is decided AFTER force_plain so a user who
+    // sets both ATOMCODE_PLAIN=1 and ATOMCODE_ALT=1 lands on plain
+    // (informed-choice priority — they explicitly opted into the
+    // bare baseline). Also requires a real TTY: alt-screen on a
+    // pipe / CI sink is meaningless.
+    //
+    // Phase 5: auto-detection (JediTerm / conhost) also lands here,
+    // so JetBrains-IDE / cmd.exe users get the full UI without
+    // setting any env var. Manual `ATOMCODE_RETAIN=1` still bypasses
+    // (lets the curious try retained on those terminals despite the
+    // known DECSTBM issues).
+    let want_alt_screen =
+        (force_alt_env || auto_alt_screen) && !force_plain_env && was_real_tty;
+
     // When force_plain wins, strip raw-mode-related capabilities so
     // every downstream branch (TerminalGuard activate, reader spawn,
     // renderer choice) consistently picks the cooked-mode / Plain
     // path. `tty=false` also skips Kitty enhancement push and the
     // startup screen clear (both emit CSI sequences that JediTerm
-    // mishandles, and PlainRenderer doesn't need either).
-    if force_plain {
+    // mishandles, and PlainRenderer doesn't need either). Skip the
+    // mutation when alt-screen is winning — alt-screen needs raw
+    // mode + bracketed paste + tty intact for full UI.
+    if force_plain && !want_alt_screen {
         caps.raw_mode = false;
         caps.bracketed_paste = false;
         caps.tty = false;
@@ -293,7 +331,14 @@ pub async fn run(
     // TTY → retained-mode Ink-style cell-diff renderer.
     // Non-TTY (pipe, CI, dumb terminal, force_plain) → PlainRenderer,
     // which just writes plain text without ANSI cursor positioning.
-    let inner: Box<dyn Renderer> = if caps.tty {
+    let inner: Box<dyn Renderer> = if want_alt_screen {
+        // Alt-screen renderer: takes over the alternate screen buffer
+        // (`\x1b[?1049h`) so it can use absolute cursor positioning
+        // without depending on DECSTBM scroll regions. Trade-off:
+        // host terminal's native scrollback is unavailable while the
+        // app runs (in-app PageUp/PageDown ships in Phase 2).
+        Box::new(crate::render::alt_screen::AltScreenRenderer::new(caps))
+    } else if caps.tty {
         Box::new(RetainedRenderer::new(caps))
     } else {
         // Pass caps + the ORIGINAL tty value so PlainRenderer can:

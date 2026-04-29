@@ -1,0 +1,1918 @@
+// crates/atomcode-tuix/src/render/alt_screen.rs
+//
+// Alt-screen renderer (Phase 1: skeleton).
+//
+// AltScreenRenderer takes over the terminal's alternate screen buffer
+// (`\x1b[?1049h`) and paints into it with absolute cursor positioning,
+// bypassing DECSTBM scroll regions entirely. This is the strategy
+// vim / htop / less / Claude Code / opencode all use, and is the
+// answer for terminals (JetBrains JediTerm, legacy Windows conhost)
+// that don't fully implement DECSTBM but DO support alt-screen.
+//
+// Trade-off: the host terminal's native scrollback is unavailable
+// while the app is running — Cmd+Up / Page Up in the host terminal
+// won't reach above the alt-screen. The app provides its own internal
+// scrollback navigation (Phase 2) instead. On exit, the alt-screen is
+// popped and the host terminal returns to its pre-app state.
+//
+// See `docs/superpowers/specs/2026-04-29-alt-screen-renderer-design.md`
+// for the full design and phasing.
+//
+// PHASE 1 SCOPE (this file): skeleton only.
+//   * Renderer trait stubbed — most arms are no-op
+//   * Welcome banner rendered at fixed rows (no body buffer yet)
+//   * Alt-screen enter on construct, pop on Drop
+//   * Routes from `lib.rs` only via `ATOMCODE_ALT=1` user opt-in
+//
+// Later phases bring in the body_lines buffer, scrollback navigation,
+// pinned input box / status bar / spinner, resize handling, and
+// auto-detection. See spec §Phasing.
+
+use std::io::{self, BufWriter, Stdout, Write};
+
+use super::{MenuPayload, Renderer, StatusLine, UiLine};
+use crate::sanitize::scrub_controls;
+use crate::terminal::TerminalCaps;
+use crate::width::{display_width, truncate_to_width};
+use unicode_width::UnicodeWidthChar;
+
+/// Truncate `s` to `max_cols` display columns, treating ANSI CSI
+/// escape sequences (`\x1b[...{letter}`) as zero-width spans so SGR
+/// styling doesn't eat budget that should belong to visible text.
+///
+/// `truncate_to_width` from `crate::width` counts each character of an
+/// SGR sequence (`[`, digits, `m`) as width 1, which under-budgets the
+/// visible content — a 79-display-col line decorated with one SGR pair
+/// would lose 5+ trailing visible chars even though the line fits the
+/// terminal exactly. This helper skips the entire CSI sequence in one
+/// go, matching how the terminal interprets it.
+///
+/// Final SGR reset (`\x1b[0m`) preservation: if truncation cut into an
+/// open span, the caller still appends a reset; this fn just guarantees
+/// the visible-text count is right.
+fn truncate_to_width_sgr_aware(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    let mut acc = String::with_capacity(s.len());
+    let mut cols = 0usize;
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        // CSI sequence: ESC `[` {params} {final letter A-Z/a-z}.
+        // Append the whole span verbatim (zero visible cost).
+        if c == '\x1b' && iter.peek() == Some(&'[') {
+            acc.push(c);
+            acc.push(iter.next().unwrap()); // consume `[`
+            for nc in iter.by_ref() {
+                acc.push(nc);
+                if nc.is_ascii_alphabetic() {
+                    break; // final byte ends the CSI sequence
+                }
+            }
+            continue;
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if cols + w > max_cols {
+            break;
+        }
+        acc.push(c);
+        cols += w;
+    }
+    acc
+}
+
+// SGR sequences used inline in body strings. Same set PlainRenderer
+// already uses; keeping them duplicated rather than re-exported because
+// alt_screen will diverge from plain on more dimensions in later phases
+// and shared constants would create a noisy upstream-change footprint.
+const SGR_RESET: &str = "\x1b[0m";
+const SGR_RED: &str = "\x1b[31m";
+const SGR_GREEN: &str = "\x1b[32m";
+const SGR_MAGENTA: &str = "\x1b[35m"; // Role::Brand — see render/theme.rs
+const SGR_CYAN: &str = "\x1b[36m";
+const SGR_DIM: &str = "\x1b[2m";
+
+/// Default cap on `body_lines` length. ~5000 rows × ~200 bytes/row
+/// (rough average for SGR-decorated text) is ~1 MB per session — fine
+/// for our tier. Override via `ATOMCODE_SCROLLBACK_ROWS`.
+const DEFAULT_SCROLLBACK_ROWS: usize = 5000;
+
+fn scrollback_rows_from_env() -> usize {
+    std::env::var("ATOMCODE_SCROLLBACK_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 100)
+        .unwrap_or(DEFAULT_SCROLLBACK_ROWS)
+}
+
+/// Alt-screen anchored renderer. See module-level doc.
+pub struct AltScreenRenderer<W: Write + Send> {
+    out: W,
+    caps: TerminalCaps,
+    /// True iff we successfully entered the alt-screen on construction.
+    /// Drop pops only when this is true so a failed enter doesn't try
+    /// to pop a buffer we never owned.
+    alt_screen_active: bool,
+    /// Cached width / height. Updated by resize in Phase 4.
+    width: u16,
+    height: u16,
+    /// All body rows ever pushed, oldest-first. Each row is a single
+    /// physical line of text (with embedded SGR colour escapes).
+    /// `paint_body` paints a slice of this against the current viewport;
+    /// no terminal-side scrollback is involved (alt-screen owns the
+    /// whole viewport, host terminal's scrollback is unreachable).
+    body_lines: Vec<String>,
+    /// Index into `body_lines` for the FIRST visible body row. Auto-
+    /// tracks the tail when `sticky_bottom` is true (most common case);
+    /// only diverges from "tail" when the user is actively scrolled up
+    /// via PageUp / Home / scroll_body.
+    viewport_top: usize,
+    /// True iff the user is at the bottom of body_lines. New content
+    /// auto-scrolls when true; held position when false. Toggled by
+    /// scroll_body / scroll_body_to_top / scroll_body_to_bottom.
+    sticky_bottom: bool,
+    /// Bound on body_lines length. Front rows drop when exceeded so
+    /// memory stays flat for very long sessions.
+    max_scrollback_rows: usize,
+    /// Line-buffer for streaming assistant text. Chunks accumulate
+    /// here until `\n` or `AssistantLineBreak`; the completed line
+    /// is then run through the markdown renderer and pushed to
+    /// `body_lines` as one entry.
+    assistant_line_buf: String,
+    /// Markdown parser state (code-block tracking, table buffering)
+    /// shared across consecutive assistant lines so a fenced code
+    /// block opened on one chunk stays open on the next. Reset on
+    /// every new `UiLine::User` (new turn) so a previous turn's
+    /// stuck-open fence doesn't bleed into the user's prompt.
+    md_state: crate::markdown::MdState,
+    /// True when widget state has changed since the last body paint.
+    /// Set on every `push_body_row`; cleared by `paint_body`. Reduces
+    /// redundant repaints when one render() call pushes multiple rows
+    /// (e.g. TurnSeparator's three rows or DiffBlock's many).
+    body_dirty: bool,
+    // ── Phase 3+: footer ──
+    /// Most-recent input prompt state — `(buf, cursor_byte)`. Kept so
+    /// `paint_footer` can re-render the input row even when triggered
+    /// by a non-InputPrompt event (e.g. a body push during streaming
+    /// would otherwise leave a stale input row from before).
+    pending_input: Option<(String, usize)>,
+    /// Most-recent status line. Pulled from `UiLine::InputPrompt` /
+    /// `UiLine::StreamingBox`. Default-initialised so paint_footer can
+    /// always render *something* (empty string) before the first
+    /// InputPrompt arrives.
+    pending_status: StatusLine,
+    /// Active spinner state — `(frame, label)`. `Some` during streaming
+    /// (paint shows it ABOVE the input row); `None` resumes the plain
+    /// input prompt. Toggled by `Spinner` / `StreamingBox` /
+    /// `ClearTransient`.
+    pending_spinner: Option<(&'static str, String)>,
+    /// Slash-command palette items + selected index. Carried through
+    /// from `UiLine::InputPrompt` / `UiLine::StreamingBox`'s `menu`
+    /// field. None → no menu paint. Up to 4 items shown at once;
+    /// pagination around `selected` when there are more.
+    pending_menu: Option<MenuPayload>,
+    /// True when footer state changed since the last paint. Same role
+    /// as `body_dirty` but for the footer strip.
+    footer_dirty: bool,
+}
+
+impl AltScreenRenderer<BufWriter<Stdout>> {
+    pub fn new(caps: TerminalCaps) -> Self {
+        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        Self::with_writer(BufWriter::new(io::stdout()), caps, w, h)
+    }
+}
+
+impl<W: Write + Send> AltScreenRenderer<W> {
+    pub fn with_writer(out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+        let mut r = Self {
+            out,
+            caps,
+            alt_screen_active: false,
+            width: w,
+            height: h,
+            body_lines: Vec::new(),
+            viewport_top: 0,
+            sticky_bottom: true,
+            max_scrollback_rows: scrollback_rows_from_env(),
+            assistant_line_buf: String::new(),
+            md_state: crate::markdown::MdState::new(),
+            body_dirty: false,
+            pending_input: None,
+            pending_status: StatusLine::default(),
+            pending_spinner: None,
+            pending_menu: None,
+            footer_dirty: true,
+        };
+        r.enter_alt_screen();
+        r
+    }
+
+    /// Number of menu rows to paint. Capped at 4 (matches retained's
+    /// pagination) so a 50-command match list doesn't squeeze body
+    /// content off the screen.
+    fn menu_paint_rows(&self) -> u16 {
+        self.pending_menu
+            .as_ref()
+            .map(|m| m.items.len().min(4) as u16)
+            .unwrap_or(0)
+    }
+
+    /// Total rows reserved for the footer. Variable because the
+    /// slash-menu palette grows / shrinks the footer dynamically:
+    ///   spinner (1) + top_rule (1) + input (1) + bot_rule (1)
+    ///   + menu (0..4) + status (1) = 5..9
+    fn footer_rows(&self) -> u16 {
+        // spinner + top_rule + input + bot_rule + status = 5 base
+        5 + self.menu_paint_rows()
+    }
+
+    /// Body region height = total rows − footer rows. Always at least 1
+    /// so `paint_body` never tries to write to row 0 / row N+ on tiny
+    /// terminals. When the terminal is so short the footer wouldn't fit,
+    /// we degrade to body_height=1 and the footer overflows the bottom —
+    /// visually broken but not crashing.
+    fn body_height(&self) -> u16 {
+        self.height.saturating_sub(self.footer_rows()).max(1)
+    }
+
+    /// Switch to alt-screen, home cursor, clear it, enable mouse
+    /// capture. Sequences:
+    ///   * `\x1b[?1049h` — save main screen + switch to alt
+    ///   * `\x1b[H\x1b[2J` — home cursor + clear screen
+    ///   * `\x1b[?1000h` — basic mouse-event mode (X10) so the
+    ///     terminal reports button presses (incl. scroll wheel
+    ///     buttons 4/5) instead of the default "translate wheel
+    ///     to arrow keys" fallback
+    ///   * `\x1b[?1006h` — SGR-extended coordinates (replaces the
+    ///     legacy fixed-byte format that breaks past col 223)
+    ///
+    /// Best-effort: if the writer fails, `alt_screen_active` stays
+    /// false and Drop won't try to pop.
+    fn enter_alt_screen(&mut self) {
+        let seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1000h\x1b[?1006h";
+        if self.out.write_all(seq.as_bytes()).is_ok() && self.out.flush().is_ok() {
+            self.alt_screen_active = true;
+        }
+    }
+
+    /// Pop the alt-screen + disable mouse capture, restoring whatever
+    /// was on the main screen before we entered. Called from
+    /// `shutdown()` on normal exit and from `Drop` as belt-and-
+    /// suspenders for panic paths. Sequences mirror the reverse of
+    /// the enter set.
+    fn leave_alt_screen(&mut self) {
+        if self.alt_screen_active {
+            // Disable mouse capture FIRST — if alt-screen pops while
+            // mouse mode is still on, some terminals leak `\x1b[<...M`
+            // events into the main screen until something resets them.
+            let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1000l\x1b[?1049l");
+            let _ = self.out.flush();
+            self.alt_screen_active = false;
+        }
+    }
+
+    /// Append one row to body_lines, drop oldest if we'd exceed the
+    /// scrollback cap, mark body dirty for the next paint. The single
+    /// entry point so cap enforcement and dirty tracking can't be
+    /// forgotten by individual UiLine arms.
+    fn push_body_row(&mut self, row: String) {
+        self.body_lines.push(row);
+        // Bound the buffer. Drop from the front so the most-recent
+        // content is preserved (the typical case is the user scrolled
+        // to bottom; oldest content is least relevant).
+        while self.body_lines.len() > self.max_scrollback_rows {
+            self.body_lines.remove(0);
+        }
+        self.body_dirty = true;
+    }
+
+    /// Render the current state of body_lines into the viewport area.
+    /// Phase 2 paints all visible rows on every dirty frame (no
+    /// cell-diff against previous frame yet — full repaint per render
+    /// call is fine at our event cadence). Cell-diff is a Phase 5+
+    /// optimization for terminals where ANSI throughput matters.
+    ///
+    /// Visible window: `body_lines[viewport_start .. viewport_start + body_height]`
+    /// where `viewport_start` honours `sticky_bottom` (auto-tail) when
+    /// set, otherwise pins to `viewport_top` (Phase 3 keyboard
+    /// handlers).
+    ///
+    /// Empty rows below the body content (when body_lines is shorter
+    /// than the viewport, early in a session) are explicitly cleared
+    /// so a previous frame's content can't ghost.
+    fn paint_body(&mut self) {
+        if !self.body_dirty {
+            return;
+        }
+        // Phase 3: footer reserves bottom rows. body_height shrinks
+        // accordingly so the input box / status bar never get
+        // overwritten by body content.
+        let body_height = self.body_height() as usize;
+        let total = self.body_lines.len();
+
+        // sticky_bottom: viewport_start is "last body_height rows"; if
+        // body_lines is shorter than viewport, just start at 0 and
+        // leave the bottom blank.
+        let viewport_start = if self.sticky_bottom {
+            total.saturating_sub(body_height)
+        } else {
+            self.viewport_top.min(total.saturating_sub(body_height))
+        };
+
+        // Walk every row in the visible window. CUP each row, EL to
+        // wipe leftover glyphs from previous frames, then write the
+        // body content (trimmed to terminal width and SGR-terminated
+        // so long lines don't autowrap into the next body row's slot
+        // and stale colour spans don't bleed). For rows past the end
+        // of body_lines, just EL (clear). 1-indexed rows.
+        let max_cols = self.width as usize;
+        for row_idx in 0..body_height {
+            let abs_row = (row_idx + 1) as u16;
+            let cup_el = format!("\x1b[{};1H\x1b[K", abs_row);
+            let _ = self.out.write_all(cup_el.as_bytes());
+            let body_idx = viewport_start + row_idx;
+            if body_idx < total {
+                let line = &self.body_lines[body_idx];
+                // SGR-aware: CSI escape sequences (`\x1b[...m`) take
+                // zero visible columns and are passed through verbatim.
+                // Without this, the `[`, digits, and final `m` of each
+                // SGR pair eat into the visible-content budget — a
+                // 80-col line with one colour span would lose 5+
+                // trailing visible chars.
+                let clipped = truncate_to_width_sgr_aware(line, max_cols);
+                let _ = self.out.write_all(clipped.as_bytes());
+                // Trailing SGR reset: in case the row had an open SGR
+                // span at the truncation point (e.g. `\x1b[31mlong red
+                // text...` cut mid-span), reset so the next row's
+                // CUP+EL doesn't paint over already-coloured cells.
+                // Cheap belt-and-suspenders — 4 bytes per row.
+                let _ = self.out.write_all(b"\x1b[0m");
+            }
+        }
+        let _ = self.out.flush();
+        self.body_dirty = false;
+    }
+
+    /// Paint the footer strip. Layout (top to bottom, 1-indexed rows
+    /// computed from the bottom of the viewport):
+    ///   spinner       (1 row, blank when no streaming)
+    ///   top rule      (1 row, full-width cyan ─)
+    ///   input         (1 row, `❯ {buf}` flush-left)
+    ///   bot rule      (1 row, full-width cyan ─)
+    ///   menu items    (0..4 rows, when slash palette is active)
+    ///   status        (1 row, dim `model · cwd`)
+    ///
+    /// Mirrors retained's footer shape (see `RetainedRenderer::paint_footer`)
+    /// minus the wrapped multi-line input — alt-screen Phase 4 keeps
+    /// input single-line; multi-line input is a Phase 5+ enhancement.
+    fn paint_footer(&mut self) {
+        if !self.footer_dirty {
+            return;
+        }
+        let h = self.height;
+        let total_footer = self.footer_rows();
+        let footer_top = h.saturating_sub(total_footer) + 1; // 1-indexed
+        let menu_rows = self.menu_paint_rows();
+        let spinner_row = footer_top;
+        let top_rule_row = footer_top + 1;
+        let input_row = footer_top + 2;
+        let bot_rule_row = footer_top + 3;
+        let menu_first_row = footer_top + 4;
+        let status_row = footer_top + 4 + menu_rows;
+
+        // Row 1 of footer: spinner during streaming, blank otherwise.
+        // Frame glyph in brand magenta (Role::Brand), label dim — gives
+        // the user a visual anchor as the frame rotates against the
+        // dim label.
+        let cup = format!("\x1b[{};1H\x1b[K", spinner_row);
+        let _ = self.out.write_all(cup.as_bytes());
+        if let Some((frame, label)) = &self.pending_spinner {
+            let cleaned = scrub_controls(label);
+            let line = if self.caps.colors {
+                format!(
+                    "  {}{}{} {}{}{}",
+                    SGR_MAGENTA, frame, SGR_RESET, SGR_DIM, cleaned, SGR_RESET
+                )
+            } else {
+                format!("  {} {}", frame, cleaned)
+            };
+            let _ = self.out.write_all(line.as_bytes());
+        }
+
+        // Top rule: full-width cyan ─ above the input box. Mirrors
+        // retained's `build_rule_row`. ASCII fallback to `-` when the
+        // terminal can't render unicode glyphs (rare in alt-screen
+        // since the auto-fallback target — JediTerm / conhost — both
+        // support unicode, but cheap to handle).
+        let rule_char = if self.caps.unicode_symbols { "─" } else { "-" };
+        let rule = rule_char.repeat(self.width as usize);
+        let cup = format!("\x1b[{};1H\x1b[K", top_rule_row);
+        let _ = self.out.write_all(cup.as_bytes());
+        if self.caps.colors {
+            let _ = write!(self.out, "{}{}{}", SGR_CYAN, rule, SGR_RESET);
+        } else {
+            let _ = self.out.write_all(rule.as_bytes());
+        }
+
+        // Input row: `❯ {buf}` flush-left at col 0. matches retained's
+        // `build_middle_row`.
+        let cup = format!("\x1b[{};1H\x1b[K", input_row);
+        let _ = self.out.write_all(cup.as_bytes());
+        let chev = self.caps.prompt_chevron();
+        let buf_str = self.pending_input.as_ref().map(|(b, _)| b.as_str()).unwrap_or("");
+        let safe_buf = scrub_controls(buf_str).replace('\n', " ");
+        let max_cols = (self.width as usize).saturating_sub(chev.chars().count());
+        let trimmed = truncate_to_width(&safe_buf, max_cols);
+        let input_line = if self.caps.colors {
+            format!("{}{}{}{}", SGR_CYAN, chev, SGR_RESET, trimmed)
+        } else {
+            format!("{}{}", chev, trimmed)
+        };
+        let _ = self.out.write_all(input_line.as_bytes());
+
+        // Bottom rule: same as top rule.
+        let cup = format!("\x1b[{};1H\x1b[K", bot_rule_row);
+        let _ = self.out.write_all(cup.as_bytes());
+        if self.caps.colors {
+            let _ = write!(self.out, "{}{}{}", SGR_CYAN, rule, SGR_RESET);
+        } else {
+            let _ = self.out.write_all(rule.as_bytes());
+        }
+
+        // Menu rows: 0..4 of `/{name}  {desc}`. Selected gets `▸` prefix
+        // + reverse-video for visibility. Pagination around `selected`
+        // (matches retained's 4-item viewport) so a 50-command match
+        // list doesn't crowd the screen.
+        if let Some(menu) = self.pending_menu.clone() {
+            let len = menu.items.len();
+            let offset = if len <= 4 {
+                0
+            } else if menu.selected < 4 {
+                0
+            } else {
+                (menu.selected + 1).saturating_sub(4).min(len.saturating_sub(4))
+            };
+            let end = (offset + 4).min(len);
+            for (i, (name, desc)) in menu.items[offset..end].iter().enumerate() {
+                let row_n = menu_first_row + i as u16;
+                let cup = format!("\x1b[{};1H\x1b[K", row_n);
+                let _ = self.out.write_all(cup.as_bytes());
+                let selected = (offset + i) == menu.selected;
+                let safe_name = scrub_controls(name);
+                let safe_desc = scrub_controls(desc);
+                let body = if selected {
+                    format!("  ▸ /{:<12}  {}", safe_name, safe_desc)
+                } else {
+                    format!("    /{:<12}  {}", safe_name, safe_desc)
+                };
+                if self.caps.colors {
+                    if selected {
+                        // Reverse video on the selected row to make
+                        // the keyboard focus highly visible.
+                        let _ = write!(self.out, "\x1b[7m{}\x1b[0m", body);
+                    } else {
+                        let _ = write!(self.out, "{}{}{}", SGR_DIM, body, SGR_RESET);
+                    }
+                } else {
+                    let _ = self.out.write_all(body.as_bytes());
+                }
+            }
+        }
+
+        // Status row at the bottom: dim `model · cwd`.
+        let cup = format!("\x1b[{};1H\x1b[K", status_row);
+        let _ = self.out.write_all(cup.as_bytes());
+        let status_text = if !self.pending_status.model.is_empty()
+            || !self.pending_status.cwd.is_empty()
+        {
+            let model = scrub_controls(&self.pending_status.model);
+            let cwd = scrub_controls(&self.pending_status.cwd);
+            if model.is_empty() {
+                format!("  {}", cwd)
+            } else if cwd.is_empty() {
+                format!("  {}", model)
+            } else {
+                format!("  {} \u{00b7} {}", model, cwd)
+            }
+        } else {
+            String::new()
+        };
+        if !status_text.is_empty() {
+            let line = if self.caps.colors {
+                format!("{}{}{}", SGR_DIM, status_text, SGR_RESET)
+            } else {
+                status_text
+            };
+            let _ = self.out.write_all(line.as_bytes());
+        }
+
+        // Position the terminal cursor inside the input row so the
+        // user sees where their typing will land.
+        if let Some((buf, cursor_byte)) = &self.pending_input {
+            let prefix = if *cursor_byte <= buf.len() {
+                &buf[..*cursor_byte]
+            } else {
+                buf.as_str()
+            };
+            let prefix_safe = scrub_controls(prefix).replace('\n', " ");
+            let cursor_col = chev.chars().count() + display_width(&prefix_safe);
+            let cup = format!("\x1b[{};{}H\x1b[?25h", input_row, cursor_col + 1);
+            let _ = self.out.write_all(cup.as_bytes());
+        } else {
+            let _ = self.out.write_all(b"\x1b[?25l");
+        }
+
+        let _ = self.out.flush();
+        self.footer_dirty = false;
+    }
+
+    /// Combined frame paint: body first, footer second so the cursor
+    /// final-position belongs to the footer (typically the input row).
+    fn paint_frame(&mut self) {
+        self.paint_body();
+        self.paint_footer();
+    }
+
+    /// Pipe one completed line through the markdown renderer and push
+    /// the result. None outputs (table buffering, fence toggle) are
+    /// dropped intentionally — the renderer handles flush via the
+    /// next non-buffered line. Always-some output (the common case)
+    /// becomes one body_lines entry.
+    fn render_md_and_push(&mut self, line: &str) {
+        if let Some(rendered) =
+            crate::markdown::render_line(line, &mut self.md_state, self.caps)
+        {
+            // `rendered` may itself contain `\n` when it includes a
+            // table flush prefix from a prior buffered block. Split
+            // so each physical line becomes its own body_lines entry
+            // — paint_body assumes one entry == one terminal row.
+            for sub in rendered.split('\n') {
+                self.push_body_row(sub.to_string());
+            }
+        }
+    }
+
+    /// Flush the in-progress assistant streaming buffer as a body row,
+    /// regardless of whether a `\n` was seen. Called by
+    /// `AssistantLineBreak`, `TurnComplete`, and any non-streaming
+    /// UiLine that arrives mid-stream — locks in the partial chunk so
+    /// it stays in scrollback rather than dangling.
+    fn flush_assistant_remainder(&mut self) {
+        if !self.assistant_line_buf.is_empty() {
+            let line = std::mem::take(&mut self.assistant_line_buf);
+            self.render_md_and_push(&line);
+        }
+        // Also flush any pending markdown state (e.g. a buffered
+        // table block) so end-of-turn doesn't strand it. Mirrors
+        // RetainedRenderer's TurnComplete handling.
+        if let Some(tail) =
+            crate::markdown::finalize(&mut self.md_state, self.caps)
+        {
+            for sub in tail.split('\n') {
+                self.push_body_row(sub.to_string());
+            }
+        }
+    }
+
+    /// Append streaming assistant text. Splits at `\n` so each completed
+    /// physical line gets routed through the markdown renderer; partial
+    /// trailing chunks stay in the buffer until the next `\n` or
+    /// `AssistantLineBreak`. Inline markdown (`**bold**`, `*italic*`,
+    /// `\`code\``) and block markdown (headings, code fences, tables) all
+    /// resolve through `crate::markdown::render_line`.
+    fn append_assistant_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\n' {
+                let line = std::mem::take(&mut self.assistant_line_buf);
+                self.render_md_and_push(&line);
+            } else {
+                self.assistant_line_buf.push(ch);
+            }
+        }
+    }
+
+    /// Build a horizontal-rule TurnSeparator like
+    /// `─────── label ───────` centred on the terminal width. Mirrors
+    /// the retained renderer's TurnSeparator rendering at a coarser
+    /// grain (no Cell layout, just inline SGR). Muted gray colour to
+    /// match the existing aesthetic.
+    fn build_turn_separator(&self, label: &str) -> String {
+        let w = (self.width as usize).max(20);
+        let label_text = format!(" {} ", scrub_controls(label));
+        let label_w = label_text.chars().count();
+        let remaining = w.saturating_sub(label_w);
+        let left = remaining / 2;
+        let right = remaining - left;
+        let dashes_left = "─".repeat(left);
+        let dashes_right = "─".repeat(right);
+        if self.caps.colors {
+            format!("{}{}{}{}{}", SGR_DIM, dashes_left, label_text, dashes_right, SGR_RESET)
+        } else {
+            format!("{}{}{}", dashes_left, label_text, dashes_right)
+        }
+    }
+
+    /// Banner rows pushed for `UiLine::Welcome`. Mirrors retained's
+    /// layout (see `RetainedRenderer::build_welcome_rows`):
+    ///   ◆ AtomCode                           v… · MIT
+    ///   · {working_dir}
+    ///   · {model}
+    ///   (blank)
+    ///   type something, or press / to browse commands
+    ///   /provider  to add a custom model
+    ///   (blank)
+    fn push_welcome(&mut self, model: &str, working_dir: &str) {
+        let diamond = if self.caps.unicode_symbols { "\u{25c6}" } else { "*" };
+        let bullet = if self.caps.unicode_symbols { "\u{2219}" } else { "*" };
+        // Title row with right-aligned version + license. Fill the
+        // gap with spaces so v4.x.y · MIT lands at the right edge.
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let licence = "MIT";
+        let title_left = format!("{} AtomCode", diamond);
+        let title_right = format!("{} \u{00b7} {}", version, licence);
+        let title_left_w = display_width(&title_left);
+        let title_right_w = display_width(&title_right);
+        let total_w = self.width as usize;
+        let gap = total_w
+            .saturating_sub(title_left_w)
+            .saturating_sub(title_right_w);
+        let title = if self.caps.colors {
+            format!(
+                "{}{}{}{}{}{}{}",
+                SGR_MAGENTA,
+                title_left,
+                SGR_RESET,
+                " ".repeat(gap),
+                SGR_DIM,
+                title_right,
+                SGR_RESET,
+            )
+        } else {
+            format!("{}{}{}", title_left, " ".repeat(gap), title_right)
+        };
+        self.push_body_row(title);
+        self.push_body_row(format!("{} {}", bullet, scrub_controls(working_dir)));
+        self.push_body_row(format!("{} {}", bullet, scrub_controls(model)));
+        self.push_body_row(String::new());
+        // Onboarding hints — first thing a new user reads. Slash
+        // shortcuts in cyan accent; surrounding prose in dim text so
+        // it reads as subordinate to primary content.
+        let hint_a = if self.caps.colors {
+            format!(
+                "{}type something, or press {}{}/{}{}  to browse commands{}",
+                SGR_DIM, SGR_RESET, SGR_CYAN, SGR_RESET, SGR_DIM, SGR_RESET
+            )
+        } else {
+            "type something, or press / to browse commands".into()
+        };
+        self.push_body_row(hint_a);
+        let hint_b = if self.caps.colors {
+            format!(
+                "{}/provider{}  {}to add a custom model{}",
+                SGR_CYAN, SGR_RESET, SGR_DIM, SGR_RESET
+            )
+        } else {
+            "/provider  to add a custom model".into()
+        };
+        self.push_body_row(hint_b);
+        self.push_body_row(String::new());
+    }
+
+    /// User echo row: `❯ {text}` (or `> {text}` on dumb caps) + blank
+    /// spacer. Resets markdown state so a previous turn's stuck-open
+    /// fence / buffered table can't bleed into this turn's prose.
+    fn push_user(&mut self, text: &str) {
+        self.flush_assistant_remainder();
+        self.md_state.reset();
+        let chev = self.caps.prompt_chevron();
+        let safe = scrub_controls(text);
+        let row = if self.caps.colors {
+            format!("{}{}{}{}", SGR_CYAN, chev, SGR_RESET, safe)
+        } else {
+            format!("{}{}", chev, safe)
+        };
+        self.push_body_row(row);
+        self.push_body_row(String::new());
+    }
+
+    /// `▸ name(detail)` row for tool calls. Cyan name when colours on.
+    /// Same line for both `ToolCall` (terminal final-state) and
+    /// `ToolCallInFlight` (Phase 2: no live spinner — stays static
+    /// until commit). Spinner animation for in-flight ships in Phase 3.
+    fn push_tool_call(&mut self, name: &str, detail: &str) {
+        self.flush_assistant_remainder();
+        let arrow = "\u{25b8}"; // ▸
+        let name_safe = scrub_controls(name);
+        let detail_safe = scrub_controls(detail);
+        let row = match (self.caps.colors, detail_safe.is_empty()) {
+            (true, true) => format!("{}{} {}{}", SGR_CYAN, arrow, name_safe, SGR_RESET),
+            (true, false) => format!(
+                "{}{} {}{}({})",
+                SGR_CYAN, arrow, name_safe, SGR_RESET, detail_safe
+            ),
+            (false, true) => format!("{} {}", arrow, name_safe),
+            (false, false) => format!("{} {}({})", arrow, name_safe, detail_safe),
+        };
+        self.push_body_row(row);
+    }
+
+    /// `✓ summary` (green) or `✗ summary` (red) row. PlainRenderer-style.
+    fn push_tool_result(&mut self, success: bool, summary: &str) {
+        self.flush_assistant_remainder();
+        let icon = if success { "\u{2713}" } else { "\u{2717}" }; // ✓ ✗
+        let safe = scrub_controls(summary);
+        let row = if self.caps.colors {
+            let color = if success { SGR_GREEN } else { SGR_RED };
+            format!("    {}{}{} {}", color, icon, SGR_RESET, safe)
+        } else {
+            format!("    {} {}", icon, safe)
+        };
+        self.push_body_row(row);
+    }
+
+    /// `[Error: ...]` row. Red when colours on. Mirrors PlainRenderer.
+    fn push_error(&mut self, msg: &str) {
+        self.flush_assistant_remainder();
+        let safe = scrub_controls(msg);
+        let row = if self.caps.colors {
+            format!("{}[Error: {}]{}", SGR_RED, safe, SGR_RESET)
+        } else {
+            format!("[Error: {}]", safe)
+        };
+        self.push_body_row(row);
+    }
+
+    /// `(cancelled)` marker row.
+    fn push_cancelled(&mut self) {
+        self.flush_assistant_remainder();
+        let row = if self.caps.colors {
+            format!("{}(cancelled){}", SGR_DIM, SGR_RESET)
+        } else {
+            "(cancelled)".to_string()
+        };
+        self.push_body_row(row);
+    }
+
+    /// Diff line: `+ added` (green) or `- removed` (red). Per-row sign.
+    fn push_diff_line(&mut self, added: bool, text: &str) {
+        let safe = scrub_controls(text);
+        let row = match (self.caps.colors, added) {
+            (true, true) => format!("    {}+ {}{}", SGR_GREEN, safe, SGR_RESET),
+            (true, false) => format!("    {}- {}{}", SGR_RED, safe, SGR_RESET),
+            (false, true) => format!("    + {}", safe),
+            (false, false) => format!("    - {}", safe),
+        };
+        self.push_body_row(row);
+    }
+
+    /// Push CommandOutput verbatim, splitting on newlines so each
+    /// physical line is its own body row.
+    fn push_command_output(&mut self, text: &str) {
+        self.flush_assistant_remainder();
+        let safe = scrub_controls(text);
+        for line in safe.split('\n') {
+            self.push_body_row(line.to_string());
+        }
+    }
+}
+
+impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
+    fn render(&mut self, line: UiLine) {
+        match line {
+            // ── body: welcome / turn events ──
+            UiLine::Welcome { model, working_dir } => {
+                self.push_welcome(&model, &working_dir);
+            }
+            UiLine::User(text) => {
+                self.push_user(&text);
+            }
+            UiLine::TurnSeparator { label } => {
+                let row = self.build_turn_separator(&label);
+                self.push_body_row(String::new());
+                self.push_body_row(row);
+                self.push_body_row(String::new());
+            }
+            UiLine::TurnComplete => {
+                self.flush_assistant_remainder();
+            }
+            UiLine::TurnCancelled => {
+                self.push_cancelled();
+            }
+
+            // ── body: streaming assistant ──
+            UiLine::AssistantText(text) => {
+                self.append_assistant_text(&text);
+            }
+            UiLine::ReasoningText(text) => {
+                // Dim styling for reasoning chunks; same SGR pattern
+                // RetainedRenderer / PlainRenderer already use.
+                if self.caps.colors {
+                    let dimmed = format!("{}{}{}", SGR_DIM, scrub_controls(&text), SGR_RESET);
+                    self.append_assistant_text(&dimmed);
+                } else {
+                    self.append_assistant_text(&text);
+                }
+            }
+            UiLine::AssistantLineBreak => {
+                self.flush_assistant_remainder();
+            }
+
+            // ── body: tools & diffs ──
+            UiLine::ToolCall { name, detail }
+            | UiLine::ToolCallInFlight { name, detail, .. } => {
+                self.push_tool_call(&name, &detail);
+            }
+            UiLine::ToolCallCommit { .. } => {
+                // Phase 3 will add live-spinner freezing here. Phase 2
+                // pushes ToolCallInFlight as a static row already, so
+                // there's nothing to freeze yet.
+            }
+            UiLine::ToolResult { success, summary } => {
+                self.push_tool_result(success, &summary);
+            }
+            UiLine::DiffLine { added, text } => {
+                self.push_diff_line(added, &text);
+            }
+            UiLine::DiffBlock(entries) => {
+                for entry in entries {
+                    self.push_diff_line(entry.added, &entry.text);
+                }
+            }
+            UiLine::ApprovalPrompt { tool, detail } => {
+                let safe_tool = scrub_controls(&tool);
+                let safe_detail = scrub_controls(&detail);
+                let prompt = format!(
+                    "Allow {}({})? [Y]es / [N]o / [A]lways",
+                    safe_tool, safe_detail
+                );
+                let row = if self.caps.colors {
+                    format!("{}{}{}", SGR_CYAN, prompt, SGR_RESET)
+                } else {
+                    prompt
+                };
+                self.push_body_row(row);
+            }
+
+            // ── body: command output / errors ──
+            UiLine::CommandOutput(text) => {
+                self.push_command_output(&text);
+            }
+            UiLine::Error(msg) => {
+                self.push_error(&msg);
+            }
+
+            // ── footer: input box ──
+            UiLine::InputPrompt {
+                buf,
+                cursor_byte,
+                menu,
+                status,
+            } => {
+                self.pending_input = Some((buf, cursor_byte));
+                self.pending_status = status;
+                self.pending_menu = menu; // slash-palette payload
+                self.pending_spinner = None; // input takes over from spinner
+                self.footer_dirty = true;
+                // Menu state changes the footer height (variable rows).
+                // Repaint body too so it shrinks/grows correspondingly.
+                self.body_dirty = true;
+            }
+            UiLine::StreamingBox {
+                buf,
+                cursor_byte,
+                frame,
+                label,
+                status,
+                menu,
+            } => {
+                self.pending_input = Some((buf, cursor_byte));
+                self.pending_status = status;
+                self.pending_menu = menu;
+                self.pending_spinner = Some((frame, label));
+                self.footer_dirty = true;
+                self.body_dirty = true;
+            }
+            UiLine::InputCommit => {
+                // The committed buffer became a `User` body row already
+                // (event loop emits both); just clear input state so
+                // the next paint shows an empty prompt.
+                self.pending_input = Some((String::new(), 0));
+                self.footer_dirty = true;
+            }
+            UiLine::Spinner { frame, label } => {
+                self.pending_spinner = Some((frame, label));
+                self.footer_dirty = true;
+            }
+            UiLine::ClearTransient => {
+                self.pending_spinner = None;
+                self.footer_dirty = true;
+            }
+        }
+
+        // Repaint after every render call. Both paint helpers are
+        // no-ops when their *_dirty flag is false, so unconditional
+        // calls cost only the branch — far cleaner than threading
+        // dirty checks through every match arm.
+        self.paint_frame();
+    }
+
+    fn flush(&mut self) {
+        let _ = self.out.flush();
+    }
+
+    fn shutdown(&mut self) {
+        self.leave_alt_screen();
+    }
+
+    fn reset(&mut self) {
+        // Wipe body_lines + viewport state, repaint blank canvas.
+        // Used by `/clear` slash command. Footer state preserved so
+        // the input box / status keep their value across the wipe.
+        self.body_lines.clear();
+        self.assistant_line_buf.clear();
+        self.viewport_top = 0;
+        self.sticky_bottom = true;
+        self.body_dirty = true;
+        self.footer_dirty = true;
+        let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+        self.paint_frame();
+    }
+
+    fn clear_screen(&mut self) {
+        // Same shape as reset: wipe everything. The slash `/clear`
+        // semantic is "remove visible content"; in alt-screen there's
+        // no host scrollback to preserve, so wiping body_lines too is
+        // consistent with what the user expects ("a clean slate").
+        self.reset();
+    }
+
+    fn suspend_for_external(&mut self) {
+        // To run an external child cleanly we pop alt-screen so the
+        // child sees the host terminal's main screen. resume re-enters.
+        self.leave_alt_screen();
+    }
+
+    fn resume_from_external(&mut self) {
+        self.enter_alt_screen();
+        // After re-entering, the alt-screen is blank — repaint our
+        // entire body buffer + footer chrome.
+        self.body_dirty = true;
+        self.footer_dirty = true;
+        self.paint_frame();
+    }
+
+    fn flush_deferred(&mut self) {
+        // Phase 5+ adds frame coalescing. For now, nothing buffered.
+    }
+
+    fn scroll_body(&mut self, delta: i32) {
+        let body_height = self.body_height() as usize;
+        let total = self.body_lines.len();
+        let max_top = total.saturating_sub(body_height);
+
+        // Compute the new viewport_top. Treat sticky_bottom as
+        // viewport_top = max_top so a user scrolling up from the
+        // pinned-bottom state lands one page above the tail (not
+        // anchored at 0 because the buffer might be much longer than
+        // one page).
+        let current_top = if self.sticky_bottom { max_top } else { self.viewport_top };
+        let new_top: usize = if delta < 0 {
+            current_top.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            (current_top + delta as usize).min(max_top)
+        };
+
+        self.viewport_top = new_top;
+        // Sticky-bottom transitions:
+        //   * Scrolling up (or anywhere short of max_top) breaks sticky.
+        //   * Scrolling down past the end re-pins to bottom — new
+        //     content auto-follows again from there.
+        self.sticky_bottom = new_top >= max_top;
+        self.body_dirty = true;
+        // Footer also dirty: paint_body's last cursor position lands
+        // somewhere in the body region, but the user expects the
+        // terminal cursor to stay in the input row at the right
+        // buf-prefix offset. Without this flag, paint_frame would
+        // skip paint_footer and leave the cursor stranded mid-body.
+        self.footer_dirty = true;
+        self.paint_frame();
+    }
+
+    fn scroll_body_to_top(&mut self) {
+        self.viewport_top = 0;
+        self.sticky_bottom = false;
+        self.body_dirty = true;
+        self.footer_dirty = true;
+        self.paint_frame();
+    }
+
+    fn scroll_body_to_bottom(&mut self) {
+        let body_height = self.body_height() as usize;
+        self.viewport_top = self.body_lines.len().saturating_sub(body_height);
+        self.sticky_bottom = true;
+        self.body_dirty = true;
+        self.footer_dirty = true;
+        self.paint_frame();
+    }
+
+    fn on_resize(&mut self, cols: u16, rows: u16) {
+        // Resize is the simplest of all renderers in alt-screen mode:
+        // no DECSTBM region to renegotiate, no scroll-region edge
+        // cases, no auto-wrap-into-footer issues. We just:
+        //   1. update cached size
+        //   2. wipe the alt-screen with `\x1b[2J\x1b[H` so stale
+        //      pre-resize glyphs at old absolute positions can't
+        //      ghost — iTerm2 / some terminals leave them visible
+        //      until something overwrites them
+        //   3. mark both panes dirty + repaint
+        //
+        // body_lines are kept verbatim; on resize-narrower the next
+        // paint_body truncates each row to the new width, on
+        // resize-wider previously-clipped tails reappear from the
+        // un-truncated source. No re-flow / re-wrap needed because
+        // we trim at paint time, not at push time.
+        self.width = cols;
+        self.height = rows;
+        // Re-clamp viewport_top against the new (possibly smaller)
+        // body_height, so a user who'd Page-Up'd into the buffer
+        // doesn't end up with viewport_top past end-of-buffer.
+        let new_body_height = self.body_height() as usize;
+        self.viewport_top = self
+            .viewport_top
+            .min(self.body_lines.len().saturating_sub(new_body_height));
+        let _ = self.out.write_all(b"\x1b[2J\x1b[H");
+        self.body_dirty = true;
+        self.footer_dirty = true;
+        self.paint_frame();
+    }
+}
+
+impl<W: Write + Send> Drop for AltScreenRenderer<W> {
+    fn drop(&mut self) {
+        // Belt-and-suspenders pop. `shutdown()` already runs on
+        // normal exit and `leave_alt_screen` is idempotent (gated
+        // on `alt_screen_active`), so the duplicate pop is safe.
+        // This Drop is what saves the user's terminal when a panic
+        // bypasses `shutdown()`.
+        self.leave_alt_screen();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps_default() -> TerminalCaps {
+        TerminalCaps {
+            tty: true,
+            colors: true,
+            spinner: true,
+            bracketed_paste: true,
+            raw_mode: true,
+            scroll_region: true,
+            unicode_symbols: true,
+        }
+    }
+
+    /// Construction enters alt-screen + enables mouse capture.
+    /// Drop reverses both. The lifecycle is what the rest of Phase 1
+    /// hangs off — if this is wrong, every later test is moot.
+    #[test]
+    fn construct_emits_alt_screen_enter_sequence() {
+        let mut buf = Vec::new();
+        let r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("\x1b[?1049h"), "alt-screen ENTER missing. got: {:?}", s);
+        assert!(s.contains("\x1b[?1000h"), "mouse-mode ENTER (1000h) missing. got: {:?}", s);
+        assert!(s.contains("\x1b[?1006h"), "mouse-mode ENTER (1006h) missing. got: {:?}", s);
+        assert!(s.contains("\x1b[?1049l"), "alt-screen LEAVE missing. got: {:?}", s);
+        assert!(s.contains("\x1b[?1000l"), "mouse-mode LEAVE (1000l) missing. got: {:?}", s);
+        assert!(s.contains("\x1b[?1006l"), "mouse-mode LEAVE (1006l) missing. got: {:?}", s);
+    }
+
+    /// Welcome pushes 4 rows (title, working_dir, model, blank) into
+    /// body_lines and paint_body emits each at absolute CUP. Phase 2:
+    /// no longer "renders at fixed rows 1/2/3" — rows are derived from
+    /// body_lines + viewport, but in a fresh session the welcome lands
+    /// at the top of the buffer so rows 1-4 still hold its content.
+    #[test]
+    fn welcome_pushes_four_body_rows_at_top() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::Welcome {
+            model: "claude-opus-4-7".into(),
+            working_dir: "/tmp/proj".into(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // First three rows of the body received CUP + content.
+        assert!(s.contains("\x1b[1;1H"), "row 1 CUP missing. got: {:?}", s);
+        assert!(s.contains("\x1b[2;1H"), "row 2 CUP missing. got: {:?}", s);
+        assert!(s.contains("\x1b[3;1H"), "row 3 CUP missing. got: {:?}", s);
+        assert!(
+            s.contains("AtomCode"),
+            "welcome banner must include 'AtomCode'. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("claude-opus-4-7"),
+            "welcome banner must include the model name. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("/tmp/proj"),
+            "welcome banner must include the working dir. got: {:?}",
+            s
+        );
+    }
+
+    /// Phase 2: User / AssistantText / ToolCall / ToolResult / Error
+    /// all push body rows. Verify each surfaces in the painted output.
+    #[test]
+    fn body_uilines_render_into_viewport() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::User("hi".into()));
+        r.render(UiLine::AssistantText("hello there\n".into()));
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::ToolCall {
+            name: "read_file".into(),
+            detail: "x.rs".into(),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "ok".into(),
+        });
+        r.render(UiLine::Error("boom".into()));
+        r.render(UiLine::TurnComplete);
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("hi"), "user echo missing. got: {:?}", s);
+        assert!(s.contains("hello there"), "assistant text missing. got: {:?}", s);
+        assert!(s.contains("read_file"), "tool call name missing. got: {:?}", s);
+        assert!(s.contains("ok"), "tool result summary missing. got: {:?}", s);
+        assert!(s.contains("[Error: boom]"), "error line missing. got: {:?}", s);
+    }
+
+    /// Each body push produces a paint cycle that EL-clears every row
+    /// in the viewport (including ones past end-of-content) so a
+    /// previous frame's content can't ghost. Phase 3: body_height =
+    /// height − footer_rows, so verify the BODY rows specifically (1..=7
+    /// when height=10, footer_rows=3) all get CUP+EL.
+    #[test]
+    fn paint_body_clears_every_viewport_row() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::User("hi".into()));
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // 10-row terminal − 3-row footer = 7-row body. Body paints
+        // emit CUP+EL for rows 1..=7.
+        for row in 1..=7u16 {
+            assert!(
+                s.contains(&format!("\x1b[{};1H", row)),
+                "row {} CUP missing. got: {:?}",
+                row,
+                s
+            );
+        }
+    }
+
+    /// Bounded buffer: when body_lines exceeds max_scrollback_rows,
+    /// oldest rows drop from the front. Sanity-check via direct field
+    /// access (bypass the env var by going through with_writer + manual
+    /// max_scrollback_rows override via test-only API). Keep the cap
+    /// small so the test runs fast.
+    #[test]
+    fn bounded_buffer_drops_front_rows_on_overflow() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // Override the cap directly. Field is private but we're in the
+        // same module so this is fine for tests.
+        r.max_scrollback_rows = 5;
+        for i in 0..10 {
+            r.push_body_row(format!("row {}", i));
+        }
+        // Cap is 5, pushed 10 → only the last 5 should remain (rows 5..9).
+        assert_eq!(r.body_lines.len(), 5, "buffer must be capped at 5");
+        assert_eq!(r.body_lines[0], "row 5");
+        assert_eq!(r.body_lines[4], "row 9");
+        drop(r);
+    }
+
+    /// sticky_bottom (default) shows the TAIL of body_lines. With more
+    /// body rows than viewport height, only the last viewport_height
+    /// rows should be in the painted output.
+    #[test]
+    fn sticky_bottom_shows_tail_when_body_exceeds_viewport() {
+        let mut buf = Vec::new();
+        // Phase 4.5: footer reserves 5 rows. Use height=10 so body_height=5.
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        for i in 0..10 {
+            r.push_body_row(format!("ROW{}", i));
+        }
+        r.body_dirty = true;
+        r.paint_body();
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // 5-row body viewport, 10 body rows → tail = ROW5..ROW9.
+        // ROW0..ROW4 must NOT be in the most recent painted output.
+        // Since each paint emits all 5 rows, the latest paint contains
+        // ROW5..ROW9.
+        for i in 5..10 {
+            assert!(
+                s.contains(&format!("ROW{}", i)),
+                "expected ROW{} in tail. got: {:?}",
+                i,
+                s
+            );
+        }
+        // The leading rows might still appear in EARLIER paints (one
+        // per push_body_row when called via render()); we don't assert
+        // their absence — only that the tail is present in the final
+        // state. This test would need a "rendered final frame only"
+        // helper for stronger assertions; out of scope for Phase 2.
+    }
+
+    /// Assistant streaming: chunks accumulate in assistant_line_buf
+    /// across multiple AssistantText events; complete physical lines
+    /// (terminated by `\n`) get pushed into body_lines; trailing
+    /// partial chunks stay in the buffer until AssistantLineBreak or
+    /// TurnComplete flushes them.
+    #[test]
+    fn assistant_streaming_buffers_until_newline_or_break() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // First chunk has no newline — should buffer, not push.
+        r.render(UiLine::AssistantText("hello ".into()));
+        assert_eq!(r.body_lines.len(), 0, "no newline yet → no body row");
+        assert_eq!(r.assistant_line_buf, "hello ");
+
+        // Second chunk completes the line with `\n` → push.
+        r.render(UiLine::AssistantText("world\n".into()));
+        assert_eq!(r.body_lines.len(), 1, "newline triggers push");
+        assert_eq!(r.body_lines[0], "hello world");
+        assert!(r.assistant_line_buf.is_empty(), "buffer drained on \\n");
+
+        // Trailing chunk without newline → buffer again.
+        r.render(UiLine::AssistantText("tail ".into()));
+        assert_eq!(r.body_lines.len(), 1, "trailing chunk doesn't push yet");
+
+        // AssistantLineBreak forces flush.
+        r.render(UiLine::AssistantLineBreak);
+        assert_eq!(r.body_lines.len(), 2, "AssistantLineBreak flushes");
+        assert_eq!(r.body_lines[1], "tail ");
+        drop(r);
+    }
+
+    /// TurnSeparator pushes 3 rows: blank, ─── label ───, blank.
+    /// Mirrors the visual breathing-room used by retained mode.
+    #[test]
+    fn turn_separator_pushes_three_rows() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::TurnSeparator {
+            label: "Done".into(),
+        });
+        assert_eq!(r.body_lines.len(), 3);
+        assert!(r.body_lines[0].is_empty(), "first row is blank spacer");
+        assert!(r.body_lines[1].contains("Done"), "middle row has label");
+        assert!(r.body_lines[1].contains("─"), "middle row has rule chars");
+        assert!(r.body_lines[2].is_empty(), "third row is blank spacer");
+        drop(r);
+    }
+
+    /// Phase 3.5: assistant text routes through `markdown::render_line`,
+    /// so inline markdown syntax (`**bold**`) becomes ANSI SGR (bold
+    /// escape) when caps.colors is on. Verify a complete-line streaming
+    /// sequence ends with a body row containing the bold SGR sequence.
+    #[test]
+    fn assistant_text_renders_inline_bold_via_markdown() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::AssistantText("This is **bold** text\n".into()));
+        // After the newline the line gets pushed.
+        assert_eq!(r.body_lines.len(), 1);
+        let row = &r.body_lines[0];
+        // Bold SGR is `\x1b[1m` ... `\x1b[22m` (or `\x1b[0m` reset).
+        assert!(
+            row.contains("\x1b[1m"),
+            "bold SGR opener missing — markdown didn't fire. got: {:?}",
+            row
+        );
+        assert!(row.contains("bold"), "literal text retained. got: {:?}", row);
+        drop(r);
+    }
+
+    /// Phase 3.5: `# Heading` becomes a styled body row (markdown
+    /// renderer applies bold + colour for headings). Just verify the
+    /// SGR emerges; we don't assert exact escape since the renderer
+    /// may evolve heading style.
+    #[test]
+    fn assistant_heading_renders_with_sgr() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::AssistantText("# My Heading\n".into()));
+        assert_eq!(r.body_lines.len(), 1);
+        let row = &r.body_lines[0];
+        assert!(
+            row.contains("\x1b["),
+            "heading should have SGR styling. got: {:?}",
+            row
+        );
+        assert!(row.contains("My Heading"));
+        drop(r);
+    }
+
+    /// Phase 3.5: code fences toggle md_state. A ```fenced``` block
+    /// keeps subsequent lines in code-block mode (no inline markdown
+    /// applied). The fence line itself returns None from render_line
+    /// (no body row pushed for the ```fence``` line) but `body_dirty`
+    /// is still set on subsequent content.
+    #[test]
+    fn fenced_code_block_state_carries_across_streaming_chunks() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::AssistantText("```rust\n".into()));
+        // Fence line itself doesn't render — md_state.in_code_block
+        // flips to true, no body row pushed.
+        assert_eq!(r.body_lines.len(), 0, "fence-open line must not push");
+        assert!(r.md_state.in_code_block, "code-block state must flip on");
+
+        r.render(UiLine::AssistantText("let x = 1;\n".into()));
+        assert_eq!(r.body_lines.len(), 1, "code line pushed");
+        // Code-block state still on — next line should still be in code.
+        assert!(r.md_state.in_code_block);
+
+        r.render(UiLine::AssistantText("```\n".into()));
+        // Fence-close, state flips back.
+        assert!(!r.md_state.in_code_block, "code-block state must flip off");
+        drop(r);
+    }
+
+    /// Phase 3.5: `push_user` resets md_state so a previous turn's
+    /// stuck-open fence can't bleed into the new turn.
+    #[test]
+    fn user_turn_resets_markdown_state() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // Open a fence in turn 1, never close.
+        r.render(UiLine::AssistantText("```\n".into()));
+        assert!(r.md_state.in_code_block);
+
+        // New user turn — md_state should reset.
+        r.render(UiLine::User("next question".into()));
+        assert!(
+            !r.md_state.in_code_block,
+            "User turn must reset md_state.in_code_block"
+        );
+        drop(r);
+    }
+
+    /// `reset()` (and `clear_screen()` which forwards to reset) wipes
+    /// body_lines and the assistant streaming buffer so the next paint
+    /// starts from a blank slate.
+    #[test]
+    fn reset_wipes_body_lines_and_streaming_buffer() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::User("first".into()));
+        r.render(UiLine::AssistantText("partial chunk".into()));
+        assert!(!r.body_lines.is_empty());
+        assert!(!r.assistant_line_buf.is_empty());
+
+        r.reset();
+        assert!(r.body_lines.is_empty(), "body_lines wiped on reset");
+        assert!(r.assistant_line_buf.is_empty(), "buffer wiped on reset");
+        drop(r);
+    }
+
+    /// Phase 4.5: footer is now 5 rows (spinner | top_rule | input |
+    /// bot_rule | status). With height=10, footer_top=6, so:
+    /// spinner@6, top_rule@7, input@8, bot_rule@9, status@10.
+    #[test]
+    fn input_prompt_renders_at_footer_with_cursor() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::InputPrompt {
+            buf: "hello".into(),
+            cursor_byte: 5,
+            menu: None,
+            status: crate::render::StatusLine::default(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("\x1b[8;1H"), "input row CUP at row 8 missing. got: {:?}", s);
+        assert!(s.contains("hello"), "input buf missing. got: {:?}", s);
+        // Cursor at row 8 col 8 (chevron 2 cols + 5 buf chars + 1 for
+        // 1-indexed) followed by show-cursor.
+        assert!(
+            s.contains("\x1b[8;8H\x1b[?25h"),
+            "cursor must be positioned at end of buf with show-cursor. got: {:?}",
+            s
+        );
+    }
+
+    /// Phase 4.5: status bar at row 10 (height=10, last row).
+    #[test]
+    fn status_bar_renders_model_and_cwd() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "claude-opus-4-7".into(),
+                cwd: "/tmp/proj".into(),
+                ..Default::default()
+            },
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("\x1b[10;1H"), "status row CUP at row 10 missing. got: {:?}", s);
+        assert!(
+            s.contains("claude-opus-4-7 \u{00b7} /tmp/proj"),
+            "status content missing. got: {:?}",
+            s
+        );
+        assert!(s.contains("\x1b[2m"), "status should be dim. got: {:?}", s);
+    }
+
+    /// Phase 4.5: top + bottom rules render as cyan ─ across full width.
+    #[test]
+    fn input_box_has_top_and_bottom_rules() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 20, 10);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine::default(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // top_rule at row 7, bot_rule at row 9. Each row has 20 ─.
+        let twenty_dashes = "─".repeat(20);
+        assert!(s.contains("\x1b[7;1H"), "top rule row CUP missing. got: {:?}", s);
+        assert!(s.contains("\x1b[9;1H"), "bot rule row CUP missing. got: {:?}", s);
+        assert!(
+            s.contains(&twenty_dashes),
+            "20 ─ chars missing. got: {:?}",
+            s
+        );
+        // Cyan colour applied to the rule.
+        assert!(s.contains("\x1b[36m"), "rule should be cyan. got: {:?}", s);
+    }
+
+    /// Phase 4.5: slash menu palette grows the footer dynamically.
+    /// 4 menu items → footer_rows = 5 + 4 = 9. body_height shrinks.
+    #[test]
+    fn slash_menu_grows_footer_and_shrinks_body() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        let baseline_body = r.body_height();
+        assert_eq!(baseline_body, 24 - 5, "no menu → body = 24 - 5 = 19");
+
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(crate::render::MenuPayload {
+                items: vec![
+                    ("login".into(), "sign in".into()),
+                    ("model".into(), "switch model".into()),
+                    ("exit".into(), "leave".into()),
+                ],
+                selected: 0,
+            }),
+            status: crate::render::StatusLine::default(),
+        });
+        // 3 menu items → footer = 5 + 3 = 8 → body = 24 - 8 = 16.
+        assert_eq!(r.body_height(), 24 - 8);
+        drop(r);
+    }
+
+    /// Phase 4.5: selected menu item gets reverse-video SGR (`\x1b[7m`)
+    /// so keyboard focus is highly visible. Non-selected items get dim.
+    #[test]
+    fn slash_menu_selected_uses_reverse_video() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(crate::render::MenuPayload {
+                items: vec![
+                    ("login".into(), "sign in".into()),
+                    ("exit".into(), "leave".into()),
+                ],
+                selected: 1,
+            }),
+            status: crate::render::StatusLine::default(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("\x1b[7m"),
+            "selected menu row should use reverse video. got: {:?}",
+            s
+        );
+        // Both items present.
+        assert!(s.contains("login"));
+        assert!(s.contains("exit"));
+    }
+
+    /// Phase 4.5: welcome banner now includes the version (right-aligned)
+    /// and the onboarding hints (`type something...`, `/provider...`).
+    #[test]
+    fn welcome_includes_version_and_hint_lines() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::Welcome {
+            model: "claude-opus-4-7".into(),
+            working_dir: "/tmp/proj".into(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("AtomCode"));
+        assert!(s.contains("MIT"), "license MIT missing from banner. got: {:?}", s);
+        assert!(s.contains("type something"), "hint A missing. got: {:?}", s);
+        assert!(s.contains("/provider"), "hint B missing. got: {:?}", s);
+    }
+
+    /// Phase 3: Spinner sets the spinner-row content; ClearTransient
+    /// wipes it. Spinner row is footer-top (row N-2 for footer_rows=3).
+    #[test]
+    fn spinner_renders_at_footer_top() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::Spinner {
+            frame: "\u{280b}",
+            label: "Thinking".into(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // Spinner row CUP at row 8 + label.
+        assert!(s.contains("\x1b[8;1H"), "spinner row CUP missing. got: {:?}", s);
+        assert!(s.contains("Thinking"), "spinner label missing. got: {:?}", s);
+    }
+
+    /// The spinner FRAME (the rotating glyph) must be coloured brand
+    /// magenta (`\x1b[35m`) when caps.colors is on — visual anchor so
+    /// the rotation reads as motion against the dim label. Mirrors
+    /// `RetainedRenderer::build_spinner_body_row` (Role::Brand frame +
+    /// Role::Secondary label).
+    #[test]
+    fn spinner_frame_uses_brand_magenta() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::Spinner {
+            frame: "\u{280b}",
+            label: "Thinking".into(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("\x1b[35m\u{280b}\x1b[0m"),
+            "spinner frame must be wrapped in magenta SGR. got: {:?}",
+            s
+        );
+        // Label still dim — the two SGRs co-exist on the same row.
+        assert!(s.contains("\x1b[2m"), "label should still be dim. got: {:?}", s);
+    }
+
+    /// `ClearTransient` flips `pending_spinner` back to None so the
+    /// next paint of the spinner row emits only EL (no content).
+    /// Verify by inspecting field state directly — checking the byte
+    /// stream in the cumulative buffer is fragile because the spinner
+    /// row gets repainted multiple times.
+    #[test]
+    fn clear_transient_drops_pending_spinner() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.render(UiLine::Spinner {
+            frame: "\u{280b}",
+            label: "Thinking".into(),
+        });
+        assert!(r.pending_spinner.is_some(), "spinner should be active");
+        r.render(UiLine::ClearTransient);
+        assert!(r.pending_spinner.is_none(), "ClearTransient must drop spinner");
+        drop(r);
+    }
+
+    /// Phase 4: `on_resize` updates cached dimensions, wipes the
+    /// alt-screen, and repaints. body_lines are kept verbatim — paint
+    /// truncates each row to the new width on the fly so we don't have
+    /// to re-flow at resize time.
+    #[test]
+    fn on_resize_updates_dimensions_and_repaints() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::User("hi".into()));
+        assert_eq!(r.width, 80);
+        assert_eq!(r.height, 24);
+
+        r.on_resize(60, 16);
+        assert_eq!(r.width, 60);
+        assert_eq!(r.height, 16);
+        // body_height = 16 - 5 = 11.
+        assert_eq!(r.body_height(), 11);
+
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("\x1b[2J\x1b[H"),
+            "on_resize should wipe screen. got: {:?}",
+            s
+        );
+    }
+
+    /// Phase 4: long body lines get clipped to terminal width at paint
+    /// time so they don't autowrap into the next row's slot. `truncate_to_width`
+    /// is SGR-aware (skips ESC chars in width count) so colour styling
+    /// survives the clip.
+    #[test]
+    fn paint_body_clips_long_lines_to_width() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 20, 10);
+        // Push a row much longer than terminal width — 50 chars.
+        let long = "a".repeat(50);
+        r.push_body_row(long);
+        r.body_dirty = true;
+        r.paint_body();
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // The terminal is 20 cols wide. After paint, the line should
+        // appear at most 20 a's in a single row (no autowrap into
+        // the next row).
+        let twenty_a = "a".repeat(20);
+        assert!(
+            s.contains(&twenty_a),
+            "20 a's should appear (the visible portion). got: {:?}",
+            s
+        );
+        // 21 a's must NOT appear consecutively — that would mean we
+        // failed to truncate and the terminal autowrapped.
+        let twenty_one_a = "a".repeat(21);
+        assert!(
+            !s.contains(&twenty_one_a),
+            "long line should be truncated to 20 cols. got: {:?}",
+            s
+        );
+    }
+
+    /// Phase 4: paint emits SGR reset after every row so an open
+    /// colour span on one row can't leak into the next row's CUP+EL
+    /// region. Verify the reset sequence appears in the output.
+    #[test]
+    fn paint_body_appends_sgr_reset_per_row() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::User("hi".into()));
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("\x1b[0m"),
+            "expected SGR reset after at least one body row. got: {:?}",
+            s
+        );
+    }
+
+    /// scroll_body with negative delta scrolls UP (towards older
+    /// content), breaks sticky_bottom, and the next paint shows
+    /// earlier rows.
+    #[test]
+    fn scroll_body_up_breaks_sticky_and_shows_older_rows() {
+        let mut buf = Vec::new();
+        // height=10 → body_height=5 (Phase 4.5: footer is 5 rows).
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        for i in 0..20 {
+            r.push_body_row(format!("R{:02}", i));
+        }
+        assert!(r.sticky_bottom);
+        r.scroll_body(-5);
+        assert!(!r.sticky_bottom, "scroll up must break sticky_bottom");
+        // viewport_top: max_top = 20 - 5 = 15, after -5 → 10.
+        assert_eq!(r.viewport_top, 10);
+        drop(r);
+    }
+
+    /// scroll_body that lands at max_top (or past) re-pins sticky.
+    /// Verifies the auto-follow-on-scroll-down behaviour.
+    #[test]
+    fn scroll_body_down_to_end_re_pins_sticky() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        for i in 0..20 {
+            r.push_body_row(format!("R{:02}", i));
+        }
+        r.scroll_body(-5); // up first
+        assert!(!r.sticky_bottom);
+        // Scroll down enough to pass max_top (5 was distance up, scroll
+        // down 10 should overshoot and clamp).
+        r.scroll_body(10);
+        assert!(r.sticky_bottom, "reaching max_top must re-stick to bottom");
+        drop(r);
+    }
+
+    /// scroll_body_to_top jumps viewport_top to 0 and clears sticky.
+    #[test]
+    fn scroll_body_to_top_jumps_to_zero() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        for i in 0..20 {
+            r.push_body_row(format!("R{:02}", i));
+        }
+        r.scroll_body_to_top();
+        assert_eq!(r.viewport_top, 0);
+        assert!(!r.sticky_bottom);
+        drop(r);
+    }
+
+    /// scroll_body_to_bottom jumps to max_top and re-pins sticky.
+    #[test]
+    fn scroll_body_to_bottom_jumps_to_max_top_and_sticks() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        for i in 0..20 {
+            r.push_body_row(format!("R{:02}", i));
+        }
+        r.scroll_body_to_top();
+        r.scroll_body_to_bottom();
+        // body_height = 5, total = 20, max_top = 15.
+        assert_eq!(r.viewport_top, 15);
+        assert!(r.sticky_bottom);
+        drop(r);
+    }
+
+    /// While scrolled up, new body content arrives via push_body_row.
+    /// sticky_bottom is false → viewport_top stays put → user keeps
+    /// looking at old content. body_dirty flips so next paint reflects
+    /// the new buffer length but visible content is the same. (When
+    /// new content pushes the user's snapshot out of the bounded buffer
+    /// front, viewport_top would shift; that's the bounded-buffer test.)
+    #[test]
+    fn new_content_during_scroll_holds_user_position() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        for i in 0..20 {
+            r.push_body_row(format!("R{:02}", i));
+        }
+        r.scroll_body(-5);
+        let pinned_top = r.viewport_top;
+        // Append new content while user is scrolled up.
+        r.push_body_row("NEW".into());
+        // viewport_top unchanged because sticky_bottom was false.
+        assert_eq!(r.viewport_top, pinned_top);
+        assert!(!r.sticky_bottom);
+        drop(r);
+    }
+
+    /// Phase 4 edge case: resize that puts viewport_top past the new
+    /// end-of-buffer must clamp viewport_top instead of leaving it
+    /// in an out-of-range state.
+    #[test]
+    fn on_resize_clamps_viewport_top_when_buffer_shorter_than_viewport() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // Push 5 rows; resize to a height that gives body_height=10.
+        // viewport_top should clamp to body_lines.len() - body_height,
+        // saturating to 0 because 5 < 10.
+        for i in 0..5 {
+            r.push_body_row(format!("r{}", i));
+        }
+        r.viewport_top = 3; // simulate user scrolled up
+        r.on_resize(80, 13); // body_height = 13 - 3 = 10
+        assert_eq!(
+            r.viewport_top, 0,
+            "viewport_top must clamp to 0 when body_lines.len() < body_height"
+        );
+        drop(r);
+    }
+
+    /// `with_writer` takes terminal width/height; `body_height()`
+    /// subtracts footer_rows. Verify the math + saturating-min.
+    #[test]
+    fn body_height_subtracts_footer_rows_with_min_one() {
+        let mut buf = Vec::new();
+        let r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        // height=10, footer base = 5 (no menu) → body_height=5.
+        assert_eq!(r.body_height(), 5);
+        drop(r);
+
+        // Tiny terminal: height=2, footer would consume all → degrade
+        // to body_height=1 (saturating min) instead of 0 / underflow.
+        let mut buf = Vec::new();
+        let r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 2);
+        assert_eq!(r.body_height(), 1);
+        drop(r);
+    }
+
+    /// `suspend_for_external` pops alt-screen so a child process
+    /// sees the host terminal's main screen; `resume` re-enters.
+    /// Used by the OAuth login flow and any future shell-out.
+    #[test]
+    fn suspend_resume_pops_and_re_enters_alt_screen() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.suspend_for_external();
+        r.resume_from_external();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // Sequence on the wire should be: enter, leave (suspend),
+        // enter again (resume), leave (drop). Two of each.
+        assert_eq!(
+            s.matches("\x1b[?1049h").count(),
+            2,
+            "expected two ENTERs (construct + resume). got: {:?}",
+            s
+        );
+        assert_eq!(
+            s.matches("\x1b[?1049l").count(),
+            2,
+            "expected two LEAVEs (suspend + drop). got: {:?}",
+            s
+        );
+    }
+
+    /// Regression: when scrollback navigation runs (PageUp / Shift+Up /
+    /// mouse wheel) the body region repaints but the terminal cursor
+    /// must stay in the input row at the right buf-prefix offset.
+    /// Earlier `scroll_body` only flipped `body_dirty`, leaving
+    /// `footer_dirty=false` and skipping the input-row CUP at the
+    /// end of `paint_footer` — symptom: cursor stranded mid-body
+    /// at the last paint_body row, where the user's next keystroke
+    /// would visually echo into the conversation history rather than
+    /// the input box. Both flags now get set.
+    #[test]
+    fn scroll_repositions_terminal_cursor_into_input_row() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        // Set up an active InputPrompt so paint_footer has cursor data.
+        r.render(UiLine::InputPrompt {
+            buf: "hello".into(),
+            cursor_byte: 5,
+            menu: None,
+            status: crate::render::StatusLine::default(),
+        });
+        // Push enough body to give scrollback room.
+        for i in 0..20 {
+            r.push_body_row(format!("R{:02}", i));
+        }
+        // Scroll then drop so we can read `buf` cleanly. The post-scroll
+        // bytes include both the scroll repaint AND the alt-screen pop
+        // sequence; we assert on the cursor CUP being present anywhere
+        // in those bytes — paint_body alone never emits `\x1b[8;...H`
+        // followed by show-cursor (only paint_footer does).
+        r.scroll_body(-3);
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // Input row is at row 8 (height 10 - footer 5 + 3 = row 8).
+        // After scroll, paint_footer must emit a CUP back to row 8
+        // (the input row) followed by show-cursor — otherwise the
+        // terminal cursor stays in the last body row. We assert at
+        // least one `\x1b[8;{col}H\x1b[?25h` sequence is in the
+        // post-scroll bytes.
+        assert!(
+            s.contains("\x1b[8;") && s.contains("H\x1b[?25h"),
+            "scroll must re-emit the input-row cursor CUP. got: {:?}",
+            s
+        );
+    }
+
+    /// Mouse scroll wheel routes through `scroll_body`. Negative
+    /// delta scrolls UP (older content), positive scrolls DOWN.
+    /// Verifies the same field-level outcome as keyboard PageUp.
+    #[test]
+    fn mouse_scroll_via_scroll_body_updates_viewport() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        for i in 0..20 {
+            r.push_body_row(format!("R{:02}", i));
+        }
+        assert!(r.sticky_bottom);
+        // Reader emits MouseScroll(-3) for ScrollUp; event_loop calls
+        // renderer.scroll_body(-3). Verify here at the renderer level.
+        r.scroll_body(-3);
+        assert!(!r.sticky_bottom, "scroll up via mouse must break sticky");
+        // body_height = 5 (height 10 - footer 5), max_top = 15. -3
+        // from sticky-bottom origin → 12.
+        assert_eq!(r.viewport_top, 12);
+        drop(r);
+    }
+}

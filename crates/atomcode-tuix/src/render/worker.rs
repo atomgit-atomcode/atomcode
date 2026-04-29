@@ -55,6 +55,13 @@ enum RenderCmd {
     Resize(u16, u16),
     /// Remove the tail ApprovalPrompt body row (fire-and-forget).
     PopApprovalPrompt,
+    /// Scroll the body viewport by `delta` rows. Negative = up,
+    /// positive = down. AltScreenRenderer mutates viewport_top;
+    /// other renderers default to no-op.
+    ScrollBody(i32),
+    /// Jump body viewport to absolute top / bottom of scrollback.
+    ScrollBodyToTop,
+    ScrollBodyToBottom,
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -165,6 +172,18 @@ impl Renderer for TaskRenderer {
     fn pop_approval_prompt(&mut self) {
         let _ = self.cmd_tx.send(RenderCmd::PopApprovalPrompt);
     }
+
+    fn scroll_body(&mut self, delta: i32) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollBody(delta));
+    }
+
+    fn scroll_body_to_top(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToTop);
+    }
+
+    fn scroll_body_to_bottom(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToBottom);
+    }
 }
 
 impl Drop for TaskRenderer {
@@ -223,6 +242,15 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             }
             RenderCmd::PopApprovalPrompt => {
                 inner.pop_approval_prompt();
+            }
+            RenderCmd::ScrollBody(delta) => {
+                inner.scroll_body(delta);
+            }
+            RenderCmd::ScrollBodyToTop => {
+                inner.scroll_body_to_top();
+            }
+            RenderCmd::ScrollBodyToBottom => {
+                inner.scroll_body_to_bottom();
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();
