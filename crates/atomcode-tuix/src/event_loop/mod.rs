@@ -28,6 +28,9 @@ use atomcode_core::session::SessionManager;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
+use base64::Engine;
+use atomcode_core::conversation::message::ImagePart;
+
 use crate::commands::{parse_slash_line, CommandRegistry};
 use crate::input::history::History;
 use crate::input::key_action::{classify, Action};
@@ -35,6 +38,32 @@ use crate::input::InputEvent;
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
+
+/// Encode raw RGBA pixel data as a PNG image in memory.
+fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut encoder = png::Encoder::new(&mut buf, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(rgba).ok()?;
+    drop(writer);
+    Some(buf)
+}
+
+/// Try to grab an image from the system clipboard via `arboard`.
+/// Returns `Some(ImagePart)` with a base64-encoded PNG if the clipboard
+/// contains an image, `None` otherwise (text-only clipboard, etc).
+fn try_paste_clipboard_image() -> Option<ImagePart> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img = clipboard.get_image().ok()?;
+    let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+    Some(ImagePart {
+        media_type: "image/png".into(),
+        data: b64,
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct McpReloadProgress {
@@ -1198,7 +1227,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![] }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -1393,7 +1422,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![] }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -1800,6 +1829,23 @@ fn handle_idle_key(
         }
     }
 
+    // Ctrl+V: try clipboard image first, fall back to text paste.
+    if code == KeyCode::Char('v') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if let Some(img) = try_paste_clipboard_image() {
+            let n = app.state.pending_images.len() + 1;
+            app.state.pending_images.push(img);
+            renderer.render(UiLine::CommandOutput(format!(
+                "  [image #{}] pasted from clipboard\n",
+                n
+            )));
+            renderer.flush();
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            return Ok(());
+        }
+        // No image in clipboard — fall through to normal key handling
+        // (the `v` char will be inserted as a regular character via classify).
+    }
+
     let action = classify(code, modifiers);
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::tuix_trace!(
@@ -1887,9 +1933,10 @@ fn handle_idle_key(
                 // takes this Option and restores it to `app.buf.text`
                 // so the cancelled message can be edited and resent.
                 app.state.last_submitted_message = Some(expanded.clone());
+                let images = std::mem::take(&mut app.state.pending_images);
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(expanded))
+                    .send(AgentCommand::SendMessage { text: expanded, images })
                     .ok();
                 app.state.on_submit();
                 // CodingPlan drift check — fire before every turn sent

@@ -15,6 +15,9 @@ unicode-width = "0.2"
 unicode-segmentation = "1"
 libc = "0.2"
 dirs = "6"
+arboard = "3"
+png = "0.17"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

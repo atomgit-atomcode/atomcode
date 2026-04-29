@@ -34,8 +34,11 @@ use crate::turn::runner::TurnRunner;
 /// Commands sent FROM the UI TO the agent loop.
 #[derive(Debug)]
 pub enum AgentCommand {
-    /// User sent a message (may include attached file content).
-    SendMessage(String),
+    /// User sent a message (may include attached file content and/or images).
+    SendMessage {
+        text: String,
+        images: Vec<crate::conversation::message::ImagePart>,
+    },
     /// Cancel current operation.
     Cancel,
     /// Approve a pending tool call.
@@ -653,8 +656,8 @@ impl AgentLoop {
 
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
-                AgentCommand::SendMessage(content) => {
-                    self.handle_send_message(content).await;
+                AgentCommand::SendMessage { text, images } => {
+                    self.handle_send_message(text, images).await;
                 }
                 AgentCommand::Cancel => {
                     self.cancel_token.cancel();
@@ -822,7 +825,11 @@ impl AgentLoop {
     // Core agent logic
     // -------------------------------------------------------------------------
 
-    async fn handle_send_message(&mut self, content: String) {
+    async fn handle_send_message(
+        &mut self,
+        content: String,
+        images: Vec<crate::conversation::message::ImagePart>,
+    ) {
         self.current_task = content.clone();
 
         if let Some(reason) = self.turn_runner.provider.availability_error() {
@@ -920,7 +927,21 @@ impl AgentLoop {
             }
         }
 
-        self.conversation.add_user_message(&clean);
+        if images.is_empty() {
+            self.conversation.add_user_message(&clean);
+        } else {
+            use crate::conversation::message::{Message, MessageContent, Role};
+            let msg = Message {
+                role: Role::User,
+                content: MessageContent::MultiPart {
+                    text: if clean.is_empty() { None } else { Some(clean.clone()) },
+                    images,
+                },
+            };
+            let idx = self.conversation.messages.len();
+            self.conversation.messages.push(msg);
+            self.conversation.turn_tracker.on_user_message(idx);
+        }
         self.turn_tokens = 0;
         self.tool_call_count = 0;
         // Reset the reflection marker so the next cadence checkpoint is

@@ -65,6 +65,23 @@ impl ClaudeProvider {
                 Role::User => {
                     let content = match &m.content {
                         MessageContent::Text(s) => json!(s),
+                        MessageContent::MultiPart { text, images } => {
+                            let mut parts: Vec<serde_json::Value> = Vec::new();
+                            for img in images {
+                                parts.push(json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": &img.media_type,
+                                        "data": &img.data,
+                                    }
+                                }));
+                            }
+                            if let Some(t) = text {
+                                parts.push(json!({"type": "text", "text": t}));
+                            }
+                            json!(parts)
+                        }
                         _ => json!(""),
                     };
                     msgs.push(json!({"role": "user", "content": content}));
@@ -98,7 +115,9 @@ impl ClaudeProvider {
                             }
                             msgs.push(json!({"role": "assistant", "content": parts}));
                         }
-                        MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
+                        MessageContent::ToolResult(_)
+                        | MessageContent::ToolResultRef(_)
+                        | MessageContent::MultiPart { .. } => {
                             // Should not appear on assistant role; skip.
                         }
                     }

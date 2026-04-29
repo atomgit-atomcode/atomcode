@@ -116,6 +116,9 @@ pub struct UiState {
     /// loop. The bool is the `prompt` sub-arg (include full system
     /// prompt body).
     pub pending_context_render: Option<bool>,
+    /// Images pasted from clipboard (Ctrl+V) waiting to be sent with
+    /// the next user message. Drained on submit.
+    pub pending_images: Vec<atomcode_core::conversation::message::ImagePart>,
 }
 
 impl Default for UiState {
@@ -145,6 +148,7 @@ impl UiState {
             last_context: None,
             last_submitted_message: None,
             pending_context_render: None,
+            pending_images: Vec::new(),
         }
     }
 

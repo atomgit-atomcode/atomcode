@@ -1247,7 +1247,7 @@ pub(crate) fn launch_fixissue(
             fixissue_buffer.clear();
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SendMessage(prompt))
+                .send(AgentCommand::SendMessage { text: prompt, images: vec![] })
                 .ok();
             state.on_submit();
         }

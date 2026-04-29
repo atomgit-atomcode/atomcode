@@ -9,6 +9,15 @@ pub enum Role {
     Tool,
 }
 
+/// A single image attachment, base64-encoded.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImagePart {
+    /// MIME type, e.g. "image/png", "image/jpeg".
+    pub media_type: String,
+    /// Base64-encoded image data.
+    pub data: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MessageContent {
     Text(String),
@@ -30,6 +39,11 @@ pub enum MessageContent {
     /// Lightweight reference to a tool result whose full output is cached on disk.
     /// Used for new tool results; old `ToolResult` variant kept for backward compat.
     ToolResultRef(ToolResultRef),
+    /// User message with text and/or image attachments (vision models).
+    MultiPart {
+        text: Option<String>,
+        images: Vec<ImagePart>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,6 +66,7 @@ impl Message {
             MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref(),
             MessageContent::ToolResult(r) => Some(&r.output),
             MessageContent::ToolResultRef(r) => Some(&r.summary),
+            MessageContent::MultiPart { text, .. } => text.as_deref(),
         }
     }
 
@@ -77,6 +92,11 @@ impl Message {
             // ToolResultRef: kept for backward compat (loading old conversations).
             // Estimate from full size since old conversations may still contain these.
             MessageContent::ToolResultRef(r) => r.byte_size + 10,
+            MessageContent::MultiPart { text, images } => {
+                let text_len = text.as_ref().map_or(0, |t| t.len());
+                // Each image ≈ 1600 tokens (conservative estimate for vision models).
+                return (text_len / 4).max(1) + images.len() * 1600 + 4;
+            }
         };
         // ~4 chars per token for English, add 4 tokens overhead per message
         (char_count / 4).max(1) + 4
@@ -130,6 +150,8 @@ impl Message {
             }
             // ToolResultRef is already condensed (only holds a summary).
             MessageContent::ToolResultRef(_) => self.clone(),
+            // MultiPart messages (images + text) are not condensable.
+            MessageContent::MultiPart { .. } => self.clone(),
             _ => self.clone(),
         }
     }

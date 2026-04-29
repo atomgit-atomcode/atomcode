@@ -239,6 +239,21 @@ impl OpenAiProvider {
                             .collect::<Vec<_>>());
                         Some(msg)
                     }
+                    MessageContent::MultiPart { text, images } => {
+                        let mut parts: Vec<serde_json::Value> = Vec::new();
+                        for img in images {
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", img.media_type, img.data),
+                                }
+                            }));
+                        }
+                        if let Some(t) = text {
+                            parts.push(json!({"type": "text", "text": t}));
+                        }
+                        Some(json!({"role": "user", "content": parts}))
+                    }
                     MessageContent::ToolResult(r) => {
                         if r.call_id.is_empty() {
                             return None;
