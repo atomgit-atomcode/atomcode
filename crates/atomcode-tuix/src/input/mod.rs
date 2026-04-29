@@ -25,4 +25,10 @@ pub enum InputEvent {
     /// AltScreenRenderer only — RetainedRenderer relies on host-
     /// terminal scrollback, PlainRenderer doesn't pin a UI).
     MouseScroll(i32),
+    /// Mouse primary button pressed at terminal cell `(col, row)`.
+    MouseDown { col: u16, row: u16 },
+    /// Mouse drag moved to terminal cell `(col, row)`.
+    MouseDrag { col: u16, row: u16 },
+    /// Mouse primary button released.
+    MouseUp,
 }

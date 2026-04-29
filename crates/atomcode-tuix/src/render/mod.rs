@@ -191,6 +191,13 @@ pub trait Renderer: Send {
     /// scrollback. Used for Home / End key handling.
     fn scroll_body_to_top(&mut self) {}
     fn scroll_body_to_bottom(&mut self) {}
+
+    /// Mouse text-selection hooks. Backends that own mouse capture can
+    /// override these; streaming/native-scrollback backends keep host
+    /// terminal selection behavior and no-op here.
+    fn begin_selection(&mut self, _col: u16, _row: u16) {}
+    fn update_selection(&mut self, _col: u16, _row: u16) {}
+    fn end_selection(&mut self) {}
 }
 
 /// Slash-command palette payload: filtered entries + which one is selected.
