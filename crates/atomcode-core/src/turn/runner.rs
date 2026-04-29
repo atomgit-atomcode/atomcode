@@ -446,11 +446,9 @@ impl TurnRunner {
                                             call.arguments = unwrapped;
                                         }
                                         conversation.tool_call_buffer = None;
-                                        let _ = event_tx.send(TurnEvent::ToolCallStarted {
-                                            id: call.id.clone(),
-                                            name: call.name.clone(),
-                                            arguments: call.arguments.clone(),
-                                        });
+                                        // Don't send ToolCallStarted here - send it when the tool
+                                        // actually starts executing, so that tool call and result
+                                        // are paired correctly in the UI for sequential execution.
                                         tool_calls_buf.push(call);
                                     }
 
@@ -622,19 +620,9 @@ impl TurnRunner {
         // Models often generate 2+ separate edit_file calls for the same file instead of
         // using the edits array. Merging at framework level is 100% reliable vs prompt ~50%.
         //
-        // Each merged-away call had its own ToolCallStarted emitted upstream — we MUST
-        // emit a matching ToolCallResult so the TUI's in-flight spinner stops animating
-        // for those orphan ids.
-        let merged_away_ids = merge_edit_calls(&mut tool_calls_buf);
-        for merged_id in &merged_away_ids {
-            let _ = event_tx.send(TurnEvent::ToolCallResult {
-                call_id: merged_id.clone(),
-                name: "edit_file".to_string(),
-                output: "[merged into adjacent edit_file call on same file]".to_string(),
-                success: true,
-                duration: std::time::Duration::ZERO,
-            });
-        }
+        // Merged-away calls are silently dropped - no ToolCallStarted was sent,
+        // so no ToolCallResult is needed either.
+        let _merged_away_ids = merge_edit_calls(&mut tool_calls_buf);
 
         // ── Layer B: per-turn read budget allocation ──
         // Count read_file calls in this batch and set per-file token budget.
@@ -675,6 +663,15 @@ impl TurnRunner {
             if cancel.is_cancelled() {
                 tel_return!(TurnResult::Cancelled, tool_count);
             }
+            
+            // Send ToolCallStarted event when the tool actually starts executing.
+            // This ensures tool call and result are paired correctly in the UI.
+            let _ = event_tx.send(TurnEvent::ToolCallStarted {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            });
+            
             // Enforce tool filter at execution time — LLM may call tools
             // not in the provided tool_defs (e.g., during diagnosis read-only phase).
             if let Some(filter) = allowed_tools {

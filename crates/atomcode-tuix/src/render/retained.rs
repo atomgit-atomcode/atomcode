@@ -396,7 +396,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             format!("{}({})", safe_name, safe_detail)
         };
-        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+        // No left padding - tool call rows sit flush-left at col 0
+        // to align with the input-box chevron and approval prompts.
         push_str_cells(&mut row, icon, &muted);
         push_str_cells(&mut row, " ", &pad);
         push_str_cells(&mut row, &body_str, &tool_name_style);
