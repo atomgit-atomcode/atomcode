@@ -2504,6 +2504,26 @@ fn redraw_after_slash(
 }
 
 /// Persist config changes and notify the daemon to pick them up.
+/// Refresh the plugin-derived registries on `LoopCtx` after a
+/// `/plugin` install / uninstall / marketplace mutation. Re-walks the
+/// skill / custom-command sources from disk so newly-installed plugin
+/// assets become visible to the slash-command palette and the agent
+/// loop within the same session.
+///
+/// Hook executor is NOT rebuilt here: in this codebase the executor
+/// lives entirely on the agent side (see `agent::mod` lines around
+/// 718–722) and is reconstructed per `cd`. New hook plugins therefore
+/// pick up at the next `/cd` (or process restart). Per spec §8 this
+/// deferred behavior is acceptable.
+pub(crate) fn reload_plugins(ctx: &mut LoopCtx) {
+    if let Ok(mut guard) = ctx.skill_registry.write() {
+        guard.reload(&ctx.working_dir);
+    }
+    ctx.custom_commands =
+        atomcode_core::commands::CustomCommandRegistry::load(&ctx.working_dir);
+    // hooks reload at next turn (executor lives on the agent loop, rebuilt on /cd).
+}
+
 pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     let path = Config::default_path();
     match ctx.config.save(&path) {
