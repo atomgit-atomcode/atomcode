@@ -901,7 +901,7 @@ pub(super) fn execute_slash_command(
                 if let Some(rendered) = expand_skill(ctx, &registry_key, skill_args) {
                     ctx.agent
                         .cmd_tx
-                        .send(AgentCommand::SendMessage(rendered))
+                        .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
                         .ok();
                     state.on_submit();
                 } else {
@@ -921,13 +921,13 @@ pub(super) fn execute_slash_command(
             if let Some(rendered) = ctx.custom_commands.render(other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(rendered))
+                    .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
                     .ok();
                 state.on_submit();
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(rendered))
+                    .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
                     .ok();
                 state.on_submit();
             } else {
