@@ -999,7 +999,13 @@ async fn run() -> Result<i32> {
     if enabled("bash") {
         tool_registry.register_sync(Box::new(BashTool));
     }
-    if enabled("change_dir") {
+    // change_dir is opt-in: weak models (e.g. deepseek-v4-flash) repeatedly
+    // emit empty `arguments: {}` for it, looping the same broken call until
+    // the identical-args guard blocks it. Bash with `cd` already covers the
+    // legitimate use case (atomcode tracks `cd` in bash and mutates
+    // `working_dir` accordingly), and `/cd` lets the user switch manually.
+    // Set ATOMCODE_ENABLE_CD=1 to re-expose the tool to the LLM.
+    if enabled("change_dir") && std::env::var("ATOMCODE_ENABLE_CD").is_ok() {
         tool_registry.register_sync(Box::new(CdTool));
     }
     if enabled("grep") {
