@@ -1076,22 +1076,28 @@ async fn run() -> Result<i32> {
         ToolContext::with_telemetry(working_dir.clone(), "default", telemetry.clone());
     tool_context.lsp = lsp_manager;
 
-    // Auto-continue the latest session for this working directory.
-    // Same behavior as Claude Code: re-entering a project resumes where you left off.
-    // Use --new to force a fresh session.
-    let session_to_continue = {
+    // Continue the previous session only when the user explicitly opts
+    // in via `-c` / `--continue`. Bare `atomcode` starts a fresh
+    // session — no auto-resume, no scrollback replay. Users who want to
+    // pick a specific older session can still use `/resume` inside the
+    // TUI.
+    let session_to_continue = if cli.continue_last {
         let session_manager = SessionManager::new(&working_dir);
         match session_manager.latest() {
             Ok(Some(session)) => Some(session),
             _ => None,
         }
+    } else {
+        None
     };
 
-    // Start with a fresh conversation each session.
-    // Previous session context is injected via build_previous_session_context()
-    // from the saved history file — no need to load raw messages.
-    // Loading raw messages caused: old model's tool_call format incompatibility,
-    // stale file paths from old working directories, and 100+ message context pollution.
+    // Start with a fresh conversation each session. The TUI replays
+    // `session_to_continue` (when present) into scrollback for visual
+    // continuity, but the agent's model context starts empty —
+    // re-injecting raw messages caused old tool_call format
+    // incompatibilities, stale file paths from old working dirs, and
+    // 100+ message context pollution. Users who want full model-side
+    // restoration use the `/resume` slash command.
     let conversation = Conversation::new();
 
     let (mut agent_loop, agent_handle) = AgentLoop::new(

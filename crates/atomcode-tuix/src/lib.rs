@@ -170,7 +170,7 @@ pub async fn run(
     agent_handle: AgentHandle,
     _tool_context: ToolContext,
     working_dir: std::path::PathBuf,
-    _session_to_continue: Option<atomcode_core::session::Session>,
+    session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
     mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
@@ -511,6 +511,7 @@ pub async fn run(
         custom_commands,
         skill_registry,
         caps,
+        replay_on_start: session_to_continue,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

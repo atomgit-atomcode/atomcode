@@ -165,6 +165,12 @@ pub struct LoopCtx {
     /// and ellipsis. Same value as `RetainedRenderer` was constructed
     /// with — single source of truth.
     pub caps: crate::terminal::TerminalCaps,
+    /// Session loaded by the CLI auto-continue path (`atomcode -c` or
+    /// the default behavior of `atomcode` when a prior session exists
+    /// for this working dir). Replayed into scrollback once on first
+    /// `run_loop` entry, then dropped — purely visual continuity, the
+    /// agent's model context starts fresh.
+    pub replay_on_start: Option<atomcode_core::session::Session>,
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user
@@ -1141,6 +1147,24 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
              bypass this fallback (may show duplicated content on scroll).\n\n"
                 .into(),
         ));
+    }
+
+    // Auto-continue: if the CLI loaded the most recent session for this
+    // working dir, replay its messages into scrollback so the user sees
+    // "where I left off". Visual-only — agent context starts fresh, so
+    // any follow-up question that depends on prior history will surprise
+    // the user. The hint below sets that expectation. Users who want
+    // full restoration (model context too) should run `/resume`.
+    if let Some(session) = ctx.replay_on_start.take() {
+        if !session.messages.is_empty() {
+            crate::modals::session_picker::replay_session(renderer, &session, false);
+            renderer.render(UiLine::CommandOutput(
+                "  ⓘ Showing previous session — model context starts fresh.\n    \
+                 Use /resume to fully restore the conversation including model memory.\n\n"
+                    .into(),
+            ));
+            renderer.flush();
+        }
     }
 
     // First-run onboarding: no providers configured AND no OAuth login
@@ -3262,11 +3286,10 @@ fn handle_agent_event(
 }
 
 /// Copy the latest conversation into `ctx.current_session`, auto-name
-/// the session from the first user message when it's still at its
-/// default label, and write the session file to disk. Called on every
-/// TurnComplete and TurnCancelled so `/resume` can find the
-/// conversation after a quit. No-op when the conversation is empty
-/// (don't save a blank session).
+/// the session from the first real user message, and write the session
+/// file to disk. Called on every TurnComplete and TurnCancelled so
+/// `/resume` can find the conversation after a quit. No-op when the
+/// conversation is empty (don't save a blank session).
 fn persist_current_session(
     ctx: &mut LoopCtx,
     messages: Vec<atomcode_core::conversation::message::Message>,
@@ -3276,28 +3299,75 @@ fn persist_current_session(
     }
     ctx.current_session.messages = messages;
     ctx.current_session.touch();
-    // Rename from the generated default (`default` or `session-<ts>`)
-    // to the first user message's first line, truncated. Keeps the
-    // `/resume` picker scannable.
-    let should_rename =
-        ctx.current_session.name == "default" || ctx.current_session.name.starts_with("session-");
+    // Triggers for renaming:
+    //   * `default` / `session-<ts>` — never renamed yet
+    //   * leading `[` — previous rename grabbed a synthetic system-meta
+    //     marker (`[System meta · not a user message]`,
+    //     `[You are stuck — ...]`, etc.) that the agent injects as a
+    //     Role::User message for plumbing reasons. Re-derive from the
+    //     next non-synthetic user turn so the /resume picker stops
+    //     showing those as session titles.
+    let should_rename = ctx.current_session.name == "default"
+        || ctx.current_session.name.starts_with("session-")
+        || ctx.current_session.name.trim_start().starts_with('[');
     if should_rename {
         use atomcode_core::conversation::message::Role;
-        if let Some(first_user) = ctx
+        let first_real_user = ctx
             .current_session
             .messages
             .iter()
-            .find(|m| matches!(m.role, Role::User))
-        {
-            if let Some(text) = first_user.text() {
-                let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
-                if !name.is_empty() {
-                    ctx.current_session.name = name;
-                }
+            .filter(|m| matches!(m.role, Role::User))
+            .find_map(|m| m.text().filter(|t| !is_synthetic_user_text(t)));
+        if let Some(text) = first_real_user {
+            let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
+            if !name.is_empty() {
+                ctx.current_session.name = name;
             }
         }
+        // Else: leave the existing default/session-<ts>/[...]-marker
+        // name. Better to keep a generic placeholder than to commit to
+        // a synthetic injection as the title.
     }
     let _ = ctx.session_manager.save(&ctx.current_session);
+}
+
+/// True when `text` looks like a synthetic user-channel injection
+/// (atomcode plumbs system-meta control signals through `add_user_message`
+/// and tags them with a leading `[...]` bracket marker on the first line:
+/// `[System meta · not a user message]`, `[You are stuck — ...]`, etc.).
+/// Used by session naming to skip these so `/resume` titles stay
+/// human-meaningful.
+fn is_synthetic_user_text(text: &str) -> bool {
+    text.trim_start().starts_with('[')
+}
+
+#[cfg(test)]
+mod session_naming_tests {
+    use super::is_synthetic_user_text;
+
+    #[test]
+    fn synthetic_system_meta_is_detected() {
+        assert!(is_synthetic_user_text("[System meta · not a user message]\n12 calls..."));
+    }
+
+    #[test]
+    fn synthetic_stuck_warning_is_detected() {
+        assert!(is_synthetic_user_text(
+            "[You are stuck — read foo.rs repeatedly without making progress.]"
+        ));
+    }
+
+    #[test]
+    fn leading_whitespace_does_not_hide_synthetic_marker() {
+        assert!(is_synthetic_user_text("   [System meta] body"));
+    }
+
+    #[test]
+    fn real_user_message_is_not_synthetic() {
+        assert!(!is_synthetic_user_text("Fix the auth bug in login.rs"));
+        assert!(!is_synthetic_user_text("Continue."));
+        assert!(!is_synthetic_user_text("(why does this break?)"));
+    }
 }
 
 /// Build the persistent status line shown directly below the input box.
