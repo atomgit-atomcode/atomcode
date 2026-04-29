@@ -1768,7 +1768,7 @@ fn handle_input(
             match app.state.phase {
                 UiPhase::Idle => handle_idle_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Streaming => handle_streaming_key(app, ctx, renderer, code, modifiers)?,
-                UiPhase::Approval => handle_approval_key(code, &mut app.state, ctx, renderer)?,
+                UiPhase::Approval => handle_approval_key(app, ctx, renderer, code, modifiers)?,
                 UiPhase::Suspended => {}
             }
         }
@@ -2443,11 +2443,38 @@ fn handle_streaming_key(
 }
 
 fn handle_approval_key(
-    code: KeyCode,
-    state: &mut UiState,
+    app: &mut App,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // Ctrl+C: first press denies the tool and arms exit confirmation;
+    // second press within the window actually exits.
+    if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        let now = std::time::Instant::now();
+        let armed = app
+            .exit_pending
+            .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
+        if armed {
+            ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+        } else {
+            // First Ctrl+C: deny the tool and arm the exit confirmation
+            app.exit_pending = Some(now);
+            renderer.pop_approval_prompt();
+            ctx.agent.cmd_tx.send(AgentCommand::DenyTool).ok();
+            app.state.on_approval_resolved();
+            renderer.render(UiLine::CommandOutput(
+                "  (press Ctrl+C again to exit)\n".into(),
+            ));
+            renderer.flush();
+        }
+        return Ok(());
+    }
+
+    // Any other key resets the exit confirmation
+    app.exit_pending = None;
+
     let cmd = match code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => AgentCommand::ApproveTool,
         KeyCode::Char('a') | KeyCode::Char('A') => AgentCommand::ApproveToolAlways,
@@ -2459,7 +2486,7 @@ fn handle_approval_key(
     // the tool result, creating visual noise.
     renderer.pop_approval_prompt();
     ctx.agent.cmd_tx.send(cmd).ok();
-    state.on_approval_resolved();
+    app.state.on_approval_resolved();
     Ok(())
 }
 
