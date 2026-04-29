@@ -1800,6 +1800,26 @@ fn handle_idle_key(
         }
     }
 
+    // Tab on an empty buffer toggles Plan/Build mode instead of
+    // attempting slash-command completion (which has nothing to
+    // complete). When the buffer has text the normal tab-complete
+    // path runs as usual.
+    if code == KeyCode::Tab && app.buf.text.is_empty() {
+        app.state.agent_mode = app.state.agent_mode.toggle();
+        let is_plan = matches!(app.state.agent_mode, crate::state::AgentMode::Plan);
+        ctx.agent
+            .cmd_tx
+            .send(AgentCommand::SetPlanMode(is_plan))
+            .ok();
+        renderer.render(UiLine::CommandOutput(format!(
+            "  Switched to {} mode.\n",
+            app.state.agent_mode.label()
+        )));
+        renderer.flush();
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
     let action = classify(code, modifiers);
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::tuix_trace!(

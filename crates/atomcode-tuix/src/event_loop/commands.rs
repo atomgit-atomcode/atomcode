@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use super::{save_and_reload, LoopCtx};
 use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
-use crate::state::UiState;
+use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::provider::ProviderConfig;
@@ -90,6 +90,22 @@ pub(super) fn execute_slash_command(
         }
         "help" => {
             renderer.render(UiLine::CommandOutput(ctx.commands.help_text()));
+            renderer.flush();
+        }
+        "plan" => {
+            state.agent_mode = AgentMode::Plan;
+            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();
+            renderer.render(UiLine::CommandOutput(
+                "  Switched to Plan mode (read-only exploration).\n".into(),
+            ));
+            renderer.flush();
+        }
+        "build" => {
+            state.agent_mode = AgentMode::Build;
+            ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(false)).ok();
+            renderer.render(UiLine::CommandOutput(
+                "  Switched to Build mode (full execution).\n".into(),
+            ));
             renderer.flush();
         }
         "config" => {
