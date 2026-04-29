@@ -529,7 +529,25 @@ impl<W: Write + Send> AltScreenRenderer<W> {
 
     /// Combined frame paint: body first, footer second so the cursor
     /// final-position belongs to the footer (typically the input row).
+    ///
+    /// Hides the cursor for the duration of the paint so the user
+    /// doesn't see it dart through every intermediate CUP. body + footer
+    /// emit roughly `body_rows + 5..9` CUP sequences per frame; on
+    /// slow terminals (JediTerm in JetBrains IDEs in particular) each
+    /// CUP is processed synchronously, and the cursor is briefly
+    /// visible at every row 1, 2, 3, …, 7, then through every footer
+    /// row before settling. paint_footer's tail emits show-cursor +
+    /// the final input-row CUP atomically, so re-revealing it there
+    /// gives a single visible position per frame instead of a moving
+    /// trail. Reported in Android Studio's terminal as "cursor jumps
+    /// around when scrolling history".
     fn paint_frame(&mut self) {
+        // Hide cursor up-front so paint_body's per-row CUPs aren't
+        // visible to the user. paint_footer's tail re-emits show-
+        // cursor (`\x1b[?25h`) at the final input-row position when
+        // `pending_input` is set, or leaves it hidden otherwise
+        // (e.g. during streaming with no input prompt to anchor on).
+        let _ = self.out.write_all(b"\x1b[?25l");
         self.paint_body();
         self.paint_footer();
     }
@@ -1891,6 +1909,36 @@ mod tests {
         assert!(
             s.contains("\x1b[8;") && s.contains("H\x1b[?25h"),
             "scroll must re-emit the input-row cursor CUP. got: {:?}",
+            s
+        );
+    }
+
+    /// Regression: every paint_frame must start by hiding the cursor
+    /// so its journey through ~10+ intermediate CUP positions (one
+    /// per body row, one per footer row) isn't visible to the user.
+    /// Synchronous-CUP terminals like JediTerm rendered the cursor's
+    /// trail as visible "jumping" — Android Studio bug report.
+    /// paint_footer re-emits show-cursor at its tail when
+    /// pending_input is set, so the cursor only appears once at its
+    /// final position.
+    #[test]
+    fn paint_frame_hides_cursor_before_painting() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // Force a paint via any body push.
+        r.render(UiLine::User("hello".into()));
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // Hide-cursor (`\x1b[?25l`) must precede the body row CUP
+        // sequences — proves we hide before painting, not after.
+        let hide_pos = s.find("\x1b[?25l").expect("hide-cursor sequence missing");
+        let first_body_cup = s.find("\x1b[1;1H\x1b[K")
+            .expect("body row 1 CUP+EL missing");
+        assert!(
+            hide_pos < first_body_cup,
+            "hide-cursor must come before the first body CUP. hide@{}, body@{}, output: {:?}",
+            hide_pos,
+            first_body_cup,
             s
         );
     }
