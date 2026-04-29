@@ -1518,6 +1518,68 @@ fn resolve_cd(
     Ok(canon)
 }
 
+/// Build the OAuth-prompt body shown in scrollback while waiting for
+/// the user to complete sign-in. Always includes the URL and ESC
+/// affordance; renders a QR code above the URL when the terminal can
+/// display it and the rendered block fits the current width.
+///
+/// Style selection (Unicode-capable terminals only):
+/// * `ATOMCODE_QR_DENSE=1` → `Dense1x2` half-block (≈ 45 cols).
+///   Conservative fallback for any scanner that can't read braille
+///   QR codes.
+/// * Otherwise → braille (≈ 23 cols). The compact default.
+///
+/// On terminals without Unicode block-glyph support
+/// (`TerminalCaps::unicode_symbols == false` — POSIX locale, dumb
+/// TERM, legacy Windows conhost) we skip the QR entirely: the only
+/// scannable ASCII form is ≈ 90 columns wide, which doesn't fit any
+/// realistic terminal window, and these environments are typically
+/// keyboard-driven anyway. The body becomes URL-only.
+fn compose_login_chrome(url: &str, unicode: bool) -> String {
+    let qr_block = if unicode {
+        use crate::render::qr::QrStyle;
+        let style = if std::env::var("ATOMCODE_QR_DENSE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            QrStyle::Dense1x2
+        } else {
+            QrStyle::Braille
+        };
+        let term_cols = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
+        crate::render::qr::render_login_qr(url, style).and_then(|s| {
+            let cols = crate::render::qr::block_cols(&s);
+            // Reserve 2 cols for the leading indent + 2 cols breathing room.
+            if (cols as u16).saturating_add(4) <= term_cols {
+                Some(
+                    s.lines()
+                        .map(|l| format!("  {}", l))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
+    let mut out = String::new();
+    if let Some(block) = qr_block {
+        out.push_str("  Sign in to AtomGit — scan the QR code with your WeChat:\n\n");
+        out.push_str(&block);
+        out.push_str("\n\n  OR open the URL below in a browser:\n  ");
+        out.push_str(url);
+    } else {
+        out.push_str("  Open this URL in any browser to sign in to AtomGit:\n  ");
+        out.push_str(url);
+    }
+    out.push_str("\n\n  Press ESC to cancel\n");
+    out
+}
+
 /// Render the OAuth URL block + ESC affordance into scrollback, then
 /// drive the auth/check poll loop without leaving raw mode. ESC is read
 /// from `ctx.input_rx` (the same channel the main event loop uses) so
@@ -1539,12 +1601,16 @@ fn run_oauth_with_renderer(
 
     let session = atomcode_core::auth::start_login()?;
 
-    // URL + ESC affordance go through the body via UiLine::CommandOutput
+    // QR + URL + ESC affordance go through the body via UiLine::CommandOutput
     // — same channel as `Auth saved to:` etc., so they sit in scrollback
-    // above the input box exactly like any other slash-command output.
-    renderer.render(UiLine::CommandOutput(format!(
-        "  Browser didn't open? Open the URL below in any browser to sign in:\n  {}\n\n  Press ESC to cancel\n",
-        session.url()
+    // above the input box exactly like any other slash-command output. The
+    // QR is the primary CTA (scan with phone); the URL is the fallback for
+    // users who'd rather click into a desktop browser. Both render before
+    // the best-effort browser launch so the QR is on screen even when the
+    // browser opens instantly.
+    renderer.render(UiLine::CommandOutput(compose_login_chrome(
+        session.url(),
+        ctx.caps.unicode_symbols,
     )));
     renderer.flush();
 

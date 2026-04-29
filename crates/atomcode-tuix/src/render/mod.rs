@@ -2,6 +2,7 @@
 pub mod alt_screen;
 pub mod cell;
 pub mod plain;
+pub mod qr;
 pub mod retained;
 pub mod screen;
 pub mod theme;
