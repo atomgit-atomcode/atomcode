@@ -434,21 +434,42 @@ impl TurnRunner {
                                     }
 
                                     Some(Ok(StreamEvent::ToolCallDone(mut call))) => {
-                                        // DeepSeek-V4-Flash and some Qwen variants
-                                        // occasionally wrap args as {"arguments":{...}}
-                                        // instead of the flat schema-shaped object.
-                                        // Unwrap once so downstream tools, discipline
-                                        // tracking, and the TUI display all see the
-                                        // corrected form.
-                                        if let Some(unwrapped) =
-                                            crate::tool::unwrap_doubly_nested_args(&call.arguments)
-                                        {
-                                            call.arguments = unwrapped;
-                                        }
                                         conversation.tool_call_buffer = None;
-                                        // Don't send ToolCallStarted here - send it when the tool
-                                        // actually starts executing, so that tool call and result
-                                        // are paired correctly in the UI for sequential execution.
+                                        // Variant E — atomgit gateway occasionally
+                                        // corrupts `function.name` by spilling argument
+                                        // attributes into it (e.g.
+                                        // name='grep" path="..." pattern="..."'). The
+                                        // `arguments` field is then "{}". Drop the call
+                                        // entirely so it never enters tool_calls_buf nor
+                                        // the assistant message — the next stream is a
+                                        // fresh routing-lottery roll. Surface a one-line
+                                        // Error event so the user sees what happened.
+                                        if name_looks_corrupt(&call.name) {
+                                            let _ = event_tx.send(TurnEvent::Error(format!(
+                                                "Dropped malformed tool_call (provider returned corrupt function name: {:?})",
+                                                truncate(&call.name, 60)
+                                            )));
+                                            continue;
+                                        }
+
+                                        // Variants A/A2/B/C/D — atomgit gateway wraps
+                                        // tool args in `{"arguments": ...}` envelopes
+                                        // (string- or object-valued, 1-3 levels deep,
+                                        // with optional sibling fields). Schema-aware
+                                        // recovery unwraps to the flat form expected by
+                                        // the OpenAI tool-call protocol. See
+                                        // `recover_tool_args` for the variant catalogue.
+                                        let expected = self.tools.expected_top_keys(&call.name).await;
+                                        if let Some(recovered) =
+                                            crate::tool::recover_tool_args(&call.arguments, &expected)
+                                        {
+                                            call.arguments = recovered;
+                                        }
+
+                                        // ToolCallStarted is intentionally NOT sent here —
+                                        // it's emitted when the tool actually starts executing,
+                                        // so tool call and result are paired correctly in the
+                                        // UI for sequential execution.
                                         tool_calls_buf.push(call);
                                     }
 
@@ -1266,6 +1287,32 @@ fn extract_path_hint(partial_json: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Detect provider-side corruption of a tool_call's `function.name` field.
+/// atomgit's gateway sometimes spills attribute syntax into `name`, leaving
+/// `arguments` as `"{}"` — e.g. `name='grep" path="..." pattern="..."'`.
+/// Legitimate tool names are short ASCII identifiers (`bash`, `read_file`,
+/// `mcp__server__tool`), so any whitespace/quote/`=`/`<`/`>` or a length
+/// far above what we register is a strong corruption signal.
+fn name_looks_corrupt(name: &str) -> bool {
+    if name.is_empty() {
+        return true;
+    }
+    if name.len() > 96 {
+        return true;
+    }
+    name.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '=' | '<' | '>'))
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// DeepSeek uses `<think>...</think>`, QwQ uses similar patterns.
