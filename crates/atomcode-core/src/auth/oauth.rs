@@ -354,9 +354,21 @@ pub fn start_login() -> Result<LoginSession> {
         .context("Failed to parse /auth/login response")?;
     Ok(LoginSession {
         state: resp.state,
-        login_url: resp.login_url,
+        login_url: strip_force_login(&resp.login_url),
         client,
     })
+}
+
+/// Drop `force_login=true` from the broker-supplied OAuth URL. The
+/// broker emits this flag to force re-authentication on every login;
+/// stripping it lets users already signed in to atomgit.com
+/// auto-authorize and skip the consent page. State binding via the
+/// `state` parameter is unchanged, so the request is still anchored
+/// to this specific login attempt.
+fn strip_force_login(url: &str) -> String {
+    url.replace("&force_login=true", "")
+        .replace("?force_login=true&", "?")
+        .replace("?force_login=true", "")
 }
 
 /// Stdout-driven OAuth login: prints the URL, opens the browser,
@@ -1000,6 +1012,48 @@ fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_force_login_removes_trailing_param() {
+        let url = "https://atomgit.com/oauth/authorize?client_id=abc&state=xyz&force_login=true";
+        assert_eq!(
+            strip_force_login(url),
+            "https://atomgit.com/oauth/authorize?client_id=abc&state=xyz"
+        );
+    }
+
+    #[test]
+    fn strip_force_login_removes_middle_param() {
+        let url = "https://atomgit.com/oauth/authorize?client_id=abc&force_login=true&state=xyz";
+        assert_eq!(
+            strip_force_login(url),
+            "https://atomgit.com/oauth/authorize?client_id=abc&state=xyz"
+        );
+    }
+
+    #[test]
+    fn strip_force_login_removes_only_param() {
+        let url = "https://atomgit.com/oauth/authorize?force_login=true";
+        assert_eq!(
+            strip_force_login(url),
+            "https://atomgit.com/oauth/authorize"
+        );
+    }
+
+    #[test]
+    fn strip_force_login_removes_first_of_many() {
+        let url = "https://atomgit.com/oauth/authorize?force_login=true&state=xyz";
+        assert_eq!(
+            strip_force_login(url),
+            "https://atomgit.com/oauth/authorize?state=xyz"
+        );
+    }
+
+    #[test]
+    fn strip_force_login_passthrough_when_absent() {
+        let url = "https://atomgit.com/oauth/authorize?client_id=abc&state=xyz";
+        assert_eq!(strip_force_login(url), url);
+    }
 
     #[test]
     fn parse_happy_path_loopback_url() {
