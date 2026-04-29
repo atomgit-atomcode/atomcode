@@ -22,9 +22,11 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
+use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
+use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
@@ -1692,7 +1694,7 @@ async fn process_chat_request(
         },
         env!("CARGO_PKG_VERSION").into(),
     );
-    let tool_context =
+    let mut tool_context =
         ToolContext::with_telemetry(working_dir.clone(), "default", daemon_telemetry);
     let mut tool_registry = ToolRegistry::new();
     // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
@@ -1755,6 +1757,13 @@ async fn process_chat_request(
     if !mcp_tools.is_empty() {
         register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
     }
+
+    // Build LSP manager from config and inject into ToolContext.
+    let lsp_manager = build_lsp_manager(&config.lsp, &working_dir);
+    if lsp_manager.is_some() && enabled("diagnostics") {
+        tool_registry.register_sync(Box::new(DiagnosticsTool));
+    }
+    tool_context.lsp = lsp_manager;
 
     let shared_tools = Arc::new(tool_registry);
 

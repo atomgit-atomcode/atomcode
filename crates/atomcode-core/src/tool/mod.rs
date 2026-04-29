@@ -746,6 +746,20 @@ impl ToolContext {
         ctx.lsp = self.lsp.clone();
         ctx
     }
+
+    /// Notify LSP that a file changed (if LSP is enabled).
+    /// This is a convenience method for write/edit/search_replace tools.
+    pub async fn notify_lsp_file_changed(&self, path: &Path, content: &str) {
+        if let Some(ref lsp) = self.lsp {
+            if let Err(e) = lsp.notify_file_changed(path, content).await {
+                eprintln!(
+                    "[lsp] Failed to refresh diagnostics for {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
 }
 
 /// Build a disabled (no-op) `Telemetry` handle — zero overhead, no I/O.

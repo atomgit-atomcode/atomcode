@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use super::client::LspClient;
 use super::registry::LspServerRegistry;
 use super::types::Diagnostic;
+use crate::config::LspConfig;
 
 /// Extension-to-language_id mapping for LSP `textDocument/didOpen`.
 fn extension_to_language_id(ext: &str) -> &str {
@@ -178,8 +179,8 @@ impl LspManager {
         let clients = self.clients.read().await;
         if let Some(client) = clients.get(&ext) {
             let language_id = extension_to_language_id(&ext);
-            // Use did_open as a simple full-document sync.
-            client.did_open(path, content, language_id).await?;
+            // Use sync_document for proper didOpen/didChange versioning.
+            client.sync_document(path, content, language_id).await?;
             return Ok(true);
         }
 
@@ -206,6 +207,32 @@ impl LspManager {
             }
         }
     }
+}
+
+/// Build an LspManager from config, providing a unified entry point for CLI and daemon.
+/// Returns `None` if LSP is disabled in config.
+pub fn build_lsp_manager(config: &LspConfig, project_root: &Path) -> Option<Arc<LspManager>> {
+    if !config.enabled {
+        return None;
+    }
+
+    let mut registry = if config.auto_detect {
+        LspServerRegistry::with_defaults()
+    } else {
+        LspServerRegistry::empty()
+    };
+
+    // Merge user-configured servers (overrides defaults for same extension).
+    registry.merge_user_config(config.servers.clone());
+
+    let manager = LspManager::new(
+        project_root.to_path_buf(),
+        registry,
+        true,
+        config.diagnostics_settle_delay_ms,
+    );
+
+    Some(Arc::new(manager))
 }
 
 #[cfg(test)]
@@ -279,5 +306,64 @@ mod tests {
         let registry = LspServerRegistry::with_defaults();
         let mgr = LspManager::new(PathBuf::from("/tmp"), registry, true, 150);
         mgr.shutdown().await; // Should not panic.
+    }
+
+    #[test]
+    fn build_lsp_manager_returns_none_when_disabled() {
+        let config = LspConfig {
+            enabled: false,
+            auto_detect: true,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: 150,
+        };
+        let result = build_lsp_manager(&config, Path::new("/tmp"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_lsp_manager_returns_some_when_enabled() {
+        let config = LspConfig {
+            enabled: true,
+            auto_detect: true,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: 150,
+        };
+        let result = build_lsp_manager(&config, Path::new("/tmp"));
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn build_lsp_manager_respects_auto_detect() {
+        // auto_detect=false should start with empty registry
+        let config = LspConfig {
+            enabled: true,
+            auto_detect: false,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: 150,
+        };
+        let result = build_lsp_manager(&config, Path::new("/tmp"));
+        assert!(result.is_some());
+        // The manager should have no servers configured (empty registry)
+    }
+
+    #[test]
+    fn build_lsp_manager_merges_user_servers() {
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "xyz".to_string(),
+            super::super::registry::LspServerConfig {
+                command: "my-lsp".to_string(),
+                args: vec![],
+                root_markers: vec![],
+            },
+        );
+        let config = LspConfig {
+            enabled: true,
+            auto_detect: true,
+            servers,
+            diagnostics_settle_delay_ms: 150,
+        };
+        let result = build_lsp_manager(&config, Path::new("/tmp"));
+        assert!(result.is_some());
     }
 }

@@ -33,7 +33,9 @@ use atomcode_core::tool::search_replace::SearchReplaceTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
 use atomcode_core::tool::web_search::WebSearchTool;
 use atomcode_core::tool::write::WriteFileTool;
+use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
+use atomcode_core::lsp::manager::build_lsp_manager;
 
 use atomcode_core::auth;
 use atomcode_telemetry::{
@@ -1051,9 +1053,16 @@ async fn run() -> Result<i32> {
         (Some(mcp_registry), Some(rx))
     };
 
+    // Build LSP manager from config and inject into ToolContext.
+    let lsp_manager = build_lsp_manager(&config.lsp, &working_dir);
+    if lsp_manager.is_some() && enabled("diagnostics") {
+        tool_registry.register_sync(Box::new(DiagnosticsTool));
+    }
+
     // Pass the already-initialized telemetry handle into ToolContext.
-    let tool_context =
+    let mut tool_context =
         ToolContext::with_telemetry(working_dir.clone(), "default", telemetry.clone());
+    tool_context.lsp = lsp_manager;
 
     // Auto-continue the latest session for this working directory.
     // Same behavior as Claude Code: re-entering a project resumes where you left off.
