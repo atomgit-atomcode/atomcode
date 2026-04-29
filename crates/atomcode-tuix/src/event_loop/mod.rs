@@ -629,87 +629,10 @@ mod menu_tests {
     }
 
     #[test]
-    fn skill_appears_in_menu_under_unique_name() {
-        let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
-        skills.register(skill_fixture(
-            "atomcode-unique-skill-xyz",
-            "test skill",
-            true,
-        ));
-        let lock = std::sync::RwLock::new(skills);
-
-        let items = build_menu_items("/atomcode-unique", &reg, &custom, Some(&lock))
-            .expect("skill prefix should populate menu");
-        assert!(
-            items.iter().any(|(n, _)| n == "atomcode-unique-skill-xyz"),
-            "skill should appear in menu, got {:?}",
-            items
-        );
-    }
-
-    #[test]
-    fn skill_marked_not_user_invocable_is_hidden() {
-        let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
-        skills.register(skill_fixture("hidden-skill-zzz", "hidden", false));
-        let lock = std::sync::RwLock::new(skills);
-
-        // Either no menu (no matches) or the hidden name absent — both are pass.
-        let items = build_menu_items("/hidden-skill-zzz", &reg, &custom, Some(&lock));
-        assert!(
-            items
-                .as_ref()
-                .map(|v| !v.iter().any(|(n, _)| n == "hidden-skill-zzz"))
-                .unwrap_or(true),
-            "hidden skill must not leak into the / menu"
-        );
-    }
-
-    #[test]
-    fn builtin_shadows_skill_of_same_name() {
-        // Pick a built-in we know exists. `help` is a stable built-in.
-        let reg = CommandRegistry::builtin();
-        let builtin_name = reg
-            .matching_prefix("help")
-            .first()
-            .map(|c| c.name.to_string())
-            .expect("built-in registry should expose /help");
-
-        let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
-        // Skill with same name as the built-in.
-        skills.register(skill_fixture(&builtin_name, "skill desc", true));
-        let lock = std::sync::RwLock::new(skills);
-
-        let items = build_menu_items(&format!("/{}", builtin_name), &reg, &custom, Some(&lock))
-            .expect("menu should include built-in");
-        let count = items.iter().filter(|(n, _)| *n == builtin_name).count();
-        assert_eq!(
-            count, 1,
-            "skill named '{}' must not duplicate same-name built-in",
-            builtin_name
-        );
-        // And the description retained should be the built-in's, not "skill desc".
-        let (_, desc) = items
-            .iter()
-            .find(|(n, _)| *n == builtin_name)
-            .expect("entry present");
-        assert_ne!(
-            desc, "skill desc",
-            "built-in description should win over shadowed skill"
-        );
-    }
-
-    #[test]
-    fn bare_suffix_search_matches_namespaced_skill() {
-        // Regression — once skills load under `skills:<name>`, a naive
-        // prefix match would require the user to type `skills:bra` to
-        // surface `/skills:brainstorming`. We want `/bra` to still find
-        // it (display-only namespace), so the menu matches against both
-        // the full name and the bare suffix after the first `:`.
+    fn top_level_hides_individual_skills() {
+        // Regression for the two-level palette: typing /bra or any
+        // bare-name prefix must NOT surface skills. They live behind
+        // the `/skills` gateway so the top palette stays uncluttered.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
         let mut skills = atomcode_core::skill::SkillRegistry::new();
@@ -717,49 +640,104 @@ mod menu_tests {
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
 
-        // /bra → matches `brainstorming` via the bare suffix; the
-        // displayed entry retains the full `skills:` prefix.
-        let items = build_menu_items("/bra", &reg, &custom, Some(&lock))
-            .expect("/bra should surface the namespaced skill");
+        // /bra — no skill should appear; /bra falls through to "no
+        // matches" since no built-in starts with bra either.
         assert!(
-            items.iter().any(|(n, _)| n == "skills:brainstorming"),
-            "menu must include the prefixed display name, got {:?}",
-            items
+            build_menu_items("/bra", &reg, &custom, Some(&lock)).is_none(),
+            "individual skills must not leak into the top-level menu"
         );
-        // Sibling skill whose suffix doesn't start with `bra` must NOT
-        // appear (no false positives from the looser match).
-        assert!(
-            !items.iter().any(|(n, _)| n == "skills:web-access"),
-            "non-matching skill must not leak via bare-suffix search"
-        );
-    }
 
-    #[test]
-    fn colon_namespaced_skill_filters_correctly() {
-        // Production loader prefixes loose skills with `skills:` so they
-        // are visually distinct from built-ins. The menu must filter them
-        // when the user types the prefix character-by-character.
-        let reg = CommandRegistry::builtin();
-        let custom = CustomCommandRegistry::empty();
-        let mut skills = atomcode_core::skill::SkillRegistry::new();
-        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
-        skills.register(skill_fixture("skills:web-access", "Web", true));
-        let lock = std::sync::RwLock::new(skills);
-
-        // After typing `/skills:` the menu should contain both prefixed
-        // skills. Built-in entries do not start with `skills:` so they
-        // drop out naturally.
-        let items = build_menu_items("/skills:", &reg, &custom, Some(&lock))
-            .expect("skills:-prefix should produce a menu");
-        assert!(items.iter().any(|(n, _)| n == "skills:brainstorming"));
-        assert!(items.iter().any(|(n, _)| n == "skills:web-access"));
+        // /skills — only the built-in gateway entry, never the
+        // individual skills.
+        let items = build_menu_items("/skills", &reg, &custom, Some(&lock))
+            .expect("/skills must include the built-in gateway");
+        assert!(items.iter().any(|(n, _)| n == "skills"));
         for (n, _) in &items {
             assert!(
-                n.starts_with("skills:"),
-                "non-skill entry leaked: {}",
+                !n.contains(':'),
+                "namespaced skill leaked into top-level: {}",
                 n
             );
         }
+    }
+
+    #[test]
+    fn skills_sub_mode_lists_skills_under_bare_names() {
+        // Once the user has typed `/skills ` (trailing space, normally
+        // injected by the needs_args path on Enter), the palette
+        // switches to second-level: bare skill names, ready to commit
+        // as `/skills <name>`.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        let items = build_menu_items("/skills ", &reg, &custom, Some(&lock))
+            .expect("/skills (with space) must list skills");
+        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "web-access"));
+        for (n, _) in &items {
+            assert!(!n.contains(':'), "sub-mode names must be bare: {}", n);
+        }
+    }
+
+    #[test]
+    fn skills_sub_mode_filters_by_bare_prefix() {
+        // /skills bra narrows to brainstorming. /skills web narrows
+        // to web-access. /skills zz returns no menu at all.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        skills.register(skill_fixture("skills:web-access", "Web", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        let bra = build_menu_items("/skills bra", &reg, &custom, Some(&lock))
+            .expect("filter must produce a result");
+        assert_eq!(bra.len(), 1);
+        assert_eq!(bra[0].0, "brainstorming");
+
+        let web = build_menu_items("/skills web", &reg, &custom, Some(&lock))
+            .expect("filter must produce a result");
+        assert_eq!(web.len(), 1);
+        assert_eq!(web[0].0, "web-access");
+
+        assert!(build_menu_items("/skills zz", &reg, &custom, Some(&lock)).is_none());
+    }
+
+    #[test]
+    fn skills_sub_mode_hides_after_skill_name() {
+        // /skills brainstorming why X — user is typing skill args now,
+        // menu should disappear so arrow keys don't navigate stale entries.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
+        let lock = std::sync::RwLock::new(skills);
+
+        assert!(build_menu_items("/skills brainstorming why", &reg, &custom, Some(&lock)).is_none());
+    }
+
+    #[test]
+    fn skills_sub_mode_excludes_hidden_skills() {
+        // user_invocable=false skills must not surface in the sub-menu
+        // either — they're LLM-only via the use_skill tool.
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        let mut skills = atomcode_core::skill::SkillRegistry::new();
+        skills.register(skill_fixture("skills:visible", "shown", true));
+        skills.register(skill_fixture("skills:hidden", "hidden", false));
+        let lock = std::sync::RwLock::new(skills);
+
+        let items = build_menu_items("/skills ", &reg, &custom, Some(&lock))
+            .expect("at least one visible skill should produce a menu");
+        assert!(items.iter().any(|(n, _)| n == "visible"));
+        assert!(
+            !items.iter().any(|(n, _)| n == "hidden"),
+            "user_invocable=false skill leaked into sub-menu"
+        );
     }
 
     #[test]
@@ -2062,15 +2040,54 @@ fn build_menu_items(
     if !buf.starts_with('/') {
         return None;
     }
+
+    // Two-level palette for skills.
+    //
+    // Level 1 (top): the built-in `/skills` entry acts as a gateway —
+    // it does NOT expand into individual skills here, so it cannot
+    // crowd or collide with built-in / custom commands.
+    //
+    // Level 2 (sub-mode): once the user has typed `/skills ` (with a
+    // trailing space, usually injected by the needs_args path on
+    // Enter), this branch fires and lists user-invocable skills under
+    // their bare names. Submission rewrites the committed line back
+    // to `/skills <name>` so the `skills` arm in execute_slash_command
+    // looks up `skills:<name>` in the registry and dispatches.
+    if let Some(after) = buf.strip_prefix("/skills ") {
+        // Beyond the skill name (user typing skill args) — close menu.
+        if after.contains(char::is_whitespace) {
+            return None;
+        }
+        let prefix_lower = after.to_ascii_lowercase();
+        let mut items: Vec<(String, String)> = Vec::new();
+        if let Some(reg) = skill_registry {
+            if let Ok(reg) = reg.read() {
+                for skill in reg.user_invocable() {
+                    let bare = skill
+                        .name
+                        .split_once(':')
+                        .map(|(_, s)| s)
+                        .unwrap_or(skill.name.as_str());
+                    if bare.to_ascii_lowercase().starts_with(&prefix_lower) {
+                        items.push((bare.to_string(), skill.description.clone()));
+                    }
+                }
+            }
+        }
+        // Stable order so navigation feels predictable across runs.
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        return if items.is_empty() { None } else { Some(items) };
+    }
+
     let rest = &buf[1..];
     // Once a space appears (user is typing args), stop showing menu.
     if rest.contains(char::is_whitespace) {
         return None;
     }
     let prefix_lower = rest.to_ascii_lowercase();
-    // Priority order: built-in > custom > skill. Same-name shadowing
-    // means a built-in `/login` always wins over a `login` skill from
-    // user space, and a custom command wins over a same-name skill.
+    // Top-level: built-ins (which now include the `/skills` gateway)
+    // followed by custom commands. Individual skills are intentionally
+    // hidden from this level — users access them via `/skills <name>`.
     let mut matches: Vec<(String, String)> = commands
         .matching_prefix(rest)
         .into_iter()
@@ -2081,36 +2098,7 @@ fn build_menu_items(
             matches.push((name, desc));
         }
     }
-    // Skills last so they shadow nothing. `user_invocable()` already
-    // filters out skills marked hidden from the `/` menu (the
-    // `disable_model_invocation: true` ones — those are exposed only
-    // through the use_skill tool to the LLM).
-    //
-    // Skills are stored under a namespace like `skills:brainstorming`
-    // (loose) or `superpowers:brainstorming` (plugin) so the displayed
-    // name visibly distinguishes skills from built-ins. To keep search
-    // friction-free, match the prefix against BOTH the full name and
-    // the bare suffix after the first `:` — so `/bra` still surfaces
-    // `/skills:brainstorming`, while `/skills:` and `/skills:bra`
-    // continue to work as full-name prefix matches.
-    if let Some(reg) = skill_registry {
-        if let Ok(reg) = reg.read() {
-            for skill in reg.user_invocable() {
-                let name_lower = skill.name.to_ascii_lowercase();
-                let bare_suffix = name_lower
-                    .split_once(':')
-                    .map(|(_, s)| s)
-                    .unwrap_or(name_lower.as_str());
-                let matches_full = name_lower.starts_with(&prefix_lower);
-                let matches_bare = bare_suffix.starts_with(&prefix_lower);
-                if (matches_full || matches_bare)
-                    && !matches.iter().any(|(n, _)| n.eq_ignore_ascii_case(&skill.name))
-                {
-                    matches.push((skill.name.clone(), skill.description.clone()));
-                }
-            }
-        }
-    }
+    let _ = skill_registry; // referenced only inside the sub-mode branch above
     if matches.is_empty() {
         None
     } else {
@@ -2199,11 +2187,47 @@ fn handle_idle_key(
                     // so build_menu_items correctly hides the menu.
                     app.buf.text = format!("/{} ", name);
                     app.buf.cursor = app.buf.text.len();
+
+                    // The `/skills` gateway is special: build_menu_items
+                    // recognises the `/skills ` prefix and returns the
+                    // second-level palette of skills. Render that
+                    // immediately so the user doesn't see the menu blink
+                    // out and reappear.
+                    if name == "skills" {
+                        if let Some(items) = build_menu_items(
+                            &app.buf.text,
+                            &ctx.commands,
+                            &ctx.custom_commands,
+                            Some(&ctx.skill_registry),
+                        ) {
+                            app.menu.selected = 0;
+                            redraw_with_menu(
+                                &app.buf,
+                                &items,
+                                0,
+                                &app.state,
+                                ctx,
+                                renderer,
+                            );
+                            return Ok(());
+                        }
+                    }
+
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     return Ok(());
                 }
 
-                let committed = format!("/{}", name);
+                // Sub-mode submit: items in the skills palette carry
+                // bare names (e.g. "brainstorming"). Re-prefix with
+                // `/skills ` so dispatch routes through the `skills`
+                // arm in execute_slash_command, which performs the
+                // registry lookup + expand.
+                let in_skills_sub_mode = app.buf.text.starts_with("/skills ");
+                let committed = if in_skills_sub_mode {
+                    format!("/skills {}", name)
+                } else {
+                    format!("/{}", name)
+                };
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
                 app.buf.text.clear();

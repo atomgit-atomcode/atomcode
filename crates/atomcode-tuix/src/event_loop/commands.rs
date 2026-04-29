@@ -853,6 +853,66 @@ pub(super) fn execute_slash_command(
                 }
             }
         }
+        "skills" => {
+            // Gateway command. With no arg, list user-invocable skills
+            // so the user knows what's available without opening the
+            // menu (useful in non-TTY transcripts and copy/paste).
+            // With an arg, treat the first word as a skill name and
+            // dispatch its expanded template as a user message — same
+            // path the menu's sub-mode submission lands on.
+            let arg_trim = arg.trim();
+            if arg_trim.is_empty() {
+                let lines: Vec<String> = ctx
+                    .skill_registry
+                    .read()
+                    .ok()
+                    .map(|r| {
+                        let mut v: Vec<String> = r
+                            .user_invocable()
+                            .map(|s| {
+                                let bare = s
+                                    .name
+                                    .split_once(':')
+                                    .map(|(_, x)| x)
+                                    .unwrap_or(s.name.as_str());
+                                format!("  /skills {:<24}  {}", bare, s.description)
+                            })
+                            .collect();
+                        v.sort();
+                        v
+                    })
+                    .unwrap_or_default();
+                if lines.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  No user-invocable skills loaded.\n".into(),
+                    ));
+                } else {
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  Available skills:\n{}\n",
+                        lines.join("\n")
+                    )));
+                }
+                renderer.flush();
+            } else {
+                let mut parts = arg_trim.splitn(2, char::is_whitespace);
+                let skill_name = parts.next().unwrap_or("");
+                let skill_args = parts.next().unwrap_or("").trim_start();
+                let registry_key = format!("skills:{}", skill_name);
+                if let Some(rendered) = expand_skill(ctx, &registry_key, skill_args) {
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage(rendered))
+                        .ok();
+                    state.on_submit();
+                } else {
+                    renderer.render(UiLine::Error(format!(
+                        "Unknown skill: {} (try /skills to list)",
+                        skill_name
+                    )));
+                    renderer.flush();
+                }
+            }
+        }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,

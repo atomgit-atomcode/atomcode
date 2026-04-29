@@ -98,6 +98,12 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
+    // Gateway entry that opens a second-level palette listing all
+    // user-invocable skills. needs_args=true so Enter rewrites the
+    // buffer to `/skills ` and lets the sub-mode menu render the
+    // skill list. Selecting a skill commits as `/skills <name>` →
+    // dispatched by the `skills` arm in execute_slash_command.
+    Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
 ];
 
 /// A completion candidate for slash-command Tab completion, merging built-in
