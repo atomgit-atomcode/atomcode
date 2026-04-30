@@ -1299,6 +1299,7 @@ impl AgentLoop {
                 let last_bash_cmd = &mut self.discipline_state.last_bash_cmd;
                 let session_files = &mut self.session_files;
                 let reindex_tx = &self.reindex_tx;
+                let working_dir_for_read_counts = runner.context.working_dir.clone();
 
                 // Tool filtering: diagnosis phase uses read-only tools.
                 // All other turns have full tool access (including edit_file).
@@ -1395,7 +1396,8 @@ impl AgentLoop {
                                                 // post-turn warning in `discipline::apply_post_turn_discipline`
                                                 // agrees with the guard on what counts as "same region".
                                                 if name == "read_file" {
-                                                    let key = crate::turn::runner::read_region_key(&short, arguments);
+                                                    let working_dir = working_dir_for_read_counts.try_read().ok().map(|g| g.clone());
+                                                    let key = crate::turn::runner::read_region_key(arguments, working_dir.as_deref());
                                                     *file_read_counts.entry(key).or_insert(0) += 1;
                                                     if !files_read_this_turn.contains(&short) {
                                                         files_read_this_turn.push(short);

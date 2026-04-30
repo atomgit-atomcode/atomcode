@@ -48,9 +48,23 @@ impl AgentLoop {
                 *slot = (*slot).max(*count);
             }
         }
+        let canonical_wd = self.turn_runner.context.working_dir.try_read().ok()
+            .and_then(|g| std::fs::canonicalize(&*g).ok());
         let blocked_files: Vec<String> = per_file_max
             .into_iter()
-            .map(|(file, count)| format!("{} ({}x same region)", file, count))
+            .map(|(file, count)| {
+                let display = canonical_wd
+                    .as_ref()
+                    .and_then(|wd| std::path::Path::new(&file).strip_prefix(wd).ok())
+                    .map(|rel| rel.to_string_lossy().to_string())
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(&file)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or(file)
+                    });
+                format!("{} ({}x same region)", display, count)
+            })
             .collect();
         if !blocked_files.is_empty() {
             let task = if self.current_task.is_empty() {

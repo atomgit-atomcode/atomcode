@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use futures::StreamExt;
@@ -67,14 +68,79 @@ pub(crate) const READ_REGION_BUCKET: u64 = 50;
 
 /// Extract the region-bucket key for a `read_file` call so that writers
 /// (agent loop, discipline) and readers (loop guard) agree on the key shape.
-/// `short` is the file basename (not full path). Missing / malformed offset
-/// → bucket 0 (which is also the bucket for "whole-file" reads).
-pub(crate) fn read_region_key(short: &str, args: &str) -> (String, u64) {
+/// Prefer a canonical workspace-resolved path to avoid nested workspace and
+/// basename collisions. Missing / malformed offset → bucket 0 (which is also
+/// the bucket for "whole-file" reads).
+pub(crate) fn read_region_key(args: &str, working_dir: Option<&Path>) -> (String, u64) {
+    let file_key = read_file_key(args, working_dir).unwrap_or_else(|| "<malformed>".to_string());
     let offset = serde_json::from_str::<serde_json::Value>(args)
         .ok()
         .and_then(|v| v.get("offset").and_then(|x| x.as_u64()))
         .unwrap_or(0);
-    (short.to_string(), offset / READ_REGION_BUCKET)
+    (file_key, offset / READ_REGION_BUCKET)
+}
+
+fn read_file_key(args: &str, working_dir: Option<&Path>) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(args).ok()?;
+    let fp = v.get("file_path").and_then(|v| v.as_str())?;
+    Some(canonical_or_lexical_path_key(fp, working_dir))
+}
+
+fn canonical_or_lexical_path_key(raw_path: &str, working_dir: Option<&Path>) -> String {
+    if let Some(working_dir) = working_dir {
+        if let Ok(access) = crate::tool::inspect_path_access(raw_path, working_dir) {
+            return access.path.display().to_string();
+        }
+    }
+
+    let expanded = expand_home_for_loop_key(raw_path);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else if let Some(working_dir) = working_dir {
+        working_dir.join(expanded)
+    } else {
+        expanded
+    };
+    lexical_normalize_for_loop_key(&candidate)
+        .display()
+        .to_string()
+}
+
+fn expand_home_for_loop_key(path: &str) -> PathBuf {
+    if path == "~" {
+        return crate::tool::real_home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return crate::tool::real_home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    PathBuf::from(path)
+}
+
+fn lexical_normalize_for_loop_key(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, std::path::Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                } else if normalized.as_os_str().is_empty() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            std::path::Component::RootDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+
+    normalized
 }
 
 impl TurnRunner {
@@ -1164,14 +1230,15 @@ impl TurnRunner {
     /// a loop — only literal re-reads do.
     pub(super) fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
         // --- Pattern 1: per-region read saturation ----------------------------
+        let working_dir = self.context.working_dir.try_read().ok().map(|g| g.clone());
         if tool_name == "read_file" {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                 if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                    let short = std::path::Path::new(fp)
+                    let display_name = std::path::Path::new(fp)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| fp.to_string());
-                    let key = read_region_key(&short, args);
+                    let key = read_region_key(args, working_dir.as_deref());
                     let count = self.file_read_counts.entry(key).or_insert(0);
                     *count += 1;
                     if *count >= 3 {
@@ -1187,7 +1254,7 @@ impl TurnRunner {
                              (pandoc / pdftotext / antiword / unzip for .docx) or tell the user \
                              the format isn't supported. \
                              Do not re-read this region again in this turn.",
-                            short, count
+                            display_name, count
                         ));
                     }
                 }
@@ -1201,17 +1268,15 @@ impl TurnRunner {
         if matches!(tool_name, "edit_file" | "write_file" | "create_file") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                 if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                    let short = std::path::Path::new(fp)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| fp.to_string());
-                    self.file_read_counts.retain(|(file, _), _| file != &short);
+                    let file_key = canonical_or_lexical_path_key(fp, working_dir.as_deref());
+                    self.file_read_counts
+                        .retain(|(file, _), _| file != &file_key);
                 }
             }
         }
 
         // --- Pattern 2: exact-repeat across any tool --------------------------
-        let args_hash = loop_args_hash(tool_name, args);
+        let args_hash = loop_args_hash(tool_name, args, working_dir.as_deref());
         let sig = (tool_name.to_string(), args_hash);
 
         // Count repeats of this exact signature *since the last edit*. An edit
@@ -1255,13 +1320,14 @@ impl TurnRunner {
 /// is stable whether the model omits the field or sends it as `null`.
 ///
 /// For every other tool we hash the whole `args` string.
-fn loop_args_hash(tool_name: &str, args: &str) -> u64 {
+fn loop_args_hash(tool_name: &str, args: &str, working_dir: Option<&Path>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     if tool_name == "read_file" {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-            if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                fp.hash(&mut h);
+            if v.get("file_path").and_then(|v| v.as_str()).is_some() {
+                let file_key = read_file_key(args, working_dir).unwrap_or_default();
+                file_key.hash(&mut h);
                 v.get("offset")
                     .and_then(|x| x.as_u64())
                     .unwrap_or(0)
@@ -1529,40 +1595,48 @@ mod loop_hash_tests {
         let a = loop_args_hash(
             "read_file",
             r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+            None,
         );
         let b = loop_args_hash(
             "read_file",
             r#"{"file_path":"/a.rs","offset":100,"limit":60}"#,
+            None,
         );
         assert_ne!(a, b, "offsets 1 vs 100 must hash differently");
 
         let c = loop_args_hash(
             "read_file",
             r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+            None,
         );
         let d = loop_args_hash(
             "read_file",
             r#"{"file_path":"/a.rs","offset":1,"limit":120}"#,
+            None,
         );
         assert_ne!(c, d, "limit 60 vs 120 must hash differently");
 
         let e = loop_args_hash(
             "read_file",
             r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+            None,
         );
         let f = loop_args_hash(
             "read_file",
             r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+            None,
         );
         assert_eq!(e, f, "identical args must hash identically");
 
         let g = loop_args_hash(
             "read_file",
             r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
+            None,
         );
         let h = loop_args_hash(
             "read_file",
             r#"{"file_path":"/b.rs","offset":1,"limit":60}"#,
+            None,
         );
         assert_ne!(g, h, "different files must hash differently");
     }
@@ -1571,8 +1645,12 @@ mod loop_hash_tests {
     fn missing_offset_and_limit_normalize_to_zero() {
         // `{path}` and `{path, offset:0, limit:0}` must hash the same — otherwise
         // the model can evade the loop guard just by toggling the field's presence.
-        let bare = loop_args_hash("read_file", r#"{"file_path":"/a.rs"}"#);
-        let zeros = loop_args_hash("read_file", r#"{"file_path":"/a.rs","offset":0,"limit":0}"#);
+        let bare = loop_args_hash("read_file", r#"{"file_path":"/a.rs"}"#, None);
+        let zeros = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"/a.rs","offset":0,"limit":0}"#,
+            None,
+        );
         assert_eq!(bare, zeros);
     }
 
@@ -1580,12 +1658,12 @@ mod loop_hash_tests {
     fn other_tools_hash_full_args() {
         // Non-read tools keep full-args hashing so changing any field (path,
         // pattern, command) is correctly treated as a different call.
-        let a = loop_args_hash("grep", r#"{"pattern":"foo","path":"/x"}"#);
-        let b = loop_args_hash("grep", r#"{"pattern":"foo","path":"/y"}"#);
+        let a = loop_args_hash("grep", r#"{"pattern":"foo","path":"/x"}"#, None);
+        let b = loop_args_hash("grep", r#"{"pattern":"foo","path":"/y"}"#, None);
         assert_ne!(a, b);
 
-        let s1 = loop_args_hash("bash", r#"{"command":"ls"}"#);
-        let s2 = loop_args_hash("bash", r#"{"command":"ls"}"#);
+        let s1 = loop_args_hash("bash", r#"{"command":"ls"}"#, None);
+        let s2 = loop_args_hash("bash", r#"{"command":"ls"}"#, None);
         assert_eq!(s1, s2);
     }
 
@@ -1593,12 +1671,12 @@ mod loop_hash_tests {
     fn region_key_buckets_are_per_file() {
         // Same file, same bucket regardless of how offset rounds down.
         let a = read_region_key(
-            "render.rs",
             r#"{"file_path":"/x/render.rs","offset":100,"limit":50}"#,
+            None,
         );
         let b = read_region_key(
-            "render.rs",
             r#"{"file_path":"/x/render.rs","offset":130,"limit":50}"#,
+            None,
         );
         assert_eq!(
             a,
@@ -1609,23 +1687,69 @@ mod loop_hash_tests {
 
         // Jump by one full bucket → different key.
         let far = read_region_key(
-            "render.rs",
             &format!(
                 r#"{{"file_path":"/x/render.rs","offset":{},"limit":50}}"#,
                 READ_REGION_BUCKET + 200
             ),
+            None,
         );
         assert_ne!(a, far, "offsets across bucket boundaries must differ");
 
         // Whole-file read and `offset=0` both normalize to bucket 0.
-        let full = read_region_key("render.rs", r#"{"file_path":"/x/render.rs"}"#);
-        let zero = read_region_key("render.rs", r#"{"file_path":"/x/render.rs","offset":0}"#);
+        let full = read_region_key(r#"{"file_path":"/x/render.rs"}"#, None);
+        let zero = read_region_key(r#"{"file_path":"/x/render.rs","offset":0}"#, None);
         assert_eq!(full, zero);
         assert_eq!(full.1, 0);
 
         // Different files are different keys even at the same offset bucket.
-        let other = read_region_key("mod.rs", r#"{"file_path":"/x/mod.rs","offset":100}"#);
+        let other = read_region_key(r#"{"file_path":"/x/mod.rs","offset":100}"#, None);
         assert_ne!(a, other);
+    }
+
+    #[test]
+    fn read_file_hash_canonicalizes_relative_paths_with_working_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn lib() {}\n").unwrap();
+
+        let rel = loop_args_hash(
+            "read_file",
+            r#"{"file_path":"src/lib.rs","offset":0,"limit":20}"#,
+            Some(dir.path()),
+        );
+        let abs = loop_args_hash(
+            "read_file",
+            &format!(
+                r#"{{"file_path":"{}","offset":0,"limit":20}}"#,
+                file.display()
+            ),
+            Some(dir.path()),
+        );
+
+        assert_eq!(rel, abs, "relative and absolute path to same file must collapse");
+    }
+
+    #[test]
+    fn region_key_distinguishes_same_basename_in_different_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a/mod.rs");
+        let b = dir.path().join("b/mod.rs");
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+        std::fs::write(&a, "mod a;\n").unwrap();
+        std::fs::write(&b, "mod b;\n").unwrap();
+
+        let key_a = read_region_key(
+            r#"{"file_path":"a/mod.rs","offset":100,"limit":50}"#,
+            Some(dir.path()),
+        );
+        let key_b = read_region_key(
+            r#"{"file_path":"b/mod.rs","offset":100,"limit":50}"#,
+            Some(dir.path()),
+        );
+
+        assert_ne!(key_a, key_b, "same basename in different dirs must not share a read bucket");
     }
 
     #[test]
@@ -1633,8 +1757,8 @@ mod loop_hash_tests {
         // Garbage in → bucket 0 (same as no-offset), so at worst we over-count
         // a single bucket and the model gets a helpful block message instead
         // of a mis-routed one.
-        let bad = read_region_key("x.rs", "not json");
-        assert_eq!(bad, ("x.rs".to_string(), 0));
+        let bad = read_region_key("not json", None);
+        assert_eq!(bad, ("<malformed>".to_string(), 0));
     }
 
     #[test]
@@ -1642,12 +1766,12 @@ mod loop_hash_tests {
         // If args aren't valid JSON or lack file_path, still produce a stable
         // hash from the raw string so the loop detector at least collapses
         // exact duplicate bad calls.
-        let a = loop_args_hash("read_file", "not json at all");
-        let b = loop_args_hash("read_file", "not json at all");
+        let a = loop_args_hash("read_file", "not json at all", None);
+        let b = loop_args_hash("read_file", "not json at all", None);
         assert_eq!(a, b);
 
-        let c = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#);
-        let d = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#);
+        let c = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#, None);
+        let d = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#, None);
         assert_eq!(c, d);
 
         assert_ne!(a, c, "different malformed inputs still differ");
