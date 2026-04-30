@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode"
-version = "4.21.1"
+version = "4.21.2"
 dependencies = [
  "anyhow",
  "atomcode-core",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-core"
-version = "4.21.1"
+version = "4.21.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-daemon"
-version = "4.21.1"
+version = "4.21.2"
 dependencies = [
  "anyhow",
  "atomcode-core",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-telemetry"
-version = "4.21.1"
+version = "4.21.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "atomcode-tuix"
-version = "4.21.1"
+version = "4.21.2"
 dependencies = [
  "anyhow",
  "atomcode-core",
