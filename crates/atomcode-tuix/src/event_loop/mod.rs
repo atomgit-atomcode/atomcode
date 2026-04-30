@@ -1300,6 +1300,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             }
 
             // ── Spinner tick (from background task) ──
+            // During Approval phase, we skip the spinner tick to avoid
+            // distracting the user with animated countdowns. The approval
+            // prompt should be the focus of attention.
             Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                 last_spinner_draw = std::time::Instant::now();
@@ -1440,6 +1443,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
+                // During Approval phase, we skip the spinner tick to avoid
+                // distracting the user with animated countdowns. The approval
+                // prompt should be the focus of attention.
                 if matches!(app.state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {
@@ -1505,6 +1511,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             }
 
             // ── Spinner tick (from background task) ──
+            // During Approval phase, we skip the spinner tick to avoid
+            // distracting the user with animated countdowns. The approval
+            // prompt should be the focus of attention.
             Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                 last_spinner_draw = std::time::Instant::now();
@@ -1640,6 +1649,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                 if pre_phase != app.state.phase {
                     crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                 }
+                // During Approval phase, we skip the spinner tick to avoid
+                // distracting the user with animated countdowns. The approval
+                // prompt should be the focus of attention.
                 if matches!(app.state.phase, UiPhase::Streaming)
                     && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                 {

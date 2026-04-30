@@ -1610,11 +1610,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // one is already animating, freeze it before starting
                 // a new one — single-at-a-time animation is a deliberate
                 // simplification (see field doc).
+                //
+                // When freezing the previous tool and immediately starting
+                // a new one, we want to REPLACE the spinner row in-place
+                // rather than pushing a new row. This keeps the UI compact
+                // and avoids duplicate lines when the agent retries the
+                // same call or moves to the next tool.
+                let was_live = self.live_spinner_active;
                 if self.inflight_tool.is_some() {
-                    let prev = std::mem::take(&mut self.inflight_tool).unwrap();
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &prev.1, &prev.2);
-                    self.push_or_update_live_spinner(frozen);
-                    self.live_spinner_active = false;
+                    // Don't render the frozen row separately - just clear
+                    // the old inflight_tool and let the new one take over
+                    // the spinner slot. This prevents duplicate lines when
+                    // tool calls are retried or chained quickly.
+                    self.inflight_tool = None;
                 }
                 // Use a plausible "still" frame for the initial paint;
                 // the next Spinner / StreamingBox tick (within ~80ms)
@@ -1623,7 +1631,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let initial = if self.caps.unicode_symbols { "\u{2819}" } else { "*" };
                 let row = self.build_inflight_tool_row(initial, &name, &detail);
                 self.inflight_tool = Some((id, name, detail));
-                self.push_or_update_live_spinner(row);
+                // If we had a live spinner, update it in-place.
+                // Otherwise push a new row.
+                if was_live {
+                    if let Some(last) = self.body_lines.last_mut() {
+                        *last = row.clone();
+                    }
+                    self.ensure_scroll_region();
+                    let bottom = self.body_bottom_row();
+                    if bottom > 0 {
+                        let seq = format!("\x1b[{};1H\x1b[K", bottom);
+                        let _ = self.out.write_all(seq.as_bytes());
+                        let bytes = serialize_row(&row);
+                        let _ = self.out.write_all(&bytes);
+                    }
+                } else {
+                    self.push_or_update_live_spinner(row);
+                }
             }
             UiLine::ToolCallCommit { call_id } => {
                 // Only commit if the inflight_tool matches the expected call_id,

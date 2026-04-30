@@ -316,6 +316,9 @@ impl UiState {
     }
 
     pub fn on_approval_needed(&mut self, _tool: &str) {
+        // Clear the spinner label during approval - the tool has not started
+        // running yet, so "Running Bash..." would be misleading.
+        self.spinner_label.clear();
         self.phase = UiPhase::Approval;
     }
 
