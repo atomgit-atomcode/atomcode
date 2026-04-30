@@ -17,3 +17,17 @@ pub(crate) mod url;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+/// Result of a long-running plugin operation that the TUI runs off the event
+/// loop (clone / pull / install). The dispatcher fires-and-forgets a
+/// `tokio::task::spawn_blocking` and the main `select!` consumes one of these
+/// once the worker finishes, so the input thread never sees the git latency.
+#[derive(Debug)]
+pub enum PluginJobEvent {
+    MarketplaceAdded(marketplace::MarketplaceInfo),
+    MarketplaceUpdated(marketplace::MarketplaceInfo),
+    PluginInstalled(installer::InstalledPluginInfo),
+    /// Generic failure: `op` is one of "add" / "update" / "install" so the
+    /// renderer can produce the same human message as the prior sync path.
+    Failed { op: String, msg: String },
+}

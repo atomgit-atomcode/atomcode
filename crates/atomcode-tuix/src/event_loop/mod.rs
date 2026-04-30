@@ -116,6 +116,13 @@ pub struct LoopCtx {
     /// Consumed in the main `select!` so upgrade progress is rendered
     /// alongside agent events.
     pub upgrade_rx: mpsc::UnboundedReceiver<atomcode_core::self_update::UpgradeEvent>,
+    /// Long-lived channel for /plugin marketplace add|update and /plugin
+    /// install. Each invocation spawns a blocking task that does the git
+    /// clone/pull and pushes a `PluginJobEvent` here when done. Mirrors the
+    /// `upgrade_tx`/`rx` layout so the event loop only has to add a single
+    /// `select!` arm. Unbounded — events are tiny terminal results.
+    pub plugin_job_tx: mpsc::UnboundedSender<atomcode_core::plugin::PluginJobEvent>,
+    pub plugin_job_rx: mpsc::UnboundedReceiver<atomcode_core::plugin::PluginJobEvent>,
     /// Signal channel from the `/issue` wizard modal back to the event
     /// loop. The wizard's Enter handler can't touch `App` directly
     /// (modals only see `LoopCtx`), so it stores the collected title +
@@ -1449,6 +1456,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                 }
             }
 
+            // ── /plugin async job result ──
+            Some(ev) = ctx.plugin_job_rx.recv() => {
+                handle_plugin_job_event(ev, &mut ctx, &app.state, renderer);
+                if matches!(app.state.phase, UiPhase::Idle) {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
+            }
+
             // ── Agent events ──
             // Consumed regardless of phase. Gating on Streaming missed
             // the TurnComplete that arrives *after* an Error event: the
@@ -1644,6 +1659,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
                 if upgrade_done { break; }
+                if matches!(app.state.phase, UiPhase::Idle) {
+                    redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                }
+            }
+
+            // ── /plugin async job result ──
+            Some(ev) = ctx.plugin_job_rx.recv() => {
+                handle_plugin_job_event(ev, &mut ctx, &app.state, renderer);
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
@@ -2515,13 +2538,27 @@ fn redraw_after_slash(
 /// 718–722) and is reconstructed per `cd`. New hook plugins therefore
 /// pick up at the next `/cd` (or process restart). Per spec §8 this
 /// deferred behavior is acceptable.
-pub(crate) fn reload_plugins(ctx: &mut LoopCtx) {
+/// Returns `(skills_loaded, skip_warnings)`. Caller decides how (and
+/// whether) to surface the warnings — the TUI gates them behind verbose
+/// mode (Ctrl+O) and always shows a `N loaded / M skipped` summary on
+/// /plugin install. Non-summary callers can ignore both values.
+pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
+    let mut loaded = 0usize;
+    let mut warnings = Vec::new();
     if let Ok(mut guard) = ctx.skill_registry.write() {
-        guard.reload(&ctx.working_dir);
+        warnings = guard.reload(&ctx.working_dir);
+        loaded = guard.all().count();
     }
     ctx.custom_commands =
         atomcode_core::commands::CustomCommandRegistry::load(&ctx.working_dir);
-    // hooks reload at next turn (executor lives on the agent loop, rebuilt on /cd).
+    // Hook executor lives on the agent loop. Send a one-shot rebuild signal
+    // so plugin-contributed hooks (especially UserPromptSubmit) fire on the
+    // next user message rather than waiting for /cd or restart.
+    let _ = ctx
+        .agent
+        .cmd_tx
+        .send(atomcode_core::agent::AgentCommand::ReloadHooks);
+    (loaded, warnings)
 }
 
 pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
@@ -2805,6 +2842,67 @@ fn handle_approval_key(
 /// `upgrade_last_pct` reasoning). Sets `done = true` when the upgrade
 /// succeeds, so the main loop can break after rendering the success
 /// line — the user must restart to load the new binary.
+/// Render the result of an async /plugin operation. Mirrors the messages
+/// emitted by the previous synchronous path in `handle_plugin` so users see
+/// the same wording — only the timing changes.
+pub(super) fn handle_plugin_job_event(
+    ev: atomcode_core::plugin::PluginJobEvent,
+    ctx: &mut LoopCtx,
+    state: &crate::state::UiState,
+    renderer: &mut dyn Renderer,
+) {
+    use atomcode_core::plugin::PluginJobEvent;
+    match ev {
+        PluginJobEvent::MarketplaceAdded(info) => {
+            // Marketplace add by itself doesn't load any skills (those come
+            // from installed plugins) — show only the marketplace summary.
+            let _ = reload_plugins(ctx);
+            renderer.render(UiLine::CommandOutput(format!(
+                "  marketplace `{}` added at {} ({} plugins)\n",
+                info.name,
+                &info.git_commit[..7.min(info.git_commit.len())],
+                info.plugins.len()
+            )));
+        }
+        PluginJobEvent::MarketplaceUpdated(info) => {
+            let _ = reload_plugins(ctx);
+            renderer.render(UiLine::CommandOutput(format!(
+                "  marketplace `{}` updated to {}\n",
+                info.name,
+                &info.git_commit[..7.min(info.git_commit.len())]
+            )));
+        }
+        PluginJobEvent::PluginInstalled(info) => {
+            let (loaded, warnings) = reload_plugins(ctx);
+            // Verbose mode (Ctrl+O) dumps the per-skill rejection reasons,
+            // so users can debug a misnamed SKILL.md without restarting.
+            // Default mode prints only the count summary — no cursor races.
+            if state.show_tool_output {
+                for w in &warnings {
+                    renderer.render(UiLine::CommandOutput(format!("  {}\n", w)));
+                }
+            }
+            let hint = if warnings.is_empty() || state.show_tool_output {
+                String::new()
+            } else {
+                "  (Ctrl+O for details)".to_string()
+            };
+            renderer.render(UiLine::CommandOutput(format!(
+                "  installed `{}@{}` — {} skills loaded, {} skipped{}\n",
+                info.plugin,
+                info.marketplace,
+                loaded,
+                warnings.len(),
+                hint,
+            )));
+        }
+        PluginJobEvent::Failed { op, msg } => {
+            renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
+        }
+    }
+    renderer.flush();
+}
+
 pub(super) fn handle_upgrade_event(
     ev: atomcode_core::self_update::UpgradeEvent,
     last_pct: &mut i32,

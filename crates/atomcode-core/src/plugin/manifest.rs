@@ -14,18 +14,79 @@ pub struct MarketplaceManifest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginEntry {
     pub name: String,
-    /// Path relative to marketplace root, e.g. "./" or "plugins/foo".
-    #[serde(default = "default_source")]
-    pub source: String,
+    /// Either an inline path relative to the marketplace root (legacy / CC
+    /// shorthand) or a tagged object describing an external source.
+    #[serde(default)]
+    pub source: PluginSource,
     #[serde(default)]
     pub description: Option<String>,
 }
 
-fn default_source() -> String {
-    "./".to_string()
+/// Plugin source spec. Mirrors Claude Code's marketplace schema.
+///
+/// Two wire forms are accepted via untagged deserialization:
+///   1. A plain string → inline path inside the marketplace clone (e.g. "./",
+///      "plugins/foo"). This is the historical AtomCode form.
+///   2. A tagged object `{"source": "url"|"git"|"github"|"local", ...}`
+///      describing an external location that must be cloned/copied into the
+///      plugin's own install directory.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PluginSource {
+    Inline(String),
+    External(ExternalSource),
 }
 
-/// Per-plugin manifest (`<plugin-dir>/plugin.json`). All fields optional.
+impl Default for PluginSource {
+    fn default() -> Self {
+        PluginSource::Inline("./".into())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "source", rename_all = "lowercase")]
+pub enum ExternalSource {
+    /// Arbitrary git URL. Cloned with `git clone`.
+    Url {
+        url: String,
+        #[serde(flatten)]
+        pin: GitPin,
+    },
+    /// Alias for `url` — Claude Code accepts both spellings.
+    Git {
+        url: String,
+        #[serde(flatten)]
+        pin: GitPin,
+    },
+    /// GitHub shorthand. Expanded to `https://github.com/<repo>.git`.
+    Github {
+        repo: String,
+        #[serde(flatten)]
+        pin: GitPin,
+    },
+    /// Local filesystem path. Contents copied into the install dir.
+    Local { path: String },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct GitPin {
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
+}
+
+/// Per-plugin manifest (`<plugin-dir>/plugin.json` or
+/// `<plugin-dir>/.claude-plugin/plugin.json`). All fields optional.
+///
+/// Schema is the union of atomcode's original layout and Claude Code's
+/// embedded format — both `skills: "skills"` (string path) and
+/// `skills: ["./skills"]` (CC array form) parse, ditto for `hooks` which
+/// can be either a path string (legacy) or an embedded CC hooks object.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PluginManifest {
     #[serde(default)]
@@ -34,26 +95,96 @@ pub struct PluginManifest {
     pub version: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
-    /// Path to skills dir, default "skills".
+    /// Path to the skills directory. Accepts a single path or a CC-style
+    /// array (we use the first entry — multi-dir merging is a follow-up).
     #[serde(default)]
-    pub skills: Option<String>,
-    /// Path to commands dir, default "commands".
+    pub skills: Option<PathOrList>,
+    /// Path to commands directory. Same dual shape as `skills`.
     #[serde(default)]
-    pub commands: Option<String>,
-    /// Path to hooks json, default "hooks.json".
+    pub commands: Option<PathOrList>,
+    /// Either a path to a legacy `hooks.json` (string) or an embedded
+    /// Claude-Code-style hooks object keyed by event name.
     #[serde(default)]
-    pub hooks: Option<String>,
+    pub hooks: Option<HooksField>,
+}
+
+/// `"skills"` or `["./skills", "./more"]`. We keep all entries to leave the
+/// door open for multi-dir merging; current callers pick the first.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PathOrList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl PathOrList {
+    pub fn first(&self) -> &str {
+        match self {
+            PathOrList::One(s) => s.as_str(),
+            PathOrList::Many(v) => v.first().map(String::as_str).unwrap_or(""),
+        }
+    }
+}
+
+/// Either a path to a hooks.json file, or an inline CC hooks map.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum HooksField {
+    Path(String),
+    Inline(CCHooksMap),
+}
+
+/// Claude Code's hook layout: `{ "<EventName>": [ { matcher?, hooks: [...] } ] }`.
+/// Event names are PascalCase (`PreToolUse`, `UserPromptSubmit`, ...). Each
+/// matcher group contains an optional regex/glob to filter on tool name and
+/// a list of command specs to run.
+pub type CCHooksMap = std::collections::BTreeMap<String, Vec<CCHookGroup>>;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CCHookGroup {
+    #[serde(default)]
+    pub matcher: Option<String>,
+    pub hooks: Vec<CCHookSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CCHookSpec {
+    /// CC always sets this to "command"; reserved for future variants.
+    #[serde(default = "default_hook_type", rename = "type")]
+    pub kind: String,
+    pub command: String,
+    /// CC's timeout is in seconds; we convert to ms in the adapter.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
+fn default_hook_type() -> String {
+    "command".to_string()
 }
 
 impl PluginManifest {
     pub fn skills_path(&self) -> &str {
-        self.skills.as_deref().unwrap_or("skills")
+        self.skills.as_ref().map(|p| p.first()).filter(|s| !s.is_empty()).unwrap_or("skills")
     }
     pub fn commands_path(&self) -> &str {
-        self.commands.as_deref().unwrap_or("commands")
+        self.commands.as_ref().map(|p| p.first()).filter(|s| !s.is_empty()).unwrap_or("commands")
     }
+    /// Path to a legacy `hooks.json`. Returns the default "hooks.json" both
+    /// when the field is absent AND when it is the inline CC form (which has
+    /// no associated path on disk — its hooks come from the manifest itself).
     pub fn hooks_path(&self) -> &str {
-        self.hooks.as_deref().unwrap_or("hooks.json")
+        match &self.hooks {
+            Some(HooksField::Path(p)) => p.as_str(),
+            _ => "hooks.json",
+        }
+    }
+    /// CC-style inline hooks, if present. Loader callers convert these into
+    /// `HookConfig` entries via `cc_hooks_to_atomcode`.
+    pub fn inline_cc_hooks(&self) -> Option<&CCHooksMap> {
+        match &self.hooks {
+            Some(HooksField::Inline(m)) => Some(m),
+            _ => None,
+        }
     }
 }
 
@@ -75,18 +206,28 @@ pub fn load_marketplace_manifest(marketplace_root: &Path) -> Result<Option<Marke
     Ok(None)
 }
 
-/// Load `<plugin-dir>/plugin.json` if present. Returns default when missing.
-/// Returns `Err` when present but unparseable (fail closed).
+/// Load a plugin manifest. Search order mirrors the marketplace manifest:
+///   1. `<plugin-dir>/.atomcode-plugin/plugin.json`  atomcode native
+///   2. `<plugin-dir>/.claude-plugin/plugin.json`    Claude Code compat
+///   3. `<plugin-dir>/plugin.json`                   legacy flat layout
+/// First file that exists wins. Returns the default manifest when none
+/// exist; returns `Err` when a file exists but cannot be parsed (fail closed).
 pub fn load_plugin_manifest(plugin_dir: &Path) -> Result<PluginManifest> {
-    let path = plugin_dir.join("plugin.json");
-    if !path.exists() {
-        return Ok(PluginManifest::default());
+    for rel in [
+        ".atomcode-plugin/plugin.json",
+        ".claude-plugin/plugin.json",
+        "plugin.json",
+    ] {
+        let path = plugin_dir.join(rel);
+        if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let manifest: PluginManifest = serde_json::from_str(&raw)
+                .with_context(|| format!("parse {}", path.display()))?;
+            return Ok(manifest);
+        }
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let manifest: PluginManifest = serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", path.display()))?;
-    Ok(manifest)
+    Ok(PluginManifest::default())
 }
 
 #[cfg(test)]
@@ -150,6 +291,73 @@ mod tests {
         let m = load_plugin_manifest(tmp.path()).unwrap();
         assert_eq!(m.skills_path(), "my_skills");
         assert_eq!(m.commands_path(), "commands");
+    }
+
+    #[test]
+    fn parses_inline_source_string() {
+        let raw = r#"{"name":"mp","plugins":[{"name":"p","source":"./sub"}]}"#;
+        let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
+        match &m.plugins[0].source {
+            PluginSource::Inline(s) => assert_eq!(s, "./sub"),
+            _ => panic!("expected Inline"),
+        }
+    }
+
+    #[test]
+    fn parses_object_source_url_with_extra_fields() {
+        // Real Claude-Code-style marketplace.json: source is an object, plus
+        // unknown sibling fields like version/author. Both must round-trip.
+        let raw = r#"{
+            "name": "ascend",
+            "owner": {"name": "x"},
+            "plugins": [{
+                "name": "ascend",
+                "source": {"source": "url", "url": "https://example.com/r.git"},
+                "description": "d",
+                "version": "1.0.0",
+                "author": {"name": "a"}
+            }]
+        }"#;
+        let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
+        match &m.plugins[0].source {
+            PluginSource::External(ExternalSource::Url { url, .. }) => {
+                assert_eq!(url, "https://example.com/r.git");
+            }
+            _ => panic!("expected External::Url"),
+        }
+    }
+
+    #[test]
+    fn parses_object_source_github_with_branch_pin() {
+        let raw = r#"{"name":"mp","plugins":[{"name":"p","source":{"source":"github","repo":"o/r","branch":"dev"}}]}"#;
+        let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
+        match &m.plugins[0].source {
+            PluginSource::External(ExternalSource::Github { repo, pin }) => {
+                assert_eq!(repo, "o/r");
+                assert_eq!(pin.branch.as_deref(), Some("dev"));
+            }
+            _ => panic!("expected External::Github"),
+        }
+    }
+
+    #[test]
+    fn parses_object_source_local() {
+        let raw = r#"{"name":"mp","plugins":[{"name":"p","source":{"source":"local","path":"/tmp/x"}}]}"#;
+        let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
+        match &m.plugins[0].source {
+            PluginSource::External(ExternalSource::Local { path }) => assert_eq!(path, "/tmp/x"),
+            _ => panic!("expected External::Local"),
+        }
+    }
+
+    #[test]
+    fn parses_object_source_git_alias() {
+        let raw = r#"{"name":"mp","plugins":[{"name":"p","source":{"source":"git","url":"u"}}]}"#;
+        let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
+        assert!(matches!(
+            m.plugins[0].source,
+            PluginSource::External(ExternalSource::Git { .. })
+        ));
     }
 
     #[test]

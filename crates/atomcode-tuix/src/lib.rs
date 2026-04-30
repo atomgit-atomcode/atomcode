@@ -458,6 +458,10 @@ pub async fn run(
     // we never want the upgrade task to block on UI backpressure.
     let (upgrade_tx, upgrade_rx) =
         tokio::sync::mpsc::unbounded_channel::<atomcode_core::self_update::UpgradeEvent>();
+    // Mirror channel for /plugin add|update|install so git latency never
+    // stalls the input loop. See LoopCtx::plugin_job_tx for the rationale.
+    let (plugin_job_tx, plugin_job_rx) =
+        tokio::sync::mpsc::unbounded_channel::<atomcode_core::plugin::PluginJobEvent>();
 
     // Seed the recent-project-dirs ring from disk and guarantee the
     // current working dir sits at index 0 so the `/cd` picker always
@@ -500,6 +504,8 @@ pub async fn run(
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,
+        plugin_job_tx,
+        plugin_job_rx,
         pending_new_issue: None,
         pending_run_codingplan: false,
         pending_open_provider_wizard: false,

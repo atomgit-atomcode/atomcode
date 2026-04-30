@@ -996,21 +996,24 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             let action = parts.next().unwrap_or("");
             let arg = parts.next().unwrap_or("").trim();
             match action {
-                "add" => match atomcode_core::plugin::marketplace::add_marketplace(arg) {
-                    Ok(info) => {
-                        super::reload_plugins(ctx);
-                        ok(
-                            renderer,
-                            format!(
-                                "marketplace `{}` added at {} ({} plugins)",
-                                info.name,
-                                &info.git_commit[..7.min(info.git_commit.len())],
-                                info.plugins.len()
-                            ),
-                        );
-                    }
-                    Err(e) => err(renderer, format!("add marketplace: {}", e)),
-                },
+                "add" => {
+                    // Network-bound: git clone happens off the event loop so
+                    // the input thread keeps drawing. Result event is
+                    // consumed by handle_plugin_job_event and rendered there.
+                    let url = arg.to_string();
+                    let tx = ctx.plugin_job_tx.clone();
+                    ok(renderer, format!("cloning marketplace from {}…", url));
+                    tokio::task::spawn_blocking(move || {
+                        let ev = match atomcode_core::plugin::marketplace::add_marketplace(&url) {
+                            Ok(info) => atomcode_core::plugin::PluginJobEvent::MarketplaceAdded(info),
+                            Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
+                                op: "add marketplace".into(),
+                                msg: format!("{:#}", e),
+                            },
+                        };
+                        let _ = tx.send(ev);
+                    });
+                }
                 "remove" => match atomcode_core::plugin::marketplace::remove_marketplace(arg) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
@@ -1018,20 +1021,21 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                     }
                     Err(e) => err(renderer, format!("remove marketplace: {}", e)),
                 },
-                "update" => match atomcode_core::plugin::marketplace::update_marketplace(arg) {
-                    Ok(info) => {
-                        super::reload_plugins(ctx);
-                        ok(
-                            renderer,
-                            format!(
-                                "marketplace `{}` updated to {}",
-                                info.name,
-                                &info.git_commit[..7.min(info.git_commit.len())]
-                            ),
-                        );
-                    }
-                    Err(e) => err(renderer, format!("update marketplace: {}", e)),
-                },
+                "update" => {
+                    let name = arg.to_string();
+                    let tx = ctx.plugin_job_tx.clone();
+                    ok(renderer, format!("updating marketplace `{}`…", name));
+                    tokio::task::spawn_blocking(move || {
+                        let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name) {
+                            Ok(info) => atomcode_core::plugin::PluginJobEvent::MarketplaceUpdated(info),
+                            Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
+                                op: "update marketplace".into(),
+                                msg: format!("{:#}", e),
+                            },
+                        };
+                        let _ = tx.send(ev);
+                    });
+                }
                 "list" => match atomcode_core::plugin::marketplace::list_marketplaces() {
                     Ok(items) if items.is_empty() => {
                         ok(renderer, "no marketplaces registered".into());
@@ -1062,16 +1066,24 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             }
         }
         "install" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {
-            Some((plugin, mp)) => match atomcode_core::plugin::installer::install(&plugin, &mp) {
-                Ok(info) => {
-                    super::reload_plugins(ctx);
-                    ok(
-                        renderer,
-                        format!("installed `{}@{}`", info.plugin, info.marketplace),
-                    );
-                }
-                Err(e) => err(renderer, format!("install: {}", e)),
-            },
+            Some((plugin, mp)) => {
+                // External-source plugins also clone, so dispatch async like
+                // the marketplace add path. Inline-source installs are fast
+                // (state-file edit only) but still go through the same
+                // codepath for consistency.
+                let tx = ctx.plugin_job_tx.clone();
+                ok(renderer, format!("installing `{}@{}`…", plugin, mp));
+                tokio::task::spawn_blocking(move || {
+                    let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
+                        Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
+                        Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
+                            op: "install".into(),
+                            msg: format!("{:#}", e),
+                        },
+                    };
+                    let _ = tx.send(ev);
+                });
+            }
             None => err(renderer, "usage: /plugin install <plugin>@<marketplace>".into()),
         },
         "uninstall" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {

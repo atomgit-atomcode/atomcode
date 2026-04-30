@@ -313,10 +313,10 @@ fn validate_skill_name(name: &str) -> anyhow::Result<()> {
     }
     if !name
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     {
         anyhow::bail!(
-            "skill name '{}' must contain only lowercase letters, digits, and hyphens",
+            "skill name '{}' must contain only lowercase letters, digits, hyphens, and underscores",
             name
         );
     }
@@ -374,8 +374,13 @@ impl SkillRegistry {
     /// Note: If ATOMCODE_HOME env var is set, it overrides the default home directory
     /// for atomcode-specific paths (.atomcode/commands and .atomcode/skills).
     /// Claude Code compat paths (.claude/*) always use the system home directory.
-    pub fn reload(&mut self, working_dir: &Path) {
+    /// Reload skills. Returns a list of "skipped" diagnostics (one per
+    /// rejected skill on disk). Callers in interactive contexts (TUI) can
+    /// surface these gated behind verbose mode; non-interactive callers
+    /// (agent bootstrap, /cd) drop them.
+    pub fn reload(&mut self, working_dir: &Path) -> Vec<String> {
         self.skills.clear();
+        let mut warnings: Vec<String> = Vec::new();
 
         // System home directory (for Claude Code compat paths)
         let system_home = crate::tool::real_home_dir();
@@ -397,26 +402,27 @@ impl SkillRegistry {
 
         // Load Claude Code compat paths from system home (always)
         if let Some(ref home) = system_home {
-            self.load_flat_commands(&home.join(".claude").join("commands"), LOOSE_NS);
-            self.load_skills_dir(&home.join(".claude").join("skills"), LOOSE_NS);
+            self.load_flat_commands(&home.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
+            self.load_skills_dir(&home.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
         }
 
         // Load atomcode native paths from ATOMCODE_HOME (or system home as fallback)
         if let Some(ref home) = atomcode_home {
-            self.load_flat_commands(&home.join(".atomcode").join("commands"), LOOSE_NS);
-            self.load_skills_dir(&home.join(".atomcode").join("skills"), LOOSE_NS);
+            self.load_flat_commands(&home.join(".atomcode").join("commands"), LOOSE_NS, &mut warnings);
+            self.load_skills_dir(&home.join(".atomcode").join("skills"), LOOSE_NS, &mut warnings);
         }
 
         // Project-level skills (always from working dir)
-        self.load_flat_commands(&working_dir.join(".claude").join("commands"), LOOSE_NS);
-        self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), LOOSE_NS);
-        self.load_skills_dir(&working_dir.join(".claude").join("skills"), LOOSE_NS);
-        self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), LOOSE_NS);
+        self.load_flat_commands(&working_dir.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
+        self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(&working_dir.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), LOOSE_NS, &mut warnings);
 
         // Plugin layer — installed plugins contribute namespaced skills.
         for assets in crate::plugin::loader::iter_installed_plugin_assets() {
-            self.load_skills_dir(&assets.skills_dir(), Some(&assets.plugin));
+            self.load_skills_dir(&assets.skills_dir(), Some(&assets.plugin), &mut warnings);
         }
+        warnings
     }
 
     /// Register a pre-built skill directly (used by plugin system).
@@ -450,7 +456,7 @@ impl SkillRegistry {
     // -----------------------------------------------------------------------
 
     /// Load all `.md` files from a flat `commands/` directory.
-    fn load_flat_commands(&mut self, dir: &Path, namespace: Option<&str>) {
+    fn load_flat_commands(&mut self, dir: &Path, namespace: Option<&str>, warnings: &mut Vec<String>) {
         if !dir.is_dir() {
             return;
         }
@@ -468,7 +474,7 @@ impl SkillRegistry {
                     self.skills.insert(skill.name.clone(), skill);
                 }
                 Err(e) => {
-                    eprintln!("[skill] skipping {}: {}", path.display(), e);
+                    warnings.push(format!("[skill] skipping {}: {}", path.display(), e));
                 }
             }
         }
@@ -476,7 +482,7 @@ impl SkillRegistry {
 
     /// Load directory-style skills from a `skills/` directory.
     /// Each subdirectory that contains a `SKILL.md` becomes one skill.
-    fn load_skills_dir(&mut self, dir: &Path, namespace: Option<&str>) {
+    fn load_skills_dir(&mut self, dir: &Path, namespace: Option<&str>, warnings: &mut Vec<String>) {
         if !dir.is_dir() {
             return;
         }
@@ -498,7 +504,7 @@ impl SkillRegistry {
                     self.skills.insert(skill.name.clone(), skill);
                 }
                 Err(e) => {
-                    eprintln!("[skill] skipping {}: {}", skill_dir.display(), e);
+                    warnings.push(format!("[skill] skipping {}: {}", skill_dir.display(), e));
                 }
             }
         }
@@ -659,7 +665,8 @@ mod tests {
         .unwrap();
 
         let mut reg = SkillRegistry::new();
-        reg.load_skills_dir(tmp.path(), Some("skills"));
+        let mut warnings = Vec::new();
+        reg.load_skills_dir(tmp.path(), Some("skills"), &mut warnings);
 
         assert!(
             reg.get("skills:brainstorming").is_some(),
@@ -682,7 +689,8 @@ mod tests {
         .unwrap();
 
         let mut reg = SkillRegistry::new();
-        reg.load_flat_commands(tmp.path(), Some("skills"));
+        let mut warnings = Vec::new();
+        reg.load_flat_commands(tmp.path(), Some("skills"), &mut warnings);
 
         assert!(reg.get("skills:commit").is_some());
         assert!(reg.get("commit").is_none());

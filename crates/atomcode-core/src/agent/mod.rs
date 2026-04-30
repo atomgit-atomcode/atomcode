@@ -75,6 +75,10 @@ pub enum AgentCommand {
     /// after out-of-turn mutations like `inject_post_compress_state`) the
     /// snapshot can lag the actual conversation state.
     RefreshContextStats,
+    /// Rebuild the hook executor from disk after a `/plugin install|uninstall`
+    /// or other change to plugin state. Cheap (just re-reads JSON files);
+    /// does NOT touch provider/model state, unlike ReloadConfig.
+    ReloadHooks,
     /// Shutdown the agent.
     Shutdown,
 }
@@ -452,7 +456,7 @@ impl AgentLoop {
         let graph = std::sync::Arc::new(tokio::sync::RwLock::new(code_graph));
         tool_context.graph = graph.clone();
         let mut registry = SkillRegistry::new();
-        registry.reload(&working_dir);
+        let _ = registry.reload(&working_dir);
         let has_skills = !registry.is_empty();
         let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
         // Only register use_skill tool when skills are available.
@@ -968,6 +972,24 @@ impl AgentLoop {
                         .build_messages(&self.conversation, &system_prompt, "");
                     self.emit_rich_context_stats(&self.conversation, &msgs).await;
                 }
+                AgentCommand::ReloadHooks => {
+                    // Triggered by /plugin install|uninstall in the TUI so
+                    // newly-contributed hooks (especially UserPromptSubmit)
+                    // fire on the very next user message instead of waiting
+                    // for /cd or restart.
+                    let wd = self
+                        .turn_runner
+                        .context
+                        .working_dir
+                        .try_read()
+                        .map(|g| g.clone())
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
+                    self.hook_executor = std::sync::Arc::new(
+                        crate::hook::executor::HookExecutor::new(hooks),
+                    );
+                    self.turn_runner.hook_executor = self.hook_executor.clone();
+                }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
                     if self.hook_executor.has_hooks() {
@@ -994,13 +1016,49 @@ impl AgentLoop {
     // Core agent logic
     // -------------------------------------------------------------------------
 
-    async fn handle_send_message(&mut self, content: String) {
+    async fn handle_send_message(&mut self, mut content: String) {
         self.current_task = content.clone();
 
         if let Some(reason) = self.turn_runner.provider.availability_error() {
             let _ = self.event_tx.send(AgentEvent::Error(reason.to_string()));
             self.finish_turn(TurnStopReason::Error);
             return;
+        }
+
+        // ── UserPromptSubmit hooks ──
+        // Run before any preprocessing so plugin hooks see the raw user
+        // input. A hook can either block the turn (CC `decision: "block"`
+        // or non-zero exit) or inject extra context that we splice into
+        // the user message before the LLM sees it.
+        if self.hook_executor.has_hooks() {
+            let cwd = self
+                .turn_runner
+                .context
+                .working_dir
+                .try_read()
+                .map(|g| g.display().to_string())
+                .unwrap_or_default();
+            match self
+                .hook_executor
+                .run_user_prompt_submit(&content, "", &cwd)
+                .await
+            {
+                crate::hook::UserPromptHookResult::Continue => {}
+                crate::hook::UserPromptHookResult::Inject(extra) => {
+                    // Append rather than prepend so the user's wording stays
+                    // at the top of the message — the hook context reads as
+                    // supplementary, not as a rewrite.
+                    content.push_str("\n\n");
+                    content.push_str(&extra);
+                }
+                crate::hook::UserPromptHookResult::Block(reason) => {
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::Error(format!("hook blocked: {}", reason)));
+                    self.finish_turn(TurnStopReason::Error);
+                    return;
+                }
+            }
         }
 
         // Detect negative feedback — user is unhappy with previous turn's work.

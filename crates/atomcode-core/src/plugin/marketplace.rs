@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-use super::manifest::{load_marketplace_manifest, MarketplaceManifest};
+use super::manifest::{load_marketplace_manifest, MarketplaceManifest, PluginSource};
 use super::paths;
 use super::state::{load_marketplaces_file, save_marketplaces_file, MarketplaceEntry};
 use super::url::{infer_marketplace_name_from_url, validate_git_url};
@@ -135,7 +135,7 @@ pub(super) fn resolve_marketplace_identity(
             dir_name.to_string(),
             vec![PluginEntry {
                 name: dir_name.to_string(),
-                source: "./".into(),
+                source: PluginSource::Inline("./".into()),
                 description: None,
             }],
         ),
