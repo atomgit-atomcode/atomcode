@@ -75,6 +75,10 @@ pub enum AgentCommand {
     /// after out-of-turn mutations like `inject_post_compress_state`) the
     /// snapshot can lag the actual conversation state.
     RefreshContextStats,
+    /// Rebuild the hook executor from disk after a `/plugin install|uninstall`
+    /// or other change to plugin state. Cheap (just re-reads JSON files);
+    /// does NOT touch provider/model state, unlike ReloadConfig.
+    ReloadHooks,
     /// Shutdown the agent.
     Shutdown,
 }
@@ -94,6 +98,14 @@ pub enum TurnStopReason {
     Cancelled,
     /// API or internal error terminated the loop.
     Error,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompressionOutcome {
+    applied: bool,
+    before_tokens: usize,
+    after_tokens: usize,
+    removed_messages: usize,
 }
 
 impl TurnStopReason {
@@ -444,7 +456,7 @@ impl AgentLoop {
         let graph = std::sync::Arc::new(tokio::sync::RwLock::new(code_graph));
         tool_context.graph = graph.clone();
         let mut registry = SkillRegistry::new();
-        registry.reload(&working_dir);
+        let _ = registry.reload(&working_dir);
         let has_skills = !registry.is_empty();
         let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
         // Only register use_skill tool when skills are available.
@@ -960,6 +972,24 @@ impl AgentLoop {
                         .build_messages(&self.conversation, &system_prompt, "");
                     self.emit_rich_context_stats(&self.conversation, &msgs).await;
                 }
+                AgentCommand::ReloadHooks => {
+                    // Triggered by /plugin install|uninstall in the TUI so
+                    // newly-contributed hooks (especially UserPromptSubmit)
+                    // fire on the very next user message instead of waiting
+                    // for /cd or restart.
+                    let wd = self
+                        .turn_runner
+                        .context
+                        .working_dir
+                        .try_read()
+                        .map(|g| g.clone())
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
+                    self.hook_executor = std::sync::Arc::new(
+                        crate::hook::executor::HookExecutor::new(hooks),
+                    );
+                    self.turn_runner.hook_executor = self.hook_executor.clone();
+                }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
                     if self.hook_executor.has_hooks() {
@@ -986,13 +1016,49 @@ impl AgentLoop {
     // Core agent logic
     // -------------------------------------------------------------------------
 
-    async fn handle_send_message(&mut self, content: String) {
+    async fn handle_send_message(&mut self, mut content: String) {
         self.current_task = content.clone();
 
         if let Some(reason) = self.turn_runner.provider.availability_error() {
             let _ = self.event_tx.send(AgentEvent::Error(reason.to_string()));
             self.finish_turn(TurnStopReason::Error);
             return;
+        }
+
+        // ── UserPromptSubmit hooks ──
+        // Run before any preprocessing so plugin hooks see the raw user
+        // input. A hook can either block the turn (CC `decision: "block"`
+        // or non-zero exit) or inject extra context that we splice into
+        // the user message before the LLM sees it.
+        if self.hook_executor.has_hooks() {
+            let cwd = self
+                .turn_runner
+                .context
+                .working_dir
+                .try_read()
+                .map(|g| g.display().to_string())
+                .unwrap_or_default();
+            match self
+                .hook_executor
+                .run_user_prompt_submit(&content, "", &cwd)
+                .await
+            {
+                crate::hook::UserPromptHookResult::Continue => {}
+                crate::hook::UserPromptHookResult::Inject(extra) => {
+                    // Append rather than prepend so the user's wording stays
+                    // at the top of the message — the hook context reads as
+                    // supplementary, not as a rewrite.
+                    content.push_str("\n\n");
+                    content.push_str(&extra);
+                }
+                crate::hook::UserPromptHookResult::Block(reason) => {
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::Error(format!("hook blocked: {}", reason)));
+                    self.finish_turn(TurnStopReason::Error);
+                    return;
+                }
+            }
         }
 
         // Detect negative feedback — user is unhappy with previous turn's work.
@@ -1080,7 +1146,8 @@ impl AgentLoop {
             // one-line-per-round summaries (DefaultCtx) compact enough
             // for cold zone.
             if let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) {
-                self.conversation.apply_compression(n_msgs, content);
+                let system_prompt = self.build_system_prompt();
+                let _ = self.try_apply_compression(&system_prompt, n_msgs, content, false);
             }
         }
 
@@ -1299,6 +1366,7 @@ impl AgentLoop {
                 let last_bash_cmd = &mut self.discipline_state.last_bash_cmd;
                 let session_files = &mut self.session_files;
                 let reindex_tx = &self.reindex_tx;
+                let working_dir_for_read_counts = runner.context.working_dir.clone();
 
                 // Tool filtering: diagnosis phase uses read-only tools.
                 // All other turns have full tool access (including edit_file).
@@ -1395,7 +1463,8 @@ impl AgentLoop {
                                                 // post-turn warning in `discipline::apply_post_turn_discipline`
                                                 // agrees with the guard on what counts as "same region".
                                                 if name == "read_file" {
-                                                    let key = crate::turn::runner::read_region_key(&short, arguments);
+                                                    let working_dir = working_dir_for_read_counts.try_read().ok().map(|g| g.clone());
+                                                    let key = crate::turn::runner::read_region_key(arguments, working_dir.as_deref());
                                                     *file_read_counts.entry(key).or_insert(0) += 1;
                                                     if !files_read_this_turn.contains(&short) {
                                                         files_read_this_turn.push(short);
@@ -1967,8 +2036,7 @@ impl AgentLoop {
         let summary = self.run_llm_summary(&summarize_prompt).await;
         let final_summary = if summary.trim().is_empty() { content } else { summary };
 
-        self.conversation.apply_compression(n_turns, final_summary);
-        self.inject_post_compress_state();
+        let _ = self.try_apply_compression(system_prompt, n_turns, final_summary, true);
     }
 
     /// Emit a full ContextStats snapshot for the `/context` command.
@@ -2036,6 +2104,61 @@ impl AgentLoop {
         }
     }
 
+    fn rendered_token_count(&self, system_prompt: &str) -> usize {
+        self.ctx
+            .build_messages(&self.conversation, system_prompt, "")
+            .0
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum()
+    }
+
+    /// Apply a compression candidate only when it reduces the next request
+    /// payload. This is the single success criterion for all compression
+    /// entry points: manual `/compact`, threshold-driven auto-compression,
+    /// and task-boundary cleanup.
+    fn try_apply_compression(
+        &mut self,
+        system_prompt: &str,
+        remove_count: usize,
+        summary: String,
+        inject_state: bool,
+    ) -> CompressionOutcome {
+        let before_msg_count = self.conversation.messages.len();
+        let before_tokens = self.rendered_token_count(system_prompt);
+
+        let msgs_snapshot = self.conversation.messages.clone();
+        let cold_snapshot = self.conversation.cold_summaries.clone();
+        let turns_snapshot = self.conversation.turn_tracker.clone();
+
+        self.conversation.apply_compression(remove_count, summary);
+        if inject_state {
+            self.inject_post_compress_state();
+        }
+
+        let after_tokens = self.rendered_token_count(system_prompt);
+        let removed_messages = before_msg_count.saturating_sub(self.conversation.messages.len());
+
+        if after_tokens >= before_tokens {
+            self.conversation.messages = msgs_snapshot;
+            self.conversation.cold_summaries = cold_snapshot;
+            self.conversation.turn_tracker = turns_snapshot;
+            CompressionOutcome {
+                applied: false,
+                before_tokens,
+                after_tokens,
+                removed_messages: 0,
+            }
+        } else {
+            CompressionOutcome {
+                applied: true,
+                before_tokens,
+                after_tokens,
+                removed_messages,
+            }
+        }
+    }
+
     /// Manual `/compact` entry point. Mechanical only — reuses the active
     /// ctx strategy's `compression_plan` (same path as the task-boundary
     /// cleanup in `handle_send_message`) so behavior stays consistent with
@@ -2053,14 +2176,6 @@ impl AgentLoop {
     /// made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
         let system_prompt = self.build_system_prompt();
-        let before_msg_count = self.conversation.messages.len();
-        let before_tokens: usize = self
-            .ctx
-            .build_messages(&self.conversation, &system_prompt, "")
-            .0
-            .iter()
-            .map(|m| m.estimate_tokens())
-            .sum();
         let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 "(nothing to compact — conversation is short)\n".to_string(),
@@ -2091,30 +2206,13 @@ impl AgentLoop {
             summary
         };
 
-        // Rollback snapshot
-        let msgs_snapshot = self.conversation.messages.clone();
-        let cold_snapshot = self.conversation.cold_summaries.clone();
-        let turns_snapshot = self.conversation.turn_tracker.clone();
+        let outcome = self.try_apply_compression(&system_prompt, n_msgs, content, true);
 
-        self.conversation.apply_compression(n_msgs, content);
-        self.inject_post_compress_state();
-
-        let after_tokens: usize = self
-            .ctx
-            .build_messages(&self.conversation, &system_prompt, "")
-            .0
-            .iter()
-            .map(|m| m.estimate_tokens())
-            .sum();
-
-        if after_tokens >= before_tokens {
-            self.conversation.messages = msgs_snapshot;
-            self.conversation.cold_summaries = cold_snapshot;
-            self.conversation.turn_tracker = turns_snapshot;
+        if !outcome.applied {
             let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
                 "(nothing to compact — would not save tokens: {} → {})\n",
-                fmt_k_tokens(before_tokens),
-                fmt_k_tokens(after_tokens),
+                fmt_k_tokens(outcome.before_tokens),
+                fmt_k_tokens(outcome.after_tokens),
             )));
             let (msgs, _) =
                 self.ctx
@@ -2123,13 +2221,12 @@ impl AgentLoop {
             return;
         }
 
-        let removed = before_msg_count.saturating_sub(self.conversation.messages.len());
         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
             "(compacted — dropped {} message{}, {} → {} tokens)\n",
-            removed,
-            if removed == 1 { "" } else { "s" },
-            fmt_k_tokens(before_tokens),
-            fmt_k_tokens(after_tokens),
+            outcome.removed_messages,
+            if outcome.removed_messages == 1 { "" } else { "s" },
+            fmt_k_tokens(outcome.before_tokens),
+            fmt_k_tokens(outcome.after_tokens),
         )));
 
         let (msgs, _) = self

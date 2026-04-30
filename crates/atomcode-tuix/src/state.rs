@@ -223,9 +223,23 @@ impl UiState {
         ctx_name: &str,
         system_prompt: &str,
     ) {
+        let is_rich = ctx_window > 0;
         let snap = self
             .last_context
             .get_or_insert_with(ContextSnapshot::default);
+        if is_rich {
+            snap.system_tokens = system_tokens;
+            snap.sent_tokens = sent_tokens;
+            snap.tool_defs_tokens = tool_defs_tokens;
+            snap.cold_zone_tokens = cold_zone_tokens;
+            snap.total_messages = total_messages;
+            snap.ctx_window = ctx_window;
+            if !ctx_name.is_empty() {
+                snap.ctx_name = ctx_name.to_string();
+            }
+            snap.system_prompt = system_prompt.to_string();
+            return;
+        }
         if system_tokens > 0 {
             snap.system_tokens = system_tokens;
         }
@@ -238,10 +252,6 @@ impl UiState {
         // cold_zone can be 0 legitimately (no compression yet) — the rich
         // emission always sends an accurate value, so only overwrite when
         // the emission carries the ctx_window signal (rich path).
-        if ctx_window > 0 {
-            snap.cold_zone_tokens = cold_zone_tokens;
-            snap.ctx_window = ctx_window;
-        }
         if total_messages > 0 {
             snap.total_messages = total_messages;
         }

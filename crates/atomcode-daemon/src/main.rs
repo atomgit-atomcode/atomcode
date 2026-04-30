@@ -2,11 +2,16 @@
 //!
 //! Provides HTTP API for querying conversation history and streaming chat.
 
+mod api_auth;
+mod api_codingplan;
+mod api_config;
+mod api_provider;
+
 use axum::{
     extract::{Path, Query, State},
     http::{header, request::Parts as RequestParts, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Json, sse::Sse},
-    routing::{get, post},
+    response::{sse::Sse, IntoResponse, Json},
+    routing::{delete, get, post},
     Router,
 };
 use futures::stream::StreamExt;
@@ -32,6 +37,71 @@ use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::{ResolvedConfig, Telemetry, TelemetryState};
+
+// ============================================================================
+// Shared DTOs for P0 API endpoints
+// ============================================================================
+
+/// Structured error response for all new P0 endpoints.
+#[derive(Debug, Serialize)]
+pub(crate) struct ApiError {
+    pub success: bool,
+    pub error: String,
+}
+
+/// Sanitized config response (never exposes api_key).
+#[derive(Debug, Serialize)]
+pub(crate) struct ConfigResponse {
+    pub path: PathBuf,
+    pub default_provider: String,
+    pub default_workdir: Option<String>,
+    pub providers: Vec<ProviderInfo>,
+}
+
+/// Sanitized provider view (no api_key).
+#[derive(Debug, Serialize)]
+pub(crate) struct ProviderInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub has_api_key: bool,
+    pub is_default: bool,
+    pub context_window: usize,
+    pub max_tokens: Option<usize>,
+    pub thinking_enabled: Option<bool>,
+    pub thinking_budget: Option<u32>,
+    pub thinking_type: Option<String>,
+    pub thinking_keep: Option<String>,
+    pub reasoning_history: Option<String>,
+    pub skip_tls_verify: bool,
+    pub ephemeral: bool,
+}
+
+/// In-flight OAuth login session stored in daemon memory.
+pub struct LoginSessionEntry {
+    pub session: atomcode_core::auth::LoginSession,
+    pub created_at: std::time::Instant,
+}
+
+/// Login sessions store: login_id -> LoginSessionEntry
+pub(crate) type LoginSessionsStore = Arc<RwLock<HashMap<String, LoginSessionEntry>>>;
+
+/// Create a structured JSON error response.
+pub(crate) fn json_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ApiError>) {
+    (
+        status,
+        Json(ApiError {
+            success: false,
+            error: message.into(),
+        }),
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectInfo {
     /// Project hash (directory name in sessions/)
@@ -143,6 +213,8 @@ pub struct AppState {
     pub stopped_sessions: StoppedSessionsStore,
     /// MCP server registry (shared across chat requests)
     pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
+    /// In-flight OAuth login sessions (login_id -> entry)
+    pub login_sessions: LoginSessionsStore,
 }
 
 /// Get default working directory
@@ -2212,6 +2284,7 @@ async fn main() {
         chat_tasks: Arc::new(RwLock::new(HashMap::new())),
         stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
+        login_sessions: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -2239,6 +2312,37 @@ async fn main() {
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
+        // Config API (P0)
+        .route("/config", get(api_config::get_config))
+        .route("/config/reload", post(api_config::reload_config))
+        // Provider API (P0)
+        .route(
+            "/providers",
+            get(api_provider::get_providers).post(api_provider::create_provider),
+        )
+        .route(
+            "/providers/:name",
+            patch(api_provider::patch_provider).delete(api_provider::delete_provider),
+        )
+        .route(
+            "/providers/:name/default",
+            post(api_provider::set_default_provider),
+        )
+        .route(
+            "/providers/:name/thinking",
+            patch(api_provider::patch_thinking),
+        )
+        // Auth API (P0)
+        .route("/auth/status", get(api_auth::auth_status))
+        .route("/auth/login/start", post(api_auth::auth_login_start))
+        .route(
+            "/auth/login/:login_id/poll",
+            post(api_auth::auth_login_poll),
+        )
+        .route("/auth/login/:login_id", delete(api_auth::auth_login_cancel))
+        .route("/auth/logout", post(api_auth::auth_logout))
+        // CodingPlan API (P0)
+        .route("/codingplan/setup", post(api_codingplan::codingplan_setup))
         .with_state(state)
         .layer(cors_layer());
 
@@ -2273,6 +2377,20 @@ async fn main() {
     println!("  GET    /sessions/search?q=<keyword>    - Search sessions by name");
     println!("  GET    /models                         - List available models");
     println!("  POST   /chat                           - Stream chat response (SSE)");
+    println!("  GET    /config                         - Get sanitized config");
+    println!("  POST   /config/reload                  - Reload config from disk");
+    println!("  GET    /providers                      - List providers");
+    println!("  POST   /providers                      - Create/replace provider");
+    println!("  PATCH  /providers/:name                - Partially update provider");
+    println!("  DELETE /providers/:name                - Delete provider");
+    println!("  POST   /providers/:name/default        - Set default provider");
+    println!("  PATCH  /providers/:name/thinking       - Update thinking settings");
+    println!("  GET    /auth/status                    - Auth status");
+    println!("  POST   /auth/login/start               - Start OAuth login");
+    println!("  POST   /auth/login/:login_id/poll      - Poll login session");
+    println!("  DELETE /auth/login/:login_id           - Cancel login session");
+    println!("  POST   /auth/logout                    - Logout");
+    println!("  POST   /codingplan/setup               - Run CodingPlan setup");
     println!("\nChange directory body:");
     println!("  {{\"path\": \"/path/to/project\"}}  or {{\"path\": \"-\"}} to go back");
     println!("\nChat request body:");

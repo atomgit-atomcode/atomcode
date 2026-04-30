@@ -59,6 +59,29 @@ pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
         }
     }
 
+    // Plugin layer — two flavors per plugin:
+    //   1. CC-style inline hooks declared in plugin.json (priority).
+    //   2. Legacy atomcode hooks.json file (fallback).
+    // CC wins when both exist because plugin authors targeting CC are the
+    // common case, and a plugin shipping only a legacy hooks.json would not
+    // have a colliding plugin.json hooks block.
+    for assets in crate::plugin::loader::iter_installed_plugin_assets() {
+        if let Some(cc_map) = assets.manifest.inline_cc_hooks() {
+            for (name, hook) in cc_hooks_to_atomcode(cc_map, &assets.plugin_dir) {
+                let key = format!("{}:{}", assets.plugin, name);
+                merged.insert(key, hook);
+            }
+            continue;
+        }
+        let path = assets.hooks_file();
+        if let Ok(hooks) = load_hooks_file(&path) {
+            for (name, hook) in hooks {
+                let key = format!("{}:{}", assets.plugin, name);
+                merged.insert(key, hook);
+            }
+        }
+    }
+
     // Load project hooks — override global by name.
     if let Ok(hooks) = load_hooks_file(&project_path) {
         for (name, hook) in hooks {
@@ -67,6 +90,73 @@ pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
     }
 
     merged.into_values().collect()
+}
+
+/// Translate a Claude-Code-style nested hooks block (as found in
+/// `plugin.json`) into our flat `HookConfig` list. Each command spec
+/// becomes one named entry; the synthetic name lets multiple hooks under
+/// the same event coexist when later merged into the global hook table.
+///
+/// The plugin install directory is exported by the executor as the
+/// `CLAUDE_PLUGIN_ROOT` / `ATOMCODE_PLUGIN_ROOT` environment variables —
+/// hook authors reference it via `"${CLAUDE_PLUGIN_ROOT}/script.py"` in
+/// the command string. We deliberately do NOT substitute the path into
+/// the command at conversion time: paths containing spaces, quotes, `$`
+/// or `;` would break shell parsing or open injection. Env vars are
+/// also what Claude Code uses, so existing CC plugin scripts work as-is.
+pub(crate) fn cc_hooks_to_atomcode(
+    cc: &crate::plugin::manifest::CCHooksMap,
+    plugin_root: &Path,
+) -> Vec<(String, HookConfig)> {
+    use crate::plugin::manifest::CCHookGroup;
+
+    let mut out = Vec::new();
+
+    for (event_name, groups) in cc {
+        let event = match cc_event_name_to_event(event_name) {
+            Some(e) => e,
+            None => continue, // unsupported event — skip silently for now.
+        };
+        for (gi, CCHookGroup { matcher, hooks }) in groups.iter().enumerate() {
+            for (hi, spec) in hooks.iter().enumerate() {
+                if spec.kind != "command" {
+                    continue;
+                }
+                // CC encodes timeout in seconds; we store ms internally.
+                let timeout_ms = spec
+                    .timeout
+                    .map(|s| s.saturating_mul(1000))
+                    .unwrap_or(10_000);
+                let name = format!("{}-{}-{}", event_name, gi, hi);
+                out.push((
+                    name,
+                    HookConfig {
+                        event: event.clone(),
+                        matcher: matcher.clone(),
+                        command: spec.command.clone(),
+                        timeout_ms,
+                        plugin_root: Some(plugin_root.to_path_buf()),
+                    },
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Map CC's PascalCase event names to our `HookEvent` enum. Returns `None`
+/// for events we don't yet support (e.g. `Stop`, `PreCompact`,
+/// `SubagentStop`); callers skip those entries.
+fn cc_event_name_to_event(name: &str) -> Option<HookEvent> {
+    Some(match name {
+        "PreToolUse" => HookEvent::PreToolUse,
+        "PostToolUse" => HookEvent::PostToolUse,
+        "SessionStart" => HookEvent::SessionStart,
+        "SessionEnd" => HookEvent::SessionEnd,
+        "Notification" => HookEvent::Notification,
+        "UserPromptSubmit" => HookEvent::UserPromptSubmit,
+        _ => return None,
+    })
 }
 
 /// Parse a single hooks JSON file and return named hook configs.
@@ -97,6 +187,11 @@ fn load_hooks_file(path: &Path) -> Result<Vec<(String, HookConfig)>> {
                 matcher: entry.matcher,
                 command: entry.command,
                 timeout_ms: entry.timeout_ms,
+                // Legacy flat hooks.json doesn't know which plugin owns
+                // the hook (the hooks.json layout pre-dates the plugin
+                // system). Plugin-contributed hooks come through
+                // `cc_hooks_to_atomcode` which sets this.
+                plugin_root: None,
             },
         ));
     }
@@ -106,6 +201,76 @@ fn load_hooks_file(path: &Path) -> Result<Vec<(String, HookConfig)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cc_hooks_to_atomcode_records_plugin_root_without_substitution() {
+        // Regression: we used to substitute `${CLAUDE_PLUGIN_ROOT}` into the
+        // command string, which broke under `sh -c` for paths containing
+        // spaces / quotes. The contract now is: command is passed through
+        // unchanged, plugin_root is set, executor exports the env var.
+        use crate::plugin::manifest::{CCHookGroup, CCHookSpec};
+        let mut cc: crate::plugin::manifest::CCHooksMap = std::collections::BTreeMap::new();
+        cc.insert(
+            "UserPromptSubmit".into(),
+            vec![CCHookGroup {
+                matcher: None,
+                hooks: vec![CCHookSpec {
+                    kind: "command".into(),
+                    command: "python \"${CLAUDE_PLUGIN_ROOT}/h.py\"".into(),
+                    timeout: Some(5),
+                }],
+            }],
+        );
+        let plugin_root = std::path::Path::new("/opt/x");
+        let out = cc_hooks_to_atomcode(&cc, plugin_root);
+        assert_eq!(out.len(), 1);
+        let (_, h) = &out[0];
+        assert_eq!(h.event, HookEvent::UserPromptSubmit);
+        // Command unchanged — substitution is the executor's job.
+        assert_eq!(h.command, "python \"${CLAUDE_PLUGIN_ROOT}/h.py\"");
+        assert_eq!(h.plugin_root.as_deref(), Some(plugin_root));
+        assert_eq!(h.timeout_ms, 5_000); // CC seconds → ms
+    }
+
+    #[test]
+    fn cc_hooks_to_atomcode_skips_unsupported_events() {
+        use crate::plugin::manifest::{CCHookGroup, CCHookSpec};
+        let mut cc: crate::plugin::manifest::CCHooksMap = std::collections::BTreeMap::new();
+        // Stop / SubagentStop / PreCompact are CC events we don't surface yet.
+        cc.insert(
+            "Stop".into(),
+            vec![CCHookGroup {
+                matcher: None,
+                hooks: vec![CCHookSpec {
+                    kind: "command".into(),
+                    command: "echo".into(),
+                    timeout: None,
+                }],
+            }],
+        );
+        assert!(cc_hooks_to_atomcode(&cc, std::path::Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn cc_hooks_to_atomcode_default_timeout_when_omitted() {
+        use crate::plugin::manifest::{CCHookGroup, CCHookSpec};
+        let mut cc: crate::plugin::manifest::CCHooksMap = std::collections::BTreeMap::new();
+        cc.insert(
+            "PreToolUse".into(),
+            vec![CCHookGroup {
+                matcher: Some("bash".into()),
+                hooks: vec![CCHookSpec {
+                    kind: "command".into(),
+                    command: "echo".into(),
+                    timeout: None,
+                }],
+            }],
+        );
+        let out = cc_hooks_to_atomcode(&cc, std::path::Path::new("/"));
+        assert_eq!(out[0].1.timeout_ms, 10_000);
+        assert_eq!(out[0].1.matcher.as_deref(), Some("bash"));
+    }
+
     /// Parse a minimal hooks JSON with one entry.
     #[test]
     fn parse_single_hook() {
@@ -328,5 +493,31 @@ mod tests {
         }"#;
         let raw: HooksFile = serde_json::from_str(json).unwrap();
         assert_eq!(raw.hooks["fast"].timeout_ms, 500);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_hooks_are_loaded_with_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+
+        let plugin_dir = tmp.path().join(".atomcode/plugins/marketplaces/p");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("hooks.json"),
+            r#"{"hooks":{"on_pre":{"event":"PreToolUse","command":"echo hi"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".atomcode/plugins/installed_plugins.json"),
+            r#"{"version":1,"plugins":{"p@p":{"marketplace":"p","plugin":"p","plugin_dir":"marketplaces/p","installed_at":"x"}}}"#,
+        )
+        .unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let hooks = load_hooks_config(working.path());
+        assert!(hooks.iter().any(|h| h.command == "echo hi"));
+
+        std::env::remove_var("ATOMCODE_HOME");
     }
 }

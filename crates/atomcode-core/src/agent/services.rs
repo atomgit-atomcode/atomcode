@@ -36,7 +36,10 @@ impl AgentLoop {
             self.env_snapshot = crate::ctx::EnvSnapshot::capture(&resolved);
             // Reload skills for the new working directory (project-level skills may differ)
             if let Ok(mut reg) = self.skill_registry.write() {
-                reg.reload(&resolved);
+                // Non-interactive context: warnings would have nowhere to
+                // render. Drop them; the TUI bootstrap reloads with a
+                // renderer in scope and will surface anything important.
+                let _ = reg.reload(&resolved);
             }
             // Reload code graph for the new project
             let graph_path = resolved.join(".atomcode").join("graph.bin");

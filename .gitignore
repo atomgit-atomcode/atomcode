@@ -74,3 +74,4 @@ docs/superpowers
 
 # Superpowers plugin state
 .superpowers/
+.plan_docs

@@ -1059,6 +1059,56 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // visually undo our hide on a 5ms cadence.
     }
 
+    /// Copy the visible body tail into the host terminal's native
+    /// scrollback before we wipe the viewport on exit. Retained mode
+    /// keeps the newest body rows pinned on screen behind a fixed
+    /// footer; those rows have not naturally scrolled off yet, so a
+    /// plain viewport clear would make the bottom of the transcript
+    /// disappear after `/quit`.
+    fn promote_visible_body_to_scrollback(&mut self) {
+        let bottom = self.body_bottom_row() as usize;
+        if bottom == 0 || self.body_lines.is_empty() {
+            return;
+        }
+
+        let screen_w = self.screen.width() as usize;
+        let screen_h = self.screen.height() as usize;
+        let n = self.body_lines.len().min(bottom);
+        if n == 1 && screen_h < 2 {
+            return;
+        }
+        let start = self.body_lines.len() - n;
+        let rows: Vec<Vec<Cell>> = self.body_lines[start..]
+            .iter()
+            .map(|row| clip_cells_to_width(row, screen_w))
+            .collect();
+
+        // Repaint the visible transcript tail at the top of a temporary
+        // top-anchored scroll region, then LF each row out of that
+        // region. Top-anchored DECSTBM is the path terminals promote
+        // into native scrollback; absolute repainting itself has no
+        // scrollback side effect.
+        let region_bottom = if n == 1 { 2 } else { n } as u16;
+        let seq = format!("\x1b[1;{}r", region_bottom);
+        let _ = self.out.write_all(seq.as_bytes());
+        for (i, row) in rows.iter().enumerate() {
+            let seq = format!("\x1b[{};1H\x1b[K", i + 1);
+            let _ = self.out.write_all(seq.as_bytes());
+            let bytes = serialize_row(row);
+            let _ = self.out.write_all(&bytes);
+        }
+        if region_bottom as usize > n {
+            let seq = format!("\x1b[{};1H\x1b[K", region_bottom);
+            let _ = self.out.write_all(seq.as_bytes());
+        }
+        let seq = format!("\x1b[{};1H", region_bottom);
+        let _ = self.out.write_all(seq.as_bytes());
+        for _ in 0..n {
+            let _ = self.out.write_all(b"\n");
+        }
+        self.scroll_region_bottom = Some(region_bottom);
+    }
+
     /// Wrap `text` to content width and push each wrapped chunk as
     /// its own body row with a PAD_COL prefix. Used by variants
     /// whose content is plain (assistant text, command output).
@@ -1620,7 +1670,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // the next Spinner / StreamingBox tick (within ~80ms)
                 // overwrites with the real frame, picking up the
                 // animation seamlessly.
-                let initial = if self.caps.unicode_symbols { "\u{2819}" } else { "*" };
+                let initial = if self.caps.unicode_symbols {
+                    "\u{2819}"
+                } else {
+                    "*"
+                };
                 let row = self.build_inflight_tool_row(initial, &name, &detail);
                 self.inflight_tool = Some((id, name, detail));
                 self.push_or_update_live_spinner(row);
@@ -1788,7 +1842,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: approval / errors / command output ──
             UiLine::ApprovalPrompt { tool, detail } => {
-                let _ = (tool, detail);  // ToolCall row already shows the command
+                let _ = (tool, detail); // ToolCall row already shows the command
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
                 let chip = |c: Color| CellStyle {
@@ -1878,6 +1932,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             let _ = self.out.write_all(&bytes);
             self.dirty = false;
         }
+        self.promote_visible_body_to_scrollback();
         // Be defensive: re-enable autowrap, release any DECSTBM, then
         // wipe the visible viewport and home the cursor. Without the
         // wipe, the welcome banner + input box survive as garbage that
@@ -4658,6 +4713,50 @@ mod tests {
             "footer growth pushed {} extra rows into scrollback; \
              repaint must use absolute positioning, not LF-scroll",
             vterm.scrollback_len() - sb_before
+        );
+    }
+
+    /// Regression for user report: after `/quit`, the newest answer
+    /// rows that were still visible above the fixed footer vanished
+    /// from host-terminal history. They had never naturally scrolled
+    /// into native scrollback, and shutdown wiped the viewport.
+    #[test]
+    fn retained_shutdown_promotes_visible_body_tail_to_scrollback() {
+        let (mut r, buf) = new_capturing(80, 12);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 12);
+        let status = status_basic();
+
+        r.render(UiLine::User("show config routes".into()));
+        r.render(UiLine::CommandOutput(
+            "GET /config\nPOST /config/reload\nvisible-bottom-answer\n".into(),
+        ));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            !vterm
+                .scrollback_texts()
+                .iter()
+                .any(|row| row.contains("visible-bottom-answer")),
+            "baseline should keep the newest visible answer out of scrollback until shutdown"
+        );
+
+        r.shutdown();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert!(
+            vterm
+                .scrollback_texts()
+                .iter()
+                .any(|row| row.contains("visible-bottom-answer")),
+            "shutdown must preserve the visible body tail in scrollback:\n{}",
+            vterm.scrollback_texts().join("\n")
         );
     }
 

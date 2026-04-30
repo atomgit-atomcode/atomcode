@@ -481,6 +481,49 @@ enum Commands {
         #[command(subcommand)]
         action: TelemetryAction,
     },
+    /// Manage skill/command plugins (mirrors `claude plugin ...`).
+    /// Operates on `~/.atomcode/plugins/` shared with the TUI's `/plugin`
+    /// slash command — anything installed via either path is visible to both.
+    #[command(subcommand)]
+    Plugin(PluginCli),
+}
+
+#[derive(Subcommand)]
+enum PluginCli {
+    /// Marketplace registry operations (add/remove/update/list).
+    #[command(subcommand)]
+    Marketplace(MarketplaceCli),
+    /// Install a plugin from a registered marketplace.
+    /// Spec format: `<plugin>@<marketplace>` (matches the slash command).
+    Install {
+        /// e.g. `ascend-model-agent-plugin@ascend-model-agent-plugin`
+        spec: String,
+    },
+    /// Uninstall a previously-installed plugin (does not touch its marketplace).
+    Uninstall {
+        /// e.g. `ascend-model-agent-plugin@ascend-model-agent-plugin`
+        spec: String,
+    },
+    /// List installed plugins.
+    List,
+}
+
+#[derive(Subcommand)]
+enum MarketplaceCli {
+    /// Clone a marketplace git repo and register it locally.
+    Add {
+        /// Git URL (https or ssh) of a marketplace repo.
+        url: String,
+    },
+    /// Drop a registered marketplace. Refuses if any plugin still installed.
+    Remove {
+        /// Marketplace name (the key shown by `marketplace list`).
+        name: String,
+    },
+    /// Re-pull a registered marketplace and refresh its plugin index.
+    Update { name: String },
+    /// List registered marketplaces.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1538,6 +1581,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")
         }
+        Commands::Plugin(sub) => handle_plugin_cli(sub),
         Commands::Mcp(McpCli::Add {
             name,
             command,
@@ -1566,6 +1610,97 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             Ok(())
         }
     }
+}
+
+/// Dispatch `atomcode plugin ...` subcommands. Each branch calls the same
+/// `atomcode_core::plugin::*` API the TUI's `/plugin` slash command uses, so
+/// CLI installs and TUI installs share state under `~/.atomcode/plugins/`.
+fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
+    use atomcode_core::plugin::{installer, marketplace};
+    match sub {
+        PluginCli::Marketplace(MarketplaceCli::Add { url }) => {
+            let info = marketplace::add_marketplace(&url)
+                .map_err(|e| anyhow::anyhow!("add marketplace: {:#}", e))?;
+            println!(
+                "  marketplace `{}` added at {} ({} plugins)",
+                info.name,
+                &info.git_commit[..7.min(info.git_commit.len())],
+                info.plugins.len()
+            );
+            Ok(())
+        }
+        PluginCli::Marketplace(MarketplaceCli::Remove { name }) => {
+            marketplace::remove_marketplace(&name)
+                .map_err(|e| anyhow::anyhow!("remove marketplace: {:#}", e))?;
+            println!("  marketplace `{}` removed", name);
+            Ok(())
+        }
+        PluginCli::Marketplace(MarketplaceCli::Update { name }) => {
+            let info = marketplace::update_marketplace(&name)
+                .map_err(|e| anyhow::anyhow!("update marketplace: {:#}", e))?;
+            println!(
+                "  marketplace `{}` updated to {}",
+                info.name,
+                &info.git_commit[..7.min(info.git_commit.len())]
+            );
+            Ok(())
+        }
+        PluginCli::Marketplace(MarketplaceCli::List) => {
+            let items = marketplace::list_marketplaces()?;
+            if items.is_empty() {
+                println!("  no marketplaces registered");
+            } else {
+                for m in items {
+                    println!(
+                        "  {}  {}  {}  ({} plugins)",
+                        m.name,
+                        m.source,
+                        &m.git_commit[..7.min(m.git_commit.len())],
+                        m.plugins.len()
+                    );
+                }
+            }
+            Ok(())
+        }
+        PluginCli::Install { spec } => {
+            let (plugin, mp) = parse_plugin_spec(&spec)?;
+            let info = installer::install(&plugin, &mp)
+                .map_err(|e| anyhow::anyhow!("install: {:#}", e))?;
+            println!("  installed `{}@{}`", info.plugin, info.marketplace);
+            Ok(())
+        }
+        PluginCli::Uninstall { spec } => {
+            let (plugin, mp) = parse_plugin_spec(&spec)?;
+            installer::uninstall(&plugin, &mp)
+                .map_err(|e| anyhow::anyhow!("uninstall: {:#}", e))?;
+            println!("  uninstalled `{}@{}`", plugin, mp);
+            Ok(())
+        }
+        PluginCli::List => {
+            let items = installer::list_installed()?;
+            if items.is_empty() {
+                println!("  no installed plugins");
+            } else {
+                for p in items {
+                    println!("  {}@{}  {}", p.plugin, p.marketplace, p.plugin_dir);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Split `<plugin>@<marketplace>` into its two parts. Reject empty halves
+/// up front so we surface a single clean error instead of letting the
+/// installer reject `""` later with a confusing "not found" message.
+fn parse_plugin_spec(s: &str) -> Result<(String, String)> {
+    let (plugin, mp) = s
+        .split_once('@')
+        .ok_or_else(|| anyhow::anyhow!("expected <plugin>@<marketplace>, got `{}`", s))?;
+    if plugin.trim().is_empty() || mp.trim().is_empty() {
+        anyhow::bail!("plugin/marketplace name must not be empty in `{}`", s);
+    }
+    Ok((plugin.trim().to_string(), mp.trim().to_string()))
 }
 
 /// CLI (non-TUI) upgrade driver — prints progress to stdout and

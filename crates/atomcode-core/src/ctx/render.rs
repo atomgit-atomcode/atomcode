@@ -1709,4 +1709,46 @@ mod tests {
             }
         }
     }
+
+    /// Conversation compression is correct only when it reduces the next
+    /// wire payload. A generated summary (plus any post-compress state note)
+    /// can be larger than the messages it replaces, so callers must judge
+    /// compression by before/after `build_messages` tokens, not by raw
+    /// history length.
+    #[test]
+    fn compression_must_be_judged_by_wire_token_savings() {
+        let mut conv = Conversation::new();
+        for i in 0..16 {
+            conv.add_user_message(&format!("task {}", i));
+            conv.push_delta("ok");
+            conv.finalize_stream();
+        }
+
+        let before_tokens: usize = build_messages(&conv, "sys", 64_000, "")
+            .0
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum();
+        let (_mechanical_summary, remove_count) = build_compression_content(&conv);
+        assert!(remove_count > 0, "test conversation should be compressible");
+
+        conv.apply_compression(remove_count, "expanded summary ".repeat(2_000));
+        conv.add_user_message(
+            "[Context was compressed. Here is your current state:]\n\
+             TASK: continue the current issue analysis\n\
+             RECENTLY READ: crates/atomcode-core/src/agent/mod.rs",
+        );
+
+        let after_tokens: usize = build_messages(&conv, "sys", 64_000, "")
+            .0
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum();
+
+        assert!(
+            after_tokens > before_tokens,
+            "dropped messages alone is not a valid compaction success metric: \
+             before={before_tokens}, after={after_tokens}"
+        );
+    }
 }
