@@ -848,8 +848,17 @@ pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
 /// failed (e.g., new binary missing execute bit under unusual filesystem
 /// constraints); caller should surface the error and keep running with
 /// the old binary rather than exiting silently.
-pub fn re_exec_self() -> Result<std::convert::Infallible> {
-    let exe = current_exe_path()?;
+/// Replace the current process with a fresh invocation of the live binary.
+///
+/// `exe_override` lets callers specify the exact binary path to exec into,
+/// bypassing `current_exe_path()`. This is critical after `replace_binary`
+/// on Linux: when the running binary has been renamed to `.bak`,
+/// `/proc/self/exe` resolves to the `.bak` path, so `current_exe_path()`
+/// would return the old version. The caller already knows the correct
+/// path (the `exe` field from `AppliedUpgrade` / `UpgradeSummary`),
+/// so we use that instead.
+pub fn re_exec_self(exe_override: Option<PathBuf>) -> Result<std::convert::Infallible> {
+    let exe = exe_override.unwrap_or_else(|| current_exe_path().unwrap());
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
 
     #[cfg(unix)]

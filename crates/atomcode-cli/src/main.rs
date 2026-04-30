@@ -261,7 +261,9 @@ async fn sync_stage_and_apply_if_newer() {
                     eprintln!("✓ Upgrading to {}...", applied.version);
                     // Save the CURRENT version (before upgrade) so TUI can show "Upgraded old → new"
                     std::env::set_var(UPGRADED_FROM_ENV, &current);
-                    match self_update::re_exec_self() {
+                    // Pass the applied exe path to re_exec_self so it execs the
+                    // NEW binary, not /proc/self/exe which may point to .bak on Linux.
+                    match self_update::re_exec_self(Some(applied.exe.clone())) {
                         Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
                         Err(e) => {
                             eprintln!(
@@ -588,7 +590,9 @@ async fn main() {
                 // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
                 // can surface a welcome-screen confirmation exactly once.
                 std::env::set_var(UPGRADED_FROM_ENV, &current_version);
-                match atomcode_core::self_update::re_exec_self() {
+                // Pass the applied exe path to re_exec_self so it execs the
+                // NEW binary, not /proc/self/exe which may point to .bak on Linux.
+                match atomcode_core::self_update::re_exec_self(Some(applied.exe.clone())) {
                     Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
                     Err(e) => {
                         eprintln!(
