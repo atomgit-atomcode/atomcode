@@ -338,6 +338,59 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Query the actual version string from a binary on disk by running
+/// `<binary> --version` and parsing the output. Returns `None` if the
+/// subprocess fails, times out, or produces unparseable output — callers
+/// should fall back to the manifest version in that case.
+///
+/// This is the single source of truth for "what version is this binary?"
+/// after `replace_binary` has put it in place, ensuring the version
+/// reported to the user always matches the real binary rather than the
+/// potentially-stale `latest.json` manifest.
+fn query_binary_version(exe: &Path) -> Option<String> {
+    let mut child = std::process::Command::new(exe)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Short timeout: a healthy binary prints its version instantly.
+    // If this hangs (AV scan, NFS stall), don't block the upgrade.
+    // Poll with try_wait since std::process::Child has no built-in timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    };
+
+    if !status.success() {
+        return None;
+    }
+
+    let stdout = child.stdout.take()?;
+    let output = std::io::read_to_string(stdout).ok()?;
+    // `atomcode --version` outputs like "4.21.0 (build-id)" on the first
+    // line. Extract the first whitespace-delimited token and prepend "v"
+    // so the result matches the `vX.Y.Z` convention used everywhere.
+    let first_line = output.lines().next()?;
+    let raw = first_line.split_whitespace().next()?;
+    if raw.starts_with('v') {
+        Some(raw.to_string())
+    } else {
+        Some(format!("v{}", raw))
+    }
+}
+
 /// Put `new_bin` in place of `exe`, keeping the previous `exe` as `.bak`.
 ///
 /// On Unix, `rename(2)` within a directory is atomic; on Windows, an
@@ -459,14 +512,20 @@ pub async fn run_upgrade(
         }
     }
 
+    // After replace_binary succeeds, the new binary is live on disk.
+    // Query its actual version instead of trusting manifest.version —
+    // the two can diverge when the manifest isn't updated in lockstep
+    // with the published artifacts (the root cause of #276).
+    let actual_version = query_binary_version(&exe).unwrap_or_else(|| manifest.version.clone());
+
     let backup = backup_path(&exe);
     let _ = tx.send(UpgradeEvent::Done {
-        version: manifest.version.clone(),
+        version: actual_version.clone(),
         backup: backup.clone(),
     });
 
     Ok(UpgradeSummary {
-        version: manifest.version,
+        version: actual_version,
         backup,
         exe,
     })
@@ -757,8 +816,14 @@ pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
     // Success — pointer is done, file moved into place by replace_binary.
     clear_pending_pointer();
 
+    // Query the actual version from the new binary on disk instead of
+    // trusting pending.version (which came from the manifest and may be
+    // stale — see #276). Fall back to pending.version if the query fails
+    // (e.g. AV intercept, NFS stall) so the upgrade still completes.
+    let actual_version = query_binary_version(&exe).unwrap_or_else(|| pending.version.clone());
+
     Ok(Some(AppliedUpgrade {
-        version: pending.version,
+        version: actual_version,
         backup: backup_path(&exe),
         exe,
     }))
@@ -1104,5 +1169,239 @@ mod tests {
             "got: {:?}",
             p
         );
+    }
+
+    // ========================================================================
+    // query_binary_version tests
+    // ========================================================================
+    //
+    // Strategy: we create small shell-script / batch "fake binaries" in a
+    // temp directory that print a version string when run with --version.
+    // This lets us exercise query_binary_version on every OS without
+    // needing the real atomcode binary.
+
+    /// Helper: create a fake "binary" in `dir` that prints `output` when
+    /// invoked with any arguments. On Unix this is a shell script; on
+    /// Windows it's a .bat file.
+    fn create_fake_binary(dir: &Path, name: &str, output: &str) -> PathBuf {
+        #[cfg(unix)]
+        {
+            let path = dir.join(name);
+            let script = format!("#!/bin/sh\necho '{}'", output);
+            std::fs::write(&path, script).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{}.bat", name));
+            let script = format!("@echo {}\n@exit /b 0", output);
+            std::fs::write(&path, script).unwrap();
+            path
+        }
+    }
+
+    // ---- Cross-platform: basic version parsing ----
+
+    #[test]
+    fn query_binary_version_parses_bare_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = create_fake_binary(tmp.path(), "atomcode", "4.21.0");
+        let result = query_binary_version(&fake);
+        assert_eq!(result, Some("v4.21.0".to_string()), "bare version should get v- prefix");
+    }
+
+    #[test]
+    fn query_binary_version_parses_v_prefixed_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = create_fake_binary(tmp.path(), "atomcode", "v4.21.0");
+        let result = query_binary_version(&fake);
+        assert_eq!(result, Some("v4.21.0".to_string()), "v-prefixed version should be preserved");
+    }
+
+    #[test]
+    fn query_binary_version_parses_version_with_build_metadata() {
+        // Real atomcode --version outputs: "4.21.0 (build-id)" or similar
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = create_fake_binary(tmp.path(), "atomcode", "4.21.0 (abc123-dirty)");
+        let result = query_binary_version(&fake);
+        assert_eq!(result, Some("v4.21.0".to_string()), "should extract first token only");
+    }
+
+    #[test]
+    fn query_binary_version_parses_v_prefix_with_build_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = create_fake_binary(tmp.path(), "atomcode", "v4.21.1 (release)");
+        let result = query_binary_version(&fake);
+        assert_eq!(result, Some("v4.21.1".to_string()), "should extract v-prefixed first token");
+    }
+
+    #[test]
+    fn query_binary_version_parses_major_minor_only() {
+        // Unlikely but should still work
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = create_fake_binary(tmp.path(), "atomcode", "5.0");
+        let result = query_binary_version(&fake);
+        assert_eq!(result, Some("v5.0".to_string()), "two-part version should work");
+    }
+
+    // ---- Cross-platform: error / edge cases ----
+
+    #[test]
+    fn query_binary_version_returns_none_for_nonexistent_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist");
+        assert_eq!(query_binary_version(&path), None, "missing binary should return None");
+    }
+
+    #[test]
+    fn query_binary_version_returns_none_for_empty_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a script that outputs nothing
+        #[cfg(unix)]
+        {
+            let path = tmp.path().join("silent");
+            std::fs::write(&path, "#!/bin/sh\ntrue").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(query_binary_version(&path), None, "empty output should return None");
+        }
+        #[cfg(windows)]
+        {
+            let path = tmp.path().join("silent.bat");
+            std::fs::write(&path, "@echo off\n@exit /b 0").unwrap();
+            assert_eq!(query_binary_version(&path), None, "empty output should return None");
+        }
+    }
+
+    #[test]
+    fn query_binary_version_returns_none_for_nonzero_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            let path = tmp.path().join("failing");
+            std::fs::write(&path, "#!/bin/sh\necho '4.21.0'; exit 1").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(query_binary_version(&path), None, "non-zero exit should return None");
+        }
+        #[cfg(windows)]
+        {
+            let path = tmp.path().join("failing.bat");
+            std::fs::write(&path, "@echo 4.21.0\n@exit /b 1").unwrap();
+            assert_eq!(query_binary_version(&path), None, "non-zero exit should return None");
+        }
+    }
+
+    // ---- macOS-specific: code-signed binary behavior ----
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn query_binary_version_works_with_real_atomcode_binary_on_macos() {
+        // If the test binary itself can be found, use it as a real binary
+        // that supports --version. This validates the full pipe on macOS.
+        let exe = std::env::current_exe().unwrap();
+        // The test binary may or may not support --version the same way as
+        // the production binary; just verify the function doesn't panic or
+        // hang. If it returns Some, check the format.
+        if let Some(v) = query_binary_version(&exe) {
+            assert!(v.starts_with('v'), "version should start with 'v', got: {}", v);
+        }
+        // Returning None is also acceptable (test binary might not support --version)
+    }
+
+    // ---- Linux-specific: executable permission behavior ----
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn query_binary_version_fails_for_non_executable_on_linux() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("noexec");
+        std::fs::write(&path, "4.21.0").unwrap();
+        // File exists but is NOT executable → spawn should fail → None
+        assert_eq!(query_binary_version(&path), None, "non-executable should return None");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn query_binary_version_works_with_executable_on_linux() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = create_fake_binary(tmp.path(), "atomcode", "4.21.0");
+        let result = query_binary_version(&fake);
+        assert_eq!(result, Some("v4.21.0".to_string()), "executable script on Linux should work");
+    }
+
+    // ---- Windows-specific: .exe behavior ----
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn query_binary_version_works_with_bat_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = create_fake_binary(tmp.path(), "atomcode", "4.21.0");
+        let result = query_binary_version(&fake);
+        assert_eq!(result, Some("v4.21.0".to_string()), "bat script on Windows should work");
+    }
+
+    // ---- Timeout behavior ----
+
+    #[test]
+    fn query_binary_version_times_out_on_hanging_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            let path = tmp.path().join("hanging");
+            // Script that sleeps for 30 seconds — much longer than the 5s timeout
+            std::fs::write(&path, "#!/bin/sh\nsleep 30\necho '4.21.0'").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let start = std::time::Instant::now();
+            let result = query_binary_version(&path);
+            let elapsed = start.elapsed();
+
+            assert_eq!(result, None, "hanging binary should return None after timeout");
+            assert!(elapsed < std::time::Duration::from_secs(8),
+                "should timeout within ~5s, not hang for 30s (elapsed: {:?})", elapsed);
+        }
+        #[cfg(windows)]
+        {
+            let path = tmp.path().join("hanging.bat");
+            // Batch that sleeps for 30 seconds
+            std::fs::write(&path, "@ping -n 30 127.0.0.1 >nul\n@echo 4.21.0").unwrap();
+
+            let start = std::time::Instant::now();
+            let result = query_binary_version(&path);
+
+            assert_eq!(result, None, "hanging binary should return None after timeout");
+            let elapsed = start.elapsed();
+            assert!(elapsed < std::time::Duration::from_secs(8),
+                "should timeout within ~5s (elapsed: {:?})", elapsed);
+        }
+    }
+
+    // ---- Fallback behavior in upgrade paths ----
+
+    #[test]
+    fn query_binary_version_fallback_returns_manifest_version_on_failure() {
+        // Simulates the fallback pattern used in run_upgrade and
+        // apply_pending_upgrade: query_binary_version(exe).unwrap_or_else(|| manifest.version)
+        let manifest_version = "v4.20.0".to_string();
+        let nonexistent = Path::new("/nonexistent-binary-xyz");
+
+        let result = query_binary_version(nonexistent).unwrap_or_else(|| manifest_version.clone());
+        assert_eq!(result, "v4.20.0", "should fall back to manifest version when query fails");
+    }
+
+    #[test]
+    fn query_binary_version_prefers_real_version_over_manifest() {
+        // When query succeeds, it should override the manifest version
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = create_fake_binary(tmp.path(), "atomcode", "4.21.1");
+        let manifest_version = "v4.21.0".to_string(); // stale manifest
+
+        let result = query_binary_version(&fake).unwrap_or_else(|| manifest_version.clone());
+        assert_eq!(result, "v4.21.1", "actual binary version should override stale manifest");
     }
 }
