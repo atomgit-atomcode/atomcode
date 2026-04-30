@@ -133,7 +133,15 @@ fn build_notification_plan(
     };
 
     // Windows 上系统通知走 PowerShell NotifyIcon，实测会让 TUI 闪退，整条通道关掉。
-    let emit_system = cfg.system && !cfg!(target_os = "windows");
+    //
+    // For background-only notifications, only use OS-native fallbacks when we
+    // know the terminal is actually unfocused. macOS Terminal.app does not feed
+    // focus events into our current reader, so its state stays Unknown while the
+    // user may still be reading scrollback in the foreground. BEL / terminal
+    // protocols can still let the terminal decide how much attention to request.
+    let emit_system = cfg.system
+        && !cfg!(target_os = "windows")
+        && (!cfg.background_only || terminal_focus_state() == Some(false));
 
     Some(NotificationPlan {
         title,
@@ -509,6 +517,12 @@ fn powershell_string_literal(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn focus_state_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn builds_human_readable_notification_text() {
@@ -658,6 +672,7 @@ mod tests {
 
     #[test]
     fn focused_terminal_suppresses_background_only_notifications() {
+        let _guard = focus_state_test_lock();
         let cfg = NotificationConfig::default();
         set_terminal_focus_state(Some(true));
         let plan = build_notification_plan(
@@ -670,6 +685,73 @@ mod tests {
         );
         set_terminal_focus_state(None);
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn background_only_unknown_focus_suppresses_system_fallback() {
+        let _guard = focus_state_test_lock();
+        let cfg = NotificationConfig::default();
+        set_terminal_focus_state(None);
+        let plan = build_notification_plan(
+            &cfg,
+            NotificationEvent::TurnFinished(TurnNotification {
+                duration: Duration::from_secs(12),
+                turn_count: 1,
+                tool_call_count: 1,
+                total_tokens: None,
+                stop_reason: TurnStopReason::Natural,
+                working_dir: Some(Path::new("/tmp/demo")),
+            }),
+        )
+        .unwrap();
+
+        assert!(plan.emit_terminal);
+        assert!(plan.emit_bell);
+        assert!(!plan.emit_system);
+    }
+
+    #[test]
+    fn background_only_unfocused_allows_system_fallback() {
+        let _guard = focus_state_test_lock();
+        let cfg = NotificationConfig::default();
+        set_terminal_focus_state(Some(false));
+        let plan = build_notification_plan(
+            &cfg,
+            NotificationEvent::TurnFinished(TurnNotification {
+                duration: Duration::from_secs(12),
+                turn_count: 1,
+                tool_call_count: 1,
+                total_tokens: None,
+                stop_reason: TurnStopReason::Natural,
+                working_dir: Some(Path::new("/tmp/demo")),
+            }),
+        )
+        .unwrap();
+        set_terminal_focus_state(None);
+
+        assert_eq!(plan.emit_system, !cfg!(target_os = "windows"));
+    }
+
+    #[test]
+    fn non_background_only_keeps_system_fallback_for_unknown_focus() {
+        let _guard = focus_state_test_lock();
+        let mut cfg = NotificationConfig::default();
+        cfg.background_only = false;
+        set_terminal_focus_state(None);
+        let plan = build_notification_plan(
+            &cfg,
+            NotificationEvent::TurnFinished(TurnNotification {
+                duration: Duration::from_secs(12),
+                turn_count: 1,
+                tool_call_count: 1,
+                total_tokens: None,
+                stop_reason: TurnStopReason::Natural,
+                working_dir: Some(Path::new("/tmp/demo")),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(plan.emit_system, !cfg!(target_os = "windows"));
     }
 
     #[cfg(target_os = "macos")]
