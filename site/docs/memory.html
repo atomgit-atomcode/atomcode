@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>永久记忆 · AtomCode 文档</title>
+  <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+  <link rel="stylesheet" href="../dist.css">
+  <link rel="stylesheet" href="./docs.css">
+  <script>(function(){var t=localStorage.getItem('atomcode-theme')||'dark';document.documentElement.setAttribute('data-theme',t);})();</script>
+</head>
+<body class="antialiased">
+  <nav class="docs-nav fixed top-0 w-full z-50 border-b border-white/5">
+    <div class="max-w-7xl mx-auto px-4 md:px-6 h-14 md:h-16 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 md:gap-3">
+        <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
+        <span class="text-base md:text-lg font-semibold tracking-tight">AtomCode</span>
+        <span class="text-xs text-slate-500 hidden sm:inline">· 使用指南</span>
+      </a>
+      <div class="flex items-center gap-2 md:gap-4">
+        <a href="../index.html" class="hidden md:inline text-sm text-slate-400 hover:text-brand-400 transition">← 返回首页</a>
+        <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" class="hidden md:inline text-sm text-slate-400 hover:text-brand-400 transition">AtomGit 仓库</a>
+        <button onclick="toggleDocsTheme()" class="w-9 h-9 rounded-lg bg-white/5 hover:bg-white/10 transition flex items-center justify-center text-slate-300" title="切换主题"><span id="themeIcon">☼</span></button>
+        <button id="sidebarToggle" class="md:hidden w-9 h-9 rounded-lg bg-white/5 flex items-center justify-center text-slate-300" aria-label="目录">☰</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="max-w-7xl mx-auto px-4 md:px-6 pt-20 md:pt-24 pb-24 md:grid md:grid-cols-[220px_1fr] md:gap-10">
+    <aside id="docsSidebar" class="docs-sidebar md:sticky md:top-24 md:self-start mb-8 md:mb-0">
+      <div class="text-xs uppercase text-slate-500 font-semibold mb-3 tracking-wider">使用指南</div>
+      <div id="docsSearch"></div>
+      <nav class="flex flex-col gap-0.5">
+        <a href="./index.html">概览</a>
+        <a href="./getting-started.html">快速开始</a>
+        <a href="./configuration.html">配置文件</a>
+        <a href="./login.html">登录方式</a>
+        <a href="./basic-usage.html">基本使用</a>
+        <a href="./slash-commands.html">斜杠命令</a>
+        <a href="./keybindings.html">快捷键</a>
+        <a href="./tools.html">内置工具</a>
+        <a href="./sessions.html">会话与撤销</a>
+        <a href="./project-instructions.html">项目指令文件</a>
+        <a href="./memory.html" aria-current="page">永久记忆</a>
+        <a href="./headless-daemon.html">Headless 与 Daemon</a>
+        <a href="./skills.html">Skills 扩展</a>
+        <a href="./mcp.html">MCP 集成</a>
+        <a href="./faq.html">常见问题</a>
+      </nav>
+    </aside>
+
+    <main class="prose-docs min-w-0">
+      <h1>永久记忆</h1>
+      <p class="lede">用 <code>/remember</code> 把零碎的偏好、约定、命令记下来,AtomCode 会在每一轮对话的系统提示里把它们带给模型。和 <a href="./project-instructions.html"><code>.atomcode.md</code> 项目指令文件</a> 互补:指令文件适合写整篇规范,记忆适合积累那些"突然想起来该告诉它"的零散事实。</p>
+
+      <h2>命令总览</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/remember &lt;内容&gt;</code></td><td>记一条到 <strong>项目级</strong> 记忆(默认作用域,绑定当前工作目录)</td></tr>
+          <tr><td><code>/remember --global &lt;内容&gt;</code></td><td>记一条到 <strong>全局</strong> 记忆(所有项目共享)</td></tr>
+          <tr><td><code>/forget &lt;关键词&gt;</code></td><td>删除全局 + 项目记忆中含该关键词的所有条目(大小写不敏感),输出会列出删了哪些条目</td></tr>
+          <tr><td><code>/memory</code></td><td>查看当前生效的所有记忆,按 <code>[Global]</code> / <code>[Project]</code> 分组并显示磁盘路径</td></tr>
+        </tbody>
+      </table>
+
+      <h2>存储位置</h2>
+      <table>
+        <thead>
+          <tr><th>作用域</th><th>路径</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>全局</td><td><code>~/.atomcode/memory.md</code>(或 <code>$ATOMCODE_HOME/memory.md</code>)</td></tr>
+          <tr><td>项目</td><td><code>&lt;project_root&gt;/.atomcode/memory.md</code></td></tr>
+        </tbody>
+      </table>
+      <p>格式是普通 Markdown,每行一条 <code>- </code> 开头的列表项。可以用 <code>/remember</code> 也可以直接手编辑——AtomCode 在下一轮会重新读取。<strong>非 <code>- </code> 开头的行会被忽略</strong>,所以可以加注释、空行、标题分组,记忆条目本身不受影响。</p>
+
+      <h2>模型怎么"用"这些记忆</h2>
+      <p>每次发请求时,AtomCode 会把<strong>全局 + 项目记忆合并</strong>注入到系统提示里(<code>crates/atomcode-core/src/agent/prompt.rs:64</code>),格式如下:</p>
+      <pre><code>=== MEMORY ===
+The user has asked you to remember these facts and preferences:
+
+[Global]
+- 用户偏好简洁回答,避免冗长解释
+- 中文回复,但 commit message 用英文
+
+[Project: atomcode]
+- 测试命令是 cargo test --workspace --no-fail-fast
+- CI 失败时先看 .github/workflows/ci.yml 第 78-92 行</code></pre>
+      <p>模型每个 turn 都能看到这块。<strong>没有"语义检索"或"按需召回"</strong>——是无条件全量注入,所以记忆条目越多,每个 turn 消耗的 token 越多。务必删除过时的条目,保持精简。</p>
+
+      <h2>容量限制</h2>
+      <table>
+        <thead>
+          <tr><th>限制</th><th>数值</th><th>触发后行为</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>单个记忆文件大小</td><td>64 KB</td><td>只读末尾 64KB(按行边界对齐,不会切坏 UTF-8 字符)</td></tr>
+          <tr><td>注入提示的总字符</td><td>4000 字符</td><td>截断并附 <code>[...truncated, run /memory to review]</code> 提示</td></tr>
+        </tbody>
+      </table>
+      <p>到上限就用 <code>/forget</code> 清理,把最近不再相关的条目删掉。</p>
+
+      <h2>使用建议</h2>
+
+      <h3>1. 项目特定的命令、约定、坑(项目级)</h3>
+      <pre><code>&gt; /remember 用 npm run check 跑类型检查(不是 npm run typecheck)
+&gt; /remember CI 失败时先看 .github/workflows/ci.yml 第 78-92 行
+&gt; /remember 这个 repo 严禁用 sed -i 改文件(macOS/Linux 行为不一致)
+&gt; /remember 数据库迁移 SQL 必须先在 staging 跑过才能上 main</code></pre>
+
+      <h3>2. 全局编码偏好、工作流(全局)</h3>
+      <pre><code>&gt; /remember --global 改完代码先跑测试再 commit
+&gt; /remember --global 不要主动 git push,让我手动确认
+&gt; /remember --global 中文回复,但 commit message 用英文
+&gt; /remember --global 优先编辑现有文件,不要擅自创建文档(*.md)</code></pre>
+
+      <h3>3. 个人或团队信息(全局)</h3>
+      <pre><code>&gt; /remember --global 我的 GitHub 用户名是 alice
+&gt; /remember --global 默认时区 Asia/Shanghai
+&gt; /remember --global 团队 standup 是周一周三周五 9:30</code></pre>
+
+      <h3>4. 清理过时记忆</h3>
+      <pre><code>&gt; /forget npm run check
+  [project] - 用 npm run check 跑类型检查(不是 npm run typecheck)
+  (removed 1 matching entry)
+
+&gt; /memory
+  [Global] (/Users/alice/.atomcode/memory.md)
+    - 改完代码先跑测试再 commit
+    - 不要主动 git push,让我手动确认
+  [Project] (/Users/alice/code/myrepo/.atomcode/memory.md)
+    - CI 失败时先看 .github/workflows/ci.yml 第 78-92 行</code></pre>
+
+      <h2>记忆 vs 项目指令文件 vs 会话历史</h2>
+      <p>AtomCode 提供了三种持久化"上下文"的方式,各自定位不同:</p>
+      <table>
+        <thead>
+          <tr><th></th><th><code>.atomcode.md</code></th><th>记忆(memory.md)</th><th>会话(<code>/resume</code>)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>适合内容</td><td>整篇规范、技术栈、详细约定</td><td>零散事实、个人偏好、命令速查</td><td>过去的对话和工具调用</td></tr>
+          <tr><td>作用范围</td><td>项目</td><td>项目 + 全局</td><td>具体某次会话</td></tr>
+          <tr><td>添加方式</td><td>手动编辑</td><td><code>/remember</code> 或手动编辑</td><td>每次对话自动保存</td></tr>
+          <tr><td>注入机制</td><td>启动时注入系统提示</td><td>每轮注入系统提示</td><td><code>/resume</code> 时整段恢复</td></tr>
+          <tr><td>token 预算</td><td>较大(整篇文档)</td><td>受 4000 字符上限</td><td>受上下文窗口限制</td></tr>
+        </tbody>
+      </table>
+      <p>典型组合:</p>
+      <ul>
+        <li><strong>团队规范</strong> 写在 <code>.atomcode.md</code> 里(进 git,所有人共享)</li>
+        <li><strong>个人偏好</strong> 用 <code>/remember --global</code>(只在你本机)</li>
+        <li><strong>项目特定坑</strong> 用 <code>/remember</code>(留在项目本地的 <code>.atomcode/memory.md</code>,可以选择是否进 git)</li>
+      </ul>
+      <p>关于 <code>.atomcode/memory.md</code> 是否提交进 git:如果团队都用 AtomCode 且记忆是项目知识(如踩过的坑、约定),可以提交;如果是个人开发笔记,可以加进 <code>.gitignore</code>。</p>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./project-instructions.html">项目指令文件</a> —— 整篇规范的最佳入口</li>
+        <li><a href="./slash-commands.html">斜杠命令</a> —— 完整命令参考</li>
+        <li><a href="./sessions.html">会话与撤销</a> —— <code>/resume</code> 的细节</li>
+      </ul>
+    </main>
+  </div>
+
+  <script src="./docs.js"></script>
+</body>
+</html>

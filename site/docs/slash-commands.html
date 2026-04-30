@@ -85,6 +85,20 @@
         </tbody>
       </table>
 
+      <h2>永久记忆</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/remember &lt;内容&gt;</code></td><td>记一条到项目级记忆(默认作用域,绑定当前工作目录)</td></tr>
+          <tr><td><code>/remember --global &lt;内容&gt;</code></td><td>记一条到全局记忆(所有项目共享)</td></tr>
+          <tr><td><code>/forget &lt;关键词&gt;</code></td><td>删除全局 + 项目记忆中含该关键词的所有条目(大小写不敏感)</td></tr>
+          <tr><td><code>/memory</code></td><td>查看当前生效的所有记忆,按 <code>[Global]</code> / <code>[Project]</code> 分组</td></tr>
+        </tbody>
+      </table>
+      <p>详细使用与最佳实践见 <a href="./memory.html">永久记忆</a>。</p>
+
       <h2>MCP 集成</h2>
       <table>
         <thead>

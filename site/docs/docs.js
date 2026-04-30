@@ -36,6 +36,7 @@
     { url: 'tools.html',               title: '内置工具' },
     { url: 'sessions.html',            title: '会话与撤销' },
     { url: 'project-instructions.html', title: '项目指令文件' },
+    { url: 'memory.html',              title: '永久记忆' },
     { url: 'skills.html',              title: 'Skills 扩展' },
     { url: 'faq.html',                 title: '常见问题' },
   ];
