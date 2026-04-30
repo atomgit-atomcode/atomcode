@@ -431,12 +431,21 @@ fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
         )
     })?;
 
+    // Move the new binary into place. `rename(2)` is atomic when source
+    // and destination are on the same filesystem, but fails with EXDEV
+    // when they are on different mount points (e.g. staged dir on /root
+    // and exe on /data). Fall back to copy-then-delete in that case.
     if let Err(e) = std::fs::rename(new_bin, exe) {
-        let _ = std::fs::rename(&backup, exe);
-        return Err(anyhow!(
-            "moving new binary into place failed ({}). Previous version restored.",
-            e
-        ));
+        // Cross-device link? Try copy + delete.
+        if let Err(copy_err) = std::fs::copy(new_bin, exe).and_then(|_| std::fs::remove_file(new_bin)) {
+            // Copy also failed — restore backup and report the original rename error.
+            let _ = std::fs::rename(&backup, exe);
+            return Err(anyhow!(
+                "moving new binary into place failed (rename: {}, copy: {}). Previous version restored.",
+                e,
+                copy_err
+            ));
+        }
     }
 
     Ok(())
