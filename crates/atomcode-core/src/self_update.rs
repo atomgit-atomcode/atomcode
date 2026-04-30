@@ -338,14 +338,82 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Remove a leftover `.bak` from a prior upgrade. Defensive against the
+/// three Windows ACCESS_DENIED scenarios reported in the field:
+///
+/// 1. The `.bak` carries a read-only attribute (some AV / SCCM policies
+///    flag any executable in `%LOCALAPPDATA%` this way). Clear it first.
+/// 2. Windows Defender or another scanner briefly holds the file open
+///    during a real-time scan — typically <500 ms. Retry once with a
+///    short sleep before giving up.
+/// 3. The `.bak` is the still-running atomcode process from a prior
+///    upgrade where the user didn't restart. Nothing we can do at the
+///    code layer; surface an error message with copy-pasteable Windows
+///    commands so the user can recover without guessing.
+///
+/// Unix has none of these problems (no read-only attribute on regular
+/// files, no AV holding handles, `unlink(2)` works on running ELFs),
+/// but the retry path is harmless there too.
+fn remove_stale_backup(backup: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        if let Ok(meta) = backup.metadata() {
+            let mut perm = meta.permissions();
+            if perm.readonly() {
+                perm.set_readonly(false);
+                let _ = std::fs::set_permissions(backup, perm);
+            }
+        }
+    }
+
+    let first = std::fs::remove_file(backup);
+    if first.is_ok() {
+        return Ok(());
+    }
+    // Brief retry to ride out a transient AV / indexer hold.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    if std::fs::remove_file(backup).is_ok() {
+        return Ok(());
+    }
+
+    // Both attempts failed — surface the original (more informative) error
+    // alongside actionable recovery steps.
+    let err = first.unwrap_err();
+    #[cfg(windows)]
+    let recovery = format!(
+        "Recovery (Windows):\n  \
+         1. Make sure no other atomcode.exe is running (Task Manager).\n  \
+         2. Run in cmd / PowerShell:\n     \
+            attrib -R \"{path}\"\n     \
+            del /F \"{path}\"\n  \
+         3. If still denied, run an elevated cmd and retry, or:\n     \
+            takeown /f \"{path}\"\n     \
+            icacls \"{path}\" /grant:r \"%USERNAME%:F\"\n     \
+            del \"{path}\"\n  \
+         4. Then re-run /upgrade.",
+        path = backup.display()
+    );
+    #[cfg(not(windows))]
+    let recovery = format!(
+        "Recovery: rm -f \"{}\" && retry /upgrade.",
+        backup.display()
+    );
+    Err(anyhow!(
+        "could not remove previous backup {}: {}.\n{}",
+        backup.display(),
+        err,
+        recovery
+    ))
+}
+
 /// Put `new_bin` in place of `exe`, keeping the previous `exe` as `.bak`.
 ///
 /// On Unix, `rename(2)` within a directory is atomic; on Windows, an
 /// exe currently being executed can be renamed (but not deleted), so
 /// the same sequence works. If a stale `.bak` exists we remove it
-/// first — if that removal fails on Windows because the user hasn't
-/// restarted since a prior upgrade (the `.bak` is the running
-/// process), we surface a clear message.
+/// first via `remove_stale_backup`, which handles the Windows-specific
+/// failure modes (read-only attribute, AV scanner holds, prior-upgrade
+/// process still running).
 fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -360,14 +428,7 @@ fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
 
     let backup = backup_path(exe);
     if backup.exists() {
-        std::fs::remove_file(&backup).map_err(|e| {
-            anyhow!(
-                "could not remove previous backup {}: {}.\n\
-                 If you upgraded without restarting, exit atomcode and retry.",
-                backup.display(),
-                e
-            )
-        })?;
+        remove_stale_backup(&backup)?;
     }
 
     std::fs::rename(exe, &backup).with_context(|| {
@@ -933,6 +994,50 @@ mod tests {
     fn backup_path_appends_bak() {
         let p = Path::new("/usr/local/bin/atomcode");
         assert_eq!(backup_path(p), PathBuf::from("/usr/local/bin/atomcode.bak"));
+    }
+
+    #[test]
+    fn remove_stale_backup_deletes_normal_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("atomcode.exe.bak");
+        std::fs::write(&p, b"old").expect("seed");
+        remove_stale_backup(&p).expect("remove ok");
+        assert!(!p.exists(), "backup should be gone");
+    }
+
+    #[test]
+    fn remove_stale_backup_clears_readonly_then_deletes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("atomcode.exe.bak");
+        std::fs::write(&p, b"old").expect("seed");
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&p, perm).expect("set readonly");
+        // On Windows the readonly flag would block remove_file outright.
+        // On Unix it doesn't, but the helper still happens to clean up.
+        // Either way, the file must be gone after this call.
+        remove_stale_backup(&p).expect("remove ok despite readonly");
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn remove_stale_backup_surfaces_recovery_hint_on_failure() {
+        // A non-existent file's parent that itself doesn't exist makes
+        // `remove_file` fail deterministically on every platform — gives
+        // us a way to verify the error path renders the recovery hint.
+        let bogus = std::path::PathBuf::from("/no/such/dir/atomcode.exe.bak");
+        let err = remove_stale_backup(&bogus).expect_err("must fail");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("could not remove previous backup"),
+            "preamble missing: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Recovery"),
+            "recovery hint missing: {}",
+            msg
+        );
     }
 
     #[test]
