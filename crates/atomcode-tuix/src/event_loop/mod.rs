@@ -2110,13 +2110,25 @@ fn build_menu_items(
         if let Some(reg) = skill_registry {
             if let Ok(reg) = reg.read() {
                 for skill in reg.user_invocable() {
+                    // Match against either the bare suffix (`adapter-check…`)
+                    // or the full qualified name (`ascend-model-agent-plugin:
+                    // adapter-check…`). Bare match keeps the shorthand UX;
+                    // full match lets users narrow by plugin (`/ascend-`).
                     let bare = skill
                         .name
                         .split_once(':')
                         .map(|(_, s)| s)
                         .unwrap_or(skill.name.as_str());
-                    if bare.to_ascii_lowercase().starts_with(&prefix_lower) {
-                        items.push((bare.to_string(), skill.description.clone()));
+                    let full_lower = skill.name.to_ascii_lowercase();
+                    let bare_lower = bare.to_ascii_lowercase();
+                    if bare_lower.starts_with(&prefix_lower)
+                        || full_lower.starts_with(&prefix_lower)
+                    {
+                        // Display the qualified name so users see which
+                        // plugin a skill belongs to. Suffix-fallback in
+                        // SkillRegistry::get still resolves the bare form
+                        // when invoked.
+                        items.push((skill.name.clone(), skill.description.clone()));
                     }
                 }
             }

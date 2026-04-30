@@ -340,7 +340,13 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
 
     #[cfg(not(target_os = "windows"))]
     let mut child = {
+        #[cfg(not(target_env = "ohos"))]
         let mut cmd = Command::new("bash");
+        #[cfg(target_env = "ohos")]
+        let mut cmd = Command::new("sh");
+        // bash does not exist on ohos
+        // use sh (mksh)
+
         cmd.arg("-c")
             .arg(&parsed.command)
             .current_dir(&wd)

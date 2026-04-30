@@ -884,6 +884,13 @@ pub(super) fn execute_slash_command(
             // path the menu's sub-mode submission lands on.
             let arg_trim = arg.trim();
             if arg_trim.is_empty() {
+                // Show fully qualified names (`<plugin>:<skill>`) so users
+                // can see which plugin owns each skill — bare-name listing
+                // becomes ambiguous quickly once two plugins coexist.
+                // `SkillRegistry::get`'s suffix-fallback still resolves
+                // `/skills <bare>` for unambiguous bare names, so users
+                // don't have to type the full prefix unless there's a
+                // collision.
                 let lines: Vec<String> = ctx
                     .skill_registry
                     .read()
@@ -891,14 +898,7 @@ pub(super) fn execute_slash_command(
                     .map(|r| {
                         let mut v: Vec<String> = r
                             .user_invocable()
-                            .map(|s| {
-                                let bare = s
-                                    .name
-                                    .split_once(':')
-                                    .map(|(_, x)| x)
-                                    .unwrap_or(s.name.as_str());
-                                format!("  /skills {:<24}  {}", bare, s.description)
-                            })
+                            .map(|s| format!("  /skills {:<48}  {}", s.name, s.description))
                             .collect();
                         v.sort();
                         v
@@ -919,8 +919,13 @@ pub(super) fn execute_slash_command(
                 let mut parts = arg_trim.splitn(2, char::is_whitespace);
                 let skill_name = parts.next().unwrap_or("");
                 let skill_args = parts.next().unwrap_or("").trim_start();
-                let registry_key = format!("skills:{}", skill_name);
-                if let Some(rendered) = expand_skill(ctx, &registry_key, skill_args) {
+                // Pass the bare name straight through — `SkillRegistry::get`
+                // falls back to a unique `:name` suffix match, which resolves
+                // both loose skills (`skills:foo`) and plugin-contributed
+                // skills (`<plugin>:foo`) without us needing to guess the
+                // prefix here. A user-typed qualified name (`foo:bar`) still
+                // works because exact match runs first.
+                if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
                     ctx.agent
                         .cmd_tx
                         .send(AgentCommand::SendMessage(rendered))
