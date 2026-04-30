@@ -96,6 +96,14 @@ pub enum TurnStopReason {
     Error,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CompressionOutcome {
+    applied: bool,
+    before_tokens: usize,
+    after_tokens: usize,
+    removed_messages: usize,
+}
+
 impl TurnStopReason {
     /// Short machine-parseable tag (snake_case) for logs / CLI output.
     pub fn as_tag(&self) -> &'static str {
@@ -1080,7 +1088,8 @@ impl AgentLoop {
             // one-line-per-round summaries (DefaultCtx) compact enough
             // for cold zone.
             if let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) {
-                self.conversation.apply_compression(n_msgs, content);
+                let system_prompt = self.build_system_prompt();
+                let _ = self.try_apply_compression(&system_prompt, n_msgs, content, false);
             }
         }
 
@@ -1969,8 +1978,7 @@ impl AgentLoop {
         let summary = self.run_llm_summary(&summarize_prompt).await;
         let final_summary = if summary.trim().is_empty() { content } else { summary };
 
-        self.conversation.apply_compression(n_turns, final_summary);
-        self.inject_post_compress_state();
+        let _ = self.try_apply_compression(system_prompt, n_turns, final_summary, true);
     }
 
     /// Emit a full ContextStats snapshot for the `/context` command.
@@ -2038,6 +2046,61 @@ impl AgentLoop {
         }
     }
 
+    fn rendered_token_count(&self, system_prompt: &str) -> usize {
+        self.ctx
+            .build_messages(&self.conversation, system_prompt, "")
+            .0
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum()
+    }
+
+    /// Apply a compression candidate only when it reduces the next request
+    /// payload. This is the single success criterion for all compression
+    /// entry points: manual `/compact`, threshold-driven auto-compression,
+    /// and task-boundary cleanup.
+    fn try_apply_compression(
+        &mut self,
+        system_prompt: &str,
+        remove_count: usize,
+        summary: String,
+        inject_state: bool,
+    ) -> CompressionOutcome {
+        let before_msg_count = self.conversation.messages.len();
+        let before_tokens = self.rendered_token_count(system_prompt);
+
+        let msgs_snapshot = self.conversation.messages.clone();
+        let cold_snapshot = self.conversation.cold_summaries.clone();
+        let turns_snapshot = self.conversation.turn_tracker.clone();
+
+        self.conversation.apply_compression(remove_count, summary);
+        if inject_state {
+            self.inject_post_compress_state();
+        }
+
+        let after_tokens = self.rendered_token_count(system_prompt);
+        let removed_messages = before_msg_count.saturating_sub(self.conversation.messages.len());
+
+        if after_tokens >= before_tokens {
+            self.conversation.messages = msgs_snapshot;
+            self.conversation.cold_summaries = cold_snapshot;
+            self.conversation.turn_tracker = turns_snapshot;
+            CompressionOutcome {
+                applied: false,
+                before_tokens,
+                after_tokens,
+                removed_messages: 0,
+            }
+        } else {
+            CompressionOutcome {
+                applied: true,
+                before_tokens,
+                after_tokens,
+                removed_messages,
+            }
+        }
+    }
+
     /// Manual `/compact` entry point. Mechanical only — reuses the active
     /// ctx strategy's `compression_plan` (same path as the task-boundary
     /// cleanup in `handle_send_message`) so behavior stays consistent with
@@ -2055,14 +2118,6 @@ impl AgentLoop {
     /// made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
         let system_prompt = self.build_system_prompt();
-        let before_msg_count = self.conversation.messages.len();
-        let before_tokens: usize = self
-            .ctx
-            .build_messages(&self.conversation, &system_prompt, "")
-            .0
-            .iter()
-            .map(|m| m.estimate_tokens())
-            .sum();
         let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 "(nothing to compact — conversation is short)\n".to_string(),
@@ -2093,30 +2148,13 @@ impl AgentLoop {
             summary
         };
 
-        // Rollback snapshot
-        let msgs_snapshot = self.conversation.messages.clone();
-        let cold_snapshot = self.conversation.cold_summaries.clone();
-        let turns_snapshot = self.conversation.turn_tracker.clone();
+        let outcome = self.try_apply_compression(&system_prompt, n_msgs, content, true);
 
-        self.conversation.apply_compression(n_msgs, content);
-        self.inject_post_compress_state();
-
-        let after_tokens: usize = self
-            .ctx
-            .build_messages(&self.conversation, &system_prompt, "")
-            .0
-            .iter()
-            .map(|m| m.estimate_tokens())
-            .sum();
-
-        if after_tokens >= before_tokens {
-            self.conversation.messages = msgs_snapshot;
-            self.conversation.cold_summaries = cold_snapshot;
-            self.conversation.turn_tracker = turns_snapshot;
+        if !outcome.applied {
             let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
                 "(nothing to compact — would not save tokens: {} → {})\n",
-                fmt_k_tokens(before_tokens),
-                fmt_k_tokens(after_tokens),
+                fmt_k_tokens(outcome.before_tokens),
+                fmt_k_tokens(outcome.after_tokens),
             )));
             let (msgs, _) =
                 self.ctx
@@ -2125,13 +2163,12 @@ impl AgentLoop {
             return;
         }
 
-        let removed = before_msg_count.saturating_sub(self.conversation.messages.len());
         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
             "(compacted — dropped {} message{}, {} → {} tokens)\n",
-            removed,
-            if removed == 1 { "" } else { "s" },
-            fmt_k_tokens(before_tokens),
-            fmt_k_tokens(after_tokens),
+            outcome.removed_messages,
+            if outcome.removed_messages == 1 { "" } else { "s" },
+            fmt_k_tokens(outcome.before_tokens),
+            fmt_k_tokens(outcome.after_tokens),
         )));
 
         let (msgs, _) = self

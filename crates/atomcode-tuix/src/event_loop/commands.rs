@@ -222,6 +222,8 @@ pub(super) fn execute_slash_command(
             state.prompt_tokens = 0;
             state.completion_tokens = 0;
             state.cached_tokens = 0;
+            state.last_context = None;
+            state.pending_context_render = None;
             state.thinking_idx = 0;
             state.on_turn_complete();
             // New session = new session file on disk. Old session
