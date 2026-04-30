@@ -430,8 +430,35 @@ impl SkillRegistry {
         self.skills.insert(skill.name.clone(), skill);
     }
 
+    /// Look up a skill by name. Falls back to a unique `*:name` suffix
+    /// match when the exact name misses AND the request is unqualified —
+    /// covers the case where a hook-injected workflow plan or other
+    /// external material refers to a plugin skill by its bare name
+    /// (`ascend-model-verification`) instead of the registered fully
+    /// qualified key (`ascend-model-agent-plugin:ascend-model-verification`).
+    ///
+    /// Discipline: returns `None` when more than one namespace would match
+    /// the bare name. Silent-pick-the-first would mask real ambiguity (and
+    /// the LLM would invoke the wrong plugin) — better to error out so the
+    /// caller surfaces the candidates.
     pub fn get(&self, name: &str) -> Option<&Skill> {
-        self.skills.get(name)
+        if let Some(s) = self.skills.get(name) {
+            return Some(s);
+        }
+        // Only run the fallback when the request is unqualified. A
+        // qualified-but-missing lookup (`foo:bar` typo'd as `foo:baz`)
+        // should fail loudly, not silently rebind to some other plugin.
+        if name.contains(':') {
+            return None;
+        }
+        let suffix = format!(":{}", name);
+        let mut hits = self.skills.iter().filter(|(k, _)| k.ends_with(&suffix));
+        let first = hits.next()?;
+        if hits.next().is_some() {
+            // Ambiguous — the bare name maps to multiple plugins. Refuse.
+            return None;
+        }
+        Some(first.1)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -672,10 +699,77 @@ mod tests {
             reg.get("skills:brainstorming").is_some(),
             "namespaced lookup must succeed"
         );
+        // Bare-name lookup falls back to a unique `:name` suffix match —
+        // a deliberate accommodation for hook-injected workflow plans
+        // that reference plugin skills without their plugin prefix.
         assert!(
-            reg.get("brainstorming").is_none(),
-            "bare name must not resolve when loaded with a namespace"
+            reg.get("brainstorming").is_some(),
+            "bare name must resolve via suffix fallback when unambiguous"
         );
+        // Verify storage key actually IS the prefixed form (the loader
+        // contract; the fallback above could otherwise mask a regression
+        // where the prefix wasn't applied).
+        assert!(
+            reg.skills.contains_key("skills:brainstorming"),
+            "storage must use prefixed key"
+        );
+        assert!(
+            !reg.skills.contains_key("brainstorming"),
+            "storage must not duplicate under bare key"
+        );
+    }
+
+    #[test]
+    fn test_get_suffix_fallback_ambiguous_misses() {
+        // When two plugins each contribute a skill named "verify", a bare
+        // lookup must NOT silently pick one — that would invoke the wrong
+        // plugin's tool. Caller must use the qualified form.
+        let mut reg = SkillRegistry::new();
+        for ns in ["plugin-a", "plugin-b"] {
+            let key = format!("{}:verify", ns);
+            reg.skills.insert(
+                key.clone(),
+                Skill {
+                    name: key,
+                    description: "v".into(),
+                    template: "body".into(),
+                    disable_model_invocation: false,
+                    user_invocable: true,
+                    argument_hint: None,
+                    allowed_tools: vec![],
+                    skill_dir: PathBuf::new(),
+                    source_path: PathBuf::new(),
+                },
+            );
+        }
+        assert!(
+            reg.get("verify").is_none(),
+            "ambiguous bare name must miss (forces qualified lookup)"
+        );
+        assert!(reg.get("plugin-a:verify").is_some());
+        assert!(reg.get("plugin-b:verify").is_some());
+    }
+
+    #[test]
+    fn test_get_qualified_miss_does_not_fallback() {
+        // A qualified-but-typo'd name must not silently rebind to a
+        // suffix match — that would mask plugin name typos.
+        let mut reg = SkillRegistry::new();
+        reg.skills.insert(
+            "real-plugin:verify".into(),
+            Skill {
+                name: "real-plugin:verify".into(),
+                description: "v".into(),
+                template: "body".into(),
+                disable_model_invocation: false,
+                user_invocable: true,
+                argument_hint: None,
+                allowed_tools: vec![],
+                skill_dir: PathBuf::new(),
+                source_path: PathBuf::new(),
+            },
+        );
+        assert!(reg.get("typo-plugin:verify").is_none());
     }
 
     #[test]
@@ -693,7 +787,10 @@ mod tests {
         reg.load_flat_commands(tmp.path(), Some("skills"), &mut warnings);
 
         assert!(reg.get("skills:commit").is_some());
-        assert!(reg.get("commit").is_none());
+        // Suffix fallback: unambiguous bare name resolves.
+        assert!(reg.get("commit").is_some());
+        assert!(reg.skills.contains_key("skills:commit"));
+        assert!(!reg.skills.contains_key("commit"));
     }
 
     #[test]
