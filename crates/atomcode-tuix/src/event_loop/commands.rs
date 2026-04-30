@@ -919,8 +919,13 @@ pub(super) fn execute_slash_command(
                 let mut parts = arg_trim.splitn(2, char::is_whitespace);
                 let skill_name = parts.next().unwrap_or("");
                 let skill_args = parts.next().unwrap_or("").trim_start();
-                let registry_key = format!("skills:{}", skill_name);
-                if let Some(rendered) = expand_skill(ctx, &registry_key, skill_args) {
+                // Pass the bare name straight through — `SkillRegistry::get`
+                // falls back to a unique `:name` suffix match, which resolves
+                // both loose skills (`skills:foo`) and plugin-contributed
+                // skills (`<plugin>:foo`) without us needing to guess the
+                // prefix here. A user-typed qualified name (`foo:bar`) still
+                // works because exact match runs first.
+                if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
                     ctx.agent
                         .cmd_tx
                         .send(AgentCommand::SendMessage(rendered))
