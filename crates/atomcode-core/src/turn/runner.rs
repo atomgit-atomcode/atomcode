@@ -556,6 +556,13 @@ impl TurnRunner {
                                             });
                                         }
 
+                                        // Normalize tool calls before they enter history. In
+                                        // particular, merging same-file edit_file calls after
+                                        // finalization leaves the assistant message declaring
+                                        // more tool calls than the ToolResults we later append,
+                                        // which poisons the next provider request.
+                                        merge_edit_calls(&mut tool_calls_buf);
+
                                         // Finalize conversation state. Pass the accumulated
                                         // reasoning_buf so thinking-model providers (Moonshot
                                         // Kimi K2-thinking/K2.6, etc.) can echo it back on
@@ -648,13 +655,13 @@ impl TurnRunner {
             );
         }
 
-        // 6. Auto-merge multiple edit_file calls on the same file into one multi-edit.
+        // 6. Tool calls were normalized before being written into conversation
+        // history. From this point on, execute exactly the calls the provider
+        // will see in the assistant message on the next turn.
+        //
+        // Auto-merge multiple edit_file calls on the same file into one multi-edit.
         // Models often generate 2+ separate edit_file calls for the same file instead of
         // using the edits array. Merging at framework level is 100% reliable vs prompt ~50%.
-        //
-        // Merged-away calls are silently dropped - no ToolCallStarted was sent,
-        // so no ToolCallResult is needed either.
-        let _merged_away_ids = merge_edit_calls(&mut tool_calls_buf);
 
         // ── Layer B: per-turn read budget allocation ──
         // Count read_file calls in this batch and set per-file token budget.
@@ -1411,14 +1418,11 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
     calls
 }
 
-/// Merge multiple edit_file calls targeting the same file into a single multi-edit call.
-/// The model often generates 2+ separate edit_file(file, old, new) for the same file;
-/// we merge them into one edit_file(file, edits=[...]) before execution.
 /// Merge multiple edit_file calls on the same file into one multi-edit call.
-/// Returns the ids of calls that were merged away (removed from the vec) — the caller
-/// MUST emit synthetic `TurnEvent::ToolCallResult` for each of these ids, otherwise the
-/// TUI sees orphan AssistantWithToolCalls entries (started but never completed) and
-/// keeps spinning an in-flight icon forever (2026-04-13 "edit 完成 spinner 还在转" bug).
+/// The model often generates 2+ separate edit_file(file, old, new) for the same file;
+/// we merge them into one edit_file(file, edits=[...]) before execution and before
+/// the assistant tool-call message is written into conversation history.
+/// Returns the ids of calls that were merged away.
 fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     use std::collections::HashMap;
 
