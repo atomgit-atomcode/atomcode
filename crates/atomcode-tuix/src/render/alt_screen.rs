@@ -832,6 +832,15 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 } else {
                     format!("    /{:<12}  {}", safe_name, safe_desc)
                 };
+                // Clamp to terminal width before write. Without this,
+                // long descriptions (CJK glyphs are 2 display cells)
+                // overflow and the terminal auto-wraps onto subsequent
+                // rows. Single-row wrap is wiped by the next iteration's
+                // CUP+EL, but a 2+ row wrap leaks past that recovery
+                // and leaves stale glyphs in column 1+ of later menu
+                // items — observed on plugin skill listings with very
+                // long Chinese descriptions.
+                let body = truncate_to_width(&body, self.width as usize);
                 if self.caps.colors {
                     if selected {
                         // Reverse video on the selected row to make
@@ -2103,6 +2112,64 @@ mod tests {
         // Both items present.
         assert!(s.contains("login"));
         assert!(s.contains("exit"));
+    }
+
+    /// Long CJK descriptions (plugin skill listings can have 100+
+    /// display columns of Chinese) used to overflow past terminal
+    /// width and auto-wrap onto subsequent rows. The next iteration's
+    /// CUP+EL only wiped the immediately-next row, so 2+ row wraps
+    /// leaked stale glyphs into column 1+ of later menu items.
+    /// Truncating each menu body to terminal width keeps everything
+    /// confined to a single row per item.
+    #[test]
+    fn slash_menu_truncates_overlong_body_to_terminal_width() {
+        let mut buf = Vec::new();
+        // Narrow window to make overflow easy to construct without huge
+        // descriptions: 30 cols total.
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 30, 24);
+        // First item's description is 60+ display cols of CJK, ~2× wider
+        // than the window. Pre-fix this would wrap onto the second
+        // item's row. Post-fix: clamped at 30 cols, no wrap.
+        let very_long_cjk = "中文描述非常非常长".repeat(5); // 9 chars * 5 = 45 chars * 2 cols = 90 cols
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(crate::render::MenuPayload {
+                items: vec![
+                    ("first".into(), very_long_cjk.clone()),
+                    ("second".into(), "short".into()),
+                ],
+                selected: 0,
+            }),
+            status: crate::render::StatusLine::default(),
+        });
+        r.flush();
+        // Assert each menu row's writeable payload between CUPs fits
+        // inside the 30-col window. We can't easily measure visible
+        // columns from raw bytes here, but we can assert truncation
+        // happened by checking the second item's name is still emitted
+        // (it would be drowned by an unbounded first-row wrap).
+        let body_lines = r.body_lines.clone();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("first"),
+            "first item must be present in output. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("second"),
+            "second item must remain visible despite first row's overlong CJK. got: {:?}",
+            s
+        );
+        // The full 90-col CJK description must NOT all be present
+        // verbatim — it would only fit if the truncation was bypassed.
+        assert!(
+            !s.contains(very_long_cjk.as_str()),
+            "full overlong CJK description must be truncated, but emit kept the entire run. got: {:?}",
+            s
+        );
+        let _ = body_lines;
     }
 
     /// Phase 4.5: welcome banner now includes the version (right-aligned)
