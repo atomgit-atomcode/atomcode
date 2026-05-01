@@ -2277,16 +2277,27 @@ fn handle_idle_key(
                 }
 
                 // Sub-mode submit: items in the skills palette carry
-                // bare names (e.g. "brainstorming"). Re-prefix with
-                // `/skills ` so dispatch routes through the `skills`
-                // arm in execute_slash_command, which performs the
-                // registry lookup + expand.
+                // bare names (e.g. "brainstorming"). Mirror the
+                // `needs_args` branch above — Enter from the palette
+                // auto-completes to `/skills <name> ` and parks the
+                // cursor at the end so the user can append args
+                // (passed to `/use_skill` as `argument`). A second
+                // Enter (with or without args) commits through the
+                // regular BufferResult::Commit path. Without this,
+                // skills always fired without args, and there was no
+                // way to pass `argument` into the skill from the
+                // picker.
                 let in_skills_sub_mode = app.buf.text.starts_with("/skills ");
-                let committed = if in_skills_sub_mode {
-                    format!("/skills {}", name)
-                } else {
-                    format!("/{}", name)
-                };
+                if in_skills_sub_mode {
+                    app.buf.text = format!("/skills {} ", name);
+                    app.buf.cursor = app.buf.text.len();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
+
+                // Top-level no-arg command (e.g. /quit, /help): execute
+                // immediately, as before.
+                let committed = format!("/{}", name);
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
                 app.buf.text.clear();
