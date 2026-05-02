@@ -768,7 +768,41 @@ impl TurnRunner {
             if cancel.is_cancelled() {
                 tel_return!(TurnResult::Cancelled, tool_count);
             }
-            
+
+            // ── Loop detection: gate BEFORE rendering anything ──
+            // detect_call_loop must run before ToolCallStarted is emitted,
+            // otherwise blocked attempts (3rd+ consecutive identical call)
+            // each create a UiLine::ToolCallInFlight row in scrollback —
+            // visible as a wall of identical `Bash(cd ... && cargo ...)`
+            // rows when the model gets stuck. Skipping the Started emit
+            // keeps blocked calls invisible (the BLOCKED ToolCallResult
+            // still flows back to the model so it can react / give up).
+            //
+            // We use the raw (pre-name-canonicalization, pre-args-repair)
+            // call signature here. That means an alias-spamming model that
+            // alternates `Run` → `bash` → `run` would not trip the guard
+            // since the hash differs each time — this is rare in practice
+            // and the previous post-canonicalization check inside
+            // execute_single_tool also missed this case once the alias
+            // resolved to the same canonical name (it canonicalized the
+            // name in-place, so `Run` and `bash` did hash differently
+            // there too).
+            if let Some(msg) = self.detect_call_loop(&call.name, &call.arguments) {
+                let _ = event_tx.send(TurnEvent::ToolCallResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: msg.clone(),
+                    success: false,
+                    duration: std::time::Duration::ZERO,
+                });
+                conversation.add_tool_result(ToolResult {
+                    call_id: call.id.clone(),
+                    output: msg,
+                    success: false,
+                });
+                continue;
+            }
+
             // Send ToolCallStarted event when the tool actually starts executing.
             // This ensures tool call and result are paired correctly in the UI.
             let _ = event_tx.send(TurnEvent::ToolCallStarted {
@@ -776,7 +810,7 @@ impl TurnRunner {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
-            
+
             // Enforce tool filter at execution time — LLM may call tools
             // not in the provided tool_defs (e.g., during diagnosis read-only phase).
             if let Some(filter) = allowed_tools {
@@ -1012,24 +1046,10 @@ impl TurnRunner {
             call
         };
 
-        // Loop detection: block before we even ask for approval. Without this,
-        // models that get stuck (e.g. re-reading a binary Office file with
-        // different offset/limit values) can burn 30+ turns on the same call.
-        // Returns a user-facing message when blocked; the tool never runs.
-        if let Some(msg) = self.detect_call_loop(&call.name, &call.arguments) {
-            let _ = event_tx.send(TurnEvent::ToolCallResult {
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                output: msg.clone(),
-                success: false,
-                duration: std::time::Duration::ZERO,
-            });
-            return ToolResult {
-                call_id: call.id.clone(),
-                output: msg,
-                success: false,
-            };
-        }
+        // Loop detection moved upstream to `dispatch_tools` (gates BEFORE
+        // ToolCallStarted is emitted, so blocked attempts don't render
+        // ghost inflight rows in scrollback). When we reach here the
+        // call has already cleared that guard exactly once.
 
         // Check permission via the injected PermissionDecider.
         // AutoApprove tools execute immediately; RequireApproval tools go through
