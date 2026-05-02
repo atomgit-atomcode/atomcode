@@ -2282,6 +2282,92 @@ mod tests {
         drop(r);
     }
 
+    /// Plan-mode badge gets brand-color SGR (magenta, mirrors retained
+    /// renderer's `Role::Brand`) and is emitted BEFORE the dim
+    /// `model · cwd` body so the user sees the mode at a glance. Same
+    /// layout as the retained `build_status_row` test, just at the
+    /// alt-screen byte-stream level since alt-screen writes raw to
+    /// stdout instead of going through the cell-diff renderer.
+    #[test]
+    fn paint_footer_renders_plan_badge_in_brand_color() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                total_tokens: 0,
+                hint: None,
+                mode_indicator: Some("PLAN".into()),
+            },
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("\x1b[35m"),
+            "PLAN badge must use SGR_MAGENTA (Role::Brand). got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("PLAN"),
+            "PLAN literal must appear in the rendered status. got: {:?}",
+            s
+        );
+        // Badge precedes the dim model/cwd run — confirm the magenta SGR
+        // appears earlier in the byte stream than the dim SGR (\x1b[2m).
+        let badge_pos = s
+            .find("\x1b[35m")
+            .expect("magenta SGR must be present");
+        let dim_pos = s
+            .find("\x1b[2m")
+            .expect("dim SGR (status body) must be present");
+        assert!(
+            badge_pos < dim_pos,
+            "PLAN badge SGR ({}) must precede status-body dim SGR ({}). buf: {:?}",
+            badge_pos,
+            dim_pos,
+            s
+        );
+    }
+
+    /// Default Build mode (`mode_indicator = None`) emits no PLAN
+    /// literal — protects against accidental "PLAN" leak when the
+    /// status line is rendered for a non-plan session. Mirrors the
+    /// retained-renderer guard test.
+    #[test]
+    fn paint_footer_default_mode_emits_no_plan_badge() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                total_tokens: 0,
+                hint: None,
+                mode_indicator: None,
+            },
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            !s.contains("PLAN"),
+            "no mode_indicator must produce no PLAN literal. got: {:?}",
+            s
+        );
+        // Sanity: model/cwd still present so we know the status row
+        // actually rendered (not skipped via some empty-status path).
+        assert!(s.contains("glm-5"));
+        assert!(s.contains("~/proj"));
+    }
+
     /// Phase 4: `on_resize` updates cached dimensions, wipes the
     /// alt-screen, and repaints. body_lines are kept verbatim — paint
     /// truncates each row to the new width on the fly so we don't have
