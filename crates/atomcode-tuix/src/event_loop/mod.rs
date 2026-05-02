@@ -3695,7 +3695,11 @@ fn draw_spinner_now(
 fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
     let base = &state.spinner_label;
     let mut out = format!("{}{}", base, state.ellipsis());
-    if let Some(d) = state.turn_elapsed() {
+    // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
+    // `Running ReadFile… 4s`. CC behaviour: timer resets on every
+    // phase transition so the user reads "this thing has been
+    // running for N seconds", not "the whole turn so far is 1301s".
+    if let Some(d) = state.phase_elapsed() {
         out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
     }
     if queue_len > 0 {

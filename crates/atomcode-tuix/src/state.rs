@@ -128,9 +128,17 @@ pub struct UiState {
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
-    /// turn-complete / turn-cancelled / error. Used by the spinner to
-    /// display live elapsed time.
+    /// turn-complete / turn-cancelled / error. Used to surface the
+    /// total wall-clock duration in the TurnComplete event payload.
     pub turn_started_at: Option<std::time::Instant>,
+    /// When the current phase began. Reset on every phase transition
+    /// (on_submit, on_thinking, on_tool_call_streaming,
+    /// on_tool_call_started) so the spinner shows time spent on the
+    /// CURRENT operation — `Pondering… 12s`, `Running ReadFile… 4s`
+    /// — instead of accumulating over the whole turn. Cleared on
+    /// turn-complete / turn-cancelled / error so the idle spinner
+    /// (rare) doesn't tick a stale duration.
+    pub phase_started_at: Option<std::time::Instant>,
     /// Last observed context breakdown. Populated from
     /// `AgentEvent::ContextStats` — `/context` renders this. `None`
     /// before the first turn completes.
@@ -188,6 +196,7 @@ impl UiState {
             prior_phase: None,
             thinking_idx: 0,
             turn_started_at: None,
+            phase_started_at: None,
             last_context: None,
             last_submitted_message: None,
             pending_context_render: None,
@@ -271,6 +280,18 @@ impl UiState {
         self.turn_started_at.map(|t| t.elapsed())
     }
 
+    /// Elapsed wall time since the current phase began. The spinner
+    /// uses this so its `· 12s` suffix shows time on the current
+    /// operation (LLM round-trip / tool execution), not cumulative
+    /// turn time. Falls back to `turn_elapsed()` when no phase
+    /// transition has fired yet — defensive, should not normally
+    /// happen since `on_submit` seeds both.
+    pub fn phase_elapsed(&self) -> Option<std::time::Duration> {
+        self.phase_started_at
+            .map(|t| t.elapsed())
+            .or_else(|| self.turn_elapsed())
+    }
+
     fn current_thinking(&self) -> &'static str {
         THINKING_LABELS[self.thinking_idx % THINKING_LABELS.len()]
     }
@@ -280,13 +301,16 @@ impl UiState {
         self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
         self.thinking_idx = self.thinking_idx.wrapping_add(1);
-        self.turn_started_at = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.turn_started_at = Some(now);
+        self.phase_started_at = Some(now);
     }
 
     pub fn on_turn_complete(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        self.phase_started_at = None;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -299,23 +323,28 @@ impl UiState {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        self.phase_started_at = None;
     }
 
     pub fn on_error(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        self.phase_started_at = None;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
     /// the renderer appends `...` uniformly so it looks right even when
-    /// the elapsed-time suffix is appended).
+    /// the elapsed-time suffix is appended). Resets the phase clock so
+    /// the spinner timer starts fresh on this tool execution.
     pub fn on_tool_call_started(&mut self, name: &str) {
         self.spinner_label = format!("Running {}", name);
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_tool_call_streaming(&mut self, name: &str) {
         self.spinner_label = format!("Preparing {}", name);
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_thinking(&mut self) {
@@ -323,6 +352,10 @@ impl UiState {
         // on submit, one rotation per turn not per state transition).
         let idx = self.thinking_idx.saturating_sub(1) % THINKING_LABELS.len();
         self.spinner_label = THINKING_LABELS[idx].to_string();
+        // New LLM round-trip → new phase clock. Without this reset the
+        // displayed time keeps growing across consecutive thinks/tools
+        // and ends up showing "Noodling… 1301s" mid-turn.
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_approval_needed(&mut self, _tool: &str) {
