@@ -1109,7 +1109,20 @@ async fn run() -> Result<i32> {
     };
 
     // Build LSP manager from config and inject into ToolContext.
-    let lsp_manager = build_lsp_manager(&config.lsp, &working_dir);
+    // TUI mode uses the event-channel constructor so server start /
+    // failure surfaces in scrollback (✓/✗ lines) instead of being
+    // eprintln!'d directly to stderr — which would land inside the
+    // input box while the renderer owns the terminal. Headless keeps
+    // the no-channel path: stderr leakage doesn't matter when no TUI
+    // is active and CI logs benefit from raw error visibility.
+    let (lsp_manager, lsp_connect_rx) = if is_headless {
+        (build_lsp_manager(&config.lsp, &working_dir), None)
+    } else {
+        match atomcode_core::lsp::build_lsp_manager_with_events(&config.lsp, &working_dir) {
+            Some((mgr, rx)) => (Some(mgr), Some(rx)),
+            None => (None, None),
+        }
+    };
     if lsp_manager.is_some() && enabled("diagnostics") {
         tool_registry.register_sync(Box::new(DiagnosticsTool));
     }
@@ -1284,7 +1297,7 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, telemetry.clone()).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
             Ok(0)
         };
 

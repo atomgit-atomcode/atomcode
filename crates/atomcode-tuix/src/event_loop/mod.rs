@@ -151,6 +151,12 @@ pub struct LoopCtx {
     /// When `/mcp reload` is invoked, we track progress until every configured
     /// server reports Connected/Failed, then emit a one-line summary.
     pub mcp_reload: Option<McpReloadProgress>,
+    /// Channel for receiving LSP connection status events (Started / Failed
+    /// / Warning). Same plumbing as `mcp_connect_rx` — wired in TUI mode
+    /// so the manager's start failures land in scrollback as `✗ LSP server
+    /// 'rust-analyzer' for .rs failed: ...` instead of leaking to stderr
+    /// and printing inside the input box.
+    pub lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
@@ -1447,6 +1453,42 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                 renderer.flush();
             }
 
+            // ── LSP server start / failure ──
+            // Mirrors the MCP arm above. Without this, `LspManager`'s
+            // raw `eprintln!` on a failed server start would land in the
+            // input box (TUI owns the screen, stderr-fd writes hit
+            // wherever the cursor sits — between the cyan rules).
+            // Started → ✓ in scrollback. Failed → ✗ as an Error line.
+            // Warning is non-actionable noise (e.g. shutdown teardown
+            // errors) and routed to the trace log instead.
+            Some(ev) = async {
+                if let Some(rx) = ctx.lsp_connect_rx.as_mut() {
+                    rx.recv().await
+                } else {
+                    None
+                }
+            }, if ctx.lsp_connect_rx.is_some() => {
+                use atomcode_core::lsp::LspConnectEvent;
+                match &ev {
+                    LspConnectEvent::Started { command, ext } => {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "✓ LSP server '{}' started for .{}",
+                            command, ext
+                        )));
+                    }
+                    LspConnectEvent::Failed { command, ext, error } => {
+                        renderer.render(UiLine::Error(format!(
+                            "✗ LSP server '{}' for .{} failed: {}",
+                            command, ext, error
+                        )));
+                    }
+                    LspConnectEvent::Warning { ext, message } => {
+                        crate::tuix_trace!("LSP", "ext='{}' warning: {}", ext, message);
+                    }
+                }
+                renderer.flush();
+            }
+
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
@@ -1650,6 +1692,42 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                             p.connected, p.failed, elapsed_ms
                         )));
                         ctx.mcp_reload = None;
+                    }
+                }
+                renderer.flush();
+            }
+
+            // ── LSP server start / failure ──
+            // Mirrors the MCP arm above. Without this, `LspManager`'s
+            // raw `eprintln!` on a failed server start would land in the
+            // input box (TUI owns the screen, stderr-fd writes hit
+            // wherever the cursor sits — between the cyan rules).
+            // Started → ✓ in scrollback. Failed → ✗ as an Error line.
+            // Warning is non-actionable noise (e.g. shutdown teardown
+            // errors) and routed to the trace log instead.
+            Some(ev) = async {
+                if let Some(rx) = ctx.lsp_connect_rx.as_mut() {
+                    rx.recv().await
+                } else {
+                    None
+                }
+            }, if ctx.lsp_connect_rx.is_some() => {
+                use atomcode_core::lsp::LspConnectEvent;
+                match &ev {
+                    LspConnectEvent::Started { command, ext } => {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "✓ LSP server '{}' started for .{}",
+                            command, ext
+                        )));
+                    }
+                    LspConnectEvent::Failed { command, ext, error } => {
+                        renderer.render(UiLine::Error(format!(
+                            "✗ LSP server '{}' for .{} failed: {}",
+                            command, ext, error
+                        )));
+                    }
+                    LspConnectEvent::Warning { ext, message } => {
+                        crate::tuix_trace!("LSP", "ext='{}' warning: {}", ext, message);
                     }
                 }
                 renderer.flush();

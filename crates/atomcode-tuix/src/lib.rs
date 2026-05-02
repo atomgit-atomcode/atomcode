@@ -173,6 +173,7 @@ pub async fn run(
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
     mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
+    lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> Result<()> {
     let mut caps = TerminalCaps::probe();
@@ -512,6 +513,7 @@ pub async fn run(
         mcp_registry,
         mcp_connect_rx,
         mcp_reload: None,
+        lsp_connect_rx,
         telemetry,
         worktree_original_dir: None,
         custom_commands,
