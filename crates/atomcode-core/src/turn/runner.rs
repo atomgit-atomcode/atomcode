@@ -803,6 +803,30 @@ impl TurnRunner {
                 continue;
             }
 
+            // ── Dup-in-batch: silent skip BEFORE any UI event ──
+            // Some thinking-mode models emit the same tool_call N times in
+            // one assistant message. Dispatching them all wastes execute
+            // cycles, so we replay the first call's result for #2..N. The
+            // model still sees one ToolResult per tool_call (parity
+            // preserved via add_tool_result), but the UI must not render
+            // ghost inflight rows for the duplicates — which it would if
+            // ToolCallStarted fired before the is_dup gate.
+            //
+            // Symptom users saw before this gate moved up: a wall of
+            // identical `Bash(...)` rows for each batch where the model
+            // emitted N copies of the same call (e.g. dead_code grep
+            // session with N variants pasted in by mistake).
+            if is_dup[i] {
+                let result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: "[Duplicate call — same tool and arguments as an earlier call in this batch. \
+                             Result already returned above.]".to_string(),
+                    success: true,
+                };
+                conversation.add_tool_result(result);
+                continue;
+            }
+
             // Send ToolCallStarted event when the tool actually starts executing.
             // This ensures tool call and result are paired correctly in the UI.
             let _ = event_tx.send(TurnEvent::ToolCallStarted {
@@ -834,43 +858,29 @@ impl TurnRunner {
                     continue;
                 }
             }
-            if is_dup[i] {
-                let result = ToolResult {
-                    call_id: call.id.clone(),
-                    output: "[Duplicate call — same tool and arguments as an earlier call in this batch. \
-                             Result already returned above.]".to_string(),
-                    success: true,
-                };
-                let _ = event_tx.send(TurnEvent::ToolCallResult {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    output: result.output.clone(),
-                    success: true,
-                    duration: std::time::Duration::ZERO,
-                });
-                conversation.add_tool_result(result);
-            } else {
-                let result = self.execute_single_tool(call, event_tx, &cancel).await;
+            // Dup-in-batch was already short-circuited above (before the
+            // ToolCallStarted emit), so by the time we reach here this is
+            // a real, non-duplicate call to execute.
+            let result = self.execute_single_tool(call, event_tx, &cancel).await;
 
-                // Track files edited for read interception (batch + cross-turn)
-                // Use full file path as key to avoid basename collisions
-                // (e.g., api/__init__.py vs schemas/__init__.py).
-                if matches!(call.name.as_str(), "edit_file" | "create_file") && result.success {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                        if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                            let file_key = fp.to_string();
-                            if !files_edited_this_batch.contains(&file_key) {
-                                files_edited_this_batch.push(file_key.clone());
-                            }
-                            if !self.recently_edited_files.contains(&file_key) {
-                                self.recently_edited_files.push(file_key);
-                            }
+            // Track files edited for read interception (batch + cross-turn)
+            // Use full file path as key to avoid basename collisions
+            // (e.g., api/__init__.py vs schemas/__init__.py).
+            if matches!(call.name.as_str(), "edit_file" | "create_file") && result.success {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                    if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                        let file_key = fp.to_string();
+                        if !files_edited_this_batch.contains(&file_key) {
+                            files_edited_this_batch.push(file_key.clone());
+                        }
+                        if !self.recently_edited_files.contains(&file_key) {
+                            self.recently_edited_files.push(file_key);
                         }
                     }
                 }
-
-                conversation.add_tool_result(result);
             }
+
+            conversation.add_tool_result(result);
         }
 
         // Truncate oversized tool outputs before returning. Without this,
