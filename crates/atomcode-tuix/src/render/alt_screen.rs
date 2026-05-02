@@ -855,9 +855,17 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             }
         }
 
-        // Status row at the bottom: dim `model · cwd`.
+        // Status row at the bottom: dim `model · cwd`, optionally
+        // prefixed by a brand-colored `PLAN` mode badge so non-default
+        // agent modes are visible at a glance (mirrors retained's
+        // build_status_row treatment).
         let cup = format!("\x1b[{};1H\x1b[K", status_row);
         let _ = self.out.write_all(cup.as_bytes());
+        let mode_badge = self
+            .pending_status
+            .mode_indicator
+            .as_ref()
+            .map(|s| scrub_controls(s));
         let status_text = if !self.pending_status.model.is_empty()
             || !self.pending_status.cwd.is_empty()
         {
@@ -873,13 +881,34 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         } else {
             String::new()
         };
-        if !status_text.is_empty() {
-            let line = if self.caps.colors {
-                format!("{}{}{}", SGR_DIM, status_text, SGR_RESET)
-            } else {
-                status_text
-            };
-            let _ = self.out.write_all(line.as_bytes());
+        if mode_badge.is_some() || !status_text.is_empty() {
+            // Badge gets brand-colored magenta (Role::Brand). Status
+            // body keeps its faint/dim style. Color codes only emit
+            // when the terminal advertises color support.
+            if let Some(badge) = &mode_badge {
+                if self.caps.colors {
+                    let _ = write!(self.out, "  {}{}{} ", SGR_MAGENTA, badge, SGR_RESET);
+                } else {
+                    let _ = write!(self.out, "  {} ", badge);
+                }
+            }
+            if !status_text.is_empty() {
+                // status_text already includes its own leading 2-space pad
+                // when no badge precedes it. With a badge we already
+                // emitted the leading spaces + badge + space, so trim
+                // the duplicate leading pad to keep alignment.
+                let body = if mode_badge.is_some() {
+                    status_text.trim_start_matches(' ').to_string()
+                } else {
+                    status_text
+                };
+                let line = if self.caps.colors {
+                    format!("{}{}{}", SGR_DIM, body, SGR_RESET)
+                } else {
+                    body
+                };
+                let _ = self.out.write_all(line.as_bytes());
+            }
         }
 
         // Position the terminal cursor inside the input row so the

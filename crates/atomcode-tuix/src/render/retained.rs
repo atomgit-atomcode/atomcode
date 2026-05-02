@@ -516,6 +516,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // body content on dark presets — see screenshot regression).
         let secondary = self.style_faint(Role::Secondary);
         let error = self.style_for(Role::Error);
+        let brand = self.style_for(Role::Brand);
+
+        // Mode indicator first — non-default modes (Plan today) prepend
+        // a brand-colored badge so the user sees at a glance that file
+        // edits / shell are gated. Build (default) is None and adds
+        // nothing.
+        let mode_badge: Option<String> = status
+            .mode_indicator
+            .as_ref()
+            .map(|s| scrub_controls(s));
+        let mode_badge_w = mode_badge
+            .as_ref()
+            .map(|s| crate::width::display_width(s) + 1) // +1 for the trailing space separator
+            .unwrap_or(0);
 
         let mut parts: Vec<String> = Vec::with_capacity(3);
         if !status.model.is_empty() {
@@ -528,7 +542,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
             parts.push(format_token_count(status.total_tokens));
         }
         let left = parts.join(" · ");
+        // Hint right-alignment math must reserve space for the mode badge
+        // so the badge never collides with the right-aligned hint when the
+        // status row is wide.
         let max = rule_width.max(1);
+        let left_max = max.saturating_sub(mode_badge_w);
+
+        // Helper: emit the badge (with trailing space) then the rest, so
+        // the mode indicator is always at column 0 (after PAD_COL) and
+        // both hint / no-hint branches share the same prefix.
+        let push_badge = |row: &mut Vec<Cell>| {
+            if let Some(badge) = &mode_badge {
+                push_str_cells(row, badge, &brand);
+                push_str_cells(row, " ", &pad);
+            }
+        };
 
         if let Some((raw_hint, severity)) = status.hint.as_ref() {
             let hint = scrub_controls(raw_hint);
@@ -537,20 +565,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 crate::render::HintSeverity::Warning => error,
                 crate::render::HintSeverity::Info => secondary.clone(),
             };
-            if hint_w + 1 < max {
-                let left_budget = max - hint_w - 1;
+            if hint_w + 1 < left_max {
+                let left_budget = left_max - hint_w - 1;
                 let left_truncated = crate::width::truncate_to_width(&left, left_budget);
                 let left_w = crate::width::display_width(&left_truncated);
-                let pad_w = max - left_w - hint_w;
+                let pad_w = max - mode_badge_w - left_w - hint_w;
+                push_badge(&mut row);
                 push_str_cells(&mut row, &left_truncated, &secondary);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
                 push_str_cells(&mut row, &hint, &hint_style);
             } else {
-                let truncated = crate::width::truncate_to_width(&left, max);
+                let truncated = crate::width::truncate_to_width(&left, left_max);
+                push_badge(&mut row);
                 push_str_cells(&mut row, &truncated, &secondary);
             }
         } else {
-            let truncated = crate::width::truncate_to_width(&left, max);
+            let truncated = crate::width::truncate_to_width(&left, left_max);
+            push_badge(&mut row);
             push_str_cells(&mut row, &truncated, &secondary);
         }
         row
@@ -2400,7 +2431,60 @@ mod tests {
             cwd: "~/project/atomcode".into(),
             total_tokens: 0,
             hint: None,
+            mode_indicator: None,
         }
+    }
+
+    /// Mode indicator (Plan badge) renders BEFORE the model · cwd · tokens
+    /// run. Default Build mode (`mode_indicator = None`) keeps the row
+    /// unchanged so existing layout / byte-budget tests stay valid.
+    #[test]
+    fn build_status_row_renders_mode_badge_before_left_run() {
+        let (mut r, _counter) = new_counting(80, 24);
+        // Force unicode + colors so the brand SGR is reachable; without
+        // this the test target (CI sometimes) drops the SGR and we can't
+        // distinguish badge cells from body cells.
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            total_tokens: 0,
+            hint: None,
+            mode_indicator: Some("PLAN".into()),
+        };
+        let row = r.build_status_row(&status, 60);
+        // Concatenate visible chars from the cells. `PAD_COL` of leading
+        // spaces, then the badge, then a separator space, then the body.
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        let trimmed = visible.trim_start();
+        assert!(
+            trimmed.starts_with("PLAN "),
+            "badge must precede the model run; got: {:?}",
+            visible
+        );
+        assert!(
+            visible.contains("glm-5"),
+            "model name must still appear in the row; got: {:?}",
+            visible
+        );
+    }
+
+    /// Default Build mode produces no badge — row is identical to the
+    /// pre-mode-indicator layout. Guards against accidental "PLAN" leak
+    /// when no mode is active.
+    #[test]
+    fn build_status_row_default_mode_emits_no_badge() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let row = r.build_status_row(&status_basic(), 60);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            !visible.contains("PLAN"),
+            "no mode indicator should produce no PLAN badge; got: {:?}",
+            visible
+        );
     }
 
     /// Keystroke steady-state: only the middle row's last cell

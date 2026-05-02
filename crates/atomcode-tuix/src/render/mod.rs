@@ -230,6 +230,14 @@ pub struct StatusLine {
     /// (no-provider nudge, CodingPlan model-missing); `Info` renders
     /// muted (upgrade banner, CodingPlan drift notice). None → no hint.
     pub hint: Option<(String, HintSeverity)>,
+    /// Left-aligned mode indicator, prepended before `model`. Present
+    /// only when the user explicitly switched to a non-default agent
+    /// mode (Plan today; conceivably others later). `None` for the
+    /// default Build mode so the status row doesn't gain noise for
+    /// the common case. Renders in brand color (Role::Brand) to draw
+    /// the eye — switching modes changes whether file edits and shell
+    /// run, so the user wants this prominent.
+    pub mode_indicator: Option<String>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

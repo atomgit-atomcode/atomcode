@@ -3636,11 +3636,21 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         ctx.model_name.clone()
     };
+    // Mode indicator: only rendered when the user has explicitly
+    // switched away from the default Build mode. Plan disables file
+    // edits + shell, so making it prominent in the status line guards
+    // against the user being confused why the agent refuses to write
+    // files. Default Build = None, no visual noise.
+    let mode_indicator = match state.agent_mode {
+        crate::state::AgentMode::Plan => Some("PLAN".to_string()),
+        crate::state::AgentMode::Build => None,
+    };
     crate::render::StatusLine {
         model,
         cwd,
         total_tokens: state.total_tokens,
         hint,
+        mode_indicator,
     }
 }
 
