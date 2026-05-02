@@ -823,6 +823,29 @@ pub trait Tool: Send + Sync {
         self.approval(args)
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult>;
+
+    /// Pre-flight syntactic check on raw tool-call arguments. The runner
+    /// calls this **before** approval and before execute, so a parse
+    /// failure short-circuits to a tool-result error and the model
+    /// receives a structured retry hint without bothering the user.
+    ///
+    /// Default impl: `Ok(())`. Tools with strict required-field schemas
+    /// (write_file / edit_file / search_replace) override to surface the
+    /// serde error early. Implementations should be cheap (parse only,
+    /// no I/O) — the runner re-parses inside `execute()` for actual use.
+    ///
+    /// Trigger context (2026-05-02 datalog evidence): provider-side
+    /// stream truncation can deliver `[RAW ARGS: {]` or
+    /// `[RAW ARGS: {"file_path":"..."]` (closing-bracket wrong, content
+    /// missing). The previous flow let those reach `approval_with_context`
+    /// where the tool's own fail-closed branch returned
+    /// `RequireApproval("Could not parse … for safety check.")` and the
+    /// user saw an approval prompt for an obviously-broken call. Pressing
+    /// Allow then died on the same parse in `execute()`. Validating up
+    /// front eliminates the user-visible round-trip entirely.
+    fn validate_args(&self, _args: &str) -> std::result::Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct ToolRegistry {

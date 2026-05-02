@@ -144,23 +144,9 @@ impl Conversation {
 
     pub fn finalize_stream(&mut self) {
         if let Some(content) = self.stream_buffer.take() {
-            // Clean up model artifacts
-            let content = content
-                .replace("<think>", "")
-                .replace("</think>", "")
-                .replace("<|im_start|>", "")
-                .replace("<|im_end|>", "");
-            // Strip leaked reasoning: MiniMax/DeepSeek sometimes output
-            // reasoning as plain text (no <think> tag) followed by the
-            // actual response. Detect by looking for the pattern:
-            //   "要求/需要/让我/用户..." (analysis) → blank line → actual reply
-            let content = strip_leaked_reasoning(&content);
-            let content = dedup_trailing_repeat(&content);
-            // Skip empty/whitespace-only assistant messages — they waste a message
-            // slot in context without carrying information (common after <think> stripping).
-            if content.trim().is_empty() {
+            let Some(content) = clean_assistant_text(&content) else {
                 return;
-            }
+            };
             let idx = self.messages.len();
             self.messages.push(Message::new(Role::Assistant, content));
             self.turn_tracker.on_message_added(idx);
@@ -195,7 +181,10 @@ impl Conversation {
     }
 
     pub fn finalize_stream_with_tool_call(&mut self, tool_call: ToolCall, reasoning: Option<&str>) {
-        let text = self.stream_buffer.take();
+        let text = self
+            .stream_buffer
+            .take()
+            .and_then(|s| clean_assistant_text(&s));
         self.add_assistant_tool_calls(text.as_deref(), vec![tool_call], reasoning);
     }
 
@@ -208,7 +197,10 @@ impl Conversation {
         tool_calls: &[ToolCall],
         reasoning: Option<&str>,
     ) {
-        let text = self.stream_buffer.take();
+        let text = self
+            .stream_buffer
+            .take()
+            .and_then(|s| clean_assistant_text(&s));
         self.add_assistant_tool_calls(text.as_deref(), tool_calls.to_vec(), reasoning);
     }
 
@@ -458,6 +450,128 @@ fn dedup_trailing_repeat(text: &str) -> String {
     }
 
     text.to_string()
+}
+
+/// Apply the full assistant-text cleaning chain. Returns `None` when the
+/// content should be dropped instead of committed to history (empty after
+/// stripping, or corrupted bytes from provider stream failure). Used by
+/// every `finalize_stream*` entry point so all three paths share the
+/// same drop policy.
+fn clean_assistant_text(raw: &str) -> Option<String> {
+    // Strip thinking-model artifacts. `<think>` and `<|im_*|>` are model-
+    // template tokens that occasionally leak into the visible content
+    // (provider didn't filter them, or they crossed a chunk boundary).
+    let stripped = raw
+        .replace("<think>", "")
+        .replace("</think>", "")
+        .replace("<|im_start|>", "")
+        .replace("<|im_end|>", "");
+    // Strip leaked reasoning: MiniMax/DeepSeek sometimes output reasoning
+    // as plain text (no `<think>` tag) followed by the actual response.
+    // Detect by looking for the pattern: `要求/需要/让我/用户...`
+    // (analysis) → blank line → actual reply.
+    let stripped = strip_leaked_reasoning(&stripped);
+    let stripped = dedup_trailing_repeat(&stripped);
+    if stripped.trim().is_empty() {
+        return None;
+    }
+    if let Some(reason) = looks_corrupted(&stripped) {
+        // Letting corrupted bytes land in history poisons every
+        // subsequent turn — the model sees its own garbage as prior
+        // context and either echoes more garbage or derails. Drop
+        // and surface a stderr line so the user/datalog has a trail;
+        // the turn loop sees an empty assistant turn and the user can
+        // `/retry` or switch models.
+        eprintln!(
+            "[conversation] dropping corrupted assistant output: reason={} len={}",
+            reason,
+            stripped.len()
+        );
+        return None;
+    }
+    Some(stripped)
+}
+
+/// Detect output that almost-certainly came from a corrupted provider stream
+/// (binary bytes decoded as UTF-8, mojibake from wrong encoding, KV-cache
+/// poisoning after timeout/retry, etc.) and should NOT be committed to
+/// conversation history.
+///
+/// Returns `Some(reason)` when the text is corrupted; `None` when it looks
+/// like real model output. Conservative by design: only fires on
+/// unambiguously non-textual signals. False positives here would silently
+/// drop legitimate responses, which is far worse than letting one garbage
+/// turn through.
+///
+/// Trigger context (2026-05-02 datalog evidence): `deepseek-v4-flash` at
+/// ~28K ctx after a successful file write hung 155s on the next turn,
+/// then the framework's stream-timeout retry returned `P<ďĎĎĎĎ` (UTF-8
+/// bytes 0x50 0x3C 0xC4 0x8F 0xC4 0x8E ×4 — Latin Extended-A mojibake of
+/// what was almost certainly raw binary in the provider's response
+/// buffer). Once that string lands in conversation history the next turn
+/// sees its own garbage as prior context and the session is unrecoverable.
+pub fn looks_corrupted(text: &str) -> Option<&'static str> {
+    let total_chars = text.chars().count();
+    if total_chars < 4 {
+        // Too short to judge confidently. The single-char `P` we've also
+        // observed slips through — caller's empty-check + any explicit
+        // /undo gate is the recovery path for that.
+        return None;
+    }
+
+    // Signal 1: U+FFFD replacement char density. The decoder marks bytes
+    // that didn't form valid UTF-8 with this; a single one in a long reply
+    // can be incidental, but >5% means decode failed broadly.
+    let replacement = text.chars().filter(|&c| c == '\u{FFFD}').count();
+    if replacement * 20 > total_chars {
+        return Some("replacement_char_density");
+    }
+
+    // Signal 2: C0 control bytes other than \t \n \r. Real model output
+    // never contains these; provider bug or transport corruption.
+    let bad_ctrl = text.chars().filter(|&c| {
+        let cp = c as u32;
+        cp < 0x20 && cp != 0x09 && cp != 0x0A && cp != 0x0D
+    }).count();
+    if bad_ctrl > 0 {
+        return Some("c0_control_bytes");
+    }
+
+    // Signal 3: Latin Extended-A density (U+0100-U+017F). The 2026-05-02
+    // `P<ďĎĎĎĎ` fixture is 7 chars with 5 in this range (71%). A real
+    // Czech/Slovak/Polish text mixes these with ASCII at low ratio
+    // (typically <15%); >40% density is mojibake of UTF-8 bytes
+    // 0xC4 0x8E etc. East Asian text is in U+4E00+ ranges and never
+    // triggers this signal. 40% threshold also rejects legitimate short
+    // Czech words like `čaj` (33%) while catching the fixture.
+    let latin_ext_a = text.chars().filter(|&c| {
+        let cp = c as u32;
+        (0x0100..=0x017F).contains(&cp)
+    }).count();
+    if latin_ext_a * 10 > total_chars * 4 {
+        return Some("latin_extended_a_mojibake");
+    }
+
+    // Signal 4: a single non-ASCII char repeating 5+ times in a row.
+    // Tokenizer/cache failure modes often emit one stuck token over and
+    // over. ASCII repetition is allowed (`====` separators, `....`
+    // ellipses, indentation runs). Run counter tallies `c == prev`
+    // events, so 5 consecutive identical chars produce run==4.
+    let mut prev = '\0';
+    let mut run = 0;
+    for c in text.chars() {
+        if c == prev && c as u32 > 0x7F {
+            run += 1;
+            if run >= 4 {
+                return Some("stuck_non_ascii_repeat");
+            }
+        } else {
+            run = 0;
+            prev = c;
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -769,5 +883,99 @@ mod tests {
         conv.add_user_message("new message");
         assert_eq!(conv.messages.len(), 1);
         assert_eq!(conv.turn_tracker.turns.len(), 1);
+    }
+
+    // ── looks_corrupted: garbage detection ──
+
+    /// 2026-05-02 datalog `atomgr/2026-05-02_10-37-51.md` line 402:
+    /// deepseek-v4-flash returned `P<ďĎĎĎĎ` after a 155s stream timeout
+    /// + retry — UTF-8 decoding of `0x50 0x3C 0xC4 0x8F 0xC4 0x8E ×4`,
+    /// almost certainly raw binary in the provider's response buffer.
+    /// Without this guard the string lands in conversation history and
+    /// poisons every subsequent turn.
+    #[test]
+    fn looks_corrupted_catches_real_datalog_fixture() {
+        assert_eq!(
+            looks_corrupted("P<ďĎĎĎĎ"),
+            Some("latin_extended_a_mojibake")
+        );
+    }
+
+    #[test]
+    fn looks_corrupted_catches_replacement_char_density() {
+        let s: String = (0..10).map(|_| '\u{FFFD}').collect();
+        assert_eq!(looks_corrupted(&s), Some("replacement_char_density"));
+    }
+
+    #[test]
+    fn looks_corrupted_catches_c0_control_bytes() {
+        // \x01 \x02 \x03 = SOH STX ETX, never appear in real text
+        assert_eq!(
+            looks_corrupted("hello\x01world"),
+            Some("c0_control_bytes")
+        );
+    }
+
+    #[test]
+    fn looks_corrupted_catches_stuck_repeat() {
+        // Five consecutive non-ASCII chars from a tokenizer/cache failure
+        let s = format!("hi {}", "中".repeat(5));
+        assert_eq!(looks_corrupted(&s), Some("stuck_non_ascii_repeat"));
+    }
+
+    #[test]
+    fn looks_corrupted_passes_normal_chinese() {
+        // CJK is U+4E00+, well outside Latin Extended-A
+        assert_eq!(looks_corrupted("你好，让我帮你写代码"), None);
+    }
+
+    #[test]
+    fn looks_corrupted_passes_normal_english() {
+        assert_eq!(
+            looks_corrupted("Let me read the file and figure out what changed."),
+            None
+        );
+    }
+
+    #[test]
+    fn looks_corrupted_passes_short_czech() {
+        // Real Czech word `čaj` (tea) — 33% latin-ext-a but legitimate
+        assert_eq!(looks_corrupted("čaj"), None);
+        // 4 chars at 25% — below 40% threshold
+        assert_eq!(looks_corrupted("čajov"), None);
+    }
+
+    #[test]
+    fn looks_corrupted_passes_ascii_separators() {
+        // `=====` and `....` patterns are legitimate, ASCII repetition
+        // is allowed even past the 5-char run threshold
+        assert_eq!(looks_corrupted("====================="), None);
+        assert_eq!(looks_corrupted("Done. ......"), None);
+    }
+
+    #[test]
+    fn looks_corrupted_too_short_returns_none() {
+        // Below 4 chars: trim_empty handles the truly-empty case;
+        // single chars like the 2nd datalog `P` slip through and rely
+        // on /retry / model switch.
+        assert_eq!(looks_corrupted("P"), None);
+        assert_eq!(looks_corrupted("ok"), None);
+    }
+
+    #[test]
+    fn finalize_stream_drops_corrupted_output() {
+        let mut conv = Conversation::new();
+        conv.push_delta("P<ďĎĎĎĎ");
+        conv.finalize_stream();
+        // Corrupted text never reaches messages — history is preserved
+        // clean and the next turn doesn't see the garbage as context.
+        assert!(
+            conv.messages.is_empty(),
+            "corrupted assistant output must not be committed to history"
+        );
+        assert!(
+            conv.stream_buffer.is_none(),
+            "stream buffer must be drained even on drop"
+        );
     }
 }

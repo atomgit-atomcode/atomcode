@@ -1293,6 +1293,131 @@ fn detect_call_loop_edit_resets_all_regions_for_file() {
 }
 
 // ===========================================================================
+// validate_args gate: malformed tool-call args bounce back to the model
+// without prompting the user or running execute.
+// ===========================================================================
+
+#[tokio::test]
+async fn malformed_write_file_args_short_circuit_without_approval() {
+    use crate::tool::write::WriteFileTool;
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(WriteFileTool)).await;
+
+    // 2026-05-02 datalog `atomgr/2026-05-02_20-23-21.md` line 330:
+    // provider stream truncated mid-args, closing bracket wrong, no
+    // `content` field. Pre-fix, this would (a) fail json_repair, (b)
+    // fall into write_file's fail-closed approval branch which prompts
+    // the user, (c) the user approves, (d) execute() re-parses and
+    // returns the same missing-field error. Post-fix the runner's
+    // validate_args gate short-circuits to a tool-result error and
+    // approval/execute are never reached.
+    let bad_args = r#"{"file_path": "/tmp/x.rs"]"#;
+    let provider = MockProvider::with_tool_call("write_file", bad_args);
+    // Use a permission decider that PANICS if asked — proves no
+    // approval round-trip happened.
+    struct PanicOnApproval;
+    #[async_trait]
+    impl super::permission::PermissionDecider for PanicOnApproval {
+        async fn decide(
+            &self,
+            _call: &crate::tool::ToolCall,
+            _reason: &str,
+        ) -> crate::tool::PermissionDecision {
+            panic!("validate_args gate must short-circuit before approval is requested");
+        }
+    }
+    let mut runner = make_runner(provider, tools, Box::new(PanicOnApproval));
+    let mut conv = Conversation::new();
+    conv.add_user_message("write a file");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let _ = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
+    drop(tx);
+
+    let mut got_error_result = false;
+    while let Some(event) = rx.recv().await {
+        if let TurnEvent::ToolCallResult {
+            name,
+            success,
+            output,
+            ..
+        } = event
+        {
+            if name == "write_file" {
+                assert!(!success, "validate-fail must surface as success=false");
+                assert!(
+                    output.to_lowercase().contains("missing field")
+                        || output.to_lowercase().contains("re-issue"),
+                    "tool result must carry the structured retry hint, got: {output}"
+                );
+                got_error_result = true;
+            }
+        }
+    }
+    assert!(
+        got_error_result,
+        "validate-fail must still emit a ToolCallResult so the model can retry"
+    );
+}
+
+#[test]
+fn write_file_validate_args_catches_real_datalog_fixtures() {
+    use crate::tool::write::WriteFileTool;
+    use crate::tool::Tool as _;
+    let tool = WriteFileTool;
+
+    // 2026-05-02 datalog 10-37-51.md line 225: stream cut at `{`.
+    assert!(
+        tool.validate_args("{").is_err(),
+        "single-brace truncation must reject"
+    );
+    // 2026-05-02 datalog 20-23-21.md line 330: closing `]`, no content.
+    assert!(
+        tool.validate_args(r#"{"file_path": "/tmp/x.rs"]"#).is_err(),
+        "closing-bracket-wrong + missing field must reject"
+    );
+    // Empty args.
+    assert!(tool.validate_args("").is_err());
+    assert!(tool.validate_args("{}").is_err(), "empty object must reject");
+    // Valid call passes.
+    assert!(
+        tool.validate_args(r#"{"file_path":"/tmp/x.rs","content":"hi"}"#)
+            .is_ok()
+    );
+}
+
+#[test]
+fn edit_file_validate_args_rejects_missing_fields() {
+    use crate::tool::edit::EditFileTool;
+    use crate::tool::Tool as _;
+    let tool = EditFileTool;
+    assert!(tool.validate_args("{}").is_err());
+    assert!(
+        tool.validate_args(r#"{"file_path":"/x.rs"}"#).is_err(),
+        "missing old_string + new_string must reject"
+    );
+    assert!(
+        tool.validate_args(
+            r#"{"file_path":"/x.rs","old_string":"a","new_string":"b"}"#
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn search_replace_validate_args_rejects_missing_fields() {
+    use crate::tool::search_replace::SearchReplaceTool;
+    use crate::tool::Tool as _;
+    let tool = SearchReplaceTool;
+    assert!(tool.validate_args("{}").is_err());
+    assert!(
+        tool.validate_args(r#"{"search":"a","replace":"b"}"#).is_ok()
+    );
+}
+
+// ===========================================================================
 // Telemetry integration tests
 // ===========================================================================
 
