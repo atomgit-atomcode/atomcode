@@ -57,6 +57,15 @@ impl Tool for SearchReplaceTool {
         }
     }
 
+    fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
+        serde_json::from_str::<SearchReplaceArgs>(args)
+            .map(|_| ())
+            .map_err(|e| format!(
+                "{} (could not parse search_replace arguments; check `search` and `replace` are present)",
+                e
+            ))
+    }
+
     fn approval(&self, _args: &str) -> ApprovalRequirement {
         // Bulk replacement across files is potentially destructive
         // Auto-approve: search_replace is safe (literal/regex matching, respects .gitignore).

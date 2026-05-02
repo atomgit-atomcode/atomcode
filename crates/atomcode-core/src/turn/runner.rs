@@ -1056,6 +1056,35 @@ impl TurnRunner {
             call
         };
 
+        // Schema gate: bounce malformed args back to the model BEFORE
+        // approval / execute. Provider stream truncation occasionally
+        // ships `{]` or `{"file_path":"..."]` (closing bracket wrong,
+        // required field missing); without this guard, write_file's
+        // fail-closed approval branch would prompt the user, the user
+        // would Allow, and execute would then fail with the same parse
+        // error — a wasted approval round-trip on a known-broken call.
+        // Runs AFTER `repair_tool_args` (so wrapper-shape / fence / nested
+        // payloads recover first) but BEFORE approval — the unrecoverable
+        // remainder is what gets bounced.
+        if let Err(reason) = tool.validate_args(&call.arguments) {
+            let msg = format!(
+                "Error: {}. Re-issue {} with a complete JSON object containing all required fields.",
+                reason, call.name
+            );
+            let _ = event_tx.send(TurnEvent::ToolCallResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                output: msg.clone(),
+                success: false,
+                duration: std::time::Duration::ZERO,
+            });
+            return ToolResult {
+                call_id: call.id.clone(),
+                output: msg,
+                success: false,
+            };
+        }
+
         // Loop detection moved upstream to `dispatch_tools` (gates BEFORE
         // ToolCallStarted is emitted, so blocked attempts don't render
         // ghost inflight rows in scrollback). When we reach here the

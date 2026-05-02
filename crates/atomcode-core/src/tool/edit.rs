@@ -242,10 +242,46 @@ impl Tool for EditFileTool {
         }
     }
 
+    fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
+        let parsed: EditFileArgs = serde_json::from_str(args).map_err(|e| {
+            format!(
+                "{} (could not parse edit_file arguments; `file_path` is required and at least one edit mode must be present)",
+                e
+            )
+        })?;
+        // Semantic gate: edit_file is a multi-mode tool — accepts
+        // (old_string + new_string) OR (start_line + end_line +
+        // new_string) OR (edits array) OR (symbol + new_string). A call
+        // with only `file_path` is a truncated/half-formed payload that
+        // would deterministically fail in execute(); reject it here so
+        // the model gets a structured retry hint without an approval
+        // round-trip.
+        let has_string_mode = parsed.old_string.is_some() || parsed.new_string.is_some();
+        let has_line_mode = parsed.start_line.is_some() || parsed.end_line.is_some();
+        let has_edits = parsed.edits.is_some();
+        let has_symbol = parsed.symbol.is_some();
+        if !has_string_mode && !has_line_mode && !has_edits && !has_symbol {
+            return Err(
+                "edit_file arguments missing edit content. Provide `old_string`+`new_string`, \
+                 `start_line`+`end_line`+`new_string`, an `edits` array, or `symbol`+`new_string`."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     fn approval(&self, args: &str) -> ApprovalRequirement {
+        // The runner's `validate_args` gate already rejects unparseable
+        // payloads upstream — when we get here, args are valid JSON
+        // matching the schema. Sensitive-path detection still runs as
+        // a separate concern: even valid args can target a path that
+        // requires explicit user approval.
         let parsed = match serde_json::from_str::<EditFileArgs>(args) {
             Ok(p) => p,
             Err(_) => {
+                // Defense in depth: if validate_args was somehow bypassed
+                // (e.g. tool invoked from a path that doesn't run the
+                // gate), fall back to the original fail-closed behaviour.
                 return ApprovalRequirement::RequireApproval(
                     "Could not parse edit_file arguments for safety check.".to_string(),
                 );

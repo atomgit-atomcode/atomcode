@@ -35,6 +35,27 @@ impl Tool for WriteFileTool {
         }
     }
 
+    fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
+        // Reject empty / structurally-broken / required-field-missing
+        // payloads up front so the runner can bounce the call back to
+        // the model without an approval round-trip. Same struct used by
+        // execute(), so a passing validate guarantees a passing parse
+        // downstream.
+        serde_json::from_str::<WriteFileArgs>(args).map(|_| ()).map_err(|e| {
+            if args.trim().is_empty() || args.trim() == "{}" {
+                format!(
+                    "{} (tool call arrived with no arguments — likely truncated by max_tokens)",
+                    e
+                )
+            } else {
+                format!(
+                    "{} (could not parse write_file arguments; check `file_path` (absolute) and `content` are present)",
+                    e
+                )
+            }
+        })
+    }
+
     fn approval(&self, args: &str) -> ApprovalRequirement {
         let parsed = match serde_json::from_str::<WriteFileArgs>(args) {
             Ok(p) => p,
