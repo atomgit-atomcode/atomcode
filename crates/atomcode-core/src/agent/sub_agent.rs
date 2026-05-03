@@ -228,6 +228,41 @@ async fn run_turn_with_retry(
     unreachable!("run_turn_with_retry loop must exit via the inner return")
 }
 
+/// Construct a human-readable summary of what the sub-agent did.
+/// Replaces the previous "first 200 chars of last_text" approach with
+/// a compact, signal-aware multi-part line.
+fn build_summary(
+    assigned: &str,
+    tracker: &ProgressTracker,
+    last_text: &str,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if tracker.edited_files.is_empty() {
+        parts.push(format!("Did not edit `{}`", assigned));
+    } else {
+        let edited: Vec<&str> = tracker.edited_files.iter().map(|s| s.as_str()).collect();
+        parts.push(format!(
+            "Edited {} file(s): {}",
+            edited.len(),
+            edited.join(", ")
+        ));
+    }
+    if tracker.timeouts > 0 {
+        parts.push(format!("{} timeout(s) recovered", tracker.timeouts));
+    }
+    if tracker.hallucination_nudges_sent > 0 {
+        parts.push(format!(
+            "{} hallucination nudge(s) sent",
+            tracker.hallucination_nudges_sent
+        ));
+    }
+    if !last_text.is_empty() {
+        let snippet: String = last_text.chars().take(120).collect();
+        parts.push(format!("model said: {}", snippet));
+    }
+    parts.join(" · ")
+}
+
 /// A single sub-agent task: one file to modify.
 pub struct SubAgentTask {
     pub file_path: String,
@@ -455,10 +490,19 @@ impl SubAgentTask {
             }),
         };
 
+        // Sandbox: filter parent tools to the sub-agent whitelist
+        // (edit_file, search_replace, scoped read_file). Hands the
+        // filtered registry to the runner so blacklisted tools (bash,
+        // web_*, glob, list_directory, change_dir, write_file, grep)
+        // are absent — the runner returns "tool not registered" to the
+        // model, which routes it back via re-think.
+        let sandboxed_tools =
+            Arc::new(filter_tools_for_subagent(&tools, &self.file_path).await);
+
         let hooks = crate::hook::json_config::load_hooks_config(working_dir);
         let mut runner = TurnRunner {
             provider,
-            tools,
+            tools: sandboxed_tools,
             context: tool_ctx,
             config: config.clone(),
             ctx: build_ctx,
@@ -475,30 +519,78 @@ impl SubAgentTask {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TurnEvent>();
         let cancel = CancellationToken::new();
 
-        // 5. Run up to max_turns
-        let mut turns_used = 0;
+        // 5. Run loop with resilience layer
+        let res_cfg = ResilienceConfig::default();
+        let mut tracker = ProgressTracker::default();
+        let cap = max_turns.min(res_cfg.max_turns);
+        let mut dynamic_budget = res_cfg.initial_turns as i32;
         let mut last_text = String::new();
         let mut failures: Vec<SubAgentFailure> = Vec::new();
+        let mut turns_used = 0usize;
 
-        for _ in 0..max_turns {
-            turns_used += 1;
-            let result = runner
-                .run(&mut conversation, &system_prompt, &event_tx, cancel.clone())
-                .await;
+        for turn in 0..cap {
+            // 1. Idle kill check (hard exit, no recovery)
+            if tracker.no_edit_runs >= res_cfg.idle_kill_threshold {
+                failures.push(SubAgentFailure::NoProgress {
+                    idle_turns: tracker.no_edit_runs,
+                });
+                break;
+            }
 
-            // Drain events
+            // 2. Pre-turn hallucination check
+            if let Some(nudge) = tracker.hallucination_detected(&self.file_path, &res_cfg) {
+                conversation.add_user_message(&nudge);
+                tracker.hallucination_nudges_sent += 1;
+                // Grace turn so nudge has recovery room before budget check
+                dynamic_budget += 1;
+            }
+
+            // 3. Budget exhaustion check
+            if turn as i32 >= dynamic_budget && turn >= res_cfg.min_turns {
+                if tracker.edited_files.is_empty() {
+                    failures.push(SubAgentFailure::BudgetExhaustedNoEdits);
+                }
+                break;
+            }
+
+            // 4. Run turn with retry (1× for stream-timeout class)
+            let pre_msg_count = conversation.messages.len();
+            let (result, timeouts_fired) = run_turn_with_retry(
+                &mut runner,
+                &mut conversation,
+                &system_prompt,
+                &event_tx,
+                cancel.clone(),
+                res_cfg.max_call_retries,
+            )
+            .await;
+            tracker.timeouts += timeouts_fired;
+            turns_used = turn + 1;
+
+            // Drain any UI events the runner emitted (we don't forward them).
             while event_rx.try_recv().is_ok() {}
 
+            // 5. Process result
             match result {
                 TurnResult::Responded { text, .. } => {
                     last_text = text;
-                    break; // Done — model responded with text only (no more tools)
+                    break;
                 }
                 TurnResult::UsedTools { text, .. } => {
                     if let Some(t) = text {
                         last_text = t;
                     }
-                    // Continue — model may need more turns
+                    let (edited, reads) =
+                        scan_turn_signals(&conversation.messages, pre_msg_count);
+                    tracker.observe_turn(turn, &edited, &reads);
+                    let delta = tracker.budget_adjustment(&res_cfg);
+                    dynamic_budget = (dynamic_budget + delta)
+                        .max(res_cfg.min_turns as i32)
+                        .min(res_cfg.max_turns as i32);
+                }
+                TurnResult::Failed(err) if is_stream_timeout(&err) => {
+                    failures.push(SubAgentFailure::StreamTimeoutAfterRetry);
+                    break;
                 }
                 TurnResult::Failed(err) => {
                     failures.push(SubAgentFailure::ProviderError(err));
@@ -511,23 +603,25 @@ impl SubAgentTask {
             }
         }
 
-        // 6. Extract summary
-        let summary = if last_text.is_empty() {
-            format!("Edited {}", self.file_path)
-        } else {
-            // Take first 200 chars as summary
-            last_text.chars().take(200).collect()
+        // 6. Build diagnostic + summary
+        let diagnostic = Diagnostic {
+            edited_files: tracker.edited_files.iter().cloned().collect(),
+            read_counts: tracker.read_count.clone(),
+            timeouts: tracker.timeouts,
+            hallucination_nudges_sent: tracker.hallucination_nudges_sent,
+            final_budget: dynamic_budget.max(0) as usize,
+            turns_used,
         };
+        let success = !tracker.edited_files.is_empty() && failures.is_empty();
+        let summary = build_summary(&self.file_path, &tracker, &last_text);
 
-        // Diagnostic stays Default::default() until Task 8 wires the
-        // ProgressTracker into execute (per plan).
         SubAgentResult {
             file_path: self.file_path.clone(),
-            success: failures.is_empty(),
+            success,
             turns_used,
             summary,
             failures,
-            diagnostic: Diagnostic::default(),
+            diagnostic,
         }
     }
 }
