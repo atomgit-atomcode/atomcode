@@ -18,6 +18,50 @@ use crate::turn::event::{TurnEvent, TurnResult};
 use crate::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
 use crate::turn::runner::TurnRunner;
 
+/// Tunable knobs for the resilience layer of `SubAgentTask::execute`.
+/// Wired from `Config::subagent` at the call site; defaults match
+/// `SubAgentConfig::default()`.
+#[derive(Debug, Clone)]
+pub struct ResilienceConfig {
+    /// Starting per-task turn budget.
+    pub initial_turns: usize,
+    /// Hard cap regardless of progress signals.
+    pub max_turns: usize,
+    /// Minimum turns to run before honoring budget exhaustion (so a
+    /// single bad turn can't end the sub-agent prematurely).
+    pub min_turns: usize,
+    /// Budget bonus when a turn produced a successful edit.
+    pub edit_bonus: usize,
+    /// Budget penalty when no_edit_runs ≥ idle_threshold.
+    pub idle_penalty: usize,
+    /// Number of consecutive no-edit turns before idle penalty applies.
+    pub idle_threshold: usize,
+    /// Number of consecutive no-edit turns that triggers early kill
+    /// (NoProgress failure).
+    pub idle_kill_threshold: usize,
+    /// Max in-loop retries for stream-timeout class failures (network).
+    pub max_call_retries: usize,
+    /// Reads of the assigned file (with zero successful edits) that
+    /// triggers the hallucination nudge.
+    pub hallucination_read_threshold: usize,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            initial_turns: 4,
+            max_turns: 12,
+            min_turns: 2,
+            edit_bonus: 2,
+            idle_penalty: 1,
+            idle_threshold: 2,
+            idle_kill_threshold: 4,
+            max_call_retries: 1,
+            hallucination_read_threshold: 3,
+        }
+    }
+}
+
 /// A single sub-agent task: one file to modify.
 pub struct SubAgentTask {
     pub file_path: String,
@@ -545,5 +589,19 @@ mod tests {
     /// Test helper: collect tool names from a registry via the public iter API.
     async fn collect_tool_names(r: &ToolRegistry) -> Vec<String> {
         r.iter().await.map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn resilience_config_default_values_sensible() {
+        let cfg = ResilienceConfig::default();
+        assert_eq!(cfg.initial_turns, 4);
+        assert_eq!(cfg.max_turns, 12);
+        assert_eq!(cfg.min_turns, 2);
+        assert_eq!(cfg.edit_bonus, 2);
+        assert_eq!(cfg.idle_penalty, 1);
+        assert_eq!(cfg.idle_threshold, 2);
+        assert_eq!(cfg.idle_kill_threshold, 4);
+        assert_eq!(cfg.max_call_retries, 1);
+        assert_eq!(cfg.hallucination_read_threshold, 3);
     }
 }
