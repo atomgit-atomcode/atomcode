@@ -131,6 +131,57 @@ impl ProgressTracker {
     }
 }
 
+/// Walk new messages added during one turn (slice `&messages[prev_len..]`)
+/// and extract:
+///  - `edited`: files whose `edit_file` / `search_replace` call returned
+///    `success=true`. `search_replace` has no `file_path` so we record an
+///    empty string to mark "an edit occurred" (still counts toward
+///    last_edit_turn). Failed edits are excluded.
+///  - `reads`: every `read_file` call's `file_path`, regardless of result.
+fn scan_turn_signals(
+    messages: &[crate::conversation::message::Message],
+    prev_len: usize,
+) -> (Vec<String> /* edited */, Vec<String> /* reads */) {
+    use crate::conversation::message::MessageContent;
+
+    // First pass: collect (call_id → tool_name + file_path)
+    let mut call_meta: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for msg in &messages[prev_len..] {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            for tc in tool_calls {
+                let path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("file_path")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                call_meta.insert(tc.id.clone(), (tc.name.clone(), path));
+            }
+        }
+    }
+
+    // Second pass: pair tool_results with calls
+    let mut edited = Vec::new();
+    let mut reads = Vec::new();
+    for msg in &messages[prev_len..] {
+        if let MessageContent::ToolResult(r) = &msg.content {
+            if let Some((name, path)) = call_meta.get(&r.call_id) {
+                match name.as_str() {
+                    "edit_file" if r.success => edited.push(path.clone()),
+                    "search_replace" if r.success => edited.push(path.clone()),
+                    "read_file" => reads.push(path.clone()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    (edited, reads)
+}
+
 /// A single sub-agent task: one file to modify.
 pub struct SubAgentTask {
     pub file_path: String,
@@ -658,6 +709,97 @@ mod tests {
     /// Test helper: collect tool names from a registry via the public iter API.
     async fn collect_tool_names(r: &ToolRegistry) -> Vec<String> {
         r.iter().await.map(|(name, _)| name).collect()
+    }
+
+    use crate::conversation::message::{Message, MessageContent, Role};
+    use crate::tool::{ToolCall, ToolResult};
+
+    fn make_assistant_with_tool_call(call_id: &str, name: &str, args: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: call_id.into(),
+                    name: name.into(),
+                    arguments: args.into(),
+                }],
+                reasoning_content: None,
+            },
+        }
+    }
+
+    fn make_tool_result(call_id: &str, success: bool, output: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResult(ToolResult {
+                call_id: call_id.into(),
+                output: output.into(),
+                success,
+            }),
+        }
+    }
+
+    #[test]
+    fn scan_signals_counts_successful_edit_only() {
+        let msgs = vec![
+            make_assistant_with_tool_call("c1", "edit_file", r#"{"file_path":"/a.rs"}"#),
+            make_tool_result("c1", true, "Edited /a.rs"),
+        ];
+        let (edited, reads) = scan_turn_signals(&msgs, 0);
+        assert_eq!(edited, vec!["/a.rs".to_string()]);
+        assert!(reads.is_empty());
+    }
+
+    #[test]
+    fn scan_signals_failed_edit_not_counted() {
+        let msgs = vec![
+            make_assistant_with_tool_call("c1", "edit_file", r#"{"file_path":"/a.rs"}"#),
+            make_tool_result("c1", false, "old_string not found"),
+        ];
+        let (edited, _reads) = scan_turn_signals(&msgs, 0);
+        assert!(edited.is_empty(), "failed edits must not count");
+    }
+
+    #[test]
+    fn scan_signals_counts_read_regardless_of_success() {
+        let msgs = vec![
+            make_assistant_with_tool_call("c1", "read_file", r#"{"file_path":"/a.rs"}"#),
+            make_tool_result("c1", true, "..."),
+        ];
+        let (edited, reads) = scan_turn_signals(&msgs, 0);
+        assert!(edited.is_empty());
+        assert_eq!(reads, vec!["/a.rs".to_string()]);
+    }
+
+    #[test]
+    fn scan_signals_counts_search_replace_as_edit() {
+        let msgs = vec![
+            make_assistant_with_tool_call(
+                "c1",
+                "search_replace",
+                r#"{"search":"a","replace":"b"}"#,
+            ),
+            make_tool_result("c1", true, "modified 3 files"),
+        ];
+        let (edited, _reads) = scan_turn_signals(&msgs, 0);
+        // search_replace has no file_path; we record empty string to mark
+        // "an edit occurred" (still counts toward last_edit_turn).
+        assert_eq!(edited.len(), 1);
+    }
+
+    #[test]
+    fn scan_signals_respects_prev_len_offset() {
+        let msgs = vec![
+            make_assistant_with_tool_call("c0", "read_file", r#"{"file_path":"/a.rs"}"#),
+            make_tool_result("c0", true, "..."),
+            make_assistant_with_tool_call("c1", "edit_file", r#"{"file_path":"/a.rs"}"#),
+            make_tool_result("c1", true, "Edited"),
+        ];
+        // Look at only the second pair (prev_len=2)
+        let (edited, reads) = scan_turn_signals(&msgs, 2);
+        assert_eq!(edited, vec!["/a.rs".to_string()]);
+        assert!(reads.is_empty());
     }
 
     #[test]
