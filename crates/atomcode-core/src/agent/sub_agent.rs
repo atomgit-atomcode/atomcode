@@ -62,6 +62,75 @@ impl Default for ResilienceConfig {
     }
 }
 
+/// Per-execute progress signals. Updated each turn by `scan_turn_signals`.
+/// Drives the adaptive budget calculation and hallucination nudge.
+#[derive(Debug, Default, Clone)]
+struct ProgressTracker {
+    /// All files that received at least one successful edit.
+    edited_files: std::collections::HashSet<String>,
+    /// Turn index of most-recent successful edit.
+    last_edit_turn: Option<usize>,
+    /// Consecutive turns with zero successful edits.
+    no_edit_runs: usize,
+    /// Per-file read-call counts (regardless of success/failure).
+    read_count: std::collections::HashMap<String, usize>,
+    /// How many stream-timeout retries have fired so far.
+    timeouts: usize,
+    /// How many hallucination nudges have been injected.
+    hallucination_nudges_sent: usize,
+}
+
+impl ProgressTracker {
+    fn observe_turn(
+        &mut self,
+        turn_idx: usize,
+        edited: &[String],
+        reads: &[String],
+    ) {
+        if !edited.is_empty() {
+            for f in edited {
+                self.edited_files.insert(f.clone());
+            }
+            self.last_edit_turn = Some(turn_idx);
+            self.no_edit_runs = 0;
+        } else {
+            self.no_edit_runs += 1;
+        }
+        for f in reads {
+            *self.read_count.entry(f.clone()).or_default() += 1;
+        }
+    }
+
+    fn budget_adjustment(&self, cfg: &ResilienceConfig) -> i32 {
+        let mut delta = 0_i32;
+        if self.last_edit_turn.is_some() {
+            delta += cfg.edit_bonus as i32;
+        }
+        if self.no_edit_runs >= cfg.idle_threshold {
+            delta -= cfg.idle_penalty as i32;
+        }
+        delta
+    }
+
+    fn hallucination_detected(
+        &self,
+        assigned_file: &str,
+        cfg: &ResilienceConfig,
+    ) -> Option<String> {
+        let count = self.read_count.get(assigned_file).copied().unwrap_or(0);
+        if count >= cfg.hallucination_read_threshold && self.edited_files.is_empty() {
+            Some(format!(
+                "You have read `{}` {} times without editing. \
+                 Stop reading; the file content is already in your prompt above. \
+                 Call edit_file NOW with old_string + new_string.",
+                assigned_file, count
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 /// A single sub-agent task: one file to modify.
 pub struct SubAgentTask {
     pub file_path: String,
@@ -589,6 +658,82 @@ mod tests {
     /// Test helper: collect tool names from a registry via the public iter API.
     async fn collect_tool_names(r: &ToolRegistry) -> Vec<String> {
         r.iter().await.map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn progress_tracker_increments_on_successful_edit() {
+        let mut t = ProgressTracker::default();
+        t.observe_turn(0, &["a.rs".into()], &[]);
+        assert_eq!(t.last_edit_turn, Some(0));
+        assert_eq!(t.no_edit_runs, 0);
+        assert!(t.edited_files.contains("a.rs"));
+    }
+
+    #[test]
+    fn progress_tracker_failed_edit_doesnt_count() {
+        // Failed edit means scan_turn_signals returns it as nothing.
+        // The contract is "edited slice = SUCCESSFUL edits only".
+        let mut t = ProgressTracker::default();
+        t.observe_turn(0, &[], &[]);
+        assert_eq!(t.last_edit_turn, None);
+        assert_eq!(t.no_edit_runs, 1);
+    }
+
+    #[test]
+    fn progress_tracker_idle_runs_reset_on_edit() {
+        let mut t = ProgressTracker::default();
+        t.observe_turn(0, &[], &[]);
+        t.observe_turn(1, &[], &[]);
+        assert_eq!(t.no_edit_runs, 2);
+        t.observe_turn(2, &["a.rs".into()], &[]);
+        assert_eq!(t.no_edit_runs, 0);
+    }
+
+    #[test]
+    fn hallucination_detected_at_3_reads_no_edit() {
+        let cfg = ResilienceConfig::default();
+        let mut t = ProgressTracker::default();
+        t.observe_turn(0, &[], &["a.rs".into()]);
+        t.observe_turn(1, &[], &["a.rs".into()]);
+        assert!(t.hallucination_detected("a.rs", &cfg).is_none());
+        t.observe_turn(2, &[], &["a.rs".into()]);
+        let nudge = t.hallucination_detected("a.rs", &cfg);
+        assert!(nudge.is_some());
+        assert!(nudge.unwrap().contains("Stop reading"));
+    }
+
+    #[test]
+    fn hallucination_not_detected_when_already_edited() {
+        let cfg = ResilienceConfig::default();
+        let mut t = ProgressTracker::default();
+        t.observe_turn(0, &["a.rs".into()], &["a.rs".into()]);
+        t.observe_turn(1, &[], &["a.rs".into()]);
+        t.observe_turn(2, &[], &["a.rs".into()]);
+        // 3 reads but already 1 edit — no nudge
+        assert!(t.hallucination_detected("a.rs", &cfg).is_none());
+    }
+
+    #[test]
+    fn budget_adjustment_combines_signals() {
+        let cfg = ResilienceConfig::default();
+        let mut t = ProgressTracker::default();
+
+        // No edits, no idle → 0
+        assert_eq!(t.budget_adjustment(&cfg), 0);
+
+        // Edit happened, no idle → +edit_bonus
+        t.observe_turn(0, &["a.rs".into()], &[]);
+        assert_eq!(t.budget_adjustment(&cfg), cfg.edit_bonus as i32);
+
+        // After 2 idle turns → -idle_penalty (last_edit still set, so still +bonus)
+        t.observe_turn(1, &[], &[]);
+        t.observe_turn(2, &[], &[]);
+        let delta = t.budget_adjustment(&cfg);
+        assert_eq!(
+            delta,
+            cfg.edit_bonus as i32 - cfg.idle_penalty as i32,
+            "edit happened earlier (+bonus) AND idle threshold hit (-penalty)"
+        );
     }
 
     #[test]
