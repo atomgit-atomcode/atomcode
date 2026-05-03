@@ -2491,8 +2491,8 @@ impl AgentLoop {
             ));
             if !r.success {
                 all_success = false;
-                for err in &r.errors {
-                    summary.push_str(&format!("  Error: {}\n", err));
+                for failure in &r.failures {
+                    summary.push_str(&format!("  Error: {:?}\n", failure));
                 }
             }
             // Track edited files

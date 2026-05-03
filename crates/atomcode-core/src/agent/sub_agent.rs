@@ -27,6 +27,48 @@ pub struct SubAgentTask {
     pub sibling_skeletons: String,
 }
 
+/// Structured reason a sub-agent ended in failure. Replaces the old
+/// `errors: Vec<String>` so callers can match on discriminant instead
+/// of substring-matching on free text.
+#[derive(Debug, Clone)]
+pub enum SubAgentFailure {
+    /// Stream-timeout-class network failure that survived one in-loop retry.
+    StreamTimeoutAfterRetry,
+    /// Model read the same file ≥ `hallucination_read_threshold` times
+    /// without producing a successful edit, AND the recovery turn after
+    /// the nudge also failed to edit.
+    HallucinationLoop { reads: usize, file: String },
+    /// `no_edit_runs` reached `idle_kill_threshold`. May or may not be
+    /// preceded by a hallucination nudge.
+    NoProgress { idle_turns: usize },
+    /// Loop exited because turn budget was exhausted and zero edits had
+    /// landed. (If edits landed, exit is treated as success.)
+    BudgetExhaustedNoEdits,
+    /// Pool wall-time wrapper (default 5min) tripped.
+    SubAgentTimeout5min,
+    /// Provider returned a non-timeout-class error (network, 4xx/5xx).
+    ProviderError(String),
+    /// `tokio::JoinSet` reported the task panicked or was cancelled at
+    /// the runtime level.
+    JoinError(String),
+    /// User pressed Ctrl+C / cancellation token tripped.
+    Cancelled,
+}
+
+/// Per-task instrumentation snapshot. Populated as `ProgressTracker`
+/// observes turns; surfaced on `SubAgentResult` so the parent agent
+/// (and operators reading datalog) can diagnose without re-deriving
+/// from raw conversation history.
+#[derive(Debug, Clone, Default)]
+pub struct Diagnostic {
+    pub edited_files: Vec<String>,
+    pub read_counts: std::collections::HashMap<String, usize>,
+    pub timeouts: usize,
+    pub hallucination_nudges_sent: usize,
+    pub final_budget: usize,
+    pub turns_used: usize,
+}
+
 /// Result of a sub-agent execution.
 #[derive(Debug, Clone)]
 pub struct SubAgentResult {
@@ -34,7 +76,8 @@ pub struct SubAgentResult {
     pub success: bool,
     pub turns_used: usize,
     pub summary: String,
-    pub errors: Vec<String>,
+    pub failures: Vec<SubAgentFailure>,
+    pub diagnostic: Diagnostic,
 }
 
 impl SubAgentTask {
@@ -133,7 +176,7 @@ impl SubAgentTask {
         // 5. Run up to max_turns
         let mut turns_used = 0;
         let mut last_text = String::new();
-        let mut errors = Vec::new();
+        let mut failures: Vec<SubAgentFailure> = Vec::new();
 
         for _ in 0..max_turns {
             turns_used += 1;
@@ -156,11 +199,11 @@ impl SubAgentTask {
                     // Continue — model may need more turns
                 }
                 TurnResult::Failed(err) => {
-                    errors.push(err);
+                    failures.push(SubAgentFailure::ProviderError(err));
                     break;
                 }
                 TurnResult::Cancelled => {
-                    errors.push("Cancelled".to_string());
+                    failures.push(SubAgentFailure::Cancelled);
                     break;
                 }
             }
@@ -174,12 +217,15 @@ impl SubAgentTask {
             last_text.chars().take(200).collect()
         };
 
+        // Diagnostic stays Default::default() until Task 8 wires the
+        // ProgressTracker into execute (per plan).
         SubAgentResult {
             file_path: self.file_path.clone(),
-            success: errors.is_empty(),
+            success: failures.is_empty(),
             turns_used,
             summary,
-            errors,
+            failures,
+            diagnostic: Diagnostic::default(),
         }
     }
 }
@@ -289,7 +335,8 @@ impl SubAgentPool {
                             success: false,
                             turns_used: 0,
                             summary: "Timed out".to_string(),
-                            errors: vec!["Sub-agent timed out".to_string()],
+                            failures: vec![SubAgentFailure::SubAgentTimeout5min],
+                            diagnostic: Diagnostic::default(),
                         });
                     }
                     Err(join_err) => {
@@ -298,7 +345,8 @@ impl SubAgentPool {
                             success: false,
                             turns_used: 0,
                             summary: "Task panicked".to_string(),
-                            errors: vec![format!("JoinError: {}", join_err)],
+                            failures: vec![SubAgentFailure::JoinError(format!("{}", join_err))],
+                            diagnostic: Diagnostic::default(),
                         });
                     }
                 }
