@@ -2356,12 +2356,16 @@ impl AgentLoop {
     /// Try to dispatch sub-agents for parallel multi-file editing.
     /// Returns Some(summary_text) if dispatch succeeded, None if it should
     /// fall back to serial subtask execution.
-    async fn try_sub_agent_dispatch(&mut self, _plan_text: &str) -> Option<String> {
-        // Sub-agent disabled: 8 次实测全败，等 Phase 4 用 fork 模式重建。
-        // 当前 fallback 到 serial subtask execution（主 agent 串行编辑）。
-        return None;
+    async fn try_sub_agent_dispatch(&mut self, plan_text: &str) -> Option<String> {
+        // Pre-2026-05-03 history: this path was disabled because 8 attempts
+        // failed without a resilience layer. The 2026-05-03 PR added
+        // ResilienceConfig (adaptive budget, hallucination nudge,
+        // stream-timeout retry) + a tool sandbox; users can flip back to
+        // serial execution via `/config subagent.enabled false` if needed.
+        if !self.config.subagent.enabled {
+            return None;
+        }
 
-        #[allow(unreachable_code)]
         let wd = self
             .turn_runner
             .context
@@ -2455,19 +2459,23 @@ impl AgentLoop {
 
             // Extract the task instruction for this file from the plan
             let file_name = &subtasks[i].file;
-            let task_instr = extract_file_instruction(_plan_text, file_name);
+            let task_instr = extract_file_instruction(plan_text, file_name);
 
             tasks.push(sub_agent::SubAgentTask {
                 file_path: file_path.clone(),
                 file_content: all_file_contents[i].1.clone(),
                 task_instruction: task_instr,
-                contract: extract_contract(_plan_text),
+                contract: extract_contract(plan_text),
                 sibling_skeletons: siblings,
             });
         }
 
-        // Dispatch
-        let pool = sub_agent::SubAgentPool::new(tasks);
+        // Dispatch — wire pool concurrency / timeout from Config::subagent
+        let pool = sub_agent::SubAgentPool {
+            tasks,
+            max_concurrent: self.config.subagent.max_concurrent,
+            timeout_secs: self.config.subagent.timeout_secs,
+        };
         let provider = self.turn_runner.provider.clone();
         let tools = self.tool_registry.clone();
         let config = self.config.clone();
