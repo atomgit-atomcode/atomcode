@@ -182,6 +182,52 @@ fn scan_turn_signals(
     (edited, reads)
 }
 
+/// Conservative classifier: was this runner-level error a network /
+/// transport hiccup (worth one retry) or a logic error (no point
+/// retrying)? Substring-matches a small known set.
+fn is_stream_timeout(err: &str) -> bool {
+    let lo = err.to_lowercase();
+    lo.contains("stream timeout")
+        || lo.contains("first token timeout")
+        || lo.contains("connection reset")
+        || lo.contains("eof")
+}
+
+/// Wrap a single `runner.run` call with up-to-N retries for stream-timeout
+/// class failures. Returns the final `TurnResult` plus a counter of how
+/// many retries fired (so the caller can bump `tracker.timeouts`). On
+/// retry, partial conversation state from the failed attempt is rolled
+/// back so the second attempt sends a clean prompt.
+async fn run_turn_with_retry(
+    runner: &mut TurnRunner,
+    conversation: &mut Conversation,
+    system_prompt: &str,
+    event_tx: &mpsc::UnboundedSender<TurnEvent>,
+    cancel: CancellationToken,
+    max_retries: usize,
+) -> (TurnResult, usize /* timeouts_fired */) {
+    let mut timeouts_fired = 0usize;
+    for attempt in 0..=max_retries {
+        let pre_msg_count = conversation.messages.len();
+        let result = runner
+            .run(conversation, system_prompt, event_tx, cancel.clone())
+            .await;
+        match &result {
+            TurnResult::Failed(err) if is_stream_timeout(err) && attempt < max_retries => {
+                timeouts_fired += 1;
+                // Roll conversation back to pre-attempt state so retry
+                // sends a clean prompt instead of a half-filled assistant
+                // message.
+                conversation.messages.truncate(pre_msg_count);
+                conversation.clear_stream_buffer();
+                continue;
+            }
+            _ => return (result, timeouts_fired),
+        }
+    }
+    unreachable!("run_turn_with_retry loop must exit via the inner return")
+}
+
 /// A single sub-agent task: one file to modify.
 pub struct SubAgentTask {
     pub file_path: String,
@@ -709,6 +755,24 @@ mod tests {
     /// Test helper: collect tool names from a registry via the public iter API.
     async fn collect_tool_names(r: &ToolRegistry) -> Vec<String> {
         r.iter().await.map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn is_stream_timeout_matches_known_phrases() {
+        assert!(is_stream_timeout("stream timeout after 60s"));
+        assert!(is_stream_timeout("First token timeout"));
+        assert!(is_stream_timeout("connection reset by peer"));
+        assert!(is_stream_timeout("Unexpected EOF"));
+        // Case insensitive
+        assert!(is_stream_timeout("STREAM TIMEOUT"));
+    }
+
+    #[test]
+    fn is_stream_timeout_rejects_other_errors() {
+        assert!(!is_stream_timeout("401 Unauthorized"));
+        assert!(!is_stream_timeout("missing field `content`"));
+        assert!(!is_stream_timeout("Tool 'foo' was denied by the user"));
+        assert!(!is_stream_timeout(""));
     }
 
     use crate::conversation::message::{Message, MessageContent, Role};
