@@ -934,6 +934,7 @@ impl ToolRegistry {
         }
         n
     }
+
 }
 
 /// Wrapper key names atomgit's gateway has been observed to inject around

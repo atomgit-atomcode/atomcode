@@ -80,6 +80,98 @@ pub struct SubAgentResult {
     pub diagnostic: Diagnostic,
 }
 
+/// Tool wrapper that delegates to an inner `ReadFileTool` but rejects any
+/// `read_file` whose `file_path` arg differs from `assigned_file`. Used by
+/// `filter_tools_for_subagent` to keep sub-agents from drifting into
+/// sibling exploration.
+struct ScopedReadFile {
+    inner: Arc<dyn crate::tool::Tool>,
+    assigned_file: String,
+}
+
+#[async_trait::async_trait]
+impl crate::tool::Tool for ScopedReadFile {
+    fn definition(&self) -> crate::tool::ToolDef {
+        // Delegate; the LLM sees the same schema as a normal read_file.
+        self.inner.definition()
+    }
+
+    fn approval(&self, args: &str) -> crate::tool::ApprovalRequirement {
+        self.inner.approval(args)
+    }
+
+    fn approval_with_context(
+        &self,
+        args: &str,
+        ctx: &crate::tool::ToolContext,
+    ) -> crate::tool::ApprovalRequirement {
+        self.inner.approval_with_context(args, ctx)
+    }
+
+    fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
+        // First: inner schema check.
+        self.inner.validate_args(args)?;
+        // Second: scope check. Parse args to peek at file_path.
+        let parsed: serde_json::Value = serde_json::from_str(args)
+            .map_err(|e| format!("scope check parse: {e}"))?;
+        let path = parsed
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if path != self.assigned_file {
+            return Err(format!(
+                "Sub-agent only reads its assigned file `{}`. \
+                 Sibling content is in your prompt's skeleton section; \
+                 do not call read_file for path `{}`.",
+                self.assigned_file, path
+            ));
+        }
+        Ok(())
+    }
+
+    async fn execute(
+        &self,
+        args: &str,
+        ctx: &crate::tool::ToolContext,
+    ) -> anyhow::Result<crate::tool::ToolResult> {
+        self.inner.execute(args, ctx).await
+    }
+}
+
+/// Build a sub-agent ToolRegistry by selecting only whitelisted tools from
+/// the parent. `read_file` is wrapped in `ScopedReadFile` so it can only
+/// read `assigned_file`. All other tools (bash, web_*, change_dir, glob,
+/// list_directory, write_file, grep) are absent from the result —
+/// the runner's "tool not registered" path returns a structured error to
+/// the model, which routes back through the LLM as a re-think signal.
+///
+/// Async because the parent registry's lock is `tokio::sync::RwLock`. Called
+/// from `SubAgentTask::execute` (Task 8 wiring) which is itself async.
+async fn filter_tools_for_subagent(
+    parent: &ToolRegistry,
+    assigned_file: &str,
+) -> ToolRegistry {
+    let filtered = ToolRegistry::new();
+    for (name, tool) in parent.iter().await {
+        match name.as_str() {
+            "read_file" => {
+                let scoped = ScopedReadFile {
+                    inner: tool,
+                    assigned_file: assigned_file.to_string(),
+                };
+                filtered
+                    .register_arc("read_file".to_string(), Arc::new(scoped))
+                    .await;
+            }
+            "edit_file" | "search_replace" => {
+                filtered.register_arc(name, tool).await;
+            }
+            _ => {} // blacklist by omission
+        }
+    }
+    filtered
+}
+
 impl SubAgentTask {
     /// Execute this sub-agent task with its own Conversation + TurnRunner.
     /// Runs up to `max_turns` LLM round-trips. Auto-approves all tools.
@@ -382,5 +474,76 @@ mod tests {
         assert_eq!(pool.tasks.len(), 2);
         assert_eq!(pool.max_concurrent, 3);
         assert_eq!(pool.timeout_secs, 300);
+    }
+
+    #[test]
+    fn scoped_read_file_rejects_sibling_path() {
+        use crate::tool::Tool;
+        let inner = Arc::new(crate::tool::read::ReadFileTool) as Arc<dyn Tool>;
+        let scoped = ScopedReadFile {
+            inner,
+            assigned_file: "/work/a.rs".to_string(),
+        };
+        let err = scoped
+            .validate_args(r#"{"file_path":"/work/b.rs"}"#)
+            .unwrap_err();
+        assert!(
+            err.contains("only reads its assigned file"),
+            "expected scope rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn scoped_read_file_allows_assigned_path() {
+        use crate::tool::Tool;
+        let inner = Arc::new(crate::tool::read::ReadFileTool) as Arc<dyn Tool>;
+        let scoped = ScopedReadFile {
+            inner,
+            assigned_file: "/work/a.rs".to_string(),
+        };
+        assert!(
+            scoped
+                .validate_args(r#"{"file_path":"/work/a.rs"}"#)
+                .is_ok(),
+            "assigned file must pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_tools_for_subagent_keeps_only_whitelisted() {
+        let parent = make_full_tool_registry();
+        let filtered = filter_tools_for_subagent(&parent, "/work/a.rs").await;
+        let names = collect_tool_names(&filtered).await;
+        // Allowed:
+        assert!(names.contains(&"edit_file".to_string()));
+        assert!(names.contains(&"search_replace".to_string()));
+        assert!(names.contains(&"read_file".to_string()));
+        // Blocked:
+        assert!(!names.contains(&"bash".to_string()));
+        assert!(!names.contains(&"web_fetch".to_string()));
+        assert!(!names.contains(&"glob".to_string()));
+        assert!(!names.contains(&"list_directory".to_string()));
+        assert!(!names.contains(&"change_dir".to_string()));
+    }
+
+    /// Test helper: build a registry with all common tools.
+    fn make_full_tool_registry() -> ToolRegistry {
+        let mut r = ToolRegistry::new();
+        r.register_sync(Box::new(crate::tool::read::ReadFileTool));
+        r.register_sync(Box::new(crate::tool::write::WriteFileTool));
+        r.register_sync(Box::new(crate::tool::edit::EditFileTool));
+        r.register_sync(Box::new(crate::tool::bash::BashTool));
+        r.register_sync(Box::new(crate::tool::cd::CdTool));
+        r.register_sync(Box::new(crate::tool::grep::GrepTool));
+        r.register_sync(Box::new(crate::tool::glob::GlobTool));
+        r.register_sync(Box::new(crate::tool::list_dir::ListDirTool));
+        r.register_sync(Box::new(crate::tool::web_fetch::WebFetchTool));
+        r.register_sync(Box::new(crate::tool::search_replace::SearchReplaceTool));
+        r
+    }
+
+    /// Test helper: collect tool names from a registry via the public iter API.
+    async fn collect_tool_names(r: &ToolRegistry) -> Vec<String> {
+        r.iter().await.map(|(name, _)| name).collect()
     }
 }
