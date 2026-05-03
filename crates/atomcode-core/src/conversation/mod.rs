@@ -475,18 +475,14 @@ fn clean_assistant_text(raw: &str) -> Option<String> {
     if stripped.trim().is_empty() {
         return None;
     }
-    if let Some(reason) = looks_corrupted(&stripped) {
+    if looks_corrupted(&stripped).is_some() {
         // Letting corrupted bytes land in history poisons every
         // subsequent turn — the model sees its own garbage as prior
         // context and either echoes more garbage or derails. Drop
-        // and surface a stderr line so the user/datalog has a trail;
-        // the turn loop sees an empty assistant turn and the user can
-        // `/retry` or switch models.
-        eprintln!(
-            "[conversation] dropping corrupted assistant output: reason={} len={}",
-            reason,
-            stripped.len()
-        );
+        // silently: writing to stderr leaks into the TUI render area
+        // (atomcode-tuix doesn't redirect/capture stderr), polluting
+        // the input box. The turn loop sees an empty assistant turn
+        // and the user can `/retry` or switch models.
         return None;
     }
     Some(stripped)
@@ -557,10 +553,17 @@ pub fn looks_corrupted(text: &str) -> Option<&'static str> {
     // over. ASCII repetition is allowed (`====` separators, `....`
     // ellipses, indentation runs). Run counter tallies `c == prev`
     // events, so 5 consecutive identical chars produce run==4.
+    //
+    // Typographic chars (box drawing `─┌┐│═`, block elements `█▒░`,
+    // dashes `——`, ellipsis `…`, bullets `••`, middle dots `··`) are
+    // legitimate formatting — markdown tables and horizontal rules
+    // routinely repeat them dozens of times. Skipping these prevents
+    // false positives on perfectly valid model output (2026-05-03
+    // session: a markdown table with `─` × 30+ tripped this).
     let mut prev = '\0';
     let mut run = 0;
     for c in text.chars() {
-        if c == prev && c as u32 > 0x7F {
+        if c == prev && c as u32 > 0x7F && !is_typographic_repeat_safe(c) {
             run += 1;
             if run >= 4 {
                 return Some("stuck_non_ascii_repeat");
@@ -572,6 +575,20 @@ pub fn looks_corrupted(text: &str) -> Option<&'static str> {
     }
 
     None
+}
+
+/// Code points where consecutive repetition is normal typography (markdown
+/// tables, horizontal rules, ASCII-art-style art, em-dash sequences) and
+/// should NOT trip the stuck-token corruption signal.
+fn is_typographic_repeat_safe(c: char) -> bool {
+    let cp = c as u32;
+    (0x2500..=0x257F).contains(&cp)        // Box Drawing (─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬ etc.)
+        || (0x2580..=0x259F).contains(&cp) // Block Elements (█▒░▀▄ etc.)
+        || (0x2010..=0x2015).contains(&cp) // hyphens, en-dash, em-dash, horizontal bar
+        || cp == 0x2026                    // …  ellipsis
+        || cp == 0x2022                    // •  bullet
+        || cp == 0x25E6                    // ◦  white bullet
+        || cp == 0x00B7                    // ·  middle dot
 }
 
 #[cfg(test)]
@@ -951,6 +968,44 @@ mod tests {
         // is allowed even past the 5-char run threshold
         assert_eq!(looks_corrupted("====================="), None);
         assert_eq!(looks_corrupted("Done. ......"), None);
+    }
+
+    /// 2026-05-03 session: a markdown table from `deepseek-v4-flash` running
+    /// on atomgr tripped Signal 4 because `─` (U+2500) repeated dozens of
+    /// times across table borders. The whitelist prevents this false positive
+    /// while still catching CJK / latin-ext-a stuck-token corruption.
+    #[test]
+    fn looks_corrupted_passes_markdown_table_borders() {
+        // Box drawing — markdown table from real datalog
+        let table = "┌───────────────────────┬──────────────────────────────────┐\n\
+                     │ 文件                  │ 动作                             │\n\
+                     ├───────────────────────┼──────────────────────────────────┤\n\
+                     │ src/main.rs           │ CLI 改为子命令                   │\n\
+                     └───────────────────────┴──────────────────────────────────┘";
+        assert_eq!(looks_corrupted(table), None);
+    }
+
+    #[test]
+    fn looks_corrupted_passes_horizontal_rules_and_typography() {
+        // Horizontal rules using box drawing, double, em-dash, ellipsis
+        assert_eq!(looks_corrupted(&"─".repeat(80)), None);
+        assert_eq!(looks_corrupted(&"═".repeat(40)), None);
+        assert_eq!(looks_corrupted(&"━".repeat(40)), None);
+        assert_eq!(looks_corrupted(&"—".repeat(20)), None); // em-dash
+        assert_eq!(looks_corrupted(&"…".repeat(20)), None); // ellipsis
+        assert_eq!(looks_corrupted(&"•".repeat(10)), None); // bullet
+        // Block elements
+        assert_eq!(looks_corrupted(&"█".repeat(20)), None);
+    }
+
+    #[test]
+    fn looks_corrupted_still_catches_real_cjk_corruption() {
+        // CJK repetition is NOT in the whitelist — still flagged. This
+        // is the actual stuck-token failure mode.
+        assert_eq!(
+            looks_corrupted(&format!("hi {}", "中".repeat(5))),
+            Some("stuck_non_ascii_repeat")
+        );
     }
 
     #[test]
