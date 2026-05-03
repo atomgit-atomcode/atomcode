@@ -1845,12 +1845,33 @@ impl AgentLoop {
 
                     // Sub-agent extraction from UsedTools: model may output plan text
                     // alongside tool calls (e.g. "Plan: 1. IdeaCenter.vue 2. ProductCenter.vue"
-                    // + read_file in the same turn). Only dispatch on the FIRST tool-use turn
-                    // (planning phase). If model has already been editing files, don't
-                    // re-dispatch — the text may just mention files it already changed.
+                    // + read_file in the same turn). Allow extraction on ANY pre-edit turn
+                    // — weak models often follow a "read N files first, then announce plan,
+                    // then start editing" flow, in which case the plan text doesn't appear
+                    // until turn 3+ (after several read_file calls). The previous gate
+                    // `tool_call_count <= tool_count` only fired on turn 1, missing this
+                    // common case entirely (2026-05-03 test surfaced this).
+                    //
+                    // The new gate uses `files_edited_this_turn.is_empty()` to mean
+                    // "model is still in exploration/planning, no actual edits yet" —
+                    // this captures the semantic the original gate was trying to
+                    // express. Once an edit has landed, plan text in subsequent turns
+                    // is mostly retrospective ("I changed X") and shouldn't trigger
+                    // re-dispatch.
                     if let Some(ref plan_text) = text {
-                        if self.tool_call_count <= tool_count  // only first tool-use response
-                            && !self.subtask_driver.active
+                        // Allow re-extraction across turns until we have enough
+                        // subtasks to dispatch (≥2). The previous gate
+                        // `!self.subtask_driver.active` permanently locked out
+                        // re-extraction after the first text containing ANY .rs
+                        // file — so a Turn 2 saying "platform.rs 比较大" (1 file,
+                        // active=true) blocked Turn 3's "constants.rs / mod.rs /
+                        // types.rs / platform.rs" (4 files) from ever reaching
+                        // extract_from_plan. The new gate `subtasks.len() < 2`
+                        // is monotone-friendly: once we have ≥2 we stop trying;
+                        // before then we keep upgrading the plan as the model
+                        // surfaces more file names.
+                        if self.files_edited_this_turn.is_empty()  // no edits yet → still planning
+                            && self.subtask_driver.subtasks.len() < 2  // not yet enough to dispatch
                             && !plan_text.trim().is_empty()
                         {
                             self.subtask_driver.extract_from_plan(plan_text);
