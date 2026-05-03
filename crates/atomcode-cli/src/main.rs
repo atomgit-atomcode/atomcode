@@ -897,6 +897,7 @@ async fn run() -> Result<i32> {
                 telemetry: Default::default(),
                 lsp: Default::default(),
                 auto_commit: false,
+                subagent: Default::default(),
             }
         })
     } else {
@@ -912,6 +913,7 @@ async fn run() -> Result<i32> {
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            subagent: Default::default(),
         }
     };
 
@@ -1834,6 +1836,7 @@ fn run_codingplan_core(
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            subagent: Default::default(),
         },
     };
 

@@ -219,6 +219,7 @@ fn test_config() -> Config {
         telemetry: Default::default(),
         lsp: Default::default(),
         auto_commit: false,
+        subagent: Default::default(),
     }
 }
 
