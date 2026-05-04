@@ -166,6 +166,17 @@ pub struct UiState {
     /// MiniMax-M2.7). Toggled by Ctrl+O together with `show_tool_output`.
     /// When false (default), reasoning content is hidden during streaming.
     pub show_reasoning: bool,
+    /// Number of fork sub-agents currently dispatched. While > 0, the
+    /// foreground turn is blocked awaiting `pool.execute_all` — there's
+    /// no fresh tool / think event to update the spinner, so without an
+    /// override the label stays frozen on the last tool name (e.g.
+    /// "Running ReadFile… 82s") for the entire pool duration. Cleared
+    /// on `SubAgentDispatchEnd`.
+    pub sub_agent_total: usize,
+    /// How many sub-agents in the current dispatch have reported a
+    /// terminal status (done / failed / timeout). Updated by
+    /// `on_sub_agent_settled`. Reset to 0 on each new dispatch.
+    pub sub_agent_done: usize,
 }
 
 impl Default for UiState {
@@ -202,6 +213,8 @@ impl UiState {
             pending_context_render: None,
             show_tool_output: false,
             show_reasoning: false,
+            sub_agent_total: 0,
+            sub_agent_done: 0,
         }
     }
 
@@ -356,6 +369,42 @@ impl UiState {
         // displayed time keeps growing across consecutive thinks/tools
         // and ends up showing "Noodling… 1301s" mid-turn.
         self.phase_started_at = Some(std::time::Instant::now());
+    }
+
+    /// Override the foreground spinner with a "Sub-agents: 0/N" counter
+    /// for the duration of a fork dispatch. The foreground turn awaits
+    /// `pool.execute_all` and emits no fresh think/tool events, so
+    /// without this the label stays frozen on the last tool name
+    /// (typically "Running ReadFile…") for the entire pool duration.
+    /// Resets the phase clock so the displayed elapsed time tracks the
+    /// dispatch itself, not the pre-dispatch tool that ran before it.
+    pub fn on_sub_agent_dispatch_start(&mut self, count: usize) {
+        self.sub_agent_total = count;
+        self.sub_agent_done = 0;
+        self.spinner_label = format!("Sub-agents 0/{}", count);
+        self.phase_started_at = Some(std::time::Instant::now());
+    }
+
+    /// Increment the completion counter and refresh the label. Triggered
+    /// on each per-file terminal status (done / failed / timeout). Only
+    /// updates the label when a dispatch is currently active so a late
+    /// progress event after `SubAgentDispatchEnd` can't resurrect a
+    /// stale "Sub-agents X/N" label.
+    pub fn on_sub_agent_settled(&mut self) {
+        if self.sub_agent_total == 0 {
+            return;
+        }
+        self.sub_agent_done = self.sub_agent_done.saturating_add(1);
+        self.spinner_label = format!("Sub-agents {}/{}", self.sub_agent_done, self.sub_agent_total);
+    }
+
+    /// End the dispatch — clears the counter so subsequent thinks/tools
+    /// resume normal label behaviour. The next `on_thinking` /
+    /// `on_tool_call_started` will overwrite `spinner_label`; we leave it
+    /// alone here so the final "N/N" stays visible until the next phase.
+    pub fn on_sub_agent_dispatch_end(&mut self) {
+        self.sub_agent_total = 0;
+        self.sub_agent_done = 0;
     }
 
     pub fn on_approval_needed(&mut self, _tool: &str) {
@@ -536,6 +585,57 @@ mod tests {
     #[test]
     fn agent_mode_default_is_build() {
         assert_eq!(AgentMode::default(), AgentMode::Build);
+    }
+
+    #[test]
+    fn sub_agent_dispatch_overrides_stale_tool_label() {
+        // Reproduces the user's "Running ReadFile… 82s" stale-spinner
+        // problem: the foreground turn was waiting on pool.execute_all and
+        // the last tool name (read_file) stayed pinned. After dispatch_start
+        // the label must reflect the sub-agent counter, not the dead tool.
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("read_file");
+        assert!(s.spinner_label.contains("read_file"));
+        s.on_sub_agent_dispatch_start(6);
+        assert_eq!(s.spinner_label, "Sub-agents 0/6");
+    }
+
+    #[test]
+    fn sub_agent_settled_increments_counter_in_label() {
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(3);
+        s.on_sub_agent_settled();
+        assert_eq!(s.spinner_label, "Sub-agents 1/3");
+        s.on_sub_agent_settled();
+        s.on_sub_agent_settled();
+        assert_eq!(s.spinner_label, "Sub-agents 3/3");
+    }
+
+    #[test]
+    fn sub_agent_settled_outside_dispatch_is_noop() {
+        // A late SubAgentProgress event after DispatchEnd must not bring
+        // the counter label back from the dead.
+        let mut s = UiState::new();
+        s.on_thinking();
+        let pre = s.spinner_label.clone();
+        s.on_sub_agent_settled();
+        assert_eq!(s.spinner_label, pre);
+    }
+
+    #[test]
+    fn sub_agent_dispatch_end_lets_next_phase_take_over() {
+        // After end, the counter is cleared but spinner_label keeps the
+        // last "N/N" until the next phase transition overwrites it.
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(2);
+        s.on_sub_agent_settled();
+        s.on_sub_agent_settled();
+        s.on_sub_agent_dispatch_end();
+        assert_eq!(s.sub_agent_total, 0);
+        assert_eq!(s.sub_agent_done, 0);
+        s.on_thinking();
+        assert!(!s.spinner_label.starts_with("Sub-agents"));
     }
 
     #[test]

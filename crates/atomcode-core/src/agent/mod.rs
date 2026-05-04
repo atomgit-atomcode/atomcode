@@ -190,7 +190,19 @@ pub enum AgentEvent {
     },
     /// An error occurred.
     Error(String),
-    /// Sub-agent progress (real-time parallel task display).
+    /// Sub-agent batch began. UI uses this to override the foreground
+    /// spinner label (which would otherwise stay frozen on the last tool
+    /// name while the foreground turn awaits `pool.execute_all`) and to
+    /// reset its progress counter.
+    SubAgentDispatchStart { count: usize },
+    /// Sub-agent batch ended (all tasks settled or pool returned). UI
+    /// clears the override so subsequent thinks/tools resume normal
+    /// label behaviour.
+    SubAgentDispatchEnd,
+    /// Per-task progress within an active sub-agent batch. `file=""`
+    /// signals the pool header; otherwise `file` is the target file
+    /// basename. `status` is a free-form human-readable transition
+    /// (`working...`, `done 12s · 3 turns`, `failed 8s`, `timeout 300s`).
     SubAgentProgress { file: String, status: String },
     /// `/background` task finished. `summary` is the final assistant text
     /// (truncated if long). `success` is false on error / timeout / cancel.
@@ -2417,16 +2429,47 @@ impl AgentLoop {
             return None;
         }
 
+        // EDIT INTENT gate: dispatch only when the model's plan text reads
+        // as an actionable edit step. "Read X, Y, Z then write the
+        // implementation plan" lands files in subtask_driver.subtasks but
+        // is exploration/planning intent — fork sub-agents on it and they
+        // either fake edits (corrupt the file) or burn turns to
+        // BudgetExhaustedNoEdits. 2026-05-04 atomgr trace: this gate
+        // would have skipped a 6-file fork on a "Next step: Read … then
+        // write the plan" turn that produced 2 failures + a cross-file
+        // Sub<Duration> miss in the merge.
+        if !plan_has_clear_edit_intent(plan_text) {
+            return None;
+        }
+
+        // Per-file edit-intent pre-filter (P1b). Run BEFORE the
+        // "Dispatching N..." header so the count we announce matches what
+        // actually fires. Otherwise the user sees "Dispatching 6" and
+        // then 0 results when the filter drops everything.
+        let eligible_subtasks: Vec<&subtask_driver::Subtask> = subtasks
+            .iter()
+            .filter(|s| {
+                let instr = extract_file_instruction(plan_text, &s.file);
+                instruction_implies_edit(&instr)
+            })
+            .collect();
+        if eligible_subtasks.len() < 2 {
+            return None;
+        }
+
         let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
             "\n\n**Dispatching {} sub-agents in parallel...**\n",
-            subtasks.len()
+            eligible_subtasks.len()
         )));
+        let _ = self
+            .event_tx
+            .send(AgentEvent::SubAgentDispatchStart { count: eligible_subtasks.len() });
 
         // Read all target files. If any file can't be found, fall back to serial.
         let mut tasks = Vec::new();
         let mut all_file_contents: Vec<(String, String)> = Vec::new();
 
-        for subtask in subtasks {
+        for subtask in &eligible_subtasks {
             // Try to find the file: first check direct path, then walk the tree.
             let file_path = {
                 let direct = wd.join(&subtask.file);
@@ -2441,6 +2484,7 @@ impl AgentLoop {
                                 "  Cannot find {}. Falling back to serial mode.\n",
                                 subtask.file
                             )));
+                            let _ = self.event_tx.send(AgentEvent::SubAgentDispatchEnd);
                             return None;
                         }
                     }
@@ -2454,6 +2498,7 @@ impl AgentLoop {
                         "  Cannot read {}. Falling back to serial mode.\n",
                         subtask.file
                     )));
+                    let _ = self.event_tx.send(AgentEvent::SubAgentDispatchEnd);
                     return None;
                 }
             };
@@ -2478,8 +2523,11 @@ impl AgentLoop {
                 siblings.push_str(&format!("### {}\n```\n{}\n```\n\n", short, skeleton));
             }
 
-            // Extract the task instruction for this file from the plan
-            let file_name = &subtasks[i].file;
+            // Extract the task instruction for this file from the plan.
+            // The eligibility filter above already confirmed every file in
+            // `eligible_subtasks` has an edit-intent instruction, so we
+            // don't re-check here.
+            let file_name = &eligible_subtasks[i].file;
             let task_instr = extract_file_instruction(plan_text, file_name);
 
             tasks.push(sub_agent::SubAgentTask {
@@ -2504,6 +2552,7 @@ impl AgentLoop {
         let results = pool
             .execute_all(provider, tools, &config, &wd, &self.event_tx)
             .await;
+        let _ = self.event_tx.send(AgentEvent::SubAgentDispatchEnd);
 
         // Build summary
         let mut summary = String::from("\n**Sub-agent results:**\n");
@@ -2614,6 +2663,99 @@ fn extract_file_instruction(plan_text: &str, file_name: &str) -> String {
     } else {
         relevant_lines.join("\n")
     }
+}
+
+/// Per-file companion to `plan_has_clear_edit_intent`: returns true when
+/// the extracted instruction line for this file looks like an actual edit
+/// directive rather than a passing mention. Used to filter out files that
+/// only show up in a "files involved" listing — those would otherwise
+/// dispatch sub-agents with no actionable instruction.
+pub(crate) fn instruction_implies_edit(instruction: &str) -> bool {
+    let lower = instruction.to_lowercase();
+    let kw: &[&str] = &[
+        "modify", "edit", "rewrite", "refactor", "replace", "patch",
+        "implement", "add", "create", "write", "update", "change", "introduce", "fix",
+        "完善", "修改", "编辑", "重写", "重构", "替换", "实现", "添加",
+        "新增", "创建", "编写", "更新", "改动", "改写",
+    ];
+    kw.iter().any(|k| lower.contains(k))
+}
+
+/// Heuristic gate for `try_sub_agent_dispatch`: only dispatch fork sub-agents
+/// when the plan text reads as an actionable edit step. Two failure modes
+/// motivate this:
+///
+/// 1. "Next step: Read X, Y, Z then write the implementation plan" — model
+///    is exploring, not editing. Subtask driver still extracts file names,
+///    fork sub-agents fire, each gets prompted "Your ONLY job: edit X" and
+///    either fakes an edit (corrupts file) or no-ops (BudgetExhaustedNoEdits).
+/// 2. The model lists files in passing ("the relevant files are A.rs, B.rs,
+///    C.rs") with no verb. Same outcome as #1.
+///
+/// Two-tier check: a strong edit verb anywhere in the plan triggers
+/// immediately; a weaker "create/write/implement/add" verb only triggers
+/// if the plan does NOT also contain a planning-document phrase like
+/// "implementation plan" or "design doc" — those phrases mean the model
+/// is talking ABOUT planning, not executing.
+pub(crate) fn plan_has_clear_edit_intent(plan_text: &str) -> bool {
+    let lower = plan_text.to_lowercase();
+
+    let strong: &[&str] = &[
+        "modify",
+        "edit ",
+        "rewrite",
+        "refactor",
+        "replace",
+        "fix ",
+        "patch ",
+        "完善",
+        "修改",
+        "编辑",
+        "重写",
+        "重构",
+        "替换",
+    ];
+    if strong.iter().any(|k| lower.contains(k)) {
+        return true;
+    }
+
+    let conditional: &[&str] = &[
+        "implement",
+        "add ",
+        "added ",
+        "adding ",
+        "create",
+        "write ",
+        "writing ",
+        "introduce",
+        "实现",
+        "添加",
+        "新增",
+        "创建",
+        "编写",
+    ];
+    let has_cond = conditional.iter().any(|k| lower.contains(k));
+    if !has_cond {
+        return false;
+    }
+
+    let plan_phrases: &[&str] = &[
+        "implementation plan",
+        "implementation doc",
+        "design doc",
+        "design document",
+        "write the plan",
+        "write a plan",
+        "write the spec",
+        "write the design",
+        "specification",
+        "next step",
+        "实现计划",
+        "实施计划",
+        "设计文档",
+        "下一步",
+    ];
+    !plan_phrases.iter().any(|p| lower.contains(p))
 }
 
 /// Extract contract/interface information from the plan text.
@@ -3311,5 +3453,106 @@ mod bash_deleted_file_tracking_tests {
                 "/tmp/project/b.rs".to_string()
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod sub_agent_dispatch_gate_tests {
+    use super::{instruction_implies_edit, plan_has_clear_edit_intent};
+
+    #[test]
+    fn read_plus_write_plan_does_not_trigger() {
+        // Reproduces the 2026-05-04 atomgr trace: model said "Next step:
+        // Read X, Y, Z then write the implementation plan" — the bug-fix
+        // gate let this through, fork sub-agents fired on a planning-only
+        // turn and either faked edits or burned turns to no-progress.
+        // After the gate this MUST return false.
+        let plan = "3. Next step: Read the serialization code and device I/O path, then write the implementation plan.";
+        assert!(!plan_has_clear_edit_intent(plan));
+    }
+
+    #[test]
+    fn write_the_plan_alone_does_not_trigger() {
+        let plan = "Let's write the plan first before implementing anything.";
+        assert!(!plan_has_clear_edit_intent(plan));
+    }
+
+    #[test]
+    fn implementation_plan_phrase_blocks_implement_keyword() {
+        // "implementation" alone is an edit verb root, but "implementation
+        // plan" is the planning-doc phrase — must not trigger.
+        let plan = "I'll write up the implementation plan in docs/foo.md.";
+        assert!(!plan_has_clear_edit_intent(plan));
+    }
+
+    #[test]
+    fn modify_triggers_immediately() {
+        let plan = "Modify constants.rs and types.rs to add the new TokenKind variant.";
+        assert!(plan_has_clear_edit_intent(plan));
+    }
+
+    #[test]
+    fn chinese_strong_verb_triggers() {
+        let plan = "\u{4FEE}\u{6539} a.rs \u{548C} b.rs";
+        assert!(plan_has_clear_edit_intent(plan));
+    }
+
+    #[test]
+    fn chinese_implement_without_plan_phrase_triggers() {
+        let plan = "\u{5B9E}\u{73B0} 4 \u{4E2A}\u{6587}\u{4EF6}\u{7684}\u{529F}\u{80FD}";
+        assert!(plan_has_clear_edit_intent(plan));
+    }
+
+    #[test]
+    fn chinese_implement_with_plan_phrase_does_not_trigger() {
+        let plan = "\u{5199}\u{4E0B}\u{5B9E}\u{73B0}\u{8BA1}\u{5212}";
+        assert!(!plan_has_clear_edit_intent(plan));
+    }
+
+    #[test]
+    fn add_to_specific_file_triggers() {
+        let plan = "Add a `Sub<Duration>` impl to unix.rs to mirror the wrapper.";
+        assert!(plan_has_clear_edit_intent(plan));
+    }
+
+    #[test]
+    fn bare_file_listing_does_not_trigger() {
+        // The model dumps a list of involved files with no verb — no
+        // edit signal, must skip.
+        let plan = "The relevant files are:\n- a.rs\n- b.rs\n- c.rs";
+        assert!(!plan_has_clear_edit_intent(plan));
+    }
+
+    #[test]
+    fn instruction_with_synthetic_fallback_is_not_edit() {
+        // `extract_file_instruction` returns "Edit X according to the
+        // plan." when the plan text didn't mention the file at all. That
+        // string DOES contain "edit" — by design we accept it as
+        // edit-intent (the file ended up in the subtask list somehow,
+        // and the per-file gate's job is to filter PASSING MENTIONS, not
+        // synthetic fallbacks).
+        let instr = "Edit unix.rs according to the plan.";
+        assert!(instruction_implies_edit(instr));
+    }
+
+    #[test]
+    fn instruction_passing_mention_is_filtered() {
+        // The instruction is a quote of a sentence where the file is
+        // referenced without an edit verb. After P1b filtering, this file
+        // should not get a sub-agent.
+        let instr = "Looking at the type defined in unix.rs gives us the answer.";
+        assert!(!instruction_implies_edit(instr));
+    }
+
+    #[test]
+    fn instruction_with_modify_triggers() {
+        let instr = "Modify unix.rs to add the missing trait impls.";
+        assert!(instruction_implies_edit(instr));
+    }
+
+    #[test]
+    fn instruction_chinese_modify_triggers() {
+        let instr = "\u{5728} unix.rs \u{4E2D}\u{6DFB}\u{52A0}\u{65B0}\u{5B57}\u{6BB5}";
+        assert!(instruction_implies_edit(instr));
     }
 }

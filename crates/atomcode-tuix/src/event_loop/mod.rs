@@ -3475,7 +3475,35 @@ fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::SubAgentProgress { .. } => {}
+        AgentEvent::SubAgentDispatchStart { count } => {
+            state.on_sub_agent_dispatch_start(count);
+        }
+        AgentEvent::SubAgentDispatchEnd => {
+            state.on_sub_agent_dispatch_end();
+        }
+        AgentEvent::SubAgentProgress { file, status } => {
+            // Per-file progress: emit a body-row line so the user sees
+            // each transition land. Without this, a 6-fork dispatch
+            // shows the pool header then 80 seconds of nothing.
+            let lower = status.to_lowercase();
+            let is_terminal =
+                lower.starts_with("done") || lower.starts_with("failed") || lower.starts_with("timeout");
+            if is_terminal {
+                state.on_sub_agent_settled();
+            }
+            // Empty `file` is the pool header ("Dispatching N parallel agents...");
+            // skip — the agent loop already pushed the human-readable
+            // "**Dispatching N sub-agents in parallel...**" via TextDelta.
+            if !file.is_empty() {
+                let icon = if is_terminal {
+                    if lower.starts_with("done") { "\u{2713}" } else { "\u{2717}" }
+                } else {
+                    "\u{21B3}" // ↳
+                };
+                renderer.render(UiLine::CommandOutput(format!("  {} {} — {}", icon, file, status)));
+                renderer.flush();
+            }
+        }
         AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
             let header = if success {
                 format!("  Background task complete ({} turn{}):\n", turns, if turns == 1 { "" } else { "s" })

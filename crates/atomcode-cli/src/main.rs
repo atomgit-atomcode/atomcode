@@ -1510,6 +1510,16 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
+            AgentEvent::SubAgentDispatchStart { count } => {
+                if verbose {
+                    eprintln!("[sub-agent] dispatching {} in parallel", count);
+                }
+            }
+            AgentEvent::SubAgentDispatchEnd => {
+                if verbose {
+                    eprintln!("[sub-agent] dispatch complete");
+                }
+            }
             AgentEvent::SubAgentProgress { file, status } => {
                 if verbose {
                     eprintln!("[sub-agent] {} {}", file, status);
