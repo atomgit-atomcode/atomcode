@@ -25,6 +25,88 @@ pub struct Symbol {
     pub kind: String,
 }
 
+impl Symbol {
+    /// Check if this symbol has a Chinese name.
+    pub fn is_chinese(&self) -> bool {
+        contains_chinese(&self.name)
+    }
+
+    /// Check if this symbol looks like a Pinyin variable name.
+    pub fn is_pinyin(&self) -> bool {
+        is_pinyin_identifier(&self.name)
+    }
+
+    /// Check if this symbol is likely Chinese-related (Chinese name or Pinyin).
+    pub fn is_chinese_related(&self) -> bool {
+        self.is_chinese() || self.is_pinyin()
+    }
+}
+
+/// Check if a character is a Chinese character (CJK Unified Ideographs).
+fn is_chinese(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' |  // CJK Unified Ideographs
+        '\u{3400}'..='\u{4DBF}' |  // CJK Unified Ideographs Extension A
+        '\u{20000}'..='\u{2A6DF}' | // CJK Unified Ideographs Extension B
+        '\u{F900}'..='\u{FAFF}' |  // CJK Compatibility Ideographs
+        '\u{2F800}'..='\u{2FA1F}'  // CJK Compatibility Ideographs Supplement
+    )
+}
+
+/// Check if a string contains Chinese characters.
+fn contains_chinese(s: &str) -> bool {
+    s.chars().any(is_chinese)
+}
+
+/// Check if a string looks like a Pinyin variable name (e.g., yonghuMing, dingdanList).
+fn is_pinyin_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+
+    // Must start with alphabetic character
+    let first = s.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+
+    // Common Pinyin syllables that appear in variable names
+    let pinyin_syllables = [
+        "zhong", "guo", "ren", "ming", "yong", "hu", "ding", "dan", "lie", "biao",
+        "wen", "jian", "mu", "lu", "shu", "ru", "chu", "shang", "xia", "zuo", "you",
+        "da", "xiao", "gao", "di", "xin", "jiu", "kuai", "man", "re", "leng",
+        "hao", "huai", "duo", "shao", "ji", "er", "san", "si", "wu", "liu",
+        "qi", "ba", "shi", "bai", "qian", "wan", "yi", "jiu", "nian", "yue",
+        "ri", "shi", "fen", "miao", "tian", "xing", "qi", "dong", "nan", "xi",
+        "bei", "zhong", "wai", "qian", "hou", "zuo", "you", "shang", "xia", "li",
+        "wai", "nei", "da", "xiao", "zhong", "duan", "chang", "duan", "kuan", "zhai",
+        "gao", "di", "shen", "qian", "hou", "zuo", "you", "shang", "xia", "li",
+    ];
+
+    let lower = s.to_lowercase();
+    let mut remaining = lower.as_str();
+
+    while !remaining.is_empty() {
+        let mut matched = false;
+        for syllable in &pinyin_syllables {
+            if remaining.starts_with(syllable) {
+                remaining = &remaining[syllable.len()..];
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            // If we can't match more syllables, check if we've consumed most of the string
+            // This allows for some non-Pinyin parts (like numbers or English suffixes)
+            break;
+        }
+    }
+
+    // If we consumed more than 60% of the string, consider it Pinyin
+    let consumed = lower.len() - remaining.len();
+    consumed as f64 / lower.len() as f64 > 0.6
+}
+
 /// Semantic code searcher: fuses Ripgrep speed with Tree-sitter precision.
 pub struct SemanticSearcher {
     cache: ASTCache,
@@ -806,6 +888,27 @@ impl SemanticSearcher {
                     continue;
                 }
             }
+
+            // Chinese variable definitions (e.g., 用户名 = "张三")
+            // Look for lines with Chinese identifiers at indent level 0
+            if indent == 0 && contains_chinese(trimmed) {
+                // Check if this looks like a variable assignment
+                if let Some(eq_pos) = trimmed.find('=') {
+                    let var_name = trimmed[..eq_pos].trim();
+                    if contains_chinese(var_name) && !var_name.contains(' ') {
+                        let start = i;
+                        let end = i + 1;
+                        symbols.push(make_symbol(
+                            var_name.to_string(),
+                            "chinese_variable",
+                            start,
+                            end,
+                            lines,
+                        ));
+                    }
+                }
+            }
+
             i += 1;
         }
 
@@ -1083,5 +1186,92 @@ def world():
             "indent fallback symbols: {:?}",
             names
         );
+    }
+
+    #[test]
+    fn test_chinese_character_detection() {
+        assert!(is_chinese('中'));
+        assert!(is_chinese('文'));
+        assert!(!is_chinese('a'));
+        assert!(!is_chinese('1'));
+        assert!(!is_chinese('_'));
+    }
+
+    #[test]
+    fn test_contains_chinese() {
+        assert!(contains_chinese("用户名"));
+        assert!(contains_chinese("hello世界"));
+        assert!(!contains_chinese("hello"));
+        assert!(!contains_chinese("123"));
+    }
+
+    #[test]
+    fn test_pinyin_identifier_detection() {
+        // Valid Pinyin identifiers
+        assert!(is_pinyin_identifier("yonghuMing"));
+        assert!(is_pinyin_identifier("dingdanList"));
+        assert!(is_pinyin_identifier("zhongguoRen"));
+        assert!(is_pinyin_identifier("wenjianMuLu"));
+
+        // Invalid Pinyin identifiers
+        assert!(!is_pinyin_identifier("hello"));
+        assert!(!is_pinyin_identifier("getUser"));
+        assert!(!is_pinyin_identifier(""));
+        assert!(!is_pinyin_identifier("123"));
+    }
+
+    #[test]
+    fn test_symbol_chinese_detection() {
+        let sym = Symbol {
+            name: "用户名".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 9,
+            kind: "variable".to_string(),
+        };
+        assert!(sym.is_chinese());
+        assert!(!sym.is_pinyin());
+        assert!(sym.is_chinese_related());
+
+        let sym_pinyin = Symbol {
+            name: "yonghuMing".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 10,
+            kind: "variable".to_string(),
+        };
+        assert!(!sym_pinyin.is_chinese());
+        assert!(sym_pinyin.is_pinyin());
+        assert!(sym_pinyin.is_chinese_related());
+
+        let sym_english = Symbol {
+            name: "getUser".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 7,
+            kind: "function".to_string(),
+        };
+        assert!(!sym_english.is_chinese());
+        assert!(!sym_english.is_pinyin());
+        assert!(!sym_english.is_chinese_related());
+    }
+
+    #[test]
+    fn test_chinese_variable_extraction() {
+        let mut searcher = SemanticSearcher::new();
+        let source = r#"用户名 = "张三"
+年龄 = 25
+def get_user():
+    return 用户名
+"#;
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(source.as_bytes()).unwrap();
+
+        let symbols = searcher.list_symbols(tmp.path()).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"用户名"), "symbols: {:?}", names);
     }
 }
