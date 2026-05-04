@@ -420,6 +420,9 @@ impl TurnRunner {
         };
         let mut got_any_event = false;
         let mut was_truncated = false;
+        // Hides `<tool_call>...</tool_call>` blocks from UI/conversation while
+        // keeping `text_buf` raw so rescue can still parse them at Done.
+        let mut stream_filter = ToolCallStreamFilter::default();
 
         // Stream timeouts. Defaults are 300s for both first-token and
         // subsequent-token waits, since slow domestic model providers
@@ -466,9 +469,16 @@ impl TurnRunner {
                                         // Strip model-internal tags (DeepSeek </think>`, QwQ, etc.)
                                         let text = strip_model_tags(&text);
                                         if !text.is_empty() {
-                                            conversation.push_delta(&text);
+                                            // Raw goes into rescue source so XML tool_call blocks
+                                            // can be parsed at Done.
                                             text_buf.push_str(&text);
-                                            let _ = event_tx.send(TurnEvent::TextDelta(text));
+                                            // Visible stream excludes <tool_call>...</tool_call>
+                                            // blocks (Qwen/GLM XML leak suppression).
+                                            let visible = stream_filter.feed(&text);
+                                            if !visible.is_empty() {
+                                                conversation.push_delta(&visible);
+                                                let _ = event_tx.send(TurnEvent::TextDelta(visible));
+                                            }
                                         }
                                     }
                                     Some(Ok(StreamEvent::Reasoning(text))) => {
@@ -566,6 +576,16 @@ impl TurnRunner {
                                     }
 
                                     Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
+                                        // Flush any holdback from the tool_call filter. If the
+                                        // stream ended mid-`<tool_call>` block, the filter
+                                        // discards the partial — preferring a missing close to
+                                        // a leaked tag.
+                                        let trailing = stream_filter.flush();
+                                        if !trailing.is_empty() {
+                                            conversation.push_delta(&trailing);
+                                            let _ = event_tx.send(TurnEvent::TextDelta(trailing));
+                                        }
+
                                         // Reasoning-only fallback: some gateways route the
                                         // entire response through `reasoning_content` for
                                         // reasoning models (MiniMax-M2.7, DeepSeek-R1). If
@@ -1476,10 +1496,11 @@ fn strip_model_tags(text: &str) -> String {
     result
 }
 
-/// Rescue tool calls embedded as text in the model's response.
-/// Some models (GLM-5 via OpenRouter) sometimes output tool calls as
-/// `<tool_call>name(arg=value)</tool_call>` or `<tool_call>name(json)</tool_call>`
-/// instead of using the standard function calling format.
+/// Rescue tool calls embedded as text in the model's response. Three variants:
+///   1. `<tool_call>name(json)</tool_call>` — paren+JSON
+///   2. `<tool_call>name(k=v, k=v)</tool_call>` — paren+kv (legacy single-line)
+///   3. `<tool_call><tool_name>name</tool_name><arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`
+///      — Qwen/GLM XML format (multi-line, args may span newlines)
 /// Returns rescued ToolCalls, empty vec if nothing found.
 fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut calls = Vec::new();
@@ -1487,30 +1508,40 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
 
     while let Some(start) = remaining.find("<tool_call>") {
         let after_tag = &remaining[start + "<tool_call>".len()..];
-        let end = after_tag
-            .find("</tool_call>")
-            .or_else(|| after_tag.find('\n'))
-            .unwrap_or(after_tag.len());
-        let body = after_tag[..end].trim();
 
-        // Parse: "name(key=value, ...)" or "name({json})"
-        if let Some(paren) = body.find('(') {
+        // Prefer </tool_call> close (XML format spans newlines).
+        // Fall back to first newline only when no close tag is present
+        // (legacy single-line format).
+        let (body, advance) = match after_tag.find("</tool_call>") {
+            Some(pos) => (&after_tag[..pos], pos + "</tool_call>".len()),
+            None => {
+                let pos = after_tag.find('\n').unwrap_or(after_tag.len());
+                (&after_tag[..pos], pos)
+            }
+        };
+        let body = body.trim();
+
+        if let Some((name, args_json)) = parse_xml_tool_call(body) {
+            let call_id = format!("rescued_{}", calls.len());
+            calls.push(ToolCall {
+                id: call_id,
+                name,
+                arguments: args_json,
+            });
+        } else if let Some(paren) = body.find('(') {
             let name = body[..paren].trim();
             let args_raw = body[paren + 1..].trim_end_matches(')').trim();
 
             if !name.is_empty() {
-                // Try parsing as JSON first
                 let args_json = if args_raw.starts_with('{') {
                     args_raw.to_string()
                 } else {
-                    // Convert key=value pairs to JSON
                     let mut json_parts = Vec::new();
                     for part in args_raw.split(',') {
                         let part = part.trim();
                         if let Some(eq) = part.find('=') {
                             let k = part[..eq].trim();
                             let v = part[eq + 1..].trim();
-                            // Quote the value if not already quoted
                             let v_quoted = if v.starts_with('"')
                                 || v.starts_with('{')
                                 || v.starts_with('[')
@@ -1537,10 +1568,158 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
             }
         }
 
-        remaining = &after_tag[end..];
+        remaining = &after_tag[advance..];
     }
 
     calls
+}
+
+/// Parse Qwen/GLM XML-style tool call body:
+///   `<tool_name>NAME</tool_name><arg_key>K1</arg_key><arg_value>V1</arg_value>...`
+/// Returns `(name, args_as_json_object)` or None when the format doesn't match.
+fn parse_xml_tool_call(body: &str) -> Option<(String, String)> {
+    let name = extract_between(body, "<tool_name>", "</tool_name>")?
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut map = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(k_start) = rest.find("<arg_key>") {
+        let k_after = &rest[k_start + "<arg_key>".len()..];
+        let k_end = k_after.find("</arg_key>")?;
+        let key = k_after[..k_end].trim().to_string();
+        if key.is_empty() {
+            return None;
+        }
+        let after_key = &k_after[k_end + "</arg_key>".len()..];
+        let v_start = after_key.find("<arg_value>")?;
+        let v_after = &after_key[v_start + "<arg_value>".len()..];
+        let v_end = v_after.find("</arg_value>")?;
+        let raw_value = &v_after[..v_end];
+        map.insert(key, coerce_xml_value(raw_value));
+        rest = &v_after[v_end + "</arg_value>".len()..];
+    }
+
+    if map.is_empty() {
+        return None;
+    }
+    Some((name, serde_json::Value::Object(map).to_string()))
+}
+
+fn extract_between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let s = haystack.find(open)? + open.len();
+    let e = haystack[s..].find(close)? + s;
+    Some(&haystack[s..e])
+}
+
+/// Best-effort type inference for `<arg_value>` payloads. Bool/int/float/JSON
+/// literals get unquoted; everything else stays a string (preserves whitespace).
+fn coerce_xml_value(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed == "true" {
+        return serde_json::Value::Bool(true);
+    }
+    if trimmed == "false" {
+        return serde_json::Value::Bool(false);
+    }
+    if trimmed == "null" {
+        return serde_json::Value::Null;
+    }
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return serde_json::Value::from(n);
+    }
+    if let Ok(f) = trimmed.parse::<f64>() {
+        return serde_json::Value::from(f);
+    }
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return v;
+        }
+    }
+    // Preserve raw (including leading/trailing whitespace) — the model may have
+    // intended exact-match strings (e.g. old_string for edit_file).
+    serde_json::Value::String(raw.to_string())
+}
+
+/// Streaming filter that hides `<tool_call>...</tool_call>` blocks from the
+/// visible UI/conversation stream while letting the rescue path see the full
+/// raw text via a separate buffer. Tags can split across delta chunks, so the
+/// filter holds back trailing bytes that might be a partial tag.
+#[derive(Default)]
+struct ToolCallStreamFilter {
+    inside: bool,
+    holdback: String,
+}
+
+impl ToolCallStreamFilter {
+    const OPEN: &'static str = "<tool_call>";
+    const CLOSE: &'static str = "</tool_call>";
+
+    /// Feed a delta chunk; return what's safe to display now.
+    fn feed(&mut self, chunk: &str) -> String {
+        let mut work = std::mem::take(&mut self.holdback);
+        work.push_str(chunk);
+        let mut out = String::new();
+
+        loop {
+            if self.inside {
+                match work.find(Self::CLOSE) {
+                    Some(pos) => {
+                        work = work[pos + Self::CLOSE.len()..].to_string();
+                        self.inside = false;
+                    }
+                    None => {
+                        self.holdback = trail_holdback(&work, Self::CLOSE.len() - 1);
+                        return out;
+                    }
+                }
+            } else {
+                match work.find(Self::OPEN) {
+                    Some(pos) => {
+                        out.push_str(&work[..pos]);
+                        work = work[pos + Self::OPEN.len()..].to_string();
+                        self.inside = true;
+                    }
+                    None => {
+                        let hold = trail_holdback(&work, Self::OPEN.len() - 1);
+                        let visible_len = work.len() - hold.len();
+                        out.push_str(&work[..visible_len]);
+                        self.holdback = hold;
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+
+    /// End-of-stream flush. If we're still inside an unclosed `<tool_call>`,
+    /// the holdback is dropped (prevents leak); otherwise emit any held tail.
+    fn flush(&mut self) -> String {
+        if self.inside {
+            self.holdback.clear();
+            String::new()
+        } else {
+            std::mem::take(&mut self.holdback)
+        }
+    }
+}
+
+/// Take up to `max` trailing bytes from `s`, snapped down to a UTF-8 char
+/// boundary so the holdback is always a valid `String`.
+fn trail_holdback(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut split = s.len() - max;
+    while split < s.len() && !s.is_char_boundary(split) {
+        split += 1;
+    }
+    s[split..].to_string()
 }
 
 /// Merge multiple edit_file calls on the same file into one multi-edit call.
@@ -1834,5 +2013,182 @@ mod loop_hash_tests {
         assert_eq!(c, d);
 
         assert_ne!(a, c, "different malformed inputs still differ");
+    }
+}
+
+#[cfg(test)]
+mod tool_call_text_rescue_tests {
+    use super::{rescue_text_tool_calls, ToolCallStreamFilter};
+
+    #[test]
+    fn rescues_qwen_xml_format() {
+        // Qwen/GLM-5.1 sometimes emits args as <arg_key>/<arg_value> XML pairs
+        // instead of a JSON blob. Without parsing this format the call gets
+        // dispatched with empty args and edit_file fails with "old_string is
+        // required" while the raw XML leaks into the user-visible stream.
+        let text = r#"Let me make the edit:
+<tool_call>
+  <tool_name>edit_file</tool_name>
+  <arg_key>file_path</arg_key><arg_value>src/main.rs</arg_value>
+  <arg_key>old_string</arg_key><arg_value>        attrs
+      }
+  }</arg_value>
+  <arg_key>new_string</arg_key><arg_value>        attrs.push(x);
+        attrs
+      }
+  }</arg_value>
+  <arg_key>replace_all</arg_key><arg_value>false</arg_value>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 1, "single XML block should rescue one call");
+        assert_eq!(calls[0].name, "edit_file");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["file_path"], "src/main.rs");
+        assert_eq!(v["replace_all"], false);
+        // Whitespace-sensitive — old_string must round-trip exactly so edit_file
+        // can find the match in the file.
+        assert_eq!(v["old_string"], "        attrs\n      }\n  }");
+    }
+
+    #[test]
+    fn xml_without_tool_name_is_skipped() {
+        // No <tool_name> means we have no idea what to dispatch — better to
+        // skip than guess. An XML block with only <arg_key> tags is treated as
+        // a malformed legacy emit (no `(` either, so the paren branch also
+        // skips), yielding zero calls.
+        let text = r#"<tool_call>
+  <arg_key>file_path</arg_key><arg_value>x.rs</arg_value>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn legacy_paren_json_format_still_works() {
+        // Don't regress the existing rescue path used by GLM-5 via OpenRouter.
+        let text = r#"<tool_call>read_file({"file_path":"a.rs"})</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["file_path"], "a.rs");
+    }
+
+    #[test]
+    fn legacy_paren_kv_format_still_works() {
+        let text = r#"<tool_call>read_file(file_path=a.rs, offset=10)</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["file_path"], "a.rs");
+        assert_eq!(v["offset"], 10);
+    }
+
+    #[test]
+    fn xml_coerces_bool_int_float() {
+        let text = r#"<tool_call>
+  <tool_name>cfg</tool_name>
+  <arg_key>flag</arg_key><arg_value>true</arg_value>
+  <arg_key>n</arg_key><arg_value>42</arg_value>
+  <arg_key>f</arg_key><arg_value>3.14</arg_value>
+  <arg_key>s</arg_key><arg_value>hello</arg_value>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["flag"], true);
+        assert_eq!(v["n"], 42);
+        assert!((v["f"].as_f64().unwrap() - 3.14).abs() < 1e-9);
+        assert_eq!(v["s"], "hello");
+    }
+
+    #[test]
+    fn stream_filter_passes_plain_text() {
+        let mut f = ToolCallStreamFilter::default();
+        let out = f.feed("hello world");
+        // Holdback may keep up to 10 bytes in case "<tool_call" is starting,
+        // so flush to get the full output.
+        let tail = f.flush();
+        assert_eq!(format!("{}{}", out, tail), "hello world");
+    }
+
+    #[test]
+    fn stream_filter_strips_complete_block_in_one_chunk() {
+        let mut f = ToolCallStreamFilter::default();
+        let out = f.feed("before <tool_call>edit_file({})</tool_call> after");
+        let tail = f.flush();
+        let combined = format!("{}{}", out, tail);
+        assert!(combined.contains("before "));
+        assert!(combined.contains(" after"));
+        assert!(!combined.contains("<tool_call>"));
+        assert!(!combined.contains("</tool_call>"));
+        assert!(!combined.contains("edit_file"));
+    }
+
+    #[test]
+    fn stream_filter_strips_block_split_across_chunks() {
+        // Realistic case: provider streams bytes that split the open tag
+        // arbitrarily. The filter must hold back partial-tag bytes, not emit
+        // them, and resume cleanly when the close arrives.
+        let mut f = ToolCallStreamFilter::default();
+        let mut visible = String::new();
+        for chunk in [
+            "before <tool_",
+            "call><tool_name>edit_file</tool_name>",
+            "<arg_key>k</arg_key><arg_value>v</arg_value>",
+            "</tool_call> after",
+        ] {
+            visible.push_str(&f.feed(chunk));
+        }
+        visible.push_str(&f.flush());
+        assert_eq!(visible, "before  after");
+    }
+
+    #[test]
+    fn stream_filter_drops_unclosed_block() {
+        // If the stream ends mid-`<tool_call>` (truncation, error), discard
+        // the holdback rather than leaking the open fragment to the user.
+        let mut f = ToolCallStreamFilter::default();
+        let out = f.feed("text <tool_call>edit_file({});");
+        let tail = f.flush();
+        let combined = format!("{}{}", out, tail);
+        assert_eq!(combined, "text ");
+    }
+
+    #[test]
+    fn stream_filter_handles_partial_open_at_chunk_end() {
+        // The filter must not emit `<` or `<t` etc. as visible text just
+        // because the chunk happened to end mid-tag.
+        let mut f = ToolCallStreamFilter::default();
+        let v1 = f.feed("hello <");
+        // Could be holdback; not guaranteed any specific output yet.
+        let v2 = f.feed("tool_call>x</tool_call>!");
+        let tail = f.flush();
+        let combined = format!("{}{}{}", v1, v2, tail);
+        assert_eq!(combined, "hello !");
+    }
+
+    #[test]
+    fn stream_filter_passes_through_lt_that_isnt_tool_call() {
+        // A bare `<` followed by non-tool_call content should eventually flush.
+        let mut f = ToolCallStreamFilter::default();
+        let mut visible = String::new();
+        visible.push_str(&f.feed("a < b "));
+        visible.push_str(&f.feed("and c <"));
+        visible.push_str(&f.feed("d>e"));
+        visible.push_str(&f.flush());
+        assert_eq!(visible, "a < b and c <d>e");
+    }
+
+    #[test]
+    fn stream_filter_handles_utf8_at_holdback_boundary() {
+        // UTF-8 multi-byte chars must not get split across the holdback
+        // boundary — the trail snap rounds up to a char boundary.
+        let mut f = ToolCallStreamFilter::default();
+        let mut visible = String::new();
+        visible.push_str(&f.feed("中文 hello "));
+        visible.push_str(&f.feed("世界"));
+        visible.push_str(&f.flush());
+        assert_eq!(visible, "中文 hello 世界");
     }
 }
