@@ -607,6 +607,18 @@ impl TurnRunner {
                                                 false
                                             }
                                         } else {
+                                            // Repair path: model split intent across two channels
+                                            // — function-calling JSON arrived with truncated args
+                                            // (e.g. only `new_string`, missing `old_string`),
+                                            // while the text stream carried the complete args as
+                                            // `<tool_call>` XML. Fill missing keys from the XML
+                                            // pool so the call doesn't fail at execute() with a
+                                            // misleading "old_string is required". JSON wins on
+                                            // conflicts; XML only fills gaps.
+                                            let xml_pool = rescue_text_tool_calls(&text_buf);
+                                            if !xml_pool.is_empty() {
+                                                repair_tool_call_args(&mut tool_calls_buf, &xml_pool);
+                                            }
                                             false
                                         };
 
@@ -1646,6 +1658,61 @@ fn coerce_xml_value(raw: &str) -> serde_json::Value {
     serde_json::Value::String(raw.to_string())
 }
 
+/// Patch `tool_calls_buf` entries with missing keys borrowed from `xml_pool`
+/// (parsed by `rescue_text_tool_calls` on the same turn's raw text). Used when
+/// the model split intent across the function-calling JSON channel and the
+/// `<tool_call>` XML in the text — the JSON path may arrive with only a subset
+/// of the arguments, while the XML carries the full set. JSON wins on
+/// conflicts; XML only fills gaps. Multiple calls of the same name are matched
+/// to XML blocks of the same name in order of appearance.
+fn repair_tool_call_args(calls: &mut [ToolCall], xml_pool: &[ToolCall]) {
+    use std::collections::HashMap;
+
+    let mut by_name: HashMap<&str, Vec<&ToolCall>> = HashMap::new();
+    for x in xml_pool {
+        by_name.entry(x.name.as_str()).or_default().push(x);
+    }
+    let mut consumed: HashMap<&str, usize> = HashMap::new();
+
+    for call in calls.iter_mut() {
+        let Some(group) = by_name.get(call.name.as_str()) else {
+            continue;
+        };
+        let idx = consumed.entry(call.name.as_str()).or_insert(0);
+        let Some(xml_call) = group.get(*idx) else {
+            continue;
+        };
+        *idx += 1;
+
+        let xml_obj = match serde_json::from_str::<serde_json::Value>(&xml_call.arguments) {
+            Ok(serde_json::Value::Object(o)) => o,
+            _ => continue,
+        };
+
+        let merged = match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+            Ok(serde_json::Value::Object(mut j_obj)) => {
+                let mut patched = false;
+                for (k, v) in xml_obj {
+                    if !j_obj.contains_key(&k) {
+                        j_obj.insert(k, v);
+                        patched = true;
+                    }
+                }
+                if patched {
+                    Some(serde_json::Value::Object(j_obj))
+                } else {
+                    None
+                }
+            }
+            // JSON args unparseable / non-object → take XML wholesale.
+            _ => Some(serde_json::Value::Object(xml_obj)),
+        };
+        if let Some(v) = merged {
+            call.arguments = v.to_string();
+        }
+    }
+}
+
 /// Streaming filter that hides `<tool_call>...</tool_call>` blocks from the
 /// visible UI/conversation stream while letting the rescue path see the full
 /// raw text via a separate buffer. Tags can split across delta chunks, so the
@@ -2018,7 +2085,7 @@ mod loop_hash_tests {
 
 #[cfg(test)]
 mod tool_call_text_rescue_tests {
-    use super::{rescue_text_tool_calls, ToolCallStreamFilter};
+    use super::{repair_tool_call_args, rescue_text_tool_calls, ToolCall, ToolCallStreamFilter};
 
     #[test]
     fn rescues_qwen_xml_format() {
@@ -2178,6 +2245,153 @@ mod tool_call_text_rescue_tests {
         visible.push_str(&f.feed("d>e"));
         visible.push_str(&f.flush());
         assert_eq!(visible, "a < b and c <d>e");
+    }
+
+    fn tc(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.into(),
+        }
+    }
+
+    #[test]
+    fn repair_fills_missing_old_string_from_xml() {
+        // Reproduces the user-reported bug: the function-calling JSON channel
+        // delivered `{file_path, new_string, replace_all}` (passes
+        // validate_args because new_string is present) but missing
+        // `old_string` — execute() then fails with "old_string is required".
+        // The full args were carried as XML in the text stream. After repair,
+        // the call has all four keys.
+        let mut calls = vec![tc(
+            "c1",
+            "edit_file",
+            r#"{"file_path":"x.rs","new_string":"new","replace_all":false}"#,
+        )];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"old","new_string":"new","replace_all":false}"#,
+        )];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let merged: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(merged["file_path"], "x.rs");
+        assert_eq!(merged["old_string"], "old");
+        assert_eq!(merged["new_string"], "new");
+        assert_eq!(merged["replace_all"], false);
+    }
+
+    #[test]
+    fn repair_does_not_overwrite_keys_present_in_json() {
+        // Conflict policy: function-calling JSON is the source of truth; XML
+        // only fills gaps. If the JSON channel and XML disagree on a key
+        // (e.g. different new_string), keep JSON.
+        let mut calls = vec![tc(
+            "c1",
+            "edit_file",
+            r#"{"file_path":"x.rs","new_string":"json_wins"}"#,
+        )];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","new_string":"xml_loses","old_string":"old"}"#,
+        )];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let merged: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(merged["new_string"], "json_wins");
+        assert_eq!(merged["old_string"], "old");
+    }
+
+    #[test]
+    fn repair_skips_when_names_dont_match() {
+        // Repair must never cross tool boundaries — patching read_file with
+        // edit_file's args would dispatch a malformed call.
+        let original = r#"{"file_path":"x.rs"}"#;
+        let mut calls = vec![tc("c1", "read_file", original)];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"a","new_string":"b"}"#,
+        )];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        assert_eq!(calls[0].arguments, original);
+    }
+
+    #[test]
+    fn repair_takes_xml_wholesale_when_json_unparseable() {
+        // Truncated/garbled args from the JSON channel would otherwise
+        // fail to parse later anyway. Replace with the XML object.
+        let mut calls = vec![tc("c1", "edit_file", r#"{"file_path": "trunc"#)];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"a","new_string":"b"}"#,
+        )];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let merged: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(merged["file_path"], "x.rs");
+        assert_eq!(merged["old_string"], "a");
+    }
+
+    #[test]
+    fn repair_matches_multiple_same_name_calls_in_order() {
+        // Two edit_file calls in the same turn, two XML blocks — match by
+        // order so the second JSON call gets the second XML's args, not the
+        // first one's reused.
+        let mut calls = vec![
+            tc("c1", "edit_file", r#"{"file_path":"a.rs","new_string":"a_new"}"#),
+            tc("c2", "edit_file", r#"{"file_path":"b.rs","new_string":"b_new"}"#),
+        ];
+        let xml_pool = vec![
+            tc(
+                "rescued_0",
+                "edit_file",
+                r#"{"file_path":"a.rs","old_string":"a_old","new_string":"a_new"}"#,
+            ),
+            tc(
+                "rescued_1",
+                "edit_file",
+                r#"{"file_path":"b.rs","old_string":"b_old","new_string":"b_new"}"#,
+            ),
+        ];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let m1: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        let m2: serde_json::Value = serde_json::from_str(&calls[1].arguments).unwrap();
+        assert_eq!(m1["old_string"], "a_old");
+        assert_eq!(m2["old_string"], "b_old");
+    }
+
+    #[test]
+    fn repair_no_op_when_json_already_complete() {
+        // If the JSON channel got everything right, repair is silent —
+        // serialization-level identity isn't guaranteed (key order may
+        // change), but semantic equality holds.
+        let mut calls = vec![tc(
+            "c1",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"a","new_string":"b","replace_all":false}"#,
+        )];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"a"}"#,
+        )];
+        let before: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let after: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn repair_skips_unparseable_xml() {
+        // If the XML pool has a bogus entry (e.g. arguments that aren't a
+        // JSON object), repair must skip it without crashing or polluting
+        // the JSON call.
+        let original = r#"{"file_path":"x.rs"}"#;
+        let mut calls = vec![tc("c1", "edit_file", original)];
+        let xml_pool = vec![tc("rescued_0", "edit_file", "not even json")];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        assert_eq!(calls[0].arguments, original);
     }
 
     #[test]
