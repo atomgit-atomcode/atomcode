@@ -33,7 +33,6 @@ fn empty_config() -> Config {
         datalog: Default::default(),
         notifications: Default::default(),
         auto_update: true,
-        reflection_cadence: 7,
         telemetry: Default::default(),
         lsp: Default::default(),
         auto_commit: false,

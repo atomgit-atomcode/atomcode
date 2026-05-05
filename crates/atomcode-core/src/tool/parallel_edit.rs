@@ -394,7 +394,6 @@ mod validate_args_tests {
             providers: std::collections::HashMap::new(),
             datalog: Default::default(),
             auto_update: true,
-            reflection_cadence: 7,
             notifications: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),

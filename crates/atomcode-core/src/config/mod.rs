@@ -105,14 +105,6 @@ pub struct Config {
     /// works manually. Missing from older configs → defaults to `true`.
     #[serde(default = "default_true")]
     pub auto_update: bool,
-    /// Every N tool calls, inject a "restate goal / what ruled out / next
-    /// output" reflection prompt before the next turn. 0 disables the
-    /// checkpoint entirely. Default 7: dogfooding showed 10 is too slow
-    /// to catch early "same command, different flag" loops (6-7 tries
-    /// before the first checkpoint) while 5 over-injects on normal tasks.
-    /// 7 catches early loops in 1-2 retries without disturbing focused work.
-    #[serde(default = "default_reflection_cadence")]
-    pub reflection_cadence: usize,
     /// Telemetry configuration. Missing from older configs → defaults to
     /// enabled=None (consent-pending), endpoint=None (use the built-in default).
     /// Uses `#[serde(default)]` because `TelemetryConfig` has its own `Default`
@@ -208,9 +200,6 @@ impl Default for LspConfig {
 
 fn default_true() -> bool {
     true
-}
-fn default_reflection_cadence() -> usize {
-    7
 }
 fn default_notification_min_duration_secs() -> u64 {
     8
@@ -576,7 +565,6 @@ mod tests {
             },
             notifications: NotificationConfig::default(),
             auto_update: true,
-            reflection_cadence: 7,
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
@@ -703,35 +691,19 @@ mod reflection_config_tests {
     use super::*;
 
     #[test]
-    fn reflection_cadence_defaults_to_seven_when_missing_from_toml() {
-        let toml_text = r#"
-default_provider = "claude"
-[providers]
-"#;
-        let cfg: Config = toml::from_str(toml_text).expect("parses minimal config");
-        assert_eq!(cfg.reflection_cadence, 7);
-    }
-
-    #[test]
-    fn reflection_cadence_zero_means_disabled() {
-        let toml_text = r#"
-default_provider = "claude"
-reflection_cadence = 0
-[providers]
-"#;
-        let cfg: Config = toml::from_str(toml_text).expect("parses config with 0");
-        assert_eq!(cfg.reflection_cadence, 0);
-    }
-
-    #[test]
-    fn reflection_cadence_custom_value_is_preserved() {
+    fn legacy_reflection_cadence_field_is_silently_ignored() {
+        // Older configs in the wild still carry `reflection_cadence = 7`
+        // (the field's value at the time the mechanism was removed).
+        // toml + serde's default permissiveness means the unknown field
+        // is dropped without erroring; this test pins that behaviour so
+        // an accidental `#[serde(deny_unknown_fields)]` later doesn't
+        // start rejecting users' on-disk configs.
         let toml_text = r#"
 default_provider = "claude"
 reflection_cadence = 7
 [providers]
 "#;
-        let cfg: Config = toml::from_str(toml_text).expect("parses");
-        assert_eq!(cfg.reflection_cadence, 7);
+        let _cfg: Config = toml::from_str(toml_text).expect("legacy field ignored");
     }
 
     #[test]
