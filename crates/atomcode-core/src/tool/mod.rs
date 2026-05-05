@@ -15,6 +15,7 @@ pub mod read;
 pub mod read_symbol;
 pub mod result_store;
 pub mod search_replace;
+pub mod todo;
 pub mod trace_callees;
 pub mod trace_callers;
 pub mod trace_chain;
