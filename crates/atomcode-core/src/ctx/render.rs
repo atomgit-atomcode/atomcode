@@ -754,13 +754,23 @@ fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars
                 .map(|s| s.as_str())
                 .unwrap_or("tool");
 
+            // read_file results are NEVER condensed by microcompact —
+            // honour what the doc comment at the top of this function
+            // already promises. The previous read_file branch collapsed
+            // file content to `[Read file (N lines): first_line]`
+            // (~60 bytes), forcing the model to re-read every file it
+            // had previously read once total chars crossed the 100K
+            // threshold. read.rs already has its own auto-skeleton
+            // truncation (Layer A) for files that don't fit; double-
+            // condensing here was the弱智化 mechanism observed in the
+            // 2026-05-05 atomgr session (server/mod.rs read 4× in
+            // 22 turns, api.rs hit the 3-call cap because the model
+            // saw only a one-line stub of its previous reads).
+            if tool_name == "read_file" {
+                continue;
+            }
+
             let summary = match tool_name {
-                "read_file" => {
-                    let line_count = r.output.lines().count();
-                    let first_line = r.output.lines().next().unwrap_or("");
-                    let hint: String = first_line.chars().take(60).collect();
-                    format!("[Read file ({} lines): {}]", line_count, hint)
-                }
                 "bash" => {
                     let first_line = r.output.lines().next().unwrap_or("(empty)");
                     let line_count = r.output.lines().count();
@@ -1356,6 +1366,102 @@ mod tests {
             has_user,
             "last user message must always survive, got {} msgs",
             msgs.len()
+        );
+    }
+
+    #[test]
+    fn microcompact_preserves_read_file_full_content() {
+        // 2026-05-05 atomgr session reproduced this bug: once L3
+        // microcompact's threshold (100K chars) was crossed, every
+        // pre-existing read_file result got collapsed to
+        // `[Read file (N lines): first_line]` (~60 bytes), forcing the
+        // model to re-read every file it had previously read.
+        // server/mod.rs was read 4× across 22 turns and api.rs hit the
+        // 3-call cap because the model's "previous read" was a 1-line
+        // stub. read.rs's auto-skeleton (Layer A) is the single
+        // authority for read_file truncation; microcompact must NOT
+        // double-condense.
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Build a conversation with one large read_file result followed
+        // by enough other tool results to push total chars past the
+        // 100K threshold.
+        conv.add_user_message("read these files");
+
+        // 1 read_file with substantial body — what we're asserting
+        // survives microcompact intact.
+        let read_call = ToolCall {
+            id: "c_read".into(),
+            name: "read_file".into(),
+            arguments: "{\"file_path\":\"src/server/mod.rs\"}".into(),
+        };
+        conv.add_assistant_tool_calls(Some("read it"), vec![read_call], None);
+        let read_body = "// SPDX-License-Identifier: MIT\n".to_string()
+            + &"pub fn server_loop() { /* ... */ }\n".repeat(80);
+        conv.add_tool_result(ToolResult {
+            call_id: "c_read".into(),
+            output: read_body.clone(),
+            success: true,
+        });
+
+        // Pad with bash results to push total chars over 100K threshold
+        // while keeping message_count > 20 (the OTHER_KEEP guard).
+        for i in 0..30 {
+            let call = ToolCall {
+                id: format!("c_b{}", i),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            };
+            conv.add_assistant_tool_calls(None, vec![call], None);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c_b{}", i),
+                output: format!("[elapsed: 0.1s, exit: 0]\n{}", "x".repeat(4_000)),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what");
+
+        let (msgs, _) = build_messages(&conv, "sys", 131_072, "");
+
+        // The read_file result must still carry the original body.
+        // Pre-fix it would be replaced with `[Read file (N lines): ...]`.
+        let read_result_msg = msgs
+            .iter()
+            .find(|m| {
+                if let MessageContent::ToolResult(r) = &m.content {
+                    r.call_id == "c_read"
+                } else {
+                    false
+                }
+            })
+            .expect("read_file ToolResult should still be in the rendered messages");
+
+        if let MessageContent::ToolResult(r) = &read_result_msg.content {
+            assert!(
+                !r.output.starts_with("[Read file"),
+                "read_file result was condensed by microcompact (got: {:?})",
+                &r.output[..r.output.len().min(80)]
+            );
+            assert_eq!(
+                r.output, read_body,
+                "read_file result must be byte-identical to the original"
+            );
+        }
+
+        // Sanity: bash results past the OTHER_KEEP=20 window SHOULD be
+        // condensed, otherwise the test isn't actually exercising the
+        // microcompact path.
+        let condensed_bash = msgs.iter().any(|m| {
+            if let MessageContent::ToolResult(r) = &m.content {
+                r.output.starts_with("[bash (")
+            } else {
+                false
+            }
+        });
+        assert!(
+            condensed_bash,
+            "test fixture didn't trigger microcompact — fix the threshold setup"
         );
     }
 
