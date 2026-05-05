@@ -47,6 +47,38 @@ pub fn platform_rules() -> &'static str {
     }
 }
 
+/// Sub-agent execution policy (enable + resilience knobs).
+/// Drives `agent::sub_agent::SubAgentTask::execute` and the
+/// `try_sub_agent_dispatch` config gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubAgentConfig {
+    /// Master switch. `false` makes `try_sub_agent_dispatch` return None
+    /// immediately and the parent agent falls back to serial execution.
+    pub enabled: bool,
+    /// Initial per-task turn budget. Adaptive logic may extend up to
+    /// `max_turns`. See `ResilienceConfig::initial_turns`.
+    pub initial_turns: usize,
+    /// Hard cap on per-task turns regardless of progress signals.
+    pub max_turns: usize,
+    /// Max parallel sub-agents per pool batch.
+    pub max_concurrent: usize,
+    /// Wall-time timeout for a single sub-agent (seconds).
+    pub timeout_secs: u64,
+}
+
+impl Default for SubAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial_turns: 4,
+            max_turns: 12,
+            max_concurrent: 3,
+            timeout_secs: 300,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub default_provider: String,
@@ -73,14 +105,6 @@ pub struct Config {
     /// works manually. Missing from older configs → defaults to `true`.
     #[serde(default = "default_true")]
     pub auto_update: bool,
-    /// Every N tool calls, inject a "restate goal / what ruled out / next
-    /// output" reflection prompt before the next turn. 0 disables the
-    /// checkpoint entirely. Default 7: dogfooding showed 10 is too slow
-    /// to catch early "same command, different flag" loops (6-7 tries
-    /// before the first checkpoint) while 5 over-injects on normal tasks.
-    /// 7 catches early loops in 1-2 retries without disturbing focused work.
-    #[serde(default = "default_reflection_cadence")]
-    pub reflection_cadence: usize,
     /// Telemetry configuration. Missing from older configs → defaults to
     /// enabled=None (consent-pending), endpoint=None (use the built-in default).
     /// Uses `#[serde(default)]` because `TelemetryConfig` has its own `Default`
@@ -94,6 +118,10 @@ pub struct Config {
     /// Only applies when working inside a git repository.
     #[serde(default)]
     pub auto_commit: bool,
+    /// Sub-agent execution policy. Missing from older configs → defaults to
+    /// enabled=true, initial_turns=4, max_turns=12, max_concurrent=3, timeout_secs=300.
+    #[serde(default)]
+    pub subagent: SubAgentConfig,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -172,9 +200,6 @@ impl Default for LspConfig {
 
 fn default_true() -> bool {
     true
-}
-fn default_reflection_cadence() -> usize {
-    7
 }
 fn default_notification_min_duration_secs() -> u64 {
     8
@@ -540,10 +565,10 @@ mod tests {
             },
             notifications: NotificationConfig::default(),
             auto_update: true,
-            reflection_cadence: 7,
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            subagent: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -666,35 +691,19 @@ mod reflection_config_tests {
     use super::*;
 
     #[test]
-    fn reflection_cadence_defaults_to_seven_when_missing_from_toml() {
-        let toml_text = r#"
-default_provider = "claude"
-[providers]
-"#;
-        let cfg: Config = toml::from_str(toml_text).expect("parses minimal config");
-        assert_eq!(cfg.reflection_cadence, 7);
-    }
-
-    #[test]
-    fn reflection_cadence_zero_means_disabled() {
-        let toml_text = r#"
-default_provider = "claude"
-reflection_cadence = 0
-[providers]
-"#;
-        let cfg: Config = toml::from_str(toml_text).expect("parses config with 0");
-        assert_eq!(cfg.reflection_cadence, 0);
-    }
-
-    #[test]
-    fn reflection_cadence_custom_value_is_preserved() {
+    fn legacy_reflection_cadence_field_is_silently_ignored() {
+        // Older configs in the wild still carry `reflection_cadence = 7`
+        // (the field's value at the time the mechanism was removed).
+        // toml + serde's default permissiveness means the unknown field
+        // is dropped without erroring; this test pins that behaviour so
+        // an accidental `#[serde(deny_unknown_fields)]` later doesn't
+        // start rejecting users' on-disk configs.
         let toml_text = r#"
 default_provider = "claude"
 reflection_cadence = 7
 [providers]
 "#;
-        let cfg: Config = toml::from_str(toml_text).expect("parses");
-        assert_eq!(cfg.reflection_cadence, 7);
+        let _cfg: Config = toml::from_str(toml_text).expect("legacy field ignored");
     }
 
     #[test]

@@ -55,10 +55,17 @@ impl Message {
         }
     }
 
-    /// Rough token estimate: chars / 3.5 for English, / 2 for CJK-heavy, + overhead per message.
-    /// This is intentionally conservative (overestimates) to avoid overflowing the context.
+    /// Rough token estimate: bytes / 4 with a per-message overhead.
+    ///
+    /// Note on accuracy: this is a coarse approximation regardless of language.
+    /// For OpenAI-style BPE tokenizers it tracks reality within ~30% on mixed
+    /// English+CJK code/prose. We deliberately keep the formula simple and
+    /// per-content-type aware (tool args expanded, ToolResultRef counted by
+    /// what's actually sent on the wire) — small refinements to the divisor
+    /// are dwarfed by tokenizer differences across providers, so anything
+    /// short of a real tokenizer would be false precision.
     pub fn estimate_tokens(&self) -> usize {
-        let char_count = match &self.content {
+        let byte_count = match &self.content {
             MessageContent::Text(s) => s.len(),
             MessageContent::AssistantWithToolCalls {
                 text,
@@ -66,6 +73,10 @@ impl Message {
                 reasoning_content,
             } => {
                 let text_len = text.as_ref().map_or(0, |t| t.len());
+                // Each tool_use contributes name + JSON-stringified args + a
+                // small per-call overhead (id, type, wrapper braces).
+                // Matches CC's `name + jsonStringify(input)` accounting in
+                // services/tokenEstimation.ts:roughTokenCountEstimationForBlock.
                 let calls_len: usize = tool_calls
                     .iter()
                     .map(|tc| tc.name.len() + tc.arguments.len() + 20)
@@ -74,12 +85,15 @@ impl Message {
                 text_len + calls_len + reasoning_len
             }
             MessageContent::ToolResult(r) => r.output.len() + 10,
-            // ToolResultRef: kept for backward compat (loading old conversations).
-            // Estimate from full size since old conversations may still contain these.
-            MessageContent::ToolResultRef(r) => r.byte_size + 10,
+            // ToolResultRef carries `byte_size` (the full original content
+            // size, kept for the cache lookup) AND `summary` (the short
+            // representation actually sent on the wire). The estimator must
+            // count what gets sent, not what's stashed on disk — the
+            // previous behaviour overestimated externalised results by 5-50×,
+            // pushing compression to fire on phantom budget pressure.
+            MessageContent::ToolResultRef(r) => r.summary.len() + 10,
         };
-        // ~4 chars per token for English, add 4 tokens overhead per message
-        (char_count / 4).max(1) + 4
+        (byte_count / 4).max(1) + 4
     }
 
     /// Create a condensed version of this message for context budget savings.

@@ -102,6 +102,85 @@ impl LlmProvider for MockProvider {
 }
 
 // ---------------------------------------------------------------------------
+// SequencedMockProvider: Multi-turn provider for SubAgent integration tests
+// ---------------------------------------------------------------------------
+
+/// Multi-turn provider: returns the i-th `Vec<StreamEvent>` on the i-th
+/// `chat_stream` call. Used to simulate hallucinating agents (turn 0:
+/// read_file, turn 1: read_file, ...) and recovery flows (turn 0:
+/// timeout error, turn 1: edit success).
+struct SequencedMockProvider {
+    sequences: std::sync::Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+}
+
+impl SequencedMockProvider {
+    fn new(sequences: Vec<Vec<StreamEvent>>) -> Self {
+        Self {
+            sequences: std::sync::Mutex::new(sequences.into()),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for SequencedMockProvider {
+    fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: Option<&[ToolDef]>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        let next = self
+            .sequences
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![StreamEvent::Done { truncated: false }]);
+        let events: Vec<Result<StreamEvent>> = next.into_iter().map(Ok).collect();
+        Ok(Box::pin(stream::iter(events)))
+    }
+    fn model_name(&self) -> &str {
+        "sequenced-mock"
+    }
+}
+
+/// Quick builder for a single-tool-call turn (used in sequenced tests).
+fn tool_call_events(call_id: &str, name: &str, args: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolCallStart {
+            id: call_id.into(),
+            name: name.into(),
+        },
+        StreamEvent::ToolCallDelta(args.into()),
+        StreamEvent::ToolCallDone(ToolCall {
+            id: call_id.into(),
+            name: name.into(),
+            arguments: args.into(),
+        }),
+        StreamEvent::Usage(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 8,
+            cached_tokens: 0,
+        }),
+        StreamEvent::Done { truncated: false },
+    ]
+}
+
+fn text_only_events(text: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::Delta(text.into()),
+        StreamEvent::Usage(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cached_tokens: 0,
+        }),
+        StreamEvent::Done { truncated: false },
+    ]
+}
+
+fn error_events(msg: &str) -> Vec<StreamEvent> {
+    vec![StreamEvent::Error(msg.into())]
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers: Mock Tools
 // ---------------------------------------------------------------------------
 
@@ -215,10 +294,10 @@ fn test_config() -> Config {
         datalog: Default::default(),
         notifications: Default::default(),
         auto_update: false,
-        reflection_cadence: 7,
         telemetry: Default::default(),
         lsp: Default::default(),
         auto_commit: false,
+        subagent: Default::default(),
     }
 }
 
@@ -262,7 +341,6 @@ fn make_runner(
         permission,
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
-        file_read_counts: std::collections::HashMap::new(),
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::empty()
         ),
@@ -1182,114 +1260,52 @@ fn test_rules_no_dynamic_content() {
 }
 
 // ===========================================================================
-// detect_call_loop — Pattern 1 (per-region read saturation) integration tests
+// detect_call_loop — read_file fully delegated to read_cache
 // ===========================================================================
 
-/// Scanning 5 distinct regions of a large file must NOT trip the cap.
-/// This was the regression captured in the v4.20 screenshot: the model read
-/// multiple function bodies of a 1592-line render.rs with correct offsets and
-/// hit the region cap on the Nth read even though every region was different.
+/// `read_file` calls bypass `detect_call_loop` entirely now: redundancy is
+/// handled by `tool/read.rs`'s read_cache (cache hit returns the same
+/// content + an escalating "you've read this N times" note). Pattern 2's
+/// hard BLOCKED was a soft text error that the model could ignore — and
+/// did, in observed sessions where the cap counter climbed to "5-call cap"
+/// across consecutive turns. Cheap-replay-with-note is strictly more
+/// useful: model gets the answer plus a clear stop signal.
+///
+/// This test pins the new contract: regardless of how many times the same
+/// `read_file` args are issued in a row, `detect_call_loop` returns `None`.
 #[test]
-fn detect_call_loop_does_not_block_scanning_distinct_regions() {
+fn detect_call_loop_skips_read_file_for_cache_to_handle() {
     let mut runner = make_runner(
         MockProvider::text_only(""),
         ToolRegistry::new(),
         auto_bypass(),
     );
-
-    // Five reads with offsets spaced well apart (>> READ_REGION_BUCKET).
-    let offsets = [1, 200, 400, 700, 1000];
-    for off in offsets {
-        let args = format!(
-            r#"{{"file_path":"/p/render.rs","offset":{},"limit":50}}"#,
-            off
-        );
-        let verdict = runner.detect_call_loop("read_file", &args);
+    let args = r#"{"file_path":"/p/x.rs","offset":1,"limit":50}"#;
+    for i in 1..=10 {
         assert!(
-            verdict.is_none(),
-            "offset {} should not block — it's a new region\nGot: {:?}",
-            off,
-            verdict
+            runner.detect_call_loop("read_file", args).is_none(),
+            "read_file call #{} must not be blocked at the loop guard",
+            i
         );
     }
 }
 
-/// Re-reading the SAME region 3 times MUST trip Pattern 1. Each call tweaks
-/// `limit` so the exact-args Pattern 2 guard does NOT fire first — this
-/// isolates Pattern 1's semantics ("same bucket, any args"). The realistic
-/// triggering pattern is the model cycling limit on an unreadable file
-/// trying to coax different output from the same slice.
+/// Other tools still get Pattern 2 protection: identical args 3+ times in
+/// a row without an intervening edit should fire BLOCKED. read_file
+/// exclusion in the previous test does not weaken this for grep/bash/etc.
 #[test]
-fn detect_call_loop_blocks_three_reads_of_same_region() {
+fn detect_call_loop_still_blocks_other_tools_on_exact_repeat() {
     let mut runner = make_runner(
         MockProvider::text_only(""),
         ToolRegistry::new(),
         auto_bypass(),
     );
-
-    // Same offset → same bucket, but varying limit so args_hash differs and
-    // Pattern 2 (identical-args) stays dormant.
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/doc.docx","offset":1,"limit":{}}}"#,
-            40 + i * 10
-        );
-        assert!(
-            runner.detect_call_loop("read_file", &args).is_none(),
-            "call #{} of same region should not block yet",
-            i
-        );
-    }
-    // 3rd read still in the same bucket → Pattern 1 fires.
-    let third = r#"{"file_path":"/p/doc.docx","offset":1,"limit":95}"#;
-    let blocked = runner.detect_call_loop("read_file", third);
-    let msg = blocked.expect("3rd call to same region must be blocked by Pattern 1");
-    assert!(
-        msg.contains("SAME region"),
-        "block message must mention 'SAME region' so the model understands why\nGot: {}",
-        msg
-    );
-    assert!(msg.contains("doc.docx"), "block message must name the file");
-}
-
-/// A successful edit on the same file clears every region's counter so
-/// post-edit verification reads aren't blocked even if some region was near
-/// the cap pre-edit.
-#[test]
-fn detect_call_loop_edit_resets_all_regions_for_file() {
-    let mut runner = make_runner(
-        MockProvider::text_only(""),
-        ToolRegistry::new(),
-        auto_bypass(),
-    );
-
-    // Two reads of the same bucket (one shy of the 3-call cap, varying limit
-    // so Pattern 2 stays dormant).
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#,
-            30 + i * 10
-        );
-        assert!(runner.detect_call_loop("read_file", &args).is_none());
-    }
-
-    // Edit on the same file → reset all region counts for x.rs.
-    let edit_args = r#"{"file_path":"/p/x.rs","old_string":"a","new_string":"b"}"#;
-    assert!(runner.detect_call_loop("edit_file", edit_args).is_none());
-
-    // The previously-hot bucket should now be freshly empty; 2 more reads
-    // stay unblocked post-edit (verifying the `retain` cleared the entry).
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#,
-            100 + i * 10
-        );
-        assert!(
-            runner.detect_call_loop("read_file", &args).is_none(),
-            "post-edit read #{} should not be blocked — edit reset the counter",
-            i
-        );
-    }
+    let args = r#"{"pattern":"foo","path":"."}"#;
+    assert!(runner.detect_call_loop("grep", args).is_none());
+    assert!(runner.detect_call_loop("grep", args).is_none());
+    let third = runner.detect_call_loop("grep", args);
+    let msg = third.expect("3rd identical grep must be blocked by Pattern 2");
+    assert!(msg.contains("identical arguments"));
 }
 
 // ===========================================================================
@@ -1469,7 +1485,6 @@ mod telemetry_tests {
             permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
             recently_edited_files: Vec::new(),
             recent_calls: Vec::new(),
-            file_read_counts: std::collections::HashMap::new(),
             hook_executor: std::sync::Arc::new(
                 crate::hook::executor::HookExecutor::empty()
             ),
@@ -1593,4 +1608,369 @@ mod telemetry_tests {
             assert!(had_error, "failed turn must set had_error=true");
         }
     }
+}
+
+// ===========================================================================
+// SubAgentTask integration tests (Task 9: resilience layer + 7 end-to-end)
+// ===========================================================================
+
+#[tokio::test]
+async fn sub_agent_normal_path_completes_one_turn() {
+    use crate::agent::sub_agent::SubAgentTask;
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("test.rs");
+    std::fs::write(&path, "foo\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let edit_args = format!(
+        r#"{{"file_path":"{}","old_string":"foo","new_string":"bar"}}"#,
+        path_str
+    );
+
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        tool_call_events("c1", "edit_file", &edit_args),
+        text_only_events("Done."),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "foo".into(),
+        task_instruction: "Replace foo with bar".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(
+            provider as Arc<dyn LlmProvider>,
+            tools,
+            &test_config(),
+            tmp.path(),
+            12,
+        )
+        .await;
+
+    assert!(result.success, "expected success, got: {:?}", result.failures);
+    assert!(
+        result.diagnostic.edited_files.iter().any(|f| f.contains("test.rs")),
+        "expected edit recorded in diagnostic"
+    );
+}
+
+#[tokio::test]
+async fn sub_agent_hallucinating_mock_breaks_after_nudge_unheeded() {
+    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("halluc.rs");
+    std::fs::write(&path, "stub\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let read_args = format!(r#"{{"file_path":"{}"}}"#, path_str);
+
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        tool_call_events("c1", "read_file", &read_args),
+        tool_call_events("c2", "read_file", &read_args),
+        tool_call_events("c3", "read_file", &read_args),
+        tool_call_events("c4", "read_file", &read_args),
+        tool_call_events("c5", "read_file", &read_args),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "stub".into(),
+        task_instruction: "Make changes".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    assert!(!result.success);
+    assert!(
+        result.failures.iter().any(|f| matches!(
+            f,
+            SubAgentFailure::NoProgress { .. }
+                | SubAgentFailure::HallucinationLoop { .. }
+                | SubAgentFailure::BudgetExhaustedNoEdits
+        )),
+        "expected NoProgress, HallucinationLoop, or BudgetExhaustedNoEdits, got: {:?}",
+        result.failures
+    );
+    assert!(
+        result.diagnostic.hallucination_nudges_sent >= 1,
+        "expected at least one nudge to fire"
+    );
+}
+
+#[tokio::test]
+async fn sub_agent_recovers_from_first_timeout_then_succeeds() {
+    use crate::agent::sub_agent::SubAgentTask;
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("recover.rs");
+    std::fs::write(&path, "x\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let edit_args = format!(
+        r#"{{"file_path":"{}","old_string":"x","new_string":"y"}}"#,
+        path_str
+    );
+
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        error_events("stream timeout after 60s"),
+        tool_call_events("c1", "edit_file", &edit_args),
+        text_only_events("Done."),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "x".into(),
+        task_instruction: "Replace x with y".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    assert!(result.success, "retry should recover; got failures: {:?}", result.failures);
+    assert_eq!(result.diagnostic.timeouts, 1, "exactly one timeout retry");
+}
+
+#[tokio::test]
+async fn sub_agent_provider_hard_error_breaks_immediately_no_retry() {
+    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("h.rs");
+    std::fs::write(&path, "x").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        error_events("401 Unauthorized"),
+        text_only_events("would-be retry"),  // never reached if no-retry works
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "x".into(),
+        task_instruction: "—".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    assert!(!result.success);
+    assert!(
+        result.failures.iter().any(|f| matches!(f, SubAgentFailure::ProviderError(_))),
+        "expected ProviderError, got: {:?}",
+        result.failures
+    );
+    assert_eq!(result.diagnostic.timeouts, 0, "non-timeout errors must not retry");
+}
+
+#[tokio::test]
+async fn sub_agent_blocked_tool_redirects_via_validate_args() {
+    use crate::agent::sub_agent::SubAgentTask;
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sand.rs");
+    std::fs::write(&path, "a\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let edit_args = format!(
+        r#"{{"file_path":"{}","old_string":"a","new_string":"b"}}"#,
+        path_str
+    );
+
+    // Turn 0: try bash (blocked by sandbox).
+    // Turn 1: receive "tool not available" → fall through to edit_file.
+    // Turn 2: done.
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        tool_call_events("c1", "bash", r#"{"command":"ls"}"#),
+        tool_call_events("c2", "edit_file", &edit_args),
+        text_only_events("done"),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "a".into(),
+        task_instruction: "—".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    // Bash was attempted but should not have run (filtered out of registry).
+    // Sandbox routed back, edit succeeded on turn 1.
+    assert!(result.success, "model recovered after sandbox redirect");
+    assert!(!result.diagnostic.edited_files.is_empty());
+}
+
+#[tokio::test]
+async fn sub_agent_failed_edit_doesnt_burn_progress_signal() {
+    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("fail.rs");
+    std::fs::write(&path, "actual content\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let bad_args = format!(
+        r#"{{"file_path":"{}","old_string":"NOT_THERE","new_string":"y"}}"#,
+        path_str
+    );
+
+    // 5 edit_file calls all with old_string that won't match.
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        tool_call_events("c1", "edit_file", &bad_args),
+        tool_call_events("c2", "edit_file", &bad_args),
+        tool_call_events("c3", "edit_file", &bad_args),
+        tool_call_events("c4", "edit_file", &bad_args),
+        tool_call_events("c5", "edit_file", &bad_args),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "actual content".into(),
+        task_instruction: "—".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    assert!(!result.success, "no successful edit should land");
+    assert!(
+        result.failures.iter().any(|f| matches!(
+            f,
+            SubAgentFailure::NoProgress { .. } | SubAgentFailure::BudgetExhaustedNoEdits
+        )),
+        "expected NoProgress or BudgetExhausted, got: {:?}",
+        result.failures
+    );
+    assert!(
+        result.diagnostic.edited_files.is_empty(),
+        "no successful edit means edited_files stays empty"
+    );
+}
+
+#[tokio::test]
+async fn sub_agent_pool_one_failure_doesnt_affect_others() {
+    use crate::agent::sub_agent::{SubAgentPool, SubAgentTask};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let good_path = tmp.path().join("good.rs");
+    let bad_path = tmp.path().join("bad.rs");
+    std::fs::write(&good_path, "x\n").unwrap();
+    std::fs::write(&bad_path, "y\n").unwrap();
+    let good_path_str = good_path.to_string_lossy().to_string();
+    let bad_path_str = bad_path.to_string_lossy().to_string();
+
+    let edit_args = format!(
+        r#"{{"file_path":"{}","old_string":"x","new_string":"z"}}"#,
+        good_path_str
+    );
+
+    // max_concurrent=1 forces serial: task A first (succeeds), task B second (401).
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        // task A: succeeds
+        tool_call_events("a1", "edit_file", &edit_args),
+        text_only_events("done"),
+        // task B: 401 hard error
+        error_events("401 Unauthorized"),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let pool = SubAgentPool {
+        tasks: vec![
+            SubAgentTask {
+                file_path: good_path_str,
+                file_content: "x".into(),
+                task_instruction: "—".into(),
+                contract: "—".into(),
+                sibling_skeletons: "".into(),
+            },
+            SubAgentTask {
+                file_path: bad_path_str,
+                file_content: "y".into(),
+                task_instruction: "—".into(),
+                contract: "—".into(),
+                sibling_skeletons: "".into(),
+            },
+        ],
+        max_concurrent: 1, // Force serial so the sequence is deterministic
+        timeout_secs: 60,
+    };
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let results = pool.execute_all(provider, tools, &test_config(), tmp.path(), &event_tx).await;
+
+    assert_eq!(results.len(), 2);
+    let succeeded = results.iter().filter(|r| r.success).count();
+    let failed = results.iter().filter(|r| !r.success).count();
+    assert_eq!(succeeded, 1, "exactly one task should succeed");
+    assert_eq!(failed, 1, "exactly one task should fail");
 }

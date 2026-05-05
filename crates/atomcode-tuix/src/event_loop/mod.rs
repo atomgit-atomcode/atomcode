@@ -3475,7 +3475,35 @@ fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::SubAgentProgress { .. } => {}
+        AgentEvent::SubAgentDispatchStart { count } => {
+            state.on_sub_agent_dispatch_start(count);
+        }
+        AgentEvent::SubAgentDispatchEnd => {
+            state.on_sub_agent_dispatch_end();
+        }
+        AgentEvent::SubAgentProgress { file, status } => {
+            // Per-file progress: emit a body-row line so the user sees
+            // each transition land. Without this, a 6-fork dispatch
+            // shows the pool header then 80 seconds of nothing.
+            let lower = status.to_lowercase();
+            let is_terminal =
+                lower.starts_with("done") || lower.starts_with("failed") || lower.starts_with("timeout");
+            if is_terminal {
+                state.on_sub_agent_settled();
+            }
+            // Empty `file` is the pool header ("Dispatching N parallel agents...");
+            // skip — the agent loop already pushed the human-readable
+            // "**Dispatching N sub-agents in parallel...**" via TextDelta.
+            if !file.is_empty() {
+                let icon = if is_terminal {
+                    if lower.starts_with("done") { "\u{2713}" } else { "\u{2717}" }
+                } else {
+                    "\u{21B3}" // ↳
+                };
+                renderer.render(UiLine::CommandOutput(format!("  {} {} — {}", icon, file, status)));
+                renderer.flush();
+            }
+        }
         AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
             let header = if success {
                 format!("  Background task complete ({} turn{}):\n", turns, if turns == 1 { "" } else { "s" })
@@ -3645,10 +3673,21 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         crate::state::AgentMode::Plan => Some("PLAN".to_string()),
         crate::state::AgentMode::Build => None,
     };
+    // Pull current ctx usage from the last ContextStats emission. Pre-
+    // first-turn `last_context` is None — render shows nothing then.
+    // Using `sent_tokens` (what was actually sent to the model on the
+    // last turn) instead of cumulative `total_tokens` because the user
+    // cares about "how close to overflow am I", not "how many tokens
+    // has this session burned in total". See render::StatusLine docs.
+    let (ctx_used, ctx_window) = match state.last_context.as_ref() {
+        Some(snap) => (snap.sent_tokens, snap.ctx_window),
+        None => (0, 0),
+    };
     crate::render::StatusLine {
         model,
         cwd,
-        total_tokens: state.total_tokens,
+        ctx_used,
+        ctx_window,
         hint,
         mode_indicator,
     }

@@ -190,7 +190,19 @@ pub enum AgentEvent {
     },
     /// An error occurred.
     Error(String),
-    /// Sub-agent progress (real-time parallel task display).
+    /// Sub-agent batch began. UI uses this to override the foreground
+    /// spinner label (which would otherwise stay frozen on the last tool
+    /// name while the foreground turn awaits `pool.execute_all`) and to
+    /// reset its progress counter.
+    SubAgentDispatchStart { count: usize },
+    /// Sub-agent batch ended (all tasks settled or pool returned). UI
+    /// clears the override so subsequent thinks/tools resume normal
+    /// label behaviour.
+    SubAgentDispatchEnd,
+    /// Per-task progress within an active sub-agent batch. `file=""`
+    /// signals the pool header; otherwise `file` is the target file
+    /// basename. `status` is a free-form human-readable transition
+    /// (`working...`, `done 12s · 3 turns`, `failed 8s`, `timeout 300s`).
     SubAgentProgress { file: String, status: String },
     /// `/background` task finished. `summary` is the final assistant text
     /// (truncated if long). `success` is false on error / timeout / cancel.
@@ -258,15 +270,15 @@ pub(crate) struct DisciplineState {
     pub is_negative_feedback: bool,
     pub recent_calls: Vec<(String, u64)>,
     pub build_fail_count: usize,
-    /// Per-region read counter; key shape matches `TurnRunner.file_read_counts`
-    /// so the post-turn "stuck" warning in `discipline::apply_post_turn_discipline`
-    /// reads what the agent loop writes. See `turn::runner::read_region_key`.
+    /// Per-region read counter feeding the post-turn "stuck" soft warning
+    /// in `discipline::apply_post_turn_discipline`. The hard per-region
+    /// read-saturation guard that previously lived alongside this counter
+    /// in `TurnRunner` was deleted in favour of cache-replay-with-note
+    /// behaviour in `tool/read.rs`. The soft warning here remains because
+    /// it injects a "you've re-read X repeatedly, re-plan" hint at turn
+    /// end — different mechanism, different intent. See
+    /// `turn::runner::read_region_key` for the key shape.
     pub file_read_counts: std::collections::HashMap<(String, u64), usize>,
-    /// Snapshot of `AgentLoop.tool_call_count` at the last cadence reflection
-    /// injection. The delta `tool_call_count - last_reflection_at_tool_count`
-    /// feeds `should_inject_reflection` in `discipline`. Resets together with
-    /// `tool_call_count` when a new user task chain starts.
-    pub last_reflection_at_tool_count: usize,
     pub scouting_count: usize,
     pub api_confirmed_working: bool,
     pub consecutive_edits_file: Option<String>,
@@ -524,6 +536,11 @@ impl AgentLoop {
         // Share tool registry between AgentLoop and TurnRunner via Arc.
         let shared_tools = std::sync::Arc::new(tool_registry);
 
+        // Hand the registry handle to ToolContext so active-dispatch tools
+        // (parallel_edit_files) can read it at execute time without
+        // creating a Tool ↔ Registry Arc cycle.
+        tool_context.tool_registry = Some(shared_tools.clone());
+
         // Convert Box → Arc so provider can be shared with sub-agents.
         let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
 
@@ -573,7 +590,6 @@ impl AgentLoop {
             permission: interactive_permission,
             recently_edited_files: Vec::new(),
             recent_calls: Vec::new(),
-            file_read_counts: std::collections::HashMap::new(),
             hook_executor: hook_executor.clone(),
         };
 
@@ -650,6 +666,25 @@ impl AgentLoop {
     /// Run the agent loop. This is the main entry point — call from a tokio task.
     /// The loop processes commands from the UI and emits events back.
     pub async fn run(mut self) {
+        // Active-dispatch tool registration. The model invokes
+        // `parallel_edit_files` explicitly when it judges parallel edit
+        // is the right move; the framework no longer infers from text.
+        // Gated on `subagent.enabled` so users can disable fork
+        // dispatch via `/config subagent.enabled false` without code
+        // changes — the tool simply isn't advertised to the model.
+        // Registered here (not in `new()`) because `register_arc` is
+        // async and `new()` is sync.
+        if self.config.subagent.enabled {
+            let tool = crate::tool::parallel_edit::ParallelEditTool {
+                provider: self.turn_runner.provider.clone(),
+                config: self.config.clone(),
+                event_tx: self.event_tx.clone(),
+            };
+            self.tool_registry
+                .register_arc("parallel_edit_files".to_string(), std::sync::Arc::new(tool))
+                .await;
+        }
+
         // Spawn background code graph indexer
         {
             let working_dir = self.turn_runner.context.working_dir.read().await.clone();
@@ -1154,10 +1189,6 @@ impl AgentLoop {
         self.conversation.add_user_message(&clean);
         self.turn_tokens = 0;
         self.tool_call_count = 0;
-        // Reset the reflection marker so the next cadence checkpoint is
-        // measured from the start of this new task chain, not from the
-        // tool count accumulated in the previous task.
-        self.discipline_state.last_reflection_at_tool_count = 0;
         self.turn_count = 0;
         self.retry_count = 0;
         self.discipline_state.recent_calls.clear();
@@ -1458,10 +1489,10 @@ impl AgentLoop {
                                                     .map(|n| n.to_string_lossy().to_string())
                                                     .unwrap_or_else(|| fp.to_string());
                                                 session_files.insert(short.clone(), std::path::PathBuf::from(fp));
-                                                // Track per-region read count for re-read guard.
-                                                // Key matches `TurnRunner.file_read_counts` shape so the
-                                                // post-turn warning in `discipline::apply_post_turn_discipline`
-                                                // agrees with the guard on what counts as "same region".
+                                                // Track per-region read count for the post-turn soft
+                                                // re-plan warning (see
+                                                // `discipline::apply_post_turn_discipline`).
+                                                // Hard guard removed; soft warning still uses this.
                                                 if name == "read_file" {
                                                     let working_dir = working_dir_for_read_counts.try_read().ok().map(|g| g.clone());
                                                     let key = crate::turn::runner::read_region_key(arguments, working_dir.as_deref());
@@ -1843,46 +1874,11 @@ impl AgentLoop {
                         self.discipline_state.silent_tool_rounds += 1;
                     }
 
-                    // Sub-agent extraction from UsedTools: model may output plan text
-                    // alongside tool calls (e.g. "Plan: 1. IdeaCenter.vue 2. ProductCenter.vue"
-                    // + read_file in the same turn). Only dispatch on the FIRST tool-use turn
-                    // (planning phase). If model has already been editing files, don't
-                    // re-dispatch — the text may just mention files it already changed.
-                    if let Some(ref plan_text) = text {
-                        if self.tool_call_count <= tool_count  // only first tool-use response
-                            && !self.subtask_driver.active
-                            && !plan_text.trim().is_empty()
-                        {
-                            self.subtask_driver.extract_from_plan(plan_text);
-                            if self.subtask_driver.active && self.subtask_driver.subtasks.len() >= 2
-                            {
-                                self.plan_text = Some(plan_text.clone());
-                                if let Some(sub_result) =
-                                    self.try_sub_agent_dispatch(plan_text).await
-                                {
-                                    let _ = self
-                                        .event_tx
-                                        .send(AgentEvent::TextDelta(sub_result.clone()));
-                                    self.subtask_driver = subtask_driver::SubtaskDriver::new();
-
-                                    if sub_result.contains("BUILD ERRORS") {
-                                        // Build failed — inject error, continue turn loop
-                                        self.conversation.add_user_message(&format!(
-                                            "[Sub-agent merge build FAILED. Fix the errors below, then summarize.]\n{}",
-                                            sub_result
-                                        ));
-                                    } else {
-                                        // Sub-agent results streamed via TextDelta above;
-                                        // no extra "Summarize" user-turn — it just triggers
-                                        // another round of re-narration. Let the turn stop naturally.
-                                        self.finish_turn(TurnStopReason::Natural);
-                                        return;
-                                    }
-                                }
-                                // Failed — fall through to serial execution
-                            }
-                        }
-                    }
+                    // Fork sub-agent dispatch is no longer driven by parsing this
+                    // turn's text. The model invokes `parallel_edit_files`
+                    // explicitly when it judges parallel edit is the right move.
+                    // See `crate::tool::parallel_edit` for the active-dispatch
+                    // tool and `agent/mod.rs::run` for its registration.
 
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
@@ -2353,302 +2349,16 @@ impl AgentLoop {
 
     // change_dir → services.rs
 
-    /// Try to dispatch sub-agents for parallel multi-file editing.
-    /// Returns Some(summary_text) if dispatch succeeded, None if it should
-    /// fall back to serial subtask execution.
-    async fn try_sub_agent_dispatch(&mut self, _plan_text: &str) -> Option<String> {
-        // Sub-agent disabled: 8 次实测全败，等 Phase 4 用 fork 模式重建。
-        // 当前 fallback 到 serial subtask execution（主 agent 串行编辑）。
-        return None;
-
-        #[allow(unreachable_code)]
-        let wd = self
-            .turn_runner
-            .context
-            .working_dir
-            .try_read()
-            .map(|g| g.clone())
-            .ok()?;
-
-        let subtasks = &self.subtask_driver.subtasks;
-        if subtasks.len() < 2 {
-            return None;
-        }
-
-        // Bug fix tasks should NOT use sub-agents — need serial diagnosis.
-        // Only feature development (create/implement/add/beautify) benefits from parallel.
-        let task_lower = self.current_task.to_lowercase();
-        let is_bugfix = task_lower.contains("报错")
-            || task_lower.contains("错误")
-            || task_lower.contains("修复")
-            || task_lower.contains("修一下")
-            || task_lower.contains("不行")
-            || task_lower.contains("fix")
-            || task_lower.contains("error")
-            || task_lower.contains("broken")
-            || task_lower.contains("bug")
-            || task_lower.contains("还是");
-        if is_bugfix {
-            return None;
-        }
-
-        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-            "\n\n**Dispatching {} sub-agents in parallel...**\n",
-            subtasks.len()
-        )));
-
-        // Read all target files. If any file can't be found, fall back to serial.
-        let mut tasks = Vec::new();
-        let mut all_file_contents: Vec<(String, String)> = Vec::new();
-
-        for subtask in subtasks {
-            // Try to find the file: first check direct path, then walk the tree.
-            let file_path = {
-                let direct = wd.join(&subtask.file);
-                if direct.exists() {
-                    direct
-                } else {
-                    // Walk directory tree to find the file by name
-                    match find_file_recursive(&wd, &subtask.file) {
-                        Some(p) => p,
-                        None => {
-                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                                "  Cannot find {}. Falling back to serial mode.\n",
-                                subtask.file
-                            )));
-                            return None;
-                        }
-                    }
-                }
-            };
-
-            let content = match std::fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(_) => {
-                    let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                        "  Cannot read {}. Falling back to serial mode.\n",
-                        subtask.file
-                    )));
-                    return None;
-                }
-            };
-
-            all_file_contents.push((file_path.to_string_lossy().to_string(), content));
-        }
-
-        // Generate sibling skeletons: compact view of other files
-        for i in 0..all_file_contents.len() {
-            let (ref file_path, ref _content) = all_file_contents[i];
-            let mut siblings = String::new();
-            for (j, (ref sib_path, ref sib_content)) in all_file_contents.iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                let short = std::path::Path::new(sib_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| sib_path.clone());
-                // Take first 30 lines as skeleton
-                let skeleton: String = sib_content.lines().take(30).collect::<Vec<_>>().join("\n");
-                siblings.push_str(&format!("### {}\n```\n{}\n```\n\n", short, skeleton));
-            }
-
-            // Extract the task instruction for this file from the plan
-            let file_name = &subtasks[i].file;
-            let task_instr = extract_file_instruction(_plan_text, file_name);
-
-            tasks.push(sub_agent::SubAgentTask {
-                file_path: file_path.clone(),
-                file_content: all_file_contents[i].1.clone(),
-                task_instruction: task_instr,
-                contract: extract_contract(_plan_text),
-                sibling_skeletons: siblings,
-            });
-        }
-
-        // Dispatch
-        let pool = sub_agent::SubAgentPool::new(tasks);
-        let provider = self.turn_runner.provider.clone();
-        let tools = self.tool_registry.clone();
-        let config = self.config.clone();
-
-        let results = pool
-            .execute_all(provider, tools, &config, &wd, &self.event_tx)
-            .await;
-
-        // Build summary
-        let mut summary = String::from("\n**Sub-agent results:**\n");
-        let mut all_success = true;
-        for r in &results {
-            let status = if r.success { "OK" } else { "FAILED" };
-            let short = std::path::Path::new(&r.file_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| r.file_path.clone());
-            summary.push_str(&format!(
-                "| {} | {} | {} turns | {} |\n",
-                short, status, r.turns_used, r.summary,
-            ));
-            if !r.success {
-                all_success = false;
-                for err in &r.errors {
-                    summary.push_str(&format!("  Error: {}\n", err));
-                }
-            }
-            // Track edited files
-            if r.success {
-                if !self.files_edited_this_turn.contains(&r.file_path) {
-                    self.files_edited_this_turn.push(r.file_path.clone());
-                }
-            }
-        }
-
-        if all_success {
-            summary.push_str(&format!(
-                "\nAll {} sub-agents completed successfully.\n",
-                results.len()
-            ));
-        } else {
-            let failed: Vec<_> = results.iter().filter(|r| !r.success).collect();
-            summary.push_str(&format!(
-                "\n{}/{} sub-agents failed.\n",
-                failed.len(),
-                results.len()
-            ));
-        }
-
-        // Merge verification: compile/build to catch cross-file errors.
-        // Search up to 2 levels deep for build markers (handles nested project dirs).
-        let build_cmd_and_dir = find_build_command(&wd);
-
-        if let Some((cmd, build_dir)) = build_cmd_and_dir {
-            let output = tokio::process::Command::new("sh")
-                .args(["-c", &cmd])
-                .current_dir(&build_dir)
-                .output()
-                .await;
-            if let Ok(out) = output {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let combined = format!("{}{}", stdout, stderr);
-                if !out.status.success() || combined.to_lowercase().contains("error") {
-                    let err_lines: String =
-                        combined.lines().take(10).collect::<Vec<_>>().join("\n");
-                    summary.push_str(&format!(
-                        "\n⚠ BUILD ERRORS after sub-agent merge:\n{}\nFix these errors before proceeding.\n",
-                        err_lines
-                    ));
-                } else {
-                    summary.push_str("\n✓ Build verification passed.\n");
-                }
-            }
-        }
-
-        Some(summary)
-    }
+    // try_sub_agent_dispatch → REMOVED. Fork sub-agent dispatch is now
+    // ACTIVE: the model invokes `parallel_edit_files` (see
+    // `crate::tool::parallel_edit`) when it judges parallel edit is the
+    // right move. The framework no longer parses plan text or guesses
+    // intent — eliminating ~250 lines of heuristics, ~70 hardcoded
+    // intent-keywords across two iterations of failed gate logic, and
+    // an entire class of mis-fire failures (read-only turns dispatching
+    // 6 fork sub-agents that fake edits or no-op).
 }
 
-/// Recursively search for a file by name under the given directory.
-/// Returns the first match. Skips hidden dirs, node_modules, target, etc.
-fn find_file_recursive(dir: &std::path::Path, file_name: &str) -> Option<std::path::PathBuf> {
-    let walker = ignore::WalkBuilder::new(dir)
-        .hidden(true) // skip hidden
-        .git_ignore(true) // respect .gitignore
-        .max_depth(Some(10))
-        .build();
-
-    for entry in walker {
-        if let Ok(e) = entry {
-            if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                if let Some(name) = e.path().file_name() {
-                    if name.to_string_lossy() == file_name {
-                        return Some(e.into_path());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract the instruction for a specific file from the plan text.
-/// Looks for lines mentioning the file name and returns them as context.
-fn extract_file_instruction(plan_text: &str, file_name: &str) -> String {
-    let mut relevant_lines = Vec::new();
-    for line in plan_text.lines() {
-        if line.contains(file_name) {
-            relevant_lines.push(line.trim().to_string());
-        }
-    }
-    if relevant_lines.is_empty() {
-        format!("Edit {} according to the plan.", file_name)
-    } else {
-        relevant_lines.join("\n")
-    }
-}
-
-/// Extract contract/interface information from the plan text.
-/// Looks for "Contract", "Interface", "API" sections.
-fn extract_contract(plan_text: &str) -> String {
-    let mut in_contract = false;
-    let mut contract_lines = Vec::new();
-    for line in plan_text.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("contract") || lower.contains("interface") || lower.contains("api") {
-            in_contract = true;
-        }
-        if in_contract {
-            contract_lines.push(line.to_string());
-            // Stop after a blank line following contract section
-            if line.trim().is_empty() && contract_lines.len() > 1 {
-                break;
-            }
-        }
-    }
-    if contract_lines.is_empty() {
-        "No explicit contract defined. Follow the plan.".to_string()
-    } else {
-        contract_lines.join("\n")
-    }
-}
-
-/// LEGACY: Hardcoded build marker detection. Used only by sub-agent merge verification.
-fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
-    let markers: &[(&str, &str)] = &[
-        ("package.json", "npm run build 2>&1 | head -30"),
-        ("Cargo.toml", "cargo check 2>&1 | tail -20"),
-        ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
-        ("go.mod", "go build ./... 2>&1 | tail -20"),
-    ];
-
-    // Check wd itself first
-    for &(marker, cmd) in markers {
-        if wd.join(marker).exists() {
-            return Some((cmd.to_string(), wd.to_path_buf()));
-        }
-    }
-
-    // Check immediate subdirectories (depth 1)
-    if let Ok(entries) = std::fs::read_dir(wd) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let sub = entry.path();
-                // Skip hidden dirs, node_modules, target, etc.
-                let name = sub.file_name().unwrap_or_default().to_string_lossy();
-                if name.starts_with('.') || name == "node_modules" || name == "target" {
-                    continue;
-                }
-                for &(marker, cmd) in markers {
-                    if sub.join(marker).exists() {
-                        return Some((cmd.to_string(), sub));
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
 
 fn track_tool_modified_files(
     tool_name: &str,
@@ -3284,3 +2994,4 @@ mod bash_deleted_file_tracking_tests {
         );
     }
 }
+

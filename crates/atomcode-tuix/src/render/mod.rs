@@ -219,13 +219,23 @@ pub enum HintSeverity {
     Info,
 }
 
-/// "model · cwd · tokens" chrome. Visible in both Idle and Streaming
-/// phases so the user always sees what provider is active.
+/// "model · cwd · ctx_used / ctx_window" chrome. Visible in both Idle
+/// and Streaming phases so the user always sees what provider is active
+/// and how much of the context window is currently in use. Cumulative
+/// session token totals are NOT shown here — they're per-session and
+/// don't tell the user whether the next turn is at risk of overflow.
+/// `ctx_used` answers "what does the model see right now"; `ctx_window`
+/// is the cap. Together they answer "how close are we to compaction".
 #[derive(Debug, Clone, Default)]
 pub struct StatusLine {
     pub model: String,
     pub cwd: String, // HOME replaced with "~"
-    pub total_tokens: usize,
+    /// Tokens currently in the model's context (last turn's `sent_tokens`).
+    /// Pre-first-turn this is 0; the renderer hides the field then.
+    pub ctx_used: usize,
+    /// Provider's context window (cap). 0 when not yet known — renderer
+    /// falls back to a bare "12.3k tok" display in that case.
+    pub ctx_window: usize,
     /// Right-aligned passive hint with severity. `Warning` renders red
     /// (no-provider nudge, CodingPlan model-missing); `Info` renders
     /// muted (upgrade banner, CodingPlan drift notice). None → no hint.

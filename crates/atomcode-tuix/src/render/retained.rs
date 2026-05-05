@@ -34,11 +34,26 @@ use crossterm::style::Color;
 
 const PAD_COL: usize = 2;
 
-fn format_token_count(n: usize) -> String {
-    if n < 1000 {
-        format!("{} tokens", n)
+/// Render context usage as `12.3k / 131k tok` when both used and window
+/// are known, or `12.3k tok` when only the used count is known (provider
+/// hasn't reported its window yet, e.g. pre-config or fallback).
+fn format_ctx_usage(used: usize, window: usize) -> String {
+    let used_label = if used < 1000 {
+        format!("{}", used)
     } else {
-        format!("{:.1}k tokens", (n as f64) / 1000.0)
+        format!("{:.1}k", (used as f64) / 1000.0)
+    };
+    if window == 0 {
+        format!("{} tok", used_label)
+    } else {
+        let window_label = if window < 1000 {
+            format!("{}", window)
+        } else if window % 1000 == 0 {
+            format!("{}k", window / 1000)
+        } else {
+            format!("{:.0}k", (window as f64) / 1000.0)
+        };
+        format!("{}/{} tok", used_label, window_label)
     }
 }
 
@@ -538,8 +553,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if !status.cwd.is_empty() {
             parts.push(scrub_controls(&status.cwd));
         }
-        if status.total_tokens > 0 {
-            parts.push(format_token_count(status.total_tokens));
+        if status.ctx_used > 0 {
+            parts.push(format_ctx_usage(status.ctx_used, status.ctx_window));
         }
         let left = parts.join(" · ");
         // Hint right-alignment math must reserve space for the mode badge
@@ -2332,6 +2347,39 @@ mod tests {
         Arc, Mutex,
     };
 
+    #[test]
+    fn ctx_usage_with_known_window_shows_ratio() {
+        // The user's actual ask: "10.4k tokens" alone is uninformative —
+        // they want to see how close to the limit the context is. With a
+        // window, render `used/window tok` so saturation is visible.
+        assert_eq!(format_ctx_usage(10_400, 131_000), "10.4k/131k tok");
+    }
+
+    #[test]
+    fn ctx_usage_keeps_round_window_clean() {
+        // 128k window is the common default — render as `128k`, not `128.0k`.
+        assert_eq!(format_ctx_usage(50_000, 128_000), "50.0k/128k tok");
+    }
+
+    #[test]
+    fn ctx_usage_without_window_shows_used_only() {
+        // Pre-first-turn / unknown-provider fallback — window unknown.
+        // Better to show the count alone than a misleading "/0".
+        assert_eq!(format_ctx_usage(10_400, 0), "10.4k tok");
+    }
+
+    #[test]
+    fn ctx_usage_under_one_thousand_keeps_raw_count() {
+        assert_eq!(format_ctx_usage(523, 131_000), "523/131k tok");
+        assert_eq!(format_ctx_usage(523, 0), "523 tok");
+    }
+
+    #[test]
+    fn ctx_usage_non_round_window_rounds_to_nearest_k() {
+        // GLM-5.1 endpoint ships a 131_072 window; we display 131k, not 131.072k.
+        assert_eq!(format_ctx_usage(50_000, 131_072), "50.0k/131k tok");
+    }
+
     fn caps_with_color() -> TerminalCaps {
         TerminalCaps::from_env(EnvView {
             is_stdout_tty: true,
@@ -2429,7 +2477,8 @@ mod tests {
         StatusLine {
             model: "glm-5".into(),
             cwd: "~/project/atomcode".into(),
-            total_tokens: 0,
+            ctx_used: 0,
+                ctx_window: 0,
             hint: None,
             mode_indicator: None,
         }
@@ -2449,7 +2498,8 @@ mod tests {
         let status = StatusLine {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
-            total_tokens: 0,
+            ctx_used: 0,
+                ctx_window: 0,
             hint: None,
             mode_indicator: Some("PLAN".into()),
         };

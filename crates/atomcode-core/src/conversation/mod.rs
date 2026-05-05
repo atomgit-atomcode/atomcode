@@ -466,6 +466,17 @@ fn clean_assistant_text(raw: &str) -> Option<String> {
         .replace("</think>", "")
         .replace("<|im_start|>", "")
         .replace("<|im_end|>", "");
+    // Strip orphan Qwen/GLM XML tool-call residue. `ToolCallStreamFilter`
+    // (turn/runner.rs) suppresses well-formed `<tool_call>...</tool_call>`
+    // blocks during streaming, but only when the markers are PAIRED. When
+    // the model dribbles out unpaired closes (`</tool_call>`,
+    // `</arg_value>`, etc.) — observed on glm-5.1 going off the rails on
+    // reasoning-heavy questions, e.g. 2026-05-05 atomgr 14:31:48 — those
+    // residual tags pass straight through the filter and land in the
+    // assistant text. Strip them here so they don't poison the next
+    // turn's context (the model would see its own broken markup as
+    // prior conversation and double down).
+    let stripped = strip_orphan_tool_call_xml(&stripped);
     // Strip leaked reasoning: MiniMax/DeepSeek sometimes output reasoning
     // as plain text (no `<think>` tag) followed by the actual response.
     // Detect by looking for the pattern: `要求/需要/让我/用户...`
@@ -475,21 +486,82 @@ fn clean_assistant_text(raw: &str) -> Option<String> {
     if stripped.trim().is_empty() {
         return None;
     }
-    if let Some(reason) = looks_corrupted(&stripped) {
+    if looks_corrupted(&stripped).is_some() {
         // Letting corrupted bytes land in history poisons every
         // subsequent turn — the model sees its own garbage as prior
         // context and either echoes more garbage or derails. Drop
-        // and surface a stderr line so the user/datalog has a trail;
-        // the turn loop sees an empty assistant turn and the user can
-        // `/retry` or switch models.
-        eprintln!(
-            "[conversation] dropping corrupted assistant output: reason={} len={}",
-            reason,
-            stripped.len()
-        );
+        // silently: writing to stderr leaks into the TUI render area
+        // (atomcode-tuix doesn't redirect/capture stderr), polluting
+        // the input box. The turn loop sees an empty assistant turn
+        // and the user can `/retry` or switch models.
         return None;
     }
     Some(stripped)
+}
+
+/// Strip orphan Qwen/GLM XML tool-call markup from a finalised assistant
+/// message. Companion to `ToolCallStreamFilter` (turn/runner.rs) which
+/// suppresses well-formed `<tool_call>...</tool_call>` blocks at stream
+/// time but ONLY when the open and close are paired. When a model
+/// dribbles out unpaired close tags (`</tool_call>`, `</arg_value>`,
+/// etc.) without a preceding `<tool_call>` opener, the stream filter
+/// stays in `inside=false` state and lets them through as plain text.
+///
+/// This function runs at finalize time on the cumulative assistant
+/// content. It removes:
+///   - `<tool_name>X</tool_name>` and `<arg_key>X</arg_key>` and
+///     `<arg_value>X</arg_value>` paired sub-elements (with their
+///     contents, since those contents are tool-call payloads, not
+///     prose)
+///   - any `<tool_call>` and `</tool_call>` tokens left after the
+///     paired-element sweep (could be orphan opens, orphan closes, or
+///     the wrappers around already-stripped sub-elements)
+///
+/// Conservative bail-out: if the input contains no closing tags from
+/// this set, return the input unchanged. Real prose and code virtually
+/// never contain `</tool_call>` etc. as literal text, so the false-
+/// positive risk on legitimate content is near-zero.
+fn strip_orphan_tool_call_xml(text: &str) -> String {
+    if !text.contains("</tool_call>")
+        && !text.contains("</tool_name>")
+        && !text.contains("</arg_key>")
+        && !text.contains("</arg_value>")
+    {
+        return text.to_string();
+    }
+
+    let mut out = text.to_string();
+
+    // Strip paired sub-elements first, since their inner content is
+    // tool-call payload (file paths, args, etc.) and would otherwise
+    // become orphan prose after the wrapper tags are removed.
+    for tag in &["tool_name", "arg_key", "arg_value"] {
+        let open = format!("<{}>", tag);
+        let close = format!("</{}>", tag);
+        loop {
+            let Some(o) = out.find(&open) else { break };
+            let after_open = o + open.len();
+            let Some(c_rel) = out[after_open..].find(&close) else {
+                // Unmatched open — drop the bare open token and keep
+                // looking. Don't take any subsequent text since we
+                // can't tell where the intended payload ends.
+                out.replace_range(o..after_open, "");
+                continue;
+            };
+            let c_end = after_open + c_rel + close.len();
+            out.replace_range(o..c_end, "");
+        }
+        // Sweep any remaining bare close tokens (orphan closes with no
+        // preceding open).
+        out = out.replace(&close, "");
+    }
+
+    // Finally remove the outer `<tool_call>` / `</tool_call>` wrappers,
+    // including any orphan ones. Done last so the inner cleanup above
+    // still anchors on the wrapper boundaries when they were paired.
+    out = out.replace("<tool_call>", "").replace("</tool_call>", "");
+
+    out
 }
 
 /// Detect output that almost-certainly came from a corrupted provider stream
@@ -557,10 +629,17 @@ pub fn looks_corrupted(text: &str) -> Option<&'static str> {
     // over. ASCII repetition is allowed (`====` separators, `....`
     // ellipses, indentation runs). Run counter tallies `c == prev`
     // events, so 5 consecutive identical chars produce run==4.
+    //
+    // Typographic chars (box drawing `─┌┐│═`, block elements `█▒░`,
+    // dashes `——`, ellipsis `…`, bullets `••`, middle dots `··`) are
+    // legitimate formatting — markdown tables and horizontal rules
+    // routinely repeat them dozens of times. Skipping these prevents
+    // false positives on perfectly valid model output (2026-05-03
+    // session: a markdown table with `─` × 30+ tripped this).
     let mut prev = '\0';
     let mut run = 0;
     for c in text.chars() {
-        if c == prev && c as u32 > 0x7F {
+        if c == prev && c as u32 > 0x7F && !is_typographic_repeat_safe(c) {
             run += 1;
             if run >= 4 {
                 return Some("stuck_non_ascii_repeat");
@@ -574,6 +653,20 @@ pub fn looks_corrupted(text: &str) -> Option<&'static str> {
     None
 }
 
+/// Code points where consecutive repetition is normal typography (markdown
+/// tables, horizontal rules, ASCII-art-style art, em-dash sequences) and
+/// should NOT trip the stuck-token corruption signal.
+fn is_typographic_repeat_safe(c: char) -> bool {
+    let cp = c as u32;
+    (0x2500..=0x257F).contains(&cp)        // Box Drawing (─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬ etc.)
+        || (0x2580..=0x259F).contains(&cp) // Block Elements (█▒░▀▄ etc.)
+        || (0x2010..=0x2015).contains(&cp) // hyphens, en-dash, em-dash, horizontal bar
+        || cp == 0x2026                    // …  ellipsis
+        || cp == 0x2022                    // •  bullet
+        || cp == 0x25E6                    // ◦  white bullet
+        || cp == 0x00B7                    // ·  middle dot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +677,82 @@ mod tests {
         let conv = Conversation::new();
         assert!(conv.messages.is_empty());
         assert!(conv.stream_buffer.is_none());
+    }
+
+    #[test]
+    fn strip_orphan_xml_no_op_on_plain_prose() {
+        // Real prose without any tool-call markup is returned byte-identical.
+        let text = "答案是可以 ping 通 10.0.0.1，因为服务端用了 TUN 设备。";
+        assert_eq!(strip_orphan_tool_call_xml(text), text);
+    }
+
+    #[test]
+    fn strip_orphan_xml_no_op_on_rust_generics() {
+        // Code with `<>` syntax (Rust generics, HTML, etc.) doesn't match
+        // any of our specific tool-call tag names, so the early bail-out
+        // keeps it untouched.
+        let text = "let x: Vec<HashMap<String, Arc<dyn Trait>>> = vec![];\n\
+                    println!(\"<not_a_tag>\");";
+        assert_eq!(strip_orphan_tool_call_xml(text), text);
+    }
+
+    #[test]
+    fn strip_orphan_xml_handles_dribbled_close() {
+        // Reproduces 2026-05-05 atomgr 14:31:48: model emits a paired
+        // tool_call (suppressed by the stream filter), then dribbles out
+        // a SECOND set of arg_key/arg_value/close tags WITHOUT a leading
+        // <tool_call>. The stream filter in `inside=false` state passes
+        // those orphan markers straight through. The sanitiser must
+        // strip them at finalize time so they don't poison the assistant
+        // message stored in history.
+        let text = "actual_host, e\n);\npanic!(...);\n}</arg_value>\
+                    <arg_key>limit</arg_key><arg_value>100</arg_value>\
+                    <arg_key>offset</arg_key><arg_value>350</arg_value></tool_call>";
+        let cleaned = strip_orphan_tool_call_xml(text);
+        assert!(!cleaned.contains("</tool_call>"), "got: {}", cleaned);
+        assert!(!cleaned.contains("<arg_key>"), "got: {}", cleaned);
+        assert!(!cleaned.contains("</arg_value>"), "got: {}", cleaned);
+        // Real prose at the head survives.
+        assert!(cleaned.contains("actual_host, e"));
+        assert!(cleaned.contains("panic!"));
+    }
+
+    #[test]
+    fn strip_orphan_xml_consumes_paired_inner_payloads() {
+        // Inner payloads (file paths, args) are NOT prose — they're
+        // tool-call inputs that happened to leak into text. Strip the
+        // payload along with the wrapper, otherwise they'd survive as
+        // unattributed text fragments in history.
+        let text = "Sure, let me check\n<tool_name>read_file</tool_name>\
+                    <arg_key>path</arg_key><arg_value>/tmp/x.rs</arg_value>";
+        let cleaned = strip_orphan_tool_call_xml(text);
+        assert!(!cleaned.contains("read_file"), "got: {}", cleaned);
+        assert!(!cleaned.contains("/tmp/x.rs"), "got: {}", cleaned);
+        assert!(cleaned.contains("Sure, let me check"));
+    }
+
+    #[test]
+    fn strip_orphan_xml_through_clean_assistant_text() {
+        // End-to-end: clean_assistant_text applies the sanitiser as part
+        // of its pipeline. A message that is ONLY orphan markup must end
+        // up as None (empty after stripping → drop the message) so it
+        // doesn't poison the next turn's prior context.
+        let only_residue = "<arg_key>limit</arg_key>\
+                            <arg_value>100</arg_value></tool_call>";
+        assert_eq!(clean_assistant_text(only_residue), None);
+    }
+
+    #[test]
+    fn strip_orphan_xml_leaves_lone_open_alone_when_no_closes_present() {
+        // Conservative bail: when the input has NO close tags from our
+        // set, we leave it untouched. This protects prose that
+        // legitimately discusses the XML format (e.g. documentation
+        // strings mentioning the `<tool_name>` element by name) from
+        // being mangled. The failure mode that motivated the sanitiser
+        // is dribbled CLOSE tags; orphan opens-only is not seen in real
+        // datalogs, so the conservative bail is correct.
+        let text = "the field is called `<tool_name>` and contains the function name";
+        assert_eq!(strip_orphan_tool_call_xml(text), text);
     }
 
     #[test]
@@ -951,6 +1120,44 @@ mod tests {
         // is allowed even past the 5-char run threshold
         assert_eq!(looks_corrupted("====================="), None);
         assert_eq!(looks_corrupted("Done. ......"), None);
+    }
+
+    /// 2026-05-03 session: a markdown table from `deepseek-v4-flash` running
+    /// on atomgr tripped Signal 4 because `─` (U+2500) repeated dozens of
+    /// times across table borders. The whitelist prevents this false positive
+    /// while still catching CJK / latin-ext-a stuck-token corruption.
+    #[test]
+    fn looks_corrupted_passes_markdown_table_borders() {
+        // Box drawing — markdown table from real datalog
+        let table = "┌───────────────────────┬──────────────────────────────────┐\n\
+                     │ 文件                  │ 动作                             │\n\
+                     ├───────────────────────┼──────────────────────────────────┤\n\
+                     │ src/main.rs           │ CLI 改为子命令                   │\n\
+                     └───────────────────────┴──────────────────────────────────┘";
+        assert_eq!(looks_corrupted(table), None);
+    }
+
+    #[test]
+    fn looks_corrupted_passes_horizontal_rules_and_typography() {
+        // Horizontal rules using box drawing, double, em-dash, ellipsis
+        assert_eq!(looks_corrupted(&"─".repeat(80)), None);
+        assert_eq!(looks_corrupted(&"═".repeat(40)), None);
+        assert_eq!(looks_corrupted(&"━".repeat(40)), None);
+        assert_eq!(looks_corrupted(&"—".repeat(20)), None); // em-dash
+        assert_eq!(looks_corrupted(&"…".repeat(20)), None); // ellipsis
+        assert_eq!(looks_corrupted(&"•".repeat(10)), None); // bullet
+        // Block elements
+        assert_eq!(looks_corrupted(&"█".repeat(20)), None);
+    }
+
+    #[test]
+    fn looks_corrupted_still_catches_real_cjk_corruption() {
+        // CJK repetition is NOT in the whitelist — still flagged. This
+        // is the actual stuck-token failure mode.
+        assert_eq!(
+            looks_corrupted(&format!("hi {}", "中".repeat(5))),
+            Some("stuck_non_ascii_repeat")
+        );
     }
 
     #[test]

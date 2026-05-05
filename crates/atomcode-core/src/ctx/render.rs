@@ -375,21 +375,50 @@ pub fn build_messages(
     )
 }
 
+/// Default reserved headroom subtracted from the context window to derive
+/// the auto-compression threshold. Mirrors CC's `AUTOCOMPACT_BUFFER_TOKENS`
+/// (services/compact/autoCompact.ts:62) which targets Claude's 200K
+/// window. atomcode runs across windows from 8K (Ollama) to 200K+, so the
+/// effective buffer is `min(AUTO_COMPACT_BUFFER_TOKENS, ctx_window / 4)`
+/// — for large windows you get the full 13K, for small windows it scales
+/// down to 25% of the window so the threshold stays meaningful.
+pub const AUTO_COMPACT_BUFFER_TOKENS: usize = 13_000;
+
+/// Compute the auto-compression trigger threshold for a given context
+/// window. Returns the token total above which `needs_compression` fires.
+///
+/// Formula: `ctx_window - min(AUTO_COMPACT_BUFFER_TOKENS, ctx_window / 4)`.
+/// At 131K window → 131K - 13K = 118K threshold. At 8K Ollama window
+/// → 8K - 2K = 6K threshold (since 8K/4 = 2K caps the buffer).
+pub fn auto_compact_threshold(token_budget: usize) -> usize {
+    let buffer = AUTO_COMPACT_BUFFER_TOKENS.min(token_budget / 4);
+    token_budget.saturating_sub(buffer)
+}
+
 /// Check if context needs compression.
 ///
-/// Threshold: `min(50% of budget, 50K tokens)`. Stable across many real
-/// sessions — do NOT lower without validating on long write-heavy
-/// sessions (agentarena) — 55% caused total context wipeout historically.
+/// Threshold: `ctx_window - AUTO_COMPACT_BUFFER_TOKENS` (absolute
+/// headroom, CC-style). The previous percentage-based formula
+/// (`min(50% of budget, 50K)`) had two structural problems:
+///
+/// 1. **Scale-dependent buffer.** A 32K window left 16K headroom; a
+///    131K window left 50K headroom (capped). The buffer the user
+///    actually needs — one streaming response plus the next round's
+///    tool results — doesn't scale with window size, so the percentage
+///    formula was generous on small windows and stingy on large ones.
+/// 2. **Unintuitive at debug time.** "Why did compression fire at 28%
+///    of my 131K window?" had to be reverse-derived from the `min(...)`
+///    cap. The new formula reads directly: "fire when fewer than 13K
+///    tokens remain".
+///
+/// The `messages.len() < 12` guard stays — needs a non-trivial backlog
+/// before compression is worthwhile, and 1 user msg can produce 15+
+/// messages so message count is the right unit.
 pub fn needs_compression(
     conv: &Conversation,
     system_prompt_tokens: usize,
     token_budget: usize,
 ) -> bool {
-    // Guard: need enough messages to make compression worthwhile.
-    // Uses message count instead of turn count because turn_tracker counts
-    // USER MESSAGES (1 user msg = 1 turn), but a single user message can
-    // produce 15+ LLM calls with 35+ messages. The old `turns.len() < 6`
-    // guard caused compression to NEVER trigger in agent-loop scenarios.
     if conv.messages.len() < 12 {
         return false;
     }
@@ -399,8 +428,7 @@ pub fn needs_compression(
             .iter()
             .map(|m| m.estimate_tokens())
             .sum::<usize>();
-    let threshold = (token_budget * 50 / 100).min(50000);
-    total > threshold
+    total > auto_compact_threshold(token_budget)
 }
 
 /// Build content for LLM compression.
@@ -726,13 +754,23 @@ fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars
                 .map(|s| s.as_str())
                 .unwrap_or("tool");
 
+            // read_file results are NEVER condensed by microcompact —
+            // honour what the doc comment at the top of this function
+            // already promises. The previous read_file branch collapsed
+            // file content to `[Read file (N lines): first_line]`
+            // (~60 bytes), forcing the model to re-read every file it
+            // had previously read once total chars crossed the 100K
+            // threshold. read.rs already has its own auto-skeleton
+            // truncation (Layer A) for files that don't fit; double-
+            // condensing here was the弱智化 mechanism observed in the
+            // 2026-05-05 atomgr session (server/mod.rs read 4× in
+            // 22 turns, api.rs hit the 3-call cap because the model
+            // saw only a one-line stub of its previous reads).
+            if tool_name == "read_file" {
+                continue;
+            }
+
             let summary = match tool_name {
-                "read_file" => {
-                    let line_count = r.output.lines().count();
-                    let first_line = r.output.lines().next().unwrap_or("");
-                    let hint: String = first_line.chars().take(60).collect();
-                    format!("[Read file ({} lines): {}]", line_count, hint)
-                }
                 "bash" => {
                     let first_line = r.output.lines().next().unwrap_or("(empty)");
                     let line_count = r.output.lines().count();
@@ -1007,6 +1045,92 @@ mod tests {
     }
 
     #[test]
+    fn auto_compact_threshold_large_window_uses_full_buffer() {
+        // 131K window: 131072 - 13000 = 118072. The user with the GLM-5.1
+        // self-hosted endpoint sees this exact case — large headroom, fixed
+        // buffer for one streaming response + next round's tool results.
+        assert_eq!(auto_compact_threshold(131_072), 118_072);
+        assert_eq!(auto_compact_threshold(200_000), 187_000);
+    }
+
+    #[test]
+    fn auto_compact_threshold_small_window_scales_buffer_down() {
+        // 8K Ollama: a fixed 13K buffer would underflow to 0 and force
+        // compression at every turn. Scaling cap (window/4) gives 2K
+        // buffer → 6K threshold, which fires at ~75% — tight but workable
+        // for small-window local models.
+        assert_eq!(auto_compact_threshold(8_000), 6_000);
+        assert_eq!(auto_compact_threshold(16_000), 12_000);
+        // At 52K the formulas cross over: window/4 = 13K = full buffer.
+        assert_eq!(auto_compact_threshold(52_000), 39_000);
+    }
+
+    #[test]
+    fn auto_compact_threshold_handles_degenerate_window() {
+        // ctx_window == 0 happens transiently before the provider config
+        // loads; saturating_sub keeps it from panicking. Threshold is 0,
+        // so any non-empty conversation trips the gate — caller's
+        // `messages.len() < 12` check still gates the actual fire.
+        assert_eq!(auto_compact_threshold(0), 0);
+    }
+
+    #[test]
+    fn needs_compression_fires_at_absolute_headroom_not_percentage() {
+        // Reproduces the user's debug confusion: under the prior formula
+        // a 131K window's threshold was `min(131K * 50%, 50K) = 50K` —
+        // compression fired at 38% of window, leaving 81K of phantom
+        // "available" headroom that wasn't actually used. The new
+        // formula fires at 118K (90% of window), matching the user's
+        // intuition of "fire when ~13K headroom remains".
+        //
+        // Test fixture: 15 alternating User/Assistant messages so the
+        // 12-message guard passes (`add_user_message` merges
+        // consecutive User msgs, which would collapse 15 calls into 1).
+        let mut conv = Conversation::new();
+        for i in 0..8 {
+            conv.messages.push(Message::new(Role::User, format!("u{}", i)));
+            conv.messages.push(Message::new(Role::Assistant, format!("a{}", i)));
+        }
+        assert_eq!(conv.messages.len(), 16);
+        assert!(!needs_compression(&conv, 0, 131_072));
+
+        // 500K bytes ≈ 125K tokens (byte / 4) → exceeds 118K threshold.
+        conv.messages
+            .push(Message::new(Role::User, "x".repeat(500_000)));
+        assert!(needs_compression(&conv, 0, 131_072));
+    }
+
+    #[test]
+    fn tool_result_ref_token_estimate_uses_summary_not_byte_size() {
+        // Pre-fix bug: ToolResultRef estimated from the full original
+        // content size (could be 50K+ for a large file read), but at
+        // send time only `r.summary` (a short string) was actually
+        // serialised. The estimator overcounted by 5-50× on
+        // externalised results, pushing compression to fire on phantom
+        // budget pressure.
+        use crate::conversation::message::MessageContent;
+        use crate::tool::result_store::ToolResultRef;
+
+        let big_ref = ToolResultRef {
+            call_id: "call_1".into(),
+            hash: "deadbeef".into(),
+            summary: "hello".into(), // 5 bytes
+            byte_size: 200_000,      // pretend the disk-cached blob is 200KB
+            success: true,
+        };
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::ToolResultRef(big_ref),
+        };
+        // (5 + 10) / 4 + 4 = 7. Pre-fix this was (200000 + 10) / 4 + 4 = 50006.
+        assert!(
+            msg.estimate_tokens() < 20,
+            "expected estimate to track summary size, got {}",
+            msg.estimate_tokens()
+        );
+    }
+
+    #[test]
     fn apply_model_directives_cn_lock_for_cjk_tier() {
         for id in ["qwen3-max", "deepseek-v3", "kimi-k2"] {
             let out = apply_model_directives("SYS", id);
@@ -1242,6 +1366,102 @@ mod tests {
             has_user,
             "last user message must always survive, got {} msgs",
             msgs.len()
+        );
+    }
+
+    #[test]
+    fn microcompact_preserves_read_file_full_content() {
+        // 2026-05-05 atomgr session reproduced this bug: once L3
+        // microcompact's threshold (100K chars) was crossed, every
+        // pre-existing read_file result got collapsed to
+        // `[Read file (N lines): first_line]` (~60 bytes), forcing the
+        // model to re-read every file it had previously read.
+        // server/mod.rs was read 4× across 22 turns and api.rs hit the
+        // 3-call cap because the model's "previous read" was a 1-line
+        // stub. read.rs's auto-skeleton (Layer A) is the single
+        // authority for read_file truncation; microcompact must NOT
+        // double-condense.
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Build a conversation with one large read_file result followed
+        // by enough other tool results to push total chars past the
+        // 100K threshold.
+        conv.add_user_message("read these files");
+
+        // 1 read_file with substantial body — what we're asserting
+        // survives microcompact intact.
+        let read_call = ToolCall {
+            id: "c_read".into(),
+            name: "read_file".into(),
+            arguments: "{\"file_path\":\"src/server/mod.rs\"}".into(),
+        };
+        conv.add_assistant_tool_calls(Some("read it"), vec![read_call], None);
+        let read_body = "// SPDX-License-Identifier: MIT\n".to_string()
+            + &"pub fn server_loop() { /* ... */ }\n".repeat(80);
+        conv.add_tool_result(ToolResult {
+            call_id: "c_read".into(),
+            output: read_body.clone(),
+            success: true,
+        });
+
+        // Pad with bash results to push total chars over 100K threshold
+        // while keeping message_count > 20 (the OTHER_KEEP guard).
+        for i in 0..30 {
+            let call = ToolCall {
+                id: format!("c_b{}", i),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            };
+            conv.add_assistant_tool_calls(None, vec![call], None);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("c_b{}", i),
+                output: format!("[elapsed: 0.1s, exit: 0]\n{}", "x".repeat(4_000)),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what");
+
+        let (msgs, _) = build_messages(&conv, "sys", 131_072, "");
+
+        // The read_file result must still carry the original body.
+        // Pre-fix it would be replaced with `[Read file (N lines): ...]`.
+        let read_result_msg = msgs
+            .iter()
+            .find(|m| {
+                if let MessageContent::ToolResult(r) = &m.content {
+                    r.call_id == "c_read"
+                } else {
+                    false
+                }
+            })
+            .expect("read_file ToolResult should still be in the rendered messages");
+
+        if let MessageContent::ToolResult(r) = &read_result_msg.content {
+            assert!(
+                !r.output.starts_with("[Read file"),
+                "read_file result was condensed by microcompact (got: {:?})",
+                &r.output[..r.output.len().min(80)]
+            );
+            assert_eq!(
+                r.output, read_body,
+                "read_file result must be byte-identical to the original"
+            );
+        }
+
+        // Sanity: bash results past the OTHER_KEEP=20 window SHOULD be
+        // condensed, otherwise the test isn't actually exercising the
+        // microcompact path.
+        let condensed_bash = msgs.iter().any(|m| {
+            if let MessageContent::ToolResult(r) = &m.content {
+                r.output.starts_with("[bash (")
+            } else {
+                false
+            }
+        });
+        assert!(
+            condensed_bash,
+            "test fixture didn't trigger microcompact — fix the threshold setup"
         );
     }
 

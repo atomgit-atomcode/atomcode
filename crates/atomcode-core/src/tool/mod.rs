@@ -11,6 +11,7 @@ pub mod glob;
 pub mod grep;
 pub mod list_dir;
 pub mod list_symbols;
+pub mod parallel_edit;
 pub mod read;
 pub mod read_symbol;
 pub mod result_store;
@@ -654,10 +655,18 @@ impl PermissionStore {
 /// args the model sent — different slicing windows cache separately.
 pub type ReadCacheKey = (PathBuf, Option<usize>, Option<usize>);
 
-/// Read cache entry: (file mtime at cache time, rendered tool output).
-/// mtime acts as the invalidation signal — if disk mtime differs on next read,
-/// the cache is stale regardless of other state (edit/write tools change mtime).
-pub type ReadCacheEntry = (std::time::SystemTime, String);
+/// Read cache entry: (file mtime at cache time, rendered tool output, number of
+/// times this exact (path, offset, limit, mtime) tuple has been served).
+///
+/// The hit count drives the "you keep re-reading the same region" hint emitted
+/// by `read.rs` on cache hits — it replaced the prior `runner.rs` BLOCKED guard
+/// (deleted alongside) which was a soft-text error the model could ignore. By
+/// returning the cached content WITH a count-aware note instead of refusing the
+/// call, the framework lets the model see that the answer hasn't changed
+/// while still giving a clear "stop re-reading" signal. mtime is still the
+/// invalidation key — if disk mtime differs on next read, the entry is replaced
+/// and the count resets to 1.
+pub type ReadCacheEntry = (std::time::SystemTime, String, usize);
 
 /// Holds a shared working directory that tools can read (and `CdTool` can write).
 #[derive(Clone)]
@@ -701,6 +710,14 @@ pub struct ToolContext {
     pub event_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::turn::event::TurnEvent>>>,
     /// Current tool call ID for event correlation.
     pub current_call_id: Option<String>,
+    /// Shared registry handle for tools that dispatch fork sub-agents
+    /// (currently only `parallel_edit_files`). Set by `AgentLoop::new`
+    /// after the registry is wrapped in `Arc`. Reading the registry via
+    /// `ctx` instead of holding it in the tool struct avoids creating a
+    /// `Tool ↔ Registry` `Arc` cycle that would otherwise leak memory
+    /// for the lifetime of the process. `None` in headless / test
+    /// contexts that don't need fork dispatch.
+    pub tool_registry: Option<Arc<ToolRegistry>>,
 }
 
 impl ToolContext {
@@ -734,6 +751,7 @@ impl ToolContext {
             lsp: None,
             event_tx: None,
             current_call_id: None,
+            tool_registry: None,
         }
     }
 
@@ -935,6 +953,7 @@ impl ToolRegistry {
         }
         n
     }
+
 }
 
 /// Wrapper key names atomgit's gateway has been observed to inject around

@@ -411,13 +411,6 @@ struct Cli {
     #[arg(long)]
     max_turns: Option<usize>,
 
-    /// Inject a "restate goal / what ruled out / next output" reflection
-    /// prompt every N tool calls. 0 disables the checkpoint entirely.
-    /// Overrides the value in config.toml for this run. Default: use
-    /// config.toml's reflection_cadence (which itself defaults to 10).
-    #[arg(long, value_name = "N")]
-    reflection_cadence: Option<usize>,
-
     /// Disable auto-update for this launch. Skips applying any staged
     /// upgrade, skips the sync stage+apply on startup, and skips the
     /// detached background stager. Use during local development so a
@@ -893,10 +886,10 @@ async fn run() -> Result<i32> {
                 datalog: Default::default(),
                 notifications: Default::default(),
                 auto_update: true,
-                reflection_cadence: 7,
                 telemetry: Default::default(),
                 lsp: Default::default(),
                 auto_commit: false,
+                subagent: Default::default(),
             }
         })
     } else {
@@ -908,10 +901,10 @@ async fn run() -> Result<i32> {
             datalog: Default::default(),
             notifications: Default::default(),
             auto_update: true,
-            reflection_cadence: 7,
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            subagent: Default::default(),
         }
     };
 
@@ -1164,11 +1157,6 @@ async fn run() -> Result<i32> {
         conversation,
     );
     agent_loop.set_max_turns(cli.max_turns);
-    // CLI override for the cadence reflection knob. Matches the max_turns
-    // pattern — leave unset to honor config.toml; explicitly pass to force.
-    if let Some(n) = cli.reflection_cadence {
-        agent_loop.config.reflection_cadence = n;
-    }
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
     // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
@@ -1508,6 +1496,16 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
+            AgentEvent::SubAgentDispatchStart { count } => {
+                if verbose {
+                    eprintln!("[sub-agent] dispatching {} in parallel", count);
+                }
+            }
+            AgentEvent::SubAgentDispatchEnd => {
+                if verbose {
+                    eprintln!("[sub-agent] dispatch complete");
+                }
+            }
             AgentEvent::SubAgentProgress { file, status } => {
                 if verbose {
                     eprintln!("[sub-agent] {} {}", file, status);
@@ -1829,11 +1827,11 @@ fn run_codingplan_core(
             providers: std::collections::HashMap::new(),
             datalog: Default::default(),
             auto_update: true,
-            reflection_cadence: 7,
             notifications: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            subagent: Default::default(),
         },
     };
 
