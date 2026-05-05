@@ -382,49 +382,70 @@ impl LlmProvider for OpenAiProvider {
             body["thinking"] = th;
         }
 
-        let request = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body);
-
         let policy = crate::provider::retry::RetryPolicy::default_policy();
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // Move the pieces needed to rebuild the request into the task — the
+        // outer mid-stream retry loop reconstructs the builder on each
+        // attempt because `RequestBuilder` is single-use.
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+
         tokio::spawn(async move {
-            let response = match crate::provider::retry::send_with_retry(request, &policy).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    let _ = tx.send(Ok(StreamEvent::Error(format!("Connection failed: {}", e))));
+            // Mid-stream retry: when the provider opens the stream but the
+            // chunked body errors out BEFORE any SSE `data:` line is parsed,
+            // it's safe to redo the whole request — no text/tool-call has
+            // been committed to the conversation, no UI delta has been
+            // emitted. Common cause: self-hosted endpoints that reset the
+            // connection at request open under load (the failure mode
+            // `error decoding response body` surfaces as). Once `data:` has
+            // been seen, retry would produce duplicated output, so the
+            // error is surfaced verbatim with a humanised explanation.
+            const MAX_STREAM_ATTEMPTS: u32 = 2;
+            let mut attempt: u32 = 0;
+            'retry: loop {
+                attempt += 1;
+                let request = client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&body);
+
+                let response = match crate::provider::retry::send_with_retry(request, &policy).await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        let _ = tx.send(Ok(StreamEvent::Error(format!(
+                            "Connection failed: {}",
+                            e
+                        ))));
+                        return;
+                    }
+                };
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let resp_url = response.url().to_string();
+                    let body = response.text().await.unwrap_or_default();
+                    let _ = tx.send(Ok(StreamEvent::Error(format!(
+                        "API error ({}) at `{}`:\n{}",
+                        status, resp_url, body
+                    ))));
                     return;
                 }
-            };
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let resp_url = response.url().to_string();
-                let body = response.text().await.unwrap_or_default();
-                let _ = tx.send(Ok(StreamEvent::Error(format!(
-                    "API error ({}) at `{}`:\n{}",
-                    status, resp_url, body
-                ))));
-                return;
-            }
-
-            // Use byte buffer to properly handle UTF-8 characters that span chunk boundaries
-            let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
-            let mut buffer = String::new();
-            let mut byte_stream = response.bytes_stream();
-            // Track multiple tool calls by index: Vec<(id, name, args)>
-            let mut tool_calls: Vec<(String, String, String)> = Vec::new();
-            // Track the last usage report — some providers (DeepSeek) send cumulative
-            // usage in every chunk, so we only emit the final value.
-            let mut last_usage: Option<crate::stream::TokenUsage> = None;
-            let mut saw_data_line = false;
-            let mut saw_valid_chunk = false;
-            let mut invalid_chunk_samples: Vec<String> = Vec::new();
+                // Per-attempt local state. Reset on each retry so a partial
+                // first attempt's accumulated bytes don't leak into the
+                // second attempt's parser.
+                let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
+                let mut buffer = String::new();
+                let mut byte_stream = response.bytes_stream();
+                let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+                let mut last_usage: Option<crate::stream::TokenUsage> = None;
+                let mut saw_data_line = false;
+                let mut saw_valid_chunk = false;
+                let mut invalid_chunk_samples: Vec<String> = Vec::new();
 
             loop {
                 // 120s idle timeout: if no data arrives for 2 minutes, treat as dead connection.
@@ -449,7 +470,17 @@ impl LlmProvider for OpenAiProvider {
                         byte_buffer.extend_from_slice(&bytes);
                     }
                     Err(e) => {
-                        let _ = tx.send(Ok(StreamEvent::Error(e.to_string())));
+                        // Safe-to-retry condition: stream opened but no SSE
+                        // `data:` line was parsed yet. Common with
+                        // self-hosted endpoints that open the response,
+                        // immediately fail to start streaming, and reset
+                        // the chunked body — at this point nothing has
+                        // been committed downstream, so a fresh request
+                        // is equivalent to a first attempt.
+                        if !saw_data_line && attempt < MAX_STREAM_ATTEMPTS {
+                            continue 'retry;
+                        }
+                        let _ = tx.send(Ok(StreamEvent::Error(humanise_stream_error(&e))));
                         return;
                     }
                 }
@@ -648,7 +679,9 @@ impl LlmProvider for OpenAiProvider {
                 return;
             }
 
-            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                return;
+            }
         });
 
         Ok(Box::pin(
@@ -778,6 +811,47 @@ fn sample_for_error(s: &str) -> String {
         sample.push_str("...");
     }
     sample
+}
+
+/// Translate a `reqwest::Error` from the streaming body into something a
+/// non-engineer user can act on. The bare `Display` for these errors is
+/// shaped for HTTP-protocol context ("error decoding response body",
+/// "operation timed out") and lands in the chat as gibberish — users
+/// can't tell whether to retry, switch providers, or wait. Three buckets:
+///
+/// 1. `is_decode()` — the most common self-hosted-endpoint failure: the
+///    server cut the chunked body mid-flight (worker timeout, OOM,
+///    upstream proxy reset). Recoverable by resending; tell the user so.
+/// 2. `is_timeout()` — request-level timeout. Same recovery signal.
+/// 3. `is_connect()` — TCP connect failed late (rare mid-stream, but
+///    possible on connection-pool churn). Recoverable.
+/// Everything else falls through to the bare error text.
+pub(crate) fn humanise_stream_error(e: &reqwest::Error) -> String {
+    if e.is_decode() {
+        format!(
+            "Endpoint terminated the response stream mid-flight ({}). \
+             The provider may have hit a worker timeout or upstream-proxy \
+             read limit on a long generation. Try resending the message; \
+             if it recurs, increase the endpoint's read/write timeouts \
+             or split the request into smaller chunks.",
+            e
+        )
+    } else if e.is_timeout() {
+        format!(
+            "Stream timeout ({}). The provider didn't deliver chunks \
+             within the configured window. Try resending or check provider \
+             status.",
+            e
+        )
+    } else if e.is_connect() {
+        format!(
+            "Connection lost mid-stream ({}). Try resending; check \
+             network reachability if it persists.",
+            e
+        )
+    } else {
+        format!("Stream error: {}", e)
+    }
 }
 
 #[cfg(test)]
