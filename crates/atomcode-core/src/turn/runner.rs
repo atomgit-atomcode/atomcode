@@ -49,21 +49,16 @@ pub struct TurnRunner {
     /// covers `(file_path, offset, limit)` so paginating through distinct
     /// regions is not treated as a repeat; see `loop_args_hash`.
     pub recent_calls: Vec<(String, u64)>,
-    /// Per-region read counter, keyed by `(basename, offset / READ_REGION_BUCKET)`.
-    /// The region bucket means "scanning different parts of a large file" counts
-    /// as separate keys — only reading the *same* region 3+ times in a turn is
-    /// treated as a panic loop (typical of Office binaries, encoding mismatches,
-    /// or the model cycling offset/limit on an unreadable file).
-    pub file_read_counts: std::collections::HashMap<(String, u64), u32>,
     /// Hook executor — runs user-configured lifecycle hooks at tool execution boundaries.
     pub hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
 }
 
-/// Line-granularity of the read-region bucket used in `file_read_counts`.
-/// A single function body typically fits in one bucket (most are < 50 lines),
-/// so reading different functions of a large file produces different keys
-/// and doesn't cap. Shared so `DisciplineState` and the agent loop write
-/// counts under the same key the guard will read back.
+/// Line-granularity of the read-region bucket used by the discipline-layer
+/// re-read soft warning (see `agent/discipline.rs`). A single function body
+/// typically fits in one bucket (most are < 50 lines), so reading different
+/// functions of a large file produces different keys and doesn't trigger
+/// the warning. Shared with `DisciplineState` via `read_region_key` so
+/// writes and reads agree on the key shape.
 pub(crate) const READ_REGION_BUCKET: u64 = 50;
 
 /// Extract the region-bucket key for a `read_file` call so that writers
@@ -1302,71 +1297,30 @@ impl TurnRunner {
     ///
     /// Two patterns are caught:
     ///
-    /// 1. **Per-region read saturation** (`read_file` specific):
-    ///    3 unbroken `read_file` calls against the *same region* of a file
-    ///    (basename + offset bucket). Paginating through distinct regions of
-    ///    a large file produces different keys and does NOT trip — this
-    ///    specifically targets the panic loop where the model re-reads the
-    ///    same slice hoping for different content (Office binary, encoding
-    ///    mismatch, etc.). Reset by a successful `edit_file` / `write_file`
-    ///    targeting the same file (clears ALL regions for that file).
+    /// **Exact repeats** (any tool except `read_file`): 3 calls with identical
+    /// `(tool_name, args_hash)` and no intervening `edit_file` / `write_file`.
+    /// Means the model re-issued the same command without reacting to the
+    /// previous failure.
     ///
-    /// 2. **Exact repeats** (any tool): 3 calls with identical `(tool_name,
-    ///    args_hash)` and no intervening `edit_file` / `write_file`. Means
-    ///    the model re-issued the same command without reacting to the
-    ///    previous failure.
-    ///
-    /// For `read_file`, the hash covers `(file_path, offset, limit)` so that
-    /// paginating through distinct regions of a large file does NOT count as
-    /// a loop — only literal re-reads do.
+    /// `read_file` is excluded because its dedicated cache (see
+    /// `tool/read.rs`'s `read_cache` lookup) handles repeats by returning the
+    /// cached output WITH a count-aware "you've read this N times" note —
+    /// strictly more useful than a BLOCKED text error, which the model could
+    /// (and did) ignore. The prior `Pattern 1: per-region read saturation`
+    /// guard was deleted in the same commit; both Pattern 1 and the
+    /// `file_read_counts` field it owned are gone. The discipline-layer
+    /// post-turn re-read warning still tracks reads via its own counter
+    /// in `DisciplineState` and continues to fire as a soft re-plan hint.
     pub(super) fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
-        // --- Pattern 1: per-region read saturation ----------------------------
         let working_dir = self.context.working_dir.try_read().ok().map(|g| g.clone());
+
+        // `read_file` is handled by the read cache — fall through without
+        // recording a signature so its replays don't poison the cross-tool
+        // repeat detector either.
         if tool_name == "read_file" {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                    let display_name = std::path::Path::new(fp)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| fp.to_string());
-                    let key = read_region_key(args, working_dir.as_deref());
-                    let count = self.file_read_counts.entry(key).or_insert(0);
-                    *count += 1;
-                    if *count >= 3 {
-                        return Some(format!(
-                            "BLOCKED: read_file '{}' hit its {}-call cap for the SAME region of this file. \
-                             You keep requesting the same slice and getting the same output. \
-                             First, check that the path itself is right — if you're using a relative \
-                             or basename-only path, the user may have mentioned a specific absolute \
-                             path (e.g. ~/some/dir/file) that you should be using instead. \
-                             If you need more of this file, pass a different offset to jump elsewhere. \
-                             If you're stuck because the file is unreadable (Office binary, PDF, \
-                             encoding mismatch), switch to a bash converter \
-                             (pandoc / pdftotext / antiword / unzip for .docx) or tell the user \
-                             the format isn't supported. \
-                             Do not re-read this region again in this turn.",
-                            display_name, count
-                        ));
-                    }
-                }
-            }
+            return None;
         }
 
-        // A successful edit on a file clears ALL of that file's region counts,
-        // so post-edit verification reads (potentially covering different parts)
-        // aren't blocked. `edit_file` / `write_file` also clear the global
-        // recent-repeat list further down.
-        if matches!(tool_name, "edit_file" | "write_file" | "create_file") {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                    let file_key = canonical_or_lexical_path_key(fp, working_dir.as_deref());
-                    self.file_read_counts
-                        .retain(|(file, _), _| file != &file_key);
-                }
-            }
-        }
-
-        // --- Pattern 2: exact-repeat across any tool --------------------------
         let args_hash = loop_args_hash(tool_name, args, working_dir.as_deref());
         let sig = (tool_name.to_string(), args_hash);
 

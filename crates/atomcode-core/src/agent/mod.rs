@@ -270,9 +270,14 @@ pub(crate) struct DisciplineState {
     pub is_negative_feedback: bool,
     pub recent_calls: Vec<(String, u64)>,
     pub build_fail_count: usize,
-    /// Per-region read counter; key shape matches `TurnRunner.file_read_counts`
-    /// so the post-turn "stuck" warning in `discipline::apply_post_turn_discipline`
-    /// reads what the agent loop writes. See `turn::runner::read_region_key`.
+    /// Per-region read counter feeding the post-turn "stuck" soft warning
+    /// in `discipline::apply_post_turn_discipline`. The hard per-region
+    /// read-saturation guard that previously lived alongside this counter
+    /// in `TurnRunner` was deleted in favour of cache-replay-with-note
+    /// behaviour in `tool/read.rs`. The soft warning here remains because
+    /// it injects a "you've re-read X repeatedly, re-plan" hint at turn
+    /// end — different mechanism, different intent. See
+    /// `turn::runner::read_region_key` for the key shape.
     pub file_read_counts: std::collections::HashMap<(String, u64), usize>,
     pub scouting_count: usize,
     pub api_confirmed_working: bool,
@@ -585,7 +590,6 @@ impl AgentLoop {
             permission: interactive_permission,
             recently_edited_files: Vec::new(),
             recent_calls: Vec::new(),
-            file_read_counts: std::collections::HashMap::new(),
             hook_executor: hook_executor.clone(),
         };
 
@@ -1485,10 +1489,10 @@ impl AgentLoop {
                                                     .map(|n| n.to_string_lossy().to_string())
                                                     .unwrap_or_else(|| fp.to_string());
                                                 session_files.insert(short.clone(), std::path::PathBuf::from(fp));
-                                                // Track per-region read count for re-read guard.
-                                                // Key matches `TurnRunner.file_read_counts` shape so the
-                                                // post-turn warning in `discipline::apply_post_turn_discipline`
-                                                // agrees with the guard on what counts as "same region".
+                                                // Track per-region read count for the post-turn soft
+                                                // re-plan warning (see
+                                                // `discipline::apply_post_turn_discipline`).
+                                                // Hard guard removed; soft warning still uses this.
                                                 if name == "read_file" {
                                                     let working_dir = working_dir_for_read_counts.try_read().ok().map(|g| g.clone());
                                                     let key = crate::turn::runner::read_region_key(arguments, working_dir.as_deref());

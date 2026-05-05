@@ -88,7 +88,6 @@ async fn run_background_inner(
         permission,
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
-        file_read_counts: std::collections::HashMap::new(),
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::new(hooks)
         ),

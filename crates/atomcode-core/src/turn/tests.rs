@@ -341,7 +341,6 @@ fn make_runner(
         permission,
         recently_edited_files: Vec::new(),
         recent_calls: Vec::new(),
-        file_read_counts: std::collections::HashMap::new(),
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::empty()
         ),
@@ -1261,114 +1260,52 @@ fn test_rules_no_dynamic_content() {
 }
 
 // ===========================================================================
-// detect_call_loop — Pattern 1 (per-region read saturation) integration tests
+// detect_call_loop — read_file fully delegated to read_cache
 // ===========================================================================
 
-/// Scanning 5 distinct regions of a large file must NOT trip the cap.
-/// This was the regression captured in the v4.20 screenshot: the model read
-/// multiple function bodies of a 1592-line render.rs with correct offsets and
-/// hit the region cap on the Nth read even though every region was different.
+/// `read_file` calls bypass `detect_call_loop` entirely now: redundancy is
+/// handled by `tool/read.rs`'s read_cache (cache hit returns the same
+/// content + an escalating "you've read this N times" note). Pattern 2's
+/// hard BLOCKED was a soft text error that the model could ignore — and
+/// did, in observed sessions where the cap counter climbed to "5-call cap"
+/// across consecutive turns. Cheap-replay-with-note is strictly more
+/// useful: model gets the answer plus a clear stop signal.
+///
+/// This test pins the new contract: regardless of how many times the same
+/// `read_file` args are issued in a row, `detect_call_loop` returns `None`.
 #[test]
-fn detect_call_loop_does_not_block_scanning_distinct_regions() {
+fn detect_call_loop_skips_read_file_for_cache_to_handle() {
     let mut runner = make_runner(
         MockProvider::text_only(""),
         ToolRegistry::new(),
         auto_bypass(),
     );
-
-    // Five reads with offsets spaced well apart (>> READ_REGION_BUCKET).
-    let offsets = [1, 200, 400, 700, 1000];
-    for off in offsets {
-        let args = format!(
-            r#"{{"file_path":"/p/render.rs","offset":{},"limit":50}}"#,
-            off
-        );
-        let verdict = runner.detect_call_loop("read_file", &args);
+    let args = r#"{"file_path":"/p/x.rs","offset":1,"limit":50}"#;
+    for i in 1..=10 {
         assert!(
-            verdict.is_none(),
-            "offset {} should not block — it's a new region\nGot: {:?}",
-            off,
-            verdict
+            runner.detect_call_loop("read_file", args).is_none(),
+            "read_file call #{} must not be blocked at the loop guard",
+            i
         );
     }
 }
 
-/// Re-reading the SAME region 3 times MUST trip Pattern 1. Each call tweaks
-/// `limit` so the exact-args Pattern 2 guard does NOT fire first — this
-/// isolates Pattern 1's semantics ("same bucket, any args"). The realistic
-/// triggering pattern is the model cycling limit on an unreadable file
-/// trying to coax different output from the same slice.
+/// Other tools still get Pattern 2 protection: identical args 3+ times in
+/// a row without an intervening edit should fire BLOCKED. read_file
+/// exclusion in the previous test does not weaken this for grep/bash/etc.
 #[test]
-fn detect_call_loop_blocks_three_reads_of_same_region() {
+fn detect_call_loop_still_blocks_other_tools_on_exact_repeat() {
     let mut runner = make_runner(
         MockProvider::text_only(""),
         ToolRegistry::new(),
         auto_bypass(),
     );
-
-    // Same offset → same bucket, but varying limit so args_hash differs and
-    // Pattern 2 (identical-args) stays dormant.
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/doc.docx","offset":1,"limit":{}}}"#,
-            40 + i * 10
-        );
-        assert!(
-            runner.detect_call_loop("read_file", &args).is_none(),
-            "call #{} of same region should not block yet",
-            i
-        );
-    }
-    // 3rd read still in the same bucket → Pattern 1 fires.
-    let third = r#"{"file_path":"/p/doc.docx","offset":1,"limit":95}"#;
-    let blocked = runner.detect_call_loop("read_file", third);
-    let msg = blocked.expect("3rd call to same region must be blocked by Pattern 1");
-    assert!(
-        msg.contains("SAME region"),
-        "block message must mention 'SAME region' so the model understands why\nGot: {}",
-        msg
-    );
-    assert!(msg.contains("doc.docx"), "block message must name the file");
-}
-
-/// A successful edit on the same file clears every region's counter so
-/// post-edit verification reads aren't blocked even if some region was near
-/// the cap pre-edit.
-#[test]
-fn detect_call_loop_edit_resets_all_regions_for_file() {
-    let mut runner = make_runner(
-        MockProvider::text_only(""),
-        ToolRegistry::new(),
-        auto_bypass(),
-    );
-
-    // Two reads of the same bucket (one shy of the 3-call cap, varying limit
-    // so Pattern 2 stays dormant).
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#,
-            30 + i * 10
-        );
-        assert!(runner.detect_call_loop("read_file", &args).is_none());
-    }
-
-    // Edit on the same file → reset all region counts for x.rs.
-    let edit_args = r#"{"file_path":"/p/x.rs","old_string":"a","new_string":"b"}"#;
-    assert!(runner.detect_call_loop("edit_file", edit_args).is_none());
-
-    // The previously-hot bucket should now be freshly empty; 2 more reads
-    // stay unblocked post-edit (verifying the `retain` cleared the entry).
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#,
-            100 + i * 10
-        );
-        assert!(
-            runner.detect_call_loop("read_file", &args).is_none(),
-            "post-edit read #{} should not be blocked — edit reset the counter",
-            i
-        );
-    }
+    let args = r#"{"pattern":"foo","path":"."}"#;
+    assert!(runner.detect_call_loop("grep", args).is_none());
+    assert!(runner.detect_call_loop("grep", args).is_none());
+    let third = runner.detect_call_loop("grep", args);
+    let msg = third.expect("3rd identical grep must be blocked by Pattern 2");
+    assert!(msg.contains("identical arguments"));
 }
 
 // ===========================================================================
@@ -1548,7 +1485,6 @@ mod telemetry_tests {
             permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
             recently_edited_files: Vec::new(),
             recent_calls: Vec::new(),
-            file_read_counts: std::collections::HashMap::new(),
             hook_executor: std::sync::Arc::new(
                 crate::hook::executor::HookExecutor::empty()
             ),
