@@ -375,21 +375,50 @@ pub fn build_messages(
     )
 }
 
+/// Default reserved headroom subtracted from the context window to derive
+/// the auto-compression threshold. Mirrors CC's `AUTOCOMPACT_BUFFER_TOKENS`
+/// (services/compact/autoCompact.ts:62) which targets Claude's 200K
+/// window. atomcode runs across windows from 8K (Ollama) to 200K+, so the
+/// effective buffer is `min(AUTO_COMPACT_BUFFER_TOKENS, ctx_window / 4)`
+/// — for large windows you get the full 13K, for small windows it scales
+/// down to 25% of the window so the threshold stays meaningful.
+pub const AUTO_COMPACT_BUFFER_TOKENS: usize = 13_000;
+
+/// Compute the auto-compression trigger threshold for a given context
+/// window. Returns the token total above which `needs_compression` fires.
+///
+/// Formula: `ctx_window - min(AUTO_COMPACT_BUFFER_TOKENS, ctx_window / 4)`.
+/// At 131K window → 131K - 13K = 118K threshold. At 8K Ollama window
+/// → 8K - 2K = 6K threshold (since 8K/4 = 2K caps the buffer).
+pub fn auto_compact_threshold(token_budget: usize) -> usize {
+    let buffer = AUTO_COMPACT_BUFFER_TOKENS.min(token_budget / 4);
+    token_budget.saturating_sub(buffer)
+}
+
 /// Check if context needs compression.
 ///
-/// Threshold: `min(50% of budget, 50K tokens)`. Stable across many real
-/// sessions — do NOT lower without validating on long write-heavy
-/// sessions (agentarena) — 55% caused total context wipeout historically.
+/// Threshold: `ctx_window - AUTO_COMPACT_BUFFER_TOKENS` (absolute
+/// headroom, CC-style). The previous percentage-based formula
+/// (`min(50% of budget, 50K)`) had two structural problems:
+///
+/// 1. **Scale-dependent buffer.** A 32K window left 16K headroom; a
+///    131K window left 50K headroom (capped). The buffer the user
+///    actually needs — one streaming response plus the next round's
+///    tool results — doesn't scale with window size, so the percentage
+///    formula was generous on small windows and stingy on large ones.
+/// 2. **Unintuitive at debug time.** "Why did compression fire at 28%
+///    of my 131K window?" had to be reverse-derived from the `min(...)`
+///    cap. The new formula reads directly: "fire when fewer than 13K
+///    tokens remain".
+///
+/// The `messages.len() < 12` guard stays — needs a non-trivial backlog
+/// before compression is worthwhile, and 1 user msg can produce 15+
+/// messages so message count is the right unit.
 pub fn needs_compression(
     conv: &Conversation,
     system_prompt_tokens: usize,
     token_budget: usize,
 ) -> bool {
-    // Guard: need enough messages to make compression worthwhile.
-    // Uses message count instead of turn count because turn_tracker counts
-    // USER MESSAGES (1 user msg = 1 turn), but a single user message can
-    // produce 15+ LLM calls with 35+ messages. The old `turns.len() < 6`
-    // guard caused compression to NEVER trigger in agent-loop scenarios.
     if conv.messages.len() < 12 {
         return false;
     }
@@ -399,8 +428,7 @@ pub fn needs_compression(
             .iter()
             .map(|m| m.estimate_tokens())
             .sum::<usize>();
-    let threshold = (token_budget * 50 / 100).min(50000);
-    total > threshold
+    total > auto_compact_threshold(token_budget)
 }
 
 /// Build content for LLM compression.
@@ -1004,6 +1032,92 @@ mod tests {
         assert_eq!(out, "SYS");
         let out = apply_model_directives("SYS", "claude-opus-4-7");
         assert_eq!(out, "SYS");
+    }
+
+    #[test]
+    fn auto_compact_threshold_large_window_uses_full_buffer() {
+        // 131K window: 131072 - 13000 = 118072. The user with the GLM-5.1
+        // self-hosted endpoint sees this exact case — large headroom, fixed
+        // buffer for one streaming response + next round's tool results.
+        assert_eq!(auto_compact_threshold(131_072), 118_072);
+        assert_eq!(auto_compact_threshold(200_000), 187_000);
+    }
+
+    #[test]
+    fn auto_compact_threshold_small_window_scales_buffer_down() {
+        // 8K Ollama: a fixed 13K buffer would underflow to 0 and force
+        // compression at every turn. Scaling cap (window/4) gives 2K
+        // buffer → 6K threshold, which fires at ~75% — tight but workable
+        // for small-window local models.
+        assert_eq!(auto_compact_threshold(8_000), 6_000);
+        assert_eq!(auto_compact_threshold(16_000), 12_000);
+        // At 52K the formulas cross over: window/4 = 13K = full buffer.
+        assert_eq!(auto_compact_threshold(52_000), 39_000);
+    }
+
+    #[test]
+    fn auto_compact_threshold_handles_degenerate_window() {
+        // ctx_window == 0 happens transiently before the provider config
+        // loads; saturating_sub keeps it from panicking. Threshold is 0,
+        // so any non-empty conversation trips the gate — caller's
+        // `messages.len() < 12` check still gates the actual fire.
+        assert_eq!(auto_compact_threshold(0), 0);
+    }
+
+    #[test]
+    fn needs_compression_fires_at_absolute_headroom_not_percentage() {
+        // Reproduces the user's debug confusion: under the prior formula
+        // a 131K window's threshold was `min(131K * 50%, 50K) = 50K` —
+        // compression fired at 38% of window, leaving 81K of phantom
+        // "available" headroom that wasn't actually used. The new
+        // formula fires at 118K (90% of window), matching the user's
+        // intuition of "fire when ~13K headroom remains".
+        //
+        // Test fixture: 15 alternating User/Assistant messages so the
+        // 12-message guard passes (`add_user_message` merges
+        // consecutive User msgs, which would collapse 15 calls into 1).
+        let mut conv = Conversation::new();
+        for i in 0..8 {
+            conv.messages.push(Message::new(Role::User, format!("u{}", i)));
+            conv.messages.push(Message::new(Role::Assistant, format!("a{}", i)));
+        }
+        assert_eq!(conv.messages.len(), 16);
+        assert!(!needs_compression(&conv, 0, 131_072));
+
+        // 500K bytes ≈ 125K tokens (byte / 4) → exceeds 118K threshold.
+        conv.messages
+            .push(Message::new(Role::User, "x".repeat(500_000)));
+        assert!(needs_compression(&conv, 0, 131_072));
+    }
+
+    #[test]
+    fn tool_result_ref_token_estimate_uses_summary_not_byte_size() {
+        // Pre-fix bug: ToolResultRef estimated from the full original
+        // content size (could be 50K+ for a large file read), but at
+        // send time only `r.summary` (a short string) was actually
+        // serialised. The estimator overcounted by 5-50× on
+        // externalised results, pushing compression to fire on phantom
+        // budget pressure.
+        use crate::conversation::message::MessageContent;
+        use crate::tool::result_store::ToolResultRef;
+
+        let big_ref = ToolResultRef {
+            call_id: "call_1".into(),
+            hash: "deadbeef".into(),
+            summary: "hello".into(), // 5 bytes
+            byte_size: 200_000,      // pretend the disk-cached blob is 200KB
+            success: true,
+        };
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::ToolResultRef(big_ref),
+        };
+        // (5 + 10) / 4 + 4 = 7. Pre-fix this was (200000 + 10) / 4 + 4 = 50006.
+        assert!(
+            msg.estimate_tokens() < 20,
+            "expected estimate to track summary size, got {}",
+            msg.estimate_tokens()
+        );
     }
 
     #[test]
