@@ -536,6 +536,11 @@ impl AgentLoop {
         // Share tool registry between AgentLoop and TurnRunner via Arc.
         let shared_tools = std::sync::Arc::new(tool_registry);
 
+        // Hand the registry handle to ToolContext so active-dispatch tools
+        // (parallel_edit_files) can read it at execute time without
+        // creating a Tool ↔ Registry Arc cycle.
+        tool_context.tool_registry = Some(shared_tools.clone());
+
         // Convert Box → Arc so provider can be shared with sub-agents.
         let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
 
@@ -662,6 +667,25 @@ impl AgentLoop {
     /// Run the agent loop. This is the main entry point — call from a tokio task.
     /// The loop processes commands from the UI and emits events back.
     pub async fn run(mut self) {
+        // Active-dispatch tool registration. The model invokes
+        // `parallel_edit_files` explicitly when it judges parallel edit
+        // is the right move; the framework no longer infers from text.
+        // Gated on `subagent.enabled` so users can disable fork
+        // dispatch via `/config subagent.enabled false` without code
+        // changes — the tool simply isn't advertised to the model.
+        // Registered here (not in `new()`) because `register_arc` is
+        // async and `new()` is sync.
+        if self.config.subagent.enabled {
+            let tool = crate::tool::parallel_edit::ParallelEditTool {
+                provider: self.turn_runner.provider.clone(),
+                config: self.config.clone(),
+                event_tx: self.event_tx.clone(),
+            };
+            self.tool_registry
+                .register_arc("parallel_edit_files".to_string(), std::sync::Arc::new(tool))
+                .await;
+        }
+
         // Spawn background code graph indexer
         {
             let working_dir = self.turn_runner.context.working_dir.read().await.clone();
@@ -1855,67 +1879,11 @@ impl AgentLoop {
                         self.discipline_state.silent_tool_rounds += 1;
                     }
 
-                    // Sub-agent extraction from UsedTools: model may output plan text
-                    // alongside tool calls (e.g. "Plan: 1. IdeaCenter.vue 2. ProductCenter.vue"
-                    // + read_file in the same turn). Allow extraction on ANY pre-edit turn
-                    // — weak models often follow a "read N files first, then announce plan,
-                    // then start editing" flow, in which case the plan text doesn't appear
-                    // until turn 3+ (after several read_file calls). The previous gate
-                    // `tool_call_count <= tool_count` only fired on turn 1, missing this
-                    // common case entirely (2026-05-03 test surfaced this).
-                    //
-                    // The new gate uses `files_edited_this_turn.is_empty()` to mean
-                    // "model is still in exploration/planning, no actual edits yet" —
-                    // this captures the semantic the original gate was trying to
-                    // express. Once an edit has landed, plan text in subsequent turns
-                    // is mostly retrospective ("I changed X") and shouldn't trigger
-                    // re-dispatch.
-                    if let Some(ref plan_text) = text {
-                        // Allow re-extraction across turns until we have enough
-                        // subtasks to dispatch (≥2). The previous gate
-                        // `!self.subtask_driver.active` permanently locked out
-                        // re-extraction after the first text containing ANY .rs
-                        // file — so a Turn 2 saying "platform.rs 比较大" (1 file,
-                        // active=true) blocked Turn 3's "constants.rs / mod.rs /
-                        // types.rs / platform.rs" (4 files) from ever reaching
-                        // extract_from_plan. The new gate `subtasks.len() < 2`
-                        // is monotone-friendly: once we have ≥2 we stop trying;
-                        // before then we keep upgrading the plan as the model
-                        // surfaces more file names.
-                        if self.files_edited_this_turn.is_empty()  // no edits yet → still planning
-                            && self.subtask_driver.subtasks.len() < 2  // not yet enough to dispatch
-                            && !plan_text.trim().is_empty()
-                        {
-                            self.subtask_driver.extract_from_plan(plan_text);
-                            if self.subtask_driver.active && self.subtask_driver.subtasks.len() >= 2
-                            {
-                                self.plan_text = Some(plan_text.clone());
-                                if let Some(sub_result) =
-                                    self.try_sub_agent_dispatch(plan_text).await
-                                {
-                                    let _ = self
-                                        .event_tx
-                                        .send(AgentEvent::TextDelta(sub_result.clone()));
-                                    self.subtask_driver = subtask_driver::SubtaskDriver::new();
-
-                                    if sub_result.contains("BUILD ERRORS") {
-                                        // Build failed — inject error, continue turn loop
-                                        self.conversation.add_user_message(&format!(
-                                            "[Sub-agent merge build FAILED. Fix the errors below, then summarize.]\n{}",
-                                            sub_result
-                                        ));
-                                    } else {
-                                        // Sub-agent results streamed via TextDelta above;
-                                        // no extra "Summarize" user-turn — it just triggers
-                                        // another round of re-narration. Let the turn stop naturally.
-                                        self.finish_turn(TurnStopReason::Natural);
-                                        return;
-                                    }
-                                }
-                                // Failed — fall through to serial execution
-                            }
-                        }
-                    }
+                    // Fork sub-agent dispatch is no longer driven by parsing this
+                    // turn's text. The model invokes `parallel_edit_files`
+                    // explicitly when it judges parallel edit is the right move.
+                    // See `crate::tool::parallel_edit` for the active-dispatch
+                    // tool and `agent/mod.rs::run` for its registration.
 
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
@@ -2386,316 +2354,16 @@ impl AgentLoop {
 
     // change_dir → services.rs
 
-    /// Try to dispatch sub-agents for parallel multi-file editing.
-    /// Returns Some(summary_text) if dispatch succeeded, None if it should
-    /// fall back to serial subtask execution.
-    async fn try_sub_agent_dispatch(&mut self, plan_text: &str) -> Option<String> {
-        // Pre-2026-05-03 history: this path was disabled because 8 attempts
-        // failed without a resilience layer. The 2026-05-03 PR added
-        // ResilienceConfig (adaptive budget, hallucination nudge,
-        // stream-timeout retry) + a tool sandbox; users can flip back to
-        // serial execution via `/config subagent.enabled false` if needed.
-        if !self.config.subagent.enabled {
-            return None;
-        }
-
-        let wd = self
-            .turn_runner
-            .context
-            .working_dir
-            .try_read()
-            .map(|g| g.clone())
-            .ok()?;
-
-        let subtasks = &self.subtask_driver.subtasks;
-        if subtasks.len() < 2 {
-            return None;
-        }
-
-        // Bug fix tasks should NOT use sub-agents — need serial diagnosis.
-        // Only feature development (create/implement/add/beautify) benefits from parallel.
-        let task_lower = self.current_task.to_lowercase();
-        let is_bugfix = task_lower.contains("报错")
-            || task_lower.contains("错误")
-            || task_lower.contains("修复")
-            || task_lower.contains("修一下")
-            || task_lower.contains("不行")
-            || task_lower.contains("fix")
-            || task_lower.contains("error")
-            || task_lower.contains("broken")
-            || task_lower.contains("bug")
-            || task_lower.contains("还是");
-        if is_bugfix {
-            return None;
-        }
-
-        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-            "\n\n**Dispatching {} sub-agents in parallel...**\n",
-            subtasks.len()
-        )));
-        let _ = self
-            .event_tx
-            .send(AgentEvent::SubAgentDispatchStart { count: subtasks.len() });
-
-        // Read all target files. If any file can't be found, fall back to serial.
-        let mut tasks = Vec::new();
-        let mut all_file_contents: Vec<(String, String)> = Vec::new();
-
-        for subtask in subtasks {
-            // Try to find the file: first check direct path, then walk the tree.
-            let file_path = {
-                let direct = wd.join(&subtask.file);
-                if direct.exists() {
-                    direct
-                } else {
-                    // Walk directory tree to find the file by name
-                    match find_file_recursive(&wd, &subtask.file) {
-                        Some(p) => p,
-                        None => {
-                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                                "  Cannot find {}. Falling back to serial mode.\n",
-                                subtask.file
-                            )));
-                            let _ = self.event_tx.send(AgentEvent::SubAgentDispatchEnd);
-                            return None;
-                        }
-                    }
-                }
-            };
-
-            let content = match std::fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(_) => {
-                    let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                        "  Cannot read {}. Falling back to serial mode.\n",
-                        subtask.file
-                    )));
-                    let _ = self.event_tx.send(AgentEvent::SubAgentDispatchEnd);
-                    return None;
-                }
-            };
-
-            all_file_contents.push((file_path.to_string_lossy().to_string(), content));
-        }
-
-        // Generate sibling skeletons: compact view of other files
-        for i in 0..all_file_contents.len() {
-            let (ref file_path, ref _content) = all_file_contents[i];
-            let mut siblings = String::new();
-            for (j, (ref sib_path, ref sib_content)) in all_file_contents.iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                let short = std::path::Path::new(sib_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| sib_path.clone());
-                // Take first 30 lines as skeleton
-                let skeleton: String = sib_content.lines().take(30).collect::<Vec<_>>().join("\n");
-                siblings.push_str(&format!("### {}\n```\n{}\n```\n\n", short, skeleton));
-            }
-
-            // Extract the task instruction for this file from the plan
-            let file_name = &subtasks[i].file;
-            let task_instr = extract_file_instruction(plan_text, file_name);
-
-            tasks.push(sub_agent::SubAgentTask {
-                file_path: file_path.clone(),
-                file_content: all_file_contents[i].1.clone(),
-                task_instruction: task_instr,
-                contract: extract_contract(plan_text),
-                sibling_skeletons: siblings,
-            });
-        }
-
-        // Dispatch — wire pool concurrency / timeout from Config::subagent
-        let pool = sub_agent::SubAgentPool {
-            tasks,
-            max_concurrent: self.config.subagent.max_concurrent,
-            timeout_secs: self.config.subagent.timeout_secs,
-        };
-        let provider = self.turn_runner.provider.clone();
-        let tools = self.tool_registry.clone();
-        let config = self.config.clone();
-
-        let results = pool
-            .execute_all(provider, tools, &config, &wd, &self.event_tx)
-            .await;
-        let _ = self.event_tx.send(AgentEvent::SubAgentDispatchEnd);
-
-        // Build summary
-        let mut summary = String::from("\n**Sub-agent results:**\n");
-        let mut all_success = true;
-        for r in &results {
-            let status = if r.success { "OK" } else { "FAILED" };
-            let short = std::path::Path::new(&r.file_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| r.file_path.clone());
-            summary.push_str(&format!(
-                "| {} | {} | {} turns | {} |\n",
-                short, status, r.turns_used, r.summary,
-            ));
-            if !r.success {
-                all_success = false;
-                for failure in &r.failures {
-                    summary.push_str(&format!("  Error: {:?}\n", failure));
-                }
-            }
-            // Track edited files
-            if r.success {
-                if !self.files_edited_this_turn.contains(&r.file_path) {
-                    self.files_edited_this_turn.push(r.file_path.clone());
-                }
-            }
-        }
-
-        if all_success {
-            summary.push_str(&format!(
-                "\nAll {} sub-agents completed successfully.\n",
-                results.len()
-            ));
-        } else {
-            let failed: Vec<_> = results.iter().filter(|r| !r.success).collect();
-            summary.push_str(&format!(
-                "\n{}/{} sub-agents failed.\n",
-                failed.len(),
-                results.len()
-            ));
-        }
-
-        // Merge verification: compile/build to catch cross-file errors.
-        // Search up to 2 levels deep for build markers (handles nested project dirs).
-        let build_cmd_and_dir = find_build_command(&wd);
-
-        if let Some((cmd, build_dir)) = build_cmd_and_dir {
-            let output = tokio::process::Command::new("sh")
-                .args(["-c", &cmd])
-                .current_dir(&build_dir)
-                .output()
-                .await;
-            if let Ok(out) = output {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let combined = format!("{}{}", stdout, stderr);
-                if !out.status.success() || combined.to_lowercase().contains("error") {
-                    let err_lines: String =
-                        combined.lines().take(10).collect::<Vec<_>>().join("\n");
-                    summary.push_str(&format!(
-                        "\n⚠ BUILD ERRORS after sub-agent merge:\n{}\nFix these errors before proceeding.\n",
-                        err_lines
-                    ));
-                } else {
-                    summary.push_str("\n✓ Build verification passed.\n");
-                }
-            }
-        }
-
-        Some(summary)
-    }
+    // try_sub_agent_dispatch → REMOVED. Fork sub-agent dispatch is now
+    // ACTIVE: the model invokes `parallel_edit_files` (see
+    // `crate::tool::parallel_edit`) when it judges parallel edit is the
+    // right move. The framework no longer parses plan text or guesses
+    // intent — eliminating ~250 lines of heuristics, ~70 hardcoded
+    // intent-keywords across two iterations of failed gate logic, and
+    // an entire class of mis-fire failures (read-only turns dispatching
+    // 6 fork sub-agents that fake edits or no-op).
 }
 
-/// Recursively search for a file by name under the given directory.
-/// Returns the first match. Skips hidden dirs, node_modules, target, etc.
-fn find_file_recursive(dir: &std::path::Path, file_name: &str) -> Option<std::path::PathBuf> {
-    let walker = ignore::WalkBuilder::new(dir)
-        .hidden(true) // skip hidden
-        .git_ignore(true) // respect .gitignore
-        .max_depth(Some(10))
-        .build();
-
-    for entry in walker {
-        if let Ok(e) = entry {
-            if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                if let Some(name) = e.path().file_name() {
-                    if name.to_string_lossy() == file_name {
-                        return Some(e.into_path());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract the instruction for a specific file from the plan text.
-/// Looks for lines mentioning the file name and returns them as context.
-fn extract_file_instruction(plan_text: &str, file_name: &str) -> String {
-    let mut relevant_lines = Vec::new();
-    for line in plan_text.lines() {
-        if line.contains(file_name) {
-            relevant_lines.push(line.trim().to_string());
-        }
-    }
-    if relevant_lines.is_empty() {
-        format!("Edit {} according to the plan.", file_name)
-    } else {
-        relevant_lines.join("\n")
-    }
-}
-
-/// Extract contract/interface information from the plan text.
-/// Looks for "Contract", "Interface", "API" sections.
-fn extract_contract(plan_text: &str) -> String {
-    let mut in_contract = false;
-    let mut contract_lines = Vec::new();
-    for line in plan_text.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("contract") || lower.contains("interface") || lower.contains("api") {
-            in_contract = true;
-        }
-        if in_contract {
-            contract_lines.push(line.to_string());
-            // Stop after a blank line following contract section
-            if line.trim().is_empty() && contract_lines.len() > 1 {
-                break;
-            }
-        }
-    }
-    if contract_lines.is_empty() {
-        "No explicit contract defined. Follow the plan.".to_string()
-    } else {
-        contract_lines.join("\n")
-    }
-}
-
-/// LEGACY: Hardcoded build marker detection. Used only by sub-agent merge verification.
-fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
-    let markers: &[(&str, &str)] = &[
-        ("package.json", "npm run build 2>&1 | head -30"),
-        ("Cargo.toml", "cargo check 2>&1 | tail -20"),
-        ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
-        ("go.mod", "go build ./... 2>&1 | tail -20"),
-    ];
-
-    // Check wd itself first
-    for &(marker, cmd) in markers {
-        if wd.join(marker).exists() {
-            return Some((cmd.to_string(), wd.to_path_buf()));
-        }
-    }
-
-    // Check immediate subdirectories (depth 1)
-    if let Ok(entries) = std::fs::read_dir(wd) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let sub = entry.path();
-                // Skip hidden dirs, node_modules, target, etc.
-                let name = sub.file_name().unwrap_or_default().to_string_lossy();
-                if name.starts_with('.') || name == "node_modules" || name == "target" {
-                    continue;
-                }
-                for &(marker, cmd) in markers {
-                    if sub.join(marker).exists() {
-                        return Some((cmd.to_string(), sub));
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
 
 fn track_tool_modified_files(
     tool_name: &str,

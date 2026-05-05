@@ -11,6 +11,7 @@ pub mod glob;
 pub mod grep;
 pub mod list_dir;
 pub mod list_symbols;
+pub mod parallel_edit;
 pub mod read;
 pub mod read_symbol;
 pub mod result_store;
@@ -700,6 +701,14 @@ pub struct ToolContext {
     pub event_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::turn::event::TurnEvent>>>,
     /// Current tool call ID for event correlation.
     pub current_call_id: Option<String>,
+    /// Shared registry handle for tools that dispatch fork sub-agents
+    /// (currently only `parallel_edit_files`). Set by `AgentLoop::new`
+    /// after the registry is wrapped in `Arc`. Reading the registry via
+    /// `ctx` instead of holding it in the tool struct avoids creating a
+    /// `Tool ↔ Registry` `Arc` cycle that would otherwise leak memory
+    /// for the lifetime of the process. `None` in headless / test
+    /// contexts that don't need fork dispatch.
+    pub tool_registry: Option<Arc<ToolRegistry>>,
 }
 
 impl ToolContext {
@@ -733,6 +742,7 @@ impl ToolContext {
             lsp: None,
             event_tx: None,
             current_call_id: None,
+            tool_registry: None,
         }
     }
 
