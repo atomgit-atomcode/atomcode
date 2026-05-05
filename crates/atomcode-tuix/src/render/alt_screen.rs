@@ -2299,7 +2299,8 @@ mod tests {
             status: crate::render::StatusLine {
                 model: "glm-5".into(),
                 cwd: "~/proj".into(),
-                total_tokens: 0,
+                ctx_used: 0,
+                ctx_window: 0,
                 hint: None,
                 mode_indicator: Some("PLAN".into()),
             },
@@ -2349,7 +2350,8 @@ mod tests {
             status: crate::render::StatusLine {
                 model: "glm-5".into(),
                 cwd: "~/proj".into(),
-                total_tokens: 0,
+                ctx_used: 0,
+                ctx_window: 0,
                 hint: None,
                 mode_indicator: None,
             },

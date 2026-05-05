@@ -3673,10 +3673,21 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         crate::state::AgentMode::Plan => Some("PLAN".to_string()),
         crate::state::AgentMode::Build => None,
     };
+    // Pull current ctx usage from the last ContextStats emission. Pre-
+    // first-turn `last_context` is None — render shows nothing then.
+    // Using `sent_tokens` (what was actually sent to the model on the
+    // last turn) instead of cumulative `total_tokens` because the user
+    // cares about "how close to overflow am I", not "how many tokens
+    // has this session burned in total". See render::StatusLine docs.
+    let (ctx_used, ctx_window) = match state.last_context.as_ref() {
+        Some(snap) => (snap.sent_tokens, snap.ctx_window),
+        None => (0, 0),
+    };
     crate::render::StatusLine {
         model,
         cwd,
-        total_tokens: state.total_tokens,
+        ctx_used,
+        ctx_window,
         hint,
         mode_indicator,
     }
