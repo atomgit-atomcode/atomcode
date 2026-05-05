@@ -679,7 +679,59 @@ impl LlmProvider for OpenAiProvider {
                 return;
             }
 
-                let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                // ── Stream ended without close marker ──
+                // Reaching here means we parsed valid SSE chunks but the
+                // stream's `bytes_stream.next()` returned `Ok(None)` (clean
+                // close at TCP/HTTP level) WITHOUT either:
+                //   a. a `data: [DONE]` line (handled at line ~519, returns
+                //      with truncated=false), or
+                //   b. a `finish_reason` of `stop` / `length` / `tool_calls`
+                //      (handled inline in the chunk parser around line ~610,
+                //      returns with the appropriate truncated flag).
+                //
+                // Observed three times across May 2026 atomgr/atomcode
+                // sessions on the self-hosted glm-5.1 endpoint:
+                //   - 5/4 21:21 Turn 23 — `error decoding response body` (Err
+                //     path, separately fixed by mid-stream retry).
+                //   - 5/5 10:06 Turn 10 — text response stopped at "1.\n"
+                //     mid-list, no close marker (this path).
+                //   - 5/5 19:37 Turn 72-73 — markdown table truncated
+                //     mid-row, no close marker (this path).
+                //
+                // Pre-fix this branch emitted `Done { truncated: false }`,
+                // making the agent loop treat the partial output as a
+                // complete response and `finish_turn(Natural)` immediately.
+                // The user saw a cut-off table / list with no error, no
+                // retry, and no indication that anything went wrong.
+                //
+                // Post-fix (this commit):
+                //   1. Flush any in-flight tool calls so partial-args don't
+                //      silently disappear (mirrors the `length` branch's
+                //      handling at line ~622).
+                //   2. Emit a TextDelta marker so the user (and datalog) can
+                //      see why the response was cut. Goes through the
+                //      normal stream_filter path; doesn't pollute model
+                //      context with control sequences.
+                //   3. Emit `Done { truncated: true }` so the agent loop's
+                //      existing retry-with-resume path (`agent/mod.rs:1854`,
+                //      `if truncated && retry_count < 1`) injects the
+                //      "Output limit hit. … resume where you left off"
+                //      hint and triggers a continuation turn.
+                for (id, name, args) in &tool_calls {
+                    let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                        crate::tool::ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: args.clone(),
+                        },
+                    )));
+                }
+                tool_calls.clear();
+                let _ = tx.send(Ok(StreamEvent::Delta(
+                    "\n[stream ended without close marker — response above may be incomplete]\n"
+                        .to_string(),
+                )));
+                let _ = tx.send(Ok(StreamEvent::Done { truncated: true }));
                 return;
             }
         });
