@@ -1387,6 +1387,22 @@ fn loop_args_hash(tool_name: &str, args: &str, working_dir: Option<&Path>) -> u6
         // Malformed args or missing file_path — hash raw so identical bad
         // calls still collapse and trip the loop detector.
         args.hash(&mut h);
+    } else if tool_name == "bash" {
+        // Hash the POST-strip command: bash silently rewrites trailing
+        // `| tail -N` / `| head -N` away (`tool/bash.rs::strip_output_pipes`),
+        // so three runs with `| tail -15`, `| tail -20`, `| tail -30` all
+        // execute the same command. Hashing the raw args would treat those
+        // as three different calls and the 3-strike loop guard would never
+        // fire — exactly what produced the 4-cargo-check pile in datalog
+        // 2026-05-06 atomgr (P5.5 + provider-retry commits never met).
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+            if let Some(cmd) = v.get("command").and_then(|x| x.as_str()) {
+                let (stripped, _) = crate::tool::bash::strip_output_pipes(cmd);
+                stripped.hash(&mut h);
+                return h.finish();
+            }
+        }
+        args.hash(&mut h);
     } else {
         args.hash(&mut h);
     }
@@ -2034,6 +2050,70 @@ mod loop_hash_tests {
         assert_eq!(c, d);
 
         assert_ne!(a, c, "different malformed inputs still differ");
+    }
+
+    #[test]
+    fn bash_hash_collapses_pipe_variants() {
+        // Reproduces datalog 2026-05-06 atomgr: model ran cargo check with
+        // `| tail -15`, then `| tail -20`, then `| tail -30`. The framework
+        // strips the trailing tail/head pipe before executing — so all three
+        // EXECUTE the same command — but the previous loop-detection hash
+        // was computed on raw args, so the three hashed differently and
+        // detect_call_loop never fired. Now they collapse to one hash.
+        let h1 = loop_args_hash(
+            "bash",
+            r#"{"command":"cd /x && cargo check 2>&1 | tail -15"}"#,
+            None,
+        );
+        let h2 = loop_args_hash(
+            "bash",
+            r#"{"command":"cd /x && cargo check 2>&1 | tail -20"}"#,
+            None,
+        );
+        let h3 = loop_args_hash(
+            "bash",
+            r#"{"command":"cd /x && cargo check 2>&1 | tail -30"}"#,
+            None,
+        );
+        assert_eq!(h1, h2, "tail -15 and tail -20 must collapse to same hash");
+        assert_eq!(h2, h3, "tail -20 and tail -30 must collapse to same hash");
+    }
+
+    #[test]
+    fn bash_hash_distinguishes_unrelated_pipes() {
+        // `| grep err` is NOT a tail/head — different commands must still
+        // hash differently so the loop guard doesn't false-positive on
+        // legitimate exploration.
+        let h1 = loop_args_hash(
+            "bash",
+            r#"{"command":"cargo check 2>&1 | grep error"}"#,
+            None,
+        );
+        let h2 = loop_args_hash(
+            "bash",
+            r#"{"command":"cargo check 2>&1 | tail -20"}"#,
+            None,
+        );
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn bash_hash_distinguishes_genuinely_different_commands() {
+        let h1 = loop_args_hash("bash", r#"{"command":"cargo check"}"#, None);
+        let h2 = loop_args_hash("bash", r#"{"command":"cargo build"}"#, None);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn bash_hash_handles_malformed_args() {
+        // Both invalid JSON and missing-command JSON must still produce
+        // stable hashes so identical bad calls still trip the loop guard.
+        let a = loop_args_hash("bash", "not json", None);
+        let b = loop_args_hash("bash", "not json", None);
+        assert_eq!(a, b);
+        let c = loop_args_hash("bash", r#"{"not_command":"oops"}"#, None);
+        let d = loop_args_hash("bash", r#"{"not_command":"oops"}"#, None);
+        assert_eq!(c, d);
     }
 }
 
