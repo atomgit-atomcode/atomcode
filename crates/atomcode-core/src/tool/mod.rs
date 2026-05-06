@@ -811,13 +811,6 @@ pub struct ToolContext {
     /// entries on success so a stale entry cannot serve outdated
     /// bytes.
     pub file_store: Arc<RwLock<crate::ctx::file_store::FileStore>>,
-    /// Per-canonical-path read-count tracker. Drives the soft
-    /// "you've read this N times" hint that read_file appends after
-    /// the 3rd access — encourages weak models to re-read freely
-    /// (each subsequent read is store-served and effectively free)
-    /// instead of hoarding context-window with conservative
-    /// offset/limit guesses.
-    pub path_read_counts: Arc<RwLock<std::collections::HashMap<PathBuf, usize>>>,
 }
 
 impl ToolContext {
@@ -853,7 +846,6 @@ impl ToolContext {
             current_call_id: None,
             tool_registry: None,
             file_store: Arc::new(RwLock::new(crate::ctx::file_store::FileStore::new())),
-            path_read_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -869,10 +861,6 @@ impl ToolContext {
         // the parent's disk work and benefit from invalidation events
         // emitted by either side.
         ctx.file_store = self.file_store.clone();
-        // Share read counts too: the "Nth read of X" hint should reflect
-        // total session activity, not per-sub-agent counts that would
-        // both stay at 1.
-        ctx.path_read_counts = self.path_read_counts.clone();
         ctx
     }
 

@@ -273,16 +273,6 @@ impl Tool for ReadFileTool {
             });
         }
 
-        // R2: bump per-path read counter so the soft "Nth read" hint
-        // can fire below. Counter survives across sub-agents (shared
-        // via `ToolContext.isolate`).
-        let path_read_n = {
-            let mut counts = ctx.path_read_counts.write().await;
-            let n = counts.entry(path.clone()).or_insert(0);
-            *n += 1;
-            *n
-        };
-
         // D3 (merged): consult FileStore before reading disk. If we've
         // read this path before AND mtime hasn't moved, every range
         // read of any subsequent offset/limit can be served from
@@ -473,26 +463,19 @@ impl Tool for ReadFileTool {
             };
             // The upstream `served_from_store ? skip : push` block
             // already populated FileStore with the raw content; this
-            // skeleton path does NOT need its own push. The reminder
-            // "use peek_file" is also gone — peek_file no longer
-            // exists; subsequent range reads of this file now hit
-            // FileStore transparently via the upstream `store_hit`
-            // branch.
-            let skeleton_out = maybe_prepend_read_hints(
-                skeleton,
-                served_from_store,
-                path_read_n,
-                &parsed.file_path,
-            );
+            // skeleton path does NOT need its own push. Subsequent
+            // range reads of this file hit FileStore transparently
+            // via the upstream `store_hit` branch — no model-visible
+            // metadata in the result.
             if let Some(mtime) = disk_mtime {
                 ctx.read_cache.write().await.insert(
                     cache_key.clone(),
-                    (mtime, skeleton_out.clone(), 1),
+                    (mtime, skeleton.clone(), 1),
                 );
             }
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: skeleton_out,
+                output: skeleton,
                 success: true,
             });
         }
@@ -585,76 +568,17 @@ impl Tool for ReadFileTool {
         // store-id pointer the model needs to track. The renderer
         // just emits full inline content (skeleton already handled
         // very-large files above).
-        let final_output =
-            maybe_prepend_read_hints(output, served_from_store, path_read_n, &parsed.file_path);
-
         if let Some(mtime) = disk_mtime {
             ctx.read_cache
                 .write()
                 .await
-                .insert(cache_key, (mtime, final_output.clone(), 1));
+                .insert(cache_key, (mtime, output.clone(), 1));
         }
         Ok(ToolResult {
             call_id: String::new(),
-            output: final_output,
+            output,
             success: true,
         })
-    }
-}
-
-/// Prepend soft hints to a read_file result.
-///
-/// Two hints, additive:
-/// 1. `[NOTE: served from FileStore cache, no disk hit]` when the
-///    content came from an in-memory snapshot rather than disk.
-/// 2. `[NOTE: Nth read of <file>, re-reads are free]` once the same
-///    path has been read 3+ times in this session — encourages weak
-///    models to look up specific regions freely instead of hoarding
-///    context window with "just in case" full reads.
-///
-/// The `read_count < 3` case stays silent so the prompt stays clean
-/// for first-touch reads. Hints are stacked into one prefix block so
-/// the existing rendered output is untouched downstream.
-fn maybe_prepend_read_hints(
-    output: String,
-    served_from_store: bool,
-    read_count: usize,
-    file_path: &str,
-) -> String {
-    let mut prefix = String::new();
-    let display = std::path::Path::new(file_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| file_path.to_string());
-
-    if read_count >= 3 {
-        prefix.push_str(&format!(
-            "[NOTE: {}{} read of `{}` this session. Subsequent reads of any \
-             range of this file are served from local cache (no disk hit). \
-             Re-read freely — looking up specific regions is cheap.]\n",
-            read_count,
-            ordinal_suffix(read_count),
-            display,
-        ));
-    } else if served_from_store {
-        prefix.push_str(
-            "[NOTE: served from FileStore cache, no disk hit.]\n",
-        );
-    }
-    if prefix.is_empty() {
-        output
-    } else {
-        format!("{}\n{}", prefix.trim_end(), output)
-    }
-}
-
-fn ordinal_suffix(n: usize) -> &'static str {
-    match (n % 10, n % 100) {
-        (1, 11) | (2, 12) | (3, 13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
     }
 }
 
@@ -1166,36 +1090,40 @@ mod tests {
         );
     }
 
-    /// THE merge's core promise: a range read that follows a full
-    /// read of the same path is served from FileStore — no disk
-    /// hit, just an in-memory slice. Verified by the result carrying
-    /// the "from FileStore cache" notice.
+    /// THE merge's core promise: a range read after a full read of
+    /// the same path is served from FileStore (no disk hit). After
+    /// the CC-alignment cleanup the store-served path is silent —
+    /// the model gets the requested range with no model-visible
+    /// metadata about cache origin. Test pins behaviour by checking
+    /// (a) the requested lines are returned, (b) no leaked
+    /// "FileStore" / "cache" preamble appears, and (c) the store
+    /// still has the entry (so we know the cache was actually used).
     #[tokio::test]
-    async fn d3_range_read_after_full_read_serves_from_store() {
+    async fn d3_range_read_after_full_read_silently_serves_from_store() {
         let dir = TempDir::new().unwrap();
         let path = write_n_line_file(&dir, "big.rs", 200);
         let ctx = ToolContext::new(dir.path().to_path_buf());
 
-        // Full read populates the store.
         let full_args = format!(r#"{{"file_path":"{}"}}"#, path.display());
         let _ = ReadFileTool.execute(&full_args, &ctx).await.unwrap();
 
-        // Range read should now hit store transparently. We verify
-        // via the cache-served notice, since the disk path doesn't
-        // emit it. (Range reads bypass auto_skeleton, so any cache
-        // hit comes through the new merge path.)
         let range_args = format!(
             r#"{{"file_path":"{}","offset":100,"limit":5}}"#,
             path.display()
         );
         let r = ReadFileTool.execute(&range_args, &ctx).await.unwrap();
         assert!(r.success);
+        assert!(r.output.contains("line 100"));
         assert!(
-            r.output.contains("FileStore cache"),
-            "range read after full read must announce store-served:\n{}",
+            !r.output.contains("FileStore"),
+            "store-served read must NOT leak any FileStore preamble:\n{}",
             r.output
         );
-        assert!(r.output.contains("line 100"));
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            1,
+            "FileStore must retain the entry across both reads"
+        );
     }
 
     /// Edit invalidates the cache so the next read sees fresh disk
@@ -1290,12 +1218,14 @@ mod tests {
         );
     }
 
-    /// R2: third read of the same path triggers the soft "Nth read"
-    /// hint — encourages weak models to look up regions freely
-    /// without conservative offset/limit hoarding. The first two
-    /// reads stay clean.
+    /// After CC alignment: subsequent reads of the same path do NOT
+    /// surface any framework-side "Nth read of X" preamble. The
+    /// model gets the same shape of output every time. Pins the
+    /// removal of the R2 hint that earlier datalogs (2026-05-06)
+    /// showed glm-5.1 ignoring anyway — keeping it was both
+    /// hardcoded metadata-injection and ineffective.
     #[tokio::test]
-    async fn d3_third_read_emits_same_path_hint() {
+    async fn d3_subsequent_reads_have_no_framework_preamble() {
         let dir = TempDir::new().unwrap();
         let path = write_n_line_file(&dir, "big.rs", 200);
         let ctx = ToolContext::new(dir.path().to_path_buf());
@@ -1306,15 +1236,13 @@ mod tests {
         let r2 = ReadFileTool.execute(&args2, &ctx).await.unwrap();
         let r3 = ReadFileTool.execute(&args3, &ctx).await.unwrap();
         assert!(r1.success && r2.success && r3.success);
-        assert!(
-            !r1.output.contains("3rd read") && !r1.output.contains("2nd read"),
-            "first read must be clean of count hints:\n{}",
-            r1.output
-        );
-        assert!(
-            r3.output.contains("3rd read"),
-            "third read must surface the count hint:\n{}",
-            r3.output
-        );
+        for (i, r) in [&r1, &r2, &r3].iter().enumerate() {
+            assert!(
+                !r.output.contains("read of `") && !r.output.contains("FileStore cache"),
+                "read #{} must not carry framework metadata; got:\n{}",
+                i + 1,
+                r.output
+            );
+        }
     }
 }
