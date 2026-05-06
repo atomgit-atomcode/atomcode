@@ -438,15 +438,40 @@ impl Tool for ReadFileTool {
                 format!("[File skeleton: {} ({} lines) — use grep to find relevant lines, then read with offset/limit.]\n",
                     fname, total_lines)
             };
-            if let Some(mtime) = disk_mtime {
-                ctx.read_cache
+            // D3 (auto_skeleton path): push raw content into FileStore
+            // and append the store_id pointer so the model can peek any
+            // region with zero disk hit. Without this, large files
+            // (>SKELETON_LINE_THRESHOLD) bypass D3 entirely — the
+            // skeleton's "copy this offset/limit into read_file"
+            // suggestion becomes the dominant pattern and every range
+            // read costs a fresh disk roundtrip + full content carry.
+            // Datalog 2026-05-06_14-29-08 documents this miss: 19 reads
+            // of one 753-line file, 0 peek_file calls.
+            let skeleton_with_store = if let Some(mtime) = disk_mtime {
+                let store_id = ctx
+                    .file_store
                     .write()
                     .await
-                    .insert(cache_key.clone(), (mtime, skeleton.clone(), 1));
+                    .insert(path.clone(), content.clone(), mtime);
+                format!(
+                    "{}\n[Full content cached at store_id={}. \
+                     For any specific region, prefer peek_file({{\"store_id\":\"{}\",\"lines\":\"X-Y\"}}) \
+                     over read_file with offset/limit — peek is local (no disk hit, no duplicated \
+                     content carry across turns).]",
+                    skeleton, store_id, store_id,
+                )
+            } else {
+                skeleton
+            };
+            if let Some(mtime) = disk_mtime {
+                ctx.read_cache.write().await.insert(
+                    cache_key.clone(),
+                    (mtime, skeleton_with_store.clone(), 1),
+                );
             }
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: skeleton,
+                output: skeleton_with_store,
                 success: true,
             });
         }
@@ -1237,6 +1262,45 @@ mod tests {
             ctx.file_store.read().await.len(),
             1,
             "second read of identical file must not duplicate store entry"
+        );
+    }
+
+    /// Regression for the auto_skeleton bypass bug (datalog
+    /// 2026-05-06_14-29-08): a 753-line tunnel.rs was read 19 times
+    /// across the session, store_id never appeared in those results,
+    /// peek_file fired zero times. Root cause: auto_skeleton fired
+    /// at line ~340 and returned BEFORE the D3 branch at line ~535.
+    /// Large files (>300 lines) bypassed D3 entirely.
+    ///
+    /// Fix: auto_skeleton path also pushes raw content into FileStore
+    /// and appends the store_id pointer so the model can peek any
+    /// region without disk hits. This test guards that integration.
+    #[tokio::test]
+    async fn d3_skeleton_path_also_pushes_to_store() {
+        let dir = TempDir::new().unwrap();
+        // 350 lines — above SKELETON_LINE_THRESHOLD (300), so the
+        // auto_skeleton branch fires. Without the fix, store stays
+        // empty and the result lacks `store_id=fs_`.
+        let path = write_n_line_file(&dir, "huge.rs", 350);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(
+            r.output.contains("File skeleton:"),
+            "huge file should still get skeleton; got:\n{}",
+            r.output
+        );
+        assert!(
+            r.output.contains("store_id=fs_"),
+            "auto_skeleton path MUST also expose a store_id so peek_file \
+             can fetch regions; got:\n{}",
+            r.output
+        );
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            1,
+            "auto_skeleton path must populate FileStore"
         );
     }
 
