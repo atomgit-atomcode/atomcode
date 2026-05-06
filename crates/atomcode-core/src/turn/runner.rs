@@ -196,6 +196,23 @@ impl TurnRunner {
             ..parent
         };
         let turn_started = std::time::Instant::now();
+
+        // D3 path C — refresh the file-store snapshot so build_messages
+        // can inject the system-level reminder. Done here (not inside
+        // build_messages) because:
+        //   1. build_messages is sync but FileStore behind RwLock needs
+        //      `await` — pulling that boundary up keeps the trait sync.
+        //   2. Single source of truth: every render uses the freshest
+        //      snapshot of FileStore, not a possibly-stale cache.
+        //   3. Cheap: HashMap iter + sort over ≤ N entries (cap 10).
+        const ACTIVE_FILES_LIMIT: usize = 10;
+        conversation.active_files_snapshot = self
+            .context
+            .file_store
+            .read()
+            .await
+            .active_summaries(ACTIVE_FILES_LIMIT);
+
         // 1. Build messages within token budget.
         // Goes through `self.ctx.build_messages` (trait dispatch), NOT
         // `ctx::render::build_messages` (free fn) — otherwise per-model

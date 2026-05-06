@@ -34,6 +34,18 @@ pub struct Conversation {
     /// Cold zone: FIFO queue of compressed history summaries (max 3).
     /// Each entry is an LLM-generated summary of older turns.
     pub cold_summaries: Vec<String>,
+    /// D3 path C — transient mirror of `FileStore::active_summaries(N)`,
+    /// refreshed by the agent loop right before each `build_messages`
+    /// call. Lives OUTSIDE `messages` so conversation compaction
+    /// cannot destroy it: when cold-zone summarisation collapses old
+    /// turns, the store_ids embedded in those turns vanish, but this
+    /// snapshot survives untouched and gets re-injected as a system
+    /// reminder. Without this, `peek_file` becomes unaddressable
+    /// post-compaction (model has no way to learn the store_id).
+    ///
+    /// Not persisted (load/save only round-trip `messages`); rebuilt
+    /// from `FileStore` on every render.
+    pub active_files_snapshot: Vec<crate::ctx::file_store::FileSummary>,
 }
 
 impl Default for Conversation {
@@ -44,6 +56,7 @@ impl Default for Conversation {
             tool_call_buffer: None,
             turn_tracker: TurnTracker::new(),
             cold_summaries: Vec::new(),
+            active_files_snapshot: Vec::new(),
         }
     }
 }
@@ -78,6 +91,7 @@ impl Conversation {
             tool_call_buffer: None,
             turn_tracker,
             cold_summaries: Vec::new(),
+            active_files_snapshot: Vec::new(),
         }
     }
 
