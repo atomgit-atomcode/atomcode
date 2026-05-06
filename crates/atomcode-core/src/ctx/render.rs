@@ -375,41 +375,51 @@ pub fn build_messages(
     )
 }
 
-/// Default reserved headroom subtracted from the context window to derive
-/// the auto-compression threshold. Mirrors CC's `AUTOCOMPACT_BUFFER_TOKENS`
-/// (services/compact/autoCompact.ts:62) which targets Claude's 200K
-/// window. atomcode runs across windows from 8K (Ollama) to 200K+, so the
-/// effective buffer is `min(AUTO_COMPACT_BUFFER_TOKENS, ctx_window / 4)`
-/// — for large windows you get the full 13K, for small windows it scales
-/// down to 25% of the window so the threshold stays meaningful.
-pub const AUTO_COMPACT_BUFFER_TOKENS: usize = 13_000;
+/// Reserved headroom for large windows (CC / Anthropic 200K territory)
+/// where compaction can afford to leave a generous response + tool-result
+/// runway. Mirrors CC's `AUTOCOMPACT_BUFFER_TOKENS`.
+pub const AUTO_COMPACT_BUFFER_LARGE: usize = 13_000;
+
+/// Reserved headroom for small/proxy-bound windows (typical self-hosted
+/// GLM 65K). 5K leaves space for one streaming response + a round of
+/// tool results without forcing compaction so early it shrinks the
+/// usable session. Larger buffers (13K) on a 65K cap kick compaction at
+/// 52K — wasting the 12K immediately above where users do real work.
+pub const AUTO_COMPACT_BUFFER_SMALL: usize = 5_000;
+
+/// Cutoff between "small" and "large" windows. 100K is the natural
+/// dividing line: anything ≤ 100K is a self-hosted / proxy-bound
+/// deployment that benefits from a tight buffer; anything > 100K is a
+/// vendor offering (Anthropic 200K, etc.) where the wider buffer
+/// matches CC's behaviour.
+pub const AUTO_COMPACT_LARGE_WINDOW_FROM: usize = 100_000;
 
 /// Compute the auto-compression trigger threshold for a given context
 /// window. Returns the token total above which `needs_compression` fires.
 ///
-/// Formula: `ctx_window - min(AUTO_COMPACT_BUFFER_TOKENS, ctx_window / 4)`.
-/// At 131K window → 131K - 13K = 118K threshold. At 8K Ollama window
-/// → 8K - 2K = 6K threshold (since 8K/4 = 2K caps the buffer).
+/// Buffer scales with window size:
+/// - ≤ 100K (proxy-bound): 5K buffer → 65K window → 60K trigger.
+/// - > 100K (vendor large): 13K buffer → 200K window → 187K trigger.
+/// - Either branch caps at `ctx_window / 4` so degenerate small windows
+///   (8K Ollama) still land on a meaningful 6K threshold rather than
+///   underflowing to 0.
 pub fn auto_compact_threshold(token_budget: usize) -> usize {
-    let buffer = AUTO_COMPACT_BUFFER_TOKENS.min(token_budget / 4);
+    let raw_buffer = if token_budget > AUTO_COMPACT_LARGE_WINDOW_FROM {
+        AUTO_COMPACT_BUFFER_LARGE
+    } else {
+        AUTO_COMPACT_BUFFER_SMALL
+    };
+    let buffer = raw_buffer.min(token_budget / 4);
     token_budget.saturating_sub(buffer)
 }
 
 /// Check if context needs compression.
 ///
-/// Threshold: `ctx_window - AUTO_COMPACT_BUFFER_TOKENS` (absolute
-/// headroom, CC-style). The previous percentage-based formula
-/// (`min(50% of budget, 50K)`) had two structural problems:
-///
-/// 1. **Scale-dependent buffer.** A 32K window left 16K headroom; a
-///    131K window left 50K headroom (capped). The buffer the user
-///    actually needs — one streaming response plus the next round's
-///    tool results — doesn't scale with window size, so the percentage
-///    formula was generous on small windows and stingy on large ones.
-/// 2. **Unintuitive at debug time.** "Why did compression fire at 28%
-///    of my 131K window?" had to be reverse-derived from the `min(...)`
-///    cap. The new formula reads directly: "fire when fewer than 13K
-///    tokens remain".
+/// Threshold derived from `auto_compact_threshold` — fires when fewer
+/// than `buffer` tokens remain (5K for ≤100K windows, 13K for >100K).
+/// Buffer scales with the deployment: self-hosted GLM at 65K trips
+/// at 60K (4K runway is plenty for one round); Anthropic at 200K
+/// trips at 187K, matching CC's behaviour.
 ///
 /// The `messages.len() < 12` guard stays — needs a non-trivial backlog
 /// before compression is worthwhile, and 1 user msg can produce 15+
@@ -1045,24 +1055,40 @@ mod tests {
     }
 
     #[test]
-    fn auto_compact_threshold_large_window_uses_full_buffer() {
-        // 131K window: 131072 - 13000 = 118072. The user with the GLM-5.1
-        // self-hosted endpoint sees this exact case — large headroom, fixed
-        // buffer for one streaming response + next round's tool results.
-        assert_eq!(auto_compact_threshold(131_072), 118_072);
+    fn auto_compact_threshold_large_window_uses_large_buffer() {
+        // > 100K → 13K buffer (Anthropic / CC territory). 200K - 13K = 187K.
         assert_eq!(auto_compact_threshold(200_000), 187_000);
+        // 131K → boundary above the 100K cutoff, also gets 13K buffer.
+        assert_eq!(auto_compact_threshold(131_072), 118_072);
     }
 
     #[test]
-    fn auto_compact_threshold_small_window_scales_buffer_down() {
-        // 8K Ollama: a fixed 13K buffer would underflow to 0 and force
-        // compression at every turn. Scaling cap (window/4) gives 2K
-        // buffer → 6K threshold, which fires at ~75% — tight but workable
-        // for small-window local models.
+    fn auto_compact_threshold_small_window_uses_small_buffer() {
+        // ≤ 100K → 5K buffer (proxy-bound deployments). 65K - 5K = 60K
+        // — exactly the sweet spot for a 65K self-hosted GLM cap:
+        // compaction kicks in 5K below the proxy hard wall, leaving
+        // a runway for one streaming response without forcing
+        // pre-emptive compaction so early it shrinks the usable
+        // session.
+        assert_eq!(auto_compact_threshold(65_000), 60_000);
+        // 100K is the boundary — still small-buffer (the cutoff is
+        // strictly greater-than).
+        assert_eq!(auto_compact_threshold(100_000), 95_000);
+        // Just over 100K trips into large-buffer territory.
+        assert_eq!(auto_compact_threshold(101_000), 88_000);
+    }
+
+    #[test]
+    fn auto_compact_threshold_tiny_window_caps_at_quarter() {
+        // 8K Ollama: 5K buffer would still leave only 3K usable, but
+        // window/4 = 2K caps the buffer below 5K → 6K threshold (~75%
+        // of window). Scales the buffer when the window is too small
+        // for the small-buffer constant.
         assert_eq!(auto_compact_threshold(8_000), 6_000);
         assert_eq!(auto_compact_threshold(16_000), 12_000);
-        // At 52K the formulas cross over: window/4 = 13K = full buffer.
-        assert_eq!(auto_compact_threshold(52_000), 39_000);
+        // At 20K the small-buffer constant (5K) lands at exactly
+        // window/4, so 5K applies straight: 20K - 5K = 15K.
+        assert_eq!(auto_compact_threshold(20_000), 15_000);
     }
 
     #[test]

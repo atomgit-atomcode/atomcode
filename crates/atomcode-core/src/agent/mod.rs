@@ -2051,14 +2051,46 @@ impl AgentLoop {
     // forward_turn_event → tool_dispatch.rs
     // post_process_tool_results → tool_dispatch.rs
 
-    /// Compress old turns when context > threshold.
-    /// Uses LLM to summarize, falls back to mechanical compression.
+    /// Pro-active context compaction. Two-stage:
+    ///
+    /// 1. **Tier 1 (cheap, mechanical):** collapse old `ToolResult`
+    ///    bodies into stubs (`collapse_old_tool_results`, keeping the
+    ///    last 3 turns full). Zero LLM calls. Cheap to fire, easy to
+    ///    revert if model needs the bytes back via re-read.
+    ///
+    /// 2. **Tier 2 (expensive, LLM-driven):** if Tier 1 didn't bring
+    ///    the context under threshold, fall through to LLM-summarize
+    ///    older turns into the cold zone (existing path).
+    ///
+    /// Buffer was retuned 2026-05-06: small windows (≤100K, e.g.
+    /// self-hosted GLM 65K) now trigger at 60K instead of 52K, so
+    /// the 5K runway above the trigger lets Tier 1 absorb hits
+    /// before the proxy 65K wall. Datalog 2026-05-06_19-06-50: 4
+    /// reactive emergency compactions, each dropping 18-30K
+    /// catastrophically. With proactive Tier 1 firing 5K below the
+    /// wall, expected pattern is 3-4 mild Tier 1 events dropping
+    /// 5-10K each, model retains skeleton + recent turns.
     async fn maybe_compress_history(&mut self, system_prompt: &str) {
         let sys_tokens = system_prompt.len() / 4 + 4;
         if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
             return;
         }
 
+        // ── Tier 1: collapse old tool_results (no LLM call) ──
+        // Keep the most recent 3 turns at full fidelity; older
+        // turns get their tool_result bodies replaced with one-line
+        // stubs. Cheapest way to recover headroom.
+        collapse_old_tool_results(&mut self.conversation, /* keep_recent_turns */ 3);
+
+        // Re-check: if Tier 1 was enough, stop here and skip the
+        // LLM summarization round-trip. This is the common case for
+        // sessions where the bulk of context is heavy bash/cargo
+        // outputs.
+        if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
+            return;
+        }
+
+        // ── Tier 2: LLM-summarize oldest turns into cold zone ──
         let (content, n_turns) = match self.ctx.compression_plan(&self.conversation) {
             Some(plan) => plan,
             None => return,
@@ -3084,6 +3116,52 @@ mod classifier_tests {
                 _ => false,
             })
             .count()
+    }
+
+    /// Phase 1 proactive compact: Tier 1 (collapse) is enough for the
+    /// common case — heavy old tool_result bodies become stubs and
+    /// the conversation token total drops below threshold without
+    /// invoking the LLM-summary round trip. Tier 2 only fires when
+    /// Tier 1 wasn't enough. This test pins the contract that Tier 1
+    /// is invoked first; Tier 2 path is covered separately by the
+    /// existing emergency-compact tests.
+    #[test]
+    fn proactive_tier1_collapses_old_tool_results_only() {
+        // Build a conversation heavy with old, large tool_results
+        // (typical bash/cargo session shape). After Tier 1 with
+        // keep_recent_turns=3, the 3 OLDEST turns' tool_results
+        // should be stubs while the 3 RECENT turns retain full
+        // payload. Pins the "older=collapsed, newer=intact" split.
+        let mut conv = build_conv(/* n_turns */ 6, /* result_size */ 4_000);
+        super::collapse_old_tool_results(&mut conv, 3);
+
+        // Walk the messages: each turn pushes (User, AssistantToolCall,
+        // ToolResult). 6 turns × 3 msgs = 18 msgs. The first 3 turns
+        // are "old"; turns 4-6 are "recent".
+        let mut tr_sizes: Vec<usize> = Vec::new();
+        for m in &conv.messages {
+            if let MessageContent::ToolResult(tr) = &m.content {
+                tr_sizes.push(tr.output.len());
+            }
+        }
+        assert_eq!(tr_sizes.len(), 6, "expected 6 tool_results");
+        // Old: index 0, 1, 2 — must be stubs (small).
+        for &s in &tr_sizes[..3] {
+            assert!(
+                s < 200,
+                "old tool_result must collapse to stub; got len={}",
+                s
+            );
+        }
+        // Recent: index 3, 4, 5 — must remain full (4_000 chars + the
+        // 'x' chars).
+        for &s in &tr_sizes[3..] {
+            assert!(
+                s >= 4_000,
+                "recent tool_result must remain full; got len={}",
+                s
+            );
+        }
     }
 
     #[test]
