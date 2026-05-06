@@ -1312,12 +1312,20 @@ impl TurnRunner {
     /// Detect tool-call loops and return a recovery message when one should be
     /// blocked. Also updates the rolling call history as a side effect.
     ///
-    /// Two patterns are caught:
+    /// Three patterns are caught:
     ///
     /// **Exact repeats** (any tool except `read_file`): 3 calls with identical
     /// `(tool_name, args_hash)` and no intervening `edit_file` / `write_file`.
     /// Means the model re-issued the same command without reacting to the
     /// previous failure.
+    ///
+    /// **Bash churn** (bash-only): 5 consecutive bash calls with no
+    /// non-bash tool of any kind in between. Catches the cargo-check-with-
+    /// rotating-grep-filters pathology where each command's args differ
+    /// just enough to dodge the exact-hash check, but the underlying
+    /// intent ("re-run cargo and squint at the output") is identical.
+    /// Datalog 2026-05-06_15-33-23: 9 consecutive cargo invocations,
+    /// 0 hash collisions, 0 BLOCKED triggered before this guard existed.
     ///
     /// `read_file` is excluded because its dedicated cache (see
     /// `tool/read.rs`'s `read_cache` lookup) handles repeats by returning the
@@ -1336,6 +1344,37 @@ impl TurnRunner {
         // repeat detector either.
         if tool_name == "read_file" {
             return None;
+        }
+
+        // ── Pattern 2: bash-churn (consecutive bash, no other tool) ──
+        // Generic detector — does NOT inspect command shape, so we don't
+        // need tech-specific knowledge of `cargo` / `npm` / `pytest`. The
+        // streak resets on ANY non-bash tool call (read_file, grep, edit,
+        // even peek_file), so legitimate "run-investigate-run" flows
+        // where the model reads error output between bashes don't trip
+        // it. Threshold 5 leaves room for typical exploration pre-edit
+        // (e.g. cd, ls, env-check, first build) before the guard fires.
+        const BASH_CHURN_LIMIT: usize = 5;
+        if tool_name == "bash" {
+            let consecutive_bash = count_consecutive_bash_streak(&self.recent_calls);
+            if consecutive_bash >= BASH_CHURN_LIMIT {
+                // Don't push the sig — leaving it out keeps the next bash's
+                // streak counter at the same value, so subsequent attempts
+                // also block until the model breaks the pattern with a
+                // different tool (read/edit/grep/peek). Pushing here would
+                // "reset" the perceived streak from the model's side and
+                // let it limp another N rounds.
+                return Some(format!(
+                    "BLOCKED: {} consecutive bash calls with no other tool \
+                     (read/edit/grep/peek) in between. This is a churn loop. \
+                     The previous outputs are in your tool_results — parse \
+                     them. If the build/test passed (exit=0), declare success \
+                     and continue. If it failed, READ the error and edit the \
+                     relevant file. Don't keep re-running the same command \
+                     with different output filters.",
+                    consecutive_bash
+                ));
+            }
         }
 
         let args_hash = loop_args_hash(tool_name, args, working_dir.as_deref());
@@ -1371,6 +1410,29 @@ impl TurnRunner {
         }
         None
     }
+}
+
+/// Count the trailing run of `bash` entries in the call history,
+/// counting the implicit current call as 1. Any non-bash entry breaks
+/// the streak. Pure function over the history slice — exposed at module
+/// scope so the bash-churn detector can be unit-tested without needing
+/// a full TurnRunner fixture.
+///
+/// Why "consecutive, no-other-tool" is the right shape: legitimate
+/// "bash → read error → bash → read error → bash" flows include reads
+/// between failures, so the read entries break the streak and the
+/// churn guard does not fire. The pathology this catches is a tight
+/// run of bashes that NEVER let the model parse the previous output.
+fn count_consecutive_bash_streak(recent_calls: &[(String, u64)]) -> usize {
+    let mut n = 1usize; // current call
+    for prev in recent_calls.iter().rev() {
+        if prev.0 == "bash" {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n
 }
 
 /// Hash a tool call for exact-repeat loop detection.
@@ -1873,7 +1935,9 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
 
 #[cfg(test)]
 mod loop_hash_tests {
-    use super::{loop_args_hash, read_region_key, READ_REGION_BUCKET};
+    use super::{
+        count_consecutive_bash_streak, loop_args_hash, read_region_key, READ_REGION_BUCKET,
+    };
 
     // Using a separate module name to avoid conflicting with the sibling
     // `turn::tests` integration-style test module.
@@ -2131,6 +2195,80 @@ mod loop_hash_tests {
         let c = loop_args_hash("bash", r#"{"not_command":"oops"}"#, None);
         let d = loop_args_hash("bash", r#"{"not_command":"oops"}"#, None);
         assert_eq!(c, d);
+    }
+
+    // ── consecutive-bash streak counter ──
+
+    fn entry(tool: &str) -> (String, u64) {
+        (tool.to_string(), 0)
+    }
+
+    #[test]
+    fn streak_counts_one_for_first_bash_with_empty_history() {
+        // Empty `recent_calls` + current call = streak of 1. Far below
+        // the threshold of 5 — first bash in a session never blocks.
+        assert_eq!(count_consecutive_bash_streak(&[]), 1);
+    }
+
+    #[test]
+    fn streak_grows_with_bash_tail() {
+        let history = vec![entry("bash"), entry("bash"), entry("bash")];
+        // Three prior + the current call = 4.
+        assert_eq!(count_consecutive_bash_streak(&history), 4);
+    }
+
+    #[test]
+    fn any_non_bash_tool_breaks_the_streak() {
+        // bash, bash, read_file, bash, bash — only the trailing two
+        // bashes count (read_file resets the run-length walk).
+        let history = vec![
+            entry("bash"),
+            entry("bash"),
+            entry("read_file"),
+            entry("bash"),
+            entry("bash"),
+        ];
+        assert_eq!(count_consecutive_bash_streak(&history), 3);
+    }
+
+    #[test]
+    fn edit_breaks_streak_too() {
+        // edit_file is also "non-bash" so it breaks the run. We don't
+        // need a special edit-aware branch — the simple "any non-bash
+        // resets" rule already handles it.
+        let history = vec![entry("bash"), entry("edit_file"), entry("bash")];
+        assert_eq!(count_consecutive_bash_streak(&history), 2);
+    }
+
+    #[test]
+    fn streak_at_threshold_minus_one_does_not_block() {
+        // 4 consecutive bash = current 1 + 3 prior. BASH_CHURN_LIMIT is
+        // 5, so this case must NOT trigger the block — exploration
+        // sessions running cd / ls / cat / first-build legitimately
+        // fall here.
+        let history = vec![entry("bash"); 3];
+        assert_eq!(count_consecutive_bash_streak(&history), 4);
+    }
+
+    #[test]
+    fn streak_at_threshold_blocks() {
+        // 5 consecutive bash = current 1 + 4 prior — the smallest
+        // streak that triggers the BLOCKED path. Mirrors the datalog
+        // 2026-05-06_15-33-23 cargo-check run: 9 in a row after the
+        // last edit, no other tool between them.
+        let history = vec![entry("bash"); 4];
+        assert_eq!(count_consecutive_bash_streak(&history), 5);
+    }
+
+    #[test]
+    fn streak_walks_only_the_trailing_run() {
+        // Older bashes separated by another tool don't add to the
+        // streak — only the contiguous tail counts.
+        let mut history = vec![entry("bash"); 10];
+        history.push(entry("read_file"));
+        history.push(entry("bash"));
+        history.push(entry("bash"));
+        assert_eq!(count_consecutive_bash_streak(&history), 3);
     }
 }
 
