@@ -2969,7 +2969,13 @@ pub(super) fn handle_upgrade_event(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         UpgradeEvent::Failed(msg) => {
-            renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
+            if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
+                // Already latest — informational, not an error.
+                let info = msg.replace(&format!("{}: ", atomcode_core::self_update::ALREADY_LATEST), "");
+                renderer.render(UiLine::CommandOutput(format!("  {}", info)));
+            } else {
+                renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
+            }
         }
         UpgradeEvent::RolledBack { exe, backup } => {
             renderer.render(UiLine::CommandOutput(format!(
