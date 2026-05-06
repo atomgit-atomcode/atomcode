@@ -61,7 +61,7 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
 //
 // `crate::markdown::render_line` returns an ANSI-tinted string: the
 // markdown text with SGR escapes embedded (e.g. `**bold**` →
-// `\x1b[1mbold\x1b[22m`, `` `code` `` → `\x1b[96mcode\x1b[39m`).
+// `\x1b[1mbold\x1b[22m`, `` `code` `` → `\x1b[97mcode\x1b[39m`).
 // AnsiRenderer wrote those bytes straight to stdout. Retained mode
 // works on `Cell`s, so we parse the ANSI string back into a stream
 // of cells carrying their computed style. Minimal parser — handles
@@ -78,7 +78,7 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
 //   27    reverse off
 //   39    fg default
 //   90    fg DarkGrey (borders / soft headings)
-//   96    fg Cyan (inline code / code blocks)
+//   97    fg White (inline code / code blocks — bright white)
 //   0     reset everything
 //
 // Other SGR params (RGB, 256-color, italic, underline) are silently
@@ -202,7 +202,7 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             Some(27) => style.reverse = false,
             Some(39) => style.fg = None,
             Some(90) => style.fg = Some(Color::DarkGrey),
-            Some(96) => style.fg = Some(Color::Cyan),
+            Some(97) => style.fg = Some(Color::White),
             _ => {
                 // Other colors (30-37, 91-97, 38;5;N, 38;2;R;G;B, bg,
                 // underline) silently ignored — our markdown crate
@@ -4185,7 +4185,7 @@ mod tests {
 
     /// Markdown inline: `**bold**` + `` `code` `` rendered in
     /// the assistant-text stream. Grid inspects specific cells to
-    /// confirm bold and cyan fg survived the markdown → cells →
+    /// confirm bold and bright-white fg survived the markdown → cells →
     /// serialize → vte parse round-trip.
     #[test]
     fn retained_markdown_inline_styles_via_vterm() {
@@ -4222,15 +4222,16 @@ mod tests {
             cell,
             vterm.dump()
         );
-        // Inline code: markdown crate wraps it in \x1b[96m (cyan) fg.
+        // Inline code: markdown crate wraps it in \x1b[97m (bright
+        // white) fg.
         let code_pos = row_text
             .find("code")
             .expect("expected 'code' in rendered text");
         let code_cell = vterm.cell_at(row_idx, code_pos);
         assert_eq!(
             code_cell.fg,
-            Some(crossterm::style::Color::Cyan),
-            "inline code cell should be cyan: {:?}",
+            Some(crossterm::style::Color::White),
+            "inline code cell should be bright white: {:?}",
             code_cell
         );
     }
