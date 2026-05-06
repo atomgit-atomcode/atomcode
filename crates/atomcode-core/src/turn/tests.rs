@@ -1279,18 +1279,85 @@ fn detect_call_loop_edit_resets_all_regions_for_file() {
 
     // The previously-hot bucket should now be freshly empty; 2 more reads
     // stay unblocked post-edit (verifying the `retain` cleared the entry).
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#,
-            100 + i * 10
+        // Same key read twice in a second turn → should NOT be blocked.
+        for i in 1..=2 {
+            let args = format!(
+                r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#,
+                100 + i * 10
+            );
+            assert!(
+                runner.detect_call_loop("read_file", &args).is_none(),
+                "post-edit read #{} should not be blocked — edit reset the counter",
+                i
+            );
+        }
+    }
+
+    /// Confirm that `file_read_counts` is cleared between turns so that
+    /// legitimate re-reads of the same region across turns are NOT blocked.
+    /// This is the regression test for the cross-turn false-positive bug.
+    #[test]
+    fn file_read_counts_clear_between_turns() {
+        let mut runner = make_runner(
+            MockProvider::text_only(""),
+            ToolRegistry::new(),
+            auto_bypass(),
         );
+
+        // Simulate turn-1: drive one region to its 3-call cap.
+        // Use different limit values so args_hash differs — isolates Pattern 1
+        // (region count) from Pattern 2 (exact-repeat).
+        let same_file = "/p/render.rs";
+        for i in 1..=3 {
+            let region = format!(
+                r#"{{"file_path":"{}","offset":100,"limit":{}}}"#,
+                same_file,
+                50 + i * 10
+            );
+            let verdict = runner.detect_call_loop("read_file", &region);
+            if i < 3 {
+                assert!(
+                    verdict.is_none(),
+                    "call #{} should not block yet",
+                    i
+                );
+            } else {
+                assert!(
+                    verdict.is_some(),
+                    "3rd call to same region MUST be blocked in turn-1"
+                );
+            }
+        }
+
+        // Simulate the end of turn-1: clear file_read_counts (this is what
+        // run_with_filter does at line 861 of runner.rs).
+        runner.file_read_counts.clear();
+
+        // Now the same region read 3 times in the "new turn" should be allowed
+        // (first 2 pass, 3rd triggers but that's expected for the SAME turn).
+        // Use different limit values again to avoid Pattern 2 (exact-repeat).
+        for i in 1..=2 {
+            let region = format!(
+                r#"{{"file_path":"{}","offset":100,"limit":{}}}"#,
+                same_file,
+                500 + i * 10
+            );
+            let verdict = runner.detect_call_loop("read_file", &region);
+            assert!(
+                verdict.is_none(),
+                "call #{} of same region in turn-2 should NOT be blocked after clear",
+                i
+            );
+        }
+
+        // Verify: 3rd read in turn-2 IS blocked (pattern 1 still works within a turn).
+        let third = format!(r#"{{"file_path":"{}","offset":100,"limit":520}}"#, same_file);
+        let third = runner.detect_call_loop("read_file", &third);
         assert!(
-            runner.detect_call_loop("read_file", &args).is_none(),
-            "post-edit read #{} should not be blocked — edit reset the counter",
-            i
+            third.is_some(),
+            "3rd read in turn-2 should be blocked — pattern 1 still works within the same turn"
         );
     }
-}
 
 // ===========================================================================
 // Telemetry integration tests

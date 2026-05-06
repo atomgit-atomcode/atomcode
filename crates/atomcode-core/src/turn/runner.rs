@@ -169,6 +169,12 @@ impl TurnRunner {
         cancel: CancellationToken,
         allowed_tools: Option<&[&str]>,
     ) -> TurnResult {
+        // Clear per-region read counts at the start of each turn.
+        // The guard is designed to catch loops *within a single turn* —
+        // carrying counts across turns would falsely block legitimate reads
+        // in subsequent turns.
+        self.file_read_counts.clear();
+
         // Telemetry: build a per-turn context carrying turn_id / provider / model.
         // Emitted on every exit path via the `tel_return!` macro below.
         let turn_id = uuid::Uuid::new_v4();
