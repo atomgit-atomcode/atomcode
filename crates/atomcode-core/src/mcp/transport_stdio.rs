@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +19,10 @@ use super::types::{CallToolResult, InitializeResult, ListToolsResult, ServerStat
 
 /// Default timeout for MCP operations (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum non-protocol lines to skip before giving up.
+/// Protects against servers that spam stdout with logs.
+const MAX_SKIP_LINES: usize = 100;
 
 /// stdio-based MCP client.
 pub struct StdioClient {
@@ -108,9 +112,15 @@ impl StdioClient {
         // The official JS MCP SDK's stdio transport can hang when it receives
         // `"params": null` for methods that expect params to be absent.
         let mut request = serde_json::Map::new();
-        request.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
+        request.insert(
+            "jsonrpc".to_string(),
+            serde_json::Value::String("2.0".to_string()),
+        );
         request.insert("id".to_string(), serde_json::Value::Number(id.into()));
-        request.insert("method".to_string(), serde_json::Value::String(method.to_string()));
+        request.insert(
+            "method".to_string(),
+            serde_json::Value::String(method.to_string()),
+        );
         if let Some(p) = params {
             request.insert("params".to_string(), p);
         }
@@ -121,9 +131,7 @@ impl StdioClient {
         // Write request (NDJSON).
         {
             let mut stdin = self.stdin.lock().await;
-            let stdin = stdin
-                .as_mut()
-                .context("MCP server not connected (stdin)")?;
+            let stdin = stdin.as_mut().context("MCP server not connected (stdin)")?;
 
             let mut body = serde_json::to_vec(&request)?;
             body.push(b'\n');
@@ -134,15 +142,15 @@ impl StdioClient {
         // Read response with timeout
         let result = tokio::time::timeout(timeout, self.recv_jsonrpc_response())
             .await
-            .with_context(|| format!("MCP request {} timed out after {}ms", method, self.timeout_ms))??;
+            .with_context(|| {
+                format!(
+                    "MCP request {} timed out after {}ms",
+                    method, self.timeout_ms
+                )
+            })??;
 
         if let Some(error) = result.error {
-            bail!(
-                "MCP error {} (code {}): {}",
-                error.message,
-                error.code,
-                ""
-            );
+            bail!("MCP error {} (code {}): {}", error.message, error.code, "");
         }
 
         result
@@ -175,10 +183,9 @@ impl McpClient for StdioClient {
             }
         });
 
-        let result: InitializeResult = serde_json::from_value(
-            self.send_request("initialize", Some(params)).await?,
-        )
-        .context("Failed to parse initialize result")?;
+        let result: InitializeResult =
+            serde_json::from_value(self.send_request("initialize", Some(params)).await?)
+                .context("Failed to parse initialize result")?;
 
         // Send initialized notification
         {
@@ -206,7 +213,11 @@ impl McpClient for StdioClient {
         serde_json::from_value(result).context("Failed to parse tools/list result")
     }
 
-    async fn call_tool(&self, tool_name: &str, arguments: serde_json::Value) -> Result<CallToolResult> {
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<CallToolResult> {
         let params = serde_json::json!({
             "name": tool_name,
             "arguments": arguments
@@ -236,35 +247,46 @@ impl StdioClient {
             .as_mut()
             .context("MCP server not connected (reader)")?;
 
-        let line = if let Some(s) = self.preread_line.lock().await.take() {
-            s
-        } else {
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                let n = reader.read_line(&mut buf).await?;
-                if n == 0 {
-                    bail!("MCP server closed connection");
+        let mut skipped_lines = 0;
+        loop {
+            let line = if let Some(s) = self.preread_line.lock().await.take() {
+                s
+            } else {
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    let n = reader.read_line(&mut buf).await?;
+                    if n == 0 {
+                        bail!("MCP server closed connection");
+                    }
+                    if !buf.trim().is_empty() {
+                        break;
+                    }
                 }
-                if !buf.trim().is_empty() {
-                    break;
-                }
-            }
-            buf
-        };
+                buf
+            };
 
-        let body = line.trim_end_matches(['\r', '\n']).trim_start();
-        if body.starts_with('{') || body.starts_with('[') {
-            return serde_json::from_str(body)
-                .context("Failed to parse NDJSON MCP message as JSON-RPC");
+            let body = line.trim_end_matches(['\r', '\n']).trim_start();
+            if body.starts_with('{') || body.starts_with('[') {
+                return serde_json::from_str(body)
+                    .context("Failed to parse NDJSON MCP message as JSON-RPC");
+            }
+            if strip_prefix_ci(body, "content-length:").is_some() {
+                return read_content_length_message(reader, line).await;
+            }
+
+            // Some third-party MCP servers incorrectly print status logs to stdout
+            // after initialization. MCP requires stdout to contain only protocol
+            // messages, but skipping plain-text lines keeps otherwise usable tools
+            // available while still failing on malformed JSON-RPC frames above.
+            skipped_lines += 1;
+            if skipped_lines > MAX_SKIP_LINES {
+                bail!(
+                    "MCP stdio: too many non-protocol lines (>{MAX_SKIP_LINES}), last line: {}",
+                    body.chars().take(80).collect::<String>()
+                );
+            }
         }
-        if strip_prefix_ci(body, "content-length:").is_some() {
-            return read_content_length_message(reader, line).await;
-        }
-        bail!(
-            "Unexpected MCP stdio line (expected NDJSON or Content-Length): {}",
-            body.chars().take(160).collect::<String>()
-        );
     }
 
     /// Drain non-protocol lines the server may print to stdout before the first MCP message.
