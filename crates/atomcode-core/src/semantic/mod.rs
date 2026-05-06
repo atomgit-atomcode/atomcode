@@ -25,6 +25,98 @@ pub struct Symbol {
     pub kind: String,
 }
 
+impl Symbol {
+    /// Check if this symbol has a Chinese name.
+    pub fn is_chinese(&self) -> bool {
+        contains_chinese(&self.name)
+    }
+
+    /// Check if this symbol looks like a Pinyin variable name.
+    pub fn is_pinyin(&self) -> bool {
+        is_pinyin_identifier(&self.name)
+    }
+
+    /// Check if this symbol is likely Chinese-related (Chinese name or Pinyin).
+    pub fn is_chinese_related(&self) -> bool {
+        self.is_chinese() || self.is_pinyin()
+    }
+}
+
+/// Check if a character is a Chinese character (CJK Unified Ideographs).
+fn is_chinese(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' |  // CJK Unified Ideographs
+        '\u{3400}'..='\u{4DBF}' |  // CJK Unified Ideographs Extension A
+        '\u{20000}'..='\u{2A6DF}' | // CJK Unified Ideographs Extension B
+        '\u{F900}'..='\u{FAFF}' |  // CJK Compatibility Ideographs
+        '\u{2F800}'..='\u{2FA1F}'  // CJK Compatibility Ideographs Supplement
+    )
+}
+
+/// Check if a string contains Chinese characters.
+fn contains_chinese(s: &str) -> bool {
+    s.chars().any(is_chinese)
+}
+
+/// Check if a string looks like a Pinyin variable name (e.g., yonghuMing, dingdanList).
+fn is_pinyin_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+
+    // Must start with alphabetic character
+    let first = s.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+
+    // Common Pinyin syllables found in Chinese variable names (deduplicated, sorted).
+    // Derived from the original curated list — excludes syllables that overlap with
+    // common English fragments (e.g., "ge", "tu", "se", "he", "de", "le") to avoid
+    // false positives on English identifiers like "getUser".
+    let pinyin_syllables = [
+        "ba", "bai", "bei", "biao", "chang", "chu", "da", "dan", "di", "ding",
+        "dong", "duan", "duo", "er", "fen", "gao", "guo", "hao", "hou", "hu",
+        "huai", "ji", "jian", "jiu", "kuai", "kuan", "leng", "li", "lie", "lu",
+        "man", "miao", "ming", "mu", "nan", "nei", "nian", "qi", "qian", "re",
+        "ren", "ri", "san", "shang", "shao", "shen", "shi", "shu", "si", "tian",
+        "wai", "wan", "wen", "wu", "xi", "xia", "xiao", "xin", "xing", "yi",
+        "yong", "you", "yue", "zhai", "zhong", "zuo",
+    ];
+
+    let lower = s.to_lowercase();
+    let remaining_str = lower.as_str();
+
+    // Greedy longest-match: try longest syllables first to avoid short syllables
+    // consuming characters that belong to longer ones (e.g., "xi" eating into "xiang").
+    let mut pos = 0usize;
+    let mut consumed_count = 0usize;
+    let mut syllable_count = 0usize;
+
+    while pos < remaining_str.len() {
+        let mut matched_len = 0usize;
+        for len in (1..=5.min(remaining_str.len() - pos)).rev() {
+            let candidate = &remaining_str[pos..pos + len];
+            if pinyin_syllables.binary_search(&candidate).is_ok() {
+                matched_len = len;
+                break;
+            }
+        }
+        if matched_len > 0 {
+            pos += matched_len;
+            consumed_count += matched_len;
+            syllable_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Require: (1) at least 2 syllable matches, AND (2) 80% coverage.
+    // This prevents false positives on English words like "getUser" which
+    // would match zero syllables from the restricted list.
+    syllable_count >= 2 && consumed_count as f64 / lower.len() as f64 > 0.8
+}
+
 /// Semantic code searcher: fuses Ripgrep speed with Tree-sitter precision.
 pub struct SemanticSearcher {
     cache: ASTCache,
@@ -747,8 +839,34 @@ impl SemanticSearcher {
     /// Code files: indent-level-0 definitions (fn/class/def/etc.)
     fn list_symbols_code_indent(&self, lines: &[&str]) -> Vec<Symbol> {
         let mut symbols = Vec::new();
-        let mut i = 0;
 
+        // Pass 1: Extract Chinese variable assignments at any indent level.
+        // This runs independently of the definition block detection below,
+        // ensuring variables inside function bodies are also captured.
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            if indent <= 8 && contains_chinese(trimmed) {
+                if let Some(eq_pos) = trimmed.find('=') {
+                    let var_name = trimmed[..eq_pos].trim();
+                    if contains_chinese(var_name) && !var_name.contains(' ') {
+                        symbols.push(make_symbol(
+                            var_name.to_string(),
+                            "chinese_variable",
+                            i,
+                            i + 1,
+                            lines,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Pass 2: Extract indent-level-0 definition blocks (fn/class/def/etc.)
+        let mut i = 0;
         while i < lines.len() {
             let line = lines[i];
             let trimmed = line.trim();
@@ -806,6 +924,7 @@ impl SemanticSearcher {
                     continue;
                 }
             }
+
             i += 1;
         }
 
@@ -1083,5 +1202,163 @@ def world():
             "indent fallback symbols: {:?}",
             names
         );
+    }
+
+    #[test]
+    fn test_chinese_character_detection() {
+        assert!(is_chinese('中'));
+        assert!(is_chinese('文'));
+        assert!(!is_chinese('a'));
+        assert!(!is_chinese('1'));
+        assert!(!is_chinese('_'));
+    }
+
+    #[test]
+    fn test_contains_chinese() {
+        assert!(contains_chinese("用户名"));
+        assert!(contains_chinese("hello世界"));
+        assert!(!contains_chinese("hello"));
+        assert!(!contains_chinese("123"));
+    }
+
+    #[test]
+    fn test_pinyin_identifier_detection() {
+        // Valid Pinyin identifiers
+        assert!(is_pinyin_identifier("yonghuMing"));
+        assert!(is_pinyin_identifier("dingdanList"));
+        assert!(is_pinyin_identifier("zhongguoRen"));
+        assert!(is_pinyin_identifier("wenjianMuLu"));
+
+        // Invalid Pinyin identifiers
+        assert!(!is_pinyin_identifier("hello"));
+        assert!(!is_pinyin_identifier("getUser"));
+        assert!(!is_pinyin_identifier(""));
+        assert!(!is_pinyin_identifier("123"));
+    }
+
+    #[test]
+    fn test_symbol_chinese_detection() {
+        let sym = Symbol {
+            name: "用户名".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 9,
+            kind: "variable".to_string(),
+        };
+        assert!(sym.is_chinese());
+        assert!(!sym.is_pinyin());
+        assert!(sym.is_chinese_related());
+
+        let sym_pinyin = Symbol {
+            name: "yonghuMing".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 10,
+            kind: "variable".to_string(),
+        };
+        assert!(!sym_pinyin.is_chinese());
+        assert!(sym_pinyin.is_pinyin());
+        assert!(sym_pinyin.is_chinese_related());
+
+        let sym_english = Symbol {
+            name: "getUser".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 7,
+            kind: "function".to_string(),
+        };
+        assert!(!sym_english.is_chinese());
+        assert!(!sym_english.is_pinyin());
+        assert!(!sym_english.is_chinese_related());
+    }
+
+    #[test]
+    fn test_chinese_variable_extraction() {
+        let mut searcher = SemanticSearcher::new();
+        let source = r#"用户名 = "张三"
+年龄 = 25
+def get_user():
+    return 用户名
+"#;
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(source.as_bytes()).unwrap();
+
+        let symbols = searcher.list_symbols(tmp.path()).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"用户名"), "symbols: {:?}", names);
+    }
+
+    #[test]
+    fn test_mixed_chinese_english_detection() {
+        // Mixed identifiers: English prefix + Chinese suffix
+        assert!(contains_chinese("getUser用户名"));
+        assert!(contains_chinese("query_订单列表"));
+        assert!(contains_chinese("test数据"));
+        assert!(contains_chinese("order详情"));
+
+        // Mixed identifiers should be detected as Chinese-related
+        let sym_mixed1 = Symbol {
+            name: "getUser用户名".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 0,
+            kind: "variable".to_string(),
+        };
+        assert!(sym_mixed1.is_chinese_related());
+
+        let sym_mixed2 = Symbol {
+            name: "query_订单列表".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 0,
+            kind: "variable".to_string(),
+        };
+        assert!(sym_mixed2.is_chinese_related());
+
+        // Pure English should NOT be detected
+        assert!(!contains_chinese("getUser"));
+        assert!(!contains_chinese("queryOrderList"));
+    }
+
+    #[test]
+    fn test_mixed_content_extraction() {
+        let mut searcher = SemanticSearcher::new();
+        let source = r#"getUser用户名 = "张三"
+query_订单列表 = []
+test数据 = 42
+"#;
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(source.as_bytes()).unwrap();
+
+        let symbols = searcher.list_symbols(tmp.path()).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"getUser用户名"), "symbols: {:?}", names);
+        assert!(names.contains(&"query_订单列表"), "symbols: {:?}", names);
+        assert!(names.contains(&"test数据"), "symbols: {:?}", names);
+    }
+
+    #[test]
+    fn test_chinese_variable_nested_indent() {
+        // Chinese variables inside nested blocks (indent > 0) should be extracted
+        let mut searcher = SemanticSearcher::new();
+        let source = r#"def process():
+    用户名 = "张三"
+    订单列表 = []
+    if True:
+        配置项 = "value"
+"#;
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(source.as_bytes()).unwrap();
+
+        let symbols = searcher.list_symbols(tmp.path()).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"用户名"), "nested symbols: {:?}", names);
+        assert!(names.contains(&"订单列表"), "nested symbols: {:?}", names);
+        assert!(names.contains(&"配置项"), "nested symbols: {:?}", names);
     }
 }
