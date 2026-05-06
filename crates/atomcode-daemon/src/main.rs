@@ -276,6 +276,7 @@ pub struct ToolCallInfo {
 /// Tool result info for API response
 #[derive(Debug, Serialize)]
 pub struct ToolResultInfo {
+    pub call_id: String,
     pub success: bool,
     pub summary: String,
     pub line_count: usize,
@@ -346,6 +347,7 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
                     r.output.clone(),
                     None,
                     Some(ToolResultInfo {
+                        call_id: r.call_id.clone(),
                         success: r.success,
                         summary,
                         line_count: lines,
@@ -1355,13 +1357,14 @@ pub enum ChatEvent {
     ReasoningDelta { content: String },
     /// Tool call started
     #[serde(rename = "tool_start")]
-    ToolCallStarted { name: String, arguments: String },
+    ToolCallStarted { id: String, name: String, arguments: String },
     /// Real-time tool output chunk
     #[serde(rename = "tool_output")]
     ToolOutputChunk { chunk: String },
     /// Tool call completed
     #[serde(rename = "tool_result")]
     ToolCallResult {
+        id: String,
         name: String,
         output: String,
         success: bool,
@@ -1960,12 +1963,13 @@ async fn process_chat_request(
                 let _ = event_tx.send(ChatEvent::ReasoningDelta { content: text });
             }
             TurnEvent::ToolCallStarted {
-                id: _,
+                id,
                 name,
                 arguments,
             } => {
                 tool_call_count += 1;
                 let _ = event_tx.send(ChatEvent::ToolCallStarted {
+                    id: id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
                 });
@@ -2013,13 +2017,14 @@ async fn process_chat_request(
                 let _ = event_tx.send(ChatEvent::ToolOutputChunk { chunk });
             }
             TurnEvent::ToolCallResult {
-                call_id: _,
+                call_id,
                 name,
                 output,
                 success,
                 duration,
             } => {
                 let _ = event_tx.send(ChatEvent::ToolCallResult {
+                    id: call_id,
                     name,
                     output,
                     success,
