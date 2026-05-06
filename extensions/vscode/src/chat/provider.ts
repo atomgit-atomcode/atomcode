@@ -2,7 +2,19 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { DaemonClient } from '../daemon/client';
-import { ChatRequest } from '../daemon/types';
+import {
+  AuthStatusResponse,
+  ChatRequest,
+  CodingPlanSetupResponse,
+  ConfigResponse,
+  CreateProviderRequest,
+  ModelInfo,
+  MessageInfo,
+  PatchThinkingRequest,
+  ProvidersResponse,
+} from '../daemon/types';
+
+type WebviewMode = 'sidebar' | 'tab';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'atomcode.chatView';
@@ -10,7 +22,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _panel?: vscode.WebviewPanel;
   private _currentAbort?: AbortController;
   private _sessionId?: string;
+  private _loadedMessages?: MessageInfo[];
   private _isGenerating = false;
+  private _loginId?: string;
+  private _loginPoll?: ReturnType<typeof setInterval>;
 
   public onModelSelected?: (model: string) => void;
 
@@ -18,6 +33,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _extensionUri: vscode.Uri,
     private readonly _client: DaemonClient,
   ) {}
+
+  public dispose() {
+    this._clearLoginPoll();
+  }
 
   public openInTab() {
     if (this._panel) {
@@ -39,8 +58,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
 
-    this._panel.webview.html = this._getHtml(this._panel.webview);
-    this._setupWebviewMessageHandler(this._panel.webview);
+    this._panel.webview.html = this._getHtml(this._panel.webview, 'tab');
+    this._setupWebviewMessageHandler(this._panel.webview, 'tab');
 
     this._panel.onDidDispose(() => {
       this._panel = undefined;
@@ -56,15 +75,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         vscode.Uri.joinPath(this._extensionUri, 'node_modules', 'highlight.js'),
       ],
     };
-    webviewView.webview.html = this._getHtml(webviewView.webview);
-    this._setupWebviewMessageHandler(webviewView.webview);
+    webviewView.webview.html = this._getHtml(webviewView.webview, 'sidebar');
+    this._setupWebviewMessageHandler(webviewView.webview, 'sidebar');
 
     webviewView.onDidChangeVisibility(() => {
       vscode.commands.executeCommand('setContext', 'atomcode.chatFocused', webviewView.visible);
     });
   }
 
-  private _setupWebviewMessageHandler(webview: vscode.Webview) {
+  private _setupWebviewMessageHandler(webview: vscode.Webview, mode: WebviewMode) {
     webview.onDidReceiveMessage(async (msg) => {
       switch (msg.type) {
         case 'send':
@@ -74,13 +93,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.stopGeneration();
           break;
         case 'newConversation':
-          this.newConversation();
+          await this.newConversation();
           break;
         case 'ready':
-          await this._sendInitialState();
+          await this._sendInitialState(webview, mode);
           break;
         case 'selectModel':
-          this.onModelSelected?.(msg.model);
+          await this._setDefaultProvider(msg.provider || msg.model);
+          break;
+        case 'authLoginStart':
+          await this._startLogin();
+          break;
+        case 'authLoginCancel':
+          await this._cancelLogin();
+          break;
+        case 'codingPlanSetup':
+          await this._setupCodingPlan();
+          break;
+        case 'providerCreate':
+          await this._createProvider(msg.provider);
+          break;
+        case 'providerDelete':
+          await this._deleteProvider(msg.name);
+          break;
+        case 'providerSetDefault':
+          await this._setDefaultProvider(msg.name);
+          break;
+        case 'providerPatchThinking':
+          await this._patchThinking(msg.name, msg.thinking);
+          break;
+        case 'refreshSetupState':
+          await this._sendSetupState();
           break;
         case 'loadSession':
           await this._loadSession(msg.sessionId, msg.projectHash);
@@ -140,20 +183,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this._handleSend(text);
   }
 
-  public newConversation() {
+  public async newConversation() {
+    this.openInTab();
     this._sessionId = undefined;
+    this._loadedMessages = undefined;
+
+    try {
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const session = await this._client.createSession(undefined, workspaceFolder);
+      this._sessionId = session.id;
+      this._postMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
+      await this._refreshSessions();
+    } catch {
+      this._postMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
+    }
+
     this._postMessage({ type: 'clearChat' });
+    this.focusInput();
   }
 
   public stopGeneration() {
     this._currentAbort?.abort();
+    if (this._sessionId) {
+      void this._client.stopGeneration(this._sessionId).catch(() => undefined);
+    }
     this._currentAbort = undefined;
     this._isGenerating = false;
     this._postMessage({ type: 'generationStopped' });
   }
 
   public focusInput() {
-    this._view?.show(true);
+    if (!this._panel) {
+      this._view?.show(true);
+    }
     this._postMessage({ type: 'focusInput' });
   }
 
@@ -195,9 +257,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this._currentAbort = this._client.streamChat(request, {
       onText: (content) => this._postMessage({ type: 'text', content }),
-      onToolStart: (name, args) => this._postMessage({ type: 'toolStart', name, args }),
-      onToolResult: (name, output, success, durationMs) =>
-        this._postMessage({ type: 'toolResult', name, output, success, durationMs }),
+      onToolStart: (id, name, args) => this._postMessage({ type: 'toolStart', id, name, args }),
+      onToolResult: (id, name, output, success, durationMs) =>
+        this._postMessage({ type: 'toolResult', id, name, output, success, durationMs }),
       onTokens: (prompt, completion, total) =>
         this._postMessage({ type: 'tokens', prompt, completion, total }),
       onArtifactStart: (id, artifactType, language, title) =>
@@ -209,6 +271,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       onDone: (tokens, toolCalls, sessionId) => {
         if (sessionId) {
           this._sessionId = sessionId;
+          this._loadedMessages = undefined;
+          this._postMessage({ type: 'sessionSelected', sessionId });
         }
         this._isGenerating = false;
         this._postMessage({ type: 'done', tokens, toolCalls, sessionId });
@@ -231,13 +295,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // New protocol methods
 
-  private async _sendInitialState() {
+  private async _sendInitialState(webview?: vscode.Webview, mode: WebviewMode = 'tab') {
     let currentModelName = '';
+
+    await this._sendSetupState();
 
     // Send models
     try {
       const models = await this._client.listModels();
-      this._postMessage({ type: 'models', models });
+      this._postMessage({ type: 'models', models }, webview);
       const defaultModel = models.find((m: { is_default: boolean }) => m.is_default);
       if (defaultModel) {
         currentModelName = (defaultModel as { model: string }).model || '';
@@ -249,20 +315,169 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Send sessions
     try {
       const sessions = await this._client.listSessions();
-      this._postMessage({ type: 'sessions', sessions });
+      this._postMessage({ type: 'sessions', sessions }, webview);
     } catch {}
 
     // Send editor context
-    this._sendEditorContext();
+    this._sendEditorContext(webview);
 
     this._postMessage({
       type: 'init',
       generating: this._isGenerating,
       currentModel: currentModelName,
+      viewMode: mode,
+      activeSessionId: this._sessionId,
+    }, webview);
+
+    if (this._loadedMessages && mode === 'tab') {
+      this._postMessage({ type: 'sessionMessages', messages: this._loadedMessages }, webview);
+    }
+  }
+
+  private async _sendSetupState() {
+    let auth: AuthStatusResponse | undefined;
+    let providers: ProvidersResponse | undefined;
+    let config: ConfigResponse | undefined;
+    let models: ModelInfo[] | undefined;
+
+    try {
+      auth = await this._client.authStatus();
+      this._postMessage({ type: 'authStatus', auth });
+    } catch (e) {
+      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+
+    try {
+      providers = await this._client.listProviders();
+      this._postMessage({ type: 'providers', providers: providers.providers, defaultProvider: providers.default_provider });
+    } catch (e) {
+      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+
+    try {
+      config = await this._client.getConfig();
+      this._postMessage({ type: 'config', config });
+    } catch {
+      // Older daemons may not have P0 APIs; provider fetch error already surfaces enough.
+    }
+
+    try {
+      models = await this._client.listModels();
+      this._postMessage({ type: 'models', models });
+    } catch {}
+
+    const defaultProvider = providers?.providers.find((p) => p.is_default);
+    this._postMessage({
+      type: 'setupState',
+      auth,
+      providers: providers?.providers ?? [],
+      defaultProvider: providers?.default_provider ?? config?.default_provider ?? '',
+      currentModel: defaultProvider?.model || models?.find((m) => m.is_default)?.model || '',
+      setupRequired: !auth?.logged_in || (providers?.providers.length ?? 0) === 0,
     });
   }
 
-  private _sendEditorContext() {
+  private async _startLogin() {
+    try {
+      await this._cancelLogin();
+      const login = await this._client.startLogin(true);
+      this._loginId = login.login_id;
+      this._postMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
+
+      this._loginPoll = setInterval(() => {
+        void this._pollLogin();
+      }, 2000);
+      await this._pollLogin();
+    } catch (e) {
+      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+  }
+
+  private async _pollLogin() {
+    if (!this._loginId) return;
+    try {
+      const result = await this._client.pollLogin(this._loginId);
+      if (result.status === 'pending') {
+        this._postMessage({ type: 'loginPending' });
+        return;
+      }
+      this._clearLoginPoll();
+      this._loginId = undefined;
+      this._postMessage({ type: 'loginAuthorized', user: result.user });
+      await this._sendSetupState();
+    } catch (e) {
+      this._clearLoginPoll();
+      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+  }
+
+  private async _cancelLogin() {
+    this._clearLoginPoll();
+    if (this._loginId) {
+      const id = this._loginId;
+      this._loginId = undefined;
+      await this._client.cancelLogin(id).catch(() => undefined);
+    }
+  }
+
+  private _clearLoginPoll() {
+    if (this._loginPoll) {
+      clearInterval(this._loginPoll);
+      this._loginPoll = undefined;
+    }
+  }
+
+  private async _setupCodingPlan() {
+    try {
+      this._postMessage({ type: 'setupWorking', message: 'Syncing CodingPlan models...' });
+      const result: CodingPlanSetupResponse = await this._client.setupCodingPlan(this._loginId);
+      this._postMessage({ type: 'codingPlanResult', result });
+      await this._sendSetupState();
+    } catch (e) {
+      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+  }
+
+  private async _createProvider(provider: CreateProviderRequest) {
+    try {
+      await this._client.createProvider(provider);
+      await this._sendSetupState();
+    } catch (e) {
+      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+  }
+
+  private async _deleteProvider(name: string) {
+    try {
+      await this._client.deleteProvider(name);
+      await this._sendSetupState();
+    } catch (e) {
+      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+  }
+
+  private async _setDefaultProvider(name: string) {
+    if (!name) return;
+    try {
+      const config = await this._client.setDefaultProvider(name);
+      const provider = config.providers.find((p) => p.name === config.default_provider);
+      this.onModelSelected?.(provider?.model || config.default_provider);
+      await this._sendSetupState();
+    } catch (e) {
+      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+  }
+
+  private async _patchThinking(name: string, thinking: PatchThinkingRequest) {
+    try {
+      await this._client.patchThinking(name, thinking);
+      await this._sendSetupState();
+    } catch (e) {
+      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+    }
+  }
+
+  private _sendEditorContext(webview?: vscode.Webview) {
     const editor = vscode.window.activeTextEditor;
     if (editor) {
       const selection = editor.selection;
@@ -272,14 +487,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         fileName: path.basename(editor.document.uri.fsPath),
         selection: !selection.isEmpty ? editor.document.getText(selection) : undefined,
         language: editor.document.languageId,
-      });
+      }, webview);
     }
   }
 
   private async _loadSession(sessionId: string, projectHash?: string) {
-    this._sessionId = sessionId;
-    this._postMessage({ type: 'clearChat' });
-
     try {
       // If projectHash not provided, search sessions to find it
       let hash = projectHash;
@@ -289,14 +501,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           .find(s => (s.meta?.id || s.id) === sessionId);
         hash = match?.project_hash;
       }
-      if (!hash) return;
+      if (!hash) {
+        this._postMessage({ type: 'error', message: 'Unable to load session: missing project hash.' });
+        return;
+      }
 
       const detail = await this._client.getSession(hash, sessionId);
       if (detail && detail.messages) {
+        this._sessionId = sessionId;
+        this._loadedMessages = detail.messages;
+        this.openInTab();
+        this._postMessage({ type: 'sessionSelected', sessionId, projectHash: hash });
+        this._postMessage({ type: 'clearChat' });
         this._postMessage({ type: 'sessionMessages', messages: detail.messages });
+        this.focusInput();
+      } else {
+        this._postMessage({ type: 'error', message: 'Unable to load session: empty response.' });
       }
-    } catch {
-      // Session load failed
+    } catch (e) {
+      this._postMessage({ type: 'error', message: `Unable to load session: ${this._messageFromError(e)}` });
     }
   }
 
@@ -376,27 +599,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private _postMessage(msg: unknown) {
+  private _postMessage(msg: unknown, webview?: vscode.Webview) {
+    if (webview) {
+      webview.postMessage(msg);
+      return;
+    }
     this._view?.webview.postMessage(msg);
     this._panel?.webview.postMessage(msg);
   }
 
-  private _getHtml(webview: vscode.Webview): string {
-    const htmlPath = vscode.Uri.joinPath(this._extensionUri, 'webview', 'index.html');
-    let html = fs.readFileSync(htmlPath.fsPath, 'utf-8');
+  private _messageFromError(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
+  }
 
-    const webviewJsUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this._extensionUri, 'webview', 'webview.js'),
-    );
-    const webviewCssUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this._extensionUri, 'webview', 'webview.css'),
-    );
+  private _getHtml(webview: vscode.Webview, mode: WebviewMode): string {
+    const htmlPath = vscode.Uri.joinPath(this._extensionUri, 'webview', 'index.html');
+    const jsPath = vscode.Uri.joinPath(this._extensionUri, 'webview', 'webview.js');
+    const cssPath = vscode.Uri.joinPath(this._extensionUri, 'webview', 'webview.css');
+    let html = fs.readFileSync(htmlPath.fsPath, 'utf-8');
+    const jsVersion = fs.statSync(jsPath.fsPath).mtimeMs.toString(36);
+    const cssVersion = fs.statSync(cssPath.fsPath).mtimeMs.toString(36);
+
+    const webviewJsUri = webview.asWebviewUri(jsPath);
+    const webviewCssUri = webview.asWebviewUri(cssPath);
     const nonce = getNonce();
 
-    html = html.replace(/\{\{webviewJsUri\}\}/g, webviewJsUri.toString());
-    html = html.replace(/\{\{webviewCssUri\}\}/g, webviewCssUri.toString());
+    html = html.replace(/\{\{webviewJsUri\}\}/g, `${webviewJsUri.toString()}?v=${jsVersion}`);
+    html = html.replace(/\{\{webviewCssUri\}\}/g, `${webviewCssUri.toString()}?v=${cssVersion}`);
     html = html.replace(/\{\{nonce\}\}/g, nonce);
     html = html.replace(/\{\{cspSource\}\}/g, webview.cspSource);
+    html = html.replace(/\{\{viewMode\}\}/g, mode);
 
     return html;
   }
