@@ -14,6 +14,7 @@
 // Buffer); modal overlays already live in `crate::modals`.
 
 pub(crate) mod commands;
+pub(crate) mod file_index;
 pub(crate) mod monitor;
 use commands::execute_slash_command;
 
@@ -183,6 +184,9 @@ pub struct LoopCtx {
     /// agent's model context via `AgentCommand::SetMessages` on first
     /// `run_loop` entry, then dropped — matching `/resume` behaviour.
     pub replay_on_start: Option<atomcode_core::session::Session>,
+    /// Lazy file/dir index for `@`-mention popup. Built on first `@`
+    /// keystroke via `FileIndex::filter`; session-life cache.
+    pub file_index: file_index::FileIndex,
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user
@@ -584,14 +588,14 @@ mod menu_tests {
     fn non_slash_input_returns_no_menu() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        assert!(build_menu_items("hello world", &reg, &custom, None).is_none());
+        assert!(build_menu_items("hello world", 0, &reg, &custom, None, None).is_none());
     }
 
     #[test]
     fn slash_prefix_returns_all_commands() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let items = build_menu_items("/", &reg, &custom, None).expect("menu should show for '/'");
+        let items = build_menu_items("/", 0, &reg, &custom, None, None).expect("menu should show for '/'");
         assert!(!items.is_empty(), "builtin registry should have commands");
     }
 
@@ -599,8 +603,8 @@ mod menu_tests {
     fn slash_with_filter_narrows_list() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let all = build_menu_items("/", &reg, &custom, None).unwrap();
-        let filtered = build_menu_items("/he", &reg, &custom, None).unwrap_or_default();
+        let all = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
+        let filtered = build_menu_items("/he", 0, &reg, &custom, None, None).unwrap_or_default();
         assert!(
             filtered.len() < all.len(),
             "prefix '/he' should filter builtin commands"
@@ -621,15 +625,15 @@ mod menu_tests {
         // start navigating a stale palette.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        assert!(build_menu_items("/cd ", &reg, &custom, None).is_none());
-        assert!(build_menu_items("/cd /tmp", &reg, &custom, None).is_none());
+        assert!(build_menu_items("/cd ", 0, &reg, &custom, None, None).is_none());
+        assert!(build_menu_items("/cd /tmp", 0, &reg, &custom, None, None).is_none());
     }
 
     #[test]
     fn slash_with_no_matches_returns_none() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        assert!(build_menu_items("/zzznomatch", &reg, &custom, None).is_none());
+        assert!(build_menu_items("/zzznomatch", 0, &reg, &custom, None, None).is_none());
     }
 
     fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_core::skill::Skill {
@@ -661,13 +665,13 @@ mod menu_tests {
         // /bra — no skill should appear; /bra falls through to "no
         // matches" since no built-in starts with bra either.
         assert!(
-            build_menu_items("/bra", &reg, &custom, Some(&lock)).is_none(),
+            build_menu_items("/bra", 0, &reg, &custom, Some(&lock), None).is_none(),
             "individual skills must not leak into the top-level menu"
         );
 
         // /skills — only the built-in gateway entry, never the
         // individual skills.
-        let items = build_menu_items("/skills", &reg, &custom, Some(&lock))
+        let items = build_menu_items("/skills", 0, &reg, &custom, Some(&lock), None)
             .expect("/skills must include the built-in gateway");
         assert!(items.iter().any(|(n, _)| n == "skills"));
         for (n, _) in &items {
@@ -692,7 +696,7 @@ mod menu_tests {
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
 
-        let items = build_menu_items("/skills ", &reg, &custom, Some(&lock))
+        let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("/skills (with space) must list skills");
         assert!(items.iter().any(|(n, _)| n == "brainstorming"));
         assert!(items.iter().any(|(n, _)| n == "web-access"));
@@ -712,17 +716,17 @@ mod menu_tests {
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
 
-        let bra = build_menu_items("/skills bra", &reg, &custom, Some(&lock))
+        let bra = build_menu_items("/skills bra", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(bra.len(), 1);
         assert_eq!(bra[0].0, "brainstorming");
 
-        let web = build_menu_items("/skills web", &reg, &custom, Some(&lock))
+        let web = build_menu_items("/skills web", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(web.len(), 1);
         assert_eq!(web[0].0, "web-access");
 
-        assert!(build_menu_items("/skills zz", &reg, &custom, Some(&lock)).is_none());
+        assert!(build_menu_items("/skills zz", 0, &reg, &custom, Some(&lock), None).is_none());
     }
 
     #[test]
@@ -735,7 +739,7 @@ mod menu_tests {
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
-        assert!(build_menu_items("/skills brainstorming why", &reg, &custom, Some(&lock)).is_none());
+        assert!(build_menu_items("/skills brainstorming why", 0, &reg, &custom, Some(&lock), None).is_none());
     }
 
     #[test]
@@ -749,7 +753,7 @@ mod menu_tests {
         skills.register(skill_fixture("skills:hidden", "hidden", false));
         let lock = std::sync::RwLock::new(skills);
 
-        let items = build_menu_items("/skills ", &reg, &custom, Some(&lock))
+        let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("at least one visible skill should produce a menu");
         assert!(items.iter().any(|(n, _)| n == "visible"));
         assert!(
@@ -763,9 +767,9 @@ mod menu_tests {
         // Ensures the legacy call path (None) keeps working.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let with_none = build_menu_items("/", &reg, &custom, None).unwrap();
+        let with_none = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
         let empty_skills = std::sync::RwLock::new(atomcode_core::skill::SkillRegistry::new());
-        let with_empty = build_menu_items("/", &reg, &custom, Some(&empty_skills)).unwrap();
+        let with_empty = build_menu_items("/", 0, &reg, &custom, Some(&empty_skills), None).unwrap();
         assert_eq!(
             with_none.len(),
             with_empty.len(),
@@ -2193,10 +2197,33 @@ pub use crate::modals::ProviderWizard;
 /// command with the same name as a built-in) are suppressed.
 fn build_menu_items(
     buf: &str,
+    cursor: usize,
     commands: &CommandRegistry,
     custom: &atomcode_core::commands::CustomCommandRegistry,
     skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
+    // `@`-mention branch — checked first so it takes priority over any
+    // `/` interpretation.
+    if let (Some(idx), Some(token)) =
+        (file_index, file_index::detect_at_mention(buf, cursor))
+    {
+        let (scope_dir, filter) = file_index::split_token(&token);
+        let entries = idx.filter(&scope_dir, &filter);
+        if entries.is_empty() {
+            return None;
+        }
+        // Show the FULL relative path (including the scope prefix) so the
+        // user always sees where they are. e.g. when scope is `crates/`,
+        // list `crates/atomcode-cli/` not just `atomcode-cli/`.
+        return Some(
+            entries
+                .into_iter()
+                .map(|e| (e.rel_path, String::new()))
+                .collect(),
+        );
+    }
+
     if !buf.starts_with('/') {
         return None;
     }
@@ -2291,7 +2318,7 @@ fn handle_idle_key(
     let menu_items = if app.buf.is_in_history() {
         None
     } else {
-        build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry))
+        build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
     };
     if let Some(items) = &menu_items {
         // Clamp selection in range.
@@ -2335,6 +2362,27 @@ fn handle_idle_key(
                 return Ok(());
             }
             (KeyCode::Enter, m) if !m.contains(crossterm::event::KeyModifiers::SHIFT) => {
+                // `@`-mention selection: insert `@<full_path> ` at the
+                // token range, with trailing space as terminator.
+                // Backspace on the trailing space lets the user re-open
+                // the menu for drill-down.
+                if !items.is_empty() {
+                    if let Some((at_pos, end)) =
+                        file_index::detect_at_mention_range(&app.buf.text, app.buf.cursor)
+                    {
+                        // `items[selected].0` is the full relative path
+                        // (e.g. `crates/atomcode-cli/`); prepend `@` and a
+                        // trailing space terminator.
+                        let selected_path = items[app.menu.selected].0.clone();
+                        let replacement = format!("@{} ", selected_path);
+                        app.buf.text.replace_range(at_pos..end, &replacement);
+                        app.buf.cursor = at_pos + replacement.len();
+                        app.menu.selected = 0;
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        return Ok(());
+                    }
+                }
+
                 // Accept the highlighted command. Two shapes:
                 //   * arg-less commands (e.g. /help, /quit, /login) → execute
                 //     immediately on Enter, as before.
@@ -2368,9 +2416,11 @@ fn handle_idle_key(
                     if name == "skills" {
                         if let Some(items) = build_menu_items(
                             &app.buf.text,
+                            app.buf.cursor,
                             &ctx.commands,
                             &ctx.custom_commands,
                             Some(&ctx.skill_registry),
+                            Some(&ctx.file_index),
                         ) {
                             app.menu.selected = 0;
                             redraw_with_menu(
@@ -2493,7 +2543,7 @@ fn handle_idle_key(
             let items = if app.buf.is_in_history() {
                 None
             } else {
-                build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry))
+                build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
             };
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
@@ -2616,9 +2666,15 @@ fn redraw_with_menu(
     ctx: &LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
+    let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
+        crate::render::MenuKind::AtMention
+    } else {
+        crate::render::MenuKind::SlashCommand
+    };
     let payload = crate::render::MenuPayload {
         items: items.to_vec(),
         selected,
+        kind,
     };
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
@@ -2795,7 +2851,7 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry));
+    let menu_items = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index));
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -2851,7 +2907,7 @@ fn handle_streaming_key(
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry)) {
+            if let Some(items) = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)) {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
@@ -3749,9 +3805,14 @@ fn draw_spinner_now(
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
-    let menu = build_menu_items(&buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry)).map(|items| {
+    let menu = build_menu_items(&buf.text, buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
-        crate::render::MenuPayload { items, selected }
+        let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
+            crate::render::MenuKind::AtMention
+        } else {
+            crate::render::MenuKind::SlashCommand
+        };
+        crate::render::MenuPayload { items, selected, kind }
     });
     renderer.render(UiLine::StreamingBox {
         buf: buf.text.clone(),

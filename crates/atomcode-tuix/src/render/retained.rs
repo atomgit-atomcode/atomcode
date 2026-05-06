@@ -475,15 +475,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
         desc: &str,
         selected: bool,
         rule_width: usize,
+        kind: super::MenuKind,
     ) -> Vec<Cell> {
         let mut row = Vec::new();
         let pad = CellStyle::default();
-        push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+        // SlashCommand keeps the original PAD_COL outer indent; AtMention
+        // hugs the left edge so `+` lines up flush against the rule edge
+        // (matches the reference screenshot from the feature request).
+        let outer_pad = match kind {
+            super::MenuKind::SlashCommand => PAD_COL,
+            super::MenuKind::AtMention => 0,
+        };
+        push_str_cells(&mut row, &" ".repeat(outer_pad), &pad);
 
-        let content = if selected {
-            format!("  ▸ /{:<12}  {}", name, desc)
-        } else {
-            format!("    /{:<12}  {}", name, desc)
+        let content = match kind {
+            super::MenuKind::SlashCommand => {
+                if selected {
+                    format!("  ▸ /{:<12}  {}", name, desc)
+                } else {
+                    format!("    /{:<12}  {}", name, desc)
+                }
+            }
+            super::MenuKind::AtMention => {
+                // `+ <path>` for every row; selection is signalled by
+                // reverse-video on the row, no extra arrow needed.
+                if desc.is_empty() {
+                    format!("+ {}", name)
+                } else {
+                    format!("+ {}  {}", name, desc)
+                }
+            }
         };
 
         let style = if selected {
@@ -696,12 +717,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
+        let menu_kind = self
+            .menu
+            .as_ref()
+            .map(|m| m.kind)
+            .unwrap_or_default();
         let menu_cells: Vec<Vec<Cell>> = menu_items
             .iter()
             .enumerate()
             .map(|(i, (name, desc))| {
                 let selected = selected_in_view == Some(i);
-                self.build_menu_row(name, desc, selected, rule_width)
+                self.build_menu_row(name, desc, selected, rule_width, menu_kind)
             })
             .collect();
 
@@ -2600,6 +2626,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
         });
@@ -2623,6 +2650,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
         });
@@ -2635,6 +2663,7 @@ mod tests {
                 menu: Some(MenuPayload {
                     items: items.clone(),
                     selected: sel,
+                    kind: crate::render::MenuKind::SlashCommand,
                 }),
                 status: status.clone(),
             });
@@ -3068,6 +3097,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
         });
@@ -4437,7 +4467,11 @@ mod tests {
         r.render(UiLine::InputPrompt {
             buf: "/".into(),
             cursor_byte: 1,
-            menu: Some(MenuPayload { items, selected: 0 }),
+            menu: Some(MenuPayload {
+                items,
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
             status,
         });
         r.flush_deferred();
@@ -4709,6 +4743,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
         });

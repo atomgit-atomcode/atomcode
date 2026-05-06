@@ -122,6 +122,7 @@ impl Modal for ModelPicker {
         let payload = MenuPayload {
             items,
             selected: self.selected,
+            kind: crate::render::MenuKind::SlashCommand,
         };
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),

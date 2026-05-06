@@ -827,10 +827,22 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 let selected = (offset + i) == menu.selected;
                 let safe_name = scrub_controls(name);
                 let safe_desc = scrub_controls(desc);
-                let body = if selected {
-                    format!("  ▸ /{:<12}  {}", safe_name, safe_desc)
-                } else {
-                    format!("    /{:<12}  {}", safe_name, safe_desc)
+                let body = match menu.kind {
+                    crate::render::MenuKind::SlashCommand => {
+                        if selected {
+                            format!("  ▸ /{:<12}  {}", safe_name, safe_desc)
+                        } else {
+                            format!("    /{:<12}  {}", safe_name, safe_desc)
+                        }
+                    }
+                    crate::render::MenuKind::AtMention => {
+                        // No leading whitespace — `+` flush left.
+                        if safe_desc.is_empty() {
+                            format!("+ {}", safe_name)
+                        } else {
+                            format!("+ {}  {}", safe_name, safe_desc)
+                        }
+                    }
                 };
                 // Clamp to terminal width before write. Without this,
                 // long descriptions (CJK glyphs are 2 display cells)
@@ -2104,6 +2116,7 @@ mod tests {
                     ("exit".into(), "leave".into()),
                 ],
                 selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
         });
@@ -2127,6 +2140,7 @@ mod tests {
                     ("exit".into(), "leave".into()),
                 ],
                 selected: 1,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
         });
@@ -2169,6 +2183,7 @@ mod tests {
                     ("second".into(), "short".into()),
                 ],
                 selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
         });

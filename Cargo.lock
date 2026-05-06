@@ -239,6 +239,7 @@ dependencies = [
  "atomcode-telemetry",
  "crossterm",
  "dirs 6.0.0",
+ "ignore",
  "libc",
  "qrcode",
  "serde_json",

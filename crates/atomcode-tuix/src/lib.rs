@@ -481,6 +481,7 @@ pub async fn run(
     // skills without re-plumbing.
     let skill_registry = agent_handle.skill_registry.clone();
 
+    let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
         config,
         model_name,
@@ -520,6 +521,7 @@ pub async fn run(
         skill_registry,
         caps,
         replay_on_start: session_to_continue,
+        file_index: crate::event_loop::file_index::FileIndex::new(file_index_root),
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

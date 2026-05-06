@@ -484,6 +484,7 @@ fn redraw(
                 ("set-default".into(), "Switch the default provider".into()),
             ],
             selected: *selected,
+            kind: crate::render::MenuKind::SlashCommand,
         }),
         ProviderWizard::EditPick {
             providers,
@@ -512,6 +513,7 @@ fn redraw(
             Some(MenuPayload {
                 items,
                 selected: *selected,
+            kind: crate::render::MenuKind::SlashCommand,
             })
         }
         // Q&A steps: plain input box, no overlay menu.

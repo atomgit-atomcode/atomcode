@@ -132,6 +132,7 @@ fn build_menu_payload(w: &WelcomeWizard) -> MenuPayload {
     MenuPayload {
         items,
         selected: w.selected,
+            kind: crate::render::MenuKind::SlashCommand,
     }
 }
 

@@ -201,11 +201,28 @@ pub trait Renderer: Send {
     fn end_selection(&mut self) {}
 }
 
+/// Visual style for the menu popup. Drives whether the renderer prefixes
+/// each row with `/` (slash-command palette) or `+ ` (file/dir mention),
+/// and which marker indicates the selected row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MenuKind {
+    /// Default: rows shown as `/<name>`, selected row marked `▸`.
+    #[default]
+    SlashCommand,
+    /// `@`-mention popup: rows shown as `+ <path>`, no slash prefix.
+    /// Selected row uses reverse-video only (no extra arrow).
+    AtMention,
+}
+
 /// Slash-command palette payload: filtered entries + which one is selected.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MenuPayload {
     pub items: Vec<(String, String)>, // (name, desc)
     pub selected: usize,
+    /// Visual style. Defaults to `SlashCommand`; existing call sites
+    /// using `MenuPayload { items, selected }` get the slash style for
+    /// free. `@`-mention path explicitly sets `MenuKind::AtMention`.
+    pub kind: MenuKind,
 }
 
 /// Persistent status line drawn directly below the input box — CC-style
