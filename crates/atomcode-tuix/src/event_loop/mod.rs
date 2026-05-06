@@ -836,6 +836,21 @@ mod tool_format_tests {
     use super::*;
 
     #[test]
+    fn fmt_elapsed_under_one_minute_uses_seconds_only() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(999), "0s");
+        assert_eq!(fmt_elapsed(1_000), "1s");
+        assert_eq!(fmt_elapsed(45_500), "45s");
+    }
+
+    #[test]
+    fn fmt_elapsed_above_one_minute_splits_minutes_and_seconds() {
+        assert_eq!(fmt_elapsed(60_000), "1m0s");
+        assert_eq!(fmt_elapsed(141_000), "2m21s");
+        assert_eq!(fmt_elapsed(342_000), "5m42s");
+    }
+
+    #[test]
     fn display_tool_name_snake_to_pascal() {
         assert_eq!(display_tool_name("read_file"), "ReadFile");
         assert_eq!(display_tool_name("search_replace"), "SearchReplace");
@@ -3273,16 +3288,28 @@ fn handle_agent_event(
                 display_name
             };
 
+            // ParallelEditFiles already streamed a per-task line tree
+            // and an aggregate summary line via the SubAgentDispatch*
+            // events — the ToolResult body would just repeat the same
+            // info as a markdown table, doubling vertical space and
+            // truncating mid-word at terminal boundaries. Skip both
+            // the ▸ tool-call line and the ⎿ result line; the model
+            // still receives full output via the ToolResult message
+            // in the conversation.
+            let suppress_body_echo = name == "parallel_edit_files";
+
             // Only emit the tool-call line here if ApprovalNeeded didn't
             // already render it — otherwise we'd print it twice.
-            if !call_rendered {
+            if !call_rendered && !suppress_body_echo {
                 renderer.render(UiLine::ToolCall {
                     name: safe_name.clone(),
                     detail: detail.clone(),
                 });
             }
-            let summary = summarise(&output, success);
-            renderer.render(UiLine::ToolResult { success, summary });
+            if !suppress_body_echo {
+                let summary = summarise(&output, success);
+                renderer.render(UiLine::ToolResult { success, summary });
+            }
             // Collect diff lines into a single batch — N individual
             // DiffLine renders each trigger a full footer redraw and
             // tens of KB of ANSI, which blocks the event loop long
@@ -3569,34 +3596,91 @@ fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::SubAgentDispatchStart { count } => {
-            state.on_sub_agent_dispatch_start(count);
+        AgentEvent::SubAgentDispatchStart { tasks } => {
+            // Header line: announce the dispatch. The model also gets
+            // this same fact in the ToolResult, but seeing it land in
+            // the UI lets the user know "the wait is intentional, not
+            // a hang".
+            renderer.render(UiLine::CommandOutput(format!(
+                "Dispatching {} sub-agents in parallel...",
+                tasks.len()
+            )));
+            renderer.flush();
+            state.on_sub_agent_dispatch_start(tasks);
         }
-        AgentEvent::SubAgentDispatchEnd => {
-            state.on_sub_agent_dispatch_end();
-        }
-        AgentEvent::SubAgentProgress { file, status } => {
-            // Per-file progress: emit a body-row line so the user sees
-            // each transition land. Without this, a 6-fork dispatch
-            // shows the pool header then 80 seconds of nothing.
-            let lower = status.to_lowercase();
-            let is_terminal =
-                lower.starts_with("done") || lower.starts_with("failed") || lower.starts_with("timeout");
-            if is_terminal {
-                state.on_sub_agent_settled();
-            }
-            // Empty `file` is the pool header ("Dispatching N parallel agents...");
-            // skip — the agent loop already pushed the human-readable
-            // "**Dispatching N sub-agents in parallel...**" via TextDelta.
-            if !file.is_empty() {
-                let icon = if is_terminal {
-                    if lower.starts_with("done") { "\u{2713}" } else { "\u{2717}" }
-                } else {
-                    "\u{21B3}" // ↳
-                };
-                renderer.render(UiLine::CommandOutput(format!("  {} {} — {}", icon, file, status)));
+        AgentEvent::SubAgentTaskStarted { index } => {
+            // Pull the descriptor (path + dedup suffix) the dispatcher
+            // emitted at start, so three tasks against `tunnel.rs`
+            // render as `src/server/tunnel.rs`, `src/client/tunnel.rs`,
+            // and `src/server/tunnel.rs (#2)` — distinguishable.
+            if let Some(info) = state.sub_agent_tasks.get(index) {
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  ↳ {}{} — running...",
+                    info.path, info.dedup_suffix
+                )));
                 renderer.flush();
             }
+        }
+        AgentEvent::SubAgentTaskDone { index, elapsed_ms, turns, summary: _ } => {
+            state.on_sub_agent_task_done();
+            if let Some(info) = state.sub_agent_tasks.get(index) {
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  ✓ {}{} — done {} · {}T",
+                    info.path,
+                    info.dedup_suffix,
+                    fmt_elapsed(elapsed_ms),
+                    turns
+                )));
+                renderer.flush();
+            }
+        }
+        AgentEvent::SubAgentTaskFailed { index, elapsed_ms, turns: _, reason } => {
+            state.on_sub_agent_task_failed();
+            if let Some(info) = state.sub_agent_tasks.get(index) {
+                let short_reason = reason.lines().next().unwrap_or("").trim();
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  ✗ {}{} — {} · {}",
+                    info.path,
+                    info.dedup_suffix,
+                    fmt_elapsed(elapsed_ms),
+                    if short_reason.is_empty() { "failed" } else { short_reason }
+                )));
+                renderer.flush();
+            }
+        }
+        AgentEvent::SubAgentDispatchEnd => {
+            // Compute the aggregate before clearing state. This is the
+            // single line that replaces the old multi-row pipe-table
+            // result block — the model still sees the full breakdown
+            // in the ToolResult content, but the UI only needs the
+            // bottom line.
+            let total = state.sub_agent_total;
+            let failed = state.sub_agent_failed;
+            let ok = total.saturating_sub(failed);
+            let elapsed = state
+                .sub_agent_started_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            if total > 0 {
+                let summary = if failed == 0 {
+                    format!(
+                        "▸ ParallelEditFiles · {}/{} ok · {} wall",
+                        ok,
+                        total,
+                        fmt_elapsed(elapsed)
+                    )
+                } else {
+                    format!(
+                        "▸ ParallelEditFiles · {} ok · {} fail · {} wall",
+                        ok,
+                        failed,
+                        fmt_elapsed(elapsed)
+                    )
+                };
+                renderer.render(UiLine::CommandOutput(summary));
+                renderer.flush();
+            }
+            state.on_sub_agent_dispatch_end();
         }
         AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
             let header = if success {
@@ -3944,6 +4028,18 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             }
             String::new()
         }
+    }
+}
+
+/// Render an `elapsed_ms` value as `XmYs` (over 60 s) or `Ts` (under).
+/// Tens of milliseconds aren't useful for the UI; whole seconds match
+/// what users see on a wall clock and align column-wise across rows.
+pub(crate) fn fmt_elapsed(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    if total_secs >= 60 {
+        format!("{}m{}s", total_secs / 60, total_secs % 60)
+    } else {
+        format!("{}s", total_secs)
     }
 }
 

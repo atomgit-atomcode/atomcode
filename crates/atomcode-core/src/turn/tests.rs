@@ -340,7 +340,6 @@ fn make_runner(
         ctx: test_ctx,
         permission,
         recently_edited_files: Vec::new(),
-        recent_calls: Vec::new(),
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::empty()
         ),
@@ -1260,55 +1259,6 @@ fn test_rules_no_dynamic_content() {
 }
 
 // ===========================================================================
-// detect_call_loop — read_file fully delegated to read_cache
-// ===========================================================================
-
-/// `read_file` calls bypass `detect_call_loop` entirely now: redundancy is
-/// handled by `tool/read.rs`'s read_cache (cache hit returns the same
-/// content + an escalating "you've read this N times" note). Pattern 2's
-/// hard BLOCKED was a soft text error that the model could ignore — and
-/// did, in observed sessions where the cap counter climbed to "5-call cap"
-/// across consecutive turns. Cheap-replay-with-note is strictly more
-/// useful: model gets the answer plus a clear stop signal.
-///
-/// This test pins the new contract: regardless of how many times the same
-/// `read_file` args are issued in a row, `detect_call_loop` returns `None`.
-#[test]
-fn detect_call_loop_skips_read_file_for_cache_to_handle() {
-    let mut runner = make_runner(
-        MockProvider::text_only(""),
-        ToolRegistry::new(),
-        auto_bypass(),
-    );
-    let args = r#"{"file_path":"/p/x.rs","offset":1,"limit":50}"#;
-    for i in 1..=10 {
-        assert!(
-            runner.detect_call_loop("read_file", args).is_none(),
-            "read_file call #{} must not be blocked at the loop guard",
-            i
-        );
-    }
-}
-
-/// Other tools still get Pattern 2 protection: identical args 3+ times in
-/// a row without an intervening edit should fire BLOCKED. read_file
-/// exclusion in the previous test does not weaken this for grep/bash/etc.
-#[test]
-fn detect_call_loop_still_blocks_other_tools_on_exact_repeat() {
-    let mut runner = make_runner(
-        MockProvider::text_only(""),
-        ToolRegistry::new(),
-        auto_bypass(),
-    );
-    let args = r#"{"pattern":"foo","path":"."}"#;
-    assert!(runner.detect_call_loop("grep", args).is_none());
-    assert!(runner.detect_call_loop("grep", args).is_none());
-    let third = runner.detect_call_loop("grep", args);
-    let msg = third.expect("3rd identical grep must be blocked by Pattern 2");
-    assert!(msg.contains("identical arguments"));
-}
-
-// ===========================================================================
 // validate_args gate: malformed tool-call args bounce back to the model
 // without prompting the user or running execute.
 // ===========================================================================
@@ -1484,7 +1434,6 @@ mod telemetry_tests {
             ctx: test_ctx,
             permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
             recently_edited_files: Vec::new(),
-            recent_calls: Vec::new(),
             hook_executor: std::sync::Arc::new(
                 crate::hook::executor::HookExecutor::empty()
             ),

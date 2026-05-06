@@ -318,9 +318,12 @@ async fn snapshot_workspace_changes(
 }
 
 async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-    let mut parsed: BashArgs = serde_json::from_str(args)?;
-    // Strip model-added tail/head pipes — framework's truncation handles output length.
-    parsed.command = strip_output_pipes(&parsed.command);
+    let parsed: BashArgs = serde_json::from_str(args)?;
+    // Command runs verbatim — no stripping of trailing tail/head/etc.
+    // Aligns with Claude Code: model decides how to shape its own
+    // output. Previous strip-and-notice path mis-fired on `ssh "...
+    // | tail -30"` (inner pipe inside SSH quotes) and similar nested
+    // forms.
 
     // Cap timeout: model may request absurdly large values. Max 5 min.
     let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
@@ -1375,25 +1378,6 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
     Some(path.to_string())
 }
 
-/// Strip model-added `| tail -N` / `| head -N` from the end of bash commands.
-/// The framework's truncation system manages output length — model shouldn't self-truncate.
-/// Preserves `tail -f` (streaming), `| grep` (filtering), `| sort` (semantics).
-fn strip_output_pipes(cmd: &str) -> String {
-    let trimmed = cmd.trim_end();
-    // Find last pipe
-    if let Some(pipe_pos) = trimmed.rfind('|') {
-        let after_pipe = trimmed[pipe_pos + 1..].trim();
-        // Check if it's `tail -N`, `tail -n N`, `head -N`, `head -n N`
-        let is_tail_head = (after_pipe.starts_with("tail ") || after_pipe.starts_with("head "))
-            && !after_pipe.contains("-f")  // preserve tail -f (streaming)
-            && after_pipe.chars().any(|c| c.is_ascii_digit()); // must have a number
-        if is_tail_head {
-            return trimmed[..pipe_pos].trim_end().to_string();
-        }
-    }
-    cmd.to_string()
-}
-
 fn format_output(stdout: &str, stderr: &str) -> String {
     let stdout = sanitize_terminal_output(stdout);
     let stderr = sanitize_terminal_output(stderr);
@@ -1522,6 +1506,32 @@ mod exit_code_tests {
             .unwrap();
         assert!(r.success);
         assert!(r.output.contains("exit: 0"), "output was: {}", r.output);
+    }
+
+    /// Model-supplied tail/head pipes pass through verbatim — bash
+    /// runs the command exactly as written. Aligns with Claude Code:
+    /// the model decides how to shape its own output.
+    #[tokio::test]
+    async fn bash_runs_model_pipes_verbatim() {
+        let (_d, ctx) = ctx();
+        let r = BashTool
+            .execute(r#"{"command":"printf 'a\nb\nc\n' | tail -1"}"#, &ctx)
+            .await
+            .unwrap();
+        assert!(r.success);
+        // Should contain only "c" — the tail actually ran.
+        assert!(
+            r.output.contains("c"),
+            "tail -1 must produce 'c'; got:\n{}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("a") || !r.output.contains("b"),
+            "tail -1 must NOT include earlier lines; got:\n{}",
+            r.output
+        );
+        // No "stripped trailing" notice anywhere.
+        assert!(!r.output.contains("stripped trailing"));
     }
 
     #[tokio::test]

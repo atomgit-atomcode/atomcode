@@ -61,7 +61,7 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
 //
 // `crate::markdown::render_line` returns an ANSI-tinted string: the
 // markdown text with SGR escapes embedded (e.g. `**bold**` →
-// `\x1b[1mbold\x1b[22m`, `` `code` `` → `\x1b[96mcode\x1b[39m`).
+// `\x1b[1mbold\x1b[22m`, `` `code` `` → `\x1b[97mcode\x1b[39m`).
 // AnsiRenderer wrote those bytes straight to stdout. Retained mode
 // works on `Cell`s, so we parse the ANSI string back into a stream
 // of cells carrying their computed style. Minimal parser — handles
@@ -78,7 +78,7 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
 //   27    reverse off
 //   39    fg default
 //   90    fg DarkGrey (borders / soft headings)
-//   96    fg Cyan (inline code / code blocks)
+//   97    fg White (inline code / code blocks — bright white)
 //   0     reset everything
 //
 // Other SGR params (RGB, 256-color, italic, underline) are silently
@@ -202,7 +202,7 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             Some(27) => style.reverse = false,
             Some(39) => style.fg = None,
             Some(90) => style.fg = Some(Color::DarkGrey),
-            Some(96) => style.fg = Some(Color::Cyan),
+            Some(97) => style.fg = Some(Color::White),
             _ => {
                 // Other colors (30-37, 91-97, 38;5;N, 38;2;R;G;B, bg,
                 // underline) silently ignored — our markdown crate
@@ -393,12 +393,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// frame (animated ticks) or `▸` (`ToolCallCommit`, frozen
     /// post-result). Layout matches the static `UiLine::ToolCall` arm so
     /// the row is visually identical pre-commit and post-commit; only
-    /// the icon glyph differs. Caller is responsible for staying within
-    /// terminal width — for typical bash detail (truncated to 55 chars
-    /// in `format_tool_detail`) the row fits in one physical line; an
-    /// over-wide row would visually wrap via the terminal's autowrap
-    /// and the live-row repaint mechanism would only redraw the bottom
-    /// physical row.
+    /// the icon glyph differs.
+    ///
+    /// MUST clamp to one physical line. Reason: `push_or_update_live_spinner`
+    /// repaints in place by `MoveTo(bottom, 1) + EL + write`, which only
+    /// erases ONE physical row. If the row is wider than the terminal,
+    /// auto-wrap on the bottom row of the DECSTBM region scrolls the
+    /// upper portion UP into body history — every spinner tick (~12/sec)
+    /// adds another row of residue, filling the screen in seconds. Real
+    /// regression: `format_tool_detail` truncates bash to 200 chars, but
+    /// terminals < ~100 cols still overflow. We clamp here so the detail
+    /// truncation in `format_tool_detail` is one defence layer; this is
+    /// the structural one.
     fn build_inflight_tool_row(&self, icon: &str, name: &str, detail: &str) -> Vec<Cell> {
         let mut row = Vec::new();
         let pad = CellStyle::default();
@@ -411,11 +417,24 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             format!("{}({})", safe_name, safe_detail)
         };
+        // Clamp to terminal width minus icon-cell, separator space, and
+        // a 1-cell safety margin — terminals differ in whether they
+        // auto-wrap exactly at column `width` or trigger one cell early.
+        let icon_w = crate::width::display_width(icon);
+        let margin = icon_w.saturating_add(2);
+        let max_body = (self.screen.width() as usize).saturating_sub(margin);
+        let body_clamped = if max_body == 0 {
+            String::new()
+        } else if crate::width::display_width(&body_str) > max_body {
+            crate::width::truncate_with_ellipsis(&body_str, max_body)
+        } else {
+            body_str
+        };
         // No left padding - tool call rows sit flush-left at col 0
         // to align with the input-box chevron and approval prompts.
         push_str_cells(&mut row, icon, &muted);
         push_str_cells(&mut row, " ", &pad);
-        push_str_cells(&mut row, &body_str, &tool_name_style);
+        push_str_cells(&mut row, &body_clamped, &tool_name_style);
         row
     }
 
@@ -2895,6 +2914,40 @@ mod tests {
         }
     }
 
+    /// Regression (datalog symptom: the screen filled with ~35 rows of
+    /// `<spinner-glyph> Bash(cd /Users/.../cargo metadata...|python3 -c …`
+    /// stacking up). Root cause: the streaming row carrying the in-flight
+    /// tool name+detail was built from `format_tool_detail`, which clamps
+    /// bash detail at 200 chars — but on terminals narrower than ~100
+    /// cols that still overflows the row. `push_or_update_live_spinner`
+    /// repaints in place at one physical row only; the wrap residue gets
+    /// promoted into body history by DECSTBM, and every spinner tick
+    /// adds another residue row.
+    ///
+    /// Fix: `build_inflight_tool_row` clamps the body string to terminal
+    /// width minus icon and separator. The detail-side truncation in
+    /// `format_tool_detail` becomes one defence layer; this is the
+    /// structural one and ensures narrow terminals stay safe.
+    #[test]
+    fn retained_inflight_tool_row_clamped_to_terminal_width() {
+        let term_w: u16 = 80;
+        let (r, _buf) = new_capturing(term_w, 24);
+        // A real bash command from the failure datalog — well over 80
+        // columns — drives the regression.
+        let detail = "cd /Users/yubangxu/project/atomgr && cargo metadata --format-version 1 \
+                      2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); \
+                      print([p['name'] for p in d['packages']])\"";
+        let row = r.build_inflight_tool_row("⠋", "bash", detail);
+        let w: usize = row.iter().map(|c| c.width as usize).sum();
+        assert!(
+            w <= term_w as usize,
+            "inflight tool row width {} exceeds terminal {} — wide details \
+             will scroll-stack via DECSTBM auto-wrap on each spinner tick",
+            w,
+            term_w
+        );
+    }
+
     /// Regression: user reported that after a terminal resize two
     /// footers appeared stacked on screen — old footer at pre-resize
     /// absolute rows kept its chars, new footer painted at new rows,
@@ -4215,7 +4268,7 @@ mod tests {
 
     /// Markdown inline: `**bold**` + `` `code` `` rendered in
     /// the assistant-text stream. Grid inspects specific cells to
-    /// confirm bold and cyan fg survived the markdown → cells →
+    /// confirm bold and bright-white fg survived the markdown → cells →
     /// serialize → vte parse round-trip.
     #[test]
     fn retained_markdown_inline_styles_via_vterm() {
@@ -4252,15 +4305,16 @@ mod tests {
             cell,
             vterm.dump()
         );
-        // Inline code: markdown crate wraps it in \x1b[96m (cyan) fg.
+        // Inline code: markdown crate wraps it in \x1b[97m (bright
+        // white) fg.
         let code_pos = row_text
             .find("code")
             .expect("expected 'code' in rendered text");
         let code_cell = vterm.cell_at(row_idx, code_pos);
         assert_eq!(
             code_cell.fg,
-            Some(crossterm::style::Color::Cyan),
-            "inline code cell should be cyan: {:?}",
+            Some(crossterm::style::Color::White),
+            "inline code cell should be bright white: {:?}",
             code_cell
         );
     }

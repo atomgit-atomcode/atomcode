@@ -36,24 +36,26 @@ impl Tool for WriteFileTool {
     }
 
     fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
-        // Reject empty / structurally-broken / required-field-missing
-        // payloads up front so the runner can bounce the call back to
-        // the model without an approval round-trip. Same struct used by
-        // execute(), so a passing validate guarantees a passing parse
-        // downstream.
-        serde_json::from_str::<WriteFileArgs>(args).map(|_| ()).map_err(|e| {
-            if args.trim().is_empty() || args.trim() == "{}" {
+        // Surface a model-friendly diagnostic (provided/missing keys + a
+        // one-line example) instead of the raw serde "line 1 column N"
+        // error which weak models read as a parser-position complaint and
+        // try to "fix" by switching to positional arguments. See
+        // `diagnose_args` doc for the failure mode this replaces.
+        super::diagnose_args(
+            "write_file",
+            args,
+            &[&["file_path", "content"]],
+            "write_file({\"file_path\": \"<absolute path>\", \"content\": \"<file body>\"})",
+        )?;
+        // Strict struct parse only AFTER the keys are known to be present
+        // — catches type mismatches (e.g. content sent as an array).
+        serde_json::from_str::<WriteFileArgs>(args)
+            .map(|_| ())
+            .map_err(|e| {
                 format!(
-                    "{} (tool call arrived with no arguments — likely truncated by max_tokens)",
-                    e
+                    "write_file: {e}. Re-issue with file_path as a string and content as a string."
                 )
-            } else {
-                format!(
-                    "{} (could not parse write_file arguments; check `file_path` (absolute) and `content` are present)",
-                    e
-                )
-            }
-        })
+            })
     }
 
     fn approval(&self, args: &str) -> ApprovalRequirement {
@@ -108,26 +110,30 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        // Parse args defensively. Providers occasionally emit empty ({}) or
-        // truncated tool-call arguments on max_tokens cutoff; surfacing the raw
-        // serde error ("missing field `file_path` at line 1 column 2") tells
-        // the model nothing actionable. Return a success=false result with a
-        // recovery hint instead, so the next turn can re-issue the call properly.
+        // Defense-in-depth: validate_args runs at the runner gate, but if
+        // it's bypassed (or args mutated between gate and execute), we fall
+        // back to the same diagnose_args path so the model sees a uniform
+        // recovery hint instead of a raw serde error.
+        if let Err(msg) = super::diagnose_args(
+            "write_file",
+            args,
+            &[&["file_path", "content"]],
+            "write_file({\"file_path\": \"<absolute path>\", \"content\": \"<file body>\"})",
+        ) {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: msg,
+                success: false,
+            });
+        }
         let parsed: WriteFileArgs = match serde_json::from_str(args) {
             Ok(p) => p,
             Err(e) => {
-                let hint = if args.trim().is_empty() || args.trim() == "{}" {
-                    "tool call arrived with no arguments — likely truncated by max_tokens. \
-                     Re-issue write_file with both `file_path` (absolute) and `content`, \
-                     or switch to edit_file for targeted changes."
-                } else {
-                    "could not parse write_file arguments. Re-issue with a valid JSON object \
-                     containing `file_path` (absolute) and `content`. For large files, \
-                     prefer edit_file to avoid hitting the output token limit."
-                };
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output: format!("Error: {}. {}", e, hint),
+                    output: format!(
+                        "write_file: {e}. Re-issue with file_path as a string and content as a string."
+                    ),
                     success: false,
                 });
             }
@@ -168,6 +174,13 @@ impl Tool for WriteFileTool {
         let new_lines = parsed.content.lines().count();
         let bytes = parsed.content.len();
         tokio::fs::write(&path, &parsed.content).await?;
+
+        // D3: drop any FileStore entry for this path. The next peek_file
+        // against the old store_id will report "stale" and route the
+        // model toward a fresh read_file. Without this invalidation a
+        // peek_file could hand the model pre-write content that no
+        // longer matches what just landed on disk.
+        ctx.file_store.write().await.invalidate(&path);
 
         // Notify LSP that file changed (if LSP is enabled).
         ctx.notify_lsp_file_changed(&path, &parsed.content).await;

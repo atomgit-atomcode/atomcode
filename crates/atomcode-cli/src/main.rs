@@ -1494,9 +1494,12 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
-            AgentEvent::SubAgentDispatchStart { count } => {
+            AgentEvent::SubAgentDispatchStart { tasks } => {
                 if verbose {
-                    eprintln!("[sub-agent] dispatching {} in parallel", count);
+                    eprintln!("[sub-agent] dispatching {} in parallel", tasks.len());
+                    for (i, t) in tasks.iter().enumerate() {
+                        eprintln!("[sub-agent {}] {}{}", i, t.path, t.dedup_suffix);
+                    }
                 }
             }
             AgentEvent::SubAgentDispatchEnd => {
@@ -1504,9 +1507,39 @@ async fn run_headless(
                     eprintln!("[sub-agent] dispatch complete");
                 }
             }
-            AgentEvent::SubAgentProgress { file, status } => {
+            AgentEvent::SubAgentTaskStarted { index } => {
                 if verbose {
-                    eprintln!("[sub-agent] {} {}", file, status);
+                    eprintln!("[sub-agent {}] running", index);
+                }
+            }
+            AgentEvent::SubAgentTaskDone {
+                index,
+                elapsed_ms,
+                turns,
+                summary: _,
+            } => {
+                if verbose {
+                    eprintln!(
+                        "[sub-agent {}] done {}s · {}T",
+                        index,
+                        elapsed_ms / 1000,
+                        turns
+                    );
+                }
+            }
+            AgentEvent::SubAgentTaskFailed {
+                index,
+                elapsed_ms,
+                turns: _,
+                reason,
+            } => {
+                if verbose {
+                    eprintln!(
+                        "[sub-agent {}] failed {}s · {}",
+                        index,
+                        elapsed_ms / 1000,
+                        reason.lines().next().unwrap_or("")
+                    );
                 }
             }
             AgentEvent::BackgroundComplete {

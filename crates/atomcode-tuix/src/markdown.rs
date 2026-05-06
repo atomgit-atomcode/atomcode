@@ -76,16 +76,13 @@ pub fn render_line_with_width(
         return prefix_only();
     }
 
-    // Inside code block: render in bright cyan + bold (SGR 96 + 1) with
-    // no inline
-    // parsing. Bright cyan is the conventional "code" tone across themes
-    // and reads vividly on both light and dark backgrounds.
+    // Inside code block: render in bright white + bold (SGR 97 + 1) with
+    // no inline parsing. Bright white reads cleanly on both light and dark
+    // backgrounds without the low-contrast pastel hit that SGR 96 (cyan)
+    // suffers on iTerm2's default light preset.
     if state.in_code_block {
         let body = if caps.colors {
-            // Bold + bright cyan: bold compensates for the low contrast
-            // bright cyan can have on pastel light themes (e.g. iTerm2's
-            // default light preset where SGR 96 is a washed-out teal).
-            format!("\x1b[1;96m{}\x1b[22;39m", line)
+            format!("\x1b[1;97m{}\x1b[22;39m", line)
         } else {
             line.to_string()
         };
@@ -373,10 +370,10 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    // Bold + bright cyan — bold helps the inline code
-                    // span stay visible on light themes where SGR 96
-                    // can render as a low-contrast pastel.
-                    out.push_str("\x1b[1;96m");
+                    // Bold + bright white — clean, theme-neutral inline
+                    // code styling that stays readable on both light and
+                    // dark backgrounds.
+                    out.push_str("\x1b[1;97m");
                     out.push_str(&inner);
                     out.push_str("\x1b[22;39m");
                 } else {
@@ -487,10 +484,9 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        // Inline code uses SGR 1+96 (bold + bright cyan) — bold helps
-        // it stay readable on light themes where SGR 96 alone can render
-        // as a low-contrast pastel teal.
-        assert!(render_inline_line("`x`", caps()).contains("\x1b[1;96mx"));
+        // Inline code uses SGR 1+97 (bold + bright white) — clean, theme-
+        // neutral, readable on both light and dark backgrounds.
+        assert!(render_inline_line("`x`", caps()).contains("\x1b[1;97mx"));
     }
 
     #[test]

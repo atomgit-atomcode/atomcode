@@ -192,8 +192,19 @@ impl Tool for SearchReplaceTool {
                         success: false,
                     });
                 }
+                // Canonicalize once so downstream by-path lookups
+                // (FileStore, LSP) match what read.rs originally
+                // stored — `entry.path()` from the directory walk
+                // can be the un-resolved symlink form (e.g. macOS
+                // `/var/...` vs `/private/var/...`), which would
+                // miss the FileStore key inserted by read_file.
+                let canon = std::fs::canonicalize(file_path)
+                    .unwrap_or_else(|_| file_path.to_path_buf());
                 // Notify LSP that file changed (if LSP is enabled).
-                ctx.notify_lsp_file_changed(file_path, &new_content).await;
+                ctx.notify_lsp_file_changed(&canon, &new_content).await;
+                // D3: drop any FileStore entry — peek_file against an
+                // old store_id reports stale, forcing fresh read_file.
+                ctx.file_store.write().await.invalidate(&canon);
                 total_replacements += count;
                 files_modified.push(format!(
                     "  {} ({} replacements)",

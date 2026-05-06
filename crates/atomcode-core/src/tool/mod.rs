@@ -66,6 +66,92 @@ pub fn should_skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name) || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+/// Model-friendly tool-arguments validator.
+///
+/// Why this exists: serde's "missing field `X` at line 1 column 793" error
+/// reads to weak models (GLM-5.1, Qwen) as a *parser-position* complaint and
+/// reliably triggers hallucinated "fixes" like "I should use positional
+/// arguments" — wasting a turn or six on the same tool call. See datalog
+/// `atomgr-2d99b47d/2026-05-06_08-43-12.md` Turns 64–75 for the failure
+/// mode this replaces.
+///
+/// What it returns instead, on failure:
+/// - the **keys the model actually provided**
+/// - the **keys it's missing** for the closest mode
+/// - a **one-line example** of a correct call
+///
+/// `required_modes` is a list of accepted key sets — any one fully matched
+/// passes. Single-mode tools pass `&[&[required_keys]]`. Multi-mode tools
+/// like `edit_file` pass one slice per mode; the diagnostic picks the mode
+/// with the fewest missing keys for the hint.
+///
+/// Returns the parsed `Value` on success so callers can avoid a second
+/// parse pass.
+pub fn diagnose_args(
+    tool: &str,
+    args: &str,
+    required_modes: &[&[&str]],
+    example: &str,
+) -> std::result::Result<serde_json::Value, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return Err(format!(
+            "{tool} called with empty arguments — likely max_tokens cutoff. \
+             Re-issue: {example}"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(args).map_err(|_| {
+        format!(
+            "{tool} arguments are not valid JSON. Re-issue: {example}"
+        )
+    })?;
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => {
+            let kind = match &value {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => unreachable!(),
+            };
+            return Err(format!(
+                "{tool} expected a JSON object, got {kind}. Re-issue: {example}"
+            ));
+        }
+    };
+    if required_modes
+        .iter()
+        .any(|m| m.iter().all(|k| obj.contains_key(*k)))
+    {
+        return Ok(value);
+    }
+    let provided: Vec<&str> = obj.keys().map(String::as_str).collect();
+    // Pick the mode with the fewest missing keys — that's the call shape
+    // the model was probably aiming at.
+    let (closest, missing) = required_modes
+        .iter()
+        .map(|m| {
+            let miss: Vec<&str> = m
+                .iter()
+                .filter(|k| !obj.contains_key(**k))
+                .copied()
+                .collect();
+            (*m, miss)
+        })
+        .min_by_key(|(_, miss)| miss.len())
+        .expect("required_modes must be non-empty");
+    Err(format!(
+        "{tool}: provided keys [{}], missing required [{}] for mode [{}]. \
+         Re-issue: {}",
+        provided.join(", "),
+        missing.join(", "),
+        closest.join("+"),
+        example,
+    ))
+}
+
 /// Lightweight sensitive-path precheck for raw tool arguments before a
 /// workspace-aware approval pass is available.
 pub(crate) fn is_sensitive_input_path(path: &str) -> bool {
@@ -718,6 +804,14 @@ pub struct ToolContext {
     /// for the lifetime of the process. `None` in headless / test
     /// contexts that don't need fork dispatch.
     pub tool_registry: Option<Arc<ToolRegistry>>,
+    /// D3 file content store. read_file pushes large file content
+    /// here transparently and consults it on subsequent reads of any
+    /// range — disk hit only on first read or after edit. Conversation
+    /// messages carry only the rendered text (with line numbers) for
+    /// the requested region. edit_file / write_file invalidate
+    /// entries on success so a stale entry cannot serve outdated
+    /// bytes.
+    pub file_store: Arc<RwLock<crate::ctx::file_store::FileStore>>,
 }
 
 impl ToolContext {
@@ -752,6 +846,7 @@ impl ToolContext {
             event_tx: None,
             current_call_id: None,
             tool_registry: None,
+            file_store: Arc::new(RwLock::new(crate::ctx::file_store::FileStore::new())),
         }
     }
 
@@ -763,6 +858,10 @@ impl ToolContext {
         ctx.graph = self.graph.clone();
         ctx.telemetry = self.telemetry.clone();
         ctx.lsp = self.lsp.clone();
+        // Share the FileStore — sub-agents reading the same file reuse
+        // the parent's disk work and benefit from invalidation events
+        // emitted by either side.
+        ctx.file_store = self.file_store.clone();
         ctx
     }
 

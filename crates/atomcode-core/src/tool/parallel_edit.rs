@@ -225,14 +225,16 @@ impl Tool for ParallelEditTool {
             });
         }
 
-        // Lifecycle events for the TUI: spinner override + per-task rows.
-        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-            "\n**Dispatching {} sub-agents in parallel...**\n",
-            tasks.len()
-        )));
+        // Lifecycle events for the TUI. Build per-task descriptors so
+        // the renderer can pre-allocate display slots and disambiguate
+        // same-path entries with `(#2)`, `(#3)` suffixes — three
+        // sub-agents on `tunnel.rs` would otherwise show up as three
+        // identical rows the user can't tell apart.
+        let paths: Vec<&str> = tasks.iter().map(|t| t.file_path.as_str()).collect();
+        let task_infos = build_task_infos_with_dedup(&paths);
         let _ = self
             .event_tx
-            .send(AgentEvent::SubAgentDispatchStart { count: tasks.len() });
+            .send(AgentEvent::SubAgentDispatchStart { tasks: task_infos });
 
         let pool = sub_agent::SubAgentPool {
             tasks,
@@ -250,36 +252,45 @@ impl Tool for ParallelEditTool {
             .await;
         let _ = self.event_tx.send(AgentEvent::SubAgentDispatchEnd);
 
-        // Build the tool result: status table + build-probe outcome. The
-        // build probe runs once after the merge to catch cross-file gaps
-        // (e.g., wrapper edited but inner impl missed) and surfaces real
-        // compile errors verbatim so the model has something concrete to
-        // fix instead of reverse-engineering a "FAILED" summary.
-        let mut summary = String::from("**Sub-agent results:**\n");
-        let mut all_success = true;
+        // Build the tool result: per-task status block + build-probe
+        // outcome. This is what the MODEL sees — it must contain enough
+        // signal to decide whether to retry / fix-up. The TUI renders
+        // this same content collapsed (single aggregate line); the
+        // duplicate-display problem is solved at the UI layer, not by
+        // shrinking the message the model needs to read.
+        //
+        // Format change: pipe-table ("- file | OK | 2 turns | model said: ...")
+        // dropped. Hard to scan, eyes have to stop at every `|`, and
+        // `model said:` quotes were truncating mid-word at terminal
+        // width. New format is one task per line, status icon prefix,
+        // full path, time/turns in compact bracket, summary in plain
+        // prose so wrapping is natural.
+        let ok_count = results.iter().filter(|r| r.success).count();
+        let fail_count = results.len() - ok_count;
+        let mut summary = format!(
+            "Sub-agents: {} ok, {} fail (of {})\n",
+            ok_count,
+            fail_count,
+            results.len(),
+        );
+        let mut all_success = fail_count == 0;
         for r in &results {
-            let status = if r.success { "OK" } else { "FAILED" };
-            let short = std::path::Path::new(&r.file_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| r.file_path.clone());
+            let icon = if r.success { "✓" } else { "✗" };
+            // Time isn't tracked on SubAgentResult — the per-task UI
+            // events carry elapsed_ms and the user already saw it
+            // stream in. The model only needs turn count to decide
+            // between rescue / retry / abandon, and a one-line summary.
+            let one_line = r.summary.lines().next().unwrap_or("").trim();
             summary.push_str(&format!(
-                "- {} | {} | {} turns | {}\n",
-                short, status, r.turns_used, r.summary,
+                "  {} {} ({}T) — {}\n",
+                icon, r.file_path, r.turns_used, one_line,
             ));
             if !r.success {
                 all_success = false;
                 for failure in &r.failures {
-                    summary.push_str(&format!("  Error: {:?}\n", failure));
+                    summary.push_str(&format!("      reason: {:?}\n", failure));
                 }
             }
-        }
-        if !all_success {
-            summary.push_str(&format!(
-                "\n{}/{} sub-agents failed.\n",
-                results.iter().filter(|r| !r.success).count(),
-                results.len(),
-            ));
         }
 
         // Build verification — best-effort, structural detector (probes
@@ -320,6 +331,38 @@ impl Tool for ParallelEditTool {
 /// Detect the workspace's primary build command by probing for canonical
 /// project-root marker files. Structural (one marker per ecosystem), not
 /// inference — the markers are the build system's own signature, not the
+/// Build `SubAgentTaskInfo` descriptors with per-occurrence `(#N)`
+/// disambiguation when the same path appears more than once in the
+/// dispatch list. Unique paths get an empty `dedup_suffix`. Order
+/// matches the input — index N in `paths` maps to index N in the
+/// returned vec, so the `index` field on lifecycle events stays a
+/// valid lookup key.
+fn build_task_infos_with_dedup(paths: &[&str]) -> Vec<crate::agent::SubAgentTaskInfo> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for p in paths {
+        *counts.entry(*p).or_insert(0) += 1;
+    }
+    paths
+        .iter()
+        .map(|p| {
+            let total = counts.get(*p).copied().unwrap_or(1);
+            let dedup_suffix = if total > 1 {
+                let n = seen.entry(*p).or_insert(0);
+                *n += 1;
+                format!(" (#{})", *n)
+            } else {
+                String::new()
+            };
+            crate::agent::SubAgentTaskInfo {
+                path: p.to_string(),
+                dedup_suffix,
+            }
+        })
+        .collect()
+}
+
 /// model's text. Searches the working directory then immediate
 /// subdirectories so nested project layouts (a Cargo workspace under a
 /// monorepo) still resolve.
@@ -489,5 +532,46 @@ mod validate_args_tests {
         let args = "not json at all";
         let err = tool().validate_args(args).unwrap_err();
         assert!(err.contains("parallel_edit_files arguments"), "got: {}", err);
+    }
+
+    // ── dedup-suffix logic ──
+
+    #[test]
+    fn dedup_suffix_empty_for_unique_paths() {
+        let infos = super::build_task_infos_with_dedup(&[
+            "src/server/api.rs",
+            "src/client/mod.rs",
+            "src/server/mod.rs",
+        ]);
+        for i in &infos {
+            assert_eq!(i.dedup_suffix, "", "{} should be unique", i.path);
+        }
+    }
+
+    #[test]
+    fn dedup_suffix_numbers_repeats_in_order() {
+        let infos = super::build_task_infos_with_dedup(&[
+            "src/server/tunnel.rs",
+            "src/client/tunnel.rs",
+            "src/server/tunnel.rs",
+            "src/server/tunnel.rs",
+        ]);
+        assert_eq!(infos[0].dedup_suffix, " (#1)");
+        assert_eq!(infos[1].dedup_suffix, "");
+        assert_eq!(infos[2].dedup_suffix, " (#2)");
+        assert_eq!(infos[3].dedup_suffix, " (#3)");
+    }
+
+    #[test]
+    fn dedup_suffix_preserves_input_order() {
+        // Index in returned vec must align with the input — the dispatcher
+        // emits `SubAgentTaskStarted { index: N }` events that the UI
+        // resolves by indexing into this vec.
+        let paths = ["a.rs", "b.rs", "a.rs"];
+        let infos = super::build_task_infos_with_dedup(&paths);
+        assert_eq!(infos.len(), 3);
+        assert_eq!(infos[0].path, "a.rs");
+        assert_eq!(infos[1].path, "b.rs");
+        assert_eq!(infos[2].path, "a.rs");
     }
 }

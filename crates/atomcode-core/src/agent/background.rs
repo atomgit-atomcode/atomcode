@@ -87,7 +87,6 @@ async fn run_background_inner(
         ctx,
         permission,
         recently_edited_files: Vec::new(),
-        recent_calls: Vec::new(),
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::new(hooks)
         ),
