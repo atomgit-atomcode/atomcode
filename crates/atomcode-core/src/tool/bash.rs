@@ -318,10 +318,12 @@ async fn snapshot_workspace_changes(
 }
 
 async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-    let mut parsed: BashArgs = serde_json::from_str(args)?;
-    // Strip model-added tail/head pipes — framework's truncation handles output length.
-    let (stripped_cmd, removed_pipe) = strip_output_pipes(&parsed.command);
-    parsed.command = stripped_cmd;
+    let parsed: BashArgs = serde_json::from_str(args)?;
+    // Command runs verbatim — no stripping of trailing tail/head/etc.
+    // Aligns with Claude Code: model decides how to shape its own
+    // output. Previous strip-and-notice path mis-fired on `ssh "...
+    // | tail -30"` (inner pipe inside SSH quotes) and similar nested
+    // forms.
 
     // Cap timeout: model may request absurdly large values. Max 5 min.
     let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
@@ -531,29 +533,11 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                 combined.push_str(suffix);
             }
             let elapsed_marker = format_exit_marker(elapsed_secs, code);
-            // Prepend the strip-notice when applicable so the model knows
-            // its `| tail -N` / `| head -N` was rewritten — without this,
-            // 3 consecutive runs with different tail values look like 3
-            // different commands to the model, and it loops re-tweaking
-            // the truncation knob instead of parsing the error already
-            // in front of it (datalog 2026-05-06 atomgr session).
-            let strip_notice = removed_pipe.as_ref().map(|p| {
-                format!(
-                    "[note: stripped trailing `{}` — framework already caps output, \
-                     piping tail/head won't change what you see; parse the full \
-                     output below]\n",
-                    p
-                )
-            });
             // Prepend elapsed so it's visible even when output is truncated later
-            let body = if combined.is_empty() {
+            let output = if combined.is_empty() {
                 elapsed_marker
             } else {
                 format!("{}\n{}", elapsed_marker, combined)
-            };
-            let output = match strip_notice {
-                Some(n) => format!("{}{}", n, body),
-                None => body,
             };
             Ok(ToolResult {
                 call_id: String::new(),
@@ -1394,31 +1378,6 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
     Some(path.to_string())
 }
 
-/// Strip model-added `| tail -N` / `| head -N` from the end of bash commands.
-/// The framework's truncation system manages output length — model shouldn't self-truncate.
-/// Preserves `tail -f` (streaming), `| grep` (filtering), `| sort` (semantics).
-///
-/// Returns `(stripped_cmd, removed_pipe)` — the second tuple slot carries
-/// the dropped pipe segment (e.g. `"| tail -15"`) so the bash dispatcher
-/// can announce the rewrite in the result. Without that announcement,
-/// the model sees identical output for `… | tail -15` and `… | tail -20`
-/// and assumes it isn't "seeing enough" — wasting turns on tail-knob
-/// twiddling instead of parsing the error that's already in front of it.
-pub(crate) fn strip_output_pipes(cmd: &str) -> (String, Option<String>) {
-    let trimmed = cmd.trim_end();
-    if let Some(pipe_pos) = trimmed.rfind('|') {
-        let after_pipe = trimmed[pipe_pos + 1..].trim();
-        let is_tail_head = (after_pipe.starts_with("tail ") || after_pipe.starts_with("head "))
-            && !after_pipe.contains("-f")  // preserve tail -f (streaming)
-            && after_pipe.chars().any(|c| c.is_ascii_digit());
-        if is_tail_head {
-            let removed = trimmed[pipe_pos..].trim_end().to_string();
-            return (trimmed[..pipe_pos].trim_end().to_string(), Some(removed));
-        }
-    }
-    (cmd.to_string(), None)
-}
-
 fn format_output(stdout: &str, stderr: &str) -> String {
     let stdout = sanitize_terminal_output(stdout);
     let stderr = sanitize_terminal_output(stderr);
@@ -1549,77 +1508,30 @@ mod exit_code_tests {
         assert!(r.output.contains("exit: 0"), "output was: {}", r.output);
     }
 
-    // ── strip_output_pipes pure-function tests ──
-
-    #[test]
-    fn strip_output_pipes_extracts_tail() {
-        let (cmd, removed) = strip_output_pipes("ls -la | tail -15");
-        assert_eq!(cmd, "ls -la");
-        assert_eq!(removed.as_deref(), Some("| tail -15"));
-    }
-
-    #[test]
-    fn strip_output_pipes_extracts_head_n() {
-        let (cmd, removed) = strip_output_pipes("cat /etc/passwd | head -n 5");
-        assert_eq!(cmd, "cat /etc/passwd");
-        assert_eq!(removed.as_deref(), Some("| head -n 5"));
-    }
-
-    #[test]
-    fn strip_output_pipes_preserves_tail_f() {
-        // `tail -f` is streaming, not output capping — must NOT be stripped.
-        let (cmd, removed) = strip_output_pipes("tail -f /var/log/x.log");
-        assert_eq!(cmd, "tail -f /var/log/x.log");
-        assert!(removed.is_none());
-    }
-
-    #[test]
-    fn strip_output_pipes_leaves_grep_alone() {
-        // `| grep` filters semantically — stripping would change behavior.
-        let (cmd, removed) = strip_output_pipes("cargo check 2>&1 | grep error");
-        assert_eq!(cmd, "cargo check 2>&1 | grep error");
-        assert!(removed.is_none());
-    }
-
-    #[test]
-    fn strip_output_pipes_returns_unchanged_when_no_pipe() {
-        let (cmd, removed) = strip_output_pipes("ls -la");
-        assert_eq!(cmd, "ls -la");
-        assert!(removed.is_none());
-    }
-
-    // ── bash result includes strip notice when applicable ──
-
+    /// Model-supplied tail/head pipes pass through verbatim — bash
+    /// runs the command exactly as written. Aligns with Claude Code:
+    /// the model decides how to shape its own output.
     #[tokio::test]
-    async fn bash_result_includes_strip_notice_when_tail_pipe_present() {
-        // The model needs to know its `| tail -N` was rewritten — without
-        // this notice, three runs with different tail values look like
-        // three different commands (datalog 2026-05-06 atomgr loop bug).
+    async fn bash_runs_model_pipes_verbatim() {
         let (_d, ctx) = ctx();
         let r = BashTool
-            .execute(r#"{"command":"echo hello | tail -1"}"#, &ctx)
+            .execute(r#"{"command":"printf 'a\nb\nc\n' | tail -1"}"#, &ctx)
             .await
             .unwrap();
+        assert!(r.success);
+        // Should contain only "c" — the tail actually ran.
         assert!(
-            r.output.contains("[note: stripped trailing"),
-            "result must announce the strip; got:\n{}",
+            r.output.contains("c"),
+            "tail -1 must produce 'c'; got:\n{}",
             r.output
         );
-        assert!(r.output.contains("| tail -1"), "notice must include the dropped pipe; got:\n{}", r.output);
-    }
-
-    #[tokio::test]
-    async fn bash_result_omits_strip_notice_when_no_pipe_stripped() {
-        let (_d, ctx) = ctx();
-        let r = BashTool
-            .execute(r#"{"command":"echo hello"}"#, &ctx)
-            .await
-            .unwrap();
         assert!(
-            !r.output.contains("stripped trailing"),
-            "no strip notice should appear for clean commands; got:\n{}",
+            !r.output.contains("a") || !r.output.contains("b"),
+            "tail -1 must NOT include earlier lines; got:\n{}",
             r.output
         );
+        // No "stripped trailing" notice anywhere.
+        assert!(!r.output.contains("stripped trailing"));
     }
 
     #[tokio::test]
