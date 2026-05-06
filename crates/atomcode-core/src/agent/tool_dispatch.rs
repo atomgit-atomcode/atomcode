@@ -28,6 +28,14 @@ impl AgentLoop {
                 ref name,
                 ref arguments,
             } => {
+                // Dedupe across retries — see the matching guard in
+                // `agent/mod.rs` inline forward path. Same id arriving
+                // twice means the previous attempt's stream got cut off
+                // (429 / timeout) and was retried; we've already painted
+                // a row for it.
+                if !self.emitted_tool_ids.insert(id.clone()) {
+                    return;
+                }
                 self.datalog.log_tool_call(name, arguments);
 
                 self.current_tool_name = name.clone();

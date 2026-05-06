@@ -376,6 +376,16 @@ pub struct AgentLoop {
     /// LLM returns no tool calls, or when the step budget is hit).
     max_turns: Option<usize>,
     retry_count: usize,
+    /// Tool-call IDs already forwarded to the renderer in the current
+    /// user turn. Cleared at the start of each new user message (in
+    /// `process_user_input` per-turn reset block).
+    ///
+    /// Dedupes the case where 429 / stream-ended retries cause the
+    /// runner to re-emit `TurnEvent::ToolCallStarted` with the same
+    /// provider-assigned tool_call_id. Without this, every retry adds
+    /// a duplicate `▸ Bash(...)` row in scrollback — at extreme rate-
+    /// limit scenarios users see the same command 30+ times.
+    emitted_tool_ids: std::collections::HashSet<String>,
 
     // Approval channel endpoints for InteractivePermissionDecider
     /// Receives approval requests from InteractivePermissionDecider
@@ -654,6 +664,7 @@ impl AgentLoop {
             turn_count: 0,
             max_turns: None,
             retry_count: 0,
+            emitted_tool_ids: std::collections::HashSet::new(),
             approval_req_rx,
             approval_resp_tx,
             last_approval_request: None,
@@ -1235,6 +1246,7 @@ impl AgentLoop {
         self.tool_call_count = 0;
         self.turn_count = 0;
         self.retry_count = 0;
+        self.emitted_tool_ids.clear();
         self.discipline_state.recent_calls.clear();
         self.files_read_this_turn.clear();
         self.files_edited_this_turn.clear();
@@ -1441,6 +1453,7 @@ impl AgentLoop {
                 let last_bash_cmd = &mut self.discipline_state.last_bash_cmd;
                 let session_files = &mut self.session_files;
                 let reindex_tx = &self.reindex_tx;
+                let emitted_tool_ids = &mut self.emitted_tool_ids;
                 let working_dir_for_read_counts = runner.context.working_dir.clone();
 
                 // Tool filtering: diagnosis phase uses read-only tools.
@@ -1498,6 +1511,15 @@ impl AgentLoop {
                                     let _ = event_tx.send(AgentEvent::ReasoningDelta(text));
                                 }
                                 TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
+                                    // Dedupe across retries: the same provider-assigned tool_call_id
+                                    // arrives again whenever a 429 / stream-ended attempt is retried.
+                                    // Without this guard, every retry paints another `▸ Bash(...)` row.
+                                    // Skip ALL downstream side effects (datalog, phase, file tracking,
+                                    // event emission) for the duplicate — the first emission has
+                                    // already accounted for them.
+                                    if !emitted_tool_ids.insert(id.clone()) {
+                                        continue;
+                                    }
                                     // Forward tool name immediately for UI spinner
                                     let _ = event_tx.send(AgentEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
                                     // Flush accumulated model text to datalog before logging tool call accumulated model text to datalog before logging tool call
