@@ -830,9 +830,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 let body = match menu.kind {
                     crate::render::MenuKind::SlashCommand => {
                         if selected {
-                            format!("  ▸ /{:<12}  {}", safe_name, safe_desc)
+                            format!("▸ /{:<12}  {}", safe_name, safe_desc)
                         } else {
-                            format!("    /{:<12}  {}", safe_name, safe_desc)
+                            format!("  /{:<12}  {}", safe_name, safe_desc)
                         }
                     }
                     crate::render::MenuKind::AtMention => {

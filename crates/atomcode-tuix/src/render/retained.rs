@@ -497,22 +497,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         kind: super::MenuKind,
     ) -> Vec<Cell> {
         let mut row = Vec::new();
-        let pad = CellStyle::default();
-        // SlashCommand keeps the original PAD_COL outer indent; AtMention
-        // hugs the left edge so `+` lines up flush against the rule edge
-        // (matches the reference screenshot from the feature request).
-        let outer_pad = match kind {
-            super::MenuKind::SlashCommand => PAD_COL,
-            super::MenuKind::AtMention => 0,
-        };
-        push_str_cells(&mut row, &" ".repeat(outer_pad), &pad);
-
+        // Both menu kinds hug the left edge — content prefixes (`▸ /`
+        // or `+ `) carry the visual structure. The previous PAD_COL
+        // outer indent compounded with inner format-string padding to
+        // push the `▸` arrow 4 columns right of the rule edge, which
+        // read as a wonky margin against the flush-left rule.
         let content = match kind {
             super::MenuKind::SlashCommand => {
                 if selected {
-                    format!("  ▸ /{:<12}  {}", name, desc)
+                    format!("▸ /{:<12}  {}", name, desc)
                 } else {
-                    format!("    /{:<12}  {}", name, desc)
+                    format!("  /{:<12}  {}", name, desc)
                 }
             }
             super::MenuKind::AtMention => {
