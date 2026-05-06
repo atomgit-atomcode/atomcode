@@ -1,14 +1,15 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { formatTokenCount } from '../utils/format';
-import { postMessage } from '../vscode';
 import { SlashPicker } from './SlashPicker';
+import { ModelSelector } from './ModelSelector';
 
 export function InputArea() {
   const { state, send, stop, dispatch } = useChatContext();
   const [text, setText] = useState('');
   const [showSlash, setShowSlash] = useState(false);
   const [slashFilter, setSlashFilter] = useState('');
+  const inputBoxRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -26,10 +27,23 @@ export function InputArea() {
     return () => window.removeEventListener('message', handleMessage);
   }, []);
 
+  useEffect(() => {
+    if (!showSlash) return undefined;
+
+    function handlePointerDown(e: MouseEvent) {
+      if (inputBoxRef.current && !inputBoxRef.current.contains(e.target as Node)) {
+        setShowSlash(false);
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, [showSlash]);
+
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     setText(val);
-    if (val.startsWith('/')) {
+    if (/^\/\S*$/.test(val)) {
       setSlashFilter(val.slice(1).split(/\s/)[0]);
       setShowSlash(true);
     } else {
@@ -59,9 +73,16 @@ export function InputArea() {
     textareaRef.current?.focus();
   }, []);
 
+  const handleSlashButton = useCallback(() => {
+    setText('/');
+    setSlashFilter('');
+    setShowSlash((open) => !open);
+    textareaRef.current?.focus();
+  }, []);
+
   return (
     <div className="input-container">
-      <div className="input-box">
+      <div className="input-box" ref={inputBoxRef}>
         {showSlash && (
           <SlashPicker filter={slashFilter} onSelect={handleSlashSelect} onClose={() => setShowSlash(false)} />
         )}
@@ -86,14 +107,12 @@ export function InputArea() {
           disabled={state.isGenerating}
         />
         <div className="input-footer">
-          <button className="footer-attach-btn" onClick={() => postMessage({ type: 'attachFile' })} title="Attach file">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M11.5 1A3.5 3.5 0 0115 4.5v6a4.5 4.5 0 01-9 0V4a2 2 0 114 0v6.5a.5.5 0 01-1 0V4H7.5v6.5a2 2 0 004 0V4.5a2 2 0 00-4 0v6a3 3 0 006 0v-6A3.5 3.5 0 0011.5 1z" />
-            </svg>
-            Attach
+          <button className="footer-slash-btn" onClick={handleSlashButton} title="Commands">
+            /
           </button>
           <span className="footer-spacer" />
           {state.tokenCount && <span className="footer-tokens">{formatTokenCount(state.tokenCount.total)}</span>}
+          <ModelSelector placement="up" onOpen={() => setShowSlash(false)} />
           {state.isGenerating ? (
             <button className="btn-stop" onClick={stop} title="Stop">
               <div style={{ width: 8, height: 8, background: 'currentColor', borderRadius: 1 }} />

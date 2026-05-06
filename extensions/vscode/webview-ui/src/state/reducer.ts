@@ -5,15 +5,59 @@ function nextId(): string {
   return `msg-${Date.now()}-${++_msgCounter}`;
 }
 
+function normalizeRole(role: string): 'user' | 'assistant' | 'tool' | 'system' | 'unknown' {
+  const normalized = String(role || '').toLowerCase();
+  if (normalized === 'user' || normalized === 'assistant' || normalized === 'tool' || normalized === 'system') {
+    return normalized;
+  }
+  return 'unknown';
+}
+
+function textFromContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!content || typeof content !== 'object') return '';
+
+  const value = content as {
+    Text?: unknown;
+    AssistantWithToolCalls?: { text?: unknown };
+    ToolResult?: { output?: unknown };
+    ToolResultRef?: { summary?: unknown };
+  };
+
+  if (typeof value.Text === 'string') return value.Text;
+  if (value.AssistantWithToolCalls) {
+    return typeof value.AssistantWithToolCalls.text === 'string' ? value.AssistantWithToolCalls.text : '';
+  }
+  if (value.ToolResult) {
+    return typeof value.ToolResult.output === 'string' ? value.ToolResult.output : '';
+  }
+  if (value.ToolResultRef) {
+    return typeof value.ToolResultRef.summary === 'string' ? value.ToolResultRef.summary : '';
+  }
+
+  return '';
+}
+
 export const initialState: ChatState = {
   messages: [],
   isGenerating: false,
+  viewMode: document.body.dataset.viewMode === 'sidebar' ? 'sidebar' : 'tab',
   currentModel: 'default',
+  currentProvider: '',
   models: [],
+  providers: [],
+  auth: undefined,
+  setupRequired: false,
+  setupStatus: undefined,
+  setupError: undefined,
+  loginUrl: undefined,
   sessions: [],
+  activeSessionId: undefined,
+  activeProjectHash: undefined,
   contextFiles: [],
   tokenCount: undefined,
   historyOpen: false,
+  settingsOpen: false,
   searchQuery: '',
   searchOpen: false,
 };
@@ -145,11 +189,69 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'SET_MODELS':
       return { ...state, models: action.models };
 
+    case 'SET_PROVIDERS': {
+      const current = action.providers.find((p) => p.name === action.defaultProvider)
+        ?? action.providers.find((p) => p.is_default);
+      return {
+        ...state,
+        providers: action.providers,
+        currentProvider: current?.name ?? state.currentProvider,
+        currentModel: current?.model ?? state.currentModel,
+        setupRequired: state.auth?.logged_in === false || action.providers.length === 0,
+      };
+    }
+
+    case 'SET_AUTH':
+      return {
+        ...state,
+        auth: action.auth,
+        setupRequired: !action.auth.logged_in || state.providers.length === 0,
+      };
+
+    case 'SET_SETUP_STATE': {
+      const current = action.providers.find((p) => p.name === action.defaultProvider)
+        ?? action.providers.find((p) => p.is_default);
+      return {
+        ...state,
+        auth: action.auth ?? state.auth,
+        providers: action.providers,
+        currentProvider: current?.name ?? action.defaultProvider ?? state.currentProvider,
+        currentModel: action.currentModel ?? current?.model ?? state.currentModel,
+        setupRequired: action.setupRequired,
+        setupError: undefined,
+        setupStatus: action.setupRequired ? state.setupStatus : undefined,
+      };
+    }
+
+    case 'SET_SETUP_STATUS':
+      return {
+        ...state,
+        setupStatus: action.status,
+        setupError: action.error,
+        loginUrl: action.loginUrl ?? state.loginUrl,
+      };
+
     case 'SET_CURRENT_MODEL':
       return { ...state, currentModel: action.model };
 
+    case 'SET_CURRENT_PROVIDER': {
+      const provider = state.providers.find((p) => p.name === action.provider);
+      return {
+        ...state,
+        currentProvider: action.provider,
+        currentModel: action.model ?? provider?.model ?? state.currentModel,
+      };
+    }
+
     case 'SET_SESSIONS':
       return { ...state, sessions: action.sessions };
+
+    case 'SET_ACTIVE_SESSION':
+      return {
+        ...state,
+        activeSessionId: action.sessionId,
+        activeProjectHash: action.projectHash,
+      };
 
     // ─── Context files ──────────────────────────────
     case 'ADD_CONTEXT_FILE': {
@@ -169,18 +271,57 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'TOGGLE_HISTORY':
       return { ...state, historyOpen: !state.historyOpen };
 
+    case 'TOGGLE_SETTINGS':
+      return { ...state, settingsOpen: !state.settingsOpen };
+
     case 'LOAD_SESSION_MESSAGES': {
       // Convert daemon message format to our ChatMessage format
-      const messages: ChatMessage[] = action.messages
-        .filter((m: { role: string }) => m.role === 'user' || m.role === 'assistant')
-        .map((m: { role: string; content: string }) => ({
+      const messages: ChatMessage[] = [];
+
+      for (const m of action.messages) {
+        const role = normalizeRole(m.role);
+
+        if (role === 'tool') {
+          const lastAssistant = messages.findLast((msg) => msg.role === 'assistant' && msg.toolCalls?.length);
+          const callId = m.tool_result?.call_id;
+          const output = textFromContent(m.content);
+          if (lastAssistant?.toolCalls && output) {
+            const targetIndex = callId
+              ? lastAssistant.toolCalls.findIndex((tool) => tool.id === callId)
+              : lastAssistant.toolCalls.findIndex((tool) => tool.output === undefined);
+            if (targetIndex >= 0) {
+              lastAssistant.toolCalls[targetIndex] = {
+                ...lastAssistant.toolCalls[targetIndex],
+                output,
+                success: m.tool_result?.success ?? true,
+                status: m.tool_result?.success === false ? 'error' : 'done',
+              };
+            }
+          }
+          continue;
+        }
+
+        if (role !== 'user' && role !== 'assistant') {
+          continue;
+        }
+
+        const toolCalls: ToolCallData[] = (m.tool_calls ?? []).map((tool, index) => ({
+          id: tool.id || `history-tool-${index}`,
+          name: tool.name || 'tool',
+          args: tool.arguments || '',
+          success: true,
+          status: 'done',
+        }));
+
+        messages.push({
           id: nextId(),
-          role: m.role as 'user' | 'assistant',
-          text: m.content || '',
-          toolCalls: [],
+          role,
+          text: textFromContent(m.content),
+          toolCalls,
           streaming: false,
           timestamp: Date.now(),
-        }));
+        });
+      }
       return { ...state, messages };
     }
 
@@ -229,6 +370,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ...state,
         isGenerating: action.generating,
         currentModel: action.currentModel ?? state.currentModel,
+        viewMode: action.viewMode ?? state.viewMode,
+        activeSessionId: action.activeSessionId ?? state.activeSessionId,
       };
 
     default:
