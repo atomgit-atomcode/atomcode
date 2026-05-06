@@ -16,6 +16,7 @@
 pub(crate) mod commands;
 pub(crate) mod file_index;
 pub(crate) mod monitor;
+pub(crate) mod usage_monitor;
 use commands::execute_slash_command;
 
 use std::collections::VecDeque;
@@ -85,6 +86,18 @@ pub struct LoopCtx {
     /// timestamp; startup + `/model` switch bypass the cooldown.
     /// `None` = no check has run yet this session.
     pub monitor_last_check_at: Option<std::time::Instant>,
+    /// CodingPlan token-usage snapshot. Populated by
+    /// `usage_monitor::spawn_check` at startup and after each
+    /// TurnComplete (30s cooldown). Read on every redraw to construct
+    /// the right-aligned usage hint when usage_percent ≥ 80% and the
+    /// current model is on a CodingPlan provider.
+    pub usage_slot: std::sync::Arc<
+        std::sync::Mutex<Option<atomcode_core::coding_plan::types::UsageInfo>>,
+    >,
+    /// Last time `usage_monitor::spawn_check` was invoked. Used to
+    /// enforce `usage_monitor::USAGE_COOLDOWN` on TurnComplete-triggered
+    /// refreshes. `None` = no check has run yet this session.
+    pub usage_last_check_at: Option<std::time::Instant>,
     /// Last-observed timestamp from the shared CodingPlan sync marker
     /// (`~/.atomcode/codingplan_sync.json`). On every user input we
     /// re-read it; a change means ANOTHER atomcode process (e.g. a
@@ -1287,6 +1300,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 ctx.wake_tx.clone(),
             );
         }
+        // Startup usage check (separate cooldown — 30s vs drift's 15min).
+        // Always fires once at startup so the user sees current quota
+        // immediately if they're already over 80%.
+        ctx.usage_last_check_at = Some(std::time::Instant::now());
+        usage_monitor::spawn_check(ctx.usage_slot.clone(), ctx.wake_tx.clone());
     }
 
     // Spinner tick channel — a background task fires a tick every 100ms
@@ -1897,6 +1915,13 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
         *g = None;
     }
     ctx.monitor_last_check_at = None;
+    // Same logic for the usage slot — a cross-process /codingplan
+    // re-sync may also have rotated the quota window. Clear + reset
+    // so the next opportunity fetches fresh.
+    if let Ok(mut g) = ctx.usage_slot.lock() {
+        *g = None;
+    }
+    ctx.usage_last_check_at = None;
 }
 
 fn handle_input(
@@ -3454,6 +3479,24 @@ fn handle_agent_event(
             // find it after a clean exit — the whole point of sessions.
             persist_current_session(ctx, messages);
 
+            // CodingPlan usage refresh — fire after each completed turn
+            // (with cooldown) so the right-aligned hint reflects the
+            // tokens the turn just consumed. Gated to CodingPlan users
+            // only; non-CodingPlan paths skip all network activity.
+            if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                let cooled = ctx
+                    .usage_last_check_at
+                    .map(|t| t.elapsed() >= usage_monitor::USAGE_COOLDOWN)
+                    .unwrap_or(true);
+                if cooled {
+                    ctx.usage_last_check_at = Some(std::time::Instant::now());
+                    usage_monitor::spawn_check(
+                        ctx.usage_slot.clone(),
+                        ctx.wake_tx.clone(),
+                    );
+                }
+            }
+
             // fixissue post-run side effects — only on successful TurnComplete
             // (TurnCancelled / Error arms below clear `fixissue_pending`
             // without posting). Takes the IssueRef out so only this turn's
@@ -3810,10 +3853,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     let no_provider =
         ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none();
     // Priority: no-provider (Warning red) > CodingPlan drift monitor
-    // (both ModelMissing and StaleList render as Warning red — model
-    // list drift is an actionable UX event worth the same visual weight
-    // as "active model gone") > upgrade banner (Info dim).
-    // Only one hint can render at a time (right-aligned on the status row).
+    // (Warning red) > CodingPlan token-usage hint (Info ≥80%, Warning
+    // ≥95%) > upgrade banner (Info dim). Usage outranks upgrade because
+    // ">80% in this rolling window" is more actionable than "new
+    // version available". Only one hint renders at a time (right-aligned
+    // on the status row).
     let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
         Some((
             "no provider · /provider to configure".into(),
@@ -3821,6 +3865,10 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         ))
     } else if let Some(warning) = ctx.monitor_warning.lock().ok().and_then(|g| g.clone()) {
         Some((warning.display_text(), crate::render::HintSeverity::Warning))
+    } else if let Some(usage) =
+        usage_monitor::build_usage_hint(&ctx.usage_slot, &ctx.config.default_provider)
+    {
+        Some(usage)
     } else {
         ctx.update_hint
             .lock()

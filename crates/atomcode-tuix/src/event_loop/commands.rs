@@ -2061,6 +2061,12 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
                     *g = None;
                 }
                 ctx.monitor_last_check_at = None;
+                // Same for usage slot — a fresh /codingplan run may have
+                // rotated the quota window or switched plan tiers.
+                if let Ok(mut g) = ctx.usage_slot.lock() {
+                    *g = None;
+                }
+                ctx.usage_last_check_at = None;
             }
             renderer.render(UiLine::CommandOutput(report.render()));
             renderer.flush();
