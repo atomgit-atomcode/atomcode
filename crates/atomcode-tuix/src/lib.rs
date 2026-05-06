@@ -538,8 +538,39 @@ pub async fn run(
 
     let result = run_loop(ctx, renderer.as_mut()).await;
 
+    // Must shut down the renderer BEFORE re-exec: the alternate screen is
+    // still active and raw mode is on — if we spawn a child while the
+    // terminal is in that state, the new process inherits a garbled TTY.
     renderer.shutdown();
     drop(pipe_reader); // pipe-mode thread exits on next channel send failure
 
-    result
+    // If /upgrade succeeded, the live binary has been replaced on disk.
+    // Re-exec into the new version so the user gets a seamless upgrade
+    // without manually restarting. This mirrors the startup-time upgrade
+    // path in main.rs (apply_pending_upgrade → re_exec_self).
+    //
+    // The exe path comes from `ExitReason::UpgradeRestart { exe }`, which
+    // was captured *before* `replace_binary` renamed the running binary.
+    // On Windows, `std::env::current_exe()` would return the renamed
+    // `.atomcode.rolling` path after the swap, so we MUST use this saved
+    // value instead.
+    if let Ok(event_loop::ExitReason::UpgradeRestart { exe }) = &result {
+        // Set env var so the new process can show a one-time "upgraded" banner
+        // on the welcome screen.
+        std::env::set_var("ATOMCODE_UPGRADED_FROM", format!("v{}", env!("CARGO_PKG_VERSION")));
+        match atomcode_core::self_update::re_exec_self(Some(exe)) {
+            Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
+            Err(e) => {
+                // Re-exec failed. The upgrade is on disk, so the user just
+                // needs to start atomcode again — don't treat this as fatal.
+                eprintln!(
+                    "Upgrade applied but re-exec failed ({}). The new version will be used on the next launch.",
+                    e
+                );
+                std::env::remove_var("ATOMCODE_UPGRADED_FROM");
+            }
+        }
+    }
+
+    result.map(|_| ())
 }

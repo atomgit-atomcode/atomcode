@@ -1060,7 +1060,25 @@ impl App {
     }
 }
 
-pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
+/// Why the event loop exited. Callers (currently just `atomcode-tuix::run`)
+/// use this to decide whether to re-exec into the new binary after an
+/// in-place upgrade or just terminate normally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitReason {
+    /// Normal termination (user quit, Ctrl+C, etc.).
+    Normal,
+    /// `/upgrade` or `/upgrade rollback` succeeded; the live binary has been
+    /// replaced and the caller should `re_exec_self` to start the new version.
+    ///
+    /// Carries the *original* exe path (e.g. `atomcode.exe`) captured
+    /// **before** `replace_binary` renamed the running binary. On Windows,
+    /// `std::env::current_exe()` returns the renamed path after the swap,
+    /// so callers MUST use this path for `re_exec_self` instead of
+    /// `current_exe()`.
+    UpgradeRestart { exe: std::path::PathBuf },
+}
+
+pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
 
     crate::tuix_trace!(
@@ -1311,7 +1329,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     // True once Done fired successfully — the loop exits after the
     // current pending message finishes so the user sees the success
     // line before the TUI shuts down.
-    let mut upgrade_done = false;
+    let mut upgrade_done: Option<std::path::PathBuf> = None;
 
     // DEVIATION from plan:
     // 1. plan uses `SignalKind::terminal_stop()` which does not exist in tokio 1.x.
@@ -1501,7 +1519,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
-                if upgrade_done { break; }
+                if upgrade_done.is_some() { break; }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
@@ -1745,7 +1763,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
-                if upgrade_done { break; }
+                if upgrade_done.is_some() { break; }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
@@ -1807,7 +1825,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     // beyond the interval timer.
     spin_task.abort();
     let _ = ctx.history.save();
-    Ok(())
+
+    // Determine the exit reason. If the upgrade_done flag was set,
+    // the loop exited because /upgrade (or /upgrade rollback) succeeded
+    // and the live binary has been replaced — the caller should re-exec.
+    if let Some(exe) = upgrade_done {
+        Ok(ExitReason::UpgradeRestart { exe })
+    } else {
+        Ok(ExitReason::Normal)
+    }
 }
 
 /// If another atomcode process just ran `/codingplan` (i.e. the shared
@@ -3016,7 +3042,7 @@ pub(super) fn handle_plugin_job_event(
 pub(super) fn handle_upgrade_event(
     ev: atomcode_core::self_update::UpgradeEvent,
     last_pct: &mut i32,
-    done: &mut bool,
+    done: &mut Option<std::path::PathBuf>,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
@@ -3051,9 +3077,9 @@ pub(super) fn handle_upgrade_event(
         UpgradeEvent::Replacing => {
             renderer.render(UiLine::CommandOutput("  正在替换二进制文件\n".into()));
         }
-        UpgradeEvent::Done { version, backup } => {
+        UpgradeEvent::Done { version, backup, exe } => {
             renderer.render(UiLine::CommandOutput(format!(
-                "\n✓ 已升级到 {}（旧版本保留为 {}）\n  请退出后重新运行 `atomcode` 以加载新版本。\n",
+                "\n✓ 已升级到 {}（旧版本保留为 {}）\n  正在重启新版本...\n",
                 version,
                 backup.display()
             )));
@@ -3062,7 +3088,10 @@ pub(super) fn handle_upgrade_event(
             if let Ok(mut g) = ctx.update_hint.lock() {
                 *g = None;
             }
-            *done = true;
+            // Store the *original* exe path so `re_exec_self` uses it
+            // instead of `current_exe()` (which on Windows returns the
+            // renamed `.atomcode.rolling` after `replace_binary`).
+            *done = Some(exe);
             // Tell the agent to shut down so the loop exits cleanly.
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
@@ -3071,11 +3100,11 @@ pub(super) fn handle_upgrade_event(
         }
         UpgradeEvent::RolledBack { exe, backup } => {
             renderer.render(UiLine::CommandOutput(format!(
-                "\n✓ 已回滚。当前二进制: {}；另一版本保存在 {}\n  请退出后重新运行 `atomcode` 加载回滚版本。\n",
+                "\n✓ 已回滚。当前二进制: {}；另一版本保存在 {}\n  正在重启回滚版本...\n",
                 exe.display(),
                 backup.display()
             )));
-            *done = true;
+            *done = Some(exe);
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
     }
