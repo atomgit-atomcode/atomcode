@@ -237,19 +237,36 @@ impl Tool for EditFileTool {
                         "description": "Replace ALL occurrences (default: first only). Only for text mode."
                     }
                 },
-                "required": ["file_path", "new_string"]
+                // Only file_path is universally required. Mode-specific
+                // requirements (text/line/edits/symbol) are enforced in
+                // validate_args() below — encoding them in `required` is
+                // a lie because edits-mode doesn't need top-level
+                // new_string, and that lie used to bounce legitimate
+                // edits-mode calls.
+                "required": ["file_path"]
             }),
         }
     }
 
     fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
+        // Stage 1: structural diagnostic — list provided keys, name what's
+        // missing, give a copy-pasteable example. Replaces the raw serde
+        // "line 1 column N" error that weak models read as a positional-
+        // arg complaint.
+        super::diagnose_args(
+            "edit_file",
+            args,
+            &[&["file_path"]],
+            "edit_file({\"file_path\": \"<abs>\", \"old_string\": \"<old>\", \"new_string\": \"<new>\"}) \
+             — text mode; or use start_line+end_line+new_string for line mode",
+        )?;
         let parsed: EditFileArgs = serde_json::from_str(args).map_err(|e| {
             format!(
-                "{} (could not parse edit_file arguments; `file_path` is required and at least one edit mode must be present)",
-                e
+                "edit_file: {e}. Check that file_path is a string, line numbers are integers, \
+                 and old_string/new_string are strings."
             )
         })?;
-        // Semantic gate: edit_file is a multi-mode tool — accepts
+        // Stage 2: semantic gate — edit_file is a multi-mode tool. Accepts
         // (old_string + new_string) OR (start_line + end_line +
         // new_string) OR (edits array) OR (symbol + new_string). A call
         // with only `file_path` is a truncated/half-formed payload that
@@ -317,7 +334,34 @@ impl Tool for EditFileTool {
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        let parsed: EditFileArgs = serde_json::from_str(args)?;
+        // Defense-in-depth: validate_args runs at the runner gate, but if
+        // it's bypassed we surface the same model-friendly diagnostic
+        // instead of bubbling a raw serde error up the call stack.
+        if let Err(msg) = super::diagnose_args(
+            "edit_file",
+            args,
+            &[&["file_path"]],
+            "edit_file({\"file_path\": \"<abs>\", \"old_string\": \"<old>\", \"new_string\": \"<new>\"})",
+        ) {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: msg,
+                success: false,
+            });
+        }
+        let parsed: EditFileArgs = match serde_json::from_str(args) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!(
+                        "edit_file: {e}. Check that file_path is a string, line numbers are \
+                         integers, and old_string/new_string are strings."
+                    ),
+                    success: false,
+                });
+            }
+        };
         let working_dir = ctx.working_dir.read().await.clone();
         let file_path = match super::inspect_path_access(&parsed.file_path, &working_dir) {
             Ok(access) => access.path,
