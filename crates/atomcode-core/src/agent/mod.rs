@@ -1915,34 +1915,32 @@ impl AgentLoop {
 
                     if (is_messages_illegal || is_context_overflow) && self.retry_count < 2 {
                         self.retry_count += 1;
-                        // Try compression first (preserve semantics), fall back to truncation.
                         let sys_prompt = self.build_system_prompt();
-                        self.maybe_compress_history(&sys_prompt).await;
-                        // If compression didn't help enough, truncate as last resort.
-                        // Two shots: one 700K-token mess rarely sheds enough in
-                        // a single compression + 4-msg truncate.
-                        let len = self.conversation.messages.len();
-                        if len > 10 {
-                            self.conversation.messages.truncate(len - 4);
-                            // Bypassing `add_*` mutates `messages` directly, so
-                            // `turn_tracker` now points past the end of the
-                            // message list (last turn's start_idx + msg_count
-                            // can exceed messages.len()). Downstream
-                            // `build_messages` clamps via .min() so we don't
-                            // panic, but the drop-oldest loop uses wrong
-                            // boundaries. Rebuild the tracker from the
-                            // surviving messages — other truncation sites
-                            // (cancel_current_turn, ReloadConfig clear) do
-                            // the equivalent sync inline.
-                            self.conversation.turn_tracker =
-                                crate::conversation::turn::TurnTracker::rebuild(
-                                    &self.conversation.messages,
-                                );
-                        }
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            "\n[Context overflow — compressed history and retrying...]\n"
-                                .to_string(),
-                        ));
+                        // Auto-discover the proxy's actually-enforced limit
+                        // from the error body. Self-built proxies for
+                        // open-weight models often enforce far less than
+                        // the configured ctx_window — without parsing the
+                        // rejection we'd compact toward the wrong target.
+                        let limit = extract_provider_ctx_limit(&e)
+                            .unwrap_or_else(|| self.ctx.ctx_window());
+                        // 5K safety buffer — leaves room for the streaming
+                        // response and one round of tool results before the
+                        // next compact would be needed.
+                        let target = limit.saturating_sub(5_000);
+                        let recovered = self
+                            .emergency_compact_to_target(target, &sys_prompt)
+                            .await;
+                        let msg = if recovered {
+                            "\n[Context overflow — recovered via layered compact, retrying...]\n"
+                                .to_string()
+                        } else {
+                            format!(
+                                "\n[Context overflow — compacted toward {}T but still over, \
+                                 retrying anyway...]\n",
+                                target
+                            )
+                        };
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
                         continue;
                     } else if is_rate_limited && self.retry_count < 5 {
                         self.retry_count += 1;
@@ -2153,6 +2151,56 @@ impl AgentLoop {
                 removed_messages,
             }
         }
+    }
+
+    /// D2 emergency compact — layered, measured, never combines destructive
+    /// ops. Replaces the previous "LLM-compress + blind truncate(len-4)"
+    /// path that destroyed last-turn context (datalog atomgr-2d99b47d/
+    /// 2026-05-06_08-43-12: 65K → 8516 tokens because compression THEN a
+    /// 4-message truncate ran back-to-back, and the truncate dropped
+    /// exactly the recent file reads the user needed for "继续").
+    ///
+    /// Each tier checks budget against `target` and breaks at the first
+    /// sufficient tier. Returns true if any tier reached the target.
+    ///
+    /// Tiers (least → most destructive):
+    /// 1. Collapse old tool_results (keep last 3 turns full).
+    /// 2. LLM-summarize older turns into cold zone.
+    /// 3. Hard token-driven truncate (drops oldest until under target,
+    ///    snapping to safe boundaries; the last user message is sacred).
+    async fn emergency_compact_to_target(
+        &mut self,
+        target_tokens: usize,
+        system_prompt: &str,
+    ) -> bool {
+        let sys_tokens = system_prompt.len() / 4 + 4;
+        let estimate = |conv: &Conversation| -> usize {
+            sys_tokens + conv.messages.iter().map(|m| m.estimate_tokens()).sum::<usize>()
+        };
+
+        if estimate(&self.conversation) <= target_tokens {
+            return true;
+        }
+
+        // Tier 1: collapse heavy tool results in older turns.
+        collapse_old_tool_results(&mut self.conversation, /* keep_recent_turns */ 3);
+        if estimate(&self.conversation) <= target_tokens {
+            return true;
+        }
+
+        // Tier 2: LLM-summarize older turns into the cold zone. This is
+        // the most expensive tier (it makes a network round trip), so
+        // we only reach it after Tier 1 already failed.
+        self.maybe_compress_history(system_prompt).await;
+        if estimate(&self.conversation) <= target_tokens {
+            return true;
+        }
+
+        // Tier 3: hard truncate to fit. Token-driven, not message-count
+        // driven. The previous code did `truncate(len - 4)` blindly
+        // which is what produced the 8516-token catastrophe.
+        hard_truncate_to_target(&mut self.conversation, target_tokens, sys_tokens);
+        estimate(&self.conversation) <= target_tokens
     }
 
     /// Manual `/compact` entry point. Mechanical only — reuses the active
@@ -2531,6 +2579,112 @@ fn reload_should_clear_conversation(
     }
 }
 
+/// D2 Tier 1: replace the `output` of every ToolResult in turns older
+/// than the last `keep_recent_turns` with a one-line stub. Cheapest
+/// destructive tier — preserves the conversation skeleton (assistant
+/// text, tool-call shapes, paired result IDs) so the model can still
+/// reason about *what was attempted*, just not the heavy outputs.
+///
+/// The previous emergency path (`truncate(len - 4)`) destroyed the
+/// skeleton too. Keeping it intact is what lets the model resume
+/// after compaction without re-exploring.
+fn collapse_old_tool_results(
+    conv: &mut crate::conversation::Conversation,
+    keep_recent_turns: usize,
+) {
+    use crate::conversation::message::MessageContent;
+    let turns = &conv.turn_tracker.turns;
+    if turns.len() <= keep_recent_turns {
+        return;
+    }
+    let cutoff_turn = turns.len() - keep_recent_turns;
+    let cutoff_msg = turns[cutoff_turn].start_idx.min(conv.messages.len());
+    for i in 0..cutoff_msg {
+        if let MessageContent::ToolResult(ref tr) = conv.messages[i].content {
+            // Sanity floor: don't bother collapsing already-tiny results
+            // (cheap to keep, also avoids the stub being heavier than
+            // the original on terse outputs).
+            if tr.output.len() < 200 {
+                continue;
+            }
+            let stub = crate::tool::ToolResult {
+                call_id: tr.call_id.clone(),
+                output: format!(
+                    "[older tool result collapsed by emergency compact ({} chars dropped)]",
+                    tr.output.len()
+                ),
+                success: tr.success,
+            };
+            conv.messages[i].content = MessageContent::ToolResult(stub);
+        }
+    }
+}
+
+/// D2 Tier 3: drop oldest messages until total tokens (incl. system) <=
+/// `target_tokens`. Token-driven — never drops a fixed number of
+/// messages, since that's how `truncate(len - 4)` corrupted state.
+///
+/// Sacred invariants (won't violate even if it means staying over budget):
+/// 1. The last `User` message is kept (current task anchor).
+/// 2. The drop boundary snaps to a turn boundary so we never split a
+///    `tool_call` from its paired `tool_result`.
+fn hard_truncate_to_target(
+    conv: &mut crate::conversation::Conversation,
+    target_tokens: usize,
+    sys_tokens: usize,
+) {
+    use crate::conversation::message::{MessageContent, Role};
+    if conv.messages.is_empty() {
+        return;
+    }
+    let total_budget = target_tokens.saturating_sub(sys_tokens);
+
+    // Find the last User message — it must survive.
+    let last_user_idx = conv
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| m.role == Role::User)
+        .map(|(i, _)| i);
+
+    let mut kept_tokens = 0usize;
+    let mut keep_from = conv.messages.len();
+    for i in (0..conv.messages.len()).rev() {
+        let mt = conv.messages[i].estimate_tokens();
+        // Always keep the last user message regardless of budget.
+        let is_sacred = Some(i) == last_user_idx;
+        if !is_sacred && kept_tokens + mt > total_budget && keep_from < conv.messages.len() {
+            break;
+        }
+        kept_tokens += mt;
+        keep_from = i;
+    }
+
+    // Snap forward: don't start at a ToolResult orphan (its paired
+    // assistant tool_call would be in the dropped section). Keep
+    // walking forward until we land on a User or AssistantText message.
+    while keep_from < conv.messages.len() {
+        match &conv.messages[keep_from].content {
+            MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
+                keep_from += 1;
+            }
+            _ => break,
+        }
+    }
+    // Don't skip past the sacred last-user index even if the boundary
+    // walker would have taken us there — better to ship one stub
+    // tool_result than to drop the user msg.
+    if let Some(lu) = last_user_idx {
+        keep_from = keep_from.min(lu);
+    }
+
+    if keep_from > 0 {
+        conv.messages.drain(0..keep_from);
+        conv.turn_tracker = crate::conversation::turn::TurnTracker::rebuild(&conv.messages);
+    }
+}
+
 /// True when an upstream API error string indicates the request exceeded
 /// the model's context-length budget. Covers OpenRouter's verbose 400
 /// message, OpenAI's `context_length_exceeded` code, and Anthropic's
@@ -2543,6 +2697,49 @@ fn is_context_overflow_error(e: &str) -> bool {
         || e.contains("maximum context")
         || e.contains("prompt is too long")
         || e.contains("reduce the length")
+}
+
+/// Extract the provider's actually-enforced context limit from a 400/
+/// overflow error message, if it's discoverable. Used by D2 emergency
+/// compaction so we compact toward the *real* limit (proxy-enforced)
+/// rather than the configured ctx_window — which can be much larger
+/// than what the upstream actually accepts.
+///
+/// Self-built proxies for open-weight models are the worst offender:
+/// the model is nominally 128K but the proxy enforces 64K, and the
+/// framework can't know that without parsing the rejection.
+///
+/// Recognised shapes (case-sensitive, all observed in real datalogs):
+/// - OpenAI / GLM proxy: `maximum context length is 65536 tokens`
+/// - OpenRouter: `This endpoint's maximum context length is 200000 tokens`
+/// - Generic: `context length of 32768`
+/// - Anthropic-ish: `prompt is too long: 200000 tokens > 200000 maximum`
+fn extract_provider_ctx_limit(e: &str) -> Option<usize> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // Three anchors, any of them satisfies. Number captured is the
+        // smallest plausible limit token count (≥ 1024 — drop very small
+        // numbers that appear in unrelated parts of error bodies).
+        regex::Regex::new(
+            r"(?:maximum context length (?:is|of)|context length of|context length limit (?:is|of)|tokens? > (?P<rhs>\d+))\s*(?P<lhs>\d+)?",
+        )
+        .expect("valid regex")
+    });
+    for caps in re.captures_iter(e) {
+        let n = caps
+            .name("lhs")
+            .or_else(|| caps.name("rhs"))
+            .and_then(|m| m.as_str().parse::<usize>().ok());
+        // Filter out tiny numbers that aren't real ctx limits — every
+        // realistic context window is at least a few thousand tokens.
+        if let Some(n) = n {
+            if n >= 1024 {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn is_rate_limited_error(e: &str) -> bool {
@@ -2676,8 +2873,9 @@ fn fmt_k_tokens(t: usize) -> String {
 #[cfg(test)]
 mod classifier_tests {
     use super::{
-        is_auth_error, is_context_overflow_error, is_rate_limited_error, public_error_message,
-        public_error_reason, reload_should_clear_conversation,
+        extract_provider_ctx_limit, is_auth_error, is_context_overflow_error,
+        is_rate_limited_error, public_error_message, public_error_reason,
+        reload_should_clear_conversation,
     };
 
     // ── reload_should_clear_conversation ──
@@ -2769,6 +2967,189 @@ mod classifier_tests {
     #[test]
     fn auth_error_is_not_overflow() {
         assert!(!is_context_overflow_error("401 Unauthorized"));
+    }
+
+    #[test]
+    fn extract_glm_proxy_ctx_limit() {
+        // From the actual datalog that motivated D2.
+        let msg = "API error (400 Bad Request) at `http://115.120.18.212:18005/v1/chat/completions`: \
+                   {\"error\":{\"message\":\"This model's maximum context length is 65536 tokens. \
+                   However, you requested 15210 output tokens and your prompt contains at least \
+                   50327 input tokens, for a total of at least 65537 tokens.\"}}";
+        assert_eq!(extract_provider_ctx_limit(msg), Some(65536));
+    }
+
+    #[test]
+    fn extract_openrouter_ctx_limit() {
+        let msg = "API error (400): This endpoint's maximum context length is 204800 tokens. \
+                   However, you requested about 745279 tokens";
+        assert_eq!(extract_provider_ctx_limit(msg), Some(204800));
+    }
+
+    #[test]
+    fn extract_anthropic_prompt_too_long() {
+        let msg = "prompt is too long: 200000 tokens > 200000 maximum";
+        assert_eq!(extract_provider_ctx_limit(msg), Some(200000));
+    }
+
+    #[test]
+    fn extract_no_limit_returns_none_for_non_overflow_errors() {
+        assert_eq!(extract_provider_ctx_limit("429 Too Many Requests"), None);
+        assert_eq!(extract_provider_ctx_limit("401 Unauthorized"), None);
+        assert_eq!(extract_provider_ctx_limit(""), None);
+    }
+
+    #[test]
+    fn extract_filters_out_implausibly_small_numbers() {
+        // Status codes and small ints in error bodies must not be
+        // mistaken for context limits.
+        let msg = "Error 400: maximum context length is 200 tokens";
+        assert_eq!(extract_provider_ctx_limit(msg), None);
+    }
+
+    // ── D2 emergency compact tier helpers ──
+
+    use crate::conversation::{Conversation, message::MessageContent};
+    use crate::tool::{ToolCall, ToolResult};
+
+    /// Build a synthetic conversation with `n_turns` turns, each carrying
+    /// one user message + one assistant tool_call + one tool_result of
+    /// `result_size` chars.
+    fn build_conv(n_turns: usize, result_size: usize) -> Conversation {
+        let mut conv = Conversation::new();
+        for t in 0..n_turns {
+            conv.add_user_message(&format!("turn {} request", t));
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: format!("call_{}", t),
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"/x"}"#.into(),
+                }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", t),
+                output: "x".repeat(result_size),
+                success: true,
+            });
+        }
+        conv
+    }
+
+    fn count_collapsed_results(conv: &Conversation) -> usize {
+        conv.messages
+            .iter()
+            .filter(|m| match &m.content {
+                MessageContent::ToolResult(tr) => tr.output.starts_with("[older tool result"),
+                _ => false,
+            })
+            .count()
+    }
+
+    #[test]
+    fn collapse_keeps_last_n_turns_full() {
+        let mut conv = build_conv(5, 1024);
+        super::collapse_old_tool_results(&mut conv, 2);
+        // 5 turns, keep last 2 → first 3 should have stubbed tool_results.
+        assert_eq!(count_collapsed_results(&conv), 3);
+    }
+
+    #[test]
+    fn collapse_skips_already_tiny_results() {
+        // Tool results under 200 chars aren't worth collapsing — the stub
+        // would weigh more than the original.
+        let mut conv = build_conv(5, 50);
+        super::collapse_old_tool_results(&mut conv, 2);
+        assert_eq!(count_collapsed_results(&conv), 0);
+    }
+
+    #[test]
+    fn collapse_no_op_when_under_keep_threshold() {
+        let mut conv = build_conv(2, 1024);
+        super::collapse_old_tool_results(&mut conv, 3);
+        // Only 2 turns total, keep 3 — nothing to collapse.
+        assert_eq!(count_collapsed_results(&conv), 0);
+    }
+
+    #[test]
+    fn collapse_preserves_call_id_and_success_flag() {
+        let mut conv = build_conv(3, 1024);
+        super::collapse_old_tool_results(&mut conv, 1);
+        // Verify call_0's tool_result still has the right call_id even
+        // though its body was stubbed — preserves tool_call/tool_result
+        // pairing for OpenAI-style providers.
+        let tr = conv
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(tr) if tr.call_id == "call_0" => Some(tr),
+                _ => None,
+            })
+            .expect("call_0 result must still exist");
+        assert!(tr.output.starts_with("[older tool result"));
+        assert!(tr.success);
+    }
+
+    #[test]
+    fn hard_truncate_keeps_last_user_message_even_under_budget() {
+        // Tight budget that forces aggressive drops; sacred invariant
+        // says the last user msg must survive regardless. This is the
+        // structural guarantee the previous `truncate(len-4)` code
+        // *violated*, producing the 8516-token catastrophe.
+        let mut conv = build_conv(10, 2048);
+        super::hard_truncate_to_target(&mut conv, /* target */ 100, /* sys */ 50);
+        let has_user = conv
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, crate::conversation::message::Role::User));
+        assert!(has_user, "last user message must survive even at tight budget");
+    }
+
+    #[test]
+    fn hard_truncate_does_not_start_with_orphan_tool_result() {
+        // After truncate the first surviving message must NOT be a
+        // ToolResult — that would orphan it from its paired assistant
+        // tool_call, which OpenAI-style APIs reject with 400.
+        let mut conv = build_conv(8, 1024);
+        super::hard_truncate_to_target(&mut conv, /* target */ 2000, /* sys */ 100);
+        if let Some(first) = conv.messages.first() {
+            assert!(
+                !matches!(
+                    first.content,
+                    MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_)
+                ),
+                "first surviving message must not be an orphan tool_result"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_truncate_no_op_when_already_under_target() {
+        let mut conv = build_conv(3, 100);
+        let before = conv.messages.len();
+        super::hard_truncate_to_target(&mut conv, /* target */ 100_000, /* sys */ 100);
+        assert_eq!(conv.messages.len(), before);
+    }
+
+    #[test]
+    fn hard_truncate_rebuilds_turn_tracker() {
+        // After draining messages from the front, the turn_tracker must
+        // be rebuilt so its Turn entries point at valid indices. Without
+        // this, the next build_messages crashes or silently emits wrong
+        // boundaries (the bug the old `truncate(len-4)` path also
+        // patched, but inconsistently — see the rebuild call there).
+        let mut conv = build_conv(10, 2048);
+        super::hard_truncate_to_target(&mut conv, /* target */ 1000, /* sys */ 100);
+        // Every turn's start_idx must be a valid index into messages.
+        for t in &conv.turn_tracker.turns {
+            assert!(
+                t.start_idx <= conv.messages.len(),
+                "turn start_idx {} out of bounds (messages.len()={})",
+                t.start_idx,
+                conv.messages.len()
+            );
+        }
     }
 
     #[test]
