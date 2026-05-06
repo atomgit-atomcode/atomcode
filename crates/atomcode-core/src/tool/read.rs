@@ -532,15 +532,67 @@ impl Tool for ReadFileTool {
             ));
         }
 
+        // D3 step 3: full reads of LARGE files push their raw content
+        // into the shared FileStore and return a pointer + preview.
+        // Subsequent regions are fetched via peek_file (zero disk hit,
+        // not duplicated in conversation token by token). Partial
+        // range reads (model gave offset/limit) skip this branch and
+        // return the full inline output as before — that path is
+        // already tightly scoped, store would just add overhead.
+        const LARGE_FILE_LINE_THRESHOLD: usize = 50;
+        const PREVIEW_LINES: usize = 50;
+        let final_output = if returned_all && total_lines > LARGE_FILE_LINE_THRESHOLD {
+            let store_id = if let Some(mtime) = disk_mtime {
+                ctx.file_store
+                    .write()
+                    .await
+                    .insert(path.clone(), content.clone(), mtime)
+            } else {
+                // No mtime → can't safely cache (stale check needs it).
+                // Fall through to inline behaviour for this read.
+                String::new()
+            };
+            if !store_id.is_empty() {
+                let preview_end = PREVIEW_LINES.min(total_lines);
+                let preview: String = lines[..preview_end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| format!("{:>4}| {}", i + 1, line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let display_name = std::path::Path::new(&parsed.file_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| parsed.file_path.clone());
+                let size_kb = content.len() as f64 / 1024.0;
+                let remaining = total_lines.saturating_sub(preview_end);
+                format!(
+                    "[Read {} ({} lines, {:.1} KB) → store_id={}]\n\
+                     [Preview L1-{}:]\n{}\n\n\
+                     [Remaining {} lines cached locally — fetch any region with \
+                     peek_file({{\"store_id\":\"{}\",\"lines\":\"X-Y\"}}). \
+                     peek_file is free (no disk hit, no model round trip for \
+                     duplicate content).]",
+                    display_name, total_lines, size_kb, store_id,
+                    preview_end, preview,
+                    remaining, store_id,
+                )
+            } else {
+                output
+            }
+        } else {
+            output
+        };
+
         if let Some(mtime) = disk_mtime {
             ctx.read_cache
                 .write()
                 .await
-                .insert(cache_key, (mtime, output.clone(), 1));
+                .insert(cache_key, (mtime, final_output.clone(), 1));
         }
         Ok(ToolResult {
             call_id: String::new(),
-            output,
+            output: final_output,
             success: true,
         })
     }
@@ -1003,6 +1055,205 @@ mod tests {
         assert!(
             !r.output.contains("absolute path"),
             "absolute-input path must NOT show the relative-path hint. output:\n{}",
+            r.output
+        );
+    }
+
+    // ── D3 FileStore integration ────────────────────────────────────
+
+    /// Helper: write a file with `n_lines` lines (each `line N`) and
+    /// return its absolute path. Use file sizes large enough to trip
+    /// the FileStore threshold (50 lines).
+    fn write_n_line_file(dir: &TempDir, name: &str, n_lines: usize) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let body: String = (1..=n_lines).map(|i| format!("line {}\n", i)).collect();
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Large full reads return a pointer + preview, not the entire
+    /// inline content — the body lives in FileStore for cheap follow-up
+    /// peek_file calls.
+    #[tokio::test]
+    async fn d3_full_read_of_large_file_returns_pointer_and_preview() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(
+            r.output.contains("store_id=fs_"),
+            "must announce store_id; got:\n{}",
+            r.output
+        );
+        assert!(
+            r.output.contains("Preview L1-50:"),
+            "must include preview header; got:\n{}",
+            r.output
+        );
+        assert!(
+            r.output.contains("peek_file"),
+            "must point the model at peek_file; got:\n{}",
+            r.output
+        );
+        // Lines 51-200 must NOT be inlined — that's the whole point of
+        // the indirection.
+        assert!(
+            !r.output.contains("line 100"),
+            "preview should stop at line 50; line 100 must not appear:\n{}",
+            r.output
+        );
+        // Store should have one entry now.
+        assert_eq!(ctx.file_store.read().await.len(), 1);
+    }
+
+    /// Small files (≤ 50 lines) bypass the store entirely — pointer
+    /// indirection would just add overhead with no caching upside.
+    #[tokio::test]
+    async fn d3_small_file_skips_store_and_inlines() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "small.rs", 10);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(
+            !r.output.contains("store_id="),
+            "small file must inline, not point at store; got:\n{}",
+            r.output
+        );
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            0,
+            "small file must not push into store"
+        );
+    }
+
+    /// Range reads (offset/limit) bypass the store — the model is
+    /// already asking for a specific slice, no need to cache the whole
+    /// file just to serve their narrow request.
+    #[tokio::test]
+    async fn d3_range_read_skips_store() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = format!(
+            r#"{{"file_path":"{}","offset":50,"limit":20}}"#,
+            path.display()
+        );
+        let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(
+            !r.output.contains("store_id="),
+            "range read must NOT trip the store branch:\n{}",
+            r.output
+        );
+        assert_eq!(ctx.file_store.read().await.len(), 0);
+    }
+
+    /// Full lifecycle: read → peek (hit) → edit → peek (stale).
+    /// The atomgr-session bug class this prevents: after editing a
+    /// file, peek_file would otherwise serve pre-edit bytes — model
+    /// reasons against a snapshot that no longer matches disk.
+    #[tokio::test]
+    async fn d3_edit_invalidates_store_and_peek_reports_stale() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+
+        // Step 1: full read populates the store.
+        let read_args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r1 = ReadFileTool.execute(&read_args, &ctx).await.unwrap();
+        assert!(r1.success);
+        // Extract the store_id from the result.
+        let store_id = r1
+            .output
+            .lines()
+            .find_map(|l| {
+                l.find("store_id=fs_")
+                    .map(|i| l[i + "store_id=".len()..].split(']').next().unwrap().to_string())
+            })
+            .expect("store_id present in read result");
+        assert!(store_id.starts_with("fs_"));
+
+        // Step 2: peek before edit succeeds.
+        let peek_args = format!(
+            r#"{{"store_id":"{}","lines":"100-105"}}"#,
+            store_id
+        );
+        let p1 = crate::tool::peek::PeekFileTool
+            .execute(&peek_args, &ctx)
+            .await
+            .unwrap();
+        assert!(p1.success, "peek before edit must succeed; got:\n{}", p1.output);
+        assert!(p1.output.contains("line 100"));
+
+        // Step 3: edit invalidates the store.
+        let edit_args = format!(
+            r#"{{"file_path":"{}","old_string":"line 1\n","new_string":"LINE 1\n"}}"#,
+            path.display()
+        );
+        let e = crate::tool::edit::EditFileTool
+            .execute(&edit_args, &ctx)
+            .await
+            .unwrap();
+        assert!(e.success, "edit must succeed; got:\n{}", e.output);
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            0,
+            "edit must invalidate the store entry"
+        );
+
+        // Step 4: peek with the now-orphan store_id returns a friendly
+        // recovery hint, not pre-edit content.
+        let p2 = crate::tool::peek::PeekFileTool
+            .execute(&peek_args, &ctx)
+            .await
+            .unwrap();
+        assert!(!p2.success, "peek after edit must fail (stale); got:\n{}", p2.output);
+        assert!(
+            p2.output.contains("read_file"),
+            "stale message must point at re-read; got:\n{}",
+            p2.output
+        );
+    }
+
+    /// Re-reading the same large file replaces (not duplicates) the
+    /// store entry. The store_id changes only if content changed.
+    #[tokio::test]
+    async fn d3_reread_unchanged_file_reuses_store_id() {
+        let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r1 = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        // The READ cache will short-circuit the second read to the
+        // exact same output, so we extract id from r1 only — but the
+        // FileStore must still have only one entry, not two.
+        assert!(r1.success);
+        let _ = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            1,
+            "second read of identical file must not duplicate store entry"
+        );
+    }
+
+    /// peek_file with an unknown id returns a friendly error pointing
+    /// at re-read, not a panic or raw error string.
+    #[tokio::test]
+    async fn d3_peek_unknown_store_id_recovers_gracefully() {
+        let dir = TempDir::new().unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let r = crate::tool::peek::PeekFileTool
+            .execute(r#"{"store_id":"fs_deadbeef","lines":"1-5"}"#, &ctx)
+            .await
+            .unwrap();
+        assert!(!r.success);
+        assert!(
+            r.output.contains("Re-issue read_file"),
+            "must point the model at recovery; got:\n{}",
             r.output
         );
     }

@@ -116,9 +116,24 @@ async fn validate_write_check(
 
     atomic_write(file_path, &validated.fixed_content).await?;
 
+    // Canonicalize once for downstream tools that key by absolute path
+    // (FileStore, LSP). `file_path` here may be the model's
+    // raw-as-supplied string — e.g. on macOS that's `/var/folders/...`
+    // while FileStore stored the symlink-resolved `/private/var/...`.
+    // Without this normalization, FileStore's `invalidate(raw_path)`
+    // is a silent no-op and a stale `store_id` keeps serving pre-edit
+    // bytes to the next peek_file call.
+    let raw_path = std::path::Path::new(file_path);
+    let canon_path = std::fs::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
+
     // Notify LSP that file changed (if LSP is enabled).
-    let path = std::path::Path::new(file_path);
-    ctx.notify_lsp_file_changed(path, &validated.fixed_content).await;
+    ctx.notify_lsp_file_changed(&canon_path, &validated.fixed_content)
+        .await;
+    // D3: drop any FileStore entry for this path. peek_file against the
+    // pre-edit store_id will return a "stale" hint pointing at re-read,
+    // ensuring the model never operates on a snapshot that no longer
+    // matches disk after its own edit.
+    ctx.file_store.write().await.invalidate(&canon_path);
 
     // 4. Post-write syntax check (needs file on disk)
     let syntax_warn = auto_fix::post_edit_syntax_check(file_path).await;

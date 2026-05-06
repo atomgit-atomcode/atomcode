@@ -175,6 +175,13 @@ impl Tool for WriteFileTool {
         let bytes = parsed.content.len();
         tokio::fs::write(&path, &parsed.content).await?;
 
+        // D3: drop any FileStore entry for this path. The next peek_file
+        // against the old store_id will report "stale" and route the
+        // model toward a fresh read_file. Without this invalidation a
+        // peek_file could hand the model pre-write content that no
+        // longer matches what just landed on disk.
+        ctx.file_store.write().await.invalidate(&path);
+
         // Notify LSP that file changed (if LSP is enabled).
         ctx.notify_lsp_file_changed(&path, &parsed.content).await;
 

@@ -1710,8 +1710,8 @@ async fn process_chat_request(
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
-        read::ReadFileTool, search_replace::SearchReplaceTool, web_fetch::WebFetchTool,
-        web_search::WebSearchTool, write::WriteFileTool,
+        peek::PeekFileTool, read::ReadFileTool, search_replace::SearchReplaceTool,
+        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
     };
     // Load config
     let config_path = Config::default_path();
@@ -1788,6 +1788,7 @@ async fn process_chat_request(
 
     if enabled("read_file") {
         tool_registry.register_sync(Box::new(ReadFileTool));
+        tool_registry.register_sync(Box::new(PeekFileTool));
     }
     if enabled("write_file") {
         tool_registry.register_sync(Box::new(WriteFileTool));
