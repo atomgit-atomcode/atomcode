@@ -121,6 +121,22 @@ impl TurnStopReason {
     }
 }
 
+/// One descriptor per sub-agent in a `SubAgentDispatchStart` batch.
+/// Mirrored 1:1 with the `tasks` vector built in `parallel_edit::execute`
+/// so callers can reuse the index across the lifecycle events.
+#[derive(Debug, Clone)]
+pub struct SubAgentTaskInfo {
+    /// Workspace-relative file path the sub-agent will edit. Renderer
+    /// shows this in full (not basename-only) so multi-component paths
+    /// like `src/server/tunnel.rs` vs `src/client/tunnel.rs` stay
+    /// visibly distinct.
+    pub path: String,
+    /// User-facing duplicate-instance qualifier. Empty when the path
+    /// is unique within this dispatch; `" (#2)"`, `" (#3)"` when the
+    /// dispatcher is forking >1 sub-agent against the same path.
+    pub dedup_suffix: String,
+}
+
 /// Events sent FROM the agent loop TO the UI.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -190,20 +206,44 @@ pub enum AgentEvent {
     },
     /// An error occurred.
     Error(String),
-    /// Sub-agent batch began. UI uses this to override the foreground
-    /// spinner label (which would otherwise stay frozen on the last tool
-    /// name while the foreground turn awaits `pool.execute_all`) and to
-    /// reset its progress counter.
-    SubAgentDispatchStart { count: usize },
+    /// Sub-agent batch began. `tasks` is the ordered list of children
+    /// the dispatcher is about to fork — same order as the resulting
+    /// `SubAgentTaskDone`/`SubAgentTaskFailed` events will arrive in,
+    /// so the UI can pre-allocate one display slot per child and
+    /// disambiguate same-basename tasks via the index.
+    SubAgentDispatchStart {
+        /// Per-task descriptors. `path` is the workspace-relative file
+        /// path (preserved as the model wrote it — no basename-only
+        /// truncation). `dedup_suffix` is the user-facing `(#2)`,
+        /// `(#3)` qualifier when the same path appears N times in one
+        /// dispatch; empty for unique entries.
+        tasks: Vec<SubAgentTaskInfo>,
+    },
     /// Sub-agent batch ended (all tasks settled or pool returned). UI
     /// clears the override so subsequent thinks/tools resume normal
     /// label behaviour.
     SubAgentDispatchEnd,
-    /// Per-task progress within an active sub-agent batch. `file=""`
-    /// signals the pool header; otherwise `file` is the target file
-    /// basename. `status` is a free-form human-readable transition
-    /// (`working...`, `done 12s · 3 turns`, `failed 8s`, `timeout 300s`).
-    SubAgentProgress { file: String, status: String },
+    /// One sub-agent has been claimed from the pool and is now running.
+    /// `index` indexes into the `tasks` vector emitted with the
+    /// matching DispatchStart so the UI can locate its slot.
+    SubAgentTaskStarted { index: usize },
+    /// Sub-agent finished successfully. `summary` is a one-sentence
+    /// human-readable result, already truncated to a reasonable length
+    /// by the agent loop.
+    SubAgentTaskDone {
+        index: usize,
+        elapsed_ms: u64,
+        turns: usize,
+        summary: String,
+    },
+    /// Sub-agent failed (error, timeout, no-edit). `reason` is one
+    /// short phrase, not a stack trace.
+    SubAgentTaskFailed {
+        index: usize,
+        elapsed_ms: u64,
+        turns: usize,
+        reason: String,
+    },
     /// `/background` task finished. `summary` is the final assistant text
     /// (truncated if long). `success` is false on error / timeout / cancel.
     BackgroundComplete {

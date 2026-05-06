@@ -177,6 +177,21 @@ pub struct UiState {
     /// terminal status (done / failed / timeout). Updated by
     /// `on_sub_agent_settled`. Reset to 0 on each new dispatch.
     pub sub_agent_done: usize,
+    /// Per-task descriptors (path + dedup suffix) for the active
+    /// dispatch. Indexed identically to the `tasks` field on
+    /// `AgentEvent::SubAgentDispatchStart` so the UI can look up a
+    /// child's display path from the `index` field on Started/Done/
+    /// Failed events. Cleared on `on_sub_agent_dispatch_end`.
+    pub sub_agent_tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+    /// Number of failed sub-agents in the current dispatch — tracked
+    /// separately from `sub_agent_done` so the aggregate summary can
+    /// distinguish "6/7 ok · 1 fail" from "7/7 ok". Reset on each new
+    /// dispatch.
+    pub sub_agent_failed: usize,
+    /// Wall-clock start of the current dispatch. Used to render the
+    /// elapsed-time figure on the `SubAgentDispatchEnd` aggregate
+    /// summary line. Cleared with the rest of the dispatch state.
+    pub sub_agent_started_at: Option<std::time::Instant>,
 }
 
 impl Default for UiState {
@@ -215,6 +230,9 @@ impl UiState {
             show_reasoning: false,
             sub_agent_total: 0,
             sub_agent_done: 0,
+            sub_agent_tasks: Vec::new(),
+            sub_agent_failed: 0,
+            sub_agent_started_at: None,
         }
     }
 
@@ -371,40 +389,65 @@ impl UiState {
         self.phase_started_at = Some(std::time::Instant::now());
     }
 
-    /// Override the foreground spinner with a "Sub-agents: 0/N" counter
-    /// for the duration of a fork dispatch. The foreground turn awaits
-    /// `pool.execute_all` and emits no fresh think/tool events, so
-    /// without this the label stays frozen on the last tool name
-    /// (typically "Running ReadFile…") for the entire pool duration.
-    /// Resets the phase clock so the displayed elapsed time tracks the
-    /// dispatch itself, not the pre-dispatch tool that ran before it.
-    pub fn on_sub_agent_dispatch_start(&mut self, count: usize) {
-        self.sub_agent_total = count;
+    /// Begin a fork dispatch. Stores the per-task descriptors so the UI
+    /// can look up each child's display path + dedup-suffix by index
+    /// when a `SubAgentTaskStarted/Done/Failed` event arrives — the
+    /// previous flow flattened identical basenames (`tunnel.rs` × 3)
+    /// into indistinguishable rows. Also overrides the foreground
+    /// spinner label since `pool.execute_all` blocks the loop.
+    pub fn on_sub_agent_dispatch_start(
+        &mut self,
+        tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+    ) {
+        self.sub_agent_total = tasks.len();
         self.sub_agent_done = 0;
-        self.spinner_label = format!("Sub-agents 0/{}", count);
+        self.sub_agent_failed = 0;
+        self.spinner_label = format!("Sub-agents 0/{}", tasks.len());
         self.phase_started_at = Some(std::time::Instant::now());
+        self.sub_agent_started_at = Some(std::time::Instant::now());
+        self.sub_agent_tasks = tasks;
     }
 
-    /// Increment the completion counter and refresh the label. Triggered
-    /// on each per-file terminal status (done / failed / timeout). Only
-    /// updates the label when a dispatch is currently active so a late
-    /// progress event after `SubAgentDispatchEnd` can't resurrect a
-    /// stale "Sub-agents X/N" label.
-    pub fn on_sub_agent_settled(&mut self) {
+    /// Mark one sub-agent as completed (success). Late events after
+    /// `on_sub_agent_dispatch_end` are no-ops — `sub_agent_total == 0`
+    /// is the gate.
+    pub fn on_sub_agent_task_done(&mut self) {
         if self.sub_agent_total == 0 {
             return;
         }
         self.sub_agent_done = self.sub_agent_done.saturating_add(1);
+        self.refresh_sub_agent_label();
+    }
+
+    /// Mark one sub-agent as failed (error / timeout / no-edit).
+    /// Increments BOTH the done and failed counters — for the spinner
+    /// label `done` is "settled" regardless of outcome, but the
+    /// aggregate emitted on dispatch_end needs the success/fail split.
+    pub fn on_sub_agent_task_failed(&mut self) {
+        if self.sub_agent_total == 0 {
+            return;
+        }
+        self.sub_agent_done = self.sub_agent_done.saturating_add(1);
+        self.sub_agent_failed = self.sub_agent_failed.saturating_add(1);
+        self.refresh_sub_agent_label();
+    }
+
+    fn refresh_sub_agent_label(&mut self) {
         self.spinner_label = format!("Sub-agents {}/{}", self.sub_agent_done, self.sub_agent_total);
     }
 
-    /// End the dispatch — clears the counter so subsequent thinks/tools
+    /// End the dispatch — clears descriptors so subsequent thinks/tools
     /// resume normal label behaviour. The next `on_thinking` /
     /// `on_tool_call_started` will overwrite `spinner_label`; we leave it
     /// alone here so the final "N/N" stays visible until the next phase.
+    /// The success/fail split is preserved long enough for the event
+    /// loop to render the aggregate summary line, then cleared.
     pub fn on_sub_agent_dispatch_end(&mut self) {
         self.sub_agent_total = 0;
         self.sub_agent_done = 0;
+        self.sub_agent_failed = 0;
+        self.sub_agent_tasks.clear();
+        self.sub_agent_started_at = None;
     }
 
     pub fn on_approval_needed(&mut self, _tool: &str) {
@@ -587,6 +630,13 @@ mod tests {
         assert_eq!(AgentMode::default(), AgentMode::Build);
     }
 
+    fn task_info(path: &str, dedup: &str) -> atomcode_core::agent::SubAgentTaskInfo {
+        atomcode_core::agent::SubAgentTaskInfo {
+            path: path.to_string(),
+            dedup_suffix: dedup.to_string(),
+        }
+    }
+
     #[test]
     fn sub_agent_dispatch_overrides_stale_tool_label() {
         // Reproduces the user's "Running ReadFile… 82s" stale-spinner
@@ -597,45 +647,85 @@ mod tests {
         s.on_submit();
         s.on_tool_call_started("read_file");
         assert!(s.spinner_label.contains("read_file"));
-        s.on_sub_agent_dispatch_start(6);
+        let tasks = (0..6).map(|i| task_info(&format!("a{}.rs", i), "")).collect();
+        s.on_sub_agent_dispatch_start(tasks);
         assert_eq!(s.spinner_label, "Sub-agents 0/6");
     }
 
     #[test]
-    fn sub_agent_settled_increments_counter_in_label() {
+    fn sub_agent_task_done_increments_counter() {
         let mut s = UiState::new();
-        s.on_sub_agent_dispatch_start(3);
-        s.on_sub_agent_settled();
+        let tasks = vec![
+            task_info("a.rs", ""),
+            task_info("b.rs", ""),
+            task_info("c.rs", ""),
+        ];
+        s.on_sub_agent_dispatch_start(tasks);
+        s.on_sub_agent_task_done();
         assert_eq!(s.spinner_label, "Sub-agents 1/3");
-        s.on_sub_agent_settled();
-        s.on_sub_agent_settled();
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_done();
         assert_eq!(s.spinner_label, "Sub-agents 3/3");
+        assert_eq!(s.sub_agent_failed, 0);
     }
 
     #[test]
-    fn sub_agent_settled_outside_dispatch_is_noop() {
-        // A late SubAgentProgress event after DispatchEnd must not bring
-        // the counter label back from the dead.
+    fn sub_agent_task_failed_counts_toward_done_and_failed() {
+        // `sub_agent_done` is "settled" — done OR failed. The aggregate
+        // line emitted on dispatch_end uses `sub_agent_failed` to split
+        // them apart for "6 ok · 1 fail" rendering.
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(vec![task_info("x.rs", ""), task_info("y.rs", "")]);
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_failed();
+        assert_eq!(s.sub_agent_done, 2);
+        assert_eq!(s.sub_agent_failed, 1);
+    }
+
+    #[test]
+    fn sub_agent_task_event_outside_dispatch_is_noop() {
+        // A late event after DispatchEnd must not bring the counter
+        // label back from the dead.
         let mut s = UiState::new();
         s.on_thinking();
         let pre = s.spinner_label.clone();
-        s.on_sub_agent_settled();
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_failed();
         assert_eq!(s.spinner_label, pre);
     }
 
     #[test]
-    fn sub_agent_dispatch_end_lets_next_phase_take_over() {
-        // After end, the counter is cleared but spinner_label keeps the
-        // last "N/N" until the next phase transition overwrites it.
+    fn sub_agent_dispatch_end_clears_descriptors() {
         let mut s = UiState::new();
-        s.on_sub_agent_dispatch_start(2);
-        s.on_sub_agent_settled();
-        s.on_sub_agent_settled();
+        s.on_sub_agent_dispatch_start(vec![task_info("a.rs", ""), task_info("b.rs", "")]);
+        assert_eq!(s.sub_agent_tasks.len(), 2);
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_done();
         s.on_sub_agent_dispatch_end();
         assert_eq!(s.sub_agent_total, 0);
         assert_eq!(s.sub_agent_done, 0);
+        assert_eq!(s.sub_agent_failed, 0);
+        assert!(s.sub_agent_tasks.is_empty());
+        assert!(s.sub_agent_started_at.is_none());
         s.on_thinking();
         assert!(!s.spinner_label.starts_with("Sub-agents"));
+    }
+
+    #[test]
+    fn sub_agent_dispatch_preserves_dedup_suffix() {
+        // Three tasks against tunnel.rs must come through as #1/#2/#3
+        // suffixes from the dispatcher, and `state.sub_agent_tasks`
+        // must carry that data so a `SubAgentTaskStarted { index: 2 }`
+        // event renders the right disambiguator.
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(vec![
+            task_info("src/server/tunnel.rs", " (#1)"),
+            task_info("src/client/tunnel.rs", ""),
+            task_info("src/server/tunnel.rs", " (#2)"),
+        ]);
+        assert_eq!(s.sub_agent_tasks[0].dedup_suffix, " (#1)");
+        assert_eq!(s.sub_agent_tasks[1].dedup_suffix, "");
+        assert_eq!(s.sub_agent_tasks[2].dedup_suffix, " (#2)");
     }
 
     #[test]
