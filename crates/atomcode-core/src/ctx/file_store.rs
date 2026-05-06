@@ -35,22 +35,6 @@ pub struct FileEntry {
     pub line_count: usize,
 }
 
-/// Lightweight per-entry view exported each turn so the model knows
-/// what's in the store WITHOUT carrying the content itself. Renderer
-/// injects this list as a system-level reminder so a model whose
-/// conversation got compacted can still address peek_file by id.
-///
-/// Without this, store_ids appeared only inside individual ToolResult
-/// messages — and once those messages got summarised by the cold-zone
-/// compactor, the model lost every entry-point into the store. The
-/// store kept the bytes; the model couldn't reach them.
-#[derive(Debug, Clone)]
-pub struct FileSummary {
-    pub path: PathBuf,
-    pub store_id: String,
-    pub line_count: usize,
-    pub mtime: SystemTime,
-}
 
 /// Process-local file content store.
 ///
@@ -166,36 +150,6 @@ impl FileStore {
         self.entries.is_empty()
     }
 
-    /// The N most-recently-touched entries, newest first. Drives the
-    /// system-level "files in FileStore" reminder injected by
-    /// `ctx::render::build_messages` so the model retains addressable
-    /// store_ids across conversation compaction.
-    ///
-    /// Ordered by `mtime` (descending). Ties broken by path lexicographic
-    /// order — deterministic across repeated calls. `limit == 0` returns
-    /// an empty Vec.
-    pub fn active_summaries(&self, limit: usize) -> Vec<FileSummary> {
-        if limit == 0 {
-            return Vec::new();
-        }
-        let mut all: Vec<FileSummary> = self
-            .entries
-            .iter()
-            .map(|(id, e)| FileSummary {
-                path: e.path.clone(),
-                store_id: id.clone(),
-                line_count: e.line_count,
-                mtime: e.mtime,
-            })
-            .collect();
-        all.sort_by(|a, b| {
-            b.mtime
-                .cmp(&a.mtime)
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        all.truncate(limit);
-        all
-    }
 }
 
 /// Derive a stable id from path + content. Same content at the same
@@ -338,85 +292,4 @@ mod tests {
         );
     }
 
-    // ── active_summaries (D3 path C — survive-compaction reminder) ──
-
-    #[test]
-    fn active_summaries_returns_newest_first_by_mtime() {
-        let mut s = FileStore::new();
-        s.insert(PathBuf::from("/old.rs"), "old".into(), t(100));
-        s.insert(PathBuf::from("/new.rs"), "new".into(), t(300));
-        s.insert(PathBuf::from("/mid.rs"), "mid".into(), t(200));
-        let names: Vec<String> = s
-            .active_summaries(10)
-            .into_iter()
-            .map(|s| s.path.display().to_string())
-            .collect();
-        assert_eq!(names, vec!["/new.rs", "/mid.rs", "/old.rs"]);
-    }
-
-    #[test]
-    fn active_summaries_truncates_to_limit() {
-        let mut s = FileStore::new();
-        for i in 0..15 {
-            s.insert(
-                PathBuf::from(format!("/f{:02}.rs", i)),
-                format!("c{}", i),
-                t(i),
-            );
-        }
-        assert_eq!(s.active_summaries(5).len(), 5);
-        assert_eq!(s.active_summaries(50).len(), 15);
-    }
-
-    #[test]
-    fn active_summaries_zero_limit_returns_empty() {
-        let mut s = FileStore::new();
-        s.insert(PathBuf::from("/x.rs"), "x".into(), t(0));
-        assert!(s.active_summaries(0).is_empty());
-    }
-
-    #[test]
-    fn active_summaries_excludes_invalidated_entries() {
-        let mut s = FileStore::new();
-        s.insert(PathBuf::from("/a.rs"), "a".into(), t(1));
-        s.insert(PathBuf::from("/b.rs"), "b".into(), t(2));
-        s.invalidate(std::path::Path::new("/a.rs"));
-        let names: Vec<String> = s
-            .active_summaries(10)
-            .into_iter()
-            .map(|s| s.path.display().to_string())
-            .collect();
-        assert_eq!(names, vec!["/b.rs"]);
-    }
-
-    #[test]
-    fn active_summaries_carries_store_id_and_line_count() {
-        let mut s = FileStore::new();
-        let id = s.insert(PathBuf::from("/x.rs"), three_lines(), t(0));
-        let sum = s.active_summaries(1).into_iter().next().unwrap();
-        assert_eq!(sum.store_id, id);
-        assert_eq!(sum.line_count, 3);
-    }
-
-    #[test]
-    fn active_summaries_tie_breaks_by_path_for_determinism() {
-        // Two entries inserted with the same mtime — order must be stable
-        // across calls so the rendered injection is byte-identical and
-        // doesn't trash whatever upstream prompt cache exists.
-        let mut s = FileStore::new();
-        s.insert(PathBuf::from("/zzz.rs"), "z".into(), t(100));
-        s.insert(PathBuf::from("/aaa.rs"), "a".into(), t(100));
-        let first_call: Vec<_> = s
-            .active_summaries(2)
-            .into_iter()
-            .map(|s| s.path.display().to_string())
-            .collect();
-        let second_call: Vec<_> = s
-            .active_summaries(2)
-            .into_iter()
-            .map(|s| s.path.display().to_string())
-            .collect();
-        assert_eq!(first_call, second_call);
-        assert_eq!(first_call, vec!["/aaa.rs", "/zzz.rs"]);
-    }
 }

@@ -298,37 +298,95 @@ impl Tool for ReadFileTool {
             });
         }
 
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-
-        // Decode: UTF-8 first (the vast majority of text files), then GBK
-        // fallback for plain-text extensions (Chinese Windows legacy files
-        // that fail UTF-8 validation), then declare binary.
-        let content = match String::from_utf8(bytes.clone()) {
-            Ok(s) => s,
-            Err(_) => match decode_non_utf8_text(path_ref, &bytes) {
-                Some(s) => s,
-                None => {
-                    let output = format!(
-                        "Binary file ({} bytes), cannot display as text.{}",
-                        bytes.len(),
-                        binary_recovery_hint(path_ref, &parsed.file_path),
-                    );
-                    if let Some(mtime) = disk_mtime {
-                        ctx.read_cache
-                            .write()
-                            .await
-                            .insert(cache_key.clone(), (mtime, output.clone(), 1));
-                    }
-                    return Ok(ToolResult {
-                        call_id: String::new(),
-                        output,
-                        success: true,
-                    });
-                }
-            },
+        // R2: bump per-path read counter so the soft "Nth read" hint
+        // can fire below. Counter survives across sub-agents (shared
+        // via `ToolContext.isolate`).
+        let path_read_n = {
+            let mut counts = ctx.path_read_counts.write().await;
+            let n = counts.entry(path.clone()).or_insert(0);
+            *n += 1;
+            *n
         };
+
+        // D3 (merged): consult FileStore before reading disk. If we've
+        // read this path before AND mtime hasn't moved, every range
+        // read of any subsequent offset/limit can be served from
+        // memory. The previous design exposed this as a separate
+        // `peek_file` tool, but the model often defaulted to
+        // read_file anyway (datalog 2026-05-06_15-33-23: 13 peeks vs
+        // 59 reads — 18% adoption). Routing the cache hit through
+        // read_file's own path makes the optimisation transparent and
+        // tool-surface-neutral: the model has one tool, the framework
+        // decides disk vs cache.
+        let store_hit: Option<String> = if let Some(mtime) = disk_mtime {
+            let store = ctx.file_store.read().await;
+            store
+                .store_id_for_path(&path)
+                .map(|s| s.to_string())
+                .and_then(|id| store.get(&id).cloned())
+                .filter(|entry| entry.mtime == mtime)
+                .map(|entry| entry.content)
+        } else {
+            None
+        };
+        let served_from_store = store_hit.is_some();
+
+        let content = if let Some(c) = store_hit {
+            // Store entries only ever hold text (we never push binary
+            // bytes), so we can short-circuit the UTF-8 / GBK decode
+            // dance. mtime check above guarantees the content matches
+            // what's currently on disk.
+            c
+        } else {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+
+            // Decode: UTF-8 first (the vast majority of text files), then GBK
+            // fallback for plain-text extensions (Chinese Windows legacy files
+            // that fail UTF-8 validation), then declare binary.
+            match String::from_utf8(bytes.clone()) {
+                Ok(s) => s,
+                Err(_) => match decode_non_utf8_text(path_ref, &bytes) {
+                    Some(s) => s,
+                    None => {
+                        let output = format!(
+                            "Binary file ({} bytes), cannot display as text.{}",
+                            bytes.len(),
+                            binary_recovery_hint(path_ref, &parsed.file_path),
+                        );
+                        if let Some(mtime) = disk_mtime {
+                            ctx.read_cache
+                                .write()
+                                .await
+                                .insert(cache_key.clone(), (mtime, output.clone(), 1));
+                        }
+                        return Ok(ToolResult {
+                            call_id: String::new(),
+                            output,
+                            success: true,
+                        });
+                    }
+                },
+            }
+        };
+
+        // Push fresh disk content into the FileStore exactly once,
+        // upstream of every output-shaping branch (skeleton / D3a /
+        // range-slice). Subsequent reads of the same path at any range
+        // hit the store path above (`store_hit`) and skip disk
+        // entirely. Idempotent: re-reading after an edit pushes the
+        // new content under the same path key, replacing the prior
+        // entry. Skipped when we just served from store — content is
+        // already there.
+        if !served_from_store {
+            if let Some(mtime) = disk_mtime {
+                ctx.file_store
+                    .write()
+                    .await
+                    .insert(path.clone(), content.clone(), mtime);
+            }
+        }
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -438,40 +496,28 @@ impl Tool for ReadFileTool {
                 format!("[File skeleton: {} ({} lines) — use grep to find relevant lines, then read with offset/limit.]\n",
                     fname, total_lines)
             };
-            // D3 (auto_skeleton path): push raw content into FileStore
-            // and append the store_id pointer so the model can peek any
-            // region with zero disk hit. Without this, large files
-            // (>SKELETON_LINE_THRESHOLD) bypass D3 entirely — the
-            // skeleton's "copy this offset/limit into read_file"
-            // suggestion becomes the dominant pattern and every range
-            // read costs a fresh disk roundtrip + full content carry.
-            // Datalog 2026-05-06_14-29-08 documents this miss: 19 reads
-            // of one 753-line file, 0 peek_file calls.
-            let skeleton_with_store = if let Some(mtime) = disk_mtime {
-                let store_id = ctx
-                    .file_store
-                    .write()
-                    .await
-                    .insert(path.clone(), content.clone(), mtime);
-                format!(
-                    "{}\n[Full content cached at store_id={}. \
-                     For any specific region, prefer peek_file({{\"store_id\":\"{}\",\"lines\":\"X-Y\"}}) \
-                     over read_file with offset/limit — peek is local (no disk hit, no duplicated \
-                     content carry across turns).]",
-                    skeleton, store_id, store_id,
-                )
-            } else {
-                skeleton
-            };
+            // The upstream `served_from_store ? skip : push` block
+            // already populated FileStore with the raw content; this
+            // skeleton path does NOT need its own push. The reminder
+            // "use peek_file" is also gone — peek_file no longer
+            // exists; subsequent range reads of this file now hit
+            // FileStore transparently via the upstream `store_hit`
+            // branch.
+            let skeleton_out = maybe_prepend_read_hints(
+                skeleton,
+                served_from_store,
+                path_read_n,
+                &parsed.file_path,
+            );
             if let Some(mtime) = disk_mtime {
                 ctx.read_cache.write().await.insert(
                     cache_key.clone(),
-                    (mtime, skeleton_with_store.clone(), 1),
+                    (mtime, skeleton_out.clone(), 1),
                 );
             }
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: skeleton_with_store,
+                output: skeleton_out,
                 success: true,
             });
         }
@@ -557,57 +603,15 @@ impl Tool for ReadFileTool {
             ));
         }
 
-        // D3 step 3: full reads of LARGE files push their raw content
-        // into the shared FileStore and return a pointer + preview.
-        // Subsequent regions are fetched via peek_file (zero disk hit,
-        // not duplicated in conversation token by token). Partial
-        // range reads (model gave offset/limit) skip this branch and
-        // return the full inline output as before — that path is
-        // already tightly scoped, store would just add overhead.
-        const LARGE_FILE_LINE_THRESHOLD: usize = 50;
-        const PREVIEW_LINES: usize = 50;
-        let final_output = if returned_all && total_lines > LARGE_FILE_LINE_THRESHOLD {
-            let store_id = if let Some(mtime) = disk_mtime {
-                ctx.file_store
-                    .write()
-                    .await
-                    .insert(path.clone(), content.clone(), mtime)
-            } else {
-                // No mtime → can't safely cache (stale check needs it).
-                // Fall through to inline behaviour for this read.
-                String::new()
-            };
-            if !store_id.is_empty() {
-                let preview_end = PREVIEW_LINES.min(total_lines);
-                let preview: String = lines[..preview_end]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| format!("{:>4}| {}", i + 1, line))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let display_name = std::path::Path::new(&parsed.file_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| parsed.file_path.clone());
-                let size_kb = content.len() as f64 / 1024.0;
-                let remaining = total_lines.saturating_sub(preview_end);
-                format!(
-                    "[Read {} ({} lines, {:.1} KB) → store_id={}]\n\
-                     [Preview L1-{}:]\n{}\n\n\
-                     [Remaining {} lines cached locally — fetch any region with \
-                     peek_file({{\"store_id\":\"{}\",\"lines\":\"X-Y\"}}). \
-                     peek_file is free (no disk hit, no model round trip for \
-                     duplicate content).]",
-                    display_name, total_lines, size_kb, store_id,
-                    preview_end, preview,
-                    remaining, store_id,
-                )
-            } else {
-                output
-            }
-        } else {
-            output
-        };
+        // After the merge of peek_file → read_file, the previous
+        // "pointer + preview" branch (LARGE_FILE_LINE_THRESHOLD) is
+        // gone. Range reads are served from FileStore transparently
+        // via the upstream `store_hit` check, so there's no separate
+        // store-id pointer the model needs to track. The renderer
+        // just emits full inline content (skeleton already handled
+        // very-large files above).
+        let final_output =
+            maybe_prepend_read_hints(output, served_from_store, path_read_n, &parsed.file_path);
 
         if let Some(mtime) = disk_mtime {
             ctx.read_cache
@@ -620,6 +624,62 @@ impl Tool for ReadFileTool {
             output: final_output,
             success: true,
         })
+    }
+}
+
+/// Prepend soft hints to a read_file result.
+///
+/// Two hints, additive:
+/// 1. `[NOTE: served from FileStore cache, no disk hit]` when the
+///    content came from an in-memory snapshot rather than disk.
+/// 2. `[NOTE: Nth read of <file>, re-reads are free]` once the same
+///    path has been read 3+ times in this session — encourages weak
+///    models to look up specific regions freely instead of hoarding
+///    context window with "just in case" full reads.
+///
+/// The `read_count < 3` case stays silent so the prompt stays clean
+/// for first-touch reads. Hints are stacked into one prefix block so
+/// the existing rendered output is untouched downstream.
+fn maybe_prepend_read_hints(
+    output: String,
+    served_from_store: bool,
+    read_count: usize,
+    file_path: &str,
+) -> String {
+    let mut prefix = String::new();
+    let display = std::path::Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.to_string());
+
+    if read_count >= 3 {
+        prefix.push_str(&format!(
+            "[NOTE: {}{} read of `{}` this session. Subsequent reads of any \
+             range of this file are served from local cache (no disk hit). \
+             Re-read freely — looking up specific regions is cheap.]\n",
+            read_count,
+            ordinal_suffix(read_count),
+            display,
+        ));
+    } else if served_from_store {
+        prefix.push_str(
+            "[NOTE: served from FileStore cache, no disk hit.]\n",
+        );
+    }
+    if prefix.is_empty() {
+        output
+    } else {
+        format!("{}\n{}", prefix.trim_end(), output)
+    }
+}
+
+fn ordinal_suffix(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
     }
 }
 
@@ -1096,125 +1156,103 @@ mod tests {
         path
     }
 
-    /// Large full reads return a pointer + preview, not the entire
-    /// inline content — the body lives in FileStore for cheap follow-up
-    /// peek_file calls.
+    /// Every fresh disk read pushes its content into FileStore so
+    /// subsequent reads of any range hit the in-memory snapshot
+    /// instead of touching disk again. After the peek_file → read_file
+    /// merge, the model never sees a store_id — the cache is purely
+    /// internal.
     #[tokio::test]
-    async fn d3_full_read_of_large_file_returns_pointer_and_preview() {
+    async fn d3_full_read_pushes_to_store_returns_inline_content() {
         let dir = TempDir::new().unwrap();
         let path = write_n_line_file(&dir, "big.rs", 200);
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
         let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
         assert!(r.success);
+        // No more pointer/preview formatting — model gets the content
+        // directly. store_id is internal-only after the merge.
         assert!(
-            r.output.contains("store_id=fs_"),
-            "must announce store_id; got:\n{}",
+            !r.output.contains("store_id="),
+            "store_id must NOT leak into model output:\n{}",
             r.output
         );
         assert!(
-            r.output.contains("Preview L1-50:"),
-            "must include preview header; got:\n{}",
+            !r.output.contains("peek_file"),
+            "peek_file no longer exists, must not be referenced:\n{}",
             r.output
         );
-        assert!(
-            r.output.contains("peek_file"),
-            "must point the model at peek_file; got:\n{}",
-            r.output
-        );
-        // Lines 51-200 must NOT be inlined — that's the whole point of
-        // the indirection.
-        assert!(
-            !r.output.contains("line 100"),
-            "preview should stop at line 50; line 100 must not appear:\n{}",
-            r.output
-        );
-        // Store should have one entry now.
+        // Full content is inline.
+        assert!(r.output.contains("line 1"));
+        assert!(r.output.contains("line 100"));
+        assert!(r.output.contains("line 200"));
+        // Store populated for future range reads.
         assert_eq!(ctx.file_store.read().await.len(), 1);
     }
 
-    /// Small files (≤ 50 lines) bypass the store entirely — pointer
-    /// indirection would just add overhead with no caching upside.
+    /// Small files also populate the store — uniform behaviour means
+    /// the "Nth read" hint can fire on any file, and a future range
+    /// read of a small file (rare but possible) hits cache too.
     #[tokio::test]
-    async fn d3_small_file_skips_store_and_inlines() {
+    async fn d3_small_file_pushes_to_store_after_merge() {
         let dir = TempDir::new().unwrap();
         let path = write_n_line_file(&dir, "small.rs", 10);
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
         let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
         assert!(r.success);
-        assert!(
-            !r.output.contains("store_id="),
-            "small file must inline, not point at store; got:\n{}",
-            r.output
-        );
         assert_eq!(
             ctx.file_store.read().await.len(),
-            0,
-            "small file must not push into store"
+            1,
+            "fresh disk read must populate store regardless of file size"
         );
     }
 
-    /// Range reads (offset/limit) bypass the store — the model is
-    /// already asking for a specific slice, no need to cache the whole
-    /// file just to serve their narrow request.
+    /// THE merge's core promise: a range read that follows a full
+    /// read of the same path is served from FileStore — no disk
+    /// hit, just an in-memory slice. Verified by the result carrying
+    /// the "from FileStore cache" notice.
     #[tokio::test]
-    async fn d3_range_read_skips_store() {
+    async fn d3_range_read_after_full_read_serves_from_store() {
         let dir = TempDir::new().unwrap();
         let path = write_n_line_file(&dir, "big.rs", 200);
         let ctx = ToolContext::new(dir.path().to_path_buf());
-        let args = format!(
-            r#"{{"file_path":"{}","offset":50,"limit":20}}"#,
+
+        // Full read populates the store.
+        let full_args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let _ = ReadFileTool.execute(&full_args, &ctx).await.unwrap();
+
+        // Range read should now hit store transparently. We verify
+        // via the cache-served notice, since the disk path doesn't
+        // emit it. (Range reads bypass auto_skeleton, so any cache
+        // hit comes through the new merge path.)
+        let range_args = format!(
+            r#"{{"file_path":"{}","offset":100,"limit":5}}"#,
             path.display()
         );
-        let r = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        let r = ReadFileTool.execute(&range_args, &ctx).await.unwrap();
         assert!(r.success);
         assert!(
-            !r.output.contains("store_id="),
-            "range read must NOT trip the store branch:\n{}",
+            r.output.contains("FileStore cache"),
+            "range read after full read must announce store-served:\n{}",
             r.output
         );
-        assert_eq!(ctx.file_store.read().await.len(), 0);
+        assert!(r.output.contains("line 100"));
     }
 
-    /// Full lifecycle: read → peek (hit) → edit → peek (stale).
-    /// The atomgr-session bug class this prevents: after editing a
-    /// file, peek_file would otherwise serve pre-edit bytes — model
-    /// reasons against a snapshot that no longer matches disk.
+    /// Edit invalidates the cache so the next read sees fresh disk
+    /// content, not a stale snapshot. Without this, the model would
+    /// reason against bytes that no longer match what's on disk after
+    /// its own edit.
     #[tokio::test]
-    async fn d3_edit_invalidates_store_and_peek_reports_stale() {
+    async fn d3_edit_invalidates_cache_next_read_hits_disk() {
         let dir = TempDir::new().unwrap();
         let path = write_n_line_file(&dir, "big.rs", 200);
         let ctx = ToolContext::new(dir.path().to_path_buf());
 
-        // Step 1: full read populates the store.
         let read_args = format!(r#"{{"file_path":"{}"}}"#, path.display());
-        let r1 = ReadFileTool.execute(&read_args, &ctx).await.unwrap();
-        assert!(r1.success);
-        // Extract the store_id from the result.
-        let store_id = r1
-            .output
-            .lines()
-            .find_map(|l| {
-                l.find("store_id=fs_")
-                    .map(|i| l[i + "store_id=".len()..].split(']').next().unwrap().to_string())
-            })
-            .expect("store_id present in read result");
-        assert!(store_id.starts_with("fs_"));
+        let _ = ReadFileTool.execute(&read_args, &ctx).await.unwrap();
+        assert_eq!(ctx.file_store.read().await.len(), 1);
 
-        // Step 2: peek before edit succeeds.
-        let peek_args = format!(
-            r#"{{"store_id":"{}","lines":"100-105"}}"#,
-            store_id
-        );
-        let p1 = crate::tool::peek::PeekFileTool
-            .execute(&peek_args, &ctx)
-            .await
-            .unwrap();
-        assert!(p1.success, "peek before edit must succeed; got:\n{}", p1.output);
-        assert!(p1.output.contains("line 100"));
-
-        // Step 3: edit invalidates the store.
         let edit_args = format!(
             r#"{{"file_path":"{}","old_string":"line 1\n","new_string":"LINE 1\n"}}"#,
             path.display()
@@ -1223,64 +1261,51 @@ mod tests {
             .execute(&edit_args, &ctx)
             .await
             .unwrap();
-        assert!(e.success, "edit must succeed; got:\n{}", e.output);
+        assert!(e.success, "edit must succeed:\n{}", e.output);
         assert_eq!(
             ctx.file_store.read().await.len(),
             0,
             "edit must invalidate the store entry"
         );
 
-        // Step 4: peek with the now-orphan store_id returns a friendly
-        // recovery hint, not pre-edit content.
-        let p2 = crate::tool::peek::PeekFileTool
-            .execute(&peek_args, &ctx)
-            .await
-            .unwrap();
-        assert!(!p2.success, "peek after edit must fail (stale); got:\n{}", p2.output);
-        assert!(
-            p2.output.contains("read_file"),
-            "stale message must point at re-read; got:\n{}",
-            p2.output
+        // Range read after edit: store was invalidated, so this is a
+        // fresh disk read. Output must NOT carry the cache notice and
+        // store gets repopulated.
+        let range_args = format!(
+            r#"{{"file_path":"{}","offset":1,"limit":3}}"#,
+            path.display()
         );
+        let r = ReadFileTool.execute(&range_args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(
+            !r.output.contains("FileStore cache"),
+            "post-edit read must come from disk, not stale cache:\n{}",
+            r.output
+        );
+        assert_eq!(ctx.file_store.read().await.len(), 1);
     }
 
-    /// Re-reading the same large file replaces (not duplicates) the
-    /// store entry. The store_id changes only if content changed.
+    /// Re-reading the same path with the same args keeps store size
+    /// at 1 — the entry is replaced, not duplicated. Guards against
+    /// a regression where every call grew the store unboundedly.
     #[tokio::test]
-    async fn d3_reread_unchanged_file_reuses_store_id() {
+    async fn d3_reread_unchanged_file_keeps_one_entry() {
         let dir = TempDir::new().unwrap();
         let path = write_n_line_file(&dir, "big.rs", 200);
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
-        let r1 = ReadFileTool.execute(&args, &ctx).await.unwrap();
-        // The READ cache will short-circuit the second read to the
-        // exact same output, so we extract id from r1 only — but the
-        // FileStore must still have only one entry, not two.
-        assert!(r1.success);
         let _ = ReadFileTool.execute(&args, &ctx).await.unwrap();
-        assert_eq!(
-            ctx.file_store.read().await.len(),
-            1,
-            "second read of identical file must not duplicate store entry"
-        );
+        let _ = ReadFileTool.execute(&args, &ctx).await.unwrap();
+        assert_eq!(ctx.file_store.read().await.len(), 1);
     }
 
-    /// Regression for the auto_skeleton bypass bug (datalog
-    /// 2026-05-06_14-29-08): a 753-line tunnel.rs was read 19 times
-    /// across the session, store_id never appeared in those results,
-    /// peek_file fired zero times. Root cause: auto_skeleton fired
-    /// at line ~340 and returned BEFORE the D3 branch at line ~535.
-    /// Large files (>300 lines) bypassed D3 entirely.
-    ///
-    /// Fix: auto_skeleton path also pushes raw content into FileStore
-    /// and appends the store_id pointer so the model can peek any
-    /// region without disk hits. This test guards that integration.
+    /// Auto-skeleton path (>300 lines) populates the store too — fix
+    /// for the early-return bug that left huge files completely
+    /// outside the cache (datalog 2026-05-06_14-29-08: 19 reads of a
+    /// single 753-line file, zero cache hits, before this guard).
     #[tokio::test]
-    async fn d3_skeleton_path_also_pushes_to_store() {
+    async fn d3_skeleton_path_pushes_to_store() {
         let dir = TempDir::new().unwrap();
-        // 350 lines — above SKELETON_LINE_THRESHOLD (300), so the
-        // auto_skeleton branch fires. Without the fix, store stays
-        // empty and the result lacks `store_id=fs_`.
         let path = write_n_line_file(&dir, "huge.rs", 350);
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
@@ -1288,13 +1313,15 @@ mod tests {
         assert!(r.success);
         assert!(
             r.output.contains("File skeleton:"),
-            "huge file should still get skeleton; got:\n{}",
+            "huge file should still get skeleton:\n{}",
             r.output
         );
+        // Skeleton path used to expose store_id; merge removed that.
+        // The store is populated invisibly so future range reads can
+        // hit cache.
         assert!(
-            r.output.contains("store_id=fs_"),
-            "auto_skeleton path MUST also expose a store_id so peek_file \
-             can fetch regions; got:\n{}",
+            !r.output.contains("store_id="),
+            "merged design hides store_id from model:\n{}",
             r.output
         );
         assert_eq!(
@@ -1304,21 +1331,31 @@ mod tests {
         );
     }
 
-    /// peek_file with an unknown id returns a friendly error pointing
-    /// at re-read, not a panic or raw error string.
+    /// R2: third read of the same path triggers the soft "Nth read"
+    /// hint — encourages weak models to look up regions freely
+    /// without conservative offset/limit hoarding. The first two
+    /// reads stay clean.
     #[tokio::test]
-    async fn d3_peek_unknown_store_id_recovers_gracefully() {
+    async fn d3_third_read_emits_same_path_hint() {
         let dir = TempDir::new().unwrap();
+        let path = write_n_line_file(&dir, "big.rs", 200);
         let ctx = ToolContext::new(dir.path().to_path_buf());
-        let r = crate::tool::peek::PeekFileTool
-            .execute(r#"{"store_id":"fs_deadbeef","lines":"1-5"}"#, &ctx)
-            .await
-            .unwrap();
-        assert!(!r.success);
+        let args1 = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let args2 = format!(r#"{{"file_path":"{}","offset":50,"limit":10}}"#, path.display());
+        let args3 = format!(r#"{{"file_path":"{}","offset":100,"limit":10}}"#, path.display());
+        let r1 = ReadFileTool.execute(&args1, &ctx).await.unwrap();
+        let r2 = ReadFileTool.execute(&args2, &ctx).await.unwrap();
+        let r3 = ReadFileTool.execute(&args3, &ctx).await.unwrap();
+        assert!(r1.success && r2.success && r3.success);
         assert!(
-            r.output.contains("Re-issue read_file"),
-            "must point the model at recovery; got:\n{}",
-            r.output
+            !r1.output.contains("3rd read") && !r1.output.contains("2nd read"),
+            "first read must be clean of count hints:\n{}",
+            r1.output
+        );
+        assert!(
+            r3.output.contains("3rd read"),
+            "third read must surface the count hint:\n{}",
+            r3.output
         );
     }
 }

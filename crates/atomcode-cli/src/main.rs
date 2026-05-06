@@ -28,7 +28,6 @@ use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::glob::GlobTool;
 use atomcode_core::tool::grep::GrepTool;
 use atomcode_core::tool::list_dir::ListDirTool;
-use atomcode_core::tool::peek::PeekFileTool;
 use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::search_replace::SearchReplaceTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
@@ -1032,12 +1031,6 @@ async fn run() -> Result<i32> {
     let mut tool_registry = ToolRegistry::new();
     if enabled("read_file") {
         tool_registry.register_sync(Box::new(ReadFileTool));
-        // peek_file is the D3 companion to read_file: large reads cache
-        // their content in FileStore, peek_file fetches regions without
-        // disk hits or duplicated content carry. Gated by the same
-        // toggle so a deployment that disables read_file (rare) also
-        // drops peek_file — without read_file there's nothing to peek.
-        tool_registry.register_sync(Box::new(PeekFileTool));
     }
     if enabled("write_file") {
         tool_registry.register_sync(Box::new(WriteFileTool));

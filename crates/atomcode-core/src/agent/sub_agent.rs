@@ -828,7 +828,6 @@ mod tests {
     fn make_full_tool_registry() -> ToolRegistry {
         let mut r = ToolRegistry::new();
         r.register_sync(Box::new(crate::tool::read::ReadFileTool));
-        r.register_sync(Box::new(crate::tool::peek::PeekFileTool));
         r.register_sync(Box::new(crate::tool::write::WriteFileTool));
         r.register_sync(Box::new(crate::tool::edit::EditFileTool));
         r.register_sync(Box::new(crate::tool::bash::BashTool));

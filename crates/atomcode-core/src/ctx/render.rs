@@ -105,22 +105,8 @@ pub fn build_messages(
         );
     }
 
-    let mut result = Vec::with_capacity(conv.messages.len() + 4);
+    let mut result = Vec::with_capacity(conv.messages.len() + 3);
     result.push(system_msg);
-
-    // D3 path C — file-store reminder. Lives just under the system
-    // prompt so the model sees a stable, addressable list of cached
-    // files every turn. Without this, store_ids only appeared inside
-    // individual ToolResult messages and got destroyed when the
-    // cold-zone compactor summarised those turns away. The bytes
-    // survived in FileStore but the model couldn't reach them.
-    //
-    // Rendered AFTER the main system prompt and BEFORE the cold zone
-    // summary so the reminder is fresh on every render and doesn't
-    // get folded into a future cold-zone summary.
-    if let Some(reminder) = render_file_store_reminder(&conv.active_files_snapshot) {
-        result.push(Message::new(Role::System, reminder));
-    }
 
     // Inject cold zone summaries (if any)
     if !conv.cold_summaries.is_empty() {
@@ -635,46 +621,6 @@ fn compress_turn(turn_num: usize, turn_msgs: &[Message]) -> String {
     )
 }
 
-/// Render the file-store snapshot as a single system-level reminder.
-/// Returns `None` for an empty snapshot — caller skips the push so we
-/// don't pollute the prompt with an empty notice.
-///
-/// Format: one header + one bullet per file. Token budget is bounded
-/// by the snapshot cap (default 10) × ~25 tokens/file ≈ 250 tokens.
-/// Compared with the cumulative cost of letting compaction destroy
-/// store_ids and forcing re-reads, this is cheap.
-///
-/// Example output (3 files):
-/// ```text
-/// [FileStore — content cached locally for cheap re-access. Use
-///  peek_file({store_id, lines:"X-Y"}) to read any region without a
-///  disk hit. Refreshed each turn from the live store.]
-/// - /src/server/tunnel.rs → store_id=fs_abc12345 (753 lines)
-/// - /src/server/api.rs    → store_id=fs_def67890 (451 lines)
-/// - /src/types.rs         → store_id=fs_11223344 (39 lines)
-/// ```
-fn render_file_store_reminder(
-    snapshot: &[crate::ctx::file_store::FileSummary],
-) -> Option<String> {
-    if snapshot.is_empty() {
-        return None;
-    }
-    let mut buf = String::from(
-        "[FileStore — content cached locally for cheap re-access. Use \
-         peek_file({store_id, lines:\"X-Y\"}) to read any region without \
-         a disk hit. Refreshed each turn from the live store.]\n",
-    );
-    for s in snapshot {
-        buf.push_str(&format!(
-            "- {} → store_id={} ({} lines)\n",
-            s.path.display(),
-            s.store_id,
-            s.line_count
-        ));
-    }
-    Some(buf)
-}
-
 /// Fallback windowing when no turns are tracked.
 /// Keeps as many recent messages as fit within 60% of remaining budget.
 fn build_messages_fallback(
@@ -696,11 +642,8 @@ fn build_messages_fallback(
     }
     start = snap_to_valid_boundary(&conv.messages, start);
 
-    let mut result = Vec::with_capacity(conv.messages.len() - start + 2);
+    let mut result = Vec::with_capacity(conv.messages.len() - start + 1);
     result.push(system_msg);
-    if let Some(reminder) = render_file_store_reminder(&conv.active_files_snapshot) {
-        result.push(Message::new(Role::System, reminder));
-    }
     result.extend(conv.messages[start..].iter().cloned());
     sanitize_messages(&mut result);
     result
@@ -2029,108 +1972,4 @@ mod tests {
         );
     }
 
-    // ── D3 path C: file-store reminder injection ──
-
-    use crate::ctx::file_store::FileSummary;
-    use std::path::PathBuf;
-    use std::time::SystemTime;
-
-    fn make_summary(path: &str, store_id: &str, lines: usize) -> FileSummary {
-        FileSummary {
-            path: PathBuf::from(path),
-            store_id: store_id.to_string(),
-            line_count: lines,
-            mtime: SystemTime::UNIX_EPOCH,
-        }
-    }
-
-    #[test]
-    fn render_file_store_reminder_empty_returns_none() {
-        // Empty snapshot must not push a stub system message — the
-        // prompt should look identical to a session that never used
-        // FileStore at all.
-        assert!(super::render_file_store_reminder(&[]).is_none());
-    }
-
-    #[test]
-    fn render_file_store_reminder_single_file_format() {
-        let s = vec![make_summary("/src/api.rs", "fs_a1b2c3", 451)];
-        let out = super::render_file_store_reminder(&s).expect("non-empty");
-        assert!(out.starts_with("[FileStore"));
-        assert!(out.contains("peek_file"));
-        assert!(out.contains("/src/api.rs"));
-        assert!(out.contains("fs_a1b2c3"));
-        assert!(out.contains("451 lines"));
-    }
-
-    #[test]
-    fn render_file_store_reminder_lists_each_file_on_own_line() {
-        let s = vec![
-            make_summary("/a.rs", "fs_aa", 100),
-            make_summary("/b.rs", "fs_bb", 200),
-            make_summary("/c.rs", "fs_cc", 300),
-        ];
-        let out = super::render_file_store_reminder(&s).unwrap();
-        // One bullet per file (`- /…`), not all crammed into one line.
-        let bullet_count = out.matches("- /").count();
-        assert_eq!(bullet_count, 3, "got: {}", out);
-    }
-
-    #[test]
-    fn build_messages_injects_reminder_when_snapshot_present() {
-        let mut conv = Conversation::default();
-        conv.add_user_message("hello");
-        conv.active_files_snapshot = vec![make_summary("/x.rs", "fs_42", 80)];
-        let (msgs, _) = build_messages(&conv, "SYS", 64_000, "");
-        let injected = msgs.iter().any(|m| matches!(m.role, Role::System) && {
-            m.text().map(|t| t.contains("fs_42") && t.contains("/x.rs")).unwrap_or(false)
-        });
-        assert!(
-            injected,
-            "system-level reminder must appear in build_messages output:\n{:#?}",
-            msgs.iter().map(|m| (m.role.clone(), m.text())).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn build_messages_skips_reminder_when_snapshot_empty() {
-        let mut conv = Conversation::default();
-        conv.add_user_message("hello");
-        // active_files_snapshot defaults to empty; explicit for clarity.
-        conv.active_files_snapshot = Vec::new();
-        let (msgs, _) = build_messages(&conv, "SYS", 64_000, "");
-        let has_filestore_msg = msgs.iter().any(|m| {
-            m.text().map(|t| t.contains("FileStore")).unwrap_or(false)
-        });
-        assert!(
-            !has_filestore_msg,
-            "no FileStore stub when snapshot is empty"
-        );
-    }
-
-    #[test]
-    fn snapshot_field_survives_apply_compression() {
-        // The whole point of path C: cold-zone summarisation removes
-        // the conversation messages where store_ids first appeared, but
-        // active_files_snapshot must be untouched so the next render
-        // can still address peek_file by id.
-        let mut conv = Conversation::default();
-        for i in 0..15 {
-            conv.add_user_message(&format!("user msg {}", i));
-            conv.add_assistant_tool_calls(
-                Some(&format!("turn {} response", i)),
-                vec![],
-                None,
-            );
-        }
-        conv.active_files_snapshot = vec![
-            make_summary("/api.rs", "fs_keep_me", 451),
-            make_summary("/lib.rs", "fs_also_keep", 220),
-        ];
-        // apply_compression drops the oldest N messages and pushes a
-        // summary into cold_summaries. It MUST NOT touch active_files_snapshot.
-        conv.apply_compression(8, "earlier turns summary".to_string());
-        assert_eq!(conv.active_files_snapshot.len(), 2);
-        assert_eq!(conv.active_files_snapshot[0].store_id, "fs_keep_me");
-    }
 }
