@@ -1140,13 +1140,11 @@ async fn run() -> Result<i32> {
         None
     };
 
-    // Start with a fresh conversation each session. The TUI replays
-    // `session_to_continue` (when present) into scrollback for visual
-    // continuity, but the agent's model context starts empty —
-    // re-injecting raw messages caused old tool_call format
-    // incompatibilities, stale file paths from old working dirs, and
-    // 100+ message context pollution. Users who want full model-side
-    // restoration use the `/resume` slash command.
+    // Start with a fresh conversation each session. When `session_to_continue`
+    // is present (via `-c` / `--continue`), the TUI replays the prior session's
+    // messages into scrollback AND sends them to the agent via
+    // `AgentCommand::SetMessages` so the model context is fully restored.
+    // Bare `atomcode` (no `-c`) starts completely fresh.
     let conversation = Conversation::new();
 
     let (mut agent_loop, agent_handle) = AgentLoop::new(

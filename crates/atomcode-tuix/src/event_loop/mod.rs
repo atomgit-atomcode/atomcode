@@ -178,11 +178,10 @@ pub struct LoopCtx {
     /// and ellipsis. Same value as `RetainedRenderer` was constructed
     /// with — single source of truth.
     pub caps: crate::terminal::TerminalCaps,
-    /// Session loaded by the CLI auto-continue path (`atomcode -c` or
-    /// the default behavior of `atomcode` when a prior session exists
-    /// for this working dir). Replayed into scrollback once on first
-    /// `run_loop` entry, then dropped — purely visual continuity, the
-    /// agent's model context starts fresh.
+    /// Session loaded by the CLI auto-continue path (`atomcode -c` /
+    /// `--continue`). Replayed into scrollback AND restored into the
+    /// agent's model context via `AgentCommand::SetMessages` on first
+    /// `run_loop` entry, then dropped — matching `/resume` behaviour.
     pub replay_on_start: Option<atomcode_core::session::Session>,
 }
 
@@ -1163,17 +1162,27 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     }
 
     // Auto-continue: if the CLI loaded the most recent session for this
-    // working dir, replay its messages into scrollback so the user sees
-    // "where I left off". Visual-only — agent context starts fresh, so
-    // any follow-up question that depends on prior history will surprise
-    // the user. The hint below sets that expectation. Users who want
-    // full restoration (model context too) should run `/resume`.
+    // working dir (via `atomcode -c` / `--continue`), replay its messages
+    // into scrollback AND restore the agent's model context so follow-up
+    // questions can reference prior conversation. This mirrors the `/resume`
+    // slash command's behaviour: visual replay + AgentCommand::SetMessages.
     if let Some(session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
             crate::modals::session_picker::replay_session(renderer, &session, false);
+            // Sync messages into the agent loop so the LLM has full context.
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SetMessages(session.messages.clone()))
+                .ok();
+            // Continue accumulating into the same session file — future
+            // TurnComplete saves overwrite it instead of creating a new one.
+            if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
+                ctx.telemetry.set_session_id(uuid);
+            }
+            ctx.current_session = session;
+            app.state.on_turn_complete();
             renderer.render(UiLine::CommandOutput(
-                "  ⓘ Showing previous session — model context starts fresh.\n    \
-                 Use /resume to fully restore the conversation including model memory.\n\n"
+                "  ⓘ Previous session restored — conversation context is available.\n\n"
                     .into(),
             ));
             renderer.flush();

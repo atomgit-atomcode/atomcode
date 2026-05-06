@@ -851,7 +851,12 @@ impl AgentLoop {
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
+                    // Rebuild turn_tracker so the context builder can use
+                    // proper turn-based windowing instead of the fallback path.
+                    let turn_tracker =
+                        crate::conversation::turn::TurnTracker::rebuild(&messages);
                     self.conversation.messages = messages;
+                    self.conversation.turn_tracker = turn_tracker;
                 }
                 AgentCommand::SetPlanMode(enabled) => {
                     self.plan_mode = enabled;
