@@ -629,7 +629,6 @@ impl AgentLoop {
             ctx: ctx.clone(),
             permission: interactive_permission,
             recently_edited_files: Vec::new(),
-            recent_calls: Vec::new(),
             hook_executor: hook_executor.clone(),
         };
 

@@ -127,16 +127,14 @@ impl Tool for ReadFileTool {
         };
         let path_ref = path.as_path();
 
-        // ── Read cache: performance optimization + redundant-read signaller ──
-        // Cache stores (mtime, rendered_output, hit_count). If mtime matches, skip
-        // disk read + UTF-8 parse + tree-sitter and return the cached output. On
-        // the 2nd+ identical hit (same path/offset/limit/mtime), prepend a
-        // count-aware NOTE telling the model that the content hasn't changed and
-        // re-issuing this call will keep returning the same bytes — replaces the
-        // old runner-side BLOCKED guard, which was a soft-text error the model
-        // could (and did) ignore. By returning the answer + a stop signal instead
-        // of refusing the call, models that were stuck in a "retry on error"
-        // reflex see useful content + a clear hint to switch tactics.
+        // ── Read cache: pure performance optimization ──
+        // Cache stores (mtime, rendered_output). If mtime matches the
+        // current disk state, return the cached output directly —
+        // saves UTF-8 decode + tree-sitter cost on identical re-reads.
+        // No model-visible meta-commentary on cache hits: the cached
+        // bytes are returned silently, same way Claude Code's Read
+        // tool replays content. Aligns with the "framework doesn't
+        // educate the model about its own behaviour" principle.
         let cache_key: crate::tool::ReadCacheKey = (path.clone(), parsed.offset, parsed.limit);
         let disk_mtime = tokio::fs::metadata(&path)
             .await
@@ -144,34 +142,11 @@ impl Tool for ReadFileTool {
             .and_then(|m| m.modified().ok());
         if let Some(mtime) = disk_mtime {
             let cached = ctx.read_cache.read().await.get(&cache_key).cloned();
-            if let Some((cached_mtime, cached_output, prior_count)) = cached {
+            if let Some((cached_mtime, cached_output, _)) = cached {
                 if cached_mtime == mtime {
-                    let new_count = prior_count + 1;
-                    // Persist the bumped count so the next hit's note keeps escalating.
-                    ctx.read_cache.write().await.insert(
-                        cache_key.clone(),
-                        (mtime, cached_output.clone(), new_count),
-                    );
-                    let display_name = std::path::Path::new(&parsed.file_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| parsed.file_path.clone());
-                    let output = if new_count >= 2 {
-                        format!(
-                            "[NOTE: this region of `{}` has been read {} times this session — \
-                             the file hasn't changed since the previous read so the content \
-                             below is byte-identical. Re-issuing this same call will keep \
-                             returning these same bytes. If you need different information, \
-                             jump to a different offset/limit, switch to a different file, \
-                             or stop reading and proceed with the answer you already have.]\n\n{}",
-                            display_name, new_count, cached_output
-                        )
-                    } else {
-                        cached_output
-                    };
                     return Ok(ToolResult {
                         call_id: String::new(),
-                        output,
+                        output: cached_output,
                         success: true,
                     });
                 }
@@ -827,13 +802,13 @@ mod tests {
         );
     }
 
-    /// 2nd+ identical read prepends a count-aware note so the model can see
-    /// the file hasn't changed and stop re-issuing the same call. Replaces
-    /// the BLOCKED text error from the deleted Pattern 1 guard, which was a
-    /// soft signal the model ignored — observed in the field with the cap
-    /// counter climbing to "5-call cap" across consecutive turns.
+    /// 2nd+ identical read returns the cached output silently — no
+    /// model-visible meta-commentary. Aligns with Claude Code's Read
+    /// tool behaviour: cache is a performance optimisation, not a
+    /// teaching tool. The "you've read this N times" preamble that
+    /// the previous version prepended has been removed.
     #[tokio::test]
-    async fn read_cache_hits_prepend_repeat_note_after_first_replay() {
+    async fn read_cache_hits_replay_silently() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "fn main() {}\n").unwrap();
@@ -842,34 +817,18 @@ mod tests {
         let tool = ReadFileTool;
         let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
 
-        // 1st read: cache miss, no note.
         let r1 = tool.execute(&args, &ctx).await.unwrap();
-        assert!(!r1.output.starts_with("[NOTE:"), "1st read must not have a note");
-        assert!(r1.success);
-
-        // 2nd read: cache hit, note kicks in (count=2).
         let r2 = tool.execute(&args, &ctx).await.unwrap();
-        assert!(r2.success, "2nd read must still succeed (not BLOCKED)");
-        assert!(
-            r2.output.starts_with("[NOTE:"),
-            "2nd read must prepend the repeat-read note\nGot: {}",
-            &r2.output[..r2.output.len().min(120)]
-        );
-        assert!(
-            r2.output.contains("read 2 times"),
-            "note must report the running count\nGot: {}",
-            &r2.output[..r2.output.len().min(200)]
-        );
-        // The actual file content survives below the note.
-        assert!(r2.output.contains("fn main"));
-
-        // 3rd read: count keeps escalating.
         let r3 = tool.execute(&args, &ctx).await.unwrap();
-        assert!(r3.success);
-        assert!(
-            r3.output.contains("read 3 times"),
-            "3rd read note must report 3, not stay at 2"
-        );
+        assert!(r1.success && r2.success && r3.success);
+        // No "you've read N times" preamble on any replay.
+        for r in [&r2, &r3] {
+            assert!(
+                !r.output.contains("times this session"),
+                "no meta-commentary on cache hits; got:\n{}",
+                r.output
+            );
+        }
     }
 
     /// Cache miss after file content changes — mtime shifts, cached entry is ignored.

@@ -1878,7 +1878,6 @@ async fn process_chat_request(
         ctx: daemon_ctx,
         permission,
         recently_edited_files: Vec::new(),
-        recent_calls: Vec::new(),
         hook_executor: std::sync::Arc::new(atomcode_core::hook::executor::HookExecutor::new(
             atomcode_core::hook::json_config::load_hooks_config(&working_dir),
         )),
