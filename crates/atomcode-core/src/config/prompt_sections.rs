@@ -24,10 +24,23 @@ Guidelines:
 - STOP WHEN STUCK: if after 3 rounds of search/read you haven't found the issue, stop. Tell the user what you checked and suggest next diagnostic steps (e.g., runtime logs, environment checks, reproduction steps). Do NOT keep searching for something that may not be in the code.
 
 ## TOOLS:
-Call multiple tools in ONE turn. Do NOT split into separate turns.\n\
-Example: creating 3 files → call write_file 3 times in ONE response.\n\
-Example: reading 4 files → call read_file 4 times in ONE response.\n\
-Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns. A multi-step deploy or restart (build → stop old → upload → start → verify) is ONE bash call. Each separate turn round-trips through the LLM and adds 5-30s of latency for nothing. Exception: when the next step's command genuinely depends on observing the previous step's output — then split.\n\
+Call multiple tools in ONE turn whenever they have NO data dependency on each other. Each separate turn round-trips through the LLM and adds 5-30s of latency for nothing.\n\
+\n\
+MANDATORY parallel scenarios (must be ONE turn):\n\
+- Reading multiple files for context: read_file × N in one response.\n\
+- Searching for multiple patterns or paths: grep × N / glob × N in one response.\n\
+- Creating multiple new files: write_file × N in one response.\n\
+\n\
+Sequential is OK ONLY when step N+1's command DEPENDS on step N's output (edit then verify; check error then fix; test then commit).\n\
+\n\
+WRONG (4 turns, ~120s wasted):\n\
+  turn 1: read_file A.rs\n\
+  turn 2: read_file B.rs\n\
+  turn 3: read_file C.rs\n\
+  turn 4: read_file D.rs\n\
+RIGHT (1 turn): read_file A.rs + read_file B.rs + read_file C.rs + read_file D.rs all in one response.\n\
+\n\
+Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns. A multi-step deploy or restart (build → stop old → upload → start → verify) is ONE bash call. Exception: when the next step's command genuinely depends on observing the previous step's output — then split.\n\
 The fewer turns you use, the better.\n\
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives you skeletons for large files, \"Did you mean\" suggestions when the path is off by a directory, recovery hints for binary / non-UTF-8 formats, and per-session caching. `bash cat` has none of these and makes weak models cycle through wrong paths for turns.\n\
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.\n\
@@ -100,6 +113,66 @@ mod tests {
             p.contains("ONE bash call"),
             "must call out the unit of chunking"
         );
+    }
+
+    /// Lock the parallel-mandate guidance. 5-7 atomgr datalog (build 2e6621f)
+    /// 24 turn / 24 tool calls = 1.0 tool/turn average — model burns turns
+    /// on independent reads/greps that should fly in parallel. The
+    /// guidance teaches MANDATORY parallel scenarios + a concrete WRONG/
+    /// RIGHT contrast so weak models with low directive-uptake can
+    /// pattern-match and chunk correctly.
+    #[test]
+    fn unified_prompt_includes_mandatory_parallel_scenarios() {
+        let p = build_rules();
+        assert!(
+            p.contains("MANDATORY parallel"),
+            "TOOLS section must keep the mandatory-parallel header"
+        );
+        assert!(
+            p.contains("read_file × N"),
+            "must enumerate the read-many scenario"
+        );
+        assert!(
+            p.contains("grep × N"),
+            "must enumerate the search-many scenario"
+        );
+        assert!(
+            p.contains("write_file × N"),
+            "must enumerate the create-many scenario"
+        );
+        assert!(
+            p.contains("WRONG") && p.contains("RIGHT"),
+            "must include the WRONG/RIGHT contrast example"
+        );
+        assert!(
+            p.contains("DEPENDS on step N's output"),
+            "must explain when sequential is actually correct"
+        );
+    }
+
+    /// Tech-stack-neutrality check for the parallel guidance paragraph.
+    /// Other prompt sections may mention concrete commands (`cargo check`,
+    /// `tsc --noEmit`), but the parallel paragraph stays at the generic
+    /// tool-name level (read_file / grep / glob / write_file are
+    /// framework-internal tool names, not tech-stack keywords).
+    #[test]
+    fn parallel_guidance_paragraph_stays_tech_neutral() {
+        let p = build_rules();
+        let start = p
+            .find("MANDATORY parallel")
+            .expect("parallel guidance must exist");
+        // Inspect ~700 chars after the anchor (covers the WRONG/RIGHT
+        // contrast block too).
+        let para_end = (start + 700).min(p.len());
+        let para = &p[start..para_end];
+        for forbidden in &["cargo ", "npm ", "pytest", "go build", "mvn ", "gradle "] {
+            assert!(
+                !para.contains(forbidden),
+                "parallel guidance must stay tech-neutral; found `{}` in:\n{}",
+                forbidden,
+                para
+            );
+        }
     }
 
     /// Tech-stack-neutrality check: the chunking paragraph stays generic.
