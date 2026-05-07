@@ -391,6 +391,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             format!("{}({})", safe_name, safe_detail)
         };
+        // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+        // commands) from producing hundreds of terminal lines.
+        // This is a rendering safeguard only — the actual command
+        // execution uses the original, untruncated arguments.
+        let body_str = truncate_body_str(&body_str, 500);
         // Remove previously rendered inflight tool rows.
         let remove = self.inflight_tool_rows.min(self.body_lines.len());
         self.body_lines.truncate(self.body_lines.len() - remove);
@@ -1077,6 +1082,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 format!("{}({})", safe_name, safe_detail)
             };
+            // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+            // commands) from producing hundreds of terminal lines.
+            let body_str = truncate_body_str(&body_str, 500);
             // Clear any previously rendered inflight tool rows so
             // push_body_prefixed appends fresh committed lines.
             self.live_spinner_active = false;
@@ -1732,7 +1740,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     format!("{}({})", safe_name, safe_detail)
                 };
-                // Approximate AnsiRenderer's "▸ NAME(detail)" where
+                // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+                // commands) from producing hundreds of terminal lines.
+                let body_str = truncate_body_str(&body_str, 500);
                 // only NAME is bolded; retained uses a uniform style
                 // for the tool-call line (acceptable in Phase 4,
                 // tightens in Phase 5/6).
@@ -2309,6 +2319,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
         self.last_painted_footer_rows = self.current_footer_rows();
         self.dirty = false;
+    }
+}
+
+/// Truncate `body_str` to at most `max_chars` display-width characters,
+/// preserving whole characters (not splitting multi-byte sequences).
+/// This is a rendering safeguard to prevent degenerate bodies
+/// (e.g. multi-KB bash commands) from producing hundreds of terminal lines.
+fn truncate_body_str(body_str: &str, max_chars: usize) -> String {
+    if let Some((idx, _)) = body_str.char_indices().nth(max_chars) {
+        format!("{}… (truncated)", &body_str[..idx])
+    } else {
+        body_str.to_string()
     }
 }
 

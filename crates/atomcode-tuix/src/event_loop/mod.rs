@@ -857,7 +857,19 @@ mod tool_format_tests {
     }
 
     #[test]
-    fn format_tool_detail_bash_preserves_full_command() {
+    fn format_tool_detail_bash_truncates_at_500() {
+        let args = format!(r#"{{"command":"{}"}}"#, "a".repeat(600));
+        let out = format_tool_detail("bash", &args);
+        // `truncate_with_ellipsis` preserves `max_cols-1` display columns
+        // (499) then appends '…' (display width 1, 3 UTF-8 bytes).
+        // Display width = 500, byte length = 502.
+        assert_eq!(out.len(), 502, "byte length: 499 'a' + 3-byte '…'");
+        assert!(out.ends_with('…'), "should end with Unicode ellipsis");
+        assert_eq!(&out[..499], "a".repeat(499));
+    }
+
+    #[test]
+    fn format_tool_detail_bash_preserves_short_command() {
         let args = format!(r#"{{"command":"{}"}}"#, "a".repeat(500));
         let out = format_tool_detail("bash", &args);
         // Full command preserved — `push_body_prefixed` handles wrapping
@@ -3688,7 +3700,9 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
         "grep" => get_str("pattern")
             .map(|p| crate::width::truncate_with_ellipsis(&p, 100))
             .unwrap_or_default(),
-        "bash" => get_str("command").unwrap_or_default(),
+        "bash" => get_str("command")
+            .map(|c| crate::width::truncate_with_ellipsis(&c, 500))
+            .unwrap_or_default(),
         "list_directory" | "change_dir" => get_str("path").unwrap_or_else(|| ".".into()),
         "web_fetch" => get_str("url")
             .map(|u| crate::width::truncate_with_ellipsis(&u, 150))
