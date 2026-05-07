@@ -165,13 +165,24 @@ pub struct NotificationConfig {
 }
 
 /// Controls LSP (Language Server Protocol) integration.
+///
+/// Off by default. 5-7 atomgr datalog (build 942b615): the only `diagnostics`
+/// call in a 99-turn session took 33.6s (cold rust-analyzer spin-up) and
+/// returned "No diagnostics found", contributing nothing to task completion.
+/// LSP is also platform/toolchain-specific (rust-analyzer, gopls, etc.) and
+/// pulling those binaries unprompted violates the project's
+/// tech-stack-neutrality rule. Users who want it can flip `enabled = true`
+/// in their config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspConfig {
-    /// Master switch for LSP diagnostics.
-    #[serde(default = "default_true")]
+    /// Master switch for LSP diagnostics. Off by default — opt-in only.
+    #[serde(default)]
     pub enabled: bool,
-    /// Automatically detect and start language servers from the built-in registry.
-    #[serde(default = "default_true")]
+    /// Automatically detect and start language servers from the built-in
+    /// registry. Off by default — even when `enabled = true`, users must
+    /// explicitly opt in to auto-detect (or list specific `servers`) to
+    /// avoid surprising the user with binary spawns.
+    #[serde(default)]
     pub auto_detect: bool,
     /// Custom server configurations keyed by file extension.
     #[serde(default)]
@@ -190,8 +201,8 @@ fn default_diagnostics_settle_delay_ms() -> u64 {
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            auto_detect: true,
+            enabled: false,
+            auto_detect: false,
             servers: Default::default(),
             diagnostics_settle_delay_ms: default_diagnostics_settle_delay_ms(),
         }
@@ -429,6 +440,39 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LSP must default to disabled. 5-7 atomgr datalog (build 942b615):
+    /// the only `diagnostics` call in 99 turns took 33.6s for a "No
+    /// diagnostics found" reply. Spinning up rust-analyzer / gopls /
+    /// pyright unprompted also conflicts with the framework's
+    /// tech-stack-neutrality stance. Users must opt in explicitly.
+    #[test]
+    fn lsp_config_defaults_to_disabled_opt_in() {
+        let cfg = LspConfig::default();
+        assert!(!cfg.enabled, "LSP enabled must default to false");
+        assert!(
+            !cfg.auto_detect,
+            "LSP auto_detect must default to false even if enabled flips on"
+        );
+    }
+
+    /// Empty/missing `[lsp]` section in user TOML must produce the
+    /// disabled default — not silently flip back to enabled via a
+    /// stray `default = "default_true"` serde attribute.
+    #[test]
+    fn lsp_section_omitted_in_toml_yields_disabled() {
+        let toml_str = r#"
+            default_provider = "claude"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-ant-test"
+            model = "claude-opus-4-6"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("config parses");
+        assert!(!cfg.lsp.enabled, "missing [lsp] must keep LSP off");
+        assert!(!cfg.lsp.auto_detect);
+    }
 
     #[test]
     fn test_resolve_config_dir_uses_env_when_set() {
