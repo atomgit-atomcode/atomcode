@@ -1064,6 +1064,10 @@ mod tests {
             LanguageRegistry::detect(Path::new("Program.cs")),
             Some(Lang::CSharp)
         );
+        assert_eq!(
+            LanguageRegistry::detect(Path::new("index.php")),
+            Some(Lang::Php)
+        );
         assert_eq!(LanguageRegistry::detect(Path::new("readme.md")), None);
     }
 
@@ -1179,6 +1183,37 @@ interface IGreeter {
         assert!(names.contains(&"Program"), "symbols: {:?}", names);
         assert!(names.contains(&"Main"), "symbols: {:?}", names);
         assert!(names.contains(&"IGreeter"), "symbols: {:?}", names);
+    }
+
+    #[test]
+    fn test_list_symbols_php() {
+        let mut searcher = SemanticSearcher::new();
+        let source = r#"
+<?php
+
+class Calculator {
+    public function add($a, $b) {
+        return $a + $b;
+    }
+}
+
+function greet($name) {
+    return "Hello, $name";
+}
+
+interface Printable {
+    public function print();
+}
+"#;
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".php").unwrap();
+        tmp.write_all(source.as_bytes()).unwrap();
+
+        let symbols = searcher.list_symbols(tmp.path()).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Calculator"), "php: {:?}", names);
+        assert!(names.contains(&"add"), "php: {:?}", names);
+        assert!(names.contains(&"greet"), "php: {:?}", names);
+        assert!(names.contains(&"Printable"), "php: {:?}", names);
     }
 
     #[test]
