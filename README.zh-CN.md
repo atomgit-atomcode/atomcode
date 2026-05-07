@@ -102,7 +102,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 - **实时流式输出** —— Markdown 渲染 + 语法高亮
 - **代码块** —— 语言标签、行号、`base16-ocean.dark` 主题
-- **多行输入** —— Shift+Enter 换行、高度自适应、历史记录
+- **多行输入** —— Shift+Enter 或 `\` + Enter 换行、高度自适应、历史记录
 - **任务完成通知** —— 长任务结束后优先走终端原生通知协议，必要时回退到系统通知
 - **文本选择** —— 鼠标拖选、自动滚动、复制到剪贴板
 - **斜杠命令** —— `/model`、`/provider`、`/resume`、`/diff`、`/undo`、`/cost`、`/clear`、`/compact` 等（完整列表见下）
@@ -240,6 +240,7 @@ atomcode --prompt-file task.md
 | `Shift+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
 | `Ctrl+Enter` | 换行（所有终端通用，macOS 推荐） |
 | `Alt+Enter` | 换行（Linux/Windows 终端可用） |
+| `\` + `Enter` | 换行（所有终端通用） |
 | `Esc` | 清空输入 / 取消流式输出 |
 | `Up/Down` | 浏览输入历史 |
 | `Tab` | 接受补全 |

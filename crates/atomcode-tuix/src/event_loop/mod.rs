@@ -346,6 +346,19 @@ impl Buffer {
                 if line.is_empty() {
                     return BufferResult::Redraw;
                 }
+
+                // Trailing backslash before Enter means
+                // "continue line" instead of send. Strip the backslash,
+                // insert a real newline, and stay in edit mode.
+                if line.ends_with('\\') {
+                    // Find the position of the trailing backslash in the
+                    // original text (trim_end gives us its index).
+                    let pos = self.text.trim_end().len() - 1;
+                    self.text.remove(pos);
+                    self.text.insert(pos, '\n');
+                    self.cursor = pos + 1;
+                    return BufferResult::Redraw;
+                }
                 BufferResult::Commit(line)
             }
             Action::InsertNewline => {
