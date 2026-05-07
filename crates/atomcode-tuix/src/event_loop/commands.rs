@@ -705,6 +705,79 @@ pub(super) fn execute_slash_command(
         }
         "mcp" => {
             let sub = arg.trim();
+            if let Some(rest) = sub.strip_prefix("login") {
+                let server = rest.trim();
+                if server.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  Usage: /mcp login <server>\n  Example: /mcp login github\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+                if server != "github" {
+                    renderer.render(UiLine::Error(format!(
+                        "  unsupported MCP OAuth provider/server: {}\n",
+                        server
+                    )));
+                    renderer.flush();
+                    return Ok(());
+                }
+                let Some(client_id) = std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok() else {
+                    renderer.render(UiLine::Error(
+                        "  GitHub MCP OAuth requires ATOMCODE_GITHUB_MCP_CLIENT_ID.\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                };
+                renderer.render(UiLine::CommandOutput(
+                    "  Starting GitHub MCP OAuth in your browser...\n".into(),
+                ));
+                renderer.flush();
+                let scopes = Vec::<String>::new();
+                let result = tokio::task::block_in_place(|| {
+                    atomcode_core::mcp::login_github_oauth(server, &client_id, &scopes)
+                });
+                match result {
+                    Ok(token) => renderer.render(UiLine::CommandOutput(format!(
+                        "  Saved {} OAuth token for MCP server '{}'. Run /mcp reload to connect.\n",
+                        token.provider, server
+                    ))),
+                    Err(e) => renderer.render(UiLine::Error(format!(
+                        "  GitHub MCP OAuth failed: {:#}\n",
+                        e
+                    ))),
+                }
+                renderer.flush();
+                return Ok(());
+            }
+
+            if let Some(rest) = sub.strip_prefix("logout") {
+                let server = rest.trim();
+                if server.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  Usage: /mcp logout <server>\n  Example: /mcp logout github\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+                match atomcode_core::mcp::McpTokenStore::default().delete_token(server) {
+                    Ok(true) => renderer.render(UiLine::CommandOutput(format!(
+                        "  Removed saved OAuth token for MCP server '{}'.\n",
+                        server
+                    ))),
+                    Ok(false) => renderer.render(UiLine::CommandOutput(format!(
+                        "  No saved OAuth token found for MCP server '{}'.\n",
+                        server
+                    ))),
+                    Err(e) => renderer.render(UiLine::Error(format!(
+                        "  MCP OAuth logout failed: {:#}\n",
+                        e
+                    ))),
+                }
+                renderer.flush();
+                return Ok(());
+            }
+
             if sub.eq_ignore_ascii_case("reload") {
                 // Preflight: parse merged MCP config so we can show progress immediately.
                 // (Connection attempts happen in background and may take up to timeout_ms.)

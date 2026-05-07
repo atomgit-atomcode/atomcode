@@ -76,6 +76,18 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return { ...state, messages: [...state.messages, msg] };
     }
 
+    case 'ADD_ASSISTANT_MESSAGE': {
+      const msg: ChatMessage = {
+        id: nextId(),
+        role: 'assistant',
+        text: action.text,
+        toolCalls: [],
+        streaming: false,
+        timestamp: Date.now(),
+      };
+      return { ...state, messages: [...state.messages, msg] };
+    }
+
     // ─── Generation lifecycle ────────────────────────
     case 'START_GENERATION': {
       const assistant: ChatMessage = {

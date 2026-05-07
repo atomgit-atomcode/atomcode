@@ -28,7 +28,10 @@
   "icon": "resources/icon.png",
   "main": "./out/extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCommand:atomcode.explain",
+    "onCommand:atomcode.fix",
+    "onCommand:atomcode.optimize"
   ],
   "contributes": {
     "commands": [
@@ -40,6 +43,10 @@
       {
         "command": "atomcode.openTab",
         "title": "AtomCode: Open in New Tab"
+      },
+      {
+        "command": "atomcode.openPreferredLocation",
+        "title": "AtomCode: Open Preferred Location"
       },
       {
         "command": "atomcode.focusInput",

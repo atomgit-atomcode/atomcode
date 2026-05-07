@@ -377,8 +377,13 @@ body {
   width: 100%;
 }
 .setup-primary {
-  background: var(--app-brand);
-  border-color: var(--app-brand);
+  background: var(--app-button-background);
+  border-color: var(--app-button-background);
+  color: var(--app-button-foreground);
+}
+.setup-primary:hover {
+  background: var(--app-button-hover-background);
+  border-color: var(--app-button-hover-background);
 }
 .setup-secondary,
 .setup-url button {
@@ -579,6 +584,7 @@ body {
   font-size: 12px;
   text-align: left;
   gap: 8px;
+  user-select: none;
 }
 .session-item:hover {
   background: var(--app-list-hover-background);
@@ -607,6 +613,37 @@ body {
   text-align: center;
   color: var(--app-secondary-foreground);
   font-size: 12px;
+}
+.session-context-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 132px;
+  padding: 4px;
+  border: 1px solid var(--app-menu-border);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-menu-background);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+}
+.session-context-item {
+  display: flex;
+  width: 100%;
+  min-height: 28px;
+  align-items: center;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--app-primary-foreground);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.session-context-item:hover {
+  background: var(--app-list-hover-background);
+}
+.session-context-item.danger {
+  color: var(--app-diff-deletion-foreground);
 }
 .settings-overlay {
   position: fixed;
@@ -789,15 +826,9 @@ body {
   animation: blink 1s linear infinite;
 }
 .user-message-wrapper {
-  position: sticky;
-  top: 0;
+  position: relative;
   z-index: 2;
   padding: 10px 0 12px;
-  background-image:
-    linear-gradient(
-      to bottom,
-      var(--app-primary-background) calc(100% - 12px),
-      transparent 100%);
 }
 .user-message-bubble {
   display: block;
@@ -814,6 +845,43 @@ body {
   font-size: 13px;
   line-height: 1.5;
   font-weight: 400;
+}
+.user-message-text {
+  white-space: pre-wrap;
+}
+.user-message-text.is-collapsed {
+  max-height: min(260px, 34vh);
+  overflow: hidden;
+  position: relative;
+}
+.user-message-text.is-collapsed::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 52px;
+  background:
+    linear-gradient(
+      to bottom,
+      transparent,
+      var(--vscode-chat-requestBackground, var(--app-input-background)));
+  pointer-events: none;
+}
+.user-message-toggle {
+  margin-top: 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-primary-background);
+  color: var(--app-link-color);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.user-message-toggle:hover {
+  background: var(--app-ghost-button-hover-background);
 }
 .user-message-attachments {
   display: flex;

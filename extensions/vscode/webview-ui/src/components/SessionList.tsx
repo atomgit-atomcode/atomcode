@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { groupSessionsByDate, formatTimeAgo } from '../utils/format';
 import type { SessionMeta } from '../state/types';
@@ -10,8 +10,9 @@ interface SessionListProps {
 }
 
 export function SessionList({ variant = 'overlay' }: SessionListProps) {
-  const { state, dispatch, loadSession, newConversation } = useChatContext();
+  const { state, dispatch, loadSession, newConversation, renameSession, deleteSession } = useChatContext();
   const [search, setSearch] = useState('');
+  const [menu, setMenu] = useState<{ session: SessionMeta; x: number; y: number } | null>(null);
   const isOverlay = variant === 'overlay';
 
   const filteredSessions = useMemo(() => {
@@ -27,11 +28,53 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
   const groups = useMemo(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
 
   function handleSelect(session: SessionMeta) {
+    setMenu(null);
     loadSession(session.id, session.project_hash);
     if (isOverlay) {
       dispatch({ type: 'TOGGLE_HISTORY' });
     }
   }
+
+  function handleNewSession() {
+    setMenu(null);
+    newConversation();
+    if (isOverlay) {
+      dispatch({ type: 'TOGGLE_HISTORY' });
+    }
+  }
+
+  function handleContextMenu(e: React.MouseEvent, session: SessionMeta) {
+    e.preventDefault();
+    e.stopPropagation();
+    const menuWidth = 132;
+    const menuHeight = 84;
+    setMenu({
+      session,
+      x: Math.min(e.clientX, window.innerWidth - menuWidth - 8),
+      y: Math.min(e.clientY, window.innerHeight - menuHeight - 8),
+    });
+  }
+
+  useEffect(() => {
+    if (!menu) return undefined;
+
+    function close() {
+      setMenu(null);
+    }
+
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') close();
+    }
+
+    window.addEventListener('click', close);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [menu]);
 
   const content = (
     <div className={`session-list session-list-${variant}`} onClick={(e) => e.stopPropagation()}>
@@ -44,7 +87,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
             </button>
           )}
         </div>
-        <button className="session-new-btn" onClick={() => newConversation()}>
+        <button className="session-new-btn" onClick={handleNewSession}>
           <span className="session-new-icon">+</span>
           <span>New session</span>
         </button>
@@ -74,6 +117,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
                       key={`${s.project_hash ?? 'current'}:${s.id}`}
                       className={`session-item${isActive ? ' active' : ''}`}
                       onClick={() => handleSelect(s)}
+                      onContextMenu={(e) => handleContextMenu(e, s)}
                       title={s.name || s.title || 'Untitled'}
                     >
                       <span className="session-item-name">
@@ -90,6 +134,35 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
           })
         )}
       </div>
+      {menu && (
+        <div
+          className="session-context-menu"
+          style={{ left: menu.x, top: menu.y }}
+          onClick={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <button
+            type="button"
+            className="session-context-item"
+            onClick={() => {
+              renameSession(menu.session);
+              setMenu(null);
+            }}
+          >
+            修改名称
+          </button>
+          <button
+            type="button"
+            className="session-context-item danger"
+            onClick={() => {
+              deleteSession(menu.session);
+              setMenu(null);
+            }}
+          >
+            删除会话
+          </button>
+        </div>
+      )}
     </div>
   );
 

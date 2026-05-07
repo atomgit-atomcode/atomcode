@@ -87,11 +87,9 @@
 
 /* === User Message === */
 .user-message-wrapper {
-  position: sticky;
-  top: 0;
+  position: relative;
   z-index: 2;
   padding: 10px 0 12px;
-  background-image: linear-gradient(to bottom, var(--app-primary-background) calc(100% - 12px), transparent 100%);
 }
 
 .user-message-bubble {
@@ -109,6 +107,44 @@
   font-size: 13px;
   line-height: 1.5;
   font-weight: 400;
+}
+
+.user-message-text {
+  white-space: pre-wrap;
+}
+
+.user-message-text.is-collapsed {
+  max-height: min(260px, 34vh);
+  overflow: hidden;
+  position: relative;
+}
+
+.user-message-text.is-collapsed::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 52px;
+  background: linear-gradient(to bottom, transparent, var(--vscode-chat-requestBackground, var(--app-input-background)));
+  pointer-events: none;
+}
+
+.user-message-toggle {
+  margin-top: 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-primary-background);
+  color: var(--app-link-color);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.user-message-toggle:hover {
+  background: var(--app-ghost-button-hover-background);
 }
 
 .user-message-attachments {

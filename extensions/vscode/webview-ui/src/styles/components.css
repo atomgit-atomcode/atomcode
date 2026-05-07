@@ -250,8 +250,14 @@
 }
 
 .setup-primary {
-  background: var(--app-brand);
-  border-color: var(--app-brand);
+  background: var(--app-button-background);
+  border-color: var(--app-button-background);
+  color: var(--app-button-foreground);
+}
+
+.setup-primary:hover {
+  background: var(--app-button-hover-background);
+  border-color: var(--app-button-hover-background);
 }
 
 .setup-secondary,
@@ -457,6 +463,7 @@
   font-size: 12px;
   text-align: left;
   gap: 8px;
+  user-select: none;
 }
 
 .session-item:hover { background: var(--app-list-hover-background); }
@@ -475,6 +482,41 @@
 .session-item-time { font-size: 10px; color: var(--app-secondary-foreground); flex-shrink: 0; }
 
 .session-empty { padding: 20px; text-align: center; color: var(--app-secondary-foreground); font-size: 12px; }
+
+.session-context-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 132px;
+  padding: 4px;
+  border: 1px solid var(--app-menu-border);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-menu-background);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+}
+
+.session-context-item {
+  display: flex;
+  width: 100%;
+  min-height: 28px;
+  align-items: center;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--app-primary-foreground);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-context-item:hover {
+  background: var(--app-list-hover-background);
+}
+
+.session-context-item.danger {
+  color: var(--app-diff-deletion-foreground);
+}
 
 .settings-overlay {
   position: fixed;

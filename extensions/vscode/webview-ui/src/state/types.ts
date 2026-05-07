@@ -117,6 +117,7 @@ export interface ChatState {
 
 export type ChatAction =
   | { type: 'ADD_USER_MESSAGE'; text: string; contextFiles?: ContextFile[] }
+  | { type: 'ADD_ASSISTANT_MESSAGE'; text: string }
   | { type: 'START_GENERATION' }
   | { type: 'APPEND_TEXT'; content: string }
   | { type: 'TOOL_START'; id: string; name: string; args: string }
@@ -152,6 +153,7 @@ export type ChatAction =
 export type ExtensionMessage =
   | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string }
   | { type: 'userMessage'; text: string }
+  | { type: 'assistantMessage'; text: string }
   | { type: 'generationStarted' }
   | { type: 'text'; content: string }
   | { type: 'toolStart'; id?: string; name: string; args: string }
