@@ -859,6 +859,14 @@ fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars
         // 让模型在 edit 系列 turn 里始终看到最新代码。
         // D3 FileStore 已经处理 re-read 的 disk-side 成本；prompt-side
         // 多花 5-10% token 换"模型不丢上下文"，是值得的交易。
+        //
+        // 关于硬编码: 这里直接字符串比较 "read_file"，而非工具自声明
+        // (e.g. trait fn microcompact_eligible)。妥协理由：
+        // (a) "read_file" 是框架自家工具名常量，不是 cargo/npm/pytest
+        //     这类技术栈关键字，不违反"框架对技术栈中立"的项目铁律；
+        // (b) 改成 trait 方法需要把 ToolRegistry 引用穿进 render 层，
+        //     渲染路径调用面增大，收益不抵成本；
+        // (c) 仅此一处，未来如有第二个工具也要豁免，再重构成 trait。
         if tool_name == "read_file" {
             continue;
         }
