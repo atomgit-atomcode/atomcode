@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use futures::StreamExt;
@@ -45,91 +44,6 @@ pub struct TurnRunner {
     pub recently_edited_files: Vec<String>,
     /// Hook executor — runs user-configured lifecycle hooks at tool execution boundaries.
     pub hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
-}
-
-/// Line-granularity of the read-region bucket used by the discipline-layer
-/// re-read soft warning (see `agent/discipline.rs`). A single function body
-/// typically fits in one bucket (most are < 50 lines), so reading different
-/// functions of a large file produces different keys and doesn't trigger
-/// the warning. Shared with `DisciplineState` via `read_region_key` so
-/// writes and reads agree on the key shape.
-pub(crate) const READ_REGION_BUCKET: u64 = 50;
-
-/// Extract the region-bucket key for a `read_file` call so that writers
-/// (agent loop, discipline) and readers (loop guard) agree on the key shape.
-/// Prefer a canonical workspace-resolved path to avoid nested workspace and
-/// basename collisions. Missing / malformed offset → bucket 0 (which is also
-/// the bucket for "whole-file" reads).
-pub(crate) fn read_region_key(args: &str, working_dir: Option<&Path>) -> (String, u64) {
-    let file_key = read_file_key(args, working_dir).unwrap_or_else(|| "<malformed>".to_string());
-    let offset = serde_json::from_str::<serde_json::Value>(args)
-        .ok()
-        .and_then(|v| v.get("offset").and_then(|x| x.as_u64()))
-        .unwrap_or(0);
-    (file_key, offset / READ_REGION_BUCKET)
-}
-
-fn read_file_key(args: &str, working_dir: Option<&Path>) -> Option<String> {
-    let v = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    let fp = v.get("file_path").and_then(|v| v.as_str())?;
-    Some(canonical_or_lexical_path_key(fp, working_dir))
-}
-
-fn canonical_or_lexical_path_key(raw_path: &str, working_dir: Option<&Path>) -> String {
-    if let Some(working_dir) = working_dir {
-        if let Ok(access) = crate::tool::inspect_path_access(raw_path, working_dir) {
-            return access.path.display().to_string();
-        }
-    }
-
-    let expanded = expand_home_for_loop_key(raw_path);
-    let candidate = if expanded.is_absolute() {
-        expanded
-    } else if let Some(working_dir) = working_dir {
-        working_dir.join(expanded)
-    } else {
-        expanded
-    };
-    lexical_normalize_for_loop_key(&candidate)
-        .display()
-        .to_string()
-}
-
-fn expand_home_for_loop_key(path: &str) -> PathBuf {
-    if path == "~" {
-        return crate::tool::real_home_dir().unwrap_or_else(|| PathBuf::from(path));
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return crate::tool::real_home_dir()
-            .map(|home| home.join(rest))
-            .unwrap_or_else(|| PathBuf::from(path));
-    }
-    PathBuf::from(path)
-}
-
-fn lexical_normalize_for_loop_key(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                let can_pop = normalized
-                    .components()
-                    .next_back()
-                    .is_some_and(|last| matches!(last, std::path::Component::Normal(_)));
-                if can_pop {
-                    normalized.pop();
-                } else if normalized.as_os_str().is_empty() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-            std::path::Component::RootDir
-            | std::path::Component::Prefix(_)
-            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
-        }
-    }
-
-    normalized
 }
 
 impl TurnRunner {

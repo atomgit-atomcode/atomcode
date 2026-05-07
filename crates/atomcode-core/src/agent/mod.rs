@@ -313,15 +313,6 @@ pub(crate) struct DisciplineState {
     pub is_negative_feedback: bool,
     pub recent_calls: Vec<(String, u64)>,
     pub build_fail_count: usize,
-    /// Per-region read counter feeding the post-turn "stuck" soft warning
-    /// in `discipline::apply_post_turn_discipline`. The hard per-region
-    /// read-saturation guard that previously lived alongside this counter
-    /// in `TurnRunner` was deleted in favour of cache-replay-with-note
-    /// behaviour in `tool/read.rs`. The soft warning here remains because
-    /// it injects a "you've re-read X repeatedly, re-plan" hint at turn
-    /// end — different mechanism, different intent. See
-    /// `turn::runner::read_region_key` for the key shape.
-    pub file_read_counts: std::collections::HashMap<(String, u64), usize>,
     pub scouting_count: usize,
     pub api_confirmed_working: bool,
     pub consecutive_edits_file: Option<String>,
@@ -1279,7 +1270,6 @@ impl AgentLoop {
         self.discipline_state.silent_tool_rounds = 0;
         // Note: is_negative_feedback is set above, do not reset here.
         self.discipline_state.build_fail_count = 0;
-        self.discipline_state.file_read_counts.clear();
         self.discipline_state.scouting_count = 0;
         self.discipline_state.api_confirmed_working = false;
         self.discipline_state.consecutive_edits_file = None;
@@ -1469,14 +1459,12 @@ impl AgentLoop {
                 let files_edited_this_turn = &mut self.files_edited_this_turn;
                 let active_file = &mut self.active_file;
                 let files_read_this_turn = &mut self.files_read_this_turn;
-                let file_read_counts = &mut self.discipline_state.file_read_counts;
                 let consecutive_reads = &mut self.discipline_state.consecutive_reads;
                 let targeted_read_count = &mut self.discipline_state.targeted_read_count;
                 let last_bash_cmd = &mut self.discipline_state.last_bash_cmd;
                 let session_files = &mut self.session_files;
                 let reindex_tx = &self.reindex_tx;
                 let emitted_tool_ids = &mut self.emitted_tool_ids;
-                let working_dir_for_read_counts = runner.context.working_dir.clone();
 
                 // Tool filtering: diagnosis phase uses read-only tools.
                 // All other turns have full tool access (including edit_file).
@@ -1577,14 +1565,7 @@ impl AgentLoop {
                                                     .map(|n| n.to_string_lossy().to_string())
                                                     .unwrap_or_else(|| fp.to_string());
                                                 session_files.insert(short.clone(), std::path::PathBuf::from(fp));
-                                                // Track per-region read count for the post-turn soft
-                                                // re-plan warning (see
-                                                // `discipline::apply_post_turn_discipline`).
-                                                // Hard guard removed; soft warning still uses this.
                                                 if name == "read_file" {
-                                                    let working_dir = working_dir_for_read_counts.try_read().ok().map(|g| g.clone());
-                                                    let key = crate::turn::runner::read_region_key(arguments, working_dir.as_deref());
-                                                    *file_read_counts.entry(key).or_insert(0) += 1;
                                                     if !files_read_this_turn.contains(&short) {
                                                         files_read_this_turn.push(short);
                                                     }
@@ -1975,8 +1956,6 @@ impl AgentLoop {
                     // Model runs build/lint itself when needed.
                     // See docs/archive/guardian-auto-compile.md if re-introducing.
 
-                    // Apply discipline: inject status reminders (no STOP commands).
-                    self.apply_post_turn_discipline();
                     // Safety cap at 200 tool calls — only for runaway cost protection.
                     if self.check_step_limit() {
                         self.finish_turn(TurnStopReason::StepLimit);
