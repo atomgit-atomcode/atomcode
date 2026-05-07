@@ -209,6 +209,37 @@ impl Default for LspConfig {
     }
 }
 
+/// One-shot migration for users who had atomcode installed before the
+/// "LSP off by default" flip (commit 5b07e2a, 2026-05-07). The setup
+/// wizard at install time used `LspConfig::default()` which **at that
+/// time** was `enabled=true, auto_detect=true, delay=150, servers={}`,
+/// and `Config::save()` serialized those literals into
+/// `~/.atomcode/config.toml`. Subsequent loads see explicit `enabled=true`
+/// and ignore the new in-memory default — old installs keep spawning
+/// rust-analyzer / gopls and surface init failures the user never asked
+/// for.
+///
+/// Heuristic: if the on-disk LspConfig matches the OLD wizard-written
+/// shape **byte-for-byte** (every field equals its old default), reset
+/// to the new default. Any deviation (custom server, non-default delay,
+/// auto_detect=false) means the user customised it intentionally —
+/// leave alone.
+///
+/// False-positive risk: a user who manually wrote `enabled=true +
+/// auto_detect=true + delay=150 + servers={}` exactly gets silently
+/// reset. The shape is identical to the auto-written default, so
+/// distinguishing intent is impossible without a schema-version field.
+/// Probability is low; failure mode is mild (re-enable explicitly).
+fn migrate_legacy_lsp_default(cfg: &mut Config) {
+    let looks_auto_written = cfg.lsp.enabled
+        && cfg.lsp.auto_detect
+        && cfg.lsp.diagnostics_settle_delay_ms == 150
+        && cfg.lsp.servers.is_empty();
+    if looks_auto_written {
+        cfg.lsp = LspConfig::default();
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -356,8 +387,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
-        let config: Config = toml::from_str(&content)
+        let mut config: Config = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+        migrate_legacy_lsp_default(&mut config);
         Ok(config)
     }
 
@@ -454,6 +486,96 @@ mod tests {
             !cfg.auto_detect,
             "LSP auto_detect must default to false even if enabled flips on"
         );
+    }
+
+    /// Migration: on-disk config that looks like it was auto-written by
+    /// the OLD setup wizard (enabled=true + auto_detect=true + delay=150
+    /// + no custom servers) must be silently reset to disabled. Without
+    /// this, users installed before commit 5b07e2a keep spawning
+    /// rust-analyzer / gopls every startup despite the new default.
+    #[test]
+    fn migrate_resets_auto_written_lsp_to_disabled() {
+        let mut cfg = blank_config_with_lsp(LspConfig {
+            enabled: true,
+            auto_detect: true,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: 150,
+        });
+        migrate_legacy_lsp_default(&mut cfg);
+        assert!(!cfg.lsp.enabled, "auto-written shape must reset to disabled");
+        assert!(!cfg.lsp.auto_detect);
+    }
+
+    /// User who deliberately customised LSP (e.g. added a custom server
+    /// or tuned the settle delay) must NOT be reset. Migration only fires
+    /// for byte-perfect old-default shape.
+    #[test]
+    fn migrate_keeps_user_customised_lsp_intact() {
+        // Case 1: custom server registered.
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "rs".to_string(),
+            crate::lsp::registry::LspServerConfig {
+                command: "my-custom-rust-ls".to_string(),
+                args: vec![],
+                root_markers: vec![],
+            },
+        );
+        let mut cfg = blank_config_with_lsp(LspConfig {
+            enabled: true,
+            auto_detect: true,
+            servers,
+            diagnostics_settle_delay_ms: 150,
+        });
+        migrate_legacy_lsp_default(&mut cfg);
+        assert!(cfg.lsp.enabled, "custom servers means user opt-in; keep");
+
+        // Case 2: tuned settle delay.
+        let mut cfg2 = blank_config_with_lsp(LspConfig {
+            enabled: true,
+            auto_detect: true,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: 500,
+        });
+        migrate_legacy_lsp_default(&mut cfg2);
+        assert!(cfg2.lsp.enabled, "non-default delay means user tuned; keep");
+
+        // Case 3: auto_detect=false but enabled=true (explicit narrow
+        // setup with `servers` listed) — already deviates, keep.
+        let mut cfg3 = blank_config_with_lsp(LspConfig {
+            enabled: true,
+            auto_detect: false,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: 150,
+        });
+        migrate_legacy_lsp_default(&mut cfg3);
+        assert!(cfg3.lsp.enabled, "auto_detect=false means user picked manual; keep");
+    }
+
+    /// Already-disabled config: migration must be a no-op (don't flip
+    /// disabled → re-disabled, but more importantly don't trigger any
+    /// surprise side effects).
+    #[test]
+    fn migrate_noop_on_already_disabled() {
+        let mut cfg = blank_config_with_lsp(LspConfig::default());
+        migrate_legacy_lsp_default(&mut cfg);
+        assert!(!cfg.lsp.enabled);
+        assert!(!cfg.lsp.auto_detect);
+    }
+
+    fn blank_config_with_lsp(lsp: LspConfig) -> Config {
+        Config {
+            default_provider: "x".into(),
+            default_workdir: None,
+            providers: Default::default(),
+            datalog: Default::default(),
+            auto_update: true,
+            notifications: Default::default(),
+            telemetry: Default::default(),
+            lsp,
+            auto_commit: false,
+            subagent: Default::default(),
+        }
     }
 
     /// Empty/missing `[lsp]` section in user TOML must produce the
