@@ -3303,11 +3303,13 @@ fn handle_agent_event(
             // message in the conversation. Task 1.3 will upgrade this
             // to in-place checkmarks on the existing child rows instead
             // of appending new lines.
-            if state.call_id_to_batch.contains_key(&call_id) {
-                // Glyphs respect the terminal's Unicode capability:
-                // ↳ / ✓ / ✗ on modern terminals; -, [ok], [fail] on
-                // Windows legacy conhost without UTF-8 codepage. Same
-                // pattern as `state.ellipsis()`.
+            if let Some(batch_id) = state.call_id_to_batch.get(&call_id).cloned() {
+                // In-place ✓/✗ on the existing child row inside the
+                // live-group. Renderer's ToolGroupChildUpdate finds
+                // the row by call_id and CUPs to its terminal position.
+                // Falls back to no-op if the group has been frozen
+                // (something else got pushed below it) — model still
+                // gets the full ToolResult through the conversation.
                 let bullet = if state.unicode_symbols { "↳" } else { "-" };
                 let mark = if success {
                     if state.unicode_symbols { "✓" } else { "[ok]" }
@@ -3320,10 +3322,11 @@ fn handle_agent_event(
                     .remove(&call_id)
                     .map(|(d, det, _)| format!("{} {}", d, det))
                     .unwrap_or_else(|| display_tool_name(&name));
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  {} {} {}",
-                    bullet, mark, display
-                )));
+                renderer.render(UiLine::ToolGroupChildUpdate {
+                    batch_id,
+                    call_id: call_id.clone(),
+                    new_text: format!("  {} {} {}", bullet, mark, display),
+                });
                 renderer.flush();
                 return;
             }
@@ -3717,11 +3720,32 @@ fn handle_agent_event(
             //   completes. Acceptable: footer spinner conveys "working",
             //   contents become visible immediately on first result.
             // Header glyph: ▸ on Unicode-capable terminals, `>` on
-            // legacy Windows conhost / dumb terminals (state carries
-            // the cap). Matches the existing tool-call line convention.
+            // legacy Windows conhost / dumb terminals.
             let arrow = if state.unicode_symbols { "▸" } else { ">" };
+            let bullet = if state.unicode_symbols { "↳" } else { "-" };
+            // Build header + child rows; renderer keeps the group
+            // "live" while it's the bottom of body_lines, so each
+            // ToolCallResult below can update the matching child row
+            // in place (CC-style ✓ light-up).
+            let header_text = format!("{} {}", arrow, label);
+            let children: Vec<crate::render::ToolGroupChild> = calls
+                .iter()
+                .map(|c| crate::render::ToolGroupChild {
+                    call_id: c.id.clone(),
+                    text: format!(
+                        "  {} {} {}",
+                        bullet,
+                        display_tool_name(&c.name),
+                        format_tool_detail(&c.name, &c.arguments)
+                    ),
+                })
+                .collect();
             renderer.render(UiLine::AssistantLineBreak);
-            renderer.render(UiLine::CommandOutput(format!("{} {}", arrow, label)));
+            renderer.render(UiLine::ToolGroupRender {
+                batch_id: batch_id.clone(),
+                header: header_text,
+                children,
+            });
             renderer.flush();
 
             let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();

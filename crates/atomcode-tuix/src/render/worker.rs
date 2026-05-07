@@ -323,6 +323,8 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::ToolCall { .. } => "ToolCall",
             UiLine::ToolCallInFlight { .. } => "ToolCallInFlight",
             UiLine::ToolCallCommit { .. } => "ToolCallCommit",
+            UiLine::ToolGroupRender { .. } => "ToolGroupRender",
+            UiLine::ToolGroupChildUpdate { .. } => "ToolGroupChildUpdate",
         UiLine::ToolResult { .. } => "ToolResult",
         UiLine::DiffLine { .. } => "DiffLine",
         UiLine::DiffBlock(_) => "DiffBlock",
