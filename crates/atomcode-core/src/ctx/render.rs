@@ -1000,24 +1000,65 @@ fn replace_stale_reads(msgs: &mut Vec<Message>) {
 
 /// Walk forward tracking tool_call/tool_result pairing; remove orphans.
 /// Valid sequences: System → (User → Assistant/AssistantWithToolCalls → [ToolResult]* → ...)*
+///
+/// Drops three kinds of broken state:
+///
+/// 1. **Orphan ToolResult** — appears outside any `expecting` window
+///    (no preceding AssistantWithToolCalls awaiting it). Removed solo.
+/// 2. **Mid-conversation under-paired AssistantWithToolCalls** — has N
+///    tool_calls but a Text / MultiPart / next ATC arrives before all N
+///    ToolResults have been seen. The unsatisfied ATC AND any partial
+///    ToolResults already paired with it are removed together. This is
+///    the path that triggers DeepSeek's `insufficient tool messages
+///    following tool_calls message` 400 — the strictest providers
+///    require the wire-level invariant `len(asst.tool_calls) ==
+///    len(following tool messages)` to hold for every ATC, not just the
+///    most recent one.
+/// 3. **Trailing under-paired AssistantWithToolCalls** — same as (2)
+///    but the conversation ends mid-pairing. Handled by the rev-scan
+///    after the main loop.
 fn sanitize_messages(msgs: &mut Vec<Message>) {
     let mut to_remove: Vec<usize> = Vec::new();
     let mut expecting_tool_results = 0usize;
+    // Track the most recent ATC and the ToolResult indices already
+    // paired with it. On a boundary (Text / MultiPart / next ATC) with
+    // `expecting > 0`, both the ATC and its partial results are dropped.
+    let mut current_atc_idx: Option<usize> = None;
+    let mut current_atc_results: Vec<usize> = Vec::new();
 
     for i in 0..msgs.len() {
         match &msgs[i].content {
             MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
                 if expecting_tool_results > 0 {
                     expecting_tool_results -= 1;
+                    current_atc_results.push(i);
                 } else {
                     to_remove.push(i);
                 }
             }
             MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
+                if expecting_tool_results > 0 {
+                    if let Some(idx) = current_atc_idx {
+                        to_remove.push(idx);
+                    }
+                    to_remove.extend(current_atc_results.drain(..));
+                } else {
+                    current_atc_results.clear();
+                }
                 expecting_tool_results = tool_calls.len();
+                current_atc_idx = Some(i);
             }
             MessageContent::Text(_) | MessageContent::MultiPart { .. } => {
+                if expecting_tool_results > 0 {
+                    if let Some(idx) = current_atc_idx {
+                        to_remove.push(idx);
+                    }
+                    to_remove.extend(current_atc_results.drain(..));
+                } else {
+                    current_atc_results.clear();
+                }
                 expecting_tool_results = 0;
+                current_atc_idx = None;
             }
         }
     }
@@ -2066,6 +2107,233 @@ mod tests {
         sanitize_messages(&mut msgs);
         // All 4 messages should be preserved (valid pair)
         assert_eq!(msgs.len(), 4);
+    }
+
+    /// Regression for DeepSeek `insufficient tool messages following
+    /// tool_calls message` 400. An assistant emitted N=3 tool_calls but
+    /// only 2 ToolResults arrived before a User text message — the third
+    /// call_id never gets a tool message, and strict providers reject.
+    /// Sanitize must drop the offending ATC + its partial results so the
+    /// surviving prefix preserves the wire-level invariant.
+    #[test]
+    fn test_sanitize_drops_under_paired_atc_in_middle_of_history() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut msgs = vec![
+            Message::new(Role::System, "sys"),
+            Message::new(Role::User, "first"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "c1".into(),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "c2".into(),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "c3".into(),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    reasoning_content: None,
+                },
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c1".into(),
+                    output: "ok1".into(),
+                    success: true,
+                }),
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c2".into(),
+                    output: "ok2".into(),
+                    success: true,
+                }),
+            },
+            // c3 result MISSING — the source of the 400.
+            Message::new(Role::User, "second"),
+        ];
+        sanitize_messages(&mut msgs);
+        // ATC + 2 partial results gone; surviving = sys + user1 + user2.
+        assert_eq!(msgs.len(), 3, "got: {:?}", msgs);
+        assert!(matches!(msgs[0].role, Role::System));
+        assert_eq!(msgs[1].text(), Some("first"));
+        assert_eq!(msgs[2].text(), Some("second"));
+    }
+
+    /// Same situation as above, but the boundary is a *next* ATC instead
+    /// of a Text message. The first (under-paired) ATC and its partial
+    /// results must be dropped; the second (well-paired) ATC stays.
+    #[test]
+    fn test_sanitize_drops_under_paired_atc_when_followed_by_another_atc() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut msgs = vec![
+            Message::new(Role::User, "go"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "a1".into(),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "a2".into(),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    reasoning_content: None,
+                },
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "a1".into(),
+                    output: "ok".into(),
+                    success: true,
+                }),
+            },
+            // a2 missing.
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning_content: None,
+                },
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "b1".into(),
+                    output: "ok".into(),
+                    success: true,
+                }),
+            },
+        ];
+        sanitize_messages(&mut msgs);
+        // First ATC + a1 result removed; second ATC + b1 result kept.
+        assert_eq!(msgs.len(), 3, "got: {:?}", msgs);
+        assert_eq!(msgs[0].text(), Some("go"));
+        assert!(matches!(
+            msgs[1].content,
+            MessageContent::AssistantWithToolCalls { .. }
+        ));
+        assert!(matches!(msgs[2].content, MessageContent::ToolResult(_)));
+    }
+
+    /// Trailing under-paired ATC (no Text / next ATC after it) is the
+    /// case the original sanitize already handled. Pinning it here so
+    /// the new mid-history logic doesn't accidentally regress the tail
+    /// path.
+    #[test]
+    fn test_sanitize_drops_under_paired_atc_at_tail() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut msgs = vec![
+            Message::new(Role::User, "go"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "c1".into(),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "c2".into(),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    reasoning_content: None,
+                },
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c1".into(),
+                    output: "ok".into(),
+                    success: true,
+                }),
+            },
+            // c2 missing, conversation ends here.
+        ];
+        sanitize_messages(&mut msgs);
+        // ATC + 1 partial result both removed; just the user message remains.
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].text(), Some("go"));
+    }
+
+    /// Negative control: when every ATC's tool_calls are fully paired,
+    /// nothing must be removed even though the new mid-history logic
+    /// runs over Text boundaries. Catches "fix that throws away valid
+    /// history" regressions.
+    #[test]
+    fn test_sanitize_preserves_fully_paired_history_through_text_boundaries() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut msgs = vec![
+            Message::new(Role::User, "first"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "c1".into(),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                        ToolCall {
+                            id: "c2".into(),
+                            name: "bash".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    reasoning_content: None,
+                },
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c1".into(),
+                    output: "ok1".into(),
+                    success: true,
+                }),
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: "c2".into(),
+                    output: "ok2".into(),
+                    success: true,
+                }),
+            },
+            Message::new(Role::Assistant, "done"),
+            Message::new(Role::User, "second"),
+        ];
+        let len_before = msgs.len();
+        sanitize_messages(&mut msgs);
+        assert_eq!(msgs.len(), len_before, "must not drop fully-paired history");
     }
 
     /// Regression: `microcompact` gate tied to `threshold_chars`.
