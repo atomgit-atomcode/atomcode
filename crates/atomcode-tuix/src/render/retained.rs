@@ -191,7 +191,9 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
     } else {
         params.split(';').collect()
     };
-    for part in parts {
+    let mut i = 0;
+    while i < parts.len() {
+        let part = parts[i];
         match part.parse::<u32>().ok() {
             Some(0) => *style = CellStyle::default(),
             Some(1) => style.bold = true,
@@ -203,13 +205,31 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             Some(39) => style.fg = None,
             Some(90) => style.fg = Some(Color::DarkGrey),
             Some(97) => style.fg = Some(Color::White),
+            // 38;2;R;G;B — truecolor foreground. Markdown emits this
+            // for inline code / code blocks / headings so the colour
+            // survives terminal palette remapping (bright-XX colours
+            // get re-tinted by themes; truecolor RGB does not).
+            // Consume 4 extra tokens (`2`, R, G, B) on success.
+            Some(38) => {
+                if parts.get(i + 1).copied() == Some("2") {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()),
+                        parts.get(i + 3).and_then(|s| s.parse::<u8>().ok()),
+                        parts.get(i + 4).and_then(|s| s.parse::<u8>().ok()),
+                    ) {
+                        style.fg = Some(Color::Rgb { r, g, b });
+                        i += 4;
+                    }
+                }
+                // 38;5;N (256-colour) and other 38 sub-formats fall
+                // through silently — markdown doesn't emit them.
+            }
             _ => {
-                // Other colors (30-37, 91-97, 38;5;N, 38;2;R;G;B, bg,
-                // underline) silently ignored — our markdown crate
-                // doesn't emit them, and expanding CellStyle to cover
-                // them is out of scope for Phase 6.
+                // Other ANSI colours (30-37, 91-96, bg, underline)
+                // silently ignored — markdown doesn't emit them.
             }
         }
+        i += 1;
     }
 }
 
@@ -4336,16 +4356,19 @@ mod tests {
             cell,
             vterm.dump()
         );
-        // Inline code: markdown crate wraps it in \x1b[97m (bright
-        // white) fg.
+        // Inline code: markdown crate wraps it in truecolor blue-500
+        // (RGB 59,130,246) so the colour stays readable on both light
+        // and dark terminal themes (bright-XX SGR colours got remapped
+        // by individual themes — bright-white invisible on iTerm2 light,
+        // bright-cyan washed-out pastel there).
         let code_pos = row_text
             .find("code")
             .expect("expected 'code' in rendered text");
         let code_cell = vterm.cell_at(row_idx, code_pos);
         assert_eq!(
             code_cell.fg,
-            Some(crossterm::style::Color::White),
-            "inline code cell should be bright white: {:?}",
+            Some(crossterm::style::Color::Rgb { r: 59, g: 130, b: 246 }),
+            "inline code cell should be truecolor blue-500: {:?}",
             code_cell
         );
     }
