@@ -1321,6 +1321,9 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
                 self.push_command_output(&new_text);
             }
+            UiLine::ToolGroupSummary { text } => {
+                self.push_command_output(&text);
+            }
             UiLine::ToolResult { success, summary } => {
                 self.push_tool_result(success, &summary);
             }

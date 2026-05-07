@@ -3781,7 +3781,7 @@ fn handle_agent_event(
                     fmt_elapsed(elapsed_ms)
                 )
             };
-            renderer.render(UiLine::CommandOutput(summary));
+            renderer.render(UiLine::ToolGroupSummary { text: summary });
             renderer.flush();
 
             // Clear batch state — subsequent per-call events fall back
@@ -3869,7 +3869,7 @@ fn handle_agent_event(
                         fmt_elapsed(elapsed)
                     )
                 };
-                renderer.render(UiLine::CommandOutput(summary));
+                renderer.render(UiLine::ToolGroupSummary { text: summary });
                 renderer.flush();
             }
             state.on_sub_agent_dispatch_end();

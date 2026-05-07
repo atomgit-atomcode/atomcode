@@ -1831,6 +1831,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // body_lines indices map 1:1 with terminal positions.
                 // push_body_row clears any prior live_group, including
                 // ours mid-loop, so we set live_group AFTER the loop.
+                //
+                // Style: header + children all use the same plain style
+                // (no bold, no brand color). The ▸ glyph alone is the
+                // visual marker. Earlier iteration tried bold+brand on
+                // the header but combined with markdown headings + code
+                // fences + emoji the screen had too many competing
+                // emphasis tokens. CC's pattern: plain text + a single
+                // glyph as the only structural marker.
                 let muted = self.style_for(Role::Muted);
                 let screen_w = self.screen.width();
                 let header_row = build_one_row(&header, &muted, screen_w);
@@ -1902,6 +1910,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let _ = self.out.write_all(seq.as_bytes());
                 let bytes = serialize_row(&new_row);
                 let _ = self.out.write_all(&bytes);
+            }
+            UiLine::ToolGroupSummary { text } => {
+                self.flush_assistant_remainder();
+                // Plain muted style — same as header + children.
+                // Single ▸ glyph is the only structural marker; no
+                // bold / no brand color. Avoids competing with
+                // markdown headings + code fences + emoji on the
+                // same screen. Single-line append; no in-place CUP
+                // because the summary closes the group rather than
+                // mutating it.
+                let style = self.style_for(Role::Muted);
+                let row = build_one_row(&text, &style, self.screen.width());
+                self.push_body_row(row);
             }
             UiLine::ToolCall { name, detail } => {
                 self.flush_assistant_remainder();

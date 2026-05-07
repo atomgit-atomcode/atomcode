@@ -206,6 +206,10 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let _ = writeln!(self.out, "{}", new_text);
             }
+            UiLine::ToolGroupSummary { text } => {
+                self.drop_transient();
+                let _ = writeln!(self.out, "{}", text);
+            }
             UiLine::ToolResult { success, summary } => {
                 self.drop_transient();
                 let icon = if success { "✓" } else { "✗" };

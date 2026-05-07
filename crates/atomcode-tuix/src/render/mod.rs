@@ -70,6 +70,14 @@ pub enum UiLine {
         call_id: String,
         new_text: String,
     },
+    /// One-shot summary line for a completed tool batch — rendered
+    /// with bold + brand-color emphasis so it stands out as the
+    /// "this is what happened" anchor (mirrors CC's task-completion
+    /// summary visual). Used by both ToolBatchCompleted and
+    /// SubAgentDispatchEnd.
+    ToolGroupSummary {
+        text: String,
+    },
     ToolResult {
         success: bool,
         summary: String,

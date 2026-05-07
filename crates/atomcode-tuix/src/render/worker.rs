@@ -325,6 +325,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
             UiLine::ToolCallCommit { .. } => "ToolCallCommit",
             UiLine::ToolGroupRender { .. } => "ToolGroupRender",
             UiLine::ToolGroupChildUpdate { .. } => "ToolGroupChildUpdate",
+            UiLine::ToolGroupSummary { .. } => "ToolGroupSummary",
         UiLine::ToolResult { .. } => "ToolResult",
         UiLine::DiffLine { .. } => "DiffLine",
         UiLine::DiffBlock(_) => "DiffBlock",
