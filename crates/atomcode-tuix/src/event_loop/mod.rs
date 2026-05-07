@@ -439,6 +439,19 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::Submit => {
+                // Line continuation: a `\` immediately before the cursor
+                // is consumed and replaced with `\n`. Lets users insert
+                // newlines on terminals that swallow Shift/Ctrl/Alt+Enter
+                // (notably WSL + Windows Terminal). Mirrors Claude Code's
+                // behavior and matches the shell line-continuation
+                // convention Linux users already know.
+                if self.cursor > 0 && self.text.as_bytes()[self.cursor - 1] == b'\\' {
+                    let bs = self.cursor - 1;
+                    self.text.replace_range(bs..self.cursor, "\n");
+                    self.cursor = bs + 1;
+                    self.history_idx = None;
+                    return BufferResult::Redraw;
+                }
                 let line = self.text.trim().to_string();
                 if line.is_empty() {
                     return BufferResult::Redraw;
@@ -665,6 +678,65 @@ mod buffer_tests {
         assert!(out.contains(" then "));
         assert!(out.contains("B\n"));
         assert!(!out.contains("[Pasted"));
+    }
+
+    #[test]
+    fn submit_with_trailing_backslash_inserts_newline() {
+        // WSL + Windows Terminal swallows Shift/Ctrl/Alt+Enter, so we
+        // give users a `\<Enter>` continuation escape. The `\` itself
+        // must not survive into the buffer.
+        let reg = CommandRegistry::builtin();
+        let history: Vec<String> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "hello\\".to_string();
+        b.cursor = b.text.len();
+        let r = b.apply(Action::Submit, &history, &reg);
+        assert!(matches!(r, BufferResult::Redraw));
+        assert_eq!(b.text, "hello\n");
+        assert_eq!(b.cursor, b.text.len());
+    }
+
+    #[test]
+    fn submit_with_backslash_mid_buffer_inserts_newline_at_cursor() {
+        let reg = CommandRegistry::builtin();
+        let history: Vec<String> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "abc\\def".to_string();
+        b.cursor = 4; // right after the backslash
+        let r = b.apply(Action::Submit, &history, &reg);
+        assert!(matches!(r, BufferResult::Redraw));
+        assert_eq!(b.text, "abc\ndef");
+        assert_eq!(b.cursor, 4);
+    }
+
+    #[test]
+    fn submit_without_trailing_backslash_commits_normally() {
+        let reg = CommandRegistry::builtin();
+        let history: Vec<String> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "ship it".to_string();
+        b.cursor = b.text.len();
+        let r = b.apply(Action::Submit, &history, &reg);
+        match r {
+            BufferResult::Commit(s) => assert_eq!(s, "ship it"),
+            _ => panic!("expected Commit"),
+        }
+    }
+
+    #[test]
+    fn submit_with_backslash_not_before_cursor_commits_normally() {
+        // Backslash exists in the buffer but cursor isn't right after
+        // it — Enter should still submit, not insert a newline.
+        let reg = CommandRegistry::builtin();
+        let history: Vec<String> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "abc\\def".to_string();
+        b.cursor = b.text.len(); // at end, byte before is 'f'
+        let r = b.apply(Action::Submit, &history, &reg);
+        match r {
+            BufferResult::Commit(s) => assert_eq!(s, "abc\\def"),
+            _ => panic!("expected Commit"),
+        }
     }
 }
 
