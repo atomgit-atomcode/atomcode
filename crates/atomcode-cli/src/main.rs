@@ -1494,6 +1494,24 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
+            AgentEvent::ToolBatchStarted { batch_id: _, calls } => {
+                if verbose {
+                    eprintln!("[tool-batch] {} calls in parallel", calls.len());
+                }
+            }
+            AgentEvent::ToolBatchCompleted {
+                batch_id: _,
+                ok,
+                total,
+                elapsed_ms,
+            } => {
+                if verbose {
+                    eprintln!(
+                        "[tool-batch] completed {}/{} ok in {}ms",
+                        ok, total, elapsed_ms
+                    );
+                }
+            }
             AgentEvent::SubAgentDispatchStart { tasks } => {
                 if verbose {
                     eprintln!("[sub-agent] dispatching {} in parallel", tasks.len());

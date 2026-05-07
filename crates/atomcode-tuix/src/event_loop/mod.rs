@@ -3251,13 +3251,23 @@ fn handle_agent_event(
             name,
             arguments,
         } => {
-            // Emit the ▸ line immediately so users can see what command
-            // is running, especially for long-running bash commands.
-            // The line will be shown before the command completes.
             let detail = format_tool_detail(&name, &arguments);
             let display = display_tool_name(&name);
 
-            // Close any in-flight assistant line before emitting the tool call.
+            // If this call is part of an active batch, the
+            // ToolBatchStarted handler already rendered the group header
+            // + child rows — skip the standalone ▸ ToolCallInFlight
+            // line. Still record into `pending_tools` so the matching
+            // ToolCallResult knows the display name + detail and skips
+            // its own ▸ render too.
+            if state.call_id_to_batch.contains_key(&id) {
+                pending_tools.insert(id, (display.clone(), detail, true));
+                state.on_tool_call_started(&display);
+                return;
+            }
+
+            // Emit the ▸ line immediately so users can see what command
+            // is running, especially for long-running bash commands.
             renderer.render(UiLine::AssistantLineBreak);
             renderer.render(UiLine::ToolCallInFlight {
                 id: id.clone(),
@@ -3286,6 +3296,27 @@ fn handle_agent_event(
             success,
             ..
         } => {
+            // If this call belongs to an active batch, the group header
+            // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
+            // child completion and skip the full ▸ + ⎿ body render.
+            // The model still gets the full output via the ToolResult
+            // message in the conversation. Task 1.3 will upgrade this
+            // to in-place checkmarks on the existing child rows instead
+            // of appending new lines.
+            if state.call_id_to_batch.contains_key(&call_id) {
+                let mark = if success { "✓" } else { "✗" };
+                let display = pending_tools
+                    .remove(&call_id)
+                    .map(|(d, det, _)| format!("{} {}", d, det))
+                    .unwrap_or_else(|| display_tool_name(&name));
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  ↳ {} {}",
+                    mark, display
+                )));
+                renderer.flush();
+                return;
+            }
+
             // Close any in-flight assistant line before emitting the pair.
             renderer.render(UiLine::AssistantLineBreak);
             // Freeze the animated in-flight tool-call row to its final
@@ -3636,6 +3667,82 @@ fn handle_agent_event(
                         show_prompt,
                     )));
                     renderer.flush();
+                }
+            }
+        }
+        AgentEvent::ToolBatchStarted { batch_id, calls } => {
+            // Header label: "Reading 4 files in parallel" when all calls
+            // share a tool name (common case for batched read_file /
+            // grep / glob); otherwise generic "Running 4 tools in
+            // parallel". No tech-stack hardcoding — tool names come from
+            // the model's own tool_calls.name.
+            let count = calls.len();
+            let unique_names: std::collections::HashSet<&str> =
+                calls.iter().map(|c| c.name.as_str()).collect();
+            // Generic header — no per-tool verb table inside the
+            // framework. Same-name batches surface the model's own
+            // tool name; mixed batches use "tools". This avoids
+            // a `match tool_name { "bash" => "Running" ... }` table
+            // that drifts whenever new tools land or models invent
+            // names (mcp.foo, custom plugins).
+            let label = if unique_names.len() == 1 {
+                let single = unique_names.iter().next().copied().unwrap_or("tool");
+                format!("Running {} {} calls in parallel", count, single)
+            } else {
+                format!("Running {} tools in parallel", count)
+            };
+            renderer.render(UiLine::AssistantLineBreak);
+            renderer.render(UiLine::CommandOutput(format!("▸ {}", label)));
+            for c in &calls {
+                let display = display_tool_name(&c.name);
+                let detail = format_tool_detail(&c.name, &c.arguments);
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  ↳ {} {}",
+                    display, detail
+                )));
+            }
+            renderer.flush();
+
+            let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
+            for cid in &call_ids {
+                state
+                    .call_id_to_batch
+                    .insert(cid.clone(), batch_id.clone());
+            }
+            state.active_tool_batches.insert(
+                batch_id.clone(),
+                crate::state::ActiveToolBatch { call_ids },
+            );
+        }
+        AgentEvent::ToolBatchCompleted {
+            batch_id,
+            ok,
+            total,
+            elapsed_ms,
+        } => {
+            let summary = if ok == total {
+                format!(
+                    "  ▸ batch {}/{} ok · {} wall",
+                    ok,
+                    total,
+                    fmt_elapsed(elapsed_ms)
+                )
+            } else {
+                format!(
+                    "  ▸ batch {} ok · {} fail · {} wall",
+                    ok,
+                    total - ok,
+                    fmt_elapsed(elapsed_ms)
+                )
+            };
+            renderer.render(UiLine::CommandOutput(summary));
+            renderer.flush();
+
+            // Clear batch state — subsequent per-call events fall back
+            // to the standard single-tool render path.
+            if let Some(b) = state.active_tool_batches.remove(&batch_id) {
+                for cid in b.call_ids {
+                    state.call_id_to_batch.remove(&cid);
                 }
             }
         }

@@ -192,6 +192,25 @@ pub struct UiState {
     /// elapsed-time figure on the `SubAgentDispatchEnd` aggregate
     /// summary line. Cleared with the rest of the dispatch state.
     pub sub_agent_started_at: Option<std::time::Instant>,
+
+    /// Active tool batches, keyed by `batch_id`. Populated on
+    /// `ToolBatchStarted` and cleared on `ToolBatchCompleted`. Used by
+    /// per-call event handlers to detect "this ToolCallStarted/Result
+    /// belongs to an active batch" and skip the standalone row render
+    /// (the batch header already represents it).
+    pub active_tool_batches: std::collections::HashMap<String, ActiveToolBatch>,
+    /// Reverse map call_id → batch_id for O(1) lookup when a per-call
+    /// event arrives. Mirrors `active_tool_batches` membership; cleared
+    /// together.
+    pub call_id_to_batch: std::collections::HashMap<String, String>,
+}
+
+/// Per-batch state for an active `ToolBatchStarted`. Tracks how many
+/// children have completed so the UI can emit the final `· N/M ok`
+/// summary on `ToolBatchCompleted`.
+#[derive(Debug, Clone)]
+pub struct ActiveToolBatch {
+    pub call_ids: Vec<String>,
 }
 
 impl Default for UiState {
@@ -233,6 +252,8 @@ impl UiState {
             sub_agent_tasks: Vec::new(),
             sub_agent_failed: 0,
             sub_agent_started_at: None,
+            active_tool_batches: std::collections::HashMap::new(),
+            call_id_to_batch: std::collections::HashMap::new(),
         }
     }
 

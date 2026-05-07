@@ -785,6 +785,35 @@ impl TurnRunner {
                 seen_calls.insert(key, i);
             }
         }
+
+        // ── ToolBatchStarted: fires when ≥ 2 non-duplicate calls fan
+        // out from one assistant message. Lets the UI render a single
+        // grouped block instead of N independent ▸ rows.
+        // Per-call ToolCallStarted events still fire below for backward
+        // compat (UI dedupes via batch_id membership).
+        let non_dup_count = is_dup.iter().filter(|d| !**d).count();
+        let active_batch_id = if non_dup_count >= 2 {
+            let batch_id = format!("batch_{}", uuid::Uuid::new_v4());
+            let calls: Vec<crate::turn::event::ToolBatchCall> = tool_calls_buf
+                .iter()
+                .zip(is_dup.iter())
+                .filter(|(_, dup)| !**dup)
+                .map(|(c, _)| crate::turn::event::ToolBatchCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    arguments: c.arguments.clone(),
+                })
+                .collect();
+            let _ = event_tx.send(TurnEvent::ToolBatchStarted {
+                batch_id: batch_id.clone(),
+                calls,
+            });
+            Some((batch_id, std::time::Instant::now(), non_dup_count))
+        } else {
+            None
+        };
+        let mut batch_ok_count: usize = 0;
+
         let mut files_edited_this_batch: Vec<String> = Vec::new();
         for (i, call) in tool_calls_buf.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -850,6 +879,9 @@ impl TurnRunner {
             // ToolCallStarted emit), so by the time we reach here this is
             // a real, non-duplicate call to execute.
             let result = self.execute_single_tool(call, event_tx, &cancel).await;
+            if active_batch_id.is_some() && result.success {
+                batch_ok_count += 1;
+            }
 
             // Track files edited for read interception (batch + cross-turn)
             // Use full file path as key to avoid basename collisions
@@ -869,6 +901,18 @@ impl TurnRunner {
             }
 
             conversation.add_tool_result(result);
+        }
+
+        // ── ToolBatchCompleted: closes the group started above. UI
+        // uses this to swap the spinner header to a static `· N/M ok ·
+        // Xs wall` summary. Only fires when a batch was actually opened.
+        if let Some((batch_id, started_at, total)) = active_batch_id {
+            let _ = event_tx.send(TurnEvent::ToolBatchCompleted {
+                batch_id,
+                ok: batch_ok_count,
+                total,
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
+            });
         }
 
         // Truncate oversized tool outputs before returning. Without this,
