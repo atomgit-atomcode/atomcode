@@ -3769,10 +3769,12 @@ fn handle_agent_event(
             }
         }
         AgentEvent::SubAgentDispatchStart { tasks } => {
-            // Header line: announce the dispatch. The model also gets
-            // this same fact in the ToolResult, but seeing it land in
-            // the UI lets the user know "the wait is intentional, not
-            // a hang".
+            // Header line: announce the dispatch. The model gets this
+            // same fact in the ToolResult; the UI line tells the user
+            // "the wait is intentional, not a hang". Per-task running/
+            // done lines are suppressed (Task 3 — CC alignment); the
+            // footer spinner conveys mid-flight progress, the
+            // DispatchEnd summary lands the final count.
             renderer.render(UiLine::CommandOutput(format!(
                 "Dispatching {} sub-agents in parallel...",
                 tasks.len()
@@ -3780,38 +3782,29 @@ fn handle_agent_event(
             renderer.flush();
             state.on_sub_agent_dispatch_start(tasks);
         }
-        AgentEvent::SubAgentTaskStarted { index } => {
-            // Pull the descriptor (path + dedup suffix) the dispatcher
-            // emitted at start, so three tasks against `tunnel.rs`
-            // render as `src/server/tunnel.rs`, `src/client/tunnel.rs`,
-            // and `src/server/tunnel.rs (#2)` — distinguishable.
-            if let Some(info) = state.sub_agent_tasks.get(index) {
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  ↳ {}{} — running...",
-                    info.path, info.dedup_suffix
-                )));
-                renderer.flush();
-            }
+        AgentEvent::SubAgentTaskStarted { index: _ } => {
+            // Per-task running lines suppressed for CC-style collapsed
+            // view. State tracking still happens via DispatchStart's
+            // task list. Nothing to render here.
         }
-        AgentEvent::SubAgentTaskDone { index, elapsed_ms, turns, summary: _ } => {
+        AgentEvent::SubAgentTaskDone { index: _, elapsed_ms: _, turns: _, summary: _ } => {
+            // Per-task done lines suppressed — final count shows in
+            // DispatchEnd summary. Still tick the counter so the
+            // aggregate `N/M ok` reflects this completion.
             state.on_sub_agent_task_done();
-            if let Some(info) = state.sub_agent_tasks.get(index) {
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  ✓ {}{} — done {} · {}T",
-                    info.path,
-                    info.dedup_suffix,
-                    fmt_elapsed(elapsed_ms),
-                    turns
-                )));
-                renderer.flush();
-            }
         }
         AgentEvent::SubAgentTaskFailed { index, elapsed_ms, turns: _, reason } => {
+            // Failures KEEP their per-task line. Rationale: the user
+            // needs to know which sub-agent failed for diagnosis;
+            // collapsing into "1 fail" leaves them blind. Successes
+            // collapse silently (no actionable info per success).
             state.on_sub_agent_task_failed();
             if let Some(info) = state.sub_agent_tasks.get(index) {
+                let cross = if state.unicode_symbols { "✗" } else { "[fail]" };
                 let short_reason = reason.lines().next().unwrap_or("").trim();
                 renderer.render(UiLine::CommandOutput(format!(
-                    "  ✗ {}{} — {} · {}",
+                    "  {} {}{} — {} · {}",
+                    cross,
                     info.path,
                     info.dedup_suffix,
                     fmt_elapsed(elapsed_ms),
@@ -3834,16 +3827,19 @@ fn handle_agent_event(
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0);
             if total > 0 {
+                let arrow = if state.unicode_symbols { "▸" } else { ">" };
                 let summary = if failed == 0 {
                     format!(
-                        "▸ ParallelEditFiles · {}/{} ok · {} wall",
+                        "{} ParallelEditFiles · {}/{} ok · {} wall",
+                        arrow,
                         ok,
                         total,
                         fmt_elapsed(elapsed)
                     )
                 } else {
                     format!(
-                        "▸ ParallelEditFiles · {} ok · {} fail · {} wall",
+                        "{} ParallelEditFiles · {} ok · {} fail · {} wall",
+                        arrow,
                         ok,
                         failed,
                         fmt_elapsed(elapsed)
