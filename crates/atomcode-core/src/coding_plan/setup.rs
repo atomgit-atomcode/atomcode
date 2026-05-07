@@ -166,10 +166,21 @@ impl SetupReport {
             StepResult::Ok(s) => {
                 out.push_str("  ✔ CodingPlan status:\n");
                 if let Some(plan) = &s.codingplan_free {
-                    out.push_str(&format!(
-                        "      Plan: {}  ·  expires {} ({}d / {}d remaining)\n",
-                        plan.plan_name, plan.expires_at, plan.remaining_days, plan.total_days,
-                    ));
+                    if plan.expires_at.is_empty() {
+                        // Backend sends null claimed_at/expires_at while a
+                        // fresh claim is still propagating. Don't render an
+                        // empty date with `(0d / 0d remaining)` zeros — say
+                        // "pending activation" so the user knows to wait.
+                        out.push_str(&format!(
+                            "      Plan: {}  ·  pending activation\n",
+                            plan.plan_name,
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "      Plan: {}  ·  expires {} ({}d / {}d remaining)\n",
+                            plan.plan_name, plan.expires_at, plan.remaining_days, plan.total_days,
+                        ));
+                    }
                 }
                 if let Some(u) = &s.current_usage {
                     out.push_str(&format!(
@@ -774,6 +785,62 @@ mod tests {
         assert!(!out.contains("✘ Status"));
         // Login skipped + models ok ⇒ config should still be persisted.
         assert!(report.should_persist_config());
+    }
+
+    /// Regression: when a fresh claim hasn't activated yet the backend
+    /// returns `claimed_at: null, expires_at: null, total_days: 0,
+    /// remaining_days: 0`. Pre-fix the render line came out as
+    /// `Plan: CodingPlan Free  ·  expires  (0d / 0d remaining)` — empty
+    /// gap in the middle + bogus zeros, looked like a parser bug. Now
+    /// the empty-expiry case shows a meaningful "pending activation"
+    /// state instead.
+    #[test]
+    fn render_status_pending_activation_omits_zero_expiry() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Ok(ClaimInfo {
+                message: "claimed".into(),
+                duplicate: false,
+            }),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec!["a/b".into()],
+                provider_names: vec!["AtomGit".into()],
+                default_provider: "AtomGit".into(),
+            }),
+            status: StepResult::Ok(crate::coding_plan::types::StatusResponse {
+                codingplan_free: Some(crate::coding_plan::types::PlanInfo {
+                    plan_name: "CodingPlan Free".into(),
+                    status: 0,
+                    claimed_at: String::new(),
+                    expires_at: String::new(),
+                    remaining_days: 0,
+                    total_days: 0,
+                    apply_id: 0,
+                }),
+                current_usage: None,
+                audit_status: 0,
+                expires_at: None,
+                window_quota_exhausted: false,
+                window_quota_hint: None,
+            }),
+        };
+        let out = report.render();
+        assert!(out.contains("Plan: CodingPlan Free"), "plan name still shown: {}", out);
+        assert!(
+            out.contains("pending activation"),
+            "must surface pending state to user: {}",
+            out
+        );
+        assert!(
+            !out.contains("(0d / 0d"),
+            "bogus zero countdown must not render: {}",
+            out
+        );
+        assert!(
+            !out.contains("expires  ("),
+            "empty expires-date with double space must not render: {}",
+            out
+        );
     }
 
     /// Render exercise: login failed. Downstream steps are pre-marked

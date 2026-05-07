@@ -5,7 +5,22 @@
 // `#[serde(default)]` where the backend has historically returned `null`
 // or omitted fields, so the client doesn't blow up on minor schema drift.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Treat both missing and explicit-null JSON values as the type's
+/// `Default::default()`. Plain `#[serde(default)]` only fires for
+/// missing fields — explicit `null` would still try to deserialize
+/// against the target type and fail (e.g. "invalid type: null,
+/// expected a string"). The CodingPlan status endpoint sends `null`
+/// for `claimed_at` / `expires_at` when a freshly-claimed plan has
+/// not yet been activated on the backend.
+fn null_to_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// `POST /api/v5/coding-plan/claim` response.
 #[derive(Debug, Clone, Deserialize)]
@@ -57,9 +72,12 @@ pub struct PlanInfo {
     pub plan_name: String,
     #[serde(default)]
     pub status: i32,
-    #[serde(default)]
+    /// Backend sends JSON `null` for unactivated claims — must absorb
+    /// it as empty string, not error out parsing.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub claimed_at: String,
-    #[serde(default)]
+    /// Same null-when-unactivated pattern as `claimed_at`.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub expires_at: String,
     #[serde(default)]
     pub remaining_days: i32,
@@ -262,6 +280,38 @@ mod tests {
         let c: ClaimResponse = serde_json::from_str(body).unwrap();
         assert!(!c.success);
         assert!(c.duplicate);
+    }
+
+    /// Regression: when a fresh claim hasn't propagated to the status
+    /// endpoint yet, the backend returns `status: 0` with `claimed_at`
+    /// and `expires_at` as JSON `null`. Plain `#[serde(default)]` only
+    /// fires for *missing* fields, not explicit nulls — so the parser
+    /// would blow up with "invalid type: null, expected a string" and
+    /// the user saw `⚠ Status fetch failed (non-fatal)` immediately
+    /// after a successful `/codingplan` claim. Body taken verbatim from
+    /// the user's screenshot.
+    #[test]
+    fn plan_info_tolerates_null_claimed_at_and_expires_at() {
+        let body = r#"{
+            "codingplan_free": {
+                "plan_name": "CodingPlan Free",
+                "status": 0,
+                "claimed_at": null,
+                "expires_at": null,
+                "remaining_days": 0,
+                "total_days": 0,
+                "apply_id": 0
+            }
+        }"#;
+        let s: StatusResponse =
+            serde_json::from_str(body).expect("null claimed_at/expires_at must not crash parsing");
+        let plan = s.codingplan_free.expect("plan should be present");
+        assert_eq!(plan.plan_name, "CodingPlan Free");
+        assert_eq!(plan.status, 0);
+        // null collapses to empty string — render layer can decide
+        // whether to display a placeholder or skip the segment.
+        assert_eq!(plan.claimed_at, "");
+        assert_eq!(plan.expires_at, "");
     }
 
     /// Backend has historically returned nulls for optional fields;
