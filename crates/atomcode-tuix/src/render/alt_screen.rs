@@ -974,8 +974,13 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// next non-buffered line. Always-some output (the common case)
     /// becomes one body_lines entry.
     fn render_md_and_push(&mut self, line: &str) {
+        // Pass terminal width through so markdown tables render in flat
+        // mode when they don't fit at natural column widths (mirrors the
+        // `RetainedRenderer` path). Alt-screen body has no left padding,
+        // so the full screen width is the budget.
+        let md_width = self.width as usize;
         if let Some(rendered) =
-            crate::markdown::render_line(line, &mut self.md_state, self.caps)
+            crate::markdown::render_line_with_width(line, &mut self.md_state, self.caps, md_width)
         {
             // `rendered` may itself contain `\n` when it includes a
             // table flush prefix from a prior buffered block. Split
@@ -1000,8 +1005,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // Also flush any pending markdown state (e.g. a buffered
         // table block) so end-of-turn doesn't strand it. Mirrors
         // RetainedRenderer's TurnComplete handling.
+        let md_width = self.width as usize;
         if let Some(tail) =
-            crate::markdown::finalize(&mut self.md_state, self.caps)
+            crate::markdown::finalize_with_width(&mut self.md_state, self.caps, md_width)
         {
             for sub in tail.split('\n') {
                 self.push_body_row(sub.to_string());
