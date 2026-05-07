@@ -3304,14 +3304,25 @@ fn handle_agent_event(
             // to in-place checkmarks on the existing child rows instead
             // of appending new lines.
             if state.call_id_to_batch.contains_key(&call_id) {
-                let mark = if success { "✓" } else { "✗" };
+                // Glyphs respect the terminal's Unicode capability:
+                // ↳ / ✓ / ✗ on modern terminals; -, [ok], [fail] on
+                // Windows legacy conhost without UTF-8 codepage. Same
+                // pattern as `state.ellipsis()`.
+                let bullet = if state.unicode_symbols { "↳" } else { "-" };
+                let mark = if success {
+                    if state.unicode_symbols { "✓" } else { "[ok]" }
+                } else if state.unicode_symbols {
+                    "✗"
+                } else {
+                    "[fail]"
+                };
                 let display = pending_tools
                     .remove(&call_id)
                     .map(|(d, det, _)| format!("{} {}", d, det))
                     .unwrap_or_else(|| display_tool_name(&name));
                 renderer.render(UiLine::CommandOutput(format!(
-                    "  ↳ {} {}",
-                    mark, display
+                    "  {} {} {}",
+                    bullet, mark, display
                 )));
                 renderer.flush();
                 return;
@@ -3691,16 +3702,26 @@ fn handle_agent_event(
             } else {
                 format!("Running {} tools in parallel", count)
             };
+            // Header alone — child rows are NOT pre-rendered. Each
+            // child surfaces as a `  ↳ ✓ name` line when its
+            // ToolCallResult arrives. Trade-off:
+            // - PRO: zero duplication; children "trickle in" as they
+            //   complete, so user sees real progress on slow batches
+            //   (4 reads finishing within 1s look near-atomic; a 4-call
+            //   batch where 3 are fast + 1 is `cargo check` shows the
+            //   slow tail clearly).
+            // - PRO: avoids the retained-renderer's "in-place mutation
+            //   of older body rows" problem (rows already scrolled into
+            //   native terminal scrollback can't be modified).
+            // - CON: user doesn't see batch contents until first child
+            //   completes. Acceptable: footer spinner conveys "working",
+            //   contents become visible immediately on first result.
+            // Header glyph: ▸ on Unicode-capable terminals, `>` on
+            // legacy Windows conhost / dumb terminals (state carries
+            // the cap). Matches the existing tool-call line convention.
+            let arrow = if state.unicode_symbols { "▸" } else { ">" };
             renderer.render(UiLine::AssistantLineBreak);
-            renderer.render(UiLine::CommandOutput(format!("▸ {}", label)));
-            for c in &calls {
-                let display = display_tool_name(&c.name);
-                let detail = format_tool_detail(&c.name, &c.arguments);
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  ↳ {} {}",
-                    display, detail
-                )));
-            }
+            renderer.render(UiLine::CommandOutput(format!("{} {}", arrow, label)));
             renderer.flush();
 
             let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
@@ -3720,16 +3741,17 @@ fn handle_agent_event(
             total,
             elapsed_ms,
         } => {
+            let arrow = if state.unicode_symbols { "▸" } else { ">" };
             let summary = if ok == total {
                 format!(
-                    "  ▸ batch {}/{} ok · {} wall",
+                    "  {} batch {}/{} ok · {} wall", arrow,
                     ok,
                     total,
                     fmt_elapsed(elapsed_ms)
                 )
             } else {
                 format!(
-                    "  ▸ batch {} ok · {} fail · {} wall",
+                    "  {} batch {} ok · {} fail · {} wall", arrow,
                     ok,
                     total - ok,
                     fmt_elapsed(elapsed_ms)
