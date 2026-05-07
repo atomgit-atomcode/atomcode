@@ -13,6 +13,8 @@ interface ChatContextValue {
   newConversation: () => void;
   selectModel: (provider: string, model?: string) => void;
   loadSession: (sessionId: string, projectHash?: string) => void;
+  renameSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
+  deleteSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
   startLogin: () => void;
   cancelLogin: () => void;
   setupCodingPlan: () => void;
@@ -53,6 +55,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'userMessage':
           dispatch({ type: 'ADD_USER_MESSAGE', text: msg.text });
+          break;
+        case 'assistantMessage':
+          dispatch({ type: 'ADD_ASSISTANT_MESSAGE', text: msg.text });
           break;
         case 'generationStarted':
           dispatch({ type: 'START_GENERATION' });
@@ -221,6 +226,24 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     postMessage({ type: 'loadSession', sessionId, projectHash });
   }, []);
 
+  const renameSession = useCallback((session: { id: string; project_hash?: string; name?: string; title?: string }) => {
+    postMessage({
+      type: 'renameSession',
+      sessionId: session.id,
+      projectHash: session.project_hash,
+      name: session.name || session.title || '',
+    });
+  }, []);
+
+  const deleteSession = useCallback((session: { id: string; project_hash?: string; name?: string; title?: string }) => {
+    postMessage({
+      type: 'deleteSession',
+      sessionId: session.id,
+      projectHash: session.project_hash,
+      name: session.name || session.title || '',
+    });
+  }, []);
+
   const startLogin = useCallback(() => {
     postMessage({ type: 'authLoginStart' });
   }, []);
@@ -249,6 +272,8 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     newConversation,
     selectModel,
     loadSession,
+    renameSession,
+    deleteSession,
     startLogin,
     cancelLogin,
     setupCodingPlan,

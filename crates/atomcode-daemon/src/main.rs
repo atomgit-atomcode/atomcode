@@ -2085,6 +2085,7 @@ async fn process_chat_request(
     } else {
         let conv = conversation.lock().await;
         session.messages = conv.messages.clone();
+        session.auto_name_from_messages();
         session.touch();
         if let Err(e) = session_manager.save(&session) {
             eprintln!("Warning: Failed to save session: {}", e);

@@ -7,6 +7,8 @@ interface SlashCommand {
 }
 
 const slashCommands: SlashCommand[] = [
+  { name: 'login', label: '/login', description: 'Sign in with AtomGit' },
+  { name: 'codingplan', label: '/codingplan', description: 'Sync CodingPlan models' },
   { name: 'explain', label: '/explain', description: 'Explain selected code' },
   { name: 'fix', label: '/fix', description: 'Fix issues in code' },
   { name: 'test', label: '/test', description: 'Write tests' },

@@ -8,8 +8,8 @@ use tokio::sync::{mpsc, RwLock};
 
 use super::client::{McpClient, McpToolInfo};
 use super::config::{load_mcp_config, McpServerConfig};
-use super::transport_stdio::StdioClient;
 use super::transport_http::HttpClient;
+use super::transport_stdio::StdioClient;
 use super::types::ServerStatus;
 
 /// Connection status event sent to listeners when servers connect or fail.
@@ -114,11 +114,13 @@ impl McpRegistry {
                                 super::config::McpTransportConfig::Http {
                                     url,
                                     headers,
+                                    auth,
                                     timeout_ms,
                                 } => Box::new(HttpClient::new(
                                     name.clone(),
                                     url.clone(),
                                     headers.clone(),
+                                    auth.clone(),
                                     *timeout_ms,
                                 )),
                             };
@@ -194,11 +196,13 @@ impl McpRegistry {
             super::config::McpTransportConfig::Http {
                 url,
                 headers,
+                auth,
                 timeout_ms,
             } => Box::new(HttpClient::new(
                 config.name.clone(),
                 url.clone(),
                 headers.clone(),
+                auth.clone(),
                 *timeout_ms,
             )),
         };
