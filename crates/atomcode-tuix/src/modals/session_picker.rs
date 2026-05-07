@@ -256,6 +256,23 @@ impl Modal for SessionPicker {
 }
 
 fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
+    // Empty state: surface a hint row so the user can tell the filter is
+    // active and which query is excluding everything (otherwise the menu
+    // renders as blank space and looks like the modal hung).
+    if p.filtered.is_empty() {
+        let label = if p.sessions.is_empty() {
+            "(no sessions in this project yet)".to_string()
+        } else if p.query.is_empty() {
+            "(no sessions match)".to_string()
+        } else {
+            format!("(no sessions match \"{}\" — Backspace to clear)", p.query)
+        };
+        return MenuPayload {
+            items: vec![(label, String::new())],
+            selected: 0,
+            kind: crate::render::MenuKind::SlashCommand,
+        };
+    }
     let items: Vec<(String, String)> = p
         .filtered
         .iter()
@@ -274,7 +291,7 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
-            kind: crate::render::MenuKind::SlashCommand,
+        kind: crate::render::MenuKind::SlashCommand,
     }
 }
 
@@ -455,5 +472,38 @@ mod tests {
         p.query = "xyz".to_string();
         p.update_filter();
         assert!(p.chosen_id().is_none());
+    }
+
+    #[test]
+    fn build_menu_payload_shows_hint_when_filter_matches_nothing() {
+        // Regression: typing a query that excludes every session used to
+        // render a blank menu (items.len() == 0), so the user couldn't
+        // tell whether /resume hung, the filter was active, or what.
+        // Now we surface a single non-interactive hint row so the empty
+        // state is visible.
+        let mut p = SessionPicker::open(vec![meta("alpha", 1), meta("beta", 1)]);
+        p.query = "zz".to_string();
+        p.update_filter();
+        assert_eq!(p.filtered.len(), 0);
+        let payload = build_menu_payload(&p);
+        assert_eq!(
+            payload.items.len(),
+            1,
+            "empty filter should produce a single hint row, got: {:?}",
+            payload.items
+        );
+        let (label, _) = &payload.items[0];
+        assert!(
+            label.contains("zz"),
+            "hint should echo the user's query so they know which filter is active: {}",
+            label
+        );
+    }
+
+    #[test]
+    fn build_menu_payload_shows_hint_when_no_sessions_at_all() {
+        let p = SessionPicker::open(vec![]);
+        let payload = build_menu_payload(&p);
+        assert_eq!(payload.items.len(), 1, "must show some empty-state hint");
     }
 }
