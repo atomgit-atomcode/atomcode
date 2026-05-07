@@ -15,6 +15,7 @@ pub enum Lang {
     Cpp,
     CSharp,
     Html,
+    Php,
     /// Vue SFC — dual parser: <script> as TypeScript, <template> as HTML.
     Vue,
 }
@@ -34,6 +35,7 @@ impl Lang {
             Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Lang::Html => tree_sitter_html::LANGUAGE.into(),
+            Lang::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             Lang::Vue => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         }
     }
@@ -51,6 +53,7 @@ impl Lang {
             Lang::Cpp => include_str!("queries/cpp.scm"),
             Lang::CSharp => include_str!("queries/csharp.scm"),
             Lang::Html => include_str!("queries/html.scm"),
+            Lang::Php => include_str!("queries/php.scm"),
             Lang::Vue => include_str!("queries/typescript.scm"),
         }
     }
@@ -67,6 +70,7 @@ impl Lang {
             Lang::Go => Some(include_str!("../graph/queries/go_calls.scm")),
             Lang::C | Lang::Cpp | Lang::CSharp => None,
             Lang::Html => None,
+            Lang::Php => None,
         }
     }
 
@@ -100,6 +104,7 @@ impl LanguageRegistry {
             "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => Some(Lang::Cpp),
             "cs" => Some(Lang::CSharp),
             "html" | "htm" => Some(Lang::Html),
+            "php" => Some(Lang::Php),
             "vue" | "svelte" => Some(Lang::Vue),
             _ => None,
         }
