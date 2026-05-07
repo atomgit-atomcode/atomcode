@@ -96,18 +96,23 @@ pub fn render_line_with_width(
         return Some(prepend(String::new()));
     }
 
-    // Heading — express hierarchy with SGR weight (bold) and italic
-    // rather than coloured greys. SGR 90 (bright-black) renders at near-
-    // invisible contrast on several iTerm2 dark presets; italic keeps
-    // H4+ visually distinct from H1-3 without relying on a colour that
-    // can disappear into the background.
+    // Heading — H1-H3 get bold + bright cyan (Palette::ACCENT, SGR 96)
+    // so headings sit on their own colour layer above the default-colour
+    // body. Bright cyan was chosen over bright magenta (BRAND, 95)
+    // because terminals that remap bright white (97, used by inline code
+    // and code blocks) to lavender — Catppuccin / Tokyo Night / similar
+    // — typically remap bright magenta to the same lavender, which
+    // would collapse heading colour into the inline-code colour.
+    // Cyan stays hue-distinct on those palettes and on plain ANSI.
+    // H4+ keeps italic-only so the deep-hierarchy levels still read as
+    // "weaker than a real heading" without adding a third colour tier.
     if let Some((level, rest)) = parse_heading(line) {
         let inner = render_inline(rest, caps);
         let body = if !caps.colors {
             format!("{} {}", "#".repeat(level as usize), inner)
         } else {
             match level {
-                1 | 2 | 3 => format!("\x1b[1m{}\x1b[22m", inner),
+                1 | 2 | 3 => format!("\x1b[1;96m{}\x1b[22;39m", inner),
                 _ => format!("\x1b[3m{}\x1b[23m", inner),
             }
         };
@@ -545,9 +550,20 @@ mod tests {
         let mut st = MdState::new();
         let out = render_line("## Hello", &mut st, caps()).unwrap();
         assert!(out.contains("Hello"));
-        // Headings now use SGR bold (\x1b[1m) with default foreground —
-        // readable on both light and dark terminal themes.
-        assert!(out.contains("\x1b[1m"));
+        // H1-H3 use bold + bright cyan (`\x1b[1;96m`) so headings sit
+        // on a separate colour layer from default-colour body text.
+        assert!(out.contains("\x1b[1;96m"), "H2 should be bold + bright cyan, got: {:?}", out);
+    }
+
+    #[test]
+    fn heading_h4_uses_italic_not_color() {
+        let mut st = MdState::new();
+        let out = render_line("#### Sub-deep", &mut st, caps()).unwrap();
+        assert!(out.contains("Sub-deep"));
+        // H4+ keeps italic-only — distinct from coloured H1-H3 without
+        // adding a third colour tier.
+        assert!(out.contains("\x1b[3m"), "H4 should be italic, got: {:?}", out);
+        assert!(!out.contains("\x1b[1;96m"), "H4 must not pick up the H1-H3 cyan");
     }
 
     #[test]
