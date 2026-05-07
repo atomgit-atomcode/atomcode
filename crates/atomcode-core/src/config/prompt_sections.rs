@@ -27,10 +27,12 @@ Guidelines:
 Call multiple tools in ONE turn. Do NOT split into separate turns.\n\
 Example: creating 3 files → call write_file 3 times in ONE response.\n\
 Example: reading 4 files → call read_file 4 times in ONE response.\n\
+Inside one `bash` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns. A multi-step deploy or restart (build → stop old → upload → start → verify) is ONE bash call. Each separate turn round-trips through the LLM and adds 5-30s of latency for nothing. Exception: when the next step's command genuinely depends on observing the previous step's output — then split.\n\
 The fewer turns you use, the better.\n\
 To read a file, always use `read_file` — not `bash cat`. `read_file` gives you skeletons for large files, \"Did you mean\" suggestions when the path is off by a directory, recovery hints for binary / non-UTF-8 formats, and per-session caching. `bash cat` has none of these and makes weak models cycle through wrong paths for turns.\n\
 Tool results may be truncated or condensed. If you need more detail, re-read the specific section with offset/limit.\n\
-If search results are truncated, narrow the query (add path filters, more specific pattern) rather than re-running the same search.
+If search results are truncated, narrow the query (add path filters, more specific pattern) rather than re-running the same search.\n\
+
 
 ## DOING TASKS:
 - Do not propose changes to code you haven't read. Read first, then modify.
@@ -74,3 +76,53 @@ When working with Chinese codebases:
 
 ## CONTEXT:
 The system will automatically compress prior messages as context fills up. Your conversation is not limited by the context window. After compression, do NOT assume prior tool results are still available. Re-read files and re-check state before continuing.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lock the bash-chunking guidance into the prompt. 5-7 atomgr datalog
+    /// (build 942b615) showed weak models burn 5-8 turns on what should be
+    /// a single `&&`-chained bash call. If a future refactor accidentally
+    /// drops this paragraph, this test catches it.
+    #[test]
+    fn unified_prompt_includes_bash_chunking_guidance() {
+        let p = build_rules();
+        assert!(
+            p.contains("chain dependent shell steps"),
+            "TOOLS section must keep the chunking principle"
+        );
+        assert!(
+            p.contains("&&") && p.contains(";"),
+            "must show the chain operators the model should use"
+        );
+        assert!(
+            p.contains("ONE bash call"),
+            "must call out the unit of chunking"
+        );
+    }
+
+    /// Tech-stack-neutrality check: the chunking paragraph stays generic.
+    /// Other prompt sections still mention concrete commands as
+    /// illustrations (e.g. `cargo check`, `tsc --noEmit`), but the
+    /// chunking paragraph must not bloat the prompt with tool-specific
+    /// examples. Guards against well-meaning future edits that add
+    /// rust/node/python-specific deploy chains.
+    #[test]
+    fn shell_chunking_paragraph_stays_tech_neutral() {
+        let p = build_rules();
+        let start = p
+            .find("chain dependent shell steps")
+            .expect("chunking guidance must exist");
+        // Inspect the paragraph (~500 chars after the anchor).
+        let para_end = (start + 500).min(p.len());
+        let para = &p[start..para_end];
+        for forbidden in &["cargo ", "npm ", "pytest", "go build", "mvn ", "gradle "] {
+            assert!(
+                !para.contains(forbidden),
+                "chunking paragraph must stay tech-neutral; found `{}`",
+                forbidden
+            );
+        }
+    }
+}
