@@ -878,6 +878,28 @@ mod tool_format_tests {
         assert_eq!(display_tool_name("_x"), "X");
     }
 
+    /// Short form strips the redundant noun suffix so batch UI shows
+    /// `Read(mod.rs)` instead of `ReadFile(mod.rs)` — matches CC's
+    /// function-call-style tool labels. Strip list is generic
+    /// (`_file`, `_files`, `_directory`); other suffixes pass through
+    /// untouched so `search_replace` stays `SearchReplace` (no
+    /// disambiguation lost).
+    #[test]
+    fn display_tool_name_short_strips_redundant_noun() {
+        assert_eq!(display_tool_name_short("read_file"), "Read");
+        assert_eq!(display_tool_name_short("write_file"), "Write");
+        assert_eq!(display_tool_name_short("edit_file"), "Edit");
+        assert_eq!(display_tool_name_short("create_file"), "Create");
+        assert_eq!(display_tool_name_short("list_directory"), "List");
+        assert_eq!(display_tool_name_short("parallel_edit_files"), "ParallelEdit");
+        // Suffixes not in strip list pass through.
+        assert_eq!(display_tool_name_short("bash"), "Bash");
+        assert_eq!(display_tool_name_short("grep"), "Grep");
+        assert_eq!(display_tool_name_short("search_replace"), "SearchReplace");
+        assert_eq!(display_tool_name_short("web_fetch"), "WebFetch");
+        assert_eq!(display_tool_name_short("blast_radius"), "BlastRadius");
+    }
+
     #[test]
     fn format_tool_detail_read_file_basename() {
         let args = r#"{"file_path":"/abs/path/to/foo.rs"}"#;
@@ -3304,28 +3326,46 @@ fn handle_agent_event(
             // to in-place checkmarks on the existing child rows instead
             // of appending new lines.
             if let Some(batch_id) = state.call_id_to_batch.get(&call_id).cloned() {
-                // In-place ✓/✗ on the existing child row inside the
-                // live-group. Renderer's ToolGroupChildUpdate finds
-                // the row by call_id and CUPs to its terminal position.
-                // Falls back to no-op if the group has been frozen
-                // (something else got pushed below it) — model still
-                // gets the full ToolResult through the conversation.
-                let bullet = if state.unicode_symbols { "↳" } else { "-" };
-                let mark = if success {
-                    if state.unicode_symbols { "✓" } else { "[ok]" }
+                // CC-style result-data update: `⎿ Read(mod.rs) → 200 lines`.
+                // The result snippet is generic line count of the
+                // output (works across read/grep/glob/bash without
+                // per-tool extraction). Failure shows `→ ✗` so the
+                // user can spot the broken child without reading
+                // bytes-of-output.
+                //
+                // Renderer's ToolGroupChildUpdate finds the row by
+                // call_id and CUPs to its terminal position. Falls
+                // back to no-op if the group has been frozen —
+                // model still gets the full ToolResult through the
+                // conversation.
+                let child_glyph = if state.unicode_symbols { "⎿" } else { "\\" };
+                let arrow = if state.unicode_symbols { "→" } else { "->" };
+                let suffix = if success {
+                    let n = output.lines().count().max(1);
+                    let unit = if n == 1 { "line" } else { "lines" };
+                    format!(" {} {} {}", arrow, n, unit)
                 } else if state.unicode_symbols {
-                    "✗"
+                    format!(" {} ✗", arrow)
                 } else {
-                    "[fail]"
+                    format!(" {} [fail]", arrow)
                 };
-                let display = pending_tools
+                // Reuse the original Tool(arg) prefix the
+                // ToolBatchStarted handler painted. pending_tools
+                // holds (display, detail) — strip the previous "name
+                // detail" join and rebuild as Short(detail) for
+                // visual consistency with the initial child row.
+                let prefix = pending_tools
                     .remove(&call_id)
-                    .map(|(d, det, _)| format!("{} {}", d, det))
-                    .unwrap_or_else(|| display_tool_name(&name));
+                    .map(|(_, det, _)| format!(
+                        "{}({})",
+                        display_tool_name_short(&name),
+                        det
+                    ))
+                    .unwrap_or_else(|| display_tool_name_short(&name));
                 renderer.render(UiLine::ToolGroupChildUpdate {
                     batch_id,
                     call_id: call_id.clone(),
-                    new_text: format!("  {} {} {}", bullet, mark, display),
+                    new_text: format!("  {} {}{}", child_glyph, prefix, suffix),
                 });
                 renderer.flush();
                 return;
@@ -3719,23 +3759,29 @@ fn handle_agent_event(
             // - CON: user doesn't see batch contents until first child
             //   completes. Acceptable: footer spinner conveys "working",
             //   contents become visible immediately on first result.
-            // Header glyph: ▸ on Unicode-capable terminals, `>` on
-            // legacy Windows conhost / dumb terminals.
-            let arrow = if state.unicode_symbols { "▸" } else { ">" };
-            let bullet = if state.unicode_symbols { "↳" } else { "-" };
+            // CC-aligned glyphs: ⏺ for batch header (filled circle),
+            // ⎿ for each child row (pipe-corner). Windows-legacy
+            // fallback: > and \ keeps the layout intact when SGR
+            // glyphs render as tofu.
+            let head_glyph = if state.unicode_symbols { "⏺" } else { ">" };
+            let child_glyph = if state.unicode_symbols { "⎿" } else { "\\" };
             // Build header + child rows; renderer keeps the group
             // "live" while it's the bottom of body_lines, so each
             // ToolCallResult below can update the matching child row
-            // in place (CC-style ✓ light-up).
-            let header_text = format!("{} {}", arrow, label);
+            // in place (CC-style result data light-up).
+            //
+            // Child format: `⎿ Read(mod.rs)`. Tool name is the short
+            // form (Read not ReadFile); detail is wrapped in parens
+            // (Tool(arg) reads as a function call, mirroring CC).
+            let header_text = format!("{} {}", head_glyph, label);
             let children: Vec<crate::render::ToolGroupChild> = calls
                 .iter()
                 .map(|c| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
                     text: format!(
-                        "  {} {} {}",
-                        bullet,
-                        display_tool_name(&c.name),
+                        "  {} {}({})",
+                        child_glyph,
+                        display_tool_name_short(&c.name),
                         format_tool_detail(&c.name, &c.arguments)
                     ),
                 })
@@ -3761,31 +3807,23 @@ fn handle_agent_event(
         }
         AgentEvent::ToolBatchCompleted {
             batch_id,
-            ok,
-            total,
-            elapsed_ms,
+            ok: _,
+            total: _,
+            elapsed_ms: _,
         } => {
-            let arrow = if state.unicode_symbols { "▸" } else { ">" };
-            let summary = if ok == total {
-                format!(
-                    "  {} batch {}/{} ok · {} wall", arrow,
-                    ok,
-                    total,
-                    fmt_elapsed(elapsed_ms)
-                )
-            } else {
-                format!(
-                    "  {} batch {} ok · {} fail · {} wall", arrow,
-                    ok,
-                    total - ok,
-                    fmt_elapsed(elapsed_ms)
-                )
-            };
-            renderer.render(UiLine::ToolGroupSummary { text: summary });
-            renderer.flush();
-
-            // Clear batch state — subsequent per-call events fall back
-            // to the standard single-tool render path.
+            // CC-style: NO standalone batch-summary row. Each child
+            // row already shows its own `→ N lines` / `→ ✗`, so an
+            // aggregate `batch 4/4 ok · Xs wall` line would just be
+            // visual noise repeating what's already visible above.
+            //
+            // SubAgentDispatchEnd (different code path) STILL emits
+            // its `▸ ParallelEditFiles · ...` summary because sub-agent
+            // turns/elapsed per-task is hidden by Task 3's collapse —
+            // that summary is the only place the user can see how
+            // long it took.
+            //
+            // Just clear batch state so subsequent per-call events
+            // fall back to the standard single-tool render path.
             if let Some(b) = state.active_tool_batches.remove(&batch_id) {
                 for cid in b.call_ids {
                     state.call_id_to_batch.remove(&cid);
@@ -4141,6 +4179,29 @@ pub fn display_tool_name(snake: &str) -> String {
         }
     }
     out
+}
+
+/// CC-style short tool name. Strips the redundant `_file` /
+/// `_directory` / `_files` suffixes (the noun is implicit from the
+/// arg) before PascalCase conversion. Generic — no per-tool match
+/// arms; works for any future tool that follows the
+/// `<verb>_<noun>` convention.
+///
+/// Examples:
+/// - `read_file` → `Read`
+/// - `write_file` → `Write`
+/// - `list_directory` → `List`
+/// - `parallel_edit_files` → `ParallelEdit`
+/// - `bash` → `Bash` (no suffix to strip)
+/// - `search_replace` → `SearchReplace` (suffix `_replace` not in
+///    strip list, kept verbatim → preserves disambiguation)
+pub fn display_tool_name_short(snake: &str) -> String {
+    const STRIP_SUFFIXES: &[&str] = &["_files", "_file", "_directory"];
+    let trimmed = STRIP_SUFFIXES
+        .iter()
+        .find_map(|s| snake.strip_suffix(s))
+        .unwrap_or(snake);
+    display_tool_name(trimmed)
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
