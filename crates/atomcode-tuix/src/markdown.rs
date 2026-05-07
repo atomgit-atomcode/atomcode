@@ -76,15 +76,23 @@ pub fn render_line_with_width(
         return prefix_only();
     }
 
-    // Inside code block: render in bright white + bold (SGR 97 + 1) with
-    // no inline parsing. Bright white reads cleanly on both light and dark
-    // backgrounds without the low-contrast pastel hit that SGR 96 (cyan)
-    // suffers on iTerm2's default light preset.
+    // Inside code block: CC-style left-bar marker `│` (faint/SGR 2)
+    // + default-color content. The bar makes the block visually
+    // distinct without painting every line bold+bright white. A
+    // 30-line code block previously dominated screen attention with
+    // 30 bright-white rows; now it reads as a quiet quoted region
+    // with a thin gutter, the way CC renders fenced blocks.
+    //
+    // Earlier iteration used `\x1b[1;97m` (bold + bright white) to
+    // beat unreadable cyan on iTerm2 light preset. The light-preset
+    // problem is solved by NOT picking a colour at all — terminal
+    // default fg works on every theme. Bar uses faint (SGR 2) so it
+    // reads as a marker, not a competing element.
     if state.in_code_block {
         let body = if caps.colors {
-            format!("\x1b[1;97m{}\x1b[22;39m", line)
+            format!("\x1b[2m│\x1b[22m {}", line)
         } else {
-            line.to_string()
+            format!("│ {}", line)
         };
         return Some(prepend(body));
     }
@@ -512,17 +520,22 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_block_keeps_bold_bright_white() {
-        // Code BLOCKS keep bold+bright white intentionally — readers
-        // need a strong visual anchor for standalone code paragraphs.
-        // Only inline code dropped the bright-white SGR; the fence
-        // path at line ~85 still emits 1;97 so verify here.
+    fn fenced_code_block_uses_faint_left_bar_marker() {
+        // CC-style: code blocks render as `│ <line>` with a faint
+        // (SGR 2) bar marker, NOT bold+bright white per line. Pin the
+        // exact prefix shape so a future "let's brighten it again"
+        // refactor catches itself in CI.
         let mut state = MdState::new();
         let _ = render_line("```", &mut state, caps()); // open fence
         let inside = render_line("let x = 1;", &mut state, caps()).unwrap_or_default();
         assert!(
-            inside.contains("\x1b[1;97m"),
-            "fenced code block should still use bold+bright white: {}",
+            inside.contains("\x1b[2m│\x1b[22m"),
+            "fenced code block should use faint `│` left bar: {}",
+            inside
+        );
+        assert!(
+            !inside.contains("\x1b[1;97m"),
+            "fenced code block must NOT bold+bright-white the content: {}",
             inside
         );
     }
