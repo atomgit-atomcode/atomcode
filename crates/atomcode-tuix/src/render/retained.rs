@@ -1832,16 +1832,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // push_body_row clears any prior live_group, including
                 // ours mid-loop, so we set live_group AFTER the loop.
                 //
-                // Style: header + children all use the same plain style
-                // (no bold, no brand color). The ▸ glyph alone is the
-                // visual marker. Earlier iteration tried bold+brand on
-                // the header but combined with markdown headings + code
-                // fences + emoji the screen had too many competing
-                // emphasis tokens. CC's pattern: plain text + a single
-                // glyph as the only structural marker.
+                // Style: header gets bold + Brand color (single anchor
+                // line per batch — needs to read as "this is the
+                // batch boundary"). Children stay muted (high-frequency
+                // repeated rows, not anchors). Summary line uses muted
+                // too — only one bold+brand emphasis per batch keeps
+                // the screen readable when stacked next to markdown
+                // headings, code fences, and inline code.
+                let header_style = self.style_bold(Role::Brand);
                 let muted = self.style_for(Role::Muted);
                 let screen_w = self.screen.width();
-                let header_row = build_one_row(&header, &muted, screen_w);
+                let header_row = build_one_row(&header, &header_style, screen_w);
                 self.push_body_row(header_row);
                 let header_idx = self.body_lines.len() - 1;
 
