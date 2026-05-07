@@ -76,15 +76,15 @@ pub fn render_line_with_width(
         return prefix_only();
     }
 
-    // Inside code block: render in truecolor purple-500 (#A855F7, RGB
-    // 168,85,247) + bold. Direct RGB sidesteps the bright-XX palette
+    // Inside code block: render in truecolor blue-500 (#3B82F6, RGB
+    // 59,130,246) + bold. Direct RGB sidesteps the bright-XX palette
     // remap problem — `\x1b[1;97m` (bright white) was invisible on
     // iTerm2 light preset, `\x1b[1;96m` (bright cyan) was a washed-out
-    // teal there. purple-500 has lightness ≈ 0.6 so it reads with at
+    // teal there. blue-500 has lightness ≈ 0.6 so it reads with at
     // least 4:1 contrast against pure white AND pure black backgrounds.
     if state.in_code_block {
         let body = if caps.colors {
-            format!("\x1b[1;38;2;168;85;247m{}\x1b[22;39m", line)
+            format!("\x1b[1;38;2;59;130;246m{}\x1b[22;39m", line)
         } else {
             line.to_string()
         };
@@ -423,11 +423,11 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    // Bold + truecolor purple-500 (#A855F7). Same rationale
+                    // Bold + truecolor blue-500 (#3B82F6). Same rationale
                     // as the code-block path above — direct RGB so the
                     // colour survives terminal palette remap and stays
                     // readable on both light and dark backgrounds.
-                    out.push_str("\x1b[1;38;2;168;85;247m");
+                    out.push_str("\x1b[1;38;2;59;130;246m");
                     out.push_str(&inner);
                     out.push_str("\x1b[22;39m");
                 } else {
@@ -538,13 +538,13 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        // Inline code uses bold + truecolor purple-500 (#A855F7, RGB
-        // 168,85,247). Truecolor sidesteps the bright-XX palette remap
+        // Inline code uses bold + truecolor blue-500 (#3B82F6, RGB
+        // 59,130,246). Truecolor sidesteps the bright-XX palette remap
         // problem so the colour stays readable on iTerm2 light preset
         // (where bright-white was invisible and bright-cyan was a
         // washed-out pastel teal).
         assert!(
-            render_inline_line("`x`", caps()).contains("\x1b[1;38;2;168;85;247mx"),
+            render_inline_line("`x`", caps()).contains("\x1b[1;38;2;59;130;246mx"),
             "got: {:?}",
             render_inline_line("`x`", caps())
         );

@@ -4356,8 +4356,8 @@ mod tests {
             cell,
             vterm.dump()
         );
-        // Inline code: markdown crate wraps it in truecolor purple-500
-        // (RGB 168,85,247) so the colour stays readable on both light
+        // Inline code: markdown crate wraps it in truecolor blue-500
+        // (RGB 59,130,246) so the colour stays readable on both light
         // and dark terminal themes (bright-XX SGR colours got remapped
         // by individual themes — bright-white invisible on iTerm2 light,
         // bright-cyan washed-out pastel there).
@@ -4367,8 +4367,8 @@ mod tests {
         let code_cell = vterm.cell_at(row_idx, code_pos);
         assert_eq!(
             code_cell.fg,
-            Some(crossterm::style::Color::Rgb { r: 168, g: 85, b: 247 }),
-            "inline code cell should be truecolor purple-500: {:?}",
+            Some(crossterm::style::Color::Rgb { r: 59, g: 130, b: 246 }),
+            "inline code cell should be truecolor blue-500: {:?}",
             code_cell
         );
     }
