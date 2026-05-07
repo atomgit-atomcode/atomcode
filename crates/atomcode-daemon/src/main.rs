@@ -2249,24 +2249,41 @@ async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "reloading"}))
 }
 
-fn daemon_port_from_args() -> u16 {
+fn daemon_addr_from_args() -> (String, u16) {
+    const DEFAULT_HOST: &str = "127.0.0.1";
     const DEFAULT_PORT: u16 = 13456;
+
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if arg == "--host" {
+            if let Some(value) = args.next() {
+                host = Some(value);
+            }
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--host=") {
+            host = Some(value.to_string());
+            continue;
+        }
+
         if arg == "--port" {
             if let Some(value) = args.next() {
-                return value.parse().unwrap_or(DEFAULT_PORT);
+                port = value.parse().ok();
             }
-            return DEFAULT_PORT;
+            continue;
         }
 
         if let Some(value) = arg.strip_prefix("--port=") {
-            return value.parse().unwrap_or(DEFAULT_PORT);
+            port = value.parse().ok();
+            continue;
         }
     }
 
-    DEFAULT_PORT
+    (host.unwrap_or_else(|| DEFAULT_HOST.to_string()), port.unwrap_or(DEFAULT_PORT))
 }
 
 #[tokio::main]
@@ -2349,15 +2366,25 @@ async fn main() {
         .with_state(state)
         .layer(cors_layer());
 
-    // Bind loopback-only by design. The daemon hosts chat / file-edit /
-    // tool-execution endpoints that must NEVER be reachable from another
-    // host on the LAN (PR #82 briefly broke this by hard-coding 0.0.0.0;
-    // see commit `tianchang fix(daemon): harden daemon chat access` for
-    // the original loopback-default rationale). If LAN access is ever
-    // genuinely needed, run a reverse proxy in front — don't let the
-    // daemon bind public interfaces directly.
-    let port = daemon_port_from_args();
-    let addr = format!("127.0.0.1:{port}");
+    // Default to loopback-only for security. The daemon hosts chat / file-edit /
+    // tool-execution endpoints that should not be reachable from another host on
+    // the LAN without explicit configuration (PR #82 briefly broke this by
+    // hard-coding 0.0.0.0; see commit `tianchang fix(daemon): harden daemon chat
+    // access` for the original loopback-default rationale).
+    //
+    // Users can override the bind address via --host <ip>. When binding a
+    // non-loopback address, a security warning is printed. For production use,
+    // consider running a reverse proxy in front instead.
+    let (host, port) = daemon_addr_from_args();
+    let addr = format!("{host}:{port}");
+    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+        eprintln!(
+            "Warning: binding to non-loopback address '{}'. \
+            The daemon exposes sensitive endpoints (chat, file-edit, tool-execution). \
+            Ensure the network is trusted or use a reverse proxy with authentication.",
+            host
+        );
+    }
     println!("AtomCode API server listening on http://{}", addr);
     if dangerous_tools_enabled() {
         eprintln!(
