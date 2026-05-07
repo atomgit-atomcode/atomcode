@@ -47,6 +47,40 @@ fn paste_candidate_char(ev: &Event) -> Option<char> {
     }
 }
 
+/// True when an aggregated `paste_candidate_char` burst should be treated
+/// as a real `InputEvent::Paste` rather than emitted as individual key
+/// events. Three conjuncted conditions:
+///
+/// 1. **At least 2 chars** — singletons are normal typing.
+/// 2. **Contains `\n`** — the unambiguous "this is multi-line content"
+///    signal. Bursts of plain printable chars (someone typing fast) get
+///    handled per-key just fine without aggregation.
+/// 3. **At least one non-whitespace char** — distinguishes a real paste
+///    from buffered Enter/Tab keystrokes left in the tty input queue at
+///    startup. Without this guard, two Enters mashed by the user before
+///    atomcode took over the terminal (e.g. while waiting for a slow
+///    `cargo build` to finish) get aggregated into `Paste("\n\n")` and
+///    inserted as text — the input box opens with two pre-typed blank
+///    lines. Genuine pastes containing only whitespace + newlines are
+///    vanishingly rare; falling back to per-key submission of those bursts
+///    is the right trade-off.
+fn is_paste_burst(chars: &[char]) -> bool {
+    if chars.len() < 2 {
+        return false;
+    }
+    let mut has_enter = false;
+    let mut has_text_char = false;
+    for &c in chars {
+        if c == '\n' {
+            has_enter = true;
+        }
+        if !c.is_whitespace() {
+            has_text_char = true;
+        }
+    }
+    has_enter && has_text_char
+}
+
 /// Lifecycle commands for the reader thread. Sent from the event loop
 /// whenever an external process (OAuth browser flow, `/shell`, etc.)
 /// needs stdin/stdout in cooked mode without our reader racing for bytes.
@@ -303,7 +337,6 @@ fn run(
         // conservative.
         if let Some(c0) = paste_candidate_char(&ev) {
             let mut chars = vec![c0];
-            let mut has_enter = c0 == '\n';
             let mut trailing: Option<Event> = None;
             const BATCH_CAP: usize = 8192;
             while chars.len() < BATCH_CAP {
@@ -339,9 +372,6 @@ fn run(
                 match paste_candidate_char(&nxt) {
                     Some(c) => {
                         chars.push(c);
-                        if c == '\n' {
-                            has_enter = true;
-                        }
                     }
                     None => {
                         trailing = Some(nxt);
@@ -349,7 +379,7 @@ fn run(
                     }
                 }
             }
-            if chars.len() >= 2 && has_enter {
+            if is_paste_burst(&chars) {
                 let text: String = chars.into_iter().collect();
                 crate::tuix_trace!("RD", "paste-burst synth len={}", text.len());
                 if tx.send(InputEvent::Paste(text)).is_err() {
@@ -555,6 +585,52 @@ mod tests {
     fn paste_candidate_accepts_plain_enter() {
         let ev = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(paste_candidate_char(&ev), Some('\n'));
+    }
+
+    /// Regression: two Enters left in the tty input queue at startup
+    /// (e.g. user mashed Enter while waiting for `cargo build` to
+    /// finish before atomcode took over) used to aggregate into a
+    /// synthetic `Paste("\n\n")` and insert two blank lines into the
+    /// input box on launch. Pure-newline bursts must NOT count as paste.
+    #[test]
+    fn pure_newline_burst_is_not_paste() {
+        assert!(!is_paste_burst(&['\n', '\n']));
+        assert!(!is_paste_burst(&['\n', '\n', '\n']));
+    }
+
+    /// Whitespace-only bursts (newline + space, newline + tab) likewise
+    /// fail the "real content" test — same root cause as the buffered-
+    /// Enter case, just with adjacent whitespace instead.
+    #[test]
+    fn whitespace_only_burst_is_not_paste() {
+        assert!(!is_paste_burst(&[' ', '\n']));
+        assert!(!is_paste_burst(&['\t', '\n']));
+        assert!(!is_paste_burst(&['\n', ' ', '\t', '\n']));
+    }
+
+    /// Real multi-line paste (text + embedded newline) must still be
+    /// recognised — that's the entire reason the burst path exists for
+    /// terminals without bracketed paste.
+    #[test]
+    fn text_with_newline_burst_is_paste() {
+        assert!(is_paste_burst(&['h', 'i', '\n']));
+        assert!(is_paste_burst(&['\n', 'h', 'i']));
+        assert!(is_paste_burst(&['l', 'i', 'n', 'e', '1', '\n', 'l', 'i', 'n', 'e', '2']));
+    }
+
+    /// Bursts without any newline fall through to per-key handling
+    /// regardless of length — just fast typing, not a paste signal.
+    #[test]
+    fn no_newline_burst_is_not_paste() {
+        assert!(!is_paste_burst(&['a', 'b', 'c', 'd']));
+    }
+
+    /// Singleton "bursts" are never pastes; aggregation requires ≥ 2.
+    #[test]
+    fn singleton_burst_is_not_paste() {
+        assert!(!is_paste_burst(&['\n']));
+        assert!(!is_paste_burst(&['x']));
+        assert!(!is_paste_burst(&[]));
     }
 
     /// Regression for the Windows-resize crash. `crossterm::event::poll`
