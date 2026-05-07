@@ -18,6 +18,7 @@ pub(crate) mod file_index;
 pub(crate) mod monitor;
 pub(crate) mod usage_monitor;
 use commands::execute_slash_command;
+pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -26,7 +27,7 @@ use std::time::Duration;
 use anyhow::Result;
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle, AgentPhase};
 use atomcode_core::config::Config;
-use atomcode_core::session::SessionManager;
+use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
@@ -201,6 +202,9 @@ pub struct LoopCtx {
     /// Lazy file/dir index for `@`-mention popup. Built on first `@`
     /// keystroke via `FileIndex::filter`; session-life cache.
     pub file_index: file_index::FileIndex,
+    /// Active session id once `/resume` has loaded one. Required by the
+    /// `/rename` slash command to know which session file to update.
+    pub current_session_id: Option<SessionId>,
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user

@@ -22,6 +22,7 @@ use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
+use atomcode_core::session::{SessionId, SessionManager};
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
@@ -50,6 +51,56 @@ fn build_oauth_provider() -> ProviderConfig {
 // and a `build_oauth_provider` helper here. Both are owned by
 // `coding_plan::setup` now — `/login` is identity-only, provider
 // registration is the job of `/codingplan`.
+
+/// Maximum length for a session name.
+pub const MAX_SESSION_NAME_LEN: usize = 100;
+
+/// Validates a session name and returns an error message if invalid.
+/// Returns None if the name is valid.
+pub fn validate_session_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Some("Session name cannot be empty".into());
+    }
+    if trimmed.chars().count() > MAX_SESSION_NAME_LEN {
+        return Some(format!(
+            "Session name too long (max {} characters)",
+            MAX_SESSION_NAME_LEN
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Some("Session name cannot contain control characters".into());
+    }
+    None
+}
+
+/// Rename a session after validation, persist it, and return old/new names.
+pub fn perform_session_rename(
+    session_manager: &SessionManager,
+    session_id: &SessionId,
+    new_name: &str,
+) -> Result<(String, String), String> {
+    if let Some(err) = validate_session_name(new_name) {
+        return Err(err);
+    }
+    let new_name = new_name.trim().to_string();
+    let session = session_manager
+        .load(session_id)
+        .map_err(|e| format!("Failed to load session: {}", e))?;
+    let old_name = session.name.clone();
+    let renamed_session = atomcode_core::session::Session {
+        name: new_name.clone(),
+        updated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(session.updated_at),
+        ..session
+    };
+    session_manager
+        .save(&renamed_session)
+        .map_err(|e| format!("Failed to save session: {}. The name was not persisted.", e))?;
+    Ok((old_name, new_name))
+}
 
 pub(super) fn execute_slash_command(
     cmd: &str,
@@ -218,6 +269,7 @@ pub(super) fn execute_slash_command(
             // redraw the welcome screen so the user sees they're in a
             // brand-new session. Ports `/session` from the legacy TUI.
             ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+            ctx.current_session_id = None;
             state.total_tokens = 0;
             state.prompt_tokens = 0;
             state.completion_tokens = 0;
@@ -273,6 +325,28 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
             }
         },
+        "rename" => {
+            if let Some(ref session_id) = ctx.current_session_id {
+                match perform_session_rename(&ctx.session_manager, session_id, arg) {
+                    Ok((old_name, new_name)) => {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Session renamed: '{}' -> '{}'",
+                            old_name, new_name
+                        )));
+                        renderer.flush();
+                    }
+                    Err(err) => {
+                        renderer.render(UiLine::Error(err));
+                        renderer.flush();
+                    }
+                }
+            } else {
+                renderer.render(UiLine::Error(
+                    "No active session to rename. Use /resume to load a session first.".into()
+                ));
+                renderer.flush();
+            }
+        }
         "provider" => {
             *active_modal = Some(Box::new(ProviderWizard::MainMenu { selected: 0 }));
             renderer.render(UiLine::CommandOutput(

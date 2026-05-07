@@ -6,6 +6,7 @@
 // with type-to-filter search. Up/Down navigates, Enter loads + replays
 // into scrollback + syncs the agent via `AgentCommand::SetMessages`,
 // Esc cancels, printable chars + Backspace edit the filter query.
+// F2 renames the selected session.
 
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
@@ -13,7 +14,9 @@ use atomcode_core::session::{Session, SessionMeta};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, format_tool_detail, summarise, Buffer, LoopCtx};
+use crate::event_loop::{
+    build_status, format_tool_detail, perform_session_rename, summarise, Buffer, LoopCtx,
+};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -26,6 +29,10 @@ pub struct SessionPicker {
     pub filtered: Vec<usize>,
     /// Index into `filtered`.
     pub selected: usize,
+    /// Whether we are in rename editing mode.
+    pub rename_editing: bool,
+    /// The new name being edited for rename.
+    pub rename_buffer: String,
 }
 
 impl SessionPicker {
@@ -36,6 +43,8 @@ impl SessionPicker {
             query: String::new(),
             filtered,
             selected: 0,
+            rename_editing: false,
+            rename_buffer: String::new(),
         }
     }
 
@@ -52,6 +61,10 @@ impl SessionPicker {
     }
 
     pub fn up(&mut self) {
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            return;
+        }
         self.selected = self.selected.saturating_sub(1);
     }
 
@@ -60,7 +73,7 @@ impl SessionPicker {
             self.selected = 0;
             return;
         }
-        let max = self.filtered.len() - 1;
+        let max = self.filtered.len().saturating_sub(1);
         if self.selected < max {
             self.selected += 1;
         }
@@ -82,6 +95,76 @@ impl Modal for SessionPicker {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
+        // Handle rename editing mode
+        if self.rename_editing {
+            match code {
+                KeyCode::Esc => {
+                    // Cancel rename editing
+                    self.rename_editing = false;
+                    self.rename_buffer.clear();
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+                KeyCode::Enter => {
+                    if let Some(idx) = self.filtered.get(self.selected).copied() {
+                        if let Some(session_meta) = self.sessions.get(idx) {
+                            let id = session_meta.id.clone();
+                            match perform_session_rename(
+                                &ctx.session_manager,
+                                &id,
+                                &self.rename_buffer,
+                            ) {
+                                Ok((old_name, new_name)) => {
+                                    // Update the session name in our local list
+                                    if let Some(s) = self.sessions.get_mut(idx) {
+                                        s.name = new_name.clone();
+                                    }
+                                    // Recompute filtered list since new name may no longer match query
+                                    let prev_id = id.clone();
+                                    self.update_filter();
+                                    // Try to keep the same session selected
+                                    self.selected = self
+                                        .filtered
+                                        .iter()
+                                        .position(|&fi| self.sessions[fi].id == prev_id)
+                                        .unwrap_or(0);
+                                    // Show success feedback
+                                    renderer.render(UiLine::CommandOutput(format!(
+                                        "  Renamed: '{}' -> '{}'",
+                                        old_name, new_name
+                                    )));
+                                    renderer.flush();
+                                }
+                                Err(err) => {
+                                    renderer.render(UiLine::Error(err));
+                                    renderer.flush();
+                                }
+                            }
+                        }
+                    }
+                    self.rename_editing = false;
+                    self.rename_buffer.clear();
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+                KeyCode::Backspace => {
+                    self.rename_buffer.pop();
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                    self.rename_buffer.push(c);
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+                _ => {
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+            }
+        }
+
+        // Normal mode handling
         match code {
             KeyCode::Up => {
                 self.up();
@@ -105,6 +188,20 @@ impl Modal for SessionPicker {
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
+            KeyCode::F(2) => {
+                // F2 to start rename editing for selected session
+                if let Some(idx) = self.filtered.get(self.selected).copied() {
+                    if let Some(session) = self.sessions.get(idx) {
+                        self.rename_buffer = session.name.clone();
+                        self.rename_editing = true;
+                        self.draw(buf, state, ctx, renderer);
+                    }
+                } else {
+                    renderer.render(UiLine::Error("No session selected".into()));
+                    renderer.flush();
+                }
+                Ok(ModalAction::Continue)
+            }
             KeyCode::Enter => {
                 let Some(id) = self.chosen_id() else {
                     // Filter matched nothing — ignore Enter, stay open.
@@ -112,6 +209,7 @@ impl Modal for SessionPicker {
                 };
                 match ctx.session_manager.load(&id) {
                     Ok(session) => {
+                        ctx.current_session_id = Some(id);
                         replay_session(renderer, &session, true);
                         ctx.agent
                             .cmd_tx
@@ -130,6 +228,10 @@ impl Modal for SessionPicker {
                         Ok(ModalAction::Close)
                     }
                     Err(e) => {
+                        ctx.current_session_id = None;
+                        state.total_tokens = 0;
+                        state.thinking_idx = 0;
+                        state.on_turn_complete();
                         renderer.render(UiLine::Error(format!("load session failed: {}", e)));
                         renderer.flush();
                         Ok(ModalAction::Close)
@@ -157,10 +259,16 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
     let items: Vec<(String, String)> = p
         .filtered
         .iter()
-        .map(|&i| {
-            let s = &p.sessions[i];
+        .enumerate()
+        .map(|(filter_idx, &session_idx)| {
+            let s = &p.sessions[session_idx];
             let desc = format!("{} msgs · {}", s.message_count, humanize_age(s.updated_at));
-            (s.name.clone(), desc)
+            // If in rename editing mode and this is the selected item, show the editing buffer
+            if p.rename_editing && filter_idx == p.selected {
+                (format!("> {}_  [Enter: confirm, Esc: cancel]", p.rename_buffer), desc)
+            } else {
+                (s.name.clone(), desc)
+            }
         })
         .collect();
     MenuPayload {
