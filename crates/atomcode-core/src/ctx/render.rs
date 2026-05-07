@@ -690,22 +690,139 @@ fn snap_to_valid_boundary(messages: &[Message], idx: usize) -> usize {
 // `build_messages` to apply rolling condensation / freshness
 // replacement / sanity cleanup.
 
-/// Microcompact: condense old ToolResult messages to one-line summaries.
-/// Zero LLM calls — purely mechanical compression.
+/// Floor for collapse: outputs smaller than this are left alone.
+/// Doubles as the idempotence guarantee — every stub we produce is
+/// well under this size, so re-running compaction never re-stubs.
+pub(crate) const MIN_COLLAPSE_SIZE: usize = 500;
+
+/// Build the generic compaction stub used by both microcompact (render
+/// time, ephemeral) and the conv-level Tier 1 (destructive). Tool name
+/// comes from the model's own tool_calls so the framework adds zero
+/// hardcoded tool knowledge — every tool gets the same shape.
 ///
-/// `read_file` results are NEVER condensed by microcompact. They stay in
-/// context for the entire task so the model can cross-reference files
-/// freely. Cleanup happens at two higher levels:
-/// 1. Task boundary compression (new user message → old task compressed)
-/// 2. 50% LLM compression threshold (context > 32K → oldest turns compressed)
+/// **First-line picking**: skips `[elapsed: ...]` framework metadata.
+/// `tool::bash` prepends `[elapsed: Xs, exit: N]\n<actual output>` to
+/// every bash result (see bash.rs:540). 5-7 atomgr datalog showed all
+/// 1704 bash stubs surfaced this metadata as `first:` content — model
+/// got "1.9s, exit 101" instead of the actual error. Skipping to line 2
+/// flips the stub from "exit code only" to "actual error / actual
+/// output preview". Falls back to line 1 when there's no line 2
+/// (single-line bash like `wc -l`). Non-bash tools (grep, edit_file,
+/// web_fetch) don't have this prefix → unaffected.
 ///
-/// Other tool results (bash, grep, edit, etc.) are condensed after
-/// 20 messages to keep context growth in check.
+/// **Hardcoding note**: matching `[elapsed:` is framework-internal
+/// knowledge of our own bash tool's output format, not tech-stack
+/// hardcoding (the prefix is the same regardless of cargo/npm/etc).
+/// Same category as the `read_file` skip in microcompact.
+pub(crate) fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
+    let line_count = output.lines().count();
+    let first_line: String = {
+        let mut iter = output.lines();
+        let l1 = iter.next().unwrap_or("(empty)");
+        let chosen = if l1.starts_with("[elapsed:") {
+            iter.next().unwrap_or(l1)
+        } else {
+            l1
+        };
+        chosen.chars().take(80).collect()
+    };
+    let status = if success { "ok" } else { "FAILED" };
+    format!(
+        "[{} {}: {} lines, first: {}]",
+        tool_name, status, line_count, first_line,
+    )
+}
+
+/// Build a `call_id -> tool_name` lookup from a slice of messages. The
+/// `MessageContent::AssistantWithToolCalls` variant carries the model's
+/// own tool name; this is what we surface in stubs.
+fn build_call_id_to_tool_map(
+    msgs: &[Message],
+) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for msg in msgs {
+        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+            for tc in tool_calls {
+                map.insert(tc.id.clone(), tc.name.clone());
+            }
+        }
+    }
+    map
+}
+
+/// Conv-level Tier 1 compaction. Replaces tool_result bodies in turns
+/// older than `keep_recent_turns` with the same generic stub used by
+/// microcompact. This is the destructive counterpart: microcompact runs
+/// every render and is ephemeral (only mutates the rendered Vec); this
+/// runs from the agent emergency path and permanently shrinks
+/// `conv.messages` so the next `needs_compression` check sees the
+/// freed budget.
+///
+/// Idempotent: stubs already in place are smaller than MIN_COLLAPSE_SIZE
+/// and skip the rewrite.
+pub(crate) fn compact_old_tool_results_in_place(
+    conv: &mut crate::conversation::Conversation,
+    keep_recent_turns: usize,
+) {
+    let turns = &conv.turn_tracker.turns;
+    if turns.len() <= keep_recent_turns {
+        return;
+    }
+    let cutoff_turn = turns.len() - keep_recent_turns;
+    let cutoff_msg = turns[cutoff_turn].start_idx.min(conv.messages.len());
+
+    let call_id_to_tool = build_call_id_to_tool_map(&conv.messages);
+
+    for i in 0..cutoff_msg {
+        let MessageContent::ToolResult(ref tr) = conv.messages[i].content else {
+            continue;
+        };
+        if tr.output.len() <= MIN_COLLAPSE_SIZE {
+            continue;
+        }
+        let tool_name = call_id_to_tool
+            .get(&tr.call_id)
+            .map(|s| s.as_str())
+            .unwrap_or("tool");
+        let summary = build_compact_stub(tool_name, &tr.output, tr.success);
+        conv.messages[i].content = MessageContent::ToolResult(crate::tool::ToolResult {
+            call_id: tr.call_id.clone(),
+            output: summary,
+            success: tr.success,
+        });
+    }
+}
+
+/// Microcompact: condense old `ToolResult` messages to one-line semantic
+/// summaries. Zero LLM calls — purely mechanical compression.
+///
+/// **The atomcode "weak-model attention" lever** (introduced 2026-04-11
+/// in commit a8ccd7b, P5.5). Long conversations buried key signals (bash
+/// errors, grep hits) under tens of thousands of tokens of raw output.
+/// Weak models like glm-5.1 with smaller effective windows lose track of
+/// "did the previous build succeed? what error did the last grep find?"
+/// once the answer scrolls past their attention horizon. Replacing old
+/// tool_results with semantic stubs (e.g. `[bash FAILED: 45 lines, first:
+/// error: cannot find type Foo]`) keeps the signal at the surface while
+/// dropping the verbose carry — a model can scan the stubs and recall
+/// past exploration without re-running tools.
+///
+/// **Why this exists despite "no tool-name hardcoding" project rule**:
+/// the tool name in the stub comes from the model's own `tool_calls.name`
+/// (already recorded in `AssistantWithToolCalls` messages), NOT from a
+/// `match` on hardcoded strings inside the framework. Whatever the model
+/// called the tool — `bash`, `Bash`, `mcp_server.run` — that label flows
+/// through to the stub. Generic format with `success` flag preserves
+/// retry-failed-then-succeeded reasoning chains for the model.
 ///
 /// `threshold_chars` — compaction gate. Below this total-char count the
-/// function is a no-op. Previously hardcoded at 100K; now passed in by
-/// `build_messages` so small-window ctx (Ollama 8K) can compact at
-/// ~12K chars instead of waiting for 100K that never arrives.
+/// function is a no-op. Scales with `ctx_window` (40% × budget × 4,
+/// capped at 100K) so small-window deployments compact earlier.
+///
+/// `read_file` is INCLUDED in compaction now (post-D3): re-reading a
+/// previously-read file is FileStore-served (no disk hit), so collapsing
+/// the original ToolResult is safe — model can always re-read for line
+/// numbers when needed.
 fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars: usize) {
     const OTHER_KEEP: usize = 20;
 
@@ -725,16 +842,7 @@ fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars
     }
 
     let other_cutoff = total_msg_count.saturating_sub(OTHER_KEEP);
-
-    let mut call_id_to_tool: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for msg in msgs.iter() {
-        if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
-            for tc in tool_calls {
-                call_id_to_tool.insert(tc.id.clone(), tc.name.clone());
-            }
-        }
-    }
+    let call_id_to_tool = build_call_id_to_tool_map(msgs);
 
     let cold_msgs = msgs
         .iter()
@@ -744,74 +852,50 @@ fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars
     let condense_end = cold_msgs + other_cutoff;
 
     for i in cold_msgs..condense_end.min(msgs.len()) {
-        if let MessageContent::ToolResult(ref r) = msgs[i].content {
-            let _tool_name = call_id_to_tool
-                .get(&r.call_id)
-                .map(|s| s.as_str())
-                .unwrap_or("tool");
+        let MessageContent::ToolResult(ref r) = msgs[i].content else {
+            continue;
+        };
 
-            let msg_idx = i.saturating_sub(cold_msgs);
-            if msg_idx >= other_cutoff {
-                continue;
-            }
-
-            if r.output.len() <= 500 {
-                continue;
-            }
-
-            let tool_name = call_id_to_tool
-                .get(&r.call_id)
-                .map(|s| s.as_str())
-                .unwrap_or("tool");
-
-            // read_file results are NEVER condensed by microcompact —
-            // honour what the doc comment at the top of this function
-            // already promises. The previous read_file branch collapsed
-            // file content to `[Read file (N lines): first_line]`
-            // (~60 bytes), forcing the model to re-read every file it
-            // had previously read once total chars crossed the 100K
-            // threshold. read.rs already has its own auto-skeleton
-            // truncation (Layer A) for files that don't fit; double-
-            // condensing here was the弱智化 mechanism observed in the
-            // 2026-05-05 atomgr session (server/mod.rs read 4× in
-            // 22 turns, api.rs hit the 3-call cap because the model
-            // saw only a one-line stub of its previous reads).
-            if tool_name == "read_file" {
-                continue;
-            }
-
-            let summary = match tool_name {
-                "bash" => {
-                    let first_line = r.output.lines().next().unwrap_or("(empty)");
-                    let line_count = r.output.lines().count();
-                    let short: String = first_line.chars().take(80).collect();
-                    if r.success {
-                        format!("[bash ({} lines): {}]", line_count, short)
-                    } else {
-                        format!("[bash FAILED ({} lines): {}]", line_count, short)
-                    }
-                }
-                "grep" => {
-                    let match_count = r.output.lines().filter(|l| l.contains(':')).count();
-                    format!("[grep: {} matches]", match_count)
-                }
-                "glob" => {
-                    let file_count = r.output.lines().count();
-                    format!("[glob: {} files]", file_count)
-                }
-                _ => {
-                    let first_line = r.output.lines().next().unwrap_or("");
-                    let short: String = first_line.chars().take(80).collect();
-                    format!("[{}: {}]", tool_name, short)
-                }
-            };
-
-            msgs[i].content = MessageContent::ToolResult(crate::tool::ToolResult {
-                call_id: r.call_id.clone(),
-                output: summary,
-                success: r.success,
-            });
+        let msg_idx = i.saturating_sub(cold_msgs);
+        if msg_idx >= other_cutoff {
+            continue;
         }
+
+        if r.output.len() <= MIN_COLLAPSE_SIZE {
+            continue;
+        }
+
+        let tool_name = call_id_to_tool
+            .get(&r.call_id)
+            .map(|s| s.as_str())
+            .unwrap_or("tool");
+
+        // read_file 永远不被 microcompact 压缩。stub 给模型的
+        // `first: 205| pub async fn dynamic_connect(` 信息会制造"伪自信"
+        // ——模型以为还记得函数体就直接 edit，结果反复修同一个文件
+        // (5-7 atomgr datalog T22-T29 实证 6 turn 反复修补)。保留全文
+        // 让模型在 edit 系列 turn 里始终看到最新代码。
+        // D3 FileStore 已经处理 re-read 的 disk-side 成本；prompt-side
+        // 多花 5-10% token 换"模型不丢上下文"，是值得的交易。
+        //
+        // 关于硬编码: 这里直接字符串比较 "read_file"，而非工具自声明
+        // (e.g. trait fn microcompact_eligible)。妥协理由：
+        // (a) "read_file" 是框架自家工具名常量，不是 cargo/npm/pytest
+        //     这类技术栈关键字，不违反"框架对技术栈中立"的项目铁律；
+        // (b) 改成 trait 方法需要把 ToolRegistry 引用穿进 render 层，
+        //     渲染路径调用面增大，收益不抵成本；
+        // (c) 仅此一处，未来如有第二个工具也要豁免，再重构成 trait。
+        if tool_name == "read_file" {
+            continue;
+        }
+
+        let summary = build_compact_stub(tool_name, &r.output, r.success);
+
+        msgs[i].content = MessageContent::ToolResult(crate::tool::ToolResult {
+            call_id: r.call_id.clone(),
+            output: summary,
+            success: r.success,
+        });
     }
 }
 
@@ -1396,52 +1480,64 @@ mod tests {
     }
 
     #[test]
-    fn microcompact_preserves_read_file_full_content() {
-        // 2026-05-05 atomgr session reproduced this bug: once L3
-        // microcompact's threshold (100K chars) was crossed, every
-        // pre-existing read_file result got collapsed to
-        // `[Read file (N lines): first_line]` (~60 bytes), forcing the
-        // model to re-read every file it had previously read.
-        // server/mod.rs was read 4× across 22 turns and api.rs hit the
-        // 3-call cap because the model's "previous read" was a 1-line
-        // stub. read.rs's auto-skeleton (Layer A) is the single
-        // authority for read_file truncation; microcompact must NOT
-        // double-condense.
+    fn microcompact_uses_generic_format_with_tool_label_from_call_id() {
+        // microcompact emits a single generic format:
+        // `[<tool> <ok|FAILED>: N lines, first: <line>]`. Tool label comes
+        // from the model's own `tool_calls.name`, not a `match` on
+        // hardcoded strings — passes the project's tech-stack-neutrality
+        // rule. Bash, grep, glob, and unknown-tool calls all flow
+        // through the same template.
+        //
+        // read_file is exempted (5-7 atomgr datalog showed weak models
+        // build "伪自信" from `first: 205| pub async fn dynamic_connect(`
+        // and edit blind). Skip behavior is covered by
+        // `microcompact_skips_read_file_to_preserve_long_session_context`.
         use crate::tool::{ToolCall, ToolResult};
         let mut conv = Conversation::new();
 
-        // Build a conversation with one large read_file result followed
-        // by enough other tool results to push total chars past the
-        // 100K threshold.
-        conv.add_user_message("read these files");
+        conv.add_user_message("explore");
 
-        // 1 read_file with substantial body — what we're asserting
-        // survives microcompact intact.
-        let read_call = ToolCall {
-            id: "c_read".into(),
-            name: "read_file".into(),
-            arguments: "{\"file_path\":\"src/server/mod.rs\"}".into(),
-        };
-        conv.add_assistant_tool_calls(Some("read it"), vec![read_call], None);
-        let read_body = "// SPDX-License-Identifier: MIT\n".to_string()
-            + &"pub fn server_loop() { /* ... */ }\n".repeat(80);
-        conv.add_tool_result(ToolResult {
-            call_id: "c_read".into(),
-            output: read_body.clone(),
-            success: true,
-        });
-
-        // Pad with bash results to push total chars over 100K threshold
-        // while keeping message_count > 20 (the OTHER_KEEP guard).
-        for i in 0..30 {
-            let call = ToolCall {
-                id: format!("c_b{}", i),
-                name: "bash".into(),
-                arguments: "{}".into(),
-            };
-            conv.add_assistant_tool_calls(None, vec![call], None);
+        // Mix of tool calls — bash (success), bash (failure), grep,
+        // and an unknown `mcp_remote.exec`. Each gets its own large
+        // body so all should be eligible for compaction.
+        let kinds = [
+            ("c_bok", "bash", true),
+            ("c_bfail", "bash", false),
+            ("c_grep", "grep", true),
+            ("c_mcp", "mcp_remote.exec", true),
+        ];
+        for (id, name, success) in &kinds {
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: (*id).to_string(),
+                    name: (*name).to_string(),
+                    arguments: "{}".into(),
+                }],
+                None,
+            );
             conv.add_tool_result(ToolResult {
-                call_id: format!("c_b{}", i),
+                call_id: (*id).to_string(),
+                output: format!("first line for {}\n{}", name, "x".repeat(4_000)),
+                success: *success,
+            });
+        }
+
+        // Pad with extra bash to push total_msg_count past OTHER_KEEP=20
+        // and total_chars past the 100K threshold.
+        for i in 0..30 {
+            let id = format!("c_pad{}", i);
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: id.clone(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: id,
                 output: format!("[elapsed: 0.1s, exit: 0]\n{}", "x".repeat(4_000)),
                 success: true,
             });
@@ -1450,45 +1546,272 @@ mod tests {
 
         let (msgs, _) = build_messages(&conv, "sys", 131_072, "");
 
-        // The read_file result must still carry the original body.
-        // Pre-fix it would be replaced with `[Read file (N lines): ...]`.
-        let read_result_msg = msgs
-            .iter()
-            .find(|m| {
+        // Helper: find a ToolResult by call_id in the rendered messages.
+        let find_by_id = |id: &str| -> Option<String> {
+            msgs.iter().find_map(|m| {
                 if let MessageContent::ToolResult(r) = &m.content {
-                    r.call_id == "c_read"
-                } else {
-                    false
+                    if r.call_id == id {
+                        return Some(r.output.clone());
+                    }
                 }
+                None
             })
-            .expect("read_file ToolResult should still be in the rendered messages");
+        };
 
-        if let MessageContent::ToolResult(r) = &read_result_msg.content {
+        // bash (success) → compacted with `bash ok: ...` label.
+        let bok = find_by_id("c_bok").expect("c_bok must survive");
+        assert!(
+            bok.starts_with("[bash ok: ") && bok.contains("first: "),
+            "bash success format mismatch: {}",
+            bok
+        );
+
+        // bash (failure) → `bash FAILED: ...` label preserves the
+        // success/fail axis the model needs for retry reasoning.
+        let bfail = find_by_id("c_bfail").expect("c_bfail must survive");
+        assert!(
+            bfail.starts_with("[bash FAILED: ") && bfail.contains("first: "),
+            "bash failure format mismatch: {}",
+            bfail
+        );
+
+        // grep and an unknown tool name use the same template — no
+        // special-case match arms inside microcompact (read_file is
+        // exempted; see `microcompact_skips_read_file_*`).
+        for (id, expected_label) in [
+            ("c_grep", "grep"),
+            ("c_mcp", "mcp_remote.exec"),
+        ] {
+            let body = find_by_id(id).unwrap_or_else(|| panic!("{} must survive", id));
             assert!(
-                !r.output.starts_with("[Read file"),
-                "read_file result was condensed by microcompact (got: {:?})",
-                &r.output[..r.output.len().min(80)]
+                body.starts_with(&format!("[{} ok: ", expected_label)),
+                "{} expected generic `[{} ok: ...]` format, got: {}",
+                id,
+                expected_label,
+                body
             );
-            assert_eq!(
-                r.output, read_body,
-                "read_file result must be byte-identical to the original"
+            assert!(
+                body.contains("first: first line for"),
+                "{} should preserve first-line snippet, got: {}",
+                id,
+                body
             );
         }
+    }
 
-        // Sanity: bash results past the OTHER_KEEP=20 window SHOULD be
-        // condensed, otherwise the test isn't actually exercising the
-        // microcompact path.
-        let condensed_bash = msgs.iter().any(|m| {
+    /// 5-7 atomgr datalog (build 942b615): 1704/1704 bash stubs surfaced
+    /// `first: [elapsed: Xs, exit: N]` — framework metadata, zero signal.
+    /// Stub now skips that line and shows line 2 (the real output / real
+    /// error). Failed bash retry decisions go from "exit 101 of unknown
+    /// origin" to "actual error: ...".
+    #[test]
+    fn build_compact_stub_skips_bash_elapsed_metadata() {
+        let bash_failure = "[elapsed: 1.9s, exit: 101]\nerror: cannot find type `Foo` in this scope";
+        let stub = build_compact_stub("bash", bash_failure, false);
+        assert!(
+            stub.contains("error: cannot find type"),
+            "bash stub must surface the actual error, not the elapsed metadata: {}",
+            stub
+        );
+        assert!(
+            !stub.contains("first: [elapsed:"),
+            "bash stub first-line must skip the elapsed metadata: {}",
+            stub
+        );
+    }
+
+    /// Single-line bash (`wc -l`, `echo $?`, etc.) has no line 2 to fall
+    /// through to. Stub must use whatever line 1 is rather than blanking.
+    #[test]
+    fn build_compact_stub_falls_back_to_line1_when_only_one_line() {
+        let one_liner = "42";
+        let stub = build_compact_stub("bash", one_liner, true);
+        assert!(stub.contains("first: 42"), "got: {}", stub);
+    }
+
+    /// `[elapsed:` skip is bash-only by virtue of the prefix being unique
+    /// to our bash tool. grep / edit_file / web_fetch outputs do NOT
+    /// start with `[elapsed:` so they hit the normal line-1 path. This
+    /// test pins that the skip doesn't accidentally eat the first useful
+    /// line of those tools.
+    #[test]
+    fn build_compact_stub_unaffected_for_non_bash_tools() {
+        let grep = "src/foo.rs:42:    fn bar() {}\nsrc/baz.rs:10:    fn baz()";
+        let stub = build_compact_stub("grep", grep, true);
+        assert!(
+            stub.contains("first: src/foo.rs:42:"),
+            "grep stub must keep line 1 intact: {}",
+            stub
+        );
+
+        let edit = "Edited /path/to/file.rs (-3 +5 lines).";
+        let stub = build_compact_stub("edit_file", edit, true);
+        assert!(stub.contains("first: Edited /path"), "got: {}", stub);
+    }
+
+    /// 5-7 atomgr datalog (atomgr-2d99b47d/2026-05-07_00-28-34): T22-T29
+    /// reveal weak models develop "伪自信" when read_file is stubbed —
+    /// `[read_file ok: 115 lines, first: 205| pub async fn dynamic_connect(]`
+    /// gives just enough surface (line number + function name) for the
+    /// model to think it remembers the body, then it edits blind. Result:
+    /// 6 turns of patch-and-repatch the same file. Keeping read_file
+    /// FULL preserves attention on the actual code; D3 FileStore handles
+    /// the disk-side cost of re-reads transparently.
+    #[test]
+    fn microcompact_skips_read_file_to_preserve_long_session_context() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("explore");
+
+        // One read_file call with a large body — would normally be
+        // compacted under the generic path.
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall {
+                id: "c_read".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            None,
+        );
+        let read_body = format!("first line of read\n{}", "x".repeat(5_000));
+        conv.add_tool_result(ToolResult {
+            call_id: "c_read".into(),
+            output: read_body.clone(),
+            success: true,
+        });
+
+        // Pad with bash so total_msg_count crosses OTHER_KEEP=20 and
+        // total_chars crosses the threshold — guaranteeing microcompact
+        // would otherwise compact the read_file result.
+        for i in 0..30 {
+            let id = format!("c_pad{}", i);
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: id.clone(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: id,
+                output: format!("[elapsed: 0.0s, exit: 0]\n{}", "x".repeat(4_000)),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what");
+
+        let (msgs, _) = build_messages(&conv, "sys", 131_072, "");
+
+        // Locate the read_file ToolResult in the rendered messages.
+        let body = msgs
+            .iter()
+            .find_map(|m| {
+                if let MessageContent::ToolResult(r) = &m.content {
+                    if r.call_id == "c_read" {
+                        return Some(r.output.clone());
+                    }
+                }
+                None
+            })
+            .expect("c_read must survive in rendered messages");
+
+        // Read body must remain FULL — never replaced with the generic
+        // `[read_file ok: ... first: ...]` stub.
+        assert!(
+            !body.starts_with("[read_file "),
+            "read_file got compacted (伪自信 risk): {}",
+            &body[..body.len().min(200)]
+        );
+        assert_eq!(
+            body.len(),
+            read_body.len(),
+            "read_file body length must equal original (uncompacted)"
+        );
+        assert!(
+            body.contains("first line of read"),
+            "first line lost: {}",
+            &body[..body.len().min(200)]
+        );
+
+        // Sanity: bash padding ToolResults DID get compacted — confirms
+        // the threshold actually triggered, the test isn't passing
+        // because microcompact was a no-op.
+        let any_bash_compacted = msgs.iter().any(|m| {
             if let MessageContent::ToolResult(r) = &m.content {
-                r.output.starts_with("[bash (")
+                r.output.starts_with("[bash ok: ")
             } else {
                 false
             }
         });
         assert!(
-            condensed_bash,
-            "test fixture didn't trigger microcompact — fix the threshold setup"
+            any_bash_compacted,
+            "bash padding should have been compacted; if not, the \
+             threshold isn't actually triggering and read_file passing \
+             through is a false positive"
         );
+    }
+
+    /// Running compaction twice MUST be idempotent — the upgraded
+    /// microcompact's `len <= MIN_COLLAPSE_SIZE` guard ensures that
+    /// once a stub is in place, the next pass sees a < 500-char
+    /// result and skips it rather than re-stubbing into a less-useful
+    /// "[older tool result collapsed (60 chars dropped)]" form
+    /// (the bug pattern from before this unification).
+    #[test]
+    fn microcompact_is_idempotent_no_double_stub() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("trigger");
+        for i in 0..30 {
+            let id = format!("c{}", i);
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: id.clone(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: id,
+                output: format!("first line\n{}", "x".repeat(4_000)),
+                success: true,
+            });
+        }
+        conv.add_user_message("done");
+
+        let (msgs1, _) = build_messages(&conv, "sys", 131_072, "");
+        let (msgs2, _) = build_messages(&conv, "sys", 131_072, "");
+
+        // Compaction is pure over (conv, threshold) — two passes must
+        // produce byte-identical compacted bodies, no degradation.
+        let collect_tr = |m: &[Message]| -> Vec<String> {
+            m.iter()
+                .filter_map(|m| {
+                    if let MessageContent::ToolResult(r) = &m.content {
+                        Some(r.output.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(collect_tr(&msgs1), collect_tr(&msgs2));
+        // And concretely: every stub stays in `[bash ok: ...]` form,
+        // never devolves into `[older tool result collapsed ...]`.
+        for body in collect_tr(&msgs1) {
+            if body.starts_with("[bash") {
+                assert!(
+                    body.contains("first: "),
+                    "stub lost its first-line slot: {}",
+                    body
+                );
+            }
+        }
     }
 
     #[test]
