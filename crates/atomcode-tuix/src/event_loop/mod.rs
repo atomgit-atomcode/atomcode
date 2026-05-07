@@ -147,7 +147,8 @@ pub struct LoopCtx {
     pub mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
     /// Channel for receiving MCP connection status events (Connected/Failed).
     /// Events are rendered into scrollback as they arrive during startup.
-    pub mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
+    pub mcp_connect_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
     /// When `/mcp reload` is invoked, we track progress until every configured
     /// server reports Connected/Failed, then emit a one-line summary.
     pub mcp_reload: Option<McpReloadProgress>,
@@ -730,7 +731,9 @@ mod menu_tests {
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
-        assert!(build_menu_items("/skills brainstorming why", &reg, &custom, Some(&lock)).is_none());
+        assert!(
+            build_menu_items("/skills brainstorming why", &reg, &custom, Some(&lock)).is_none()
+        );
     }
 
     #[test]
@@ -854,21 +857,25 @@ mod tool_format_tests {
     }
 
     #[test]
-    fn format_tool_detail_bash_truncates_long_commands() {
+    fn format_tool_detail_bash_truncates_at_500() {
+        let args = format!(r#"{{"command":"{}"}}"#, "a".repeat(600));
+        let out = format_tool_detail("bash", &args);
+        // `truncate_with_ellipsis` preserves `max_cols-1` display columns
+        // (499) then appends '…' (display width 1, 3 UTF-8 bytes).
+        // Display width = 500, byte length = 502.
+        assert_eq!(out.len(), 502, "byte length: 499 'a' + 3-byte '…'");
+        assert!(out.ends_with('…'), "should end with Unicode ellipsis");
+        assert_eq!(&out[..499], "a".repeat(499));
+    }
+
+    #[test]
+    fn format_tool_detail_bash_preserves_short_command() {
         let args = format!(r#"{{"command":"{}"}}"#, "a".repeat(500));
         let out = format_tool_detail("bash", &args);
-        // 200-col budget with a 1-col trailing '…' (3 UTF-8 bytes).
-        assert!(
-            crate::width::display_width(&out) <= 200,
-            "bash detail should truncate to <=200 cols, got {} cols `{}`",
-            crate::width::display_width(&out),
-            out
-        );
-        assert!(
-            out.ends_with('…'),
-            "truncated bash detail should end with ellipsis: `{}`",
-            out
-        );
+        // Full command preserved — `push_body_prefixed` handles wrapping
+        // for the committed body, and `build_inflight_tool_row` clips the
+        // live spinner row to terminal width.
+        assert_eq!(out, "a".repeat(500));
     }
 
     #[test]
@@ -913,7 +920,7 @@ mod tool_format_tests {
     #[test]
     fn summarise_failure_keeps_long_path_intact() {
         let err = "Error: old_string not found in \
-                   /mnt/d/docs/work/cangjie/projects/fountain/f_store.";
+            /mnt/d/docs/work/cangjie/projects/fountain/f_store.";
         let out = summarise(err, false);
         assert!(
             out.contains("/mnt/d/docs/work/cangjie/projects/fountain/f_store"),
@@ -923,7 +930,7 @@ mod tool_format_tests {
         assert!(
             !out.contains("f_stor "),
             "must not produce mid-token truncation like `f_stor ` (note the \
-             trailing space — that's where (N lines) would attach). got: {}",
+            trailing space — that's where (N lines) would attach). got: {}",
             out
         );
     }
@@ -1126,11 +1133,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
         renderer.render(UiLine::CommandOutput(
             "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
-             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-             Native terminal scrollback is unavailable while atomcode runs;\n    \
-             on exit your host terminal restores its pre-atomcode state.\n    \
-             Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
-             ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
+            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+            Native terminal scrollback is unavailable while atomcode runs;\n    \
+            on exit your host terminal restores its pre-atomcode state.\n    \
+            Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
+            ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
                 .into(),
         ));
     }
@@ -1146,12 +1153,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         std::env::remove_var("ATOMCODE_LEGACY_CONHOST_FALLBACK");
         renderer.render(UiLine::CommandOutput(
             "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
-             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-             Native terminal scrollback is unavailable while atomcode runs.\n    \
-             For full host-terminal scrollback support, install Windows Terminal\n    \
-             (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
-             Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
-             bypass this fallback (may show duplicated content on scroll).\n\n"
+            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+            Native terminal scrollback is unavailable while atomcode runs.\n    \
+            For full host-terminal scrollback support, install Windows Terminal\n    \
+            (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
+            Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
+            bypass this fallback (may show duplicated content on scroll).\n\n"
                 .into(),
         ));
     }
@@ -1167,7 +1174,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             crate::modals::session_picker::replay_session(renderer, &session, false);
             renderer.render(UiLine::CommandOutput(
                 "  ⓘ Showing previous session — model context starts fresh.\n    \
-                 Use /resume to fully restore the conversation including model memory.\n\n"
+                Use /resume to fully restore the conversation including model memory.\n\n"
                     .into(),
             ));
             renderer.flush();
@@ -1188,7 +1195,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         // fits without scrolling the welcome banner off-screen.
         renderer.render(UiLine::CommandOutput(
             "\n  Welcome to AtomCode. Pick an option to get started:\n  \
-             (↑↓ to navigate, Enter to confirm, Esc to skip)\n\n"
+            (↑↓ to navigate, Enter to confirm, Esc to skip)\n\n"
                 .into(),
         ));
         app.active_modal = Some(Box::new(crate::modals::WelcomeWizard::new()));
@@ -1967,9 +1974,7 @@ fn handle_input(
             // before — those rely on the host terminal's native
             // scrollback). We intercept BEFORE phase dispatch so
             // scrolling works in Idle / Streaming alike.
-            if let Some(handled) =
-                handle_scroll_key(code, modifiers, renderer, &app.buf)
-            {
+            if let Some(handled) = handle_scroll_key(code, modifiers, renderer, &app.buf) {
                 if handled {
                     return Ok(());
                 }
@@ -2178,7 +2183,12 @@ fn handle_idle_key(
     let menu_items = if app.buf.is_in_history() {
         None
     } else {
-        build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry))
+        build_menu_items(
+            &app.buf.text,
+            &ctx.commands,
+            &ctx.custom_commands,
+            Some(&ctx.skill_registry),
+        )
     };
     if let Some(items) = &menu_items {
         // Clamp selection in range.
@@ -2260,14 +2270,7 @@ fn handle_idle_key(
                             Some(&ctx.skill_registry),
                         ) {
                             app.menu.selected = 0;
-                            redraw_with_menu(
-                                &app.buf,
-                                &items,
-                                0,
-                                &app.state,
-                                ctx,
-                                renderer,
-                            );
+                            redraw_with_menu(&app.buf, &items, 0, &app.state, ctx, renderer);
                             return Ok(());
                         }
                     }
@@ -2369,7 +2372,12 @@ fn handle_idle_key(
             let items = if app.buf.is_in_history() {
                 None
             } else {
-                build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry))
+                build_menu_items(
+                    &app.buf.text,
+                    &ctx.commands,
+                    &ctx.custom_commands,
+                    Some(&ctx.skill_registry),
+                )
             };
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
@@ -2561,8 +2569,7 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
         warnings = guard.reload(&ctx.working_dir);
         loaded = guard.all().count();
     }
-    ctx.custom_commands =
-        atomcode_core::commands::CustomCommandRegistry::load(&ctx.working_dir);
+    ctx.custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&ctx.working_dir);
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
     // so plugin-contributed hooks (especially UserPromptSubmit) fire on the
     // next user message rather than waiting for /cd or restart.
@@ -2671,7 +2678,12 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry));
+    let menu_items = build_menu_items(
+        &app.buf.text,
+        &ctx.commands,
+        &ctx.custom_commands,
+        Some(&ctx.skill_registry),
+    );
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -2727,7 +2739,12 @@ fn handle_streaming_key(
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(&app.buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry)) {
+            if let Some(items) = build_menu_items(
+                &app.buf.text,
+                &ctx.commands,
+                &ctx.custom_commands,
+                Some(&ctx.skill_registry),
+            ) {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
@@ -2971,7 +2988,10 @@ pub(super) fn handle_upgrade_event(
         UpgradeEvent::Failed(msg) => {
             if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
                 // Already latest — informational, not an error.
-                let info = msg.replace(&format!("{}: ", atomcode_core::self_update::ALREADY_LATEST), "");
+                let info = msg.replace(
+                    &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
+                    "",
+                );
                 renderer.render(UiLine::CommandOutput(format!("  {}", info)));
             } else {
                 renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
@@ -3136,7 +3156,7 @@ fn handle_agent_event(
             // Display AFTER the result so user sees the command first
             if name == "bash" && !state.show_tool_output {
                 renderer.render(UiLine::CommandOutput(
-                    "  ◯ Press Ctrl+O to show real-time output\n".to_string()
+                    "  ◯ Press Ctrl+O to show real-time output\n".to_string(),
                 ));
             }
             renderer.flush();
@@ -3149,7 +3169,7 @@ fn handle_agent_event(
             // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
             let detail = format_tool_detail(&tool_name, &call.arguments);
-            
+
             // Check if ToolCallStarted already rendered this tool call as a
             // dynamic ToolCallInFlight spinner. If so, we need to freeze it
             // to a static `▸` row before showing the approval prompt.
@@ -3178,7 +3198,7 @@ fn handle_agent_event(
                 });
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
-            
+
             renderer.render(UiLine::ApprovalPrompt {
                 tool: display.clone(),
                 detail: detail.clone(),
@@ -3393,11 +3413,24 @@ fn handle_agent_event(
             }
         }
         AgentEvent::SubAgentProgress { .. } => {}
-        AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
+        AgentEvent::BackgroundComplete {
+            summary,
+            files_edited,
+            turns,
+            success,
+        } => {
             let header = if success {
-                format!("  Background task complete ({} turn{}):\n", turns, if turns == 1 { "" } else { "s" })
+                format!(
+                    "  Background task complete ({} turn{}):\n",
+                    turns,
+                    if turns == 1 { "" } else { "s" }
+                )
             } else {
-                format!("  Background task failed after {} turn{}:\n", turns, if turns == 1 { "" } else { "s" })
+                format!(
+                    "  Background task failed after {} turn{}:\n",
+                    turns,
+                    if turns == 1 { "" } else { "s" }
+                )
             };
             let mut body = String::from(&header);
             body.push_str("  ");
@@ -3483,7 +3516,9 @@ mod session_naming_tests {
 
     #[test]
     fn synthetic_system_meta_is_detected() {
-        assert!(is_synthetic_user_text("[System meta · not a user message]\n12 calls..."));
+        assert!(is_synthetic_user_text(
+            "[System meta · not a user message]\n12 calls..."
+        ));
     }
 
     #[test]
@@ -3579,7 +3614,13 @@ fn draw_spinner_now(
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
-    let menu = build_menu_items(&buf.text, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry)).map(|items| {
+    let menu = build_menu_items(
+        &buf.text,
+        &ctx.commands,
+        &ctx.custom_commands,
+        Some(&ctx.skill_registry),
+    )
+    .map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
         crate::render::MenuPayload { items, selected }
     });
@@ -3660,7 +3701,7 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             .map(|p| crate::width::truncate_with_ellipsis(&p, 100))
             .unwrap_or_default(),
         "bash" => get_str("command")
-            .map(|c| crate::width::truncate_with_ellipsis(&c, 200))
+            .map(|c| crate::width::truncate_with_ellipsis(&c, 500))
             .unwrap_or_default(),
         "list_directory" | "change_dir" => get_str("path").unwrap_or_else(|| ".".into()),
         "web_fetch" => get_str("url")

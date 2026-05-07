@@ -281,6 +281,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// cleanly below it and the spinner can resume on the next tick.
     /// (call_id, name, detail).
     inflight_tool: Option<(String, String, String)>,
+    /// Number of body lines occupied by the multi-line wrapped in-flight
+    /// tool call (rendered via `render_inflight_tool`). Used to replace
+    /// those lines on each spinner tick and to clean up on commit.
+    inflight_tool_rows: usize,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -311,6 +315,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_line_count: 0,
             live_spinner_active: false,
             inflight_tool: None,
+            inflight_tool_rows: 0,
         }
     }
 
@@ -373,22 +378,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
-    /// Build a single in-flight tool-call body row: `<icon> Name(detail)`.
-    /// `icon` is supplied by the caller — typically the current spinner
-    /// frame (animated ticks) or `▸` (`ToolCallCommit`, frozen
-    /// post-result). Layout matches the static `UiLine::ToolCall` arm so
-    /// the row is visually identical pre-commit and post-commit; only
-    /// the icon glyph differs. Caller is responsible for staying within
-    /// terminal width — for typical bash detail (truncated to 55 chars
-    /// in `format_tool_detail`) the row fits in one physical line; an
-    /// over-wide row would visually wrap via the terminal's autowrap
-    /// and the live-row repaint mechanism would only redraw the bottom
-    /// physical row.
-    fn build_inflight_tool_row(&self, icon: &str, name: &str, detail: &str) -> Vec<Cell> {
-        let mut row = Vec::new();
-        let pad = CellStyle::default();
-        let muted = self.style_for(Role::Muted);
-        let tool_name_style = self.style_bold(Role::ToolName);
+    /// Render (or re-render) the in-flight tool-call body text using
+    /// `icon` as the prefix, with proper multi-line wrapping via
+    /// `push_body_prefixed`. Removes any previously rendered inflight
+    /// tool lines from `body_lines` first so the spinner animation
+    /// replaces in-place rather than accumulating rows.
+    fn render_inflight_tool(&mut self, icon: &str, name: &str, detail: &str) {
         let safe_name = scrub_controls(name);
         let safe_detail = scrub_controls(detail);
         let body_str = if safe_detail.is_empty() {
@@ -396,12 +391,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             format!("{}({})", safe_name, safe_detail)
         };
-        // No left padding - tool call rows sit flush-left at col 0
-        // to align with the input-box chevron and approval prompts.
-        push_str_cells(&mut row, icon, &muted);
-        push_str_cells(&mut row, " ", &pad);
-        push_str_cells(&mut row, &body_str, &tool_name_style);
-        row
+        // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+        // commands) from producing hundreds of terminal lines.
+        // This is a rendering safeguard only — the actual command
+        // execution uses the original, untruncated arguments.
+        let body_str = truncate_body_str(&body_str, 500);
+        // Remove previously rendered inflight tool rows.
+        let remove = self.inflight_tool_rows.min(self.body_lines.len());
+        self.body_lines.truncate(self.body_lines.len() - remove);
+        self.inflight_tool_rows = 0;
+        let before = self.body_lines.len();
+        self.push_body_prefixed(
+            &format!("{} ", icon),
+            &self.style_for(Role::Muted),
+            &body_str,
+            &self.style_bold(Role::ToolName),
+        );
+        self.inflight_tool_rows = self.body_lines.len().saturating_sub(before);
     }
 
     /// Pad a partially-built row with blank default-style cells until it
@@ -1059,6 +1065,47 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // visually undo our hide on a 5ms cadence.
     }
 
+    /// Freeze the current inflight_tool row into the body transcript
+    /// using `push_body_prefixed` so long commands are properly wrapped
+    /// across multiple terminal lines. Used as the uniform commit path
+    /// for: `ToolCallCommit`, `TurnComplete`, `TurnCancelled`, and the
+    /// `ToolResult` fallback — replaces the old pattern of
+    /// `build_inflight_tool_row` + `push_or_update_live_spinner` which
+    /// created a single unwrapped row that gets clipped on narrow
+    /// terminals and leaves no selectable overflow.
+    fn commit_inflight_tool(&mut self) {
+        if let Some((_id, name, detail)) = self.inflight_tool.take() {
+            let safe_name = scrub_controls(&name);
+            let safe_detail = scrub_controls(&detail);
+            let body_str = if safe_detail.is_empty() {
+                safe_name
+            } else {
+                format!("{}({})", safe_name, safe_detail)
+            };
+            // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+            // commands) from producing hundreds of terminal lines.
+            let body_str = truncate_body_str(&body_str, 500);
+            // Clear any previously rendered inflight tool rows so
+            // push_body_prefixed appends fresh committed lines.
+            self.live_spinner_active = false;
+            let remove = self.inflight_tool_rows.min(self.body_lines.len());
+            self.body_lines.truncate(self.body_lines.len() - remove);
+            self.inflight_tool_rows = 0;
+            self.ensure_scroll_region();
+            let bottom = self.body_bottom_row();
+            if bottom > 0 {
+                let seq = format!("\x1b[{};1H\x1b[K", bottom);
+                let _ = self.out.write_all(seq.as_bytes());
+            }
+            self.push_body_prefixed(
+                "\u{25b8} ",
+                &self.style_for(Role::Muted),
+                &body_str,
+                &self.style_bold(Role::ToolName),
+            );
+        }
+    }
+
     /// Copy the visible body tail into the host terminal's native
     /// scrollback before we wipe the viewport on exit. Retained mode
     /// keeps the newest body rows pinned on screen behind a fixed
@@ -1526,28 +1573,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
-                // Spinner (frame + label) goes into body as the live
-                // paragraph header — each tick replaces the same row
-                // via `push_or_update_live_spinner`, so animation
-                // doesn't push a new row every 80ms.
+                // Spinner (frame + label) goes into body as a live
+                // paragraph header. Each tick replaces the previous
+                // wrapped rows via render_inflight_tool so long
+                // commands wrap properly (same as committed rows).
                 //
-                // When a tool call is in flight, the live row instead
-                // carries the tool-call shape (`<frame> Bash(cmd)`),
-                // so the same animation cadence drives the tool icon.
-                let cells = if let Some((_id, name, detail)) = self.inflight_tool.clone() {
-                    self.build_inflight_tool_row(frame, &name, &detail)
+                // When a tool call is in flight, the live rows
+                // carry the tool-call shape (`<frame> Bash(cmd)`)
+                // with the animation driving the icon frame.
+                if let Some((_id, name, detail)) = self.inflight_tool.clone() {
+                    self.render_inflight_tool(frame, &name, &detail);
                 } else {
-                    self.build_spinner_body_row(frame, &label)
-                };
-                self.push_or_update_live_spinner(cells);
+                    let cells = self.build_spinner_body_row(frame, &label);
+                    self.push_or_update_live_spinner(cells);
+                }
             }
             UiLine::Spinner { frame, label } => {
-                let cells = if let Some((_id, name, detail)) = self.inflight_tool.clone() {
-                    self.build_inflight_tool_row(frame, &name, &detail)
+                if let Some((_id, name, detail)) = self.inflight_tool.clone() {
+                    self.render_inflight_tool(frame, &name, &detail);
                 } else {
-                    self.build_spinner_body_row(frame, &label)
-                };
-                self.push_or_update_live_spinner(cells);
+                    let cells = self.build_spinner_body_row(frame, &label);
+                    self.push_or_update_live_spinner(cells);
+                }
             }
             UiLine::ClearTransient | UiLine::InputCommit => {
                 // No-op in retained mode.
@@ -1634,19 +1681,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // protocol bug) would otherwise leave inflight_tool
                 // set and the next user turn's spinner would mistake
                 // the stale tool detail for the in-flight payload.
-                if let Some((_id, name, detail)) = self.inflight_tool.take() {
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
-                    self.push_or_update_live_spinner(frozen);
-                    self.live_spinner_active = false;
-                }
+                // Use push_body_prefixed for proper line wrapping.
+                self.commit_inflight_tool();
             }
             UiLine::TurnCancelled => {
                 self.flush_assistant_remainder();
-                if let Some((_id, name, detail)) = self.inflight_tool.take() {
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
-                    self.push_or_update_live_spinner(frozen);
-                    self.live_spinner_active = false;
-                }
+                self.commit_inflight_tool();
                 // (cancelled) is a state-change marker — must remain
                 // visible. Default fg, not Muted.
                 let label = self.style_for(Role::Secondary);
@@ -1661,10 +1701,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // a new one — single-at-a-time animation is a deliberate
                 // simplification (see field doc).
                 if self.inflight_tool.is_some() {
-                    let prev = std::mem::take(&mut self.inflight_tool).unwrap();
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &prev.1, &prev.2);
-                    self.push_or_update_live_spinner(frozen);
-                    self.live_spinner_active = false;
+                    // Commit the previous tool (freezes it as ▸ in
+                    // the body transcript) before starting a new one.
+                    self.commit_inflight_tool();
                 }
                 // Use a plausible "still" frame for the initial paint;
                 // the next Spinner / StreamingBox tick (within ~80ms)
@@ -1675,9 +1714,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     "*"
                 };
-                let row = self.build_inflight_tool_row(initial, &name, &detail);
-                self.inflight_tool = Some((id, name, detail));
-                self.push_or_update_live_spinner(row);
+                self.inflight_tool = Some((id, name.clone(), detail.clone()));
+                self.render_inflight_tool(initial, &name, &detail);
             }
             UiLine::ToolCallCommit { call_id } => {
                 // Only commit if the inflight_tool matches the expected call_id,
@@ -1688,15 +1726,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     _ => false,
                 };
                 if should_commit {
-                    if let Some((_id, name, detail)) = self.inflight_tool.take() {
-                        let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
-                        self.push_or_update_live_spinner(frozen);
-                        // Drop the live flag so the next push_body_row
-                        // appends BELOW this frozen row instead of popping
-                        // it — the in-flight indicator becomes a permanent
-                        // historical paragraph header.
-                        self.live_spinner_active = false;
-                    }
+                    self.commit_inflight_tool();
                 }
             }
             UiLine::ToolCall { name, detail } => {
@@ -1710,7 +1740,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     format!("{}({})", safe_name, safe_detail)
                 };
-                // Approximate AnsiRenderer's "▸ NAME(detail)" where
+                // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+                // commands) from producing hundreds of terminal lines.
+                let body_str = truncate_body_str(&body_str, 500);
                 // only NAME is bolded; retained uses a uniform style
                 // for the tool-call line (acceptable in Phase 4,
                 // tightens in Phase 5/6).
@@ -1729,11 +1761,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // merge collapse), freeze the in-flight row now so
                 // the upcoming `⎿ ...` body push doesn't itself become
                 // the next animation target on the next spinner tick.
-                if let Some((_id, name, detail)) = self.inflight_tool.take() {
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
-                    self.push_or_update_live_spinner(frozen);
-                    self.live_spinner_active = false;
-                }
+                // Use commit_inflight_tool for proper line wrapping
+                // (see method doc).
+                self.commit_inflight_tool();
                 // Style policy (header line of a failure body):
                 //   * `Error: ...` — bold red. Tool-dispatch failures
                 //     (bad JSON args, unknown tool name, etc.) are real
@@ -2289,6 +2319,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
         self.last_painted_footer_rows = self.current_footer_rows();
         self.dirty = false;
+    }
+}
+
+/// Truncate `body_str` to at most `max_chars` display-width characters,
+/// preserving whole characters (not splitting multi-byte sequences).
+/// This is a rendering safeguard to prevent degenerate bodies
+/// (e.g. multi-KB bash commands) from producing hundreds of terminal lines.
+fn truncate_body_str(body_str: &str, max_chars: usize) -> String {
+    if let Some((idx, _)) = body_str.char_indices().nth(max_chars) {
+        format!("{}… (truncated)", &body_str[..idx])
+    } else {
+        body_str.to_string()
     }
 }
 
@@ -3793,7 +3835,7 @@ mod tests {
             r.body_lines.len(),
             after_first,
             "spinner ticks grew body_lines from {} to {} — each tick \
-             must update the same row, not append",
+            must update the same row, not append",
             after_first,
             r.body_lines.len()
         );
@@ -4008,7 +4050,7 @@ mod tests {
             spin_row - user_row,
             2,
             "expected exactly 1 blank row between user message and \
-             spinner, got {} blank row(s):\n{}",
+            spinner, got {} blank row(s):\n{}",
             spin_row.saturating_sub(user_row).saturating_sub(1),
             vterm.dump()
         );
