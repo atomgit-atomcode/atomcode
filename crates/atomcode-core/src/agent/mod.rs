@@ -35,8 +35,11 @@ use crate::turn::runner::TurnRunner;
 /// Commands sent FROM the UI TO the agent loop.
 #[derive(Debug)]
 pub enum AgentCommand {
-    /// User sent a message (may include attached file content).
-    SendMessage(String),
+    /// User sent a message (may include attached file content and/or images).
+    SendMessage {
+        text: String,
+        images: Vec<crate::conversation::message::ImagePart>,
+    },
     /// Cancel current operation.
     Cancel,
     /// Approve a pending tool call.
@@ -623,7 +626,8 @@ impl AgentLoop {
                     thinking_budget: None,
                     skip_tls_verify: false,
                     ephemeral: true,
-                }),
+
+}),
             };
 
         let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
@@ -777,8 +781,8 @@ impl AgentLoop {
 
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
-                AgentCommand::SendMessage(content) => {
-                    self.handle_send_message(content).await;
+                AgentCommand::SendMessage { text, images } => {
+                    self.handle_send_message(text, images).await;
                 }
                 AgentCommand::Cancel => {
                     self.cancel_token.cancel();
@@ -1106,7 +1110,11 @@ impl AgentLoop {
     // Core agent logic
     // -------------------------------------------------------------------------
 
-    async fn handle_send_message(&mut self, mut content: String) {
+    async fn handle_send_message(
+        &mut self,
+        mut content: String,
+        images: Vec<crate::conversation::message::ImagePart>,
+    ) {
         self.current_task = content.clone();
 
         if let Some(reason) = self.turn_runner.provider.availability_error() {
@@ -1241,7 +1249,21 @@ impl AgentLoop {
             }
         }
 
-        self.conversation.add_user_message(&clean);
+        if images.is_empty() {
+            self.conversation.add_user_message(&clean);
+        } else {
+            use crate::conversation::message::{Message, MessageContent, Role};
+            let msg = Message {
+                role: Role::User,
+                content: MessageContent::MultiPart {
+                    text: if clean.is_empty() { None } else { Some(clean.clone()) },
+                    images,
+                },
+            };
+            let idx = self.conversation.messages.len();
+            self.conversation.messages.push(msg);
+            self.conversation.turn_tracker.on_user_message(idx);
+        }
         self.turn_tokens = 0;
         self.tool_call_count = 0;
         self.turn_count = 0;
@@ -2081,9 +2103,10 @@ impl AgentLoop {
     /// Pro-active context compaction. Two-stage:
     ///
     /// 1. **Tier 1 (cheap, mechanical):** collapse old `ToolResult`
-    ///    bodies into stubs (`collapse_old_tool_results`, keeping the
-    ///    last 3 turns full). Zero LLM calls. Cheap to fire, easy to
-    ///    revert if model needs the bytes back via re-read.
+    ///    bodies into stubs (`compact_old_tool_results_in_place`, the
+    ///    same generic stub format `microcompact` uses at render time;
+    ///    keeps the last 3 turns full). Zero LLM calls. Cheap to fire,
+    ///    easy to revert if model needs the bytes back via re-read.
     ///
     /// 2. **Tier 2 (expensive, LLM-driven):** if Tier 1 didn't bring
     ///    the context under threshold, fall through to LLM-summarize
@@ -2105,9 +2128,13 @@ impl AgentLoop {
 
         // ── Tier 1: collapse old tool_results (no LLM call) ──
         // Keep the most recent 3 turns at full fidelity; older
-        // turns get their tool_result bodies replaced with one-line
-        // stubs. Cheapest way to recover headroom.
-        collapse_old_tool_results(&mut self.conversation, /* keep_recent_turns */ 3);
+        // turns get their tool_result bodies replaced with the same
+        // generic stub microcompact uses at render time. One stub
+        // format, one place to maintain.
+        crate::ctx::render::compact_old_tool_results_in_place(
+            &mut self.conversation,
+            /* keep_recent_turns */ 3,
+        );
 
         // Re-check: if Tier 1 was enough, stop here and skip the
         // LLM summarization round-trip. This is the common case for
@@ -2281,7 +2308,10 @@ impl AgentLoop {
         }
 
         // Tier 1: collapse heavy tool results in older turns.
-        collapse_old_tool_results(&mut self.conversation, /* keep_recent_turns */ 3);
+        crate::ctx::render::compact_old_tool_results_in_place(
+            &mut self.conversation,
+            /* keep_recent_turns */ 3,
+        );
         if estimate(&self.conversation) <= target_tokens {
             return true;
         }
@@ -2686,38 +2716,6 @@ fn reload_should_clear_conversation(
 /// The previous emergency path (`truncate(len - 4)`) destroyed the
 /// skeleton too. Keeping it intact is what lets the model resume
 /// after compaction without re-exploring.
-fn collapse_old_tool_results(
-    conv: &mut crate::conversation::Conversation,
-    keep_recent_turns: usize,
-) {
-    use crate::conversation::message::MessageContent;
-    let turns = &conv.turn_tracker.turns;
-    if turns.len() <= keep_recent_turns {
-        return;
-    }
-    let cutoff_turn = turns.len() - keep_recent_turns;
-    let cutoff_msg = turns[cutoff_turn].start_idx.min(conv.messages.len());
-    for i in 0..cutoff_msg {
-        if let MessageContent::ToolResult(ref tr) = conv.messages[i].content {
-            // Sanity floor: don't bother collapsing already-tiny results
-            // (cheap to keep, also avoids the stub being heavier than
-            // the original on terse outputs).
-            if tr.output.len() < 200 {
-                continue;
-            }
-            let stub = crate::tool::ToolResult {
-                call_id: tr.call_id.clone(),
-                output: format!(
-                    "[older tool result collapsed by emergency compact ({} chars dropped)]",
-                    tr.output.len()
-                ),
-                success: tr.success,
-            };
-            conv.messages[i].content = MessageContent::ToolResult(stub);
-        }
-    }
-}
-
 /// D2 Tier 3: drop oldest messages until total tokens (incl. system) <=
 /// `target_tokens`. Token-driven — never drops a fixed number of
 /// messages, since that's how `truncate(len - 4)` corrupted state.
@@ -3136,10 +3134,13 @@ mod classifier_tests {
     }
 
     fn count_collapsed_results(conv: &Conversation) -> usize {
+        // New unified stub format: `[<tool> <ok|FAILED>: N lines, first: …]`.
+        // The substring " lines, first:" is unique to the stub shape and
+        // robust whether the tool name is "bash", "grep", or "tool".
         conv.messages
             .iter()
             .filter(|m| match &m.content {
-                MessageContent::ToolResult(tr) => tr.output.starts_with("[older tool result"),
+                MessageContent::ToolResult(tr) => tr.output.contains(" lines, first:"),
                 _ => false,
             })
             .count()
@@ -3160,7 +3161,7 @@ mod classifier_tests {
         // should be stubs while the 3 RECENT turns retain full
         // payload. Pins the "older=collapsed, newer=intact" split.
         let mut conv = build_conv(/* n_turns */ 6, /* result_size */ 4_000);
-        super::collapse_old_tool_results(&mut conv, 3);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3);
 
         // Walk the messages: each turn pushes (User, AssistantToolCall,
         // ToolResult). 6 turns × 3 msgs = 18 msgs. The first 3 turns
@@ -3194,7 +3195,7 @@ mod classifier_tests {
     #[test]
     fn collapse_keeps_last_n_turns_full() {
         let mut conv = build_conv(5, 1024);
-        super::collapse_old_tool_results(&mut conv, 2);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2);
         // 5 turns, keep last 2 → first 3 should have stubbed tool_results.
         assert_eq!(count_collapsed_results(&conv), 3);
     }
@@ -3204,14 +3205,14 @@ mod classifier_tests {
         // Tool results under 200 chars aren't worth collapsing — the stub
         // would weigh more than the original.
         let mut conv = build_conv(5, 50);
-        super::collapse_old_tool_results(&mut conv, 2);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2);
         assert_eq!(count_collapsed_results(&conv), 0);
     }
 
     #[test]
     fn collapse_no_op_when_under_keep_threshold() {
         let mut conv = build_conv(2, 1024);
-        super::collapse_old_tool_results(&mut conv, 3);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3);
         // Only 2 turns total, keep 3 — nothing to collapse.
         assert_eq!(count_collapsed_results(&conv), 0);
     }
@@ -3219,7 +3220,7 @@ mod classifier_tests {
     #[test]
     fn collapse_preserves_call_id_and_success_flag() {
         let mut conv = build_conv(3, 1024);
-        super::collapse_old_tool_results(&mut conv, 1);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 1);
         // Verify call_0's tool_result still has the right call_id even
         // though its body was stubbed — preserves tool_call/tool_result
         // pairing for OpenAI-style providers.
@@ -3231,7 +3232,9 @@ mod classifier_tests {
                 _ => None,
             })
             .expect("call_0 result must still exist");
-        assert!(tr.output.starts_with("[older tool result"));
+        // New unified stub format: `[<tool> <ok|FAILED>: N lines, first: …]`.
+        assert!(tr.output.contains(" lines, first:"));
+        assert!(tr.output.starts_with("["));
         assert!(tr.success);
     }
 

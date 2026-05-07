@@ -44,7 +44,8 @@ fn build_oauth_provider() -> ProviderConfig {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: false,
-    }
+
+}
 }
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
@@ -1075,7 +1076,7 @@ pub(super) fn execute_slash_command(
                 if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
                     ctx.agent
                         .cmd_tx
-                        .send(AgentCommand::SendMessage(rendered))
+                        .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
                         .ok();
                     state.on_submit();
                 } else {
@@ -1095,13 +1096,13 @@ pub(super) fn execute_slash_command(
             if let Some(rendered) = ctx.custom_commands.render(other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(rendered))
+                    .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
                     .ok();
                 state.on_submit();
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(rendered))
+                    .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
                     .ok();
                 state.on_submit();
             } else {
@@ -1744,7 +1745,7 @@ pub(crate) fn launch_fixissue(
             fixissue_buffer.clear();
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SendMessage(prompt))
+                .send(AgentCommand::SendMessage { text: prompt, images: vec![] })
                 .ok();
             state.on_submit();
         }

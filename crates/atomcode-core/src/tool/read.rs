@@ -781,6 +781,112 @@ mod tests {
         assert!(r2.output.contains("println"));
     }
 
+    /// D3 SMOKE TEST: edit_file invalidates both read_cache (via mtime) and
+    /// FileStore (via explicit invalidate). This is the load-bearing assumption
+    /// for Task 1 of plans/2026-05-07-readfile-skip-and-edit-verify.md — if
+    /// this test fails, weak models will read stale post-edit content and
+    /// the read_file-skips-microcompact strategy collapses.
+    ///
+    /// Sequence: write A → read (populates caches) → edit A→B → read again →
+    /// must observe B, not cached A.
+    #[tokio::test]
+    async fn d3_edit_invalidates_caches_for_subsequent_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("payload.rs");
+        std::fs::write(&path, "fn before() {}\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let read_tool = ReadFileTool;
+        let edit_tool = crate::tool::edit::EditFileTool;
+        let read_args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+
+        // Step 1: initial read populates read_cache and FileStore.
+        let r1 = read_tool.execute(&read_args, &ctx).await.unwrap();
+        assert!(r1.output.contains("fn before"));
+        assert_eq!(
+            ctx.file_store.read().await.len(),
+            1,
+            "FileStore should have 1 entry after read"
+        );
+        assert_eq!(
+            ctx.read_cache.read().await.len(),
+            1,
+            "read_cache should have 1 entry after read"
+        );
+
+        // NO SLEEP: deliberately worst-case. On filesystems with coarse mtime
+        // granularity (ext4 sec-precision), the post-edit mtime may equal the
+        // pre-edit mtime, defeating the read_cache mtime gate. Then the only
+        // line of defense is the explicit `invalidate(canon_path)` in edit.rs.
+        // If this test passes without sleeping, both layers are working.
+
+        // Step 2: edit_file replaces "before" with "after".
+        let edit_args = format!(
+            r#"{{"file_path":"{}","old_string":"fn before() {{}}","new_string":"fn after() {{ /* edited */ }}"}}"#,
+            path.display()
+        );
+        let e = edit_tool.execute(&edit_args, &ctx).await.unwrap();
+        assert!(e.success, "edit should succeed; got: {}", e.output);
+
+        // Sanity: disk now holds B.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("fn after"),
+            "disk content not updated: {}",
+            on_disk
+        );
+
+        // FileStore should be invalidated for this path. (Either entry gone,
+        // or replaced with new content. Both are correct outcomes.)
+        let fs_state_after_edit = {
+            let store = ctx.file_store.read().await;
+            store
+                .store_id_for_path(&path)
+                .and_then(|id| store.get(id).cloned())
+                .map(|e| e.content)
+        };
+        if let Some(content) = &fs_state_after_edit {
+            assert!(
+                content.contains("fn after"),
+                "FileStore retained pre-edit content: {}",
+                content
+            );
+        }
+        // (If None, that's even better — fully invalidated.)
+
+        // Defense-layer probe (BEFORE the second read): both caches are
+        // now explicitly purged by edit.rs.
+        //
+        // FileStore: explicitly invalidated by edit.rs — entry gone OR
+        //   overwritten with new content (already asserted above).
+        // read_cache: explicitly purged by edit.rs (defense-in-depth for
+        //   FS with coarse mtime granularity where the mtime gate alone
+        //   could fail). Map should hold no entries for this path.
+        let read_cache_post_edit = ctx.read_cache.read().await.clone();
+        let stale_cache_for_path = read_cache_post_edit
+            .keys()
+            .filter(|(p, _, _)| p == &path)
+            .count();
+        assert_eq!(
+            stale_cache_for_path, 0,
+            "read_cache must be purged for edited path; lingering entries \
+             would let coarse-mtime FS serve stale content"
+        );
+
+        // Step 3: re-read must surface B, NOT cached A.
+        let r2 = read_tool.execute(&read_args, &ctx).await.unwrap();
+        assert!(
+            r2.output.contains("fn after"),
+            "POST-EDIT READ SERVED STALE CONTENT: {}",
+            r2.output
+        );
+        assert!(
+            !r2.output.contains("fn before"),
+            "post-edit read still mentions pre-edit symbol: {}",
+            r2.output
+        );
+    }
+
     /// GBK-encoded .txt should decode via the fallback path, not be reported
     /// as binary. This is the hot path for Chinese Windows legacy text files.
     #[tokio::test]

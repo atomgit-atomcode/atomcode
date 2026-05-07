@@ -31,6 +31,9 @@ use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
+use base64::Engine;
+use atomcode_core::conversation::message::ImagePart;
+
 use crate::commands::{parse_slash_line, CommandRegistry};
 use crate::input::history::History;
 use crate::input::key_action::{classify, Action};
@@ -38,6 +41,39 @@ use crate::input::InputEvent;
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
+
+/// Encode raw RGBA pixel data as a PNG image in memory.
+fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut encoder = png::Encoder::new(&mut buf, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(rgba).ok()?;
+    drop(writer);
+    Some(buf)
+}
+
+/// Try to grab an image from the system clipboard via `arboard`.
+/// Returns `Some((ImagePart, fingerprint))` if the clipboard holds an
+/// image, `None` otherwise. The fingerprint is hashed off the raw RGBA
+/// bytes (not the PNG-encoded base64) — same hash function the status
+/// poll uses, so paste-side and poll-side fingerprints line up for the
+/// "is this the same image we already attached?" check.
+fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img = clipboard.get_image().ok()?;
+    let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
+    let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+    Some((
+        ImagePart {
+            media_type: "image/png".into(),
+            data: b64,
+        },
+        hash,
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub struct McpReloadProgress {
@@ -205,6 +241,41 @@ pub struct LoopCtx {
     /// Active session id once `/resume` has loaded one. Required by the
     /// `/rename` slash command to know which session file to update.
     pub current_session_id: Option<SessionId>,
+    /// Cached "clipboard currently holds an image" flag, with a short TTL
+    /// so the right-aligned `Image in clipboard · ctrl+v to paste` hint
+    /// stays current without thrashing the system clipboard on every
+    /// redraw. Refreshed lazily inside `build_status`.
+    pub clipboard_check: std::sync::Arc<std::sync::Mutex<ClipboardCheckState>>,
+}
+
+/// Memoised result of the most recent clipboard probe. The hash is a
+/// content fingerprint of the clipboard image's raw RGBA bytes (or
+/// `None` when the clipboard holds no image). Letting `build_status`
+/// compare this against `UiState::pending_image_hashes` is what powers
+/// the "hide hint after I already pasted THIS image, but show it again
+/// if the user copies a different one" UX.
+#[derive(Debug, Default)]
+pub struct ClipboardCheckState {
+    pub image_hash: Option<u64>,
+    pub last_checked: Option<std::time::Instant>,
+}
+
+/// Cheap content fingerprint for clipboard images. Hashes width, height,
+/// total byte length, plus the first and last 1KB of RGBA bytes — enough
+/// to distinguish typical screenshots while keeping the per-poll cost
+/// O(2KB) regardless of image dimensions (a 4K screenshot's 32MB raw
+/// buffer would be too slow to hash in full at 1.5s polling cadence).
+fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    bytes.len().hash(&mut hasher);
+    let head_end = bytes.len().min(1024);
+    bytes[..head_end].hash(&mut hasher);
+    let tail_start = bytes.len().saturating_sub(1024);
+    bytes[tail_start..].hash(&mut hasher);
+    hasher.finish()
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user
@@ -1610,7 +1681,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![] }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -1849,7 +1920,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![] }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -2011,6 +2082,57 @@ fn handle_input(
             // No modal: paste goes into the type-ahead buffer just like
             // keyboard input (Idle or Streaming, both consume it).
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
+                // When the pasted text is empty (clipboard holds an image,
+                // not text), try to grab the image via arboard. This is the
+                // primary path on terminals with bracketed paste enabled —
+                // Ctrl+V never arrives as a key event there.
+                if text.trim().is_empty() {
+                    if let Some((img, hash)) = try_paste_clipboard_image() {
+                        let supports = ctx
+                            .config
+                            .providers
+                            .get(&ctx.config.default_provider)
+                            .map(|p| p.accepts_images())
+                            .unwrap_or(false);
+                        if !supports {
+                            renderer.render(UiLine::Error(format!(
+                                "Current model \"{}\" does not appear to support image input. \
+                                 Use /model to switch to a vision-capable model.",
+                                ctx.model_name
+                            )));
+                            renderer.flush();
+                            if matches!(app.state.phase, UiPhase::Idle) {
+                                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                            }
+                            return Ok(());
+                        }
+                        // Insert `[Image #N]` directly into the input buffer
+                        // at cursor — same UX as bracketed-paste folding for
+                        // long text. The marker stays inline through submit
+                        // so the scrollback echo shows where in the message
+                        // each image was attached. Image bytes ride alongside
+                        // in `pending_images`, drained at submit.
+                        let n = app.state.pending_images.len() + 1;
+                        app.state.pending_images.push(img);
+                        app.state.pending_image_hashes.push(hash);
+                        let marker = format!("[Image #{}]", n);
+                        app.buf.text.insert_str(app.buf.cursor, &marker);
+                        app.buf.cursor += marker.len();
+                        if matches!(app.state.phase, UiPhase::Streaming) {
+                            draw_spinner_now(
+                                &mut app.state,
+                                &app.buf,
+                                ctx,
+                                renderer,
+                                app.message_queue.len(),
+                                app.menu.selected,
+                            );
+                        } else {
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        }
+                        return Ok(());
+                    }
+                }
                 app.buf.insert_paste(text);
                 if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(
@@ -2554,6 +2676,48 @@ fn handle_idle_key(
         return Ok(());
     }
 
+    // Ctrl+V: try clipboard image first, fall back to text paste.
+    if code == KeyCode::Char('v') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if let Some((img, hash)) = try_paste_clipboard_image() {
+            // Refuse to attach an image when the active model almost
+            // certainly can't accept one — sending it anyway burns a
+            // turn on a 400 from the upstream's param validator (e.g.
+            // ModelArts.81001 "message[N].content[0] has invalid
+            // field(s): text, type" for GLM-5.1). Gated by the model-name
+            // heuristic in `provider::model_name_suggests_vision`.
+            let supports = ctx
+                .config
+                .providers
+                .get(&ctx.config.default_provider)
+                .map(|p| p.accepts_images())
+                .unwrap_or(false);
+            if !supports {
+                renderer.render(UiLine::Error(format!(
+                    "Current model \"{}\" does not appear to support image input. \
+                     Use /model to switch to a vision-capable model.",
+                    ctx.model_name
+                )));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            // Insert the `[Image #N]` marker into the input buffer at
+            // cursor — same pattern as `insert_paste` for long text.
+            // The marker echoes through to scrollback on submit; image
+            // bytes are stashed in `pending_images` and drained then.
+            let n = app.state.pending_images.len() + 1;
+            app.state.pending_images.push(img);
+            app.state.pending_image_hashes.push(hash);
+            let marker = format!("[Image #{}]", n);
+            app.buf.text.insert_str(app.buf.cursor, &marker);
+            app.buf.cursor += marker.len();
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            return Ok(());
+        }
+        // No image in clipboard — fall through to normal key handling
+        // (the `v` char will be inserted as a regular character via classify).
+    }
+
     let action = classify(code, modifiers);
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::tuix_trace!(
@@ -2649,9 +2813,25 @@ fn handle_idle_key(
                 // takes this Option and restores it to `app.buf.text`
                 // so the cancelled message can be edited and resent.
                 app.state.last_submitted_message = Some(expanded.clone());
+                // Only attach images whose `[Image #N]` marker survived
+                // editing — if the user deleted the marker from the input
+                // buffer, the corresponding image must not be sent. Echo
+                // the kept images as `└ [Image #N]` sub-lines so scrollback
+                // shows what was actually sent.
+                let pending = std::mem::take(&mut app.state.pending_images);
+                app.state.pending_image_hashes.clear();
+                let mut images: Vec<ImagePart> = Vec::with_capacity(pending.len());
+                for (i, img) in pending.into_iter().enumerate() {
+                    let n = i + 1;
+                    if line.contains(&format!("[Image #{}]", n)) {
+                        renderer
+                            .render(UiLine::CommandOutput(format!("  └ [Image #{}]", n)));
+                        images.push(img);
+                    }
+                }
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(expanded))
+                    .send(AgentCommand::SendMessage { text: expanded, images })
                     .ok();
                 app.state.on_submit();
                 // CodingPlan drift check — fire before every turn sent
@@ -3862,6 +4042,28 @@ mod session_naming_tests {
 /// Build the persistent status line shown directly below the input box.
 /// Pulls model name from ctx, cwd from ctx.working_dir (with $HOME
 /// collapsed to `~`), and running token count from state.
+/// Probe the system clipboard for an image, memoising the result inside
+/// the supplied cache for `CLIPBOARD_HINT_TTL_MS`. `build_status` calls
+/// this on every redraw, so without caching every spinner tick (~12/s
+/// during streaming) would round-trip to the platform clipboard API.
+const CLIPBOARD_HINT_TTL_MS: u64 = 1500;
+
+fn clipboard_image_hash(cache: &std::sync::Mutex<ClipboardCheckState>) -> Option<u64> {
+    let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = state
+        .last_checked
+        .map(|t| t.elapsed() >= std::time::Duration::from_millis(CLIPBOARD_HINT_TTL_MS))
+        .unwrap_or(true);
+    if stale {
+        state.image_hash = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_image())
+            .ok()
+            .map(|img| rgba_fingerprint(img.width, img.height, img.bytes.as_ref()));
+        state.last_checked = Some(std::time::Instant::now());
+    }
+    state.image_hash
+}
+
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     // Priority:
@@ -3890,6 +4092,21 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         usage_monitor::build_usage_hint(&ctx.usage_slot, &ctx.config.default_provider)
     {
         Some(usage)
+    } else if let Some(h) = clipboard_image_hash(&ctx.clipboard_check)
+        .filter(|h| !state.pending_image_hashes.contains(h))
+    {
+        // Transient cue — beats the upgrade banner because the action
+        // window is "now" (the image is in the clipboard right now).
+        // Suppressed when the clipboard's image fingerprint matches one
+        // already in `pending_images`: the input box already shows
+        // `[Image #N]`, prompting another paste of the same image would
+        // just attach a dup. A NEW image (different fingerprint) appears
+        // here as a fresh hint so the user can attach it too.
+        let _ = h;
+        Some((
+            "Image in clipboard · ctrl+v to paste".into(),
+            crate::render::HintSeverity::Info,
+        ))
     } else {
         ctx.update_hint
             .lock()

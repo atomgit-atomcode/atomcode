@@ -563,7 +563,8 @@ fn build_codingplan_provider(model: &str) -> ProviderConfig {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: false,
-    }
+
+}
 }
 
 #[cfg(test)]

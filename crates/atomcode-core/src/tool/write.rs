@@ -181,6 +181,16 @@ impl Tool for WriteFileTool {
         // peek_file could hand the model pre-write content that no
         // longer matches what just landed on disk.
         ctx.file_store.write().await.invalidate(&path);
+        // Defense-in-depth: read_cache mtime gate is normally sufficient
+        // because tokio::fs::write bumps mtime, but on FS with coarse
+        // mtime granularity (ext4 1-second precision, NFS) a write within
+        // the same tick as the prior read keeps the same mtime and the
+        // gate stops protecting us. Explicit purge eliminates that
+        // corner case for any path we just wrote.
+        ctx.read_cache
+            .write()
+            .await
+            .retain(|(p, _, _), _| p != &path);
 
         // Notify LSP that file changed (if LSP is enabled).
         ctx.notify_lsp_file_changed(&path, &parsed.content).await;

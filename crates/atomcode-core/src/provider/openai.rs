@@ -32,6 +32,12 @@ pub struct OpenAiProvider {
     /// `ProviderConfig::reasoning_history` at construction so bad values
     /// fail early at load time with a clear error, not silently mid-turn.
     reasoning_history_override: Option<ReasoningPolicy>,
+    /// Whether the active model accepts image inputs. Drives `MultiPart`
+    /// serialisation: vision-capable → OpenAI image_url schema, text-only
+    /// → flat string. Computed once from `ProviderConfig::accepts_images()`
+    /// at construction; a `/model` switch rebuilds the provider so this
+    /// stays in sync with the live config.
+    supports_vision: bool,
 }
 
 impl OpenAiProvider {
@@ -69,6 +75,7 @@ impl OpenAiProvider {
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
+            supports_vision: config.accepts_images(),
         })
     }
 
@@ -126,9 +133,18 @@ impl OpenAiProvider {
         Some(serde_json::Value::Object(obj))
     }
 
+    /// `supports_vision` toggles how `MessageContent::MultiPart` historical
+    /// turns are serialised. When the target model accepts images, the
+    /// content is emitted as the OpenAI vision schema (array of
+    /// `image_url` + `text` blocks). When it doesn't (text-only proxies
+    /// like GLM-5.1 on ModelArts), `MultiPart` is degraded to a flat
+    /// string — keeps the conversation replayable across `/model`
+    /// switches between vision-capable and text-only providers without
+    /// throwing the upstream's `invalid field(s): text, type` 400.
     fn format_messages(
         messages: &[Message],
         reasoning_policy: ReasoningPolicy,
+        supports_vision: bool,
     ) -> Vec<serde_json::Value> {
         messages
             .iter()
@@ -238,6 +254,37 @@ impl OpenAiProvider {
                             })
                             .collect::<Vec<_>>());
                         Some(msg)
+                    }
+                    MessageContent::MultiPart { text, images } => {
+                        if supports_vision {
+                            let mut parts: Vec<serde_json::Value> = Vec::new();
+                            for img in images {
+                                parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!(
+                                            "data:{};base64,{}",
+                                            img.media_type, img.data
+                                        ),
+                                    }
+                                }));
+                            }
+                            if let Some(t) = text {
+                                parts.push(json!({"type": "text", "text": t}));
+                            }
+                            Some(json!({"role": "user", "content": parts}))
+                        } else {
+                            // Degrade to text-only — the model's wire schema
+                            // doesn't support image blocks. The user's
+                            // caption survives (and already has `[Image #N]`
+                            // markers from the input buffer); the image bytes
+                            // simply aren't representable here.
+                            let content = match text {
+                                Some(t) if !t.is_empty() => t.clone(),
+                                _ => "[image attached]".to_string(),
+                            };
+                            Some(json!({"role": "user", "content": content}))
+                        }
                     }
                     MessageContent::ToolResult(r) => {
                         if r.call_id.is_empty() {
@@ -350,7 +397,7 @@ impl LlmProvider for OpenAiProvider {
         let url = normalize_base_url(&self.base_url);
         let mut body = json!({
             "model": self.model,
-            "messages": Self::format_messages(messages, self.reasoning_history_policy()),
+            "messages": Self::format_messages(messages, self.reasoning_history_policy(), self.supports_vision),
             "stream": true,
             "stream_options": { "include_usage": true },
             "max_tokens": self.max_tokens,
@@ -908,8 +955,150 @@ pub(crate) fn humanise_stream_error(e: &reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_nonstream_response, sample_for_error};
+    use super::{parse_nonstream_response, sample_for_error, OpenAiProvider, ReasoningPolicy};
+    use crate::conversation::message::{ImagePart, Message, MessageContent, Role};
     use crate::stream::StreamEvent;
+
+    /// Wire shape for `MessageContent::MultiPart`: must match OpenAI's
+    /// vision schema exactly — `role: user`, `content: [...]` array,
+    /// each block tagged with `type` ("image_url" or "text"). Order
+    /// is image(s) first, text second. The PR added the multipart code
+    /// path but no test for the wire output; without this regression
+    /// guard a future field-rename or order-flip would silently break
+    /// every vision-capable provider.
+    #[test]
+    fn multipart_serialises_to_openai_vision_schema() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("describe this".to_string()),
+                images: vec![ImagePart {
+                    media_type: "image/png".to_string(),
+                    data: "AAAA".to_string(),
+                }],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
+        assert_eq!(out.len(), 1, "one message in, one out");
+        let m = &out[0];
+        assert_eq!(m["role"], "user");
+        let content = m["content"].as_array().expect("content must be an array");
+        assert_eq!(content.len(), 2, "image + text = 2 blocks");
+        // Block 0: image, must have exactly `type` and `image_url`.
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+        assert!(content[0].get("text").is_none(), "image block must not have text field");
+        // Block 1: text, must use `type: text` + `text: <string>`.
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "describe this");
+    }
+
+    /// Multi-image variant: all images come before the text block, in
+    /// the order they were attached.
+    #[test]
+    fn multipart_preserves_image_order_then_text() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("compare".to_string()),
+                images: vec![
+                    ImagePart { media_type: "image/png".into(), data: "FIRST".into() },
+                    ImagePart { media_type: "image/jpeg".into(), data: "SECOND".into() },
+                ],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,FIRST");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/jpeg;base64,SECOND");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "compare");
+    }
+
+    /// Image-only multipart (no caption): content array contains just
+    /// the image block, no empty trailing text block.
+    #[test]
+    fn multipart_without_text_omits_text_block() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: None,
+                images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "single image block, no text block");
+        assert_eq!(content[0]["type"], "image_url");
+    }
+
+    /// Regression: the user pasted an image with a vision-capable model
+    /// (Claude/Opus), got a reply, then ran `/model` to switch to GLM-5.1
+    /// (text-only) and tried to send a follow-up. The conversation still
+    /// carried the historical `MultiPart` user turn; serialising it
+    /// against GLM-5.1's text-only schema sent `content: [...]` to the
+    /// upstream which rejected with `ModelArts.81001 message[N].content[0]
+    /// has invalid field(s): text, type`. The provider must gracefully
+    /// degrade `MultiPart` → text-only string when `supports_vision = false`,
+    /// preserving the user's caption (with our `[Image #N]` marker still
+    /// inside) but stripping the image bytes the wire schema can't
+    /// represent.
+    #[test]
+    fn multipart_degrades_to_text_when_target_is_text_only() {
+        let history = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("[Image #1] 这是什么图啊".into()),
+                images: vec![ImagePart { media_type: "image/png".into(), data: "AAAA".into() }],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
+        assert_eq!(out.len(), 1);
+        let m = &out[0];
+        assert_eq!(m["role"], "user");
+        // Content must be a flat string, NOT an array — anything else is
+        // a 400 against text-only proxies (ModelArts, ZhipuAI, etc.).
+        assert!(
+            m["content"].is_string(),
+            "text-only target must receive content as a string, got: {}",
+            m["content"]
+        );
+        let content = m["content"].as_str().unwrap();
+        assert!(
+            content.contains("这是什么图啊"),
+            "user's caption must survive degradation: {:?}",
+            content
+        );
+        // No image_url block leakage.
+        assert!(
+            !content.contains("data:image"),
+            "image bytes must not appear in degraded payload: {:?}",
+            content
+        );
+    }
+
+    /// When `MultiPart` had no text at all (image-only paste, no caption)
+    /// and the target is text-only, the degraded payload must still be
+    /// non-empty — empty user content is rejected by some proxies (e.g.
+    /// "messages must contain a non-empty content"). Use a placeholder
+    /// so the conversation flow stays valid.
+    #[test]
+    fn multipart_text_only_target_uses_placeholder_when_caption_empty() {
+        let history = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: None,
+                images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
+        let content = out[0]["content"].as_str().expect("string content");
+        assert!(!content.is_empty(), "must be non-empty placeholder");
+    }
 
     #[test]
     fn parses_nonstream_text_response() {
@@ -1023,7 +1212,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        };
+
+};
         let p = OpenAiProvider::new(&cfg).expect("provider builds");
         assert_eq!(p.reasoning_history_policy(), ReasoningPolicy::Exclude);
 
@@ -1061,7 +1251,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        };
+
+};
         let err = match OpenAiProvider::new(&cfg) {
             Err(e) => e,
             Ok(_) => panic!("bad reasoning_history value must reject"),
@@ -1110,7 +1301,7 @@ mod tests {
     fn format_messages_include_with_some_reasoning_emits_field() {
         use super::{OpenAiProvider, ReasoningPolicy};
         let msgs = vec![atc_message(Some("thinking text"))];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["reasoning_content"], "thinking text");
     }
@@ -1124,7 +1315,7 @@ mod tests {
         // a short non-empty placeholder so BOTH providers accept the message.
         use super::{OpenAiProvider, ReasoningPolicy};
         let msgs = vec![atc_message(None)];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         let rc = out[0]["reasoning_content"].as_str().unwrap();
         assert!(
             !rc.is_empty(),
@@ -1146,7 +1337,7 @@ mod tests {
             role: Role::Assistant,
             content: MessageContent::Text("当前系统时间是 …".into()),
         }];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
         let rc = out[0]["reasoning_content"].as_str();
         assert!(
@@ -1157,7 +1348,7 @@ mod tests {
 
         // Under Exclude (V3/default) the key must NOT appear on Text — sending
         // it would regress V3 R1 which rejects any reasoning_content echo.
-        let out_ex = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude);
+        let out_ex = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude, true);
         assert!(
             out_ex[0]
                 .as_object()
@@ -1176,7 +1367,7 @@ mod tests {
         // replaced with the non-empty placeholder before sending.
         use super::{OpenAiProvider, ReasoningPolicy};
         let msgs = vec![atc_message(Some(""))];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         let rc = out[0]["reasoning_content"].as_str().unwrap();
         assert!(
             !rc.is_empty(),
@@ -1190,7 +1381,7 @@ mod tests {
         // so under Exclude we must NOT emit the key even when we have a value.
         use super::{OpenAiProvider, ReasoningPolicy};
         let msgs = vec![atc_message(Some("should be stripped"))];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude, true);
         assert!(
             out[0]
                 .as_object()

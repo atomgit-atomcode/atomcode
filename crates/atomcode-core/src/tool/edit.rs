@@ -134,6 +134,15 @@ async fn validate_write_check(
     // ensuring the model never operates on a snapshot that no longer
     // matches disk after its own edit.
     ctx.file_store.write().await.invalidate(&canon_path);
+    // Defense-in-depth: also purge read_cache entries for this path. The
+    // mtime gate at read.rs catches most cases, but on FS with coarse
+    // mtime granularity (ext4 sec, NFS) an edit within the same tick as
+    // the prior read leaves mtime unchanged and the gate fails open.
+    // Explicit purge closes that corner case.
+    ctx.read_cache
+        .write()
+        .await
+        .retain(|(p, _, _), _| p != &canon_path);
 
     // 4. Post-write syntax check (needs file on disk)
     let syntax_warn = auto_fix::post_edit_syntax_check(file_path).await;
