@@ -589,7 +589,8 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
-            },
+
+},
         );
         cfg.save(&tmp).unwrap();
         let text = std::fs::read_to_string(&tmp).unwrap();

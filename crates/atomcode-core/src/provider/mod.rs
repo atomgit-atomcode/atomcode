@@ -295,9 +295,48 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     Ok(token.access_token)
 }
 
+/// Heuristic: does this model name look like a vision-capable model?
+///
+/// Used by the TUI's Ctrl+V image-paste handler to refuse attaching an
+/// image when the active model almost certainly can't accept it (e.g.
+/// `glm-5.1`, `deepseek-v4-flash`, `qwen3-coder`). Without this gate
+/// the user wastes a turn on a 400 from the upstream — see the
+/// `ModelArts.81001` `message[3].content[0] has invalid field(s):
+/// text, type` failure pattern that surfaced in production.
+///
+/// Conservative — only matches well-known vision-capable patterns.
+/// False-negatives are safe: extend this list when a new vision model
+/// ships rather than threading a per-provider config knob (no
+/// user-discoverable opt-in exists). False-positives waste a turn on
+/// a 400, so when in doubt this returns false.
+pub fn model_name_suggests_vision(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("vision")
+        || n.contains("-vl")
+        || n.contains("vl-")
+        || n.contains("-4v")
+        || n.contains("-4.1v")
+        || n.starts_with("gpt-4o")
+        // Claude 3 onwards is vision-capable. Anthropic uses two naming
+        // forms: the legacy `claude-<gen>-<variant>` (claude-3-5-sonnet)
+        // and the newer `claude-<variant>-<gen>-<rev>` (claude-sonnet-4-6).
+        || n.starts_with("claude-3")
+        || n.starts_with("claude-4")
+        || n.starts_with("claude-5")
+        || n.starts_with("claude-6")
+        || n.starts_with("claude-7")
+        || n.starts_with("claude-sonnet")
+        || n.starts_with("claude-opus")
+        || n.starts_with("claude-haiku")
+        || n.starts_with("gemini")
+        || n.starts_with("pixtral")
+        || n.contains("llava")
+        || n.contains("qvq")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::unavailable_provider;
+    use super::{model_name_suggests_vision, unavailable_provider};
 
     /// Test that auth token is loaded from the correct unified path.
     /// This prevents regressions where OAuth login token persistence breaks
@@ -344,7 +383,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        }
+
+}
     }
 
     #[test]
@@ -414,5 +454,47 @@ mod tests {
             "trimmable key should be accepted, got: {:?}",
             result.err().map(|e| e.to_string())
         );
+    }
+
+    // ── model_name_suggests_vision ────────────────────────────────
+
+    #[test]
+    fn vision_heuristic_recognises_known_vision_models() {
+        // Anthropic — vision-capable since Claude 3.
+        assert!(model_name_suggests_vision("claude-3-5-sonnet"));
+        assert!(model_name_suggests_vision("claude-4-opus"));
+        assert!(model_name_suggests_vision("claude-sonnet-4-6"));
+        // OpenAI — gpt-4o family is multimodal.
+        assert!(model_name_suggests_vision("gpt-4o"));
+        assert!(model_name_suggests_vision("gpt-4o-mini"));
+        assert!(model_name_suggests_vision("gpt-4-vision-preview"));
+        // Zhipu GLM vision suffixes — `-4v`, `-4.1v` (NOT `-5.1`).
+        assert!(model_name_suggests_vision("GLM-4V"));
+        assert!(model_name_suggests_vision("glm-4.1v-thinking"));
+        // Qwen / DeepSeek / generic VL family.
+        assert!(model_name_suggests_vision("Qwen2-VL-7B"));
+        assert!(model_name_suggests_vision("deepseek-vl"));
+        // Other major vision lines.
+        assert!(model_name_suggests_vision("gemini-2.0-flash"));
+        assert!(model_name_suggests_vision("pixtral-12b"));
+        assert!(model_name_suggests_vision("llava-1.6"));
+        assert!(model_name_suggests_vision("qvq-72b-preview"));
+    }
+
+    /// Regression for the user's exact failure: pasting an image while
+    /// `GLM-5.1` was the active model produced a `ModelArts.81001 ...
+    /// message[3].content[0] has invalid field(s): text, type` 400.
+    /// The heuristic must NOT classify GLM-5.1 (or other text-only
+    /// models the user is likely to be on) as vision-capable.
+    #[test]
+    fn vision_heuristic_rejects_text_only_models() {
+        assert!(!model_name_suggests_vision("GLM-5.1"));
+        assert!(!model_name_suggests_vision("glm-5.1"));
+        assert!(!model_name_suggests_vision("deepseek-v4-flash"));
+        assert!(!model_name_suggests_vision("Qwen/Qwen3.6-35B-A3B"));
+        assert!(!model_name_suggests_vision("gpt-4-turbo")); // text-only base
+        assert!(!model_name_suggests_vision("kimi-k2-thinking"));
+        assert!(!model_name_suggests_vision("o1-preview")); // not a vision tag
+        assert!(!model_name_suggests_vision(""));
     }
 }

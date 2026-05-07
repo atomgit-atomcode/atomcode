@@ -932,7 +932,7 @@ fn sanitize_messages(msgs: &mut Vec<Message>) {
             MessageContent::AssistantWithToolCalls { tool_calls, .. } => {
                 expecting_tool_results = tool_calls.len();
             }
-            MessageContent::Text(_) => {
+            MessageContent::Text(_) | MessageContent::MultiPart { .. } => {
                 expecting_tool_results = 0;
             }
         }

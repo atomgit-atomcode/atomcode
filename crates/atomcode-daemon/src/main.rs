@@ -358,6 +358,14 @@ impl From<&atomcode_core::conversation::message::Message> for MessageInfo {
             atomcode_core::conversation::message::MessageContent::ToolResultRef(r) => {
                 (r.summary.clone(), None, None, None)
             }
+            atomcode_core::conversation::message::MessageContent::MultiPart { text, images } => {
+                let desc = format!(
+                    "{}[{} image(s)]",
+                    text.as_deref().unwrap_or(""),
+                    images.len()
+                );
+                (desc, None, None, None)
+            }
         };
 
         Self {
@@ -1870,7 +1878,8 @@ async fn process_chat_request(
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
-            })
+
+})
         }
     };
     let mut turn_runner = TurnRunner {

@@ -932,7 +932,8 @@ async fn run() -> Result<i32> {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
-            },
+
+},
             String::new(),
         )
     } else {
@@ -1329,7 +1330,7 @@ async fn run_headless(
     tokio::spawn(async move {
         atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
     });
-    cmd_tx.send(AgentCommand::SendMessage(prompt))?;
+    cmd_tx.send(AgentCommand::SendMessage { text: prompt, images: vec![] })?;
 
     let mut exit_code: i32 = 0;
     let mut had_denial = false;

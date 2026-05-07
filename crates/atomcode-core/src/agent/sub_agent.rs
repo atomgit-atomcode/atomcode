@@ -487,7 +487,8 @@ impl SubAgentTask {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
-            }),
+
+}),
         };
 
         // Sandbox: filter parent tools to the sub-agent whitelist

@@ -65,6 +65,23 @@ impl ClaudeProvider {
                 Role::User => {
                     let content = match &m.content {
                         MessageContent::Text(s) => json!(s),
+                        MessageContent::MultiPart { text, images } => {
+                            let mut parts: Vec<serde_json::Value> = Vec::new();
+                            for img in images {
+                                parts.push(json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": &img.media_type,
+                                        "data": &img.data,
+                                    }
+                                }));
+                            }
+                            if let Some(t) = text {
+                                parts.push(json!({"type": "text", "text": t}));
+                            }
+                            json!(parts)
+                        }
                         _ => json!(""),
                     };
                     msgs.push(json!({"role": "user", "content": content}));
@@ -98,7 +115,9 @@ impl ClaudeProvider {
                             }
                             msgs.push(json!({"role": "assistant", "content": parts}));
                         }
-                        MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
+                        MessageContent::ToolResult(_)
+                        | MessageContent::ToolResultRef(_)
+                        | MessageContent::MultiPart { .. } => {
                             // Should not appear on assistant role; skip.
                         }
                     }
@@ -658,5 +677,94 @@ mod tests {
             None, vec![], None, false, 10000,
         );
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn format_messages_multipart_produces_image_blocks() {
+        use crate::conversation::message::ImagePart;
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("What is in this image?".to_string()),
+                images: vec![ImagePart {
+                    media_type: "image/png".to_string(),
+                    data: "aWdub3JlLXRoaXM=".to_string(),
+                }],
+            },
+        }];
+
+        let (_system, msgs) = ClaudeProvider::format_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+
+        let user_msg = &msgs[0];
+        assert_eq!(user_msg["role"], "user");
+
+        let content = user_msg["content"].as_array().expect("content should be array");
+        assert_eq!(content.len(), 2); // 1 image + 1 text
+
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["type"], "base64");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["data"], "aWdub3JlLXRoaXM=");
+
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "What is in this image?");
+    }
+
+    #[test]
+    fn format_messages_multipart_images_only_no_text_block() {
+        use crate::conversation::message::ImagePart;
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: None,
+                images: vec![ImagePart {
+                    media_type: "image/jpeg".to_string(),
+                    data: "c29tZS1kYXRh".to_string(),
+                }],
+            },
+        }];
+
+        let (_system, msgs) = ClaudeProvider::format_messages(&messages);
+        let content = msgs[0]["content"].as_array().expect("content should be array");
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["media_type"], "image/jpeg");
+    }
+
+    #[test]
+    fn format_messages_multipart_multiple_images() {
+        use crate::conversation::message::ImagePart;
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("compare".to_string()),
+                images: vec![
+                    ImagePart {
+                        media_type: "image/png".to_string(),
+                        data: "aW1nMQ==".to_string(),
+                    },
+                    ImagePart {
+                        media_type: "image/jpeg".to_string(),
+                        data: "aW1nMg==".to_string(),
+                    },
+                ],
+            },
+        }];
+
+        let (_system, msgs) = ClaudeProvider::format_messages(&messages);
+        let content = msgs[0]["content"].as_array().expect("content should be array");
+
+        assert_eq!(content.len(), 3); // 2 images + 1 text
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["data"], "aW1nMQ==");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["data"], "aW1nMg==");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "compare");
     }
 }

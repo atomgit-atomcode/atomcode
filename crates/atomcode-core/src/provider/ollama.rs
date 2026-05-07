@@ -85,6 +85,11 @@ impl OllamaProvider {
                             "content": r.summary,
                         }))
                     }
+                    MessageContent::MultiPart { text, .. } => {
+                        let t = text.as_deref().unwrap_or("");
+                        if t.is_empty() { return None; }
+                        Some(json!({"role": "user", "content": t}))
+                    }
                 }
             })
             .collect()
