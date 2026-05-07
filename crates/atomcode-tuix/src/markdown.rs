@@ -152,9 +152,11 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
     flush_aligned_table_with_width(rows, caps, 0)
 }
 
-/// Width-aware variant. When `max_width > 0`, column widths are capped so
-/// each rendered row fits within the budget (line = `1 + ncols·(w+3)`); cells
-/// that exceed the cap are truncated with `…`. `max_width = 0` = no cap.
+/// Width-aware variant. When `max_width > 0` and the table can't fit at its
+/// natural column widths, fall back to a flat key/value record format
+/// (`header: cell` per line, blank line between rows) so no information is
+/// lost to per-cell truncation. `max_width = 0` keeps box-table rendering
+/// at natural widths regardless of size.
 pub fn flush_aligned_table_with_width(
     rows: &[String],
     caps: TerminalCaps,
@@ -180,8 +182,11 @@ pub fn flush_aligned_table_with_width(
         return String::new();
     }
 
-    // Compute col widths from non-separator rows, using display width of
-    // the plaintext (markdown markers stripped for width only).
+    // Compute natural column widths from non-separator rows. We do NOT cap
+    // these — the cap-and-truncate-with-… approach the previous code took
+    // chopped real content out of cells and made wide tables in narrow
+    // terminals unreadable. Instead, if the natural table doesn't fit, the
+    // flat-mode fallback below renders every cell in full.
     let mut col_widths = vec![0usize; ncols];
     for row in &parsed {
         if is_sep(row) {
@@ -197,16 +202,13 @@ pub fn flush_aligned_table_with_width(
         }
     }
 
-    // Cap per-column width so the full row fits: line = 1 (left `│`) +
-    // ncols · (w + 3). Lower bound 6 keeps cells legible; upper bound 40
-    // matches atomcode-tui so short tables don't waste horizontal space.
-    if max_width > 0 {
-        let overhead = 1 + 3 * ncols;
-        let budget = max_width.saturating_sub(overhead);
-        let cap = (budget / ncols.max(1)).clamp(6, 40);
-        for w in col_widths.iter_mut() {
-            *w = (*w).min(cap);
-        }
+    // Total width of one rendered row at natural widths:
+    //   `│` + per-col ` cell ` + `│` between/after each col
+    //   = 1 + sum(w + 3 for w in col_widths)
+    // If this exceeds the terminal budget, switch to flat mode.
+    let natural_row_width: usize = 1 + col_widths.iter().map(|w| w + 3).sum::<usize>();
+    if max_width > 0 && natural_row_width > max_width {
+        return render_flat_table(&parsed, caps);
     }
 
     // Bright-black / DarkGrey (SGR 90) — table borders are chrome,
@@ -249,22 +251,11 @@ pub fn flush_aligned_table_with_width(
         out.push_str(border_off);
         for (j, w) in col_widths.iter().enumerate() {
             let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            let plain = strip_md_for_width(cell);
-            let plain_w = crate::width::display_width(&plain);
-            // Truncate overlong cells to fit the column cap. Inline markdown
-            // (`**bold**`, backticks) is dropped on the truncated form — the
-            // alternative (truncating the raw string) risks unterminated
-            // `**` markers that poison the rest of the line.
-            let (body, body_w) = if plain_w > *w {
-                let t = crate::width::truncate_with_ellipsis(&plain, *w);
-                let tw = crate::width::display_width(&t);
-                (t, tw)
-            } else {
-                (render_inline(cell, caps), plain_w)
-            };
+            let plain_w = crate::width::display_width(&strip_md_for_width(cell));
+            let body = render_inline(cell, caps);
             out.push(' ');
             out.push_str(&body);
-            let pad = w.saturating_sub(body_w);
+            let pad = w.saturating_sub(plain_w);
             for _ in 0..pad {
                 out.push(' ');
             }
@@ -284,6 +275,61 @@ pub fn flush_aligned_table_with_width(
 
     // Bottom border: └─┴─┘
     out.push_str(&rule('└', '┴', '┘'));
+    out
+}
+
+/// Narrow-terminal fallback for tables that can't fit at natural column
+/// widths. Each data row is expanded into N lines of `header：cell` (one
+/// per column), with a blank line between successive rows. Soft-wrapping
+/// of long lines is left to the caller's downstream wrap stage so the
+/// terminal width budget is honoured without losing any cell content.
+fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
+    let is_sep = |row: &[String]| -> bool {
+        row.iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
+    };
+    let has_sep = parsed.iter().any(|r| is_sep(r));
+    let mut data_iter = parsed.iter().filter(|r| !is_sep(r));
+
+    // First non-sep row is treated as headers when a separator exists.
+    // Without a separator the source isn't a real markdown table (it's
+    // just `|` lines); fall back to printing every cell with no label.
+    let headers: Vec<String> = if has_sep {
+        match data_iter.next() {
+            Some(h) => h.clone(),
+            None => return String::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    let mut first = true;
+    for row in data_iter {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        for j in 0..ncols {
+            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+            let cell_rendered = render_inline(cell, caps);
+            if let Some(header) = headers.get(j) {
+                let h_rendered = render_inline(header, caps);
+                out.push_str(&h_rendered);
+                out.push('：');
+                out.push_str(&cell_rendered);
+            } else {
+                out.push_str(&cell_rendered);
+            }
+            out.push('\n');
+        }
+    }
+    // Drop the trailing newline so the caller's `format!("{}\n{}", t, body)`
+    // doesn't sprinkle an extra blank line after the block.
+    if out.ends_with('\n') {
+        out.pop();
+    }
     out
 }
 
@@ -557,51 +603,77 @@ mod tests {
         );
     }
 
-    /// Regression: `flush_aligned_table` computed col widths from raw cell
-    /// text with no upper bound. Long CJK rows produced lines far wider than
-    /// the terminal, which `wrap_cells_to_width` downstream chopped mid-border
-    /// — same structural-corruption class as the atomcode-tui table bug.
-    ///
-    /// Also prints a visual demo of a very long table so the developer can
-    /// eyeball the box-drawing alignment in a narrow panel.
+    /// Wide-enough terminal: render as a normal box-drawing table at the
+    /// table's natural column widths. No truncation, no ellipsis.
     #[test]
-    fn table_fits_within_narrow_panel_width() {
-        // ---- visual demo ----
-        let demo_rows = vec![
-            "| 功能模块 | 核心描述 | 技术栈 | 状态 | 优先级 | 负责人 |".to_string(),
-            "|------|------|------|------|------|------|".to_string(),
-            "| 用户认证系统 | 支持手机号验证码登录、邮箱密码登录、第三方 OAuth2 集成（微信、钉钉、Google）、JWT Token 自动续期、多端设备管理与会话锁定、密码策略配置与强制改密功能 | Rust + Actix-web + Redis + PostgreSQL | 开发中 | P0 | 张三 |".to_string(),
-            "| 权限管理系统 | RBAC 模型实现、细粒度资源级权限控制、数据行级访问控制、动态角色分配与审批流程、权限变更实时审计与日志追踪、组织架构同步与部门级权限继承 | Rust + PostgreSQL + Redis | 已上线 | P0 | 李四 |".to_string(),
-            "| 消息推送中心 | WebSocket 实时消息通道、FCM/APNs 推送、邮件模板引擎、短信网关集成、消息重试与死信队列、阅读状态回执与未读计数、批量推送任务调度与进度监控 | Rust + RabbitMQ + Redis + FCM | 规划中 | P1 | 王五 |".to_string(),
-            "| 文件存储服务 | 分片上传与断点续传、图片自动缩放与水印、PDF 在线预览、病毒扫描集成、CDN 加速与缓存策略、存储配额与用量统计、版本控制与回溯、大文件秒传（MD5 校验） | Rust + MinIO + Cloudflare R2 | 开发中 | P1 | 赵六 |".to_string(),
-            "| 数据分析面板 | 多维度数据聚合查询、自定义仪表盘与 Widget 布局、时间序列数据可视化、数据导出为 Excel/PDF、定时报表生成与邮件分发、实时数据大屏模式 | Rust + ClickHouse + Chart.js | 规划中 | P2 | 孙七 |".to_string(),
-            "| 工作流引擎 | 可视化流程编排与拖拽设计器、条件分支与并行网关、人工任务审批流、定时触发与延迟节点、流程版本管理与灰度发布、执行日志追踪与失败重试 | Rust + PostgreSQL + Redis | 规划中 | P2 | 周八 |".to_string(),
-            "| API 网关 | 限流与熔断、请求路由与负载均衡、身份认证与签名验证、请求响应转换、CORS 预检处理、API 文档自动生成、灰度发布与 A/B 测试、流量镜像与影子测试 | Rust + OpenResty + Lua | 已上线 | P0 | 吴九 |".to_string(),
-            "| 国际化支持 | 多语言资源文件管理与翻译工作流、RTL 右向左语言适配、时区与日期格式本地化、多货币与税务规则、区域性功能开关与特性路由、A/B 测试地域定向 | Rust + i18n-next | 开发中 | P2 | 郑十 |".to_string(),
-        ];
-        let max_w = 80;
-        println!("\n=== Rendered table demo (max_width={}) ===", max_w);
-        let rendered = flush_aligned_table_with_width(&demo_rows, plain_caps(), max_w);
-        print!("{}", rendered);
-        println!("=== End ===\n");
-
-        // ---- regression check ----
+    fn wide_table_renders_as_box_at_natural_widths() {
         let rows = vec![
-            "| 功能 | 描述 | 状态 |".to_string(),
-            "|------|------|------|".to_string(),
-            "| 用户认证系统 | 支持手机号验证码登录、邮箱密码登录、第三方 OAuth2 集成（微信、钉钉、Google）、JWT Token 自动续期 | 开发中 |".to_string(),
-            "| 权限管理系统 | RBAC 模型实现、细粒度资源级权限控制、数据行级访问控制、动态角色分配与审批流程 | 已上线 |".to_string(),
+            "| Feature | Status |".to_string(),
+            "|---------|--------|".to_string(),
+            "| login   | done   |".to_string(),
+            "| signup  | wip    |".to_string(),
         ];
-        let out = flush_aligned_table_with_width(&rows, plain_caps(), max_w);
-        for (i, line) in out.lines().enumerate() {
-            let w = crate::width::display_width(line);
-            assert!(
-                w <= max_w,
-                "line {} rendered at {} cols — exceeds max_width {}",
-                i,
-                w,
-                max_w
-            );
-        }
+        // Plenty of room — natural width is well under 80.
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        assert!(out.contains('┌'));
+        assert!(out.contains('│'));
+        assert!(out.contains('└'));
+        // Cell contents survive in full.
+        assert!(out.contains("login"));
+        assert!(out.contains("signup"));
+        // No ellipsis introduced.
+        assert!(!out.contains('…'));
+    }
+
+    /// Narrow terminal: table can't fit at natural widths → fall back to
+    /// flat `header：cell` records so no cell content is lost. Mirrors the
+    /// CC narrow-mode rendering the user requested.
+    #[test]
+    fn narrow_terminal_falls_back_to_flat_records() {
+        let rows = vec![
+            "| 能力 | AtomCode Air | Cursor | Copilot |".to_string(),
+            "|------|--------------|--------|---------|".to_string(),
+            "| 开源 | ✅ | ❌ | ❌ |".to_string(),
+            "| 多语言运行 | ✅ Python+ | 🟡 | ❌ |".to_string(),
+        ];
+        // Tight budget — the natural box layout needs > 40 cols.
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 40);
+
+        // Flat mode: no box-drawing characters anywhere.
+        assert!(!out.contains('│'), "narrow output must not contain border │");
+        assert!(!out.contains('┌'), "narrow output must not contain top corner");
+
+        // Every cell value survives in full — no truncation.
+        assert!(out.contains("AtomCode Air"));
+        assert!(out.contains("Python+"));
+
+        // Each header label appears once per data row.
+        let count_neng_li = out.matches("能力").count();
+        assert_eq!(count_neng_li, 2, "header `能力` should label both data rows");
+        let count_cursor = out.matches("Cursor").count();
+        assert_eq!(count_cursor, 2, "header `Cursor` should label both data rows");
+
+        // Records are separated by a blank line.
+        assert!(
+            out.contains("\n\n"),
+            "expected blank line between flat records"
+        );
+    }
+
+    /// Threshold transition: the same table in a slightly different
+    /// terminal width should switch modes cleanly.
+    #[test]
+    fn flat_mode_kicks_in_when_natural_width_exceeds_budget() {
+        let rows = vec![
+            "| A | B | C |".to_string(),
+            "|---|---|---|".to_string(),
+            "| short | also short | x |".to_string(),
+        ];
+        // Natural width ~ 1 + (5+3) + (10+3) + (1+3) = 26.
+        let wide = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        assert!(wide.contains('│'), "80 cols should render as box");
+
+        let narrow = flush_aligned_table_with_width(&rows, plain_caps(), 20);
+        assert!(!narrow.contains('│'), "20 cols should fall back to flat");
     }
 }
