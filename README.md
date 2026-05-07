@@ -102,7 +102,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 
 - **Real-time streaming** with markdown rendering and syntax highlighting
 - **Code blocks** with language labels, line numbers, and `base16-ocean.dark` theme
-- **Multi-line input** with Shift+Enter, auto-growing height, input history
+- **Multi-line input** with Shift+Enter (or `\` + Enter), auto-growing height, input history
 - **Text selection** with mouse drag, auto-scroll, and clipboard copy
 - **Slash commands** — `/model`, `/provider`, `/resume`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
 - **File attachment** — paste file paths to attach content as context
@@ -244,6 +244,7 @@ Then just type what you want:
 | `Ctrl+Enter` | New line (requires Kitty keyboard protocol) |
 | `Ctrl+J` | New line (requires Kitty keyboard protocol) |
 | `Alt+Enter` | New line (most terminals; see compatibility note below) |
+| `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
 | `Esc` | Clear input / Cancel stream |
 | `Up/Down` | Browse input history |
 | `Tab` | Accept suggestion |
