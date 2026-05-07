@@ -370,12 +370,22 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    // Bold + bright white — clean, theme-neutral inline
-                    // code styling that stays readable on both light and
-                    // dark backgrounds.
-                    out.push_str("\x1b[1;97m");
+                    // Bold only (no bright-white SGR 97). Earlier
+                    // iteration used `\x1b[1;97m` to fix unreadable
+                    // cyan on iTerm2 light preset, but in long mixed
+                    // output (markdown headings + code fences + many
+                    // backtick spans) the cumulative bright-white
+                    // load competed with code blocks for the eye's
+                    // anchor — every `path/to/foo.rs` shouted as loud
+                    // as a 30-line code fence. Bold-only keeps inline
+                    // code distinguishable from prose without painting
+                    // half the screen white. Code blocks (fences)
+                    // intentionally KEEP bold+bright white — readers
+                    // genuinely need that anchor when scanning a
+                    // standalone code paragraph.
+                    out.push_str("\x1b[1m");
                     out.push_str(&inner);
-                    out.push_str("\x1b[22;39m");
+                    out.push_str("\x1b[22m");
                 } else {
                     out.push('`');
                     out.push_str(&inner);
@@ -484,9 +494,37 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        // Inline code uses SGR 1+97 (bold + bright white) — clean, theme-
-        // neutral, readable on both light and dark backgrounds.
-        assert!(render_inline_line("`x`", caps()).contains("\x1b[1;97mx"));
+        // Inline code uses bold ONLY (no bright-white SGR 97). Long
+        // outputs full of backtick spans were too loud — bold alone
+        // keeps inline code distinguishable from prose without
+        // competing with code-block emphasis.
+        let rendered = render_inline_line("`x`", caps());
+        assert!(
+            rendered.contains("\x1b[1mx"),
+            "inline code must open bold (SGR 1) without bright white: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("\x1b[1;97m"),
+            "inline code must NOT include bright-white SGR 97 anymore: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_keeps_bold_bright_white() {
+        // Code BLOCKS keep bold+bright white intentionally — readers
+        // need a strong visual anchor for standalone code paragraphs.
+        // Only inline code dropped the bright-white SGR; the fence
+        // path at line ~85 still emits 1;97 so verify here.
+        let mut state = MdState::new();
+        let _ = render_line("```", &mut state, caps()); // open fence
+        let inside = render_line("let x = 1;", &mut state, caps()).unwrap_or_default();
+        assert!(
+            inside.contains("\x1b[1;97m"),
+            "fenced code block should still use bold+bright white: {}",
+            inside
+        );
     }
 
     #[test]

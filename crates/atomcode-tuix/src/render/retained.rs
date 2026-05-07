@@ -4462,16 +4462,23 @@ mod tests {
             cell,
             vterm.dump()
         );
-        // Inline code: markdown crate wraps it in \x1b[97m (bright
-        // white) fg.
+        // Inline code: bold ONLY (no bright-white SGR 97). Markdown
+        // crate dropped the `\x1b[1;97m` → `\x1b[1m` to stop the
+        // bright-white load from competing with code blocks for the
+        // eye's anchor in long mixed outputs. Inline code stays
+        // distinguishable via the bold weight.
         let code_pos = row_text
             .find("code")
             .expect("expected 'code' in rendered text");
         let code_cell = vterm.cell_at(row_idx, code_pos);
+        assert!(
+            code_cell.bold,
+            "inline code cell should be bold: {:?}",
+            code_cell
+        );
         assert_eq!(
-            code_cell.fg,
-            Some(crossterm::style::Color::White),
-            "inline code cell should be bright white: {:?}",
+            code_cell.fg, None,
+            "inline code cell must NOT carry bright-white fg anymore: {:?}",
             code_cell
         );
     }
