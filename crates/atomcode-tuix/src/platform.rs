@@ -25,8 +25,20 @@ pub fn home_dir() -> Option<PathBuf> {
 /// Replace a leading `$HOME` in `path` with `~`. Returns `path`
 /// unchanged if it doesn't start under home, or if home isn't known.
 ///
+/// On Windows, `std::fs::canonicalize` returns paths with the verbatim
+/// (`\\?\`) or UNC-verbatim (`\\?\UNC\`) prefix; both are stripped here
+/// before any other processing so the status row never shows the raw
+/// extended-length form (e.g. `\\?\D:\wwwroot\xingyu-api`).
+///
 /// Used by the status row + welcome page to keep long paths readable.
 pub fn collapse_home(path: &str) -> String {
+    let path: std::borrow::Cow<'_, str> = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        std::borrow::Cow::Owned(format!(r"\\{}", rest))
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    };
     if let Some(home) = home_dir() {
         let home_str = home.to_string_lossy();
         if !home_str.is_empty() {
@@ -42,7 +54,7 @@ pub fn collapse_home(path: &str) -> String {
             }
         }
     }
-    path.to_string()
+    path.into_owned()
 }
 
 /// Path for the per-user input history file.
@@ -73,6 +85,24 @@ mod tests {
     #[test]
     fn collapse_home_returns_unchanged_for_unrelated_path() {
         assert_eq!(collapse_home("/opt/tool/bar"), "/opt/tool/bar");
+    }
+
+    #[test]
+    fn collapse_home_strips_windows_verbatim_prefix() {
+        // The Windows extended-length / verbatim prefix is never
+        // user-facing; strip it before display.
+        assert_eq!(
+            collapse_home(r"\\?\D:\wwwroot\xingyu-api"),
+            r"D:\wwwroot\xingyu-api"
+        );
+    }
+
+    #[test]
+    fn collapse_home_strips_windows_verbatim_unc_prefix() {
+        assert_eq!(
+            collapse_home(r"\\?\UNC\server\share\proj"),
+            r"\\server\share\proj"
+        );
     }
 
     #[test]

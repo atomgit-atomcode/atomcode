@@ -304,10 +304,17 @@ fn base64_encode(input: &[u8]) -> String {
 // alt_screen will diverge from plain on more dimensions in later phases
 // and shared constants would create a noisy upstream-change footprint.
 const SGR_RESET: &str = "\x1b[0m";
-const SGR_RED: &str = "\x1b[31m";
-const SGR_GREEN: &str = "\x1b[32m";
-const SGR_MAGENTA: &str = "\x1b[35m"; // Role::Brand — see render/theme.rs
-const SGR_CYAN: &str = "\x1b[36m";
+const SGR_RED: &str = "\x1b[91m";
+const SGR_GREEN: &str = "\x1b[92m";
+const SGR_MAGENTA: &str = "\x1b[95m"; // Role::Brand — see render/theme.rs
+const SGR_CYAN: &str = "\x1b[96m"; // Role::Border / Accent — bright variant; the
+                                   // dim 36m form rendered the input-box rule
+                                   // as visibly "dashed" on Windows Terminal
+                                   // because the muted cyan let font-glyph
+                                   // gaps in `─` show through. Bright cyan
+                                   // matches retained's `Palette::BORDER`
+                                   // (Color::Cyan ≡ SGR 96 in crossterm) and
+                                   // closes the cross-renderer drift.
 const SGR_DIM: &str = "\x1b[2m";
 
 /// Default cap on `body_lines` length. ~5000 rows × ~200 bytes/row
@@ -2013,8 +2020,8 @@ mod tests {
             "20 ─ chars missing. got: {:?}",
             s
         );
-        // Cyan colour applied to the rule.
-        assert!(s.contains("\x1b[36m"), "rule should be cyan. got: {:?}", s);
+        // Bright cyan (96) — matches retained's `Palette::BORDER`.
+        assert!(s.contains("\x1b[96m"), "rule should be bright cyan. got: {:?}", s);
     }
 
     /// `wrap_to_width_sgr_aware` is the soft-wrap helper that keeps long
@@ -2260,7 +2267,7 @@ mod tests {
     }
 
     /// The spinner FRAME (the rotating glyph) must be coloured brand
-    /// magenta (`\x1b[35m`) when caps.colors is on — visual anchor so
+    /// magenta (`\x1b[95m`) when caps.colors is on — visual anchor so
     /// the rotation reads as motion against the dim label. Mirrors
     /// `RetainedRenderer::build_spinner_body_row` (Role::Brand frame +
     /// Role::Secondary label).
@@ -2276,7 +2283,7 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(
-            s.contains("\x1b[35m\u{280b}\x1b[0m"),
+            s.contains("\x1b[95m\u{280b}\x1b[0m"),
             "spinner frame must be wrapped in magenta SGR. got: {:?}",
             s
         );
@@ -2330,7 +2337,7 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(
-            s.contains("\x1b[35m"),
+            s.contains("\x1b[95m"),
             "PLAN badge must use SGR_MAGENTA (Role::Brand). got: {:?}",
             s
         );
@@ -2342,7 +2349,7 @@ mod tests {
         // Badge precedes the dim model/cwd run — confirm the magenta SGR
         // appears earlier in the byte stream than the dim SGR (\x1b[2m).
         let badge_pos = s
-            .find("\x1b[35m")
+            .find("\x1b[95m")
             .expect("magenta SGR must be present");
         let dim_pos = s
             .find("\x1b[2m")
