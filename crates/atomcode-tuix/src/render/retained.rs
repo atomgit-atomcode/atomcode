@@ -1832,14 +1832,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // push_body_row clears any prior live_group, including
                 // ours mid-loop, so we set live_group AFTER the loop.
                 //
-                // Style: header gets bold + Brand color (single anchor
-                // line per batch — needs to read as "this is the
-                // batch boundary"). Children stay muted (high-frequency
-                // repeated rows, not anchors). Summary line uses muted
-                // too — only one bold+brand emphasis per batch keeps
-                // the screen readable when stacked next to markdown
-                // headings, code fences, and inline code.
-                let header_style = self.style_bold(Role::Brand);
+                // Style:
+                // - header: bold + bright white (用户偏好，NOT brand
+                //   red/purple — those clash with the theme; bright
+                //   white is theme-neutral and reads cleanly on both
+                //   light and dark terminals)
+                // - children: muted (high-frequency rows, not anchors)
+                // - summary: bright white but NOT bold (see Summary
+                //   arm below)
+                let header_style = CellStyle {
+                    fg: Some(crossterm::style::Color::White),
+                    bold: true,
+                    ..Default::default()
+                };
                 let muted = self.style_for(Role::Muted);
                 let screen_w = self.screen.width();
                 let header_row = build_one_row(&header, &header_style, screen_w);
@@ -1914,14 +1919,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::ToolGroupSummary { text } => {
                 self.flush_assistant_remainder();
-                // Plain muted style — same as header + children.
-                // Single ▸ glyph is the only structural marker; no
-                // bold / no brand color. Avoids competing with
-                // markdown headings + code fences + emoji on the
-                // same screen. Single-line append; no in-place CUP
-                // because the summary closes the group rather than
-                // mutating it.
-                let style = self.style_for(Role::Muted);
+                // Bright white but NOT bold — distinguishable from the
+                // muted children, but quieter than the bold header.
+                // The header marks batch START with strong emphasis;
+                // the summary marks batch END with lighter emphasis.
+                // 用户偏好：亮 + 不加粗。
+                let style = CellStyle {
+                    fg: Some(crossterm::style::Color::White),
+                    bold: false,
+                    ..Default::default()
+                };
                 let row = build_one_row(&text, &style, self.screen.width());
                 self.push_body_row(row);
             }
