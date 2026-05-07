@@ -3192,7 +3192,19 @@ pub(super) fn handle_upgrade_event(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         UpgradeEvent::Failed(msg) => {
-            renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
+            if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
+                // Friendly path — not an error, just "nothing to do".
+                let friendly = msg.replace(
+                    &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
+                    "",
+                );
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  ✓ 已是最新版本，无需更新。{}\n",
+                    friendly
+                )));
+            } else {
+                renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
+            }
         }
         UpgradeEvent::RolledBack { exe, backup } => {
             renderer.render(UiLine::CommandOutput(format!(
