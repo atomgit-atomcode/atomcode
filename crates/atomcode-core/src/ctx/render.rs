@@ -699,15 +699,33 @@ pub(crate) const MIN_COLLAPSE_SIZE: usize = 500;
 /// time, ephemeral) and the conv-level Tier 1 (destructive). Tool name
 /// comes from the model's own tool_calls so the framework adds zero
 /// hardcoded tool knowledge — every tool gets the same shape.
+///
+/// **First-line picking**: skips `[elapsed: ...]` framework metadata.
+/// `tool::bash` prepends `[elapsed: Xs, exit: N]\n<actual output>` to
+/// every bash result (see bash.rs:540). 5-7 atomgr datalog showed all
+/// 1704 bash stubs surfaced this metadata as `first:` content — model
+/// got "1.9s, exit 101" instead of the actual error. Skipping to line 2
+/// flips the stub from "exit code only" to "actual error / actual
+/// output preview". Falls back to line 1 when there's no line 2
+/// (single-line bash like `wc -l`). Non-bash tools (grep, edit_file,
+/// web_fetch) don't have this prefix → unaffected.
+///
+/// **Hardcoding note**: matching `[elapsed:` is framework-internal
+/// knowledge of our own bash tool's output format, not tech-stack
+/// hardcoding (the prefix is the same regardless of cargo/npm/etc).
+/// Same category as the `read_file` skip in microcompact.
 pub(crate) fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
     let line_count = output.lines().count();
-    let first_line: String = output
-        .lines()
-        .next()
-        .unwrap_or("(empty)")
-        .chars()
-        .take(80)
-        .collect();
+    let first_line: String = {
+        let mut iter = output.lines();
+        let l1 = iter.next().unwrap_or("(empty)");
+        let chosen = if l1.starts_with("[elapsed:") {
+            iter.next().unwrap_or(l1)
+        } else {
+            l1
+        };
+        chosen.chars().take(80).collect()
+    };
     let status = if success { "ok" } else { "FAILED" };
     format!(
         "[{} {}: {} lines, first: {}]",
@@ -1579,6 +1597,56 @@ mod tests {
                 body
             );
         }
+    }
+
+    /// 5-7 atomgr datalog (build 942b615): 1704/1704 bash stubs surfaced
+    /// `first: [elapsed: Xs, exit: N]` — framework metadata, zero signal.
+    /// Stub now skips that line and shows line 2 (the real output / real
+    /// error). Failed bash retry decisions go from "exit 101 of unknown
+    /// origin" to "actual error: ...".
+    #[test]
+    fn build_compact_stub_skips_bash_elapsed_metadata() {
+        let bash_failure = "[elapsed: 1.9s, exit: 101]\nerror: cannot find type `Foo` in this scope";
+        let stub = build_compact_stub("bash", bash_failure, false);
+        assert!(
+            stub.contains("error: cannot find type"),
+            "bash stub must surface the actual error, not the elapsed metadata: {}",
+            stub
+        );
+        assert!(
+            !stub.contains("first: [elapsed:"),
+            "bash stub first-line must skip the elapsed metadata: {}",
+            stub
+        );
+    }
+
+    /// Single-line bash (`wc -l`, `echo $?`, etc.) has no line 2 to fall
+    /// through to. Stub must use whatever line 1 is rather than blanking.
+    #[test]
+    fn build_compact_stub_falls_back_to_line1_when_only_one_line() {
+        let one_liner = "42";
+        let stub = build_compact_stub("bash", one_liner, true);
+        assert!(stub.contains("first: 42"), "got: {}", stub);
+    }
+
+    /// `[elapsed:` skip is bash-only by virtue of the prefix being unique
+    /// to our bash tool. grep / edit_file / web_fetch outputs do NOT
+    /// start with `[elapsed:` so they hit the normal line-1 path. This
+    /// test pins that the skip doesn't accidentally eat the first useful
+    /// line of those tools.
+    #[test]
+    fn build_compact_stub_unaffected_for_non_bash_tools() {
+        let grep = "src/foo.rs:42:    fn bar() {}\nsrc/baz.rs:10:    fn baz()";
+        let stub = build_compact_stub("grep", grep, true);
+        assert!(
+            stub.contains("first: src/foo.rs:42:"),
+            "grep stub must keep line 1 intact: {}",
+            stub
+        );
+
+        let edit = "Edited /path/to/file.rs (-3 +5 lines).";
+        let stub = build_compact_stub("edit_file", edit, true);
+        assert!(stub.contains("first: Edited /path"), "got: {}", stub);
     }
 
     /// 5-7 atomgr datalog (atomgr-2d99b47d/2026-05-07_00-28-34): T22-T29
