@@ -761,9 +761,13 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let status_row = footer_top + 4 + menu_rows;
 
         // Row 1 of footer: spinner during streaming, blank otherwise.
-        // Frame glyph in brand magenta (Role::Brand), label dim — gives
-        // the user a visual anchor as the frame rotates against the
-        // dim label.
+        // Frame glyph in brand magenta (Role::Brand) supplies the
+        // visual anchor; label is bold + default-fg, mirroring
+        // retained's `style_bold(Role::Secondary)` in
+        // `build_spinner_body_row`. SGR_DIM was the prior choice but
+        // rendered as hard-to-read mid-gray on Windows cmd (legacy
+        // conhost <1809 swallowed the dim attribute, leaving the
+        // label barely visible against the background).
         let cup = format!("\x1b[{};1H\x1b[K", spinner_row);
         let _ = self.out.write_all(cup.as_bytes());
         if let Some((frame, label)) = &self.pending_spinner {
@@ -771,7 +775,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let line = if self.caps.colors {
                 format!(
                     "  {}{}{} {}{}{}",
-                    SGR_MAGENTA, frame, SGR_RESET, SGR_DIM, cleaned, SGR_RESET
+                    SGR_MAGENTA, frame, SGR_RESET, SGR_BOLD, cleaned, SGR_RESET
                 )
             } else {
                 format!("  {} {}", frame, cleaned)
@@ -2513,10 +2517,11 @@ mod tests {
     }
 
     /// The spinner FRAME (the rotating glyph) must be coloured brand
-    /// magenta (`\x1b[95m`) when caps.colors is on — visual anchor so
-    /// the rotation reads as motion against the dim label. Mirrors
-    /// `RetainedRenderer::build_spinner_body_row` (Role::Brand frame +
-    /// Role::Secondary label).
+    /// magenta (`\x1b[95m`) when caps.colors is on — visual anchor for
+    /// the rotation. Label is bold default-fg (mirrors retained's
+    /// `style_bold(Role::Secondary)` in build_spinner_body_row); the
+    /// previous SGR_DIM choice rendered as hard-to-read mid-gray on
+    /// Windows legacy conhost.
     #[test]
     fn spinner_frame_uses_brand_magenta() {
         let mut buf = Vec::new();
@@ -2533,8 +2538,19 @@ mod tests {
             "spinner frame must be wrapped in magenta SGR. got: {:?}",
             s
         );
-        // Label still dim — the two SGRs co-exist on the same row.
-        assert!(s.contains("\x1b[2m"), "label should still be dim. got: {:?}", s);
+        // Label is bold + default-fg — bold SGR (\x1b[1m) wraps the
+        // label, no foreground colour change. Co-exists with the
+        // magenta frame SGR on the same row.
+        assert!(
+            s.contains("\x1b[1m"),
+            "label should be wrapped in bold SGR. got: {:?}",
+            s
+        );
+        assert!(
+            !s.contains("\x1b[2m"),
+            "label must not use dim SGR (broken on Windows conhost). got: {:?}",
+            s
+        );
     }
 
     /// `ClearTransient` flips `pending_spinner` back to None so the
