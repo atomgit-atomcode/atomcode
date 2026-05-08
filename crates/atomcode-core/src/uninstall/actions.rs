@@ -545,3 +545,78 @@ mod rc_apply_tests {
         assert!(!rc.with_file_name(".zshrc.atomcode-uninstall.bak").exists());
     }
 }
+
+#[cfg(test)]
+mod execute_tests {
+    use super::super::{execute, scan, Decisions};
+    use super::NoopSelfDelete;
+    use tempfile::TempDir;
+
+    fn fake_install(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let exe = tmp.path().join("atomcode");
+        std::fs::write(&exe, b"x").unwrap();
+        let data = tmp.path().join(".atomcode");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("auth.toml"), b"k").unwrap();
+        std::fs::write(data.join("history"), b"h").unwrap();
+        std::fs::create_dir(data.join("plugins")).unwrap();
+        (exe, data)
+    }
+
+    #[test]
+    fn keep_data_only_removes_binary() {
+        let tmp = TempDir::new().unwrap();
+        let (exe, data) = fake_install(&tmp);
+        let plan = scan::scan(&exe, &data).unwrap();
+        let outcome = execute(&plan, Decisions::KEEP_DATA, &NoopSelfDelete, None).unwrap();
+        // NoopSelfDelete doesn't actually delete the file, but execute() records it.
+        // Our assertions: data files preserved.
+        assert!(data.join("auth.toml").exists());
+        assert!(data.join("history").exists());
+        assert!(outcome.failed.is_empty());
+    }
+
+    #[test]
+    fn purge_removes_everything_under_data() {
+        let tmp = TempDir::new().unwrap();
+        let (exe, data) = fake_install(&tmp);
+        let plan = scan::scan(&exe, &data).unwrap();
+        execute(&plan, Decisions::PURGE, &NoopSelfDelete, None).unwrap();
+        assert!(!data.join("auth.toml").exists());
+        assert!(!data.join("history").exists());
+        assert!(!data.join("plugins").exists());
+    }
+
+    #[test]
+    fn defaults_keep_credentials_remove_state() {
+        let tmp = TempDir::new().unwrap();
+        let (exe, data) = fake_install(&tmp);
+        let plan = scan::scan(&exe, &data).unwrap();
+        execute(&plan, Decisions::DEFAULTS, &NoopSelfDelete, None).unwrap();
+        assert!(data.join("auth.toml").exists()); // kept
+        assert!(!data.join("history").exists());
+        assert!(!data.join("plugins").exists());
+    }
+
+    #[test]
+    fn execution_order_state_then_credentials_then_binary() {
+        let tmp = TempDir::new().unwrap();
+        let (exe, data) = fake_install(&tmp);
+        let plan = scan::scan(&exe, &data).unwrap();
+        let outcome = execute(&plan, Decisions::PURGE, &NoopSelfDelete, None).unwrap();
+        // Removed list ordering proves the spec-mandated order.
+        // history (state) must appear before auth.toml (credentials), which
+        // must appear before the binary path itself.
+        let pos_history = outcome.removed.iter()
+            .position(|p| p.file_name().and_then(|n| n.to_str()) == Some("history"))
+            .expect("history was not removed");
+        let pos_auth = outcome.removed.iter()
+            .position(|p| p.file_name().and_then(|n| n.to_str()) == Some("auth.toml"))
+            .expect("auth.toml was not removed");
+        let pos_bin = outcome.removed.iter()
+            .position(|p| p == &exe)
+            .expect("binary was not removed");
+        assert!(pos_history < pos_auth, "state should be removed before credentials");
+        assert!(pos_auth < pos_bin, "credentials should be removed before binary");
+    }
+}
