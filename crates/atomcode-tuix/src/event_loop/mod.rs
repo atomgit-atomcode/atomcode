@@ -3663,16 +3663,21 @@ fn handle_agent_event(
                 // back to no-op if the group has been frozen —
                 // model still gets the full ToolResult through the
                 // conversation.
-                let child_glyph = if state.unicode_symbols { "└" } else { "\\" };
-                let arrow = if state.unicode_symbols { "→" } else { "->" };
+                // └ (U+2514 Box Drawing), → (U+2192 Arrows), ✗ (U+2717
+                // Dingbats), ● (U+25CF Geometric Shapes): all in WGL4 so
+                // every Windows monospace font (Consolas, NSimSun,
+                // Cascadia, Microsoft YaHei) ships them. Hardcoded —
+                // no `unicode_symbols` ASCII fallback — matching
+                // `alt_screen::push_tool_call`'s ● treatment for visual
+                // parity between batched and single tool-call paths.
+                let child_glyph = "\u{2514}";
+                let arrow = "\u{2192}";
                 let suffix = if success {
                     let n = output.lines().count().max(1);
                     let unit = if n == 1 { "line" } else { "lines" };
                     format!(" {} {} {}", arrow, n, unit)
-                } else if state.unicode_symbols {
-                    format!(" {} ✗", arrow)
                 } else {
-                    format!(" {} [fail]", arrow)
+                    format!(" {} \u{2717}", arrow)
                 };
                 // Reuse the original Tool(arg) prefix the
                 // ToolBatchStarted handler painted. pending_tools
@@ -4168,11 +4173,14 @@ fn handle_agent_event(
             // where the dental-symbols block tofu's. Aligns with the
             // single-tool-call ● glyph (retained::ToolCall arm) so
             // batched and single calls share one visual anchor, and
-            // with `└` for tool-result rows below the call.
-            // Windows-legacy fallback: > and \ keeps the layout
-            // intact when even these render as tofu.
-            let head_glyph = if state.unicode_symbols { "●" } else { ">" };
-            let child_glyph = if state.unicode_symbols { "└" } else { "\\" };
+            // with `└` for tool-result rows below the call. Both
+            // glyphs are in WGL4 (Consolas, NSimSun, Cascadia, Microsoft
+            // YaHei all ship them), so no `unicode_symbols` ASCII
+            // fallback — matches `alt_screen::push_tool_call`'s
+            // hardcoded ● for visual parity between batched and single
+            // tool-call paths.
+            let head_glyph = "\u{25cf}";
+            let child_glyph = "\u{2514}";
             // Build header + child rows; renderer keeps the group
             // "live" while it's the bottom of body_lines, so each
             // ToolCallResult below can update the matching child row
@@ -4270,7 +4278,7 @@ fn handle_agent_event(
             // collapse silently (no actionable info per success).
             state.on_sub_agent_task_failed();
             if let Some(info) = state.sub_agent_tasks.get(index) {
-                let cross = if state.unicode_symbols { "✗" } else { "[fail]" };
+                let cross = "\u{2717}";
                 let short_reason = reason.lines().next().unwrap_or("").trim();
                 renderer.render(UiLine::CommandOutput(format!(
                     "  {} {}{} — {} · {}",
@@ -4297,7 +4305,7 @@ fn handle_agent_event(
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0);
             if total > 0 {
-                let arrow = if state.unicode_symbols { "●" } else { ">" };
+                let arrow = "\u{25cf}";
                 let summary = if failed == 0 {
                     format!(
                         "{} ParallelEditFiles · {}/{} ok · {} wall",
