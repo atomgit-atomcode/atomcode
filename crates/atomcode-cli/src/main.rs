@@ -19,7 +19,10 @@ use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::mcp::{merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpRegistry};
+use atomcode_core::mcp::{
+    login_github_oauth, merge_http_oauth_mcp_server_into_json_file,
+    merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpRegistry, McpTokenStore,
+};
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::bash::BashTool;
@@ -535,6 +538,37 @@ enum McpCli {
         #[arg(short = 'C', long)]
         dir: Option<PathBuf>,
     },
+    /// Add GitHub's remote MCP server using OAuth.
+    AddGithubOauth {
+        /// Server key (tools appear as `mcp__<name>__…`)
+        #[arg(default_value = "github")]
+        name: String,
+        /// Write `~/.atomcode/mcp.json` instead of `<dir>/.mcp.json`
+        #[arg(long)]
+        global: bool,
+        /// Directory for project `.mcp.json` (defaults to current directory)
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+    },
+    /// Complete OAuth login for a remote MCP server.
+    Login {
+        /// Server key in mcpServers (for GitHub, usually `github`)
+        name: String,
+        /// OAuth provider to use.
+        #[arg(long, default_value = "github")]
+        provider: String,
+        /// OAuth client id. Defaults to ATOMCODE_GITHUB_MCP_CLIENT_ID.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// OAuth scopes. Defaults to GitHub MCP's broad repo-oriented set.
+        #[arg(long, value_delimiter = ',')]
+        scopes: Vec<String>,
+    },
+    /// Remove saved OAuth credentials for a remote MCP server.
+    Logout {
+        /// Server key in mcpServers.
+        name: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -932,7 +966,8 @@ async fn run() -> Result<i32> {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
-            },
+
+},
             String::new(),
         )
     } else {
@@ -1329,7 +1364,7 @@ async fn run_headless(
     tokio::spawn(async move {
         atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
     });
-    cmd_tx.send(AgentCommand::SendMessage(prompt))?;
+    cmd_tx.send(AgentCommand::SendMessage { text: prompt, images: vec![] })?;
 
     let mut exit_code: i32 = 0;
     let mut had_denial = false;
@@ -1667,6 +1702,60 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
                 program,
                 args.len()
             );
+            Ok(())
+        }
+        Commands::Mcp(McpCli::AddGithubOauth { name, global, dir }) => {
+            let base = resolve_working_dir(dir);
+            let path = if global {
+                Config::config_dir().join("mcp.json")
+            } else {
+                base.join(".mcp.json")
+            };
+            merge_http_oauth_mcp_server_into_json_file(
+                &path,
+                &name,
+                "https://api.githubcopilot.com/mcp/",
+                "github",
+            )?;
+            println!(
+                "  Added GitHub OAuth MCP server {:?} → {}",
+                name,
+                path.display()
+            );
+            Ok(())
+        }
+        Commands::Mcp(McpCli::Login {
+            name,
+            provider,
+            client_id,
+            scopes,
+        }) => {
+            if provider != "github" {
+                anyhow::bail!("unsupported MCP OAuth provider: {}", provider);
+            }
+            let client_id =
+                client_id.or_else(|| std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok());
+            let Some(client_id) = client_id else {
+                anyhow::bail!(
+                    "GitHub MCP OAuth requires --client-id or ATOMCODE_GITHUB_MCP_CLIENT_ID"
+                );
+            };
+            let token = login_github_oauth(&name, &client_id, &scopes)?;
+            println!(
+                "  Saved {} OAuth token for MCP server {:?} with {} scope(s)",
+                token.provider,
+                name,
+                token.scopes.len()
+            );
+            Ok(())
+        }
+        Commands::Mcp(McpCli::Logout { name }) => {
+            let removed = McpTokenStore::default().delete_token(&name)?;
+            if removed {
+                println!("  Removed saved OAuth token for MCP server {:?}", name);
+            } else {
+                println!("  No saved OAuth token found for MCP server {:?}", name);
+            }
             Ok(())
         }
     }

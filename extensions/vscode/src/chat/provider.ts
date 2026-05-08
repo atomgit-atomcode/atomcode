@@ -15,6 +15,7 @@ import {
 } from '../daemon/types';
 
 type WebviewMode = 'sidebar' | 'tab';
+const PANEL_READY_TIMEOUT_MS = 5000;
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'atomcode.chatView';
@@ -26,6 +27,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _isGenerating = false;
   private _loginId?: string;
   private _loginPoll?: ReturnType<typeof setInterval>;
+  private _loginStartedFromCommand = false;
+  private _panelReady = false;
+  private _panelReadyPromise?: Promise<void>;
+  private _panelReadyResolver?: () => void;
 
   public onModelSelected?: (model: string) => void;
 
@@ -43,6 +48,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._panel.reveal();
       return;
     }
+
+    this._panelReady = false;
+    this._panelReadyPromise = new Promise((resolve) => {
+      this._panelReadyResolver = resolve;
+    });
 
     this._panel = vscode.window.createWebviewPanel(
       'atomcode.chatTab',
@@ -63,7 +73,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     this._panel.onDidDispose(() => {
       this._panel = undefined;
+      this._panelReady = false;
+      this._panelReadyResolver = undefined;
+      this._panelReadyPromise = undefined;
     });
+  }
+
+  public async openInSidebar() {
+    await vscode.commands.executeCommand('workbench.view.extension.atomcode');
+    await vscode.commands.executeCommand('atomcode.chatView.focus');
+  }
+
+  public async openPreferredLocation() {
+    const preferred = vscode.workspace.getConfiguration('atomcode').get<string>('preferredLocation', 'sidebar');
+    if (preferred === 'panel') {
+      this.openInTab();
+    } else {
+      await this.openInSidebar();
+    }
+  }
+
+  public async openForEditorCommand() {
+    this.openInTab();
+    await this._waitForPanelReady(PANEL_READY_TIMEOUT_MS);
   }
 
   resolveWebviewView(webviewView: vscode.WebviewView) {
@@ -96,6 +128,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this.newConversation();
           break;
         case 'ready':
+          this._markPanelReady(webview);
           await this._sendInitialState(webview, mode);
           break;
         case 'selectModel':
@@ -127,6 +160,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'loadSession':
           await this._loadSession(msg.sessionId, msg.projectHash);
+          break;
+        case 'renameSession':
+          await this._renameSession(msg.sessionId, msg.projectHash, msg.name);
+          break;
+        case 'deleteSession':
+          await this._deleteSession(msg.sessionId, msg.projectHash, msg.name);
           break;
         case 'openSettings':
           vscode.commands.executeCommand('workbench.action.openSettings', 'atomcode');
@@ -179,6 +218,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // Public API for commands
   public async sendMessage(text: string) {
+    await this.openPreferredLocation();
+    this._postMessage({ type: 'userMessage', text });
+    await this._handleSend(text);
+  }
+
+  public async sendEditorCommandMessage(text: string) {
+    await this.openForEditorCommand();
+    if (this._isGenerating) {
+      this.stopGeneration();
+    }
+    await this._createEditorCommandSession();
     this._postMessage({ type: 'userMessage', text });
     await this._handleSend(text);
   }
@@ -221,13 +271,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // Private
   private async _handleSend(text: string, contextPaths?: string[]) {
-    if (!text.trim() || this._isGenerating) return;
+    const trimmed = text.trim();
+    if (!trimmed || this._isGenerating) return;
+
+    if (await this._handleLocalCommand(trimmed)) {
+      return;
+    }
 
     this._isGenerating = true;
     this._postMessage({ type: 'generationStarted' });
 
     // Build message with file context
-    let fullMessage = text;
+    let fullMessage = trimmed;
     if (contextPaths && contextPaths.length > 0) {
       const parts: string[] = [];
       for (const filePath of contextPaths) {
@@ -244,7 +299,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       if (parts.length > 0) {
         fullMessage = 'The user has attached the following file(s) for context. The content is provided inline below — DO NOT use read_file to re-read them.\n\n'
-          + parts.join('\n\n') + '\n\n' + 'User question: ' + text;
+          + parts.join('\n\n') + '\n\n' + 'User question: ' + trimmed;
       }
     }
 
@@ -287,6 +342,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({ type: 'error', message });
       },
     });
+  }
+
+  private async _ensureSession() {
+    if (this._sessionId) return;
+
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const session = await this._client.createSession(undefined, workspaceFolder);
+    this._sessionId = session.id;
+    this._loadedMessages = undefined;
+    this._postMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
+    await this._refreshSessions();
+  }
+
+  private async _createEditorCommandSession() {
+    this._sessionId = undefined;
+    this._loadedMessages = undefined;
+    this._postMessage({ type: 'clearChat' });
+    await this._ensureSession();
   }
 
   public sendEditorContext() {
@@ -404,10 +477,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._clearLoginPoll();
       this._loginId = undefined;
       this._postMessage({ type: 'loginAuthorized', user: result.user });
+      if (this._loginStartedFromCommand) {
+        this._postMessage({
+          type: 'assistantMessage',
+          text: `Signed in as ${result.user?.name || result.user?.username || 'AtomGit user'}.`,
+        });
+        this._loginStartedFromCommand = false;
+      }
       await this._sendSetupState();
     } catch (e) {
       this._clearLoginPoll();
       this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      if (this._loginStartedFromCommand) {
+        this._postMessage({ type: 'error', message: this._messageFromError(e) });
+        this._loginStartedFromCommand = false;
+      }
     }
   }
 
@@ -427,14 +511,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async _setupCodingPlan() {
+  private async _setupCodingPlan(): Promise<CodingPlanSetupResponse | undefined> {
     try {
       this._postMessage({ type: 'setupWorking', message: 'Syncing CodingPlan models...' });
       const result: CodingPlanSetupResponse = await this._client.setupCodingPlan(this._loginId);
       this._postMessage({ type: 'codingPlanResult', result });
       await this._sendSetupState();
+      return result;
     } catch (e) {
       this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      return undefined;
     }
   }
 
@@ -523,6 +609,71 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async _renameSession(sessionId: string, projectHash?: string, currentName?: string) {
+    const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
+    if (!hash) {
+      this._postMessage({ type: 'error', message: 'Unable to rename session: missing project hash.' });
+      return;
+    }
+
+    const nextName = await vscode.window.showInputBox({
+      title: 'Rename AtomCode session',
+      prompt: 'Enter a new session name',
+      value: currentName || '',
+      ignoreFocusOut: true,
+      validateInput: (value) => value.trim() ? undefined : 'Session name cannot be empty',
+    });
+    if (nextName === undefined) return;
+
+    try {
+      await this._client.renameSession(hash, sessionId, nextName.trim());
+      await this._refreshSessions();
+    } catch (e) {
+      this._postMessage({ type: 'error', message: `Unable to rename session: ${this._messageFromError(e)}` });
+    }
+  }
+
+  private async _deleteSession(sessionId: string, projectHash?: string, currentName?: string) {
+    const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
+    if (!hash) {
+      this._postMessage({ type: 'error', message: 'Unable to delete session: missing project hash.' });
+      return;
+    }
+
+    const label = currentName || sessionId;
+    const choice = await vscode.window.showWarningMessage(
+      `Delete AtomCode session "${label}"?`,
+      { modal: true, detail: 'This removes the session from local history.' },
+      'Delete',
+    );
+    if (choice !== 'Delete') return;
+
+    try {
+      await this._client.deleteSession(hash, sessionId);
+      if (this._sessionId === sessionId) {
+        this._sessionId = undefined;
+        this._loadedMessages = undefined;
+        this._postMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
+        this._postMessage({ type: 'clearChat' });
+      }
+      await this._refreshSessions();
+    } catch (e) {
+      this._postMessage({ type: 'error', message: `Unable to delete session: ${this._messageFromError(e)}` });
+    }
+  }
+
+  private async _resolveSessionProjectHash(sessionId: string, projectHash?: string): Promise<string | undefined> {
+    if (projectHash) return projectHash;
+    try {
+      const sessions = await this._client.listSessions();
+      const match = (sessions as Array<{ project_hash?: string; meta?: { id?: string }; id?: string }>)
+        .find(s => (s.meta?.id || s.id) === sessionId);
+      return match?.project_hash;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async _applyCode(code: string, _language: string) {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
@@ -559,6 +710,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleSlashCommand(command: string) {
+    if (await this._handleLocalCommand(command.trim())) {
+      return;
+    }
+
     const mapping: Record<string, string> = {
       '/explain': 'explain',
       '/fix': 'fix',
@@ -570,6 +725,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const action = mapping[command];
     if (action) {
       await this._handleQuickAction(action);
+    }
+  }
+
+  private async _handleLocalCommand(text: string): Promise<boolean> {
+    const [command] = text.split(/\s+/, 1);
+    switch (command.toLowerCase()) {
+      case '/login':
+        this._loginStartedFromCommand = true;
+        this._postMessage({
+          type: 'assistantMessage',
+          text: 'Opening AtomGit sign-in in your browser. Complete authorization there, then return to VS Code.',
+        });
+        await this._startLogin();
+        return true;
+      case '/codingplan':
+        this._postMessage({
+          type: 'assistantMessage',
+          text: 'Syncing CodingPlan models...',
+        });
+        {
+          const result = await this._setupCodingPlan();
+          if (result) {
+            this._postMessage({
+              type: 'assistantMessage',
+              text: result.success ? 'CodingPlan models synced.' : result.report_text,
+            });
+          }
+        }
+        return true;
+      default:
+        return false;
     }
   }
 
@@ -606,6 +792,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this._view?.webview.postMessage(msg);
     this._panel?.webview.postMessage(msg);
+  }
+
+  private _markPanelReady(webview: vscode.Webview) {
+    if (this._panel?.webview !== webview) return;
+
+    this._panelReady = true;
+    this._panelReadyResolver?.();
+    this._panelReadyResolver = undefined;
+  }
+
+  private async _waitForPanelReady(timeoutMs: number) {
+    if (!this._panel) {
+      throw new Error('AtomCode panel was not opened.');
+    }
+    if (this._panelReady) {
+      return;
+    }
+
+    const readyPromise = this._panelReadyPromise;
+    if (!readyPromise) {
+      throw new Error('AtomCode panel is not initializing.');
+    }
+
+    const ready = await Promise.race([
+      readyPromise.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+    ]);
+
+    if (!ready) {
+      throw new Error('AtomCode panel did not finish initializing.');
+    }
   }
 
   private _messageFromError(e: unknown): string {

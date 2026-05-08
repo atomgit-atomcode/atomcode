@@ -9,6 +9,15 @@ pub enum Role {
     Tool,
 }
 
+/// A single image attachment, base64-encoded.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImagePart {
+    /// MIME type, e.g. "image/png", "image/jpeg".
+    pub media_type: String,
+    /// Base64-encoded image data.
+    pub data: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MessageContent {
     Text(String),
@@ -30,6 +39,11 @@ pub enum MessageContent {
     /// Lightweight reference to a tool result whose full output is cached on disk.
     /// Used for new tool results; old `ToolResult` variant kept for backward compat.
     ToolResultRef(ToolResultRef),
+    /// User message with text and/or image attachments (vision models).
+    MultiPart {
+        text: Option<String>,
+        images: Vec<ImagePart>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,6 +66,7 @@ impl Message {
             MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref(),
             MessageContent::ToolResult(r) => Some(&r.output),
             MessageContent::ToolResultRef(r) => Some(&r.summary),
+            MessageContent::MultiPart { text, .. } => text.as_deref(),
         }
     }
 
@@ -92,6 +107,11 @@ impl Message {
             // previous behaviour overestimated externalised results by 5-50×,
             // pushing compression to fire on phantom budget pressure.
             MessageContent::ToolResultRef(r) => r.summary.len() + 10,
+            MessageContent::MultiPart { text, images } => {
+                let text_len = text.as_ref().map_or(0, |t| t.len());
+                // Each image ≈ 1600 tokens (conservative estimate for vision models).
+                return (text_len / 4).max(1) + images.len() * 1600 + 4;
+            }
         };
         (byte_count / 4).max(1) + 4
     }
@@ -144,6 +164,8 @@ impl Message {
             }
             // ToolResultRef is already condensed (only holds a summary).
             MessageContent::ToolResultRef(_) => self.clone(),
+            // MultiPart messages (images + text) are not condensable.
+            MessageContent::MultiPart { .. } => self.clone(),
             _ => self.clone(),
         }
     }
@@ -353,5 +375,158 @@ mod tests {
         };
         assert!(!r.output.contains("[File skeleton"));
         assert_eq!(r.output.lines().count(), 1);
+    }
+
+    // ── ImagePart / MultiPart tests ────────────────────────────────────────
+
+    fn sample_image_part() -> ImagePart {
+        ImagePart {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgoAAAANSUhEUg==".to_string(),
+        }
+    }
+
+    #[test]
+    fn image_part_serde_roundtrip() {
+        let img = sample_image_part();
+        let json = serde_json::to_string(&img).expect("serialize ImagePart");
+        let deserialized: ImagePart = serde_json::from_str(&json).expect("deserialize ImagePart");
+        assert_eq!(deserialized.media_type, "image/png");
+        assert_eq!(deserialized.data, img.data);
+    }
+
+    #[test]
+    fn multipart_serde_roundtrip_with_text_and_images() {
+        let content = MessageContent::MultiPart {
+            text: Some("describe this image".to_string()),
+            images: vec![sample_image_part()],
+        };
+        let json = serde_json::to_string(&content).expect("serialize MultiPart");
+        let deserialized: MessageContent =
+            serde_json::from_str(&json).expect("deserialize MultiPart");
+        match deserialized {
+            MessageContent::MultiPart { text, images } => {
+                assert_eq!(text.as_deref(), Some("describe this image"));
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].media_type, "image/png");
+            }
+            other => panic!("expected MultiPart, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multipart_serde_roundtrip_no_text() {
+        let content = MessageContent::MultiPart {
+            text: None,
+            images: vec![sample_image_part(), sample_image_part()],
+        };
+        let json = serde_json::to_string(&content).expect("serialize");
+        let deserialized: MessageContent = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            MessageContent::MultiPart { text, images } => {
+                assert!(text.is_none());
+                assert_eq!(images.len(), 2);
+            }
+            other => panic!("expected MultiPart, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multipart_text_returns_some_when_present() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("hello".to_string()),
+                images: vec![],
+            },
+        };
+        assert_eq!(msg.text(), Some("hello"));
+    }
+
+    #[test]
+    fn multipart_text_returns_none_when_absent() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: None,
+                images: vec![],
+            },
+        };
+        assert_eq!(msg.text(), None);
+    }
+
+    #[test]
+    fn multipart_estimate_tokens_includes_image_cost() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("short".to_string()),
+                images: vec![sample_image_part(), sample_image_part()],
+            },
+        };
+        let tokens = msg.estimate_tokens();
+        // 2 images * 1600 = 3200, plus text and message overhead.
+        assert!(
+            tokens >= 3200,
+            "token estimate should include ~1600 per image, got {}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn multipart_estimate_tokens_no_images() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("hello world".to_string()),
+                images: vec![],
+            },
+        };
+        let tokens = msg.estimate_tokens();
+        // No images: "hello world" = 11 chars -> 11/4 = 2 (max with 1) + 0*1600 + 4 = 6
+        assert!(tokens < 100, "no-image multipart should have small token count, got {}", tokens);
+        assert!(tokens >= 5, "should have at least text + overhead, got {}", tokens);
+    }
+
+    #[test]
+    fn multipart_is_tool_result_returns_false() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("look at this".to_string()),
+                images: vec![sample_image_part()],
+            },
+        };
+        assert!(!msg.is_tool_result());
+    }
+
+    #[test]
+    fn multipart_condensed_returns_clone() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("analyze this".to_string()),
+                images: vec![sample_image_part()],
+            },
+        };
+        let condensed = msg.condensed("");
+        match (&msg.content, &condensed.content) {
+            (
+                MessageContent::MultiPart {
+                    text: t1,
+                    images: i1,
+                },
+                MessageContent::MultiPart {
+                    text: t2,
+                    images: i2,
+                },
+            ) => {
+                assert_eq!(t1, t2);
+                assert_eq!(i1.len(), i2.len());
+                assert_eq!(i1[0].media_type, i2[0].media_type);
+                assert_eq!(i1[0].data, i2[0].data);
+            }
+            _ => panic!("condensed MultiPart should remain MultiPart"),
+        }
     }
 }

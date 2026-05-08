@@ -25,6 +25,7 @@ fn make_hook(event: HookEvent, matcher: Option<&str>, cmd: &str) -> HookConfig {
         matcher: matcher.map(String::from),
         command: cmd.to_string(),
         timeout_ms: 10_000,
+        plugin_root: None,
     }
 }
 

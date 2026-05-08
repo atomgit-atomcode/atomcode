@@ -33,21 +33,7 @@ export async function activate(context: vscode.ExtensionContext) {
   extensionState.statusBar = new StatusBarManager();
   context.subscriptions.push({ dispose: () => extensionState.statusBar.dispose() });
 
-  // 3. Try to connect
-  const connected = await extensionState.daemonProcess.ensureRunning();
-  extensionState.statusBar.update(connected);
-
-  if (connected) {
-    try {
-      const models = await extensionState.client.listModels();
-      const defaultModel = models.find(m => m.is_default);
-      if (defaultModel) extensionState.statusBar.update(true, defaultModel.model);
-    } catch {
-      // Model fetch failed, keep connected status without model name
-    }
-  }
-
-  // 4. Register ChatViewProvider
+  // 3. Register ChatViewProvider before daemon startup so commands are never blocked by daemon readiness.
   extensionState.chatProvider = new ChatViewProvider(context.extensionUri, extensionState.client);
   context.subscriptions.push({ dispose: () => extensionState.chatProvider.dispose() });
   context.subscriptions.push(
@@ -56,60 +42,67 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // 5. Register diff content provider
+  // 4. Register diff content provider
   const diffProvider = new DiffContentProvider();
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider('atomcode-original', diffProvider)
   );
 
-  // 6. Register CodeAction provider (for all languages)
+  // 5. Register CodeAction provider (for all languages)
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider('*', new AtomCodeActionProvider(), {
       providedCodeActionKinds: AtomCodeActionProvider.providedCodeActionKinds,
     })
   );
 
-  // 7. Register commands
+  // 6. Register commands before daemon startup. Command handlers surface daemon errors in the chat UI.
   const cmds = [
-    vscode.commands.registerCommand('atomcode.openSidebar', () => {
-      vscode.commands.executeCommand('atomcode.chatView.focus');
+    vscode.commands.registerCommand('atomcode.openSidebar', async () => {
+      await runCommand('open AtomCode sidebar', () => extensionState.chatProvider.openInSidebar());
     }),
 
     vscode.commands.registerCommand('atomcode.openTab', () => {
       extensionState.chatProvider.openInTab();
     }),
 
-    vscode.commands.registerCommand('atomcode.focusInput', () => {
-      extensionState.chatProvider.focusInput();
+    vscode.commands.registerCommand('atomcode.openPreferredLocation', async () => {
+      await runCommand('open AtomCode', () => extensionState.chatProvider.openPreferredLocation());
     }),
 
-    vscode.commands.registerCommand('atomcode.newConversation', () => {
-      extensionState.chatProvider.newConversation();
+    vscode.commands.registerCommand('atomcode.focusInput', async () => {
+      await runCommand('focus AtomCode input', () => extensionState.chatProvider.focusInput());
+    }),
+
+    vscode.commands.registerCommand('atomcode.newConversation', async () => {
+      await runCommand('start a new AtomCode conversation', () => extensionState.chatProvider.newConversation());
     }),
 
     vscode.commands.registerCommand('atomcode.stop', () => {
       extensionState.chatProvider.stopGeneration();
     }),
 
-    vscode.commands.registerCommand('atomcode.explain', () => {
+    vscode.commands.registerCommand('atomcode.explain', async () => {
       const ctx = getEditorContext();
       const prompt = buildContextualPrompt('Please explain this code. What does it do, and why?', ctx);
-      extensionState.chatProvider.sendMessage(prompt);
+      await runCommand('explain the selected code', () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
-    vscode.commands.registerCommand('atomcode.fix', () => {
+    vscode.commands.registerCommand('atomcode.fix', async () => {
       const ctx = getEditorContext();
       const prompt = buildContextualPrompt('Please fix any bugs or issues in this code.', ctx);
-      extensionState.chatProvider.sendMessage(prompt);
+      await runCommand('fix the selected code', () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
 
-    vscode.commands.registerCommand('atomcode.optimize', () => {
+    vscode.commands.registerCommand('atomcode.optimize', async () => {
       const ctx = getEditorContext();
       const prompt = buildContextualPrompt('Please optimize this code for better performance and readability.', ctx);
-      extensionState.chatProvider.sendMessage(prompt);
+      await runCommand('optimize the selected code', () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
   ];
   context.subscriptions.push(...cmds);
+
+  // 7. Try to connect in the background. Activation must stay responsive for menu commands.
+  void initializeDaemon();
 
   // 8. Wire model selection to status bar
   extensionState.chatProvider.onModelSelected = (model: string) => {
@@ -144,6 +137,36 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     })
   );
+}
+
+async function runCommand(label: string, command: () => Thenable<unknown> | Promise<unknown> | unknown) {
+  try {
+    await command();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    vscode.window.showErrorMessage(`AtomCode failed to ${label}: ${message}`);
+  }
+}
+
+async function initializeDaemon() {
+  try {
+    const connected = await extensionState.daemonProcess.ensureRunning();
+    extensionState.statusBar.update(connected);
+
+    if (connected) {
+      try {
+        const models = await extensionState.client.listModels();
+        const defaultModel = models.find(m => m.is_default);
+        if (defaultModel) extensionState.statusBar.update(true, defaultModel.model);
+      } catch {
+        // Model fetch failed, keep connected status without model name
+      }
+    }
+  } catch (e) {
+    extensionState.statusBar.update(false);
+    const message = e instanceof Error ? e.message : String(e);
+    vscode.window.showWarningMessage(`AtomCode daemon startup failed: ${message}`);
+  }
 }
 
 export function deactivate() {

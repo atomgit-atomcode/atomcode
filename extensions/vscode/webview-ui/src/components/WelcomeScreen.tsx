@@ -116,7 +116,9 @@ export function WelcomeScreen() {
                 </div>
               </div>
               <div className="setup-actions">
-                <button type="button" className="setup-primary" onClick={setupCodingPlan}>Sync CodingPlan models</button>
+                {state.auth?.logged_in && (
+                  <button type="button" className="setup-primary" onClick={setupCodingPlan}>Sync CodingPlan models</button>
+                )}
               </div>
             </div>
 

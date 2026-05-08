@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::conversation::message::Message;
+use crate::conversation::message::{Message, Role};
 
 /// Unique identifier for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -90,6 +90,30 @@ impl Session {
         self.touch();
     }
 
+    /// Auto-name an untouched session from the first real user message.
+    ///
+    /// This mirrors the TUI persistence behavior: default names are replaced
+    /// by the first non-synthetic user turn, while user-renamed sessions are
+    /// left alone.
+    pub fn auto_name_from_messages(&mut self) {
+        if !should_auto_name_session(&self.name) {
+            return;
+        }
+
+        let first_real_user = self
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .find_map(|m| m.text().filter(|t| !is_synthetic_user_text(t)));
+
+        if let Some(text) = first_real_user {
+            let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
+            if !name.is_empty() {
+                self.name = name;
+            }
+        }
+    }
+
     /// Update the last modified timestamp.
     pub fn touch(&mut self) {
         self.updated_at = current_timestamp();
@@ -99,6 +123,14 @@ impl Session {
     pub fn short_id(&self) -> &str {
         &self.id.0[..8]
     }
+}
+
+fn should_auto_name_session(name: &str) -> bool {
+    name == "default" || name.starts_with("session-") || name.trim_start().starts_with('[')
+}
+
+fn is_synthetic_user_text(text: &str) -> bool {
+    text.trim_start().starts_with('[')
 }
 
 /// Metadata for a session (without full message history).
@@ -382,6 +414,32 @@ mod tests {
         let session = Session::new(PathBuf::from("/tmp/test"));
         assert!(!session.id.0.is_empty());
         assert!(session.name.starts_with("session-"));
+    }
+
+    #[test]
+    fn auto_name_uses_first_real_user_message() {
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        session
+            .messages
+            .push(Message::new(Role::User, "[System meta · not a user message]\nignored"));
+        session
+            .messages
+            .push(Message::new(Role::User, "帮我修复 VS Code 会话标题自动命名的问题\n更多内容"));
+
+        session.auto_name_from_messages();
+
+        assert_eq!(session.name, "帮我修复 VS Code 会话标题自动命名的问题");
+    }
+
+    #[test]
+    fn auto_name_preserves_user_renamed_session() {
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        session.rename("手动命名".to_string());
+        session.messages.push(Message::new(Role::User, "新的用户消息"));
+
+        session.auto_name_from_messages();
+
+        assert_eq!(session.name, "手动命名");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import { ChatMessage } from '../state/types';
 
 interface UserMessageProps {
@@ -7,6 +7,12 @@ interface UserMessageProps {
 }
 
 export function UserMessage({ message, className = '' }: UserMessageProps) {
+  const [expanded, setExpanded] = useState(false);
+  const shouldCollapse = useMemo(() => {
+    const lineCount = message.text.split('\n').length;
+    return message.text.length > 1200 || lineCount > 18;
+  }, [message.text]);
+
   return (
     <div className={`user-message-wrapper${className}`}>
       <div className="user-message-bubble">
@@ -20,7 +26,18 @@ export function UserMessage({ message, className = '' }: UserMessageProps) {
             ))}
           </div>
         )}
-        <div>{message.text}</div>
+        <div className={`user-message-text${shouldCollapse && !expanded ? ' is-collapsed' : ''}`}>
+          {message.text}
+        </div>
+        {shouldCollapse && (
+          <button
+            type="button"
+            className="user-message-toggle"
+            onClick={() => setExpanded((value) => !value)}
+          >
+            {expanded ? 'Collapse' : 'Expand'}
+          </button>
+        )}
       </div>
     </div>
   );

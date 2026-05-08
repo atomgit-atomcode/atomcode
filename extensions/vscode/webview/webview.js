@@ -1338,7 +1338,7 @@
           return dispatcher;
         }
         "undefined" !== typeof __REACT_DEVTOOLS_GLOBAL_HOOK__ && "function" === typeof __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart && __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart(Error());
-        var React13 = require_react(), Internals = {
+        var React14 = require_react(), Internals = {
           d: {
             f: noop,
             r: function() {
@@ -1356,7 +1356,7 @@
           },
           p: 0,
           findDOMNode: null
-        }, REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), ReactSharedInternals = React13.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        }, REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), ReactSharedInternals = React14.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
         "function" === typeof Map && null != Map.prototype && "function" === typeof Map.prototype.forEach && "function" === typeof Set && null != Set.prototype && "function" === typeof Set.prototype.clear && "function" === typeof Set.prototype.forEach || console.error(
           "React depends on Map and Set built-in types. Make sure that you load a polyfill in older browsers. https://reactjs.org/link/react-polyfills"
         );
@@ -2891,7 +2891,7 @@
           "number" === type && getActiveElement(node.ownerDocument) === node || node.defaultValue === "" + value || (node.defaultValue = "" + value);
         }
         function validateOptionProps(element, props) {
-          null == props.value && ("object" === typeof props.children && null !== props.children ? React13.Children.forEach(props.children, function(child) {
+          null == props.value && ("object" === typeof props.children && null !== props.children ? React14.Children.forEach(props.children, function(child) {
             null == child || "string" === typeof child || "number" === typeof child || "bigint" === typeof child || didWarnInvalidChild || (didWarnInvalidChild = true, console.error(
               "Cannot infer the option value of complex children. Pass a `value` prop or use a plain string as children to <option>."
             ));
@@ -18523,14 +18523,14 @@
           ));
         }
         "undefined" !== typeof __REACT_DEVTOOLS_GLOBAL_HOOK__ && "function" === typeof __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart && __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart(Error());
-        var Scheduler = require_scheduler(), React13 = require_react(), ReactDOM = require_react_dom(), assign = Object.assign, REACT_LEGACY_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.element"), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy");
+        var Scheduler = require_scheduler(), React14 = require_react(), ReactDOM = require_react_dom(), assign = Object.assign, REACT_LEGACY_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.element"), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy");
         /* @__PURE__ */ Symbol.for("react.scope");
         var REACT_ACTIVITY_TYPE = /* @__PURE__ */ Symbol.for("react.activity");
         /* @__PURE__ */ Symbol.for("react.legacy_hidden");
         /* @__PURE__ */ Symbol.for("react.tracing_marker");
         var REACT_MEMO_CACHE_SENTINEL = /* @__PURE__ */ Symbol.for("react.memo_cache_sentinel");
         /* @__PURE__ */ Symbol.for("react.view_transition");
-        var MAYBE_ITERATOR_SYMBOL = Symbol.iterator, REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), isArrayImpl = Array.isArray, ReactSharedInternals = React13.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, ReactDOMSharedInternals = ReactDOM.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, NotPending = Object.freeze({
+        var MAYBE_ITERATOR_SYMBOL = Symbol.iterator, REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), isArrayImpl = Array.isArray, ReactSharedInternals = React14.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, ReactDOMSharedInternals = ReactDOM.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, NotPending = Object.freeze({
           pending: false,
           data: null,
           method: null,
@@ -21318,7 +21318,7 @@
           }
         };
         (function() {
-          var isomorphicReactPackageVersion = React13.version;
+          var isomorphicReactPackageVersion = React14.version;
           if ("19.2.5" !== isomorphicReactPackageVersion)
             throw Error(
               'Incompatible React versions: The "react" and "react-dom" packages must have the exact same version. Instead got:\n  - react:      ' + (isomorphicReactPackageVersion + "\n  - react-dom:  19.2.5\nLearn more: https://react.dev/warnings/version-mismatch")
@@ -21672,18 +21672,18 @@
         function isValidElement(object) {
           return "object" === typeof object && null !== object && object.$$typeof === REACT_ELEMENT_TYPE;
         }
-        var React13 = require_react(), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy"), REACT_ACTIVITY_TYPE = /* @__PURE__ */ Symbol.for("react.activity"), REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), ReactSharedInternals = React13.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, hasOwnProperty = Object.prototype.hasOwnProperty, isArrayImpl = Array.isArray, createTask = console.createTask ? console.createTask : function() {
+        var React14 = require_react(), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy"), REACT_ACTIVITY_TYPE = /* @__PURE__ */ Symbol.for("react.activity"), REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), ReactSharedInternals = React14.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, hasOwnProperty = Object.prototype.hasOwnProperty, isArrayImpl = Array.isArray, createTask = console.createTask ? console.createTask : function() {
           return null;
         };
-        React13 = {
+        React14 = {
           react_stack_bottom_frame: function(callStackForError) {
             return callStackForError();
           }
         };
         var specialPropKeyWarningShown;
         var didWarnAboutElementRef = {};
-        var unknownOwnerDebugStack = React13.react_stack_bottom_frame.bind(
-          React13,
+        var unknownOwnerDebugStack = React14.react_stack_bottom_frame.bind(
+          React14,
           UnknownOwner
         )();
         var unknownOwnerDebugTask = createTask(getTaskName(UnknownOwner));
@@ -73569,6 +73569,17 @@
         };
         return { ...state, messages: [...state.messages, msg] };
       }
+      case "ADD_ASSISTANT_MESSAGE": {
+        const msg = {
+          id: nextId(),
+          role: "assistant",
+          text: action.text,
+          toolCalls: [],
+          streaming: false,
+          timestamp: Date.now()
+        };
+        return { ...state, messages: [...state.messages, msg] };
+      }
       // ─── Generation lifecycle ────────────────────────
       case "START_GENERATION": {
         const assistant = {
@@ -73869,6 +73880,9 @@
           case "userMessage":
             dispatch({ type: "ADD_USER_MESSAGE", text: msg.text });
             break;
+          case "assistantMessage":
+            dispatch({ type: "ADD_ASSISTANT_MESSAGE", text: msg.text });
+            break;
           case "generationStarted":
             dispatch({ type: "START_GENERATION" });
             break;
@@ -74019,6 +74033,22 @@
     const loadSession = (0, import_react.useCallback)((sessionId, projectHash) => {
       postMessage({ type: "loadSession", sessionId, projectHash });
     }, []);
+    const renameSession = (0, import_react.useCallback)((session) => {
+      postMessage({
+        type: "renameSession",
+        sessionId: session.id,
+        projectHash: session.project_hash,
+        name: session.name || session.title || ""
+      });
+    }, []);
+    const deleteSession = (0, import_react.useCallback)((session) => {
+      postMessage({
+        type: "deleteSession",
+        sessionId: session.id,
+        projectHash: session.project_hash,
+        name: session.name || session.title || ""
+      });
+    }, []);
     const startLogin = (0, import_react.useCallback)(() => {
       postMessage({ type: "authLoginStart" });
     }, []);
@@ -74042,6 +74072,8 @@
       newConversation,
       selectModel,
       loadSession,
+      renameSession,
+      deleteSession,
       startLogin,
       cancelLogin,
       setupCodingPlan,
@@ -74146,7 +74178,7 @@
             /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "setup-title", children: "Models" }),
             /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "setup-subtitle", children: state.providers.length > 0 ? `${state.providers.length} provider${state.providers.length === 1 ? "" : "s"} configured` : "Sync CodingPlan models or add a provider manually." })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "setup-actions", children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("button", { type: "button", className: "setup-primary", onClick: setupCodingPlan, children: "Sync CodingPlan models" }) })
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "setup-actions", children: state.auth?.logged_in && /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("button", { type: "button", className: "setup-primary", onClick: setupCodingPlan, children: "Sync CodingPlan models" }) })
         ] }),
         /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("button", { type: "button", className: "setup-secondary setup-wide", onClick: () => setManualOpen(!manualOpen), children: "Add provider manually" }),
         manualOpen && /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("form", { className: "provider-form", onSubmit: submitProvider, children: [
@@ -74176,22 +74208,37 @@
   }
 
   // webview-ui/src/components/MessageList.tsx
-  var import_react8 = __toESM(require_react());
+  var import_react9 = __toESM(require_react());
 
   // webview-ui/src/components/UserMessage.tsx
+  var import_react3 = __toESM(require_react());
   var import_jsx_runtime4 = __toESM(require_jsx_runtime());
   function UserMessage({ message, className = "" }) {
+    const [expanded, setExpanded] = (0, import_react3.useState)(false);
+    const shouldCollapse = (0, import_react3.useMemo)(() => {
+      const lineCount = message.text.split("\n").length;
+      return message.text.length > 1200 || lineCount > 18;
+    }, [message.text]);
     return /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { className: `user-message-wrapper${className}`, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("div", { className: "user-message-bubble", children: [
       message.contextFiles && message.contextFiles.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { className: "user-message-attachments", children: message.contextFiles.map((file) => /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("span", { className: "user-message-attachment", title: file.path, children: [
         /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("span", { className: "user-message-attachment-icon", children: file.type === "selection" ? "Selection" : "File" }),
         /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("span", { className: "user-message-attachment-name", children: file.fileName })
       ] }, file.path)) }),
-      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { children: message.text })
+      /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { className: `user-message-text${shouldCollapse && !expanded ? " is-collapsed" : ""}`, children: message.text }),
+      shouldCollapse && /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+        "button",
+        {
+          type: "button",
+          className: "user-message-toggle",
+          onClick: () => setExpanded((value) => !value),
+          children: expanded ? "Collapse" : "Expand"
+        }
+      )
     ] }) });
   }
 
   // webview-ui/src/components/Markdown.tsx
-  var import_react3 = __toESM(require_react());
+  var import_react4 = __toESM(require_react());
 
   // node_modules/marked/lib/marked.esm.js
   function _getDefaults() {
@@ -77307,8 +77354,8 @@ ${content}</tr>
     return `<div class="code-block-wrapper" data-code-id="${id}"><pre><code class="hljs${language ? ` language-${language}` : ""}">${highlighted}</code></pre><button class="copy-button" data-action="copy" title="Copy"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 4v8h8V4H4zm7 7H5V5h6v6zM2 2v8h1V3h7V2H2z"/></svg></button></div>`;
   };
   function Markdown({ content }) {
-    const containerRef = (0, import_react3.useRef)(null);
-    const handleActions = (0, import_react3.useCallback)((e) => {
+    const containerRef = (0, import_react4.useRef)(null);
+    const handleActions = (0, import_react4.useCallback)((e) => {
       const target = e.target;
       const btn = target.closest(".copy-button");
       if (!btn) return;
@@ -77331,13 +77378,13 @@ ${content}</tr>
         postMessage({ type: "insertCode", code });
       }
     }, []);
-    (0, import_react3.useEffect)(() => {
+    (0, import_react4.useEffect)(() => {
       const el = containerRef.current;
       if (!el) return;
       el.addEventListener("click", handleActions);
       return () => el.removeEventListener("click", handleActions);
     }, [handleActions]);
-    const html3 = (0, import_react3.useMemo)(() => {
+    const html3 = (0, import_react4.useMemo)(() => {
       const raw = marked.parse(content, { renderer });
       return purify.sanitize(raw);
     }, [content]);
@@ -77345,7 +77392,7 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/ToolCall.tsx
-  var import_react5 = __toESM(require_react());
+  var import_react6 = __toESM(require_react());
 
   // webview-ui/src/utils/format.ts
   function formatTokenCount(total) {
@@ -77406,7 +77453,7 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/DiffView.tsx
-  var import_react4 = __toESM(require_react());
+  var import_react5 = __toESM(require_react());
   var import_jsx_runtime6 = __toESM(require_jsx_runtime());
   function parseDiff(raw) {
     const lines = [];
@@ -77438,7 +77485,7 @@ ${content}</tr>
       fontFamily: "var(--app-monospace-font-family)",
       fontSize: "var(--app-monospace-font-size-small)",
       overflowX: "auto"
-    }, children: /* @__PURE__ */ (0, import_jsx_runtime6.jsx)("div", { style: { display: "grid", gridTemplateColumns: "32px 32px 1fr" }, children: lines.map((line, i) => /* @__PURE__ */ (0, import_jsx_runtime6.jsxs)(import_react4.default.Fragment, { children: [
+    }, children: /* @__PURE__ */ (0, import_jsx_runtime6.jsx)("div", { style: { display: "grid", gridTemplateColumns: "32px 32px 1fr" }, children: lines.map((line, i) => /* @__PURE__ */ (0, import_jsx_runtime6.jsxs)(import_react5.default.Fragment, { children: [
       /* @__PURE__ */ (0, import_jsx_runtime6.jsx)("div", { style: {
         padding: "1px 4px",
         textAlign: "right",
@@ -77469,7 +77516,7 @@ ${content}</tr>
     return output.includes("@@") && (output.includes("+") || output.includes("-"));
   }
   function ToolCall({ tool }) {
-    const [expanded, setExpanded] = (0, import_react5.useState)(false);
+    const [expanded, setExpanded] = (0, import_react6.useState)(false);
     const secondary = formatToolArgs(tool.name, tool.args);
     const isEditTool = /edit|write/i.test(tool.name);
     const showDiff = isEditTool && tool.output && isDiffContent(tool.output);
@@ -77497,11 +77544,11 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/PermissionRequest.tsx
-  var import_react6 = __toESM(require_react());
+  var import_react7 = __toESM(require_react());
   var import_jsx_runtime8 = __toESM(require_jsx_runtime());
   function PermissionRequest({ request }) {
     const { dispatch } = useChatContext();
-    const handleRespond = (0, import_react6.useCallback)((allowed) => {
+    const handleRespond = (0, import_react7.useCallback)((allowed) => {
       dispatch({ type: "PERMISSION_RESPOND", id: request.id, allowed });
       postMessage({ type: "permissionResponse", id: request.id, allowed });
     }, [request.id, dispatch]);
@@ -77586,12 +77633,12 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/SearchBar.tsx
-  var import_react7 = __toESM(require_react());
+  var import_react8 = __toESM(require_react());
   var import_jsx_runtime10 = __toESM(require_jsx_runtime());
   function SearchBar() {
     const { state, dispatch } = useChatContext();
-    const inputRef = (0, import_react7.useRef)(null);
-    (0, import_react7.useEffect)(() => {
+    const inputRef = (0, import_react8.useRef)(null);
+    (0, import_react8.useEffect)(() => {
       inputRef.current?.focus();
     }, []);
     if (!state.searchOpen) return null;
@@ -77657,8 +77704,8 @@ ${content}</tr>
   var import_jsx_runtime11 = __toESM(require_jsx_runtime());
   function MessageList() {
     const { state } = useChatContext();
-    const bottomRef = (0, import_react8.useRef)(null);
-    (0, import_react8.useEffect)(() => {
+    const bottomRef = (0, import_react9.useRef)(null);
+    (0, import_react9.useEffect)(() => {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }, [state.messages, state.isGenerating]);
     const query = state.searchQuery.toLowerCase();
@@ -77684,12 +77731,14 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/InputArea.tsx
-  var import_react11 = __toESM(require_react());
+  var import_react12 = __toESM(require_react());
 
   // webview-ui/src/components/SlashPicker.tsx
-  var import_react9 = __toESM(require_react());
+  var import_react10 = __toESM(require_react());
   var import_jsx_runtime12 = __toESM(require_jsx_runtime());
   var slashCommands = [
+    { name: "login", label: "/login", description: "Sign in with AtomGit" },
+    { name: "codingplan", label: "/codingplan", description: "Sync CodingPlan models" },
     { name: "explain", label: "/explain", description: "Explain selected code" },
     { name: "fix", label: "/fix", description: "Fix issues in code" },
     { name: "test", label: "/test", description: "Write tests" },
@@ -77699,14 +77748,14 @@ ${content}</tr>
     { name: "optimize", label: "/optimize", description: "Optimize performance" }
   ];
   function SlashPicker({ filter, onSelect, onClose }) {
-    const [activeIndex, setActiveIndex] = (0, import_react9.useState)(0);
+    const [activeIndex, setActiveIndex] = (0, import_react10.useState)(0);
     const filtered = slashCommands.filter(
       (cmd) => cmd.name.startsWith(filter.toLowerCase())
     );
-    (0, import_react9.useEffect)(() => {
+    (0, import_react10.useEffect)(() => {
       setActiveIndex(0);
     }, [filter]);
-    const handleKeyDown = (0, import_react9.useCallback)(
+    const handleKeyDown = (0, import_react10.useCallback)(
       (e) => {
         if (filtered.length === 0) return;
         if (e.key === "ArrowDown") {
@@ -77725,7 +77774,7 @@ ${content}</tr>
       },
       [filtered, activeIndex, onSelect, onClose]
     );
-    (0, import_react9.useEffect)(() => {
+    (0, import_react10.useEffect)(() => {
       document.addEventListener("keydown", handleKeyDown);
       return () => document.removeEventListener("keydown", handleKeyDown);
     }, [handleKeyDown]);
@@ -77746,13 +77795,13 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/ModelSelector.tsx
-  var import_react10 = __toESM(require_react());
+  var import_react11 = __toESM(require_react());
   var import_jsx_runtime13 = __toESM(require_jsx_runtime());
   function ModelSelector({ placement = "down", onOpen }) {
     const { state, selectModel } = useChatContext();
-    const [open, setOpen] = (0, import_react10.useState)(false);
-    const containerRef = (0, import_react10.useRef)(null);
-    (0, import_react10.useEffect)(() => {
+    const [open, setOpen] = (0, import_react11.useState)(false);
+    const containerRef = (0, import_react11.useRef)(null);
+    (0, import_react11.useEffect)(() => {
       function handleClickOutside(e) {
         if (containerRef.current && !containerRef.current.contains(e.target)) {
           setOpen(false);
@@ -77815,25 +77864,25 @@ ${content}</tr>
   var import_jsx_runtime14 = __toESM(require_jsx_runtime());
   function InputArea() {
     const { state, send, stop, dispatch } = useChatContext();
-    const [text2, setText] = (0, import_react11.useState)("");
-    const [showSlash, setShowSlash] = (0, import_react11.useState)(false);
-    const [slashFilter, setSlashFilter] = (0, import_react11.useState)("");
-    const inputBoxRef = (0, import_react11.useRef)(null);
-    const textareaRef = (0, import_react11.useRef)(null);
-    (0, import_react11.useEffect)(() => {
+    const [text2, setText] = (0, import_react12.useState)("");
+    const [showSlash, setShowSlash] = (0, import_react12.useState)(false);
+    const [slashFilter, setSlashFilter] = (0, import_react12.useState)("");
+    const inputBoxRef = (0, import_react12.useRef)(null);
+    const textareaRef = (0, import_react12.useRef)(null);
+    (0, import_react12.useEffect)(() => {
       const el = textareaRef.current;
       if (!el) return;
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
     }, [text2]);
-    (0, import_react11.useEffect)(() => {
+    (0, import_react12.useEffect)(() => {
       function handleMessage(e) {
         if (e.data?.type === "focusInput") textareaRef.current?.focus();
       }
       window.addEventListener("message", handleMessage);
       return () => window.removeEventListener("message", handleMessage);
     }, []);
-    (0, import_react11.useEffect)(() => {
+    (0, import_react12.useEffect)(() => {
       if (!showSlash) return void 0;
       function handlePointerDown(e) {
         if (inputBoxRef.current && !inputBoxRef.current.contains(e.target)) {
@@ -77843,7 +77892,7 @@ ${content}</tr>
       document.addEventListener("mousedown", handlePointerDown);
       return () => document.removeEventListener("mousedown", handlePointerDown);
     }, [showSlash]);
-    const handleChange = (0, import_react11.useCallback)((e) => {
+    const handleChange = (0, import_react12.useCallback)((e) => {
       const val = e.target.value;
       setText(val);
       if (/^\/\S*$/.test(val)) {
@@ -77853,14 +77902,14 @@ ${content}</tr>
         setShowSlash(false);
       }
     }, []);
-    const handleSend = (0, import_react11.useCallback)(() => {
+    const handleSend = (0, import_react12.useCallback)(() => {
       const trimmed = text2.trim();
       if (!trimmed || state.isGenerating) return;
       send(trimmed);
       setText("");
       setShowSlash(false);
     }, [text2, state.isGenerating, send]);
-    const handleKeyDown = (0, import_react11.useCallback)(
+    const handleKeyDown = (0, import_react12.useCallback)(
       (e) => {
         if (showSlash) return;
         if (e.key === "Enter" && !e.shiftKey) {
@@ -77870,12 +77919,12 @@ ${content}</tr>
       },
       [handleSend, showSlash]
     );
-    const handleSlashSelect = (0, import_react11.useCallback)((command) => {
+    const handleSlashSelect = (0, import_react12.useCallback)((command) => {
       setText(command + " ");
       setShowSlash(false);
       textareaRef.current?.focus();
     }, []);
-    const handleSlashButton = (0, import_react11.useCallback)(() => {
+    const handleSlashButton = (0, import_react12.useCallback)(() => {
       setText("/");
       setSlashFilter("");
       setShowSlash((open) => !open);
@@ -77916,34 +77965,71 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/SessionList.tsx
-  var import_react12 = __toESM(require_react());
+  var import_react13 = __toESM(require_react());
   var import_jsx_runtime15 = __toESM(require_jsx_runtime());
   var DATE_ORDER = ["Today", "Yesterday", "This Week", "Older"];
   function SessionList({ variant = "overlay" }) {
-    const { state, dispatch, loadSession, newConversation } = useChatContext();
-    const [search, setSearch] = (0, import_react12.useState)("");
+    const { state, dispatch, loadSession, newConversation, renameSession, deleteSession } = useChatContext();
+    const [search, setSearch] = (0, import_react13.useState)("");
+    const [menu, setMenu] = (0, import_react13.useState)(null);
     const isOverlay = variant === "overlay";
-    const filteredSessions = (0, import_react12.useMemo)(() => {
+    const filteredSessions = (0, import_react13.useMemo)(() => {
       if (!search.trim()) return state.sessions;
       const q = search.toLowerCase();
       return state.sessions.filter(
         (s) => (s.name ?? "").toLowerCase().includes(q) || (s.title ?? "").toLowerCase().includes(q)
       );
     }, [state.sessions, search]);
-    const groups = (0, import_react12.useMemo)(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
+    const groups = (0, import_react13.useMemo)(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
     function handleSelect(session) {
+      setMenu(null);
       loadSession(session.id, session.project_hash);
       if (isOverlay) {
         dispatch({ type: "TOGGLE_HISTORY" });
       }
     }
+    function handleNewSession() {
+      setMenu(null);
+      newConversation();
+      if (isOverlay) {
+        dispatch({ type: "TOGGLE_HISTORY" });
+      }
+    }
+    function handleContextMenu(e, session) {
+      e.preventDefault();
+      e.stopPropagation();
+      const menuWidth = 132;
+      const menuHeight = 84;
+      setMenu({
+        session,
+        x: Math.min(e.clientX, window.innerWidth - menuWidth - 8),
+        y: Math.min(e.clientY, window.innerHeight - menuHeight - 8)
+      });
+    }
+    (0, import_react13.useEffect)(() => {
+      if (!menu) return void 0;
+      function close() {
+        setMenu(null);
+      }
+      function handleKeyDown(e) {
+        if (e.key === "Escape") close();
+      }
+      window.addEventListener("click", close);
+      window.addEventListener("scroll", close, true);
+      window.addEventListener("keydown", handleKeyDown);
+      return () => {
+        window.removeEventListener("click", close);
+        window.removeEventListener("scroll", close, true);
+        window.removeEventListener("keydown", handleKeyDown);
+      };
+    }, [menu]);
     const content = /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: `session-list session-list-${variant}`, onClick: (e) => e.stopPropagation(), children: [
       /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: "session-list-header", children: [
         /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: "session-title-row", children: [
           /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("h3", { children: "ATOMCODE" }),
           isOverlay && /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("button", { className: "ghost-btn", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), title: "Close", children: "\xD7" })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("button", { className: "session-new-btn", onClick: () => newConversation(), children: [
+        /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("button", { className: "session-new-btn", onClick: handleNewSession, children: [
           /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-new-icon", children: "+" }),
           /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { children: "New session" })
         ] }),
@@ -77971,6 +78057,7 @@ ${content}</tr>
               {
                 className: `session-item${isActive ? " active" : ""}`,
                 onClick: () => handleSelect(s),
+                onContextMenu: (e) => handleContextMenu(e, s),
                 title: s.name || s.title || "Untitled",
                 children: [
                   /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-item-name", children: s.name || s.title || "Untitled" }),
@@ -77981,7 +78068,42 @@ ${content}</tr>
             );
           })
         ] }, label);
-      }) })
+      }) }),
+      menu && /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)(
+        "div",
+        {
+          className: "session-context-menu",
+          style: { left: menu.x, top: menu.y },
+          onClick: (e) => e.stopPropagation(),
+          onContextMenu: (e) => e.preventDefault(),
+          children: [
+            /* @__PURE__ */ (0, import_jsx_runtime15.jsx)(
+              "button",
+              {
+                type: "button",
+                className: "session-context-item",
+                onClick: () => {
+                  renameSession(menu.session);
+                  setMenu(null);
+                },
+                children: "\u4FEE\u6539\u540D\u79F0"
+              }
+            ),
+            /* @__PURE__ */ (0, import_jsx_runtime15.jsx)(
+              "button",
+              {
+                type: "button",
+                className: "session-context-item danger",
+                onClick: () => {
+                  deleteSession(menu.session);
+                  setMenu(null);
+                },
+                children: "\u5220\u9664\u4F1A\u8BDD"
+              }
+            )
+          ]
+        }
+      )
     ] });
     return isOverlay ? /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-overlay", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), children: content }) : content;
   }

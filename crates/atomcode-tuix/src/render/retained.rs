@@ -191,7 +191,9 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
     } else {
         params.split(';').collect()
     };
-    for part in parts {
+    let mut i = 0;
+    while i < parts.len() {
+        let part = parts[i];
         match part.parse::<u32>().ok() {
             Some(0) => *style = CellStyle::default(),
             Some(1) => style.bold = true,
@@ -203,13 +205,31 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             Some(39) => style.fg = None,
             Some(90) => style.fg = Some(Color::DarkGrey),
             Some(97) => style.fg = Some(Color::White),
+            // 38;2;R;G;B — truecolor foreground. Markdown emits this
+            // for inline code / code blocks / headings so the colour
+            // survives terminal palette remapping (bright-XX colours
+            // get re-tinted by themes; truecolor RGB does not).
+            // Consume 4 extra tokens (`2`, R, G, B) on success.
+            Some(38) => {
+                if parts.get(i + 1).copied() == Some("2") {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()),
+                        parts.get(i + 3).and_then(|s| s.parse::<u8>().ok()),
+                        parts.get(i + 4).and_then(|s| s.parse::<u8>().ok()),
+                    ) {
+                        style.fg = Some(Color::Rgb { r, g, b });
+                        i += 4;
+                    }
+                }
+                // 38;5;N (256-colour) and other 38 sub-formats fall
+                // through silently — markdown doesn't emit them.
+            }
             _ => {
-                // Other colors (30-37, 91-97, 38;5;N, 38;2;R;G;B, bg,
-                // underline) silently ignored — our markdown crate
-                // doesn't emit them, and expanding CellStyle to cover
-                // them is out of scope for Phase 6.
+                // Other ANSI colours (30-37, 91-96, bg, underline)
+                // silently ignored — markdown doesn't emit them.
             }
         }
+        i += 1;
     }
 }
 
@@ -296,6 +316,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// cleanly below it and the spinner can resume on the next tick.
     /// (call_id, name, detail).
     inflight_tool: Option<(String, String, String)>,
+    /// Number of body lines occupied by the multi-line wrapped in-flight
+    /// tool call (rendered via `render_inflight_tool`). Used to replace
+    /// those lines on each spinner tick and to clean up on commit.
+    inflight_tool_rows: usize,
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
     /// `UiLine::ToolGroupChildUpdate` events resolve `call_id` →
@@ -354,6 +378,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             welcome_line_count: 0,
             live_spinner_active: false,
             inflight_tool: None,
+            inflight_tool_rows: 0,
             live_group: None,
         }
     }
@@ -417,28 +442,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
-    /// Build a single in-flight tool-call body row: `<icon> Name(detail)`.
-    /// `icon` is supplied by the caller — typically the current spinner
-    /// frame (animated ticks) or `▸` (`ToolCallCommit`, frozen
-    /// post-result). Layout matches the static `UiLine::ToolCall` arm so
-    /// the row is visually identical pre-commit and post-commit; only
-    /// the icon glyph differs.
-    ///
-    /// MUST clamp to one physical line. Reason: `push_or_update_live_spinner`
-    /// repaints in place by `MoveTo(bottom, 1) + EL + write`, which only
-    /// erases ONE physical row. If the row is wider than the terminal,
-    /// auto-wrap on the bottom row of the DECSTBM region scrolls the
-    /// upper portion UP into body history — every spinner tick (~12/sec)
-    /// adds another row of residue, filling the screen in seconds. Real
-    /// regression: `format_tool_detail` truncates bash to 200 chars, but
-    /// terminals < ~100 cols still overflow. We clamp here so the detail
-    /// truncation in `format_tool_detail` is one defence layer; this is
-    /// the structural one.
-    fn build_inflight_tool_row(&self, icon: &str, name: &str, detail: &str) -> Vec<Cell> {
-        let mut row = Vec::new();
-        let pad = CellStyle::default();
-        let muted = self.style_for(Role::Muted);
-        let tool_name_style = self.style_bold(Role::ToolName);
+    /// Render (or re-render) the in-flight tool-call body text using
+    /// `icon` as the prefix, with proper multi-line wrapping via
+    /// `push_body_prefixed`. Removes any previously rendered inflight
+    /// tool lines from `body_lines` first so the spinner animation
+    /// replaces in-place rather than accumulating rows.
+    fn render_inflight_tool(&mut self, icon: &str, name: &str, detail: &str) {
         let safe_name = scrub_controls(name);
         let safe_detail = scrub_controls(detail);
         let body_str = if safe_detail.is_empty() {
@@ -446,25 +455,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             format!("{}({})", safe_name, safe_detail)
         };
-        // Clamp to terminal width minus icon-cell, separator space, and
-        // a 1-cell safety margin — terminals differ in whether they
-        // auto-wrap exactly at column `width` or trigger one cell early.
-        let icon_w = crate::width::display_width(icon);
-        let margin = icon_w.saturating_add(2);
-        let max_body = (self.screen.width() as usize).saturating_sub(margin);
-        let body_clamped = if max_body == 0 {
-            String::new()
-        } else if crate::width::display_width(&body_str) > max_body {
-            crate::width::truncate_with_ellipsis(&body_str, max_body)
-        } else {
-            body_str
-        };
-        // No left padding - tool call rows sit flush-left at col 0
-        // to align with the input-box chevron and approval prompts.
-        push_str_cells(&mut row, icon, &muted);
-        push_str_cells(&mut row, " ", &pad);
-        push_str_cells(&mut row, &body_clamped, &tool_name_style);
-        row
+        // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+        // commands) from producing hundreds of terminal lines.
+        // This is a rendering safeguard only — the actual command
+        // execution uses the original, untruncated arguments.
+        let body_str = truncate_body_str(&body_str, 500);
+        // Remove previously rendered inflight tool rows.
+        let remove = self.inflight_tool_rows.min(self.body_lines.len());
+        self.body_lines.truncate(self.body_lines.len() - remove);
+        self.inflight_tool_rows = 0;
+        let before = self.body_lines.len();
+        self.push_body_prefixed(
+            &format!("{} ", icon),
+            &self.style_for(Role::Muted),
+            &body_str,
+            &self.style_bold(Role::ToolName),
+        );
+        self.inflight_tool_rows = self.body_lines.len().saturating_sub(before);
     }
 
     /// Pad a partially-built row with blank default-style cells until it
@@ -1181,6 +1188,46 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // visually undo our hide on a 5ms cadence.
     }
 
+    /// Freeze the current inflight_tool row into the body transcript
+    /// using `push_body_prefixed` so long commands are properly wrapped
+    /// across multiple terminal lines. Used as the uniform commit path
+    /// for: `ToolCallCommit`, `TurnComplete`, `TurnCancelled`, and the
+    /// `ToolResult` fallback — same wrapping pipeline as
+    /// `render_inflight_tool` but pushes a frozen `▸` icon and clears
+    /// `inflight_tool_rows` so the next live tick starts fresh.
+    fn commit_inflight_tool(&mut self) {
+        if let Some((_id, name, detail)) = self.inflight_tool.take() {
+            let safe_name = scrub_controls(&name);
+            let safe_detail = scrub_controls(&detail);
+            let body_str = if safe_detail.is_empty() {
+                safe_name
+            } else {
+                format!("{}({})", safe_name, safe_detail)
+            };
+            // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+            // commands) from producing hundreds of terminal lines.
+            let body_str = truncate_body_str(&body_str, 500);
+            // Clear any previously rendered inflight tool rows so
+            // push_body_prefixed appends fresh committed lines.
+            self.live_spinner_active = false;
+            let remove = self.inflight_tool_rows.min(self.body_lines.len());
+            self.body_lines.truncate(self.body_lines.len() - remove);
+            self.inflight_tool_rows = 0;
+            self.ensure_scroll_region();
+            let bottom = self.body_bottom_row();
+            if bottom > 0 {
+                let seq = format!("\x1b[{};1H\x1b[K", bottom);
+                let _ = self.out.write_all(seq.as_bytes());
+            }
+            self.push_body_prefixed(
+                "\u{25b8} ",
+                &self.style_for(Role::Muted),
+                &body_str,
+                &self.style_bold(Role::ToolName),
+            );
+        }
+    }
+
     /// Copy the visible body tail into the host terminal's native
     /// scrollback before we wipe the viewport on exit. Retained mode
     /// keeps the newest body rows pinned on screen behind a fixed
@@ -1648,28 +1695,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
-                // Spinner (frame + label) goes into body as the live
-                // paragraph header — each tick replaces the same row
-                // via `push_or_update_live_spinner`, so animation
-                // doesn't push a new row every 80ms.
+                // Spinner (frame + label) goes into body as a live
+                // paragraph header. Each tick replaces the previous
+                // wrapped rows via render_inflight_tool so long
+                // commands wrap properly (same as committed rows).
                 //
-                // When a tool call is in flight, the live row instead
-                // carries the tool-call shape (`<frame> Bash(cmd)`),
-                // so the same animation cadence drives the tool icon.
-                let cells = if let Some((_id, name, detail)) = self.inflight_tool.clone() {
-                    self.build_inflight_tool_row(frame, &name, &detail)
+                // When a tool call is in flight, the live rows
+                // carry the tool-call shape (`<frame> Bash(cmd)`)
+                // with the animation driving the icon frame.
+                if let Some((_id, name, detail)) = self.inflight_tool.clone() {
+                    self.render_inflight_tool(frame, &name, &detail);
                 } else {
-                    self.build_spinner_body_row(frame, &label)
-                };
-                self.push_or_update_live_spinner(cells);
+                    let cells = self.build_spinner_body_row(frame, &label);
+                    self.push_or_update_live_spinner(cells);
+                }
             }
             UiLine::Spinner { frame, label } => {
-                let cells = if let Some((_id, name, detail)) = self.inflight_tool.clone() {
-                    self.build_inflight_tool_row(frame, &name, &detail)
+                if let Some((_id, name, detail)) = self.inflight_tool.clone() {
+                    self.render_inflight_tool(frame, &name, &detail);
                 } else {
-                    self.build_spinner_body_row(frame, &label)
-                };
-                self.push_or_update_live_spinner(cells);
+                    let cells = self.build_spinner_body_row(frame, &label);
+                    self.push_or_update_live_spinner(cells);
+                }
             }
             UiLine::ClearTransient | UiLine::InputCommit => {
                 // No-op in retained mode.
@@ -1756,19 +1803,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // protocol bug) would otherwise leave inflight_tool
                 // set and the next user turn's spinner would mistake
                 // the stale tool detail for the in-flight payload.
-                if let Some((_id, name, detail)) = self.inflight_tool.take() {
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
-                    self.push_or_update_live_spinner(frozen);
-                    self.live_spinner_active = false;
-                }
+                // Use push_body_prefixed for proper line wrapping.
+                self.commit_inflight_tool();
             }
             UiLine::TurnCancelled => {
                 self.flush_assistant_remainder();
-                if let Some((_id, name, detail)) = self.inflight_tool.take() {
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
-                    self.push_or_update_live_spinner(frozen);
-                    self.live_spinner_active = false;
-                }
+                self.commit_inflight_tool();
                 // (cancelled) is a state-change marker — must remain
                 // visible. Default fg, not Muted.
                 let label = self.style_for(Role::Secondary);
@@ -1783,10 +1823,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // a new one — single-at-a-time animation is a deliberate
                 // simplification (see field doc).
                 if self.inflight_tool.is_some() {
-                    let prev = std::mem::take(&mut self.inflight_tool).unwrap();
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &prev.1, &prev.2);
-                    self.push_or_update_live_spinner(frozen);
-                    self.live_spinner_active = false;
+                    // Commit the previous tool (freezes it as ▸ in
+                    // the body transcript) before starting a new one.
+                    self.commit_inflight_tool();
                 }
                 // Use a plausible "still" frame for the initial paint;
                 // the next Spinner / StreamingBox tick (within ~80ms)
@@ -1797,9 +1836,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     "*"
                 };
-                let row = self.build_inflight_tool_row(initial, &name, &detail);
-                self.inflight_tool = Some((id, name, detail));
-                self.push_or_update_live_spinner(row);
+                self.inflight_tool = Some((id, name.clone(), detail.clone()));
+                self.render_inflight_tool(initial, &name, &detail);
             }
             UiLine::ToolCallCommit { call_id } => {
                 // Only commit if the inflight_tool matches the expected call_id,
@@ -1810,15 +1848,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     _ => false,
                 };
                 if should_commit {
-                    if let Some((_id, name, detail)) = self.inflight_tool.take() {
-                        let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
-                        self.push_or_update_live_spinner(frozen);
-                        // Drop the live flag so the next push_body_row
-                        // appends BELOW this frozen row instead of popping
-                        // it — the in-flight indicator becomes a permanent
-                        // historical paragraph header.
-                        self.live_spinner_active = false;
-                    }
+                    self.commit_inflight_tool();
                 }
             }
             UiLine::ToolGroupRender {
@@ -1943,7 +1973,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     format!("{}({})", safe_name, safe_detail)
                 };
-                // Approximate AnsiRenderer's "▸ NAME(detail)" where
+                // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
+                // commands) from producing hundreds of terminal lines.
+                let body_str = truncate_body_str(&body_str, 500);
                 // only NAME is bolded; retained uses a uniform style
                 // for the tool-call line (acceptable in Phase 4,
                 // tightens in Phase 5/6).
@@ -1962,11 +1994,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // merge collapse), freeze the in-flight row now so
                 // the upcoming `⎿ ...` body push doesn't itself become
                 // the next animation target on the next spinner tick.
-                if let Some((_id, name, detail)) = self.inflight_tool.take() {
-                    let frozen = self.build_inflight_tool_row("\u{25b8}", &name, &detail);
-                    self.push_or_update_live_spinner(frozen);
-                    self.live_spinner_active = false;
-                }
+                // Use commit_inflight_tool for proper line wrapping
+                // (see method doc).
+                self.commit_inflight_tool();
                 // Style policy (header line of a failure body):
                 //   * `Error: ...` — bold red. Tool-dispatch failures
                 //     (bad JSON args, unknown tool name, etc.) are real
@@ -2548,6 +2578,18 @@ fn build_one_row(text: &str, style: &CellStyle, screen_w: u16) -> Vec<Cell> {
     row
 }
 
+/// Truncate `body_str` to at most `max_chars` display-width characters,
+/// preserving whole characters (not splitting multi-byte sequences).
+/// This is a rendering safeguard to prevent degenerate bodies
+/// (e.g. multi-KB bash commands) from producing hundreds of terminal lines.
+fn truncate_body_str(body_str: &str, max_chars: usize) -> String {
+    if let Some((idx, _)) = body_str.char_indices().nth(max_chars) {
+        format!("{}… (truncated)", &body_str[..idx])
+    } else {
+        body_str.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3081,35 +3123,49 @@ mod tests {
 
     /// Regression (datalog symptom: the screen filled with ~35 rows of
     /// `<spinner-glyph> Bash(cd /Users/.../cargo metadata...|python3 -c …`
-    /// stacking up). Root cause: the streaming row carrying the in-flight
-    /// tool name+detail was built from `format_tool_detail`, which clamps
-    /// bash detail at 200 chars — but on terminals narrower than ~100
-    /// cols that still overflows the row. `push_or_update_live_spinner`
-    /// repaints in place at one physical row only; the wrap residue gets
-    /// promoted into body history by DECSTBM, and every spinner tick
-    /// adds another residue row.
+    /// stacking up). Root cause: a wide tool name+detail row, repainted
+    /// every spinner tick, would auto-wrap on the bottom row of the
+    /// DECSTBM region and the upper portion would scroll up into body
+    /// history — accumulating residue.
     ///
-    /// Fix: `build_inflight_tool_row` clamps the body string to terminal
-    /// width minus icon and separator. The detail-side truncation in
-    /// `format_tool_detail` becomes one defence layer; this is the
-    /// structural one and ensures narrow terminals stay safe.
+    /// Fix (post-merge): `render_inflight_tool` wraps the body via
+    /// `push_body_prefixed` so each pushed row fits the terminal width,
+    /// AND tracks `inflight_tool_rows` so the next call removes the
+    /// previously rendered rows before re-rendering — body_lines no
+    /// longer accumulates across ticks.
     #[test]
-    fn retained_inflight_tool_row_clamped_to_terminal_width() {
+    fn retained_inflight_tool_row_wraps_and_replaces_in_place() {
         let term_w: u16 = 80;
-        let (r, _buf) = new_capturing(term_w, 24);
+        let (mut r, _buf) = new_capturing(term_w, 24);
         // A real bash command from the failure datalog — well over 80
         // columns — drives the regression.
         let detail = "cd /Users/yubangxu/project/atomgr && cargo metadata --format-version 1 \
                       2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); \
                       print([p['name'] for p in d['packages']])\"";
-        let row = r.build_inflight_tool_row("⠋", "bash", detail);
-        let w: usize = row.iter().map(|c| c.width as usize).sum();
-        assert!(
-            w <= term_w as usize,
-            "inflight tool row width {} exceeds terminal {} — wide details \
-             will scroll-stack via DECSTBM auto-wrap on each spinner tick",
-            w,
-            term_w
+        r.render_inflight_tool("⠋", "bash", detail);
+        // Every wrapped row must fit the terminal — otherwise DECSTBM
+        // auto-wrap on subsequent repaints turns into scroll residue.
+        for (i, row) in r.body_lines.iter().enumerate() {
+            let w: usize = row.iter().map(|c| c.width as usize).sum();
+            assert!(
+                w <= term_w as usize,
+                "body_lines[{}] width {} exceeds terminal {}",
+                i,
+                w,
+                term_w
+            );
+        }
+        // Simulated spinner ticks: body_lines must not grow — each tick
+        // removes the prior inflight rows before re-rendering.
+        let after_first = r.body_lines.len();
+        for _ in 0..10 {
+            r.render_inflight_tool("⠙", "bash", detail);
+        }
+        assert_eq!(
+            r.body_lines.len(),
+            after_first,
+            "body_lines grew across spinner ticks — render_inflight_tool \
+             must remove previous inflight rows before re-rendering"
         );
     }
 
@@ -4175,7 +4231,7 @@ mod tests {
             r.body_lines.len(),
             after_first,
             "spinner ticks grew body_lines from {} to {} — each tick \
-             must update the same row, not append",
+            must update the same row, not append",
             after_first,
             r.body_lines.len()
         );
@@ -4390,7 +4446,7 @@ mod tests {
             spin_row - user_row,
             2,
             "expected exactly 1 blank row between user message and \
-             spinner, got {} blank row(s):\n{}",
+            spinner, got {} blank row(s):\n{}",
             spin_row.saturating_sub(user_row).saturating_sub(1),
             vterm.dump()
         );
@@ -4470,11 +4526,11 @@ mod tests {
             cell,
             vterm.dump()
         );
-        // Inline code: bold ONLY (no bright-white SGR 97). Markdown
-        // crate dropped the `\x1b[1;97m` → `\x1b[1m` to stop the
-        // bright-white load from competing with code blocks for the
-        // eye's anchor in long mixed outputs. Inline code stays
-        // distinguishable via the bold weight.
+        // Inline code: bold ONLY (no fg color). Markdown crate dropped
+        // both the `\x1b[1;97m` (bright white) and the later truecolor
+        // blue-500 attempts to stop the colour load from competing
+        // with code blocks for the eye's anchor in long mixed outputs.
+        // Inline code stays distinguishable via the bold weight alone.
         let code_pos = row_text
             .find("code")
             .expect("expected 'code' in rendered text");
@@ -4486,7 +4542,7 @@ mod tests {
         );
         assert_eq!(
             code_cell.fg, None,
-            "inline code cell must NOT carry bright-white fg anymore: {:?}",
+            "inline code cell must NOT carry any fg colour: {:?}",
             code_cell
         );
     }

@@ -326,6 +326,7 @@ fn render_instructions_section() -> String {
     out.push_str("#   1. ~/.atomcode/ATOMCODE.md           (global — your personal defaults)\n");
     out.push_str("#   2. <project>/.atomcode.md            (project — team-shared, commit to git)\n");
     out.push_str("#      or <project>/ATOMCODE.md\n");
+    out.push_str("#      or <project>/CLAUDE.md / claude.md (Claude Code compat)\n");
     out.push_str("#   3. <project>/.atomcode.user.md       (user — personal per-project, .gitignore)\n");
     out.push_str("#\n");
     out.push_str("# Higher priority files appear later in the prompt (recency effect).\n");
@@ -754,7 +755,8 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
-            },
+
+},
         );
         cfg.save(&tmp).unwrap();
         let text = std::fs::read_to_string(&tmp).unwrap();

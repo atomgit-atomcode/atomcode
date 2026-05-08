@@ -22,6 +22,7 @@ use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
+use atomcode_core::session::{SessionId, SessionManager};
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
@@ -43,13 +44,64 @@ fn build_oauth_provider() -> ProviderConfig {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: false,
-    }
+
+}
 }
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
 // and a `build_oauth_provider` helper here. Both are owned by
 // `coding_plan::setup` now — `/login` is identity-only, provider
 // registration is the job of `/codingplan`.
+
+/// Maximum length for a session name.
+pub const MAX_SESSION_NAME_LEN: usize = 100;
+
+/// Validates a session name and returns an error message if invalid.
+/// Returns None if the name is valid.
+pub fn validate_session_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Some("Session name cannot be empty".into());
+    }
+    if trimmed.chars().count() > MAX_SESSION_NAME_LEN {
+        return Some(format!(
+            "Session name too long (max {} characters)",
+            MAX_SESSION_NAME_LEN
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Some("Session name cannot contain control characters".into());
+    }
+    None
+}
+
+/// Rename a session after validation, persist it, and return old/new names.
+pub fn perform_session_rename(
+    session_manager: &SessionManager,
+    session_id: &SessionId,
+    new_name: &str,
+) -> Result<(String, String), String> {
+    if let Some(err) = validate_session_name(new_name) {
+        return Err(err);
+    }
+    let new_name = new_name.trim().to_string();
+    let session = session_manager
+        .load(session_id)
+        .map_err(|e| format!("Failed to load session: {}", e))?;
+    let old_name = session.name.clone();
+    let renamed_session = atomcode_core::session::Session {
+        name: new_name.clone(),
+        updated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(session.updated_at),
+        ..session
+    };
+    session_manager
+        .save(&renamed_session)
+        .map_err(|e| format!("Failed to save session: {}. The name was not persisted.", e))?;
+    Ok((old_name, new_name))
+}
 
 pub(super) fn execute_slash_command(
     cmd: &str,
@@ -218,6 +270,7 @@ pub(super) fn execute_slash_command(
             // redraw the welcome screen so the user sees they're in a
             // brand-new session. Ports `/session` from the legacy TUI.
             ctx.agent.cmd_tx.send(AgentCommand::ClearConversation).ok();
+            ctx.current_session_id = None;
             state.total_tokens = 0;
             state.prompt_tokens = 0;
             state.completion_tokens = 0;
@@ -273,6 +326,28 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
             }
         },
+        "rename" => {
+            if let Some(ref session_id) = ctx.current_session_id {
+                match perform_session_rename(&ctx.session_manager, session_id, arg) {
+                    Ok((old_name, new_name)) => {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Session renamed: '{}' -> '{}'",
+                            old_name, new_name
+                        )));
+                        renderer.flush();
+                    }
+                    Err(err) => {
+                        renderer.render(UiLine::Error(err));
+                        renderer.flush();
+                    }
+                }
+            } else {
+                renderer.render(UiLine::Error(
+                    "No active session to rename. Use /resume to load a session first.".into()
+                ));
+                renderer.flush();
+            }
+        }
         "provider" => {
             *active_modal = Some(Box::new(ProviderWizard::MainMenu { selected: 0 }));
             renderer.render(UiLine::CommandOutput(
@@ -631,6 +706,79 @@ pub(super) fn execute_slash_command(
         }
         "mcp" => {
             let sub = arg.trim();
+            if let Some(rest) = sub.strip_prefix("login") {
+                let server = rest.trim();
+                if server.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  Usage: /mcp login <server>\n  Example: /mcp login github\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+                if server != "github" {
+                    renderer.render(UiLine::Error(format!(
+                        "  unsupported MCP OAuth provider/server: {}\n",
+                        server
+                    )));
+                    renderer.flush();
+                    return Ok(());
+                }
+                let Some(client_id) = std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok() else {
+                    renderer.render(UiLine::Error(
+                        "  GitHub MCP OAuth requires ATOMCODE_GITHUB_MCP_CLIENT_ID.\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                };
+                renderer.render(UiLine::CommandOutput(
+                    "  Starting GitHub MCP OAuth in your browser...\n".into(),
+                ));
+                renderer.flush();
+                let scopes = Vec::<String>::new();
+                let result = tokio::task::block_in_place(|| {
+                    atomcode_core::mcp::login_github_oauth(server, &client_id, &scopes)
+                });
+                match result {
+                    Ok(token) => renderer.render(UiLine::CommandOutput(format!(
+                        "  Saved {} OAuth token for MCP server '{}'. Run /mcp reload to connect.\n",
+                        token.provider, server
+                    ))),
+                    Err(e) => renderer.render(UiLine::Error(format!(
+                        "  GitHub MCP OAuth failed: {:#}\n",
+                        e
+                    ))),
+                }
+                renderer.flush();
+                return Ok(());
+            }
+
+            if let Some(rest) = sub.strip_prefix("logout") {
+                let server = rest.trim();
+                if server.is_empty() {
+                    renderer.render(UiLine::CommandOutput(
+                        "  Usage: /mcp logout <server>\n  Example: /mcp logout github\n".into(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+                match atomcode_core::mcp::McpTokenStore::default().delete_token(server) {
+                    Ok(true) => renderer.render(UiLine::CommandOutput(format!(
+                        "  Removed saved OAuth token for MCP server '{}'.\n",
+                        server
+                    ))),
+                    Ok(false) => renderer.render(UiLine::CommandOutput(format!(
+                        "  No saved OAuth token found for MCP server '{}'.\n",
+                        server
+                    ))),
+                    Err(e) => renderer.render(UiLine::Error(format!(
+                        "  MCP OAuth logout failed: {:#}\n",
+                        e
+                    ))),
+                }
+                renderer.flush();
+                return Ok(());
+            }
+
             if sub.eq_ignore_ascii_case("reload") {
                 // Preflight: parse merged MCP config so we can show progress immediately.
                 // (Connection attempts happen in background and may take up to timeout_ms.)
@@ -928,7 +1076,7 @@ pub(super) fn execute_slash_command(
                 if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
                     ctx.agent
                         .cmd_tx
-                        .send(AgentCommand::SendMessage(rendered))
+                        .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
                         .ok();
                     state.on_submit();
                 } else {
@@ -948,13 +1096,13 @@ pub(super) fn execute_slash_command(
             if let Some(rendered) = ctx.custom_commands.render(other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(rendered))
+                    .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
                     .ok();
                 state.on_submit();
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(rendered))
+                    .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
                     .ok();
                 state.on_submit();
             } else {
@@ -1597,7 +1745,7 @@ pub(crate) fn launch_fixissue(
             fixissue_buffer.clear();
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SendMessage(prompt))
+                .send(AgentCommand::SendMessage { text: prompt, images: vec![] })
                 .ok();
             state.on_submit();
         }

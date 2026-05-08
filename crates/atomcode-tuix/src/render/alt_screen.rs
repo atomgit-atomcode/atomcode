@@ -304,10 +304,17 @@ fn base64_encode(input: &[u8]) -> String {
 // alt_screen will diverge from plain on more dimensions in later phases
 // and shared constants would create a noisy upstream-change footprint.
 const SGR_RESET: &str = "\x1b[0m";
-const SGR_RED: &str = "\x1b[31m";
-const SGR_GREEN: &str = "\x1b[32m";
-const SGR_MAGENTA: &str = "\x1b[35m"; // Role::Brand — see render/theme.rs
-const SGR_CYAN: &str = "\x1b[36m";
+const SGR_RED: &str = "\x1b[91m";
+const SGR_GREEN: &str = "\x1b[92m";
+const SGR_MAGENTA: &str = "\x1b[95m"; // Role::Brand — see render/theme.rs
+const SGR_CYAN: &str = "\x1b[96m"; // Role::Border / Accent — bright variant; the
+                                   // dim 36m form rendered the input-box rule
+                                   // as visibly "dashed" on Windows Terminal
+                                   // because the muted cyan let font-glyph
+                                   // gaps in `─` show through. Bright cyan
+                                   // matches retained's `Palette::BORDER`
+                                   // (Color::Cyan ≡ SGR 96 in crossterm) and
+                                   // closes the cross-renderer drift.
 const SGR_DIM: &str = "\x1b[2m";
 
 /// Default cap on `body_lines` length. ~5000 rows × ~200 bytes/row
@@ -974,8 +981,13 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// next non-buffered line. Always-some output (the common case)
     /// becomes one body_lines entry.
     fn render_md_and_push(&mut self, line: &str) {
+        // Pass terminal width through so markdown tables render in flat
+        // mode when they don't fit at natural column widths (mirrors the
+        // `RetainedRenderer` path). Alt-screen body has no left padding,
+        // so the full screen width is the budget.
+        let md_width = self.width as usize;
         if let Some(rendered) =
-            crate::markdown::render_line(line, &mut self.md_state, self.caps)
+            crate::markdown::render_line_with_width(line, &mut self.md_state, self.caps, md_width)
         {
             // `rendered` may itself contain `\n` when it includes a
             // table flush prefix from a prior buffered block. Split
@@ -1000,8 +1012,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // Also flush any pending markdown state (e.g. a buffered
         // table block) so end-of-turn doesn't strand it. Mirrors
         // RetainedRenderer's TurnComplete handling.
+        let md_width = self.width as usize;
         if let Some(tail) =
-            crate::markdown::finalize(&mut self.md_state, self.caps)
+            crate::markdown::finalize_with_width(&mut self.md_state, self.caps, md_width)
         {
             for sub in tail.split('\n') {
                 self.push_body_row(sub.to_string());
@@ -2024,8 +2037,8 @@ mod tests {
             "20 ─ chars missing. got: {:?}",
             s
         );
-        // Cyan colour applied to the rule.
-        assert!(s.contains("\x1b[36m"), "rule should be cyan. got: {:?}", s);
+        // Bright cyan (96) — matches retained's `Palette::BORDER`.
+        assert!(s.contains("\x1b[96m"), "rule should be bright cyan. got: {:?}", s);
     }
 
     /// `wrap_to_width_sgr_aware` is the soft-wrap helper that keeps long
@@ -2271,7 +2284,7 @@ mod tests {
     }
 
     /// The spinner FRAME (the rotating glyph) must be coloured brand
-    /// magenta (`\x1b[35m`) when caps.colors is on — visual anchor so
+    /// magenta (`\x1b[95m`) when caps.colors is on — visual anchor so
     /// the rotation reads as motion against the dim label. Mirrors
     /// `RetainedRenderer::build_spinner_body_row` (Role::Brand frame +
     /// Role::Secondary label).
@@ -2287,7 +2300,7 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(
-            s.contains("\x1b[35m\u{280b}\x1b[0m"),
+            s.contains("\x1b[95m\u{280b}\x1b[0m"),
             "spinner frame must be wrapped in magenta SGR. got: {:?}",
             s
         );
@@ -2341,7 +2354,7 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(
-            s.contains("\x1b[35m"),
+            s.contains("\x1b[95m"),
             "PLAN badge must use SGR_MAGENTA (Role::Brand). got: {:?}",
             s
         );
@@ -2353,7 +2366,7 @@ mod tests {
         // Badge precedes the dim model/cwd run — confirm the magenta SGR
         // appears earlier in the byte stream than the dim SGR (\x1b[2m).
         let badge_pos = s
-            .find("\x1b[35m")
+            .find("\x1b[95m")
             .expect("magenta SGR must be present");
         let dim_pos = s
             .find("\x1b[2m")

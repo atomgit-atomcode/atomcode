@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod config;
+pub mod oauth;
 pub mod registry;
 pub mod tool_adapter;
 pub mod transport_http;
@@ -13,8 +14,10 @@ pub mod types;
 
 pub use client::{McpClient, McpToolInfo};
 pub use config::{
-    load_mcp_config, merge_stdio_mcp_server_into_json_file, McpServerConfig, McpTransportConfig,
+    load_mcp_config, merge_http_oauth_mcp_server_into_json_file,
+    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpServerConfig, McpTransportConfig,
 };
+pub use oauth::{login_github_oauth, McpOAuthToken, McpTokenStore};
 pub use registry::{McpConnectEvent, McpRegistry};
-pub use tool_adapter::{McpToolAdapter, register_mcp_tools, register_mcp_tools_async};
+pub use tool_adapter::{register_mcp_tools, register_mcp_tools_async, McpToolAdapter};
 pub use types::*;

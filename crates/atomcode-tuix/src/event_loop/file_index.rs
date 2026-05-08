@@ -65,6 +65,20 @@ pub fn detect_at_mention_range(buf: &str, cursor: usize) -> Option<(usize, usize
     Some((at_pos, at_pos + 1 + token_len))
 }
 
+/// Convert a relative `Path` produced by `WalkBuilder` into a string that
+/// always uses `/` as the separator. Required because `filter()` matches
+/// `scope_dir` (always built from user input on `/`) against `e.rel_path`
+/// via `starts_with` — on Windows, `Path::to_string_lossy()` returns
+/// native `\` separators and breaks every drill-down past the root level.
+fn rel_path_to_forward_slash(rel: &std::path::Path) -> String {
+    let s = rel.to_string_lossy().into_owned();
+    if std::path::MAIN_SEPARATOR == '/' {
+        s
+    } else {
+        s.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
 /// Splits a mention token (without leading `@`) into `(scope_dir, filter)`
 /// at the rightmost `/`.
 ///
@@ -183,7 +197,7 @@ impl FileIndex {
                 continue; // skip the root itself
             }
             let is_dir = dent.file_type().map_or(false, |t| t.is_dir());
-            let mut s = rel.to_string_lossy().into_owned();
+            let mut s = rel_path_to_forward_slash(rel);
 
             // v1 limitation: skip paths containing whitespace (would break
             // detect_at_mention's whitespace-as-terminator rule).
@@ -231,6 +245,22 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    // ---- rel_path_to_forward_slash ----
+
+    #[test]
+    fn rel_path_to_forward_slash_normalizes_native_separators() {
+        // Build a multi-component path the way `WalkBuilder` produces them
+        // — via `PathBuf::collect`, which inserts the platform's native
+        // separator. Output must always be forward-slashed regardless of
+        // platform; on Unix this is identity, on Windows it normalizes
+        // backslashes so `filter()`'s `/`-based scope_dir prefix matching
+        // succeeds past the top level (regression: drilldown into any
+        // second-level dir like `@docs/` returned an empty popup on
+        // Windows because entries were stored as `docs\foo.md`).
+        let p: std::path::PathBuf = ["docs", "sub", "file.md"].iter().collect();
+        assert_eq!(rel_path_to_forward_slash(&p), "docs/sub/file.md");
+    }
 
     // ---- detect_at_mention ----
 

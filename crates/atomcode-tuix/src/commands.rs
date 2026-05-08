@@ -70,6 +70,7 @@ impl CommandRegistry {
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
+    Command { name: "rename",  desc: "Rename current session", needs_args: true },
     Command { name: "login",   desc: "Sign in with AtomGit OAuth", needs_args: false },
     Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false },
     Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false },
@@ -90,7 +91,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true },
     Command { name: "forget", desc: "Remove matching memories", needs_args: true },
     Command { name: "memory", desc: "Show all saved memories", needs_args: false },
-    Command { name: "mcp",     desc: "Show MCP server status (subcommand: reload)", needs_args: false },
+    Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout)", needs_args: false },
     Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
     Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },

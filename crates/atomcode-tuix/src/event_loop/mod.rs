@@ -18,6 +18,7 @@ pub(crate) mod file_index;
 pub(crate) mod monitor;
 pub(crate) mod usage_monitor;
 use commands::execute_slash_command;
+pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -26,9 +27,12 @@ use std::time::Duration;
 use anyhow::Result;
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle, AgentPhase};
 use atomcode_core::config::Config;
-use atomcode_core::session::SessionManager;
+use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
+
+use base64::Engine;
+use atomcode_core::conversation::message::ImagePart;
 
 use crate::commands::{parse_slash_line, CommandRegistry};
 use crate::input::history::History;
@@ -37,6 +41,39 @@ use crate::input::InputEvent;
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
+
+/// Encode raw RGBA pixel data as a PNG image in memory.
+fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut encoder = png::Encoder::new(&mut buf, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(rgba).ok()?;
+    drop(writer);
+    Some(buf)
+}
+
+/// Try to grab an image from the system clipboard via `arboard`.
+/// Returns `Some((ImagePart, fingerprint))` if the clipboard holds an
+/// image, `None` otherwise. The fingerprint is hashed off the raw RGBA
+/// bytes (not the PNG-encoded base64) — same hash function the status
+/// poll uses, so paste-side and poll-side fingerprints line up for the
+/// "is this the same image we already attached?" check.
+fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img = clipboard.get_image().ok()?;
+    let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
+    let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+    Some((
+        ImagePart {
+            media_type: "image/png".into(),
+            data: b64,
+        },
+        hash,
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub struct McpReloadProgress {
@@ -161,7 +198,8 @@ pub struct LoopCtx {
     pub mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
     /// Channel for receiving MCP connection status events (Connected/Failed).
     /// Events are rendered into scrollback as they arrive during startup.
-    pub mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
+    pub mcp_connect_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
     /// When `/mcp reload` is invoked, we track progress until every configured
     /// server reports Connected/Failed, then emit a one-line summary.
     pub mcp_reload: Option<McpReloadProgress>,
@@ -200,6 +238,44 @@ pub struct LoopCtx {
     /// Lazy file/dir index for `@`-mention popup. Built on first `@`
     /// keystroke via `FileIndex::filter`; session-life cache.
     pub file_index: file_index::FileIndex,
+    /// Active session id once `/resume` has loaded one. Required by the
+    /// `/rename` slash command to know which session file to update.
+    pub current_session_id: Option<SessionId>,
+    /// Cached "clipboard currently holds an image" flag, with a short TTL
+    /// so the right-aligned `Image in clipboard · ctrl+v to paste` hint
+    /// stays current without thrashing the system clipboard on every
+    /// redraw. Refreshed lazily inside `build_status`.
+    pub clipboard_check: std::sync::Arc<std::sync::Mutex<ClipboardCheckState>>,
+}
+
+/// Memoised result of the most recent clipboard probe. The hash is a
+/// content fingerprint of the clipboard image's raw RGBA bytes (or
+/// `None` when the clipboard holds no image). Letting `build_status`
+/// compare this against `UiState::pending_image_hashes` is what powers
+/// the "hide hint after I already pasted THIS image, but show it again
+/// if the user copies a different one" UX.
+#[derive(Debug, Default)]
+pub struct ClipboardCheckState {
+    pub image_hash: Option<u64>,
+    pub last_checked: Option<std::time::Instant>,
+}
+
+/// Cheap content fingerprint for clipboard images. Hashes width, height,
+/// total byte length, plus the first and last 1KB of RGBA bytes — enough
+/// to distinguish typical screenshots while keeping the per-poll cost
+/// O(2KB) regardless of image dimensions (a 4K screenshot's 32MB raw
+/// buffer would be too slow to hash in full at 1.5s polling cadence).
+fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    bytes.len().hash(&mut hasher);
+    let head_end = bytes.len().min(1024);
+    bytes[..head_end].hash(&mut hasher);
+    let tail_start = bytes.len().saturating_sub(1024);
+    bytes[tail_start..].hash(&mut hasher);
+    hasher.finish()
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user
@@ -363,6 +439,19 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::Submit => {
+                // Line continuation: a `\` immediately before the cursor
+                // is consumed and replaced with `\n`. Lets users insert
+                // newlines on terminals that swallow Shift/Ctrl/Alt+Enter
+                // (notably WSL + Windows Terminal). Mirrors Claude Code's
+                // behavior and matches the shell line-continuation
+                // convention Linux users already know.
+                if self.cursor > 0 && self.text.as_bytes()[self.cursor - 1] == b'\\' {
+                    let bs = self.cursor - 1;
+                    self.text.replace_range(bs..self.cursor, "\n");
+                    self.cursor = bs + 1;
+                    self.history_idx = None;
+                    return BufferResult::Redraw;
+                }
                 let line = self.text.trim().to_string();
                 if line.is_empty() {
                     return BufferResult::Redraw;
@@ -590,6 +679,65 @@ mod buffer_tests {
         assert!(out.contains("B\n"));
         assert!(!out.contains("[Pasted"));
     }
+
+    #[test]
+    fn submit_with_trailing_backslash_inserts_newline() {
+        // WSL + Windows Terminal swallows Shift/Ctrl/Alt+Enter, so we
+        // give users a `\<Enter>` continuation escape. The `\` itself
+        // must not survive into the buffer.
+        let reg = CommandRegistry::builtin();
+        let history: Vec<String> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "hello\\".to_string();
+        b.cursor = b.text.len();
+        let r = b.apply(Action::Submit, &history, &reg);
+        assert!(matches!(r, BufferResult::Redraw));
+        assert_eq!(b.text, "hello\n");
+        assert_eq!(b.cursor, b.text.len());
+    }
+
+    #[test]
+    fn submit_with_backslash_mid_buffer_inserts_newline_at_cursor() {
+        let reg = CommandRegistry::builtin();
+        let history: Vec<String> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "abc\\def".to_string();
+        b.cursor = 4; // right after the backslash
+        let r = b.apply(Action::Submit, &history, &reg);
+        assert!(matches!(r, BufferResult::Redraw));
+        assert_eq!(b.text, "abc\ndef");
+        assert_eq!(b.cursor, 4);
+    }
+
+    #[test]
+    fn submit_without_trailing_backslash_commits_normally() {
+        let reg = CommandRegistry::builtin();
+        let history: Vec<String> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "ship it".to_string();
+        b.cursor = b.text.len();
+        let r = b.apply(Action::Submit, &history, &reg);
+        match r {
+            BufferResult::Commit(s) => assert_eq!(s, "ship it"),
+            _ => panic!("expected Commit"),
+        }
+    }
+
+    #[test]
+    fn submit_with_backslash_not_before_cursor_commits_normally() {
+        // Backslash exists in the buffer but cursor isn't right after
+        // it — Enter should still submit, not insert a newline.
+        let reg = CommandRegistry::builtin();
+        let history: Vec<String> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "abc\\def".to_string();
+        b.cursor = b.text.len(); // at end, byte before is 'f'
+        let r = b.apply(Action::Submit, &history, &reg);
+        match r {
+            BufferResult::Commit(s) => assert_eq!(s, "abc\\def"),
+            _ => panic!("expected Commit"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -711,10 +859,10 @@ mod menu_tests {
 
         let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("/skills (with space) must list skills");
-        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
-        assert!(items.iter().any(|(n, _)| n == "web-access"));
+        assert!(items.iter().any(|(n, _)| n == "skills:brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "skills:web-access"));
         for (n, _) in &items {
-            assert!(!n.contains(':'), "sub-mode names must be bare: {}", n);
+            assert!(n.contains(':'), "sub-mode names must be qualified: {}", n);
         }
     }
 
@@ -732,12 +880,12 @@ mod menu_tests {
         let bra = build_menu_items("/skills bra", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(bra.len(), 1);
-        assert_eq!(bra[0].0, "brainstorming");
+        assert_eq!(bra[0].0, "skills:brainstorming");
 
         let web = build_menu_items("/skills web", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(web.len(), 1);
-        assert_eq!(web[0].0, "web-access");
+        assert_eq!(web[0].0, "skills:web-access");
 
         assert!(build_menu_items("/skills zz", 0, &reg, &custom, Some(&lock), None).is_none());
     }
@@ -768,9 +916,9 @@ mod menu_tests {
 
         let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("at least one visible skill should produce a menu");
-        assert!(items.iter().any(|(n, _)| n == "visible"));
+        assert!(items.iter().any(|(n, _)| n == "skills:visible"));
         assert!(
-            !items.iter().any(|(n, _)| n == "hidden"),
+            !items.iter().any(|(n, _)| n == "skills:hidden"),
             "user_invocable=false skill leaked into sub-menu"
         );
     }
@@ -913,21 +1061,25 @@ mod tool_format_tests {
     }
 
     #[test]
-    fn format_tool_detail_bash_truncates_long_commands() {
+    fn format_tool_detail_bash_truncates_at_500() {
+        let args = format!(r#"{{"command":"{}"}}"#, "a".repeat(600));
+        let out = format_tool_detail("bash", &args);
+        // `truncate_with_ellipsis` preserves `max_cols-1` display columns
+        // (499) then appends '…' (display width 1, 3 UTF-8 bytes).
+        // Display width = 500, byte length = 502.
+        assert_eq!(out.len(), 502, "byte length: 499 'a' + 3-byte '…'");
+        assert!(out.ends_with('…'), "should end with Unicode ellipsis");
+        assert_eq!(&out[..499], "a".repeat(499));
+    }
+
+    #[test]
+    fn format_tool_detail_bash_preserves_short_command() {
         let args = format!(r#"{{"command":"{}"}}"#, "a".repeat(500));
         let out = format_tool_detail("bash", &args);
-        // 200-col budget with a 1-col trailing '…' (3 UTF-8 bytes).
-        assert!(
-            crate::width::display_width(&out) <= 200,
-            "bash detail should truncate to <=200 cols, got {} cols `{}`",
-            crate::width::display_width(&out),
-            out
-        );
-        assert!(
-            out.ends_with('…'),
-            "truncated bash detail should end with ellipsis: `{}`",
-            out
-        );
+        // Full command preserved — `push_body_prefixed` handles wrapping
+        // for the committed body, and `build_inflight_tool_row` clips the
+        // live spinner row to terminal width.
+        assert_eq!(out, "a".repeat(500));
     }
 
     #[test]
@@ -972,7 +1124,7 @@ mod tool_format_tests {
     #[test]
     fn summarise_failure_keeps_long_path_intact() {
         let err = "Error: old_string not found in \
-                   /mnt/d/docs/work/cangjie/projects/fountain/f_store.";
+            /mnt/d/docs/work/cangjie/projects/fountain/f_store.";
         let out = summarise(err, false);
         assert!(
             out.contains("/mnt/d/docs/work/cangjie/projects/fountain/f_store"),
@@ -982,7 +1134,7 @@ mod tool_format_tests {
         assert!(
             !out.contains("f_stor "),
             "must not produce mid-token truncation like `f_stor ` (note the \
-             trailing space — that's where (N lines) would attach). got: {}",
+            trailing space — that's where (N lines) would attach). got: {}",
             out
         );
     }
@@ -1203,11 +1355,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
         renderer.render(UiLine::CommandOutput(
             "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
-             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-             Native terminal scrollback is unavailable while atomcode runs;\n    \
-             on exit your host terminal restores its pre-atomcode state.\n    \
-             Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
-             ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
+            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+            Native terminal scrollback is unavailable while atomcode runs;\n    \
+            on exit your host terminal restores its pre-atomcode state.\n    \
+            Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
+            ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
                 .into(),
         ));
     }
@@ -1223,12 +1375,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         std::env::remove_var("ATOMCODE_LEGACY_CONHOST_FALLBACK");
         renderer.render(UiLine::CommandOutput(
             "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
-             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-             Native terminal scrollback is unavailable while atomcode runs.\n    \
-             For full host-terminal scrollback support, install Windows Terminal\n    \
-             (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
-             Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
-             bypass this fallback (may show duplicated content on scroll).\n\n"
+            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+            Native terminal scrollback is unavailable while atomcode runs.\n    \
+            For full host-terminal scrollback support, install Windows Terminal\n    \
+            (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
+            Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
+            bypass this fallback (may show duplicated content on scroll).\n\n"
                 .into(),
         ));
     }
@@ -1275,7 +1427,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         // fits without scrolling the welcome banner off-screen.
         renderer.render(UiLine::CommandOutput(
             "\n  Welcome to AtomCode. Pick an option to get started:\n  \
-             (↑↓ to navigate, Enter to confirm, Esc to skip)\n\n"
+            (↑↓ to navigate, Enter to confirm, Esc to skip)\n\n"
                 .into(),
         ));
         app.active_modal = Some(Box::new(crate::modals::WelcomeWizard::new()));
@@ -1623,7 +1775,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![] }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -1862,7 +2014,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![] }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -2024,6 +2176,57 @@ fn handle_input(
             // No modal: paste goes into the type-ahead buffer just like
             // keyboard input (Idle or Streaming, both consume it).
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
+                // When the pasted text is empty (clipboard holds an image,
+                // not text), try to grab the image via arboard. This is the
+                // primary path on terminals with bracketed paste enabled —
+                // Ctrl+V never arrives as a key event there.
+                if text.trim().is_empty() {
+                    if let Some((img, hash)) = try_paste_clipboard_image() {
+                        let supports = ctx
+                            .config
+                            .providers
+                            .get(&ctx.config.default_provider)
+                            .map(|p| p.accepts_images())
+                            .unwrap_or(false);
+                        if !supports {
+                            renderer.render(UiLine::Error(format!(
+                                "Current model \"{}\" does not appear to support image input. \
+                                 Use /model to switch to a vision-capable model.",
+                                ctx.model_name
+                            )));
+                            renderer.flush();
+                            if matches!(app.state.phase, UiPhase::Idle) {
+                                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                            }
+                            return Ok(());
+                        }
+                        // Insert `[Image #N]` directly into the input buffer
+                        // at cursor — same UX as bracketed-paste folding for
+                        // long text. The marker stays inline through submit
+                        // so the scrollback echo shows where in the message
+                        // each image was attached. Image bytes ride alongside
+                        // in `pending_images`, drained at submit.
+                        let n = app.state.pending_images.len() + 1;
+                        app.state.pending_images.push(img);
+                        app.state.pending_image_hashes.push(hash);
+                        let marker = format!("[Image #{}]", n);
+                        app.buf.text.insert_str(app.buf.cursor, &marker);
+                        app.buf.cursor += marker.len();
+                        if matches!(app.state.phase, UiPhase::Streaming) {
+                            draw_spinner_now(
+                                &mut app.state,
+                                &app.buf,
+                                ctx,
+                                renderer,
+                                app.message_queue.len(),
+                                app.menu.selected,
+                            );
+                        } else {
+                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        }
+                        return Ok(());
+                    }
+                }
                 app.buf.insert_paste(text);
                 if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(
@@ -2146,9 +2349,7 @@ fn handle_input(
             // before — those rely on the host terminal's native
             // scrollback). We intercept BEFORE phase dispatch so
             // scrolling works in Idle / Streaming alike.
-            if let Some(handled) =
-                handle_scroll_key(code, modifiers, renderer, &app.buf)
-            {
+            if let Some(handled) = handle_scroll_key(code, modifiers, renderer, &app.buf) {
                 if handled {
                     return Ok(());
                 }
@@ -2485,14 +2686,7 @@ fn handle_idle_key(
                             Some(&ctx.file_index),
                         ) {
                             app.menu.selected = 0;
-                            redraw_with_menu(
-                                &app.buf,
-                                &items,
-                                0,
-                                &app.state,
-                                ctx,
-                                renderer,
-                            );
+                            redraw_with_menu(&app.buf, &items, 0, &app.state, ctx, renderer);
                             return Ok(());
                         }
                     }
@@ -2574,6 +2768,48 @@ fn handle_idle_key(
         renderer.flush();
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
         return Ok(());
+    }
+
+    // Ctrl+V: try clipboard image first, fall back to text paste.
+    if code == KeyCode::Char('v') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if let Some((img, hash)) = try_paste_clipboard_image() {
+            // Refuse to attach an image when the active model almost
+            // certainly can't accept one — sending it anyway burns a
+            // turn on a 400 from the upstream's param validator (e.g.
+            // ModelArts.81001 "message[N].content[0] has invalid
+            // field(s): text, type" for GLM-5.1). Gated by the model-name
+            // heuristic in `provider::model_name_suggests_vision`.
+            let supports = ctx
+                .config
+                .providers
+                .get(&ctx.config.default_provider)
+                .map(|p| p.accepts_images())
+                .unwrap_or(false);
+            if !supports {
+                renderer.render(UiLine::Error(format!(
+                    "Current model \"{}\" does not appear to support image input. \
+                     Use /model to switch to a vision-capable model.",
+                    ctx.model_name
+                )));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            // Insert the `[Image #N]` marker into the input buffer at
+            // cursor — same pattern as `insert_paste` for long text.
+            // The marker echoes through to scrollback on submit; image
+            // bytes are stashed in `pending_images` and drained then.
+            let n = app.state.pending_images.len() + 1;
+            app.state.pending_images.push(img);
+            app.state.pending_image_hashes.push(hash);
+            let marker = format!("[Image #{}]", n);
+            app.buf.text.insert_str(app.buf.cursor, &marker);
+            app.buf.cursor += marker.len();
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            return Ok(());
+        }
+        // No image in clipboard — fall through to normal key handling
+        // (the `v` char will be inserted as a regular character via classify).
     }
 
     let action = classify(code, modifiers);
@@ -2671,9 +2907,25 @@ fn handle_idle_key(
                 // takes this Option and restores it to `app.buf.text`
                 // so the cancelled message can be edited and resent.
                 app.state.last_submitted_message = Some(expanded.clone());
+                // Only attach images whose `[Image #N]` marker survived
+                // editing — if the user deleted the marker from the input
+                // buffer, the corresponding image must not be sent. Echo
+                // the kept images as `└ [Image #N]` sub-lines so scrollback
+                // shows what was actually sent.
+                let pending = std::mem::take(&mut app.state.pending_images);
+                app.state.pending_image_hashes.clear();
+                let mut images: Vec<ImagePart> = Vec::with_capacity(pending.len());
+                for (i, img) in pending.into_iter().enumerate() {
+                    let n = i + 1;
+                    if line.contains(&format!("[Image #{}]", n)) {
+                        renderer
+                            .render(UiLine::CommandOutput(format!("  └ [Image #{}]", n)));
+                        images.push(img);
+                    }
+                }
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(expanded))
+                    .send(AgentCommand::SendMessage { text: expanded, images })
                     .ok();
                 app.state.on_submit();
                 // CodingPlan drift check — fire before every turn sent
@@ -2803,8 +3055,7 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
         warnings = guard.reload(&ctx.working_dir);
         loaded = guard.all().count();
     }
-    ctx.custom_commands =
-        atomcode_core::commands::CustomCommandRegistry::load(&ctx.working_dir);
+    ctx.custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&ctx.working_dir);
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
     // so plugin-contributed hooks (especially UserPromptSubmit) fire on the
     // next user message rather than waiting for /cd or restart.
@@ -3214,7 +3465,19 @@ pub(super) fn handle_upgrade_event(
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         UpgradeEvent::Failed(msg) => {
-            renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
+            if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
+                // Friendly path — not an error, just "nothing to do".
+                let friendly = msg.replace(
+                    &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
+                    "",
+                );
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  ✓ 已是最新版本，无需更新。{}\n",
+                    friendly
+                )));
+            } else {
+                renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
+            }
         }
         UpgradeEvent::RolledBack { exe, backup } => {
             renderer.render(UiLine::CommandOutput(format!(
@@ -3450,7 +3713,7 @@ fn handle_agent_event(
             // Display AFTER the result so user sees the command first
             if name == "bash" && !state.show_tool_output {
                 renderer.render(UiLine::CommandOutput(
-                    "  ◯ Press Ctrl+O to show real-time output\n".to_string()
+                    "  ◯ Press Ctrl+O to show real-time output\n".to_string(),
                 ));
             }
             renderer.flush();
@@ -3463,7 +3726,7 @@ fn handle_agent_event(
             // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
             let detail = format_tool_detail(&tool_name, &call.arguments);
-            
+
             // Check if ToolCallStarted already rendered this tool call as a
             // dynamic ToolCallInFlight spinner. If so, we need to freeze it
             // to a static `▸` row before showing the approval prompt.
@@ -3492,7 +3755,7 @@ fn handle_agent_event(
                 });
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
-            
+
             renderer.render(UiLine::ApprovalPrompt {
                 tool: display.clone(),
                 detail: detail.clone(),
@@ -3914,9 +4177,17 @@ fn handle_agent_event(
         }
         AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
             let header = if success {
-                format!("  Background task complete ({} turn{}):\n", turns, if turns == 1 { "" } else { "s" })
+                format!(
+                    "  Background task complete ({} turn{}):\n",
+                    turns,
+                    if turns == 1 { "" } else { "s" }
+                )
             } else {
-                format!("  Background task failed after {} turn{}:\n", turns, if turns == 1 { "" } else { "s" })
+                format!(
+                    "  Background task failed after {} turn{}:\n",
+                    turns,
+                    if turns == 1 { "" } else { "s" }
+                )
             };
             let mut body = String::from(&header);
             body.push_str("  ");
@@ -4002,7 +4273,9 @@ mod session_naming_tests {
 
     #[test]
     fn synthetic_system_meta_is_detected() {
-        assert!(is_synthetic_user_text("[System meta · not a user message]\n12 calls..."));
+        assert!(is_synthetic_user_text(
+            "[System meta · not a user message]\n12 calls..."
+        ));
     }
 
     #[test]
@@ -4028,6 +4301,28 @@ mod session_naming_tests {
 /// Build the persistent status line shown directly below the input box.
 /// Pulls model name from ctx, cwd from ctx.working_dir (with $HOME
 /// collapsed to `~`), and running token count from state.
+/// Probe the system clipboard for an image, memoising the result inside
+/// the supplied cache for `CLIPBOARD_HINT_TTL_MS`. `build_status` calls
+/// this on every redraw, so without caching every spinner tick (~12/s
+/// during streaming) would round-trip to the platform clipboard API.
+const CLIPBOARD_HINT_TTL_MS: u64 = 1500;
+
+fn clipboard_image_hash(cache: &std::sync::Mutex<ClipboardCheckState>) -> Option<u64> {
+    let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = state
+        .last_checked
+        .map(|t| t.elapsed() >= std::time::Duration::from_millis(CLIPBOARD_HINT_TTL_MS))
+        .unwrap_or(true);
+    if stale {
+        state.image_hash = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_image())
+            .ok()
+            .map(|img| rgba_fingerprint(img.width, img.height, img.bytes.as_ref()));
+        state.last_checked = Some(std::time::Instant::now());
+    }
+    state.image_hash
+}
+
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     // Priority:
@@ -4056,6 +4351,21 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         usage_monitor::build_usage_hint(&ctx.usage_slot, &ctx.config.default_provider)
     {
         Some(usage)
+    } else if let Some(h) = clipboard_image_hash(&ctx.clipboard_check)
+        .filter(|h| !state.pending_image_hashes.contains(h))
+    {
+        // Transient cue — beats the upgrade banner because the action
+        // window is "now" (the image is in the clipboard right now).
+        // Suppressed when the clipboard's image fingerprint matches one
+        // already in `pending_images`: the input box already shows
+        // `[Image #N]`, prompting another paste of the same image would
+        // just attach a dup. A NEW image (different fingerprint) appears
+        // here as a fresh hint so the user can attach it too.
+        let _ = h;
+        Some((
+            "Image in clipboard · ctrl+v to paste".into(),
+            crate::render::HintSeverity::Info,
+        ))
     } else {
         ctx.update_hint
             .lock()
@@ -4237,7 +4547,7 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             .map(|p| crate::width::truncate_with_ellipsis(&p, 100))
             .unwrap_or_default(),
         "bash" => get_str("command")
-            .map(|c| crate::width::truncate_with_ellipsis(&c, 200))
+            .map(|c| crate::width::truncate_with_ellipsis(&c, 500))
             .unwrap_or_default(),
         "list_directory" | "change_dir" => get_str("path").unwrap_or_else(|| ".".into()),
         "web_fetch" => get_str("url")

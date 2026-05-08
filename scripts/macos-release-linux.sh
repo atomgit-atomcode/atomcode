@@ -19,11 +19,6 @@
 #   HOMEBREW_API_DOMAIN=https://mirrors.ustc.edu.cn/homebrew-bottles/api \
 #   HOMEBREW_BOTTLE_DOMAIN=https://mirrors.ustc.edu.cn/homebrew-bottles \
 #   brew install FiloSottile/musl-cross/musl-cross
-#
-# Environment:
-#   ATOMCODE_VERSION=vX.Y.Z       Override version. Defaults to Cargo.toml.
-#   ATOMCODE_LINUX_TARGETS=x64    Comma-separated: x64,arm64,all. Defaults to x64.
-#   ATOMCODE_INCLUDE_CLI=1        Also build atomcode CLI binary.
 
 set -euo pipefail
 
@@ -63,22 +58,69 @@ esac
 DIST="${ROOT}/dist/${VERSION}"
 mkdir -p "$DIST"
 
-# Default: build daemon only. Set ATOMCODE_INCLUDE_CLI=1 to also build CLI.
-INCLUDE_CLI="${ATOMCODE_INCLUDE_CLI:-0}"
+# ============== Interactive Menu ==============
+
+echo "=== AtomCode Linux Release ${VERSION} (cross-compile from macOS) ==="
+echo ""
+
+# Step 1: Select target architecture
+echo "请选择目标架构："
+echo "  1) Linux x64 (x86_64-unknown-linux-musl)"
+echo "  2) Linux ARM64 (aarch64-unknown-linux-musl)"
+echo "  3) 全部 (x64 + ARM64)"
+echo ""
+read -rp "请输入 [1/2/3] (默认: 1): " arch_choice
+arch_choice="${arch_choice:-1}"
+
+case "$arch_choice" in
+    1) BUILD_X64=1; BUILD_ARM64=0 ;;
+    2) BUILD_X64=0; BUILD_ARM64=1 ;;
+    3) BUILD_X64=1; BUILD_ARM64=1 ;;
+    *)
+        echo "无效选择: ${arch_choice}，默认构建 x64"
+        BUILD_X64=1; BUILD_ARM64=0
+        ;;
+esac
+
+# Step 2: Select build scope
+echo ""
+echo "请选择构建范围："
+echo "  1) 仅 atomcode-daemon"
+echo "  2) atomcode-daemon + atomcode CLI"
+echo ""
+read -rp "请输入 [1/2] (默认: 1): " scope_choice
+scope_choice="${scope_choice:-1}"
+
+case "$scope_choice" in
+    1) INCLUDE_CLI=0 ;;
+    2) INCLUDE_CLI=1 ;;
+    *)
+        echo "无效选择: ${scope_choice}，默认仅构建 daemon"
+        INCLUDE_CLI=0
+        ;;
+esac
+
 CARGO_PKG_ARGS=(-p atomcode-daemon)
 if [ "$INCLUDE_CLI" = "1" ]; then
     CARGO_PKG_ARGS+=(-p atomcode)
 fi
 
-want_target() {
-    local name="$1"
-    local requested="${ATOMCODE_LINUX_TARGETS:-x64}"
-    [ "$requested" = "all" ] && return 0
-    case ",${requested}," in
-        *",${name},"*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
+# Confirm
+echo ""
+echo "--- 构建配置 ---"
+echo "版本:     ${VERSION}"
+echo "架构:     $([ "$BUILD_X64" = "1" ] && echo -n "x64 "; [ "$BUILD_ARM64" = "1" ] && echo -n "arm64")"
+echo "产物:     atomcode-daemon$([ "$INCLUDE_CLI" = "1" ] && echo " + atomcode CLI")"
+echo "输出目录: ${DIST}"
+echo ""
+read -rp "确认开始构建? [Y/n] " confirm
+confirm="${confirm:-Y}"
+if [[ ! "$confirm" =~ ^[Yy] ]]; then
+    echo "已取消。"
+    exit 0
+fi
+
+# ============== Build Functions ==============
 
 copy_cli() {
     [ "$INCLUDE_CLI" = "1" ] || return 0
@@ -94,6 +136,7 @@ build_linux_x64() {
     local target="x86_64-unknown-linux-musl"
     local suffix="linux-x64"
 
+    echo ""
     echo "[x64] Checking linker..."
     if ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
         echo "Missing x86_64-linux-musl-gcc."
@@ -117,6 +160,7 @@ build_linux_arm64() {
     local target="aarch64-unknown-linux-musl"
     local suffix="linux-arm64"
 
+    echo ""
     echo "[arm64] Checking linker..."
     if ! command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
         echo "Missing aarch64-linux-musl-gcc."
@@ -137,16 +181,16 @@ build_linux_arm64() {
     copy_cli "$target" "$suffix"
 }
 
-echo "=== AtomCode Linux Release ${VERSION} (cross-compile from macOS) ==="
-echo "Artifacts: ${DIST}"
-echo "Targets: ${ATOMCODE_LINUX_TARGETS:-x64}"
-echo ""
+# ============== Execute Build ==============
 
-if want_target x64; then
+echo ""
+echo "=== 开始构建 ==="
+
+if [ "$BUILD_X64" = "1" ]; then
     build_linux_x64
 fi
 
-if want_target arm64; then
+if [ "$BUILD_ARM64" = "1" ]; then
     build_linux_arm64
 fi
 

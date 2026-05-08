@@ -158,6 +158,17 @@ pub struct UiState {
     /// loop. The bool is the `prompt` sub-arg (include full system
     /// prompt body).
     pub pending_context_render: Option<bool>,
+    /// Images pasted from clipboard (Ctrl+V) waiting to be sent with
+    /// the next user message. Drained on submit.
+    pub pending_images: Vec<atomcode_core::conversation::message::ImagePart>,
+    /// Parallel to `pending_images` — content fingerprint of each pasted
+    /// image's raw RGBA bytes. Used by the right-aligned status hint to
+    /// suppress `Image in clipboard · ctrl+v to paste` once the clipboard
+    /// content matches an already-attached image (avoids dup paste prompts),
+    /// while still surfacing the hint when the user copies a new image
+    /// after pasting an earlier one. Cleared together with `pending_images`
+    /// on submit.
+    pub pending_image_hashes: Vec<u64>,
     /// Whether to show real-time tool output (e.g., bash stdout/stderr).
     /// Toggled by Ctrl+O. When false (default), tool output is hidden
     /// during execution and only shown in the final result.
@@ -245,6 +256,8 @@ impl UiState {
             last_context: None,
             last_submitted_message: None,
             pending_context_render: None,
+            pending_images: Vec::new(),
+            pending_image_hashes: Vec::new(),
             show_tool_output: false,
             show_reasoning: false,
             sub_agent_total: 0,
