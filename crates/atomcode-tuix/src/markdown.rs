@@ -76,17 +76,27 @@ pub fn render_line_with_width(
         return prefix_only();
     }
 
-    // Inside code block: render in truecolor blue-500 (#3B82F6, RGB
-    // 59,130,246) + bold. Direct RGB sidesteps the bright-XX palette
-    // remap problem — `\x1b[1;97m` (bright white) was invisible on
-    // iTerm2 light preset, `\x1b[1;96m` (bright cyan) was a washed-out
-    // teal there. blue-500 has lightness ≈ 0.6 so it reads with at
-    // least 4:1 contrast against pure white AND pure black backgrounds.
+    // Inside code block: CC-style left-bar marker `│` (faint/SGR 2)
+    // + default-color content. The bar makes the block visually
+    // distinct without painting every line bold+bright white. A
+    // 30-line code block previously dominated screen attention with
+    // 30 bright-white rows; now it reads as a quiet quoted region
+    // with a thin gutter, the way CC renders fenced blocks.
+    //
+    // Earlier iterations tried bright white (`\x1b[1;97m`) and
+    // truecolor blue-500 (`\x1b[1;38;2;59;130;246m`) to dodge palette
+    // remap issues on various terminals — both still painted every
+    // code line in a bright colour, dominating attention when 30+
+    // lines of code shared the screen with markdown headings + emoji.
+    // The light-preset readability problem is now solved by NOT
+    // picking a foreground colour — terminal default fg works on
+    // every theme. Bar uses faint (SGR 2) so it reads as a quiet
+    // marker, not a competing element.
     if state.in_code_block {
         let body = if caps.colors {
-            format!("\x1b[1;38;2;59;130;246m{}\x1b[22;39m", line)
+            format!("\x1b[2m│\x1b[22m {}", line)
         } else {
-            line.to_string()
+            format!("│ {}", line)
         };
         return Some(prepend(body));
     }
@@ -423,13 +433,20 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    // Bold + truecolor blue-500 (#3B82F6). Same rationale
-                    // as the code-block path above — direct RGB so the
-                    // colour survives terminal palette remap and stays
-                    // readable on both light and dark backgrounds.
-                    out.push_str("\x1b[1;38;2;59;130;246m");
+                    // Bold only (no fg colour). Earlier iterations used
+                    // `\x1b[1;97m` (bright white) and then truecolor
+                    // blue-500 (`\x1b[1;38;2;59;130;246m`) to dodge
+                    // terminal palette remap. In long mixed output
+                    // (markdown headings + code fences + many backtick
+                    // spans) the cumulative colour load competed with
+                    // code blocks for the eye's anchor — every
+                    // `path/to/foo.rs` shouted as loud as a 30-line
+                    // code fence. Bold alone keeps inline code
+                    // distinguishable from prose without painting half
+                    // the screen.
+                    out.push_str("\x1b[1m");
                     out.push_str(&inner);
-                    out.push_str("\x1b[22;39m");
+                    out.push_str("\x1b[22m");
                 } else {
                     out.push('`');
                     out.push_str(&inner);
@@ -538,15 +555,52 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        // Inline code uses bold + truecolor blue-500 (#3B82F6, RGB
-        // 59,130,246). Truecolor sidesteps the bright-XX palette remap
-        // problem so the colour stays readable on iTerm2 light preset
-        // (where bright-white was invisible and bright-cyan was a
-        // washed-out pastel teal).
+        // Inline code uses bold ONLY (no fg colour). Earlier
+        // iterations tried bright-white and truecolor blue-500;
+        // both painted too many backtick spans on screen. Bold alone
+        // keeps inline code distinguishable from prose without
+        // competing with code-block emphasis.
+        let rendered = render_inline_line("`x`", caps());
         assert!(
-            render_inline_line("`x`", caps()).contains("\x1b[1;38;2;59;130;246mx"),
-            "got: {:?}",
-            render_inline_line("`x`", caps())
+            rendered.contains("\x1b[1mx"),
+            "inline code must open bold (SGR 1) without fg colour: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("\x1b[1;97m"),
+            "inline code must NOT include bright-white SGR 97: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("\x1b[1;38;2;"),
+            "inline code must NOT include truecolor RGB anymore: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_uses_faint_left_bar_marker() {
+        // CC-style: code blocks render as `│ <line>` with a faint
+        // (SGR 2) bar marker, NOT bold+bright white nor truecolor
+        // blue-500 per line. Pin the exact prefix shape so a future
+        // "let's brighten it again" refactor catches itself in CI.
+        let mut state = MdState::new();
+        let _ = render_line("```", &mut state, caps()); // open fence
+        let inside = render_line("let x = 1;", &mut state, caps()).unwrap_or_default();
+        assert!(
+            inside.contains("\x1b[2m│\x1b[22m"),
+            "fenced code block should use faint `│` left bar: {}",
+            inside
+        );
+        assert!(
+            !inside.contains("\x1b[1;97m"),
+            "fenced code block must NOT bold+bright-white the content: {}",
+            inside
+        );
+        assert!(
+            !inside.contains("\x1b[1;38;2;"),
+            "fenced code block must NOT truecolor-blue the content: {}",
+            inside
         );
     }
 

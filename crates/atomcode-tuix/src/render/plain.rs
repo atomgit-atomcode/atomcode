@@ -189,6 +189,27 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 // Plain mode never animated the row, so there is
                 // nothing to freeze. Skip silently.
             }
+            UiLine::ToolGroupRender { batch_id: _, header, children } => {
+                // Plain mode lacks CUP-rewrite — print header + each
+                // child row plainly. Subsequent ToolGroupChildUpdate
+                // events also print plainly (see the ChildUpdate arm
+                // below), so plain output ends up with header, then
+                // children, then update lines. Less elegant than
+                // retained's in-place ✓, but functional.
+                self.drop_transient();
+                let _ = writeln!(self.out, "{}", header);
+                for c in children {
+                    let _ = writeln!(self.out, "{}", c.text);
+                }
+            }
+            UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
+                self.drop_transient();
+                let _ = writeln!(self.out, "{}", new_text);
+            }
+            UiLine::ToolGroupSummary { text } => {
+                self.drop_transient();
+                let _ = writeln!(self.out, "{}", text);
+            }
             UiLine::ToolResult { success, summary } => {
                 self.drop_transient();
                 let icon = if success { "✓" } else { "✗" };

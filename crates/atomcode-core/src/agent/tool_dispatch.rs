@@ -18,6 +18,24 @@ impl AgentLoop {
                     .event_tx
                     .send(AgentEvent::ToolCallStreaming { name, hint });
             }
+            TurnEvent::ToolBatchStarted { batch_id, calls } => {
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolBatchStarted { batch_id, calls });
+            }
+            TurnEvent::ToolBatchCompleted {
+                batch_id,
+                ok,
+                total,
+                elapsed_ms,
+            } => {
+                let _ = self.event_tx.send(AgentEvent::ToolBatchCompleted {
+                    batch_id,
+                    ok,
+                    total,
+                    elapsed_ms,
+                });
+            }
             TurnEvent::ToolOutputChunk { call_id, chunk } => {
                 let _ = self
                     .event_tx

@@ -49,6 +49,35 @@ pub enum UiLine {
     ToolCallCommit {
         call_id: Option<String>,
     },
+    /// Push a parallel-tool batch as a live multi-row group: one
+    /// header line + N child rows (one per tool call), all visible
+    /// from the start. Subsequent `ToolGroupChildUpdate` events find
+    /// child rows by `call_id` and update them in place (CC-style
+    /// ✓ light-up). The group is "live" only as long as it remains
+    /// the bottom of body_lines; any other body push freezes it (in
+    /// place forever, but no further child updates take effect).
+    ToolGroupRender {
+        batch_id: String,
+        header: String,
+        children: Vec<ToolGroupChild>,
+    },
+    /// Update one child row inside an active live-group. Renderer
+    /// finds the row keyed by `call_id` and CUPs to its terminal
+    /// position to rewrite. Falls back to no-op if the group has been
+    /// frozen (other content was pushed below it).
+    ToolGroupChildUpdate {
+        batch_id: String,
+        call_id: String,
+        new_text: String,
+    },
+    /// One-shot summary line for a completed tool batch — rendered
+    /// with bold + brand-color emphasis so it stands out as the
+    /// "this is what happened" anchor (mirrors CC's task-completion
+    /// summary visual). Used by both ToolBatchCompleted and
+    /// SubAgentDispatchEnd.
+    ToolGroupSummary {
+        text: String,
+    },
     ToolResult {
         success: bool,
         summary: String,
@@ -271,6 +300,17 @@ pub struct StatusLine {
 #[derive(Debug, Clone)]
 pub struct DiffEntry {
     pub added: bool,
+    pub text: String,
+}
+
+/// One child entry inside a `UiLine::ToolGroupRender` payload. `call_id`
+/// is the model-supplied tool-call id; `text` is the display string the
+/// renderer initially prints (e.g. `↳ Read File foo.rs`). Subsequent
+/// `ToolGroupChildUpdate` events with the same call_id rewrite this row
+/// in place (e.g. to `↳ ✓ Read File foo.rs`).
+#[derive(Debug, Clone)]
+pub struct ToolGroupChild {
+    pub call_id: String,
     pub text: String,
 }
 

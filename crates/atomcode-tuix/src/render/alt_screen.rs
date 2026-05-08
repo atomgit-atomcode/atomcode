@@ -1320,6 +1320,23 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // pushes ToolCallInFlight as a static row already, so
                 // there's nothing to freeze yet.
             }
+            UiLine::ToolGroupRender { batch_id: _, header, children } => {
+                // alt-screen mirrors retained's append-style without
+                // the in-place ✓ rewrite (alt-screen layout is
+                // virtual-buffer based; live-group rewrite would need
+                // its own row tracking). Header + children print
+                // statically; ChildUpdate appends a new row.
+                self.push_command_output(&header);
+                for c in children {
+                    self.push_command_output(&c.text);
+                }
+            }
+            UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
+                self.push_command_output(&new_text);
+            }
+            UiLine::ToolGroupSummary { text } => {
+                self.push_command_output(&text);
+            }
             UiLine::ToolResult { success, summary } => {
                 self.push_tool_result(success, &summary);
             }

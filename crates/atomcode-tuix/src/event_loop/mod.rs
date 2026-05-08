@@ -1026,6 +1026,28 @@ mod tool_format_tests {
         assert_eq!(display_tool_name("_x"), "X");
     }
 
+    /// Short form strips the redundant noun suffix so batch UI shows
+    /// `Read(mod.rs)` instead of `ReadFile(mod.rs)` — matches CC's
+    /// function-call-style tool labels. Strip list is generic
+    /// (`_file`, `_files`, `_directory`); other suffixes pass through
+    /// untouched so `search_replace` stays `SearchReplace` (no
+    /// disambiguation lost).
+    #[test]
+    fn display_tool_name_short_strips_redundant_noun() {
+        assert_eq!(display_tool_name_short("read_file"), "Read");
+        assert_eq!(display_tool_name_short("write_file"), "Write");
+        assert_eq!(display_tool_name_short("edit_file"), "Edit");
+        assert_eq!(display_tool_name_short("create_file"), "Create");
+        assert_eq!(display_tool_name_short("list_directory"), "List");
+        assert_eq!(display_tool_name_short("parallel_edit_files"), "ParallelEdit");
+        // Suffixes not in strip list pass through.
+        assert_eq!(display_tool_name_short("bash"), "Bash");
+        assert_eq!(display_tool_name_short("grep"), "Grep");
+        assert_eq!(display_tool_name_short("search_replace"), "SearchReplace");
+        assert_eq!(display_tool_name_short("web_fetch"), "WebFetch");
+        assert_eq!(display_tool_name_short("blast_radius"), "BlastRadius");
+    }
+
     #[test]
     fn format_tool_detail_read_file_basename() {
         let args = r#"{"file_path":"/abs/path/to/foo.rs"}"#;
@@ -3514,13 +3536,23 @@ fn handle_agent_event(
             name,
             arguments,
         } => {
-            // Emit the ▸ line immediately so users can see what command
-            // is running, especially for long-running bash commands.
-            // The line will be shown before the command completes.
             let detail = format_tool_detail(&name, &arguments);
             let display = display_tool_name(&name);
 
-            // Close any in-flight assistant line before emitting the tool call.
+            // If this call is part of an active batch, the
+            // ToolBatchStarted handler already rendered the group header
+            // + child rows — skip the standalone ▸ ToolCallInFlight
+            // line. Still record into `pending_tools` so the matching
+            // ToolCallResult knows the display name + detail and skips
+            // its own ▸ render too.
+            if state.call_id_to_batch.contains_key(&id) {
+                pending_tools.insert(id, (display.clone(), detail, true));
+                state.on_tool_call_started(&display);
+                return;
+            }
+
+            // Emit the ▸ line immediately so users can see what command
+            // is running, especially for long-running bash commands.
             renderer.render(UiLine::AssistantLineBreak);
             renderer.render(UiLine::ToolCallInFlight {
                 id: id.clone(),
@@ -3549,6 +3581,59 @@ fn handle_agent_event(
             success,
             ..
         } => {
+            // If this call belongs to an active batch, the group header
+            // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
+            // child completion and skip the full ▸ + ⎿ body render.
+            // The model still gets the full output via the ToolResult
+            // message in the conversation. Task 1.3 will upgrade this
+            // to in-place checkmarks on the existing child rows instead
+            // of appending new lines.
+            if let Some(batch_id) = state.call_id_to_batch.get(&call_id).cloned() {
+                // CC-style result-data update: `⎿ Read(mod.rs) → 200 lines`.
+                // The result snippet is generic line count of the
+                // output (works across read/grep/glob/bash without
+                // per-tool extraction). Failure shows `→ ✗` so the
+                // user can spot the broken child without reading
+                // bytes-of-output.
+                //
+                // Renderer's ToolGroupChildUpdate finds the row by
+                // call_id and CUPs to its terminal position. Falls
+                // back to no-op if the group has been frozen —
+                // model still gets the full ToolResult through the
+                // conversation.
+                let child_glyph = if state.unicode_symbols { "⎿" } else { "\\" };
+                let arrow = if state.unicode_symbols { "→" } else { "->" };
+                let suffix = if success {
+                    let n = output.lines().count().max(1);
+                    let unit = if n == 1 { "line" } else { "lines" };
+                    format!(" {} {} {}", arrow, n, unit)
+                } else if state.unicode_symbols {
+                    format!(" {} ✗", arrow)
+                } else {
+                    format!(" {} [fail]", arrow)
+                };
+                // Reuse the original Tool(arg) prefix the
+                // ToolBatchStarted handler painted. pending_tools
+                // holds (display, detail) — strip the previous "name
+                // detail" join and rebuild as Short(detail) for
+                // visual consistency with the initial child row.
+                let prefix = pending_tools
+                    .remove(&call_id)
+                    .map(|(_, det, _)| format!(
+                        "{}({})",
+                        display_tool_name_short(&name),
+                        det
+                    ))
+                    .unwrap_or_else(|| display_tool_name_short(&name));
+                renderer.render(UiLine::ToolGroupChildUpdate {
+                    batch_id,
+                    call_id: call_id.clone(),
+                    new_text: format!("  {} {}{}", child_glyph, prefix, suffix),
+                });
+                renderer.flush();
+                return;
+            }
+
             // Close any in-flight assistant line before emitting the pair.
             renderer.render(UiLine::AssistantLineBreak);
             // Freeze the animated in-flight tool-call row to its final
@@ -3902,11 +3987,119 @@ fn handle_agent_event(
                 }
             }
         }
+        AgentEvent::ToolBatchStarted { batch_id, calls } => {
+            // Header label: "Reading 4 files in parallel" when all calls
+            // share a tool name (common case for batched read_file /
+            // grep / glob); otherwise generic "Running 4 tools in
+            // parallel". No tech-stack hardcoding — tool names come from
+            // the model's own tool_calls.name.
+            let count = calls.len();
+            let unique_names: std::collections::HashSet<&str> =
+                calls.iter().map(|c| c.name.as_str()).collect();
+            // Generic header — no per-tool verb table inside the
+            // framework. Same-name batches surface the model's own
+            // tool name; mixed batches use "tools". This avoids
+            // a `match tool_name { "bash" => "Running" ... }` table
+            // that drifts whenever new tools land or models invent
+            // names (mcp.foo, custom plugins).
+            let label = if unique_names.len() == 1 {
+                let single = unique_names.iter().next().copied().unwrap_or("tool");
+                format!("Running {} {} calls in parallel", count, single)
+            } else {
+                format!("Running {} tools in parallel", count)
+            };
+            // Header alone — child rows are NOT pre-rendered. Each
+            // child surfaces as a `  ↳ ✓ name` line when its
+            // ToolCallResult arrives. Trade-off:
+            // - PRO: zero duplication; children "trickle in" as they
+            //   complete, so user sees real progress on slow batches
+            //   (4 reads finishing within 1s look near-atomic; a 4-call
+            //   batch where 3 are fast + 1 is `cargo check` shows the
+            //   slow tail clearly).
+            // - PRO: avoids the retained-renderer's "in-place mutation
+            //   of older body rows" problem (rows already scrolled into
+            //   native terminal scrollback can't be modified).
+            // - CON: user doesn't see batch contents until first child
+            //   completes. Acceptable: footer spinner conveys "working",
+            //   contents become visible immediately on first result.
+            // CC-aligned glyphs: ⏺ for batch header (filled circle),
+            // ⎿ for each child row (pipe-corner). Windows-legacy
+            // fallback: > and \ keeps the layout intact when SGR
+            // glyphs render as tofu.
+            let head_glyph = if state.unicode_symbols { "⏺" } else { ">" };
+            let child_glyph = if state.unicode_symbols { "⎿" } else { "\\" };
+            // Build header + child rows; renderer keeps the group
+            // "live" while it's the bottom of body_lines, so each
+            // ToolCallResult below can update the matching child row
+            // in place (CC-style result data light-up).
+            //
+            // Child format: `⎿ Read(mod.rs)`. Tool name is the short
+            // form (Read not ReadFile); detail is wrapped in parens
+            // (Tool(arg) reads as a function call, mirroring CC).
+            let header_text = format!("{} {}", head_glyph, label);
+            let children: Vec<crate::render::ToolGroupChild> = calls
+                .iter()
+                .map(|c| crate::render::ToolGroupChild {
+                    call_id: c.id.clone(),
+                    text: format!(
+                        "  {} {}({})",
+                        child_glyph,
+                        display_tool_name_short(&c.name),
+                        format_tool_detail(&c.name, &c.arguments)
+                    ),
+                })
+                .collect();
+            renderer.render(UiLine::AssistantLineBreak);
+            renderer.render(UiLine::ToolGroupRender {
+                batch_id: batch_id.clone(),
+                header: header_text,
+                children,
+            });
+            renderer.flush();
+
+            let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
+            for cid in &call_ids {
+                state
+                    .call_id_to_batch
+                    .insert(cid.clone(), batch_id.clone());
+            }
+            state.active_tool_batches.insert(
+                batch_id.clone(),
+                crate::state::ActiveToolBatch { call_ids },
+            );
+        }
+        AgentEvent::ToolBatchCompleted {
+            batch_id,
+            ok: _,
+            total: _,
+            elapsed_ms: _,
+        } => {
+            // CC-style: NO standalone batch-summary row. Each child
+            // row already shows its own `→ N lines` / `→ ✗`, so an
+            // aggregate `batch 4/4 ok · Xs wall` line would just be
+            // visual noise repeating what's already visible above.
+            //
+            // SubAgentDispatchEnd (different code path) STILL emits
+            // its `▸ ParallelEditFiles · ...` summary because sub-agent
+            // turns/elapsed per-task is hidden by Task 3's collapse —
+            // that summary is the only place the user can see how
+            // long it took.
+            //
+            // Just clear batch state so subsequent per-call events
+            // fall back to the standard single-tool render path.
+            if let Some(b) = state.active_tool_batches.remove(&batch_id) {
+                for cid in b.call_ids {
+                    state.call_id_to_batch.remove(&cid);
+                }
+            }
+        }
         AgentEvent::SubAgentDispatchStart { tasks } => {
-            // Header line: announce the dispatch. The model also gets
-            // this same fact in the ToolResult, but seeing it land in
-            // the UI lets the user know "the wait is intentional, not
-            // a hang".
+            // Header line: announce the dispatch. The model gets this
+            // same fact in the ToolResult; the UI line tells the user
+            // "the wait is intentional, not a hang". Per-task running/
+            // done lines are suppressed (Task 3 — CC alignment); the
+            // footer spinner conveys mid-flight progress, the
+            // DispatchEnd summary lands the final count.
             renderer.render(UiLine::CommandOutput(format!(
                 "Dispatching {} sub-agents in parallel...",
                 tasks.len()
@@ -3914,38 +4107,29 @@ fn handle_agent_event(
             renderer.flush();
             state.on_sub_agent_dispatch_start(tasks);
         }
-        AgentEvent::SubAgentTaskStarted { index } => {
-            // Pull the descriptor (path + dedup suffix) the dispatcher
-            // emitted at start, so three tasks against `tunnel.rs`
-            // render as `src/server/tunnel.rs`, `src/client/tunnel.rs`,
-            // and `src/server/tunnel.rs (#2)` — distinguishable.
-            if let Some(info) = state.sub_agent_tasks.get(index) {
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  ↳ {}{} — running...",
-                    info.path, info.dedup_suffix
-                )));
-                renderer.flush();
-            }
+        AgentEvent::SubAgentTaskStarted { index: _ } => {
+            // Per-task running lines suppressed for CC-style collapsed
+            // view. State tracking still happens via DispatchStart's
+            // task list. Nothing to render here.
         }
-        AgentEvent::SubAgentTaskDone { index, elapsed_ms, turns, summary: _ } => {
+        AgentEvent::SubAgentTaskDone { index: _, elapsed_ms: _, turns: _, summary: _ } => {
+            // Per-task done lines suppressed — final count shows in
+            // DispatchEnd summary. Still tick the counter so the
+            // aggregate `N/M ok` reflects this completion.
             state.on_sub_agent_task_done();
-            if let Some(info) = state.sub_agent_tasks.get(index) {
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  ✓ {}{} — done {} · {}T",
-                    info.path,
-                    info.dedup_suffix,
-                    fmt_elapsed(elapsed_ms),
-                    turns
-                )));
-                renderer.flush();
-            }
         }
         AgentEvent::SubAgentTaskFailed { index, elapsed_ms, turns: _, reason } => {
+            // Failures KEEP their per-task line. Rationale: the user
+            // needs to know which sub-agent failed for diagnosis;
+            // collapsing into "1 fail" leaves them blind. Successes
+            // collapse silently (no actionable info per success).
             state.on_sub_agent_task_failed();
             if let Some(info) = state.sub_agent_tasks.get(index) {
+                let cross = if state.unicode_symbols { "✗" } else { "[fail]" };
                 let short_reason = reason.lines().next().unwrap_or("").trim();
                 renderer.render(UiLine::CommandOutput(format!(
-                    "  ✗ {}{} — {} · {}",
+                    "  {} {}{} — {} · {}",
+                    cross,
                     info.path,
                     info.dedup_suffix,
                     fmt_elapsed(elapsed_ms),
@@ -3968,22 +4152,25 @@ fn handle_agent_event(
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0);
             if total > 0 {
+                let arrow = if state.unicode_symbols { "▸" } else { ">" };
                 let summary = if failed == 0 {
                     format!(
-                        "▸ ParallelEditFiles · {}/{} ok · {} wall",
+                        "{} ParallelEditFiles · {}/{} ok · {} wall",
+                        arrow,
                         ok,
                         total,
                         fmt_elapsed(elapsed)
                     )
                 } else {
                     format!(
-                        "▸ ParallelEditFiles · {} ok · {} fail · {} wall",
+                        "{} ParallelEditFiles · {} ok · {} fail · {} wall",
+                        arrow,
                         ok,
                         failed,
                         fmt_elapsed(elapsed)
                     )
                 };
-                renderer.render(UiLine::CommandOutput(summary));
+                renderer.render(UiLine::ToolGroupSummary { text: summary });
                 renderer.flush();
             }
             state.on_sub_agent_dispatch_end();
@@ -4302,6 +4489,29 @@ pub fn display_tool_name(snake: &str) -> String {
         }
     }
     out
+}
+
+/// CC-style short tool name. Strips the redundant `_file` /
+/// `_directory` / `_files` suffixes (the noun is implicit from the
+/// arg) before PascalCase conversion. Generic — no per-tool match
+/// arms; works for any future tool that follows the
+/// `<verb>_<noun>` convention.
+///
+/// Examples:
+/// - `read_file` → `Read`
+/// - `write_file` → `Write`
+/// - `list_directory` → `List`
+/// - `parallel_edit_files` → `ParallelEdit`
+/// - `bash` → `Bash` (no suffix to strip)
+/// - `search_replace` → `SearchReplace` (suffix `_replace` not in
+///    strip list, kept verbatim → preserves disambiguation)
+pub fn display_tool_name_short(snake: &str) -> String {
+    const STRIP_SUFFIXES: &[&str] = &["_files", "_file", "_directory"];
+    let trimmed = STRIP_SUFFIXES
+        .iter()
+        .find_map(|s| snake.strip_suffix(s))
+        .unwrap_or(snake);
+    display_tool_name(trimmed)
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {

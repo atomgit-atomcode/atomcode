@@ -2062,6 +2062,11 @@ async fn process_chat_request(
                 // Daemon/HTTP mode doesn't surface the "tool name streaming" phase —
                 // API clients receive the complete ToolCallStarted event when args are ready.
             }
+            TurnEvent::ToolBatchStarted { .. } | TurnEvent::ToolBatchCompleted { .. } => {
+                // Batch events are TUI-only display optimisations. The
+                // per-call ToolCallStarted/Result events still fire and
+                // carry the full payload that HTTP clients consume.
+            }
             TurnEvent::WorkingDirChanged(_) => {
                 // Daemon/HTTP mode doesn't maintain a TUI footer; the shared
                 // `ctx.working_dir` was already updated in the tool. Clients

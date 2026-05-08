@@ -234,7 +234,21 @@ impl TurnRunner {
 
         // 4. Process stream events
         let mut tool_calls_buf: Vec<ToolCall> = Vec::new();
+        // RAW accumulator — keeps `<tool_call>...</tool_call>` blocks intact
+        // so the rescue path at Done can parse them when the model emitted
+        // its tool calls as XML in text instead of using the structured
+        // tool_calls API (Qwen / GLM / DeepSeek occasional misbehavior).
         let mut text_buf = String::new();
+        // VISIBLE accumulator — mirror of what `stream_filter` actually
+        // emitted to UI / conversation history. Used for `TurnResult::
+        // Responded.text` so downstream consumers (datalog `log_text`,
+        // ATLAS plan extraction, telemetry) see the same clean text the
+        // user saw, not the raw text_buf with leaked XML. Earlier bug
+        // (5-7 datalog 20-14-23 Turn 5): Responded.text was raw text_buf
+        // → datalog `**Response:**` block carried `<tool_call>grep<arg_key>
+        // pattern</arg_key>...</tool_call>` mid-prose, polluting A/B
+        // analysis.
+        let mut visible_text_buf = String::new();
         // Reasoning-model thinking content collected separately — not emitted
         // to scrollback by default (users don't want to read the thinking).
         // If `text_buf` ends up empty at `Done` but this is non-empty, we
@@ -381,6 +395,7 @@ impl TurnRunner {
                                             let visible = stream_filter.feed(&text);
                                             if !visible.is_empty() {
                                                 conversation.push_delta(&visible);
+                                                visible_text_buf.push_str(&visible);
                                                 let _ = event_tx.send(TurnEvent::TextDelta(visible));
                                             }
                                         }
@@ -487,6 +502,7 @@ impl TurnRunner {
                                         let trailing = stream_filter.flush();
                                         if !trailing.is_empty() {
                                             conversation.push_delta(&trailing);
+                                            visible_text_buf.push_str(&trailing);
                                             let _ = event_tx.send(TurnEvent::TextDelta(trailing));
                                         }
 
@@ -534,6 +550,11 @@ impl TurnRunner {
                                             let promoted = std::mem::take(&mut reasoning_buf);
                                             conversation.push_delta(&promoted);
                                             text_buf.push_str(&promoted);
+                                            // Reasoning channel doesn't carry tool_call XML
+                                            // (it's a separate stream from delta text), so
+                                            // promoting it directly to visible_text_buf is
+                                            // safe — no need to re-feed through stream_filter.
+                                            visible_text_buf.push_str(&promoted);
                                             let _ = event_tx.send(TurnEvent::TextDelta(promoted));
                                         }
 
@@ -645,11 +666,17 @@ impl TurnRunner {
             );
         }
 
-        // 5. If no tool calls, we're done — LLM produced text only
+        // 5. If no tool calls, we're done — LLM produced text only.
+        //    Use the FILTERED accumulator so downstream consumers
+        //    (datalog `log_text`, ATLAS plan extraction, telemetry)
+        //    see clean prose, not raw text_buf with leaked XML
+        //    tool_call blocks. Earlier bug: 5-7 atomgr datalog
+        //    20-14-23 Turn 5 logged `### 3. 传输层安全<tool_call>grep
+        //    <arg_key>...` because Responded.text was raw.
         if tool_calls_buf.is_empty() {
             tel_return!(
                 TurnResult::Responded {
-                    text: text_buf,
+                    text: visible_text_buf,
                     tokens: total_tokens,
                     truncated: was_truncated,
                 },
@@ -699,6 +726,35 @@ impl TurnRunner {
                 seen_calls.insert(key, i);
             }
         }
+
+        // ── ToolBatchStarted: fires when ≥ 2 non-duplicate calls fan
+        // out from one assistant message. Lets the UI render a single
+        // grouped block instead of N independent ▸ rows.
+        // Per-call ToolCallStarted events still fire below for backward
+        // compat (UI dedupes via batch_id membership).
+        let non_dup_count = is_dup.iter().filter(|d| !**d).count();
+        let active_batch_id = if non_dup_count >= 2 {
+            let batch_id = format!("batch_{}", uuid::Uuid::new_v4());
+            let calls: Vec<crate::turn::event::ToolBatchCall> = tool_calls_buf
+                .iter()
+                .zip(is_dup.iter())
+                .filter(|(_, dup)| !**dup)
+                .map(|(c, _)| crate::turn::event::ToolBatchCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    arguments: c.arguments.clone(),
+                })
+                .collect();
+            let _ = event_tx.send(TurnEvent::ToolBatchStarted {
+                batch_id: batch_id.clone(),
+                calls,
+            });
+            Some((batch_id, std::time::Instant::now(), non_dup_count))
+        } else {
+            None
+        };
+        let mut batch_ok_count: usize = 0;
+
         let mut files_edited_this_batch: Vec<String> = Vec::new();
         for (i, call) in tool_calls_buf.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -764,6 +820,9 @@ impl TurnRunner {
             // ToolCallStarted emit), so by the time we reach here this is
             // a real, non-duplicate call to execute.
             let result = self.execute_single_tool(call, event_tx, &cancel).await;
+            if active_batch_id.is_some() && result.success {
+                batch_ok_count += 1;
+            }
 
             // Track files edited for read interception (batch + cross-turn)
             // Use full file path as key to avoid basename collisions
@@ -785,6 +844,18 @@ impl TurnRunner {
             conversation.add_tool_result(result);
         }
 
+        // ── ToolBatchCompleted: closes the group started above. UI
+        // uses this to swap the spinner header to a static `· N/M ok ·
+        // Xs wall` summary. Only fires when a batch was actually opened.
+        if let Some((batch_id, started_at, total)) = active_batch_id {
+            let _ = event_tx.send(TurnEvent::ToolBatchCompleted {
+                batch_id,
+                ok: batch_ok_count,
+                total,
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
+            });
+        }
+
         // Truncate oversized tool outputs before returning. Without this,
         // a single `ls -la node_modules` / wide `find` dump (multi-MB)
         // stays raw in `conversation.messages` and the NEXT LLM call
@@ -802,10 +873,13 @@ impl TurnRunner {
 
         tel_return!(
             TurnResult::UsedTools {
-                text: if text_buf.is_empty() {
+                // Same filtered-vs-raw split as the Responded arm above.
+                // text_buf keeps raw for the rescue path; visible_text_buf
+                // is what should reach downstream consumers.
+                text: if visible_text_buf.is_empty() {
                     None
                 } else {
-                    Some(text_buf)
+                    Some(visible_text_buf)
                 },
                 tool_count,
                 tokens: total_tokens,
@@ -1708,6 +1782,59 @@ mod tool_call_text_rescue_tests {
         // so flush to get the full output.
         let tail = f.flush();
         assert_eq!(format!("{}{}", out, tail), "hello world");
+    }
+
+    /// Regression for 5-7 atomgr datalog (build dd425fd, 20-14-23 Turn 5):
+    /// GLM-5.1 emitted prose then mid-sentence switched to XML tool_call:
+    /// `### 3. 传输层安全<tool_call>grep<arg_key>pattern</arg_key>...
+    /// </tool_call>`. The stream_filter caught it for streamed deltas /
+    /// conversation history, but `TurnResult::Responded.text` used raw
+    /// `text_buf` → `datalog::log_text` printed the XML in `**Response:**`.
+    ///
+    /// Fix: parallel `visible_text_buf` mirrors what the filter actually
+    /// emitted; `Responded.text` and `UsedTools.text` use it instead of
+    /// raw text_buf. This test pins the visible-side behavior for the
+    /// exact Turn 5 input shape.
+    #[test]
+    fn glm_xml_leak_mid_prose_strips_to_clean_visible_text() {
+        let mut f = ToolCallStreamFilter::default();
+        let mut visible = String::new();
+
+        // Replay the actual Turn 5 chunking shape: prose, then XML
+        // tool_call split across multiple deltas (provider chunks at
+        // arbitrary boundaries — the filter must hold back across them).
+        for chunk in [
+            "### 3. 传输层安全",
+            "<tool_call>grep",
+            "<arg_key>pattern</arg_key>",
+            "<arg_value>http://</arg_value>",
+            "<arg_key>path</arg_key>",
+            "<arg_value>/Users/y/project</arg_value>",
+            "</tool_call>",
+        ] {
+            visible.push_str(&f.feed(chunk));
+        }
+        visible.push_str(&f.flush());
+
+        assert!(
+            !visible.contains("<tool_call>"),
+            "visible accumulator must strip <tool_call> open tag: {:?}",
+            visible
+        );
+        assert!(
+            !visible.contains("</tool_call>"),
+            "visible accumulator must strip </tool_call> close tag: {:?}",
+            visible
+        );
+        assert!(
+            !visible.contains("<arg_key>") && !visible.contains("<arg_value>"),
+            "visible accumulator must strip XML inner tags: {:?}",
+            visible
+        );
+        assert_eq!(
+            visible, "### 3. 传输层安全",
+            "only the pre-tool prose should reach Responded.text"
+        );
     }
 
     #[test]

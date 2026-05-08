@@ -161,6 +161,24 @@ pub enum AgentEvent {
         name: String,
         arguments: String,
     },
+    /// Multiple tool calls fan out from one assistant message. Fires BEFORE
+    /// the per-call `ToolCallStarted` events, only when ≥ 2 non-duplicate
+    /// calls are about to dispatch. UI uses this to render a single
+    /// grouped block (`▸ Reading 4 files (parallel)` + child rows) rather
+    /// than N independent `▸` rows. Per-call events still fire for
+    /// backward compat — UI dedupes via `batch_id` membership.
+    ToolBatchStarted {
+        batch_id: String,
+        calls: Vec<crate::turn::event::ToolBatchCall>,
+    },
+    /// Closes the batch opened by `ToolBatchStarted`. UI finalizes the
+    /// group header with `· N/M ok · Xs wall` summary.
+    ToolBatchCompleted {
+        batch_id: String,
+        ok: usize,
+        total: usize,
+        elapsed_ms: u64,
+    },
     /// Real-time output chunk from a running tool (e.g., bash command).
     /// Sent during tool execution before ToolCallResult.
     ToolOutputChunk {
@@ -1519,6 +1537,20 @@ impl AgentLoop {
                                 }
                                 TurnEvent::ReasoningDelta(text) => {
                                     let _ = event_tx.send(AgentEvent::ReasoningDelta(text));
+                                }
+                                TurnEvent::ToolBatchStarted { ref batch_id, ref calls } => {
+                                    let _ = event_tx.send(AgentEvent::ToolBatchStarted {
+                                        batch_id: batch_id.clone(),
+                                        calls: calls.clone(),
+                                    });
+                                }
+                                TurnEvent::ToolBatchCompleted { ref batch_id, ok, total, elapsed_ms } => {
+                                    let _ = event_tx.send(AgentEvent::ToolBatchCompleted {
+                                        batch_id: batch_id.clone(),
+                                        ok,
+                                        total,
+                                        elapsed_ms,
+                                    });
                                 }
                                 TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
                                     // Dedupe across retries: the same provider-assigned tool_call_id

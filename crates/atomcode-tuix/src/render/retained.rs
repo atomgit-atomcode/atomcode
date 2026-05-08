@@ -320,6 +320,34 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// tool call (rendered via `render_inflight_tool`). Used to replace
     /// those lines on each spinner tick and to clean up on commit.
     inflight_tool_rows: usize,
+    /// Active multi-row "live group" — the tail of `body_lines` is one
+    /// header + N child rows for a parallel tool batch. Subsequent
+    /// `UiLine::ToolGroupChildUpdate` events resolve `call_id` →
+    /// `body_lines` index via the `child_indices` map and CUP+rewrite
+    /// in place, mirroring CC's `Read 4 files` block where each row
+    /// lights up `✓` as its result lands. Any external `push_body_row`
+    /// freezes the group (flag taken: subsequent updates fall back to
+    /// no-op since the group rows are no longer at the bottom and may
+    /// have scrolled out of the visible body strip).
+    live_group: Option<LiveGroup>,
+}
+
+/// Tracking state for an active multi-row live group. Populated by
+/// `UiLine::ToolGroupRender`, consulted by `UiLine::ToolGroupChildUpdate`,
+/// cleared by any unrelated `push_body_row`.
+#[derive(Debug, Clone)]
+struct LiveGroup {
+    batch_id: String,
+    /// Index of the header row in `body_lines`. Reserved for a
+    /// follow-up `ToolGroupHeaderUpdate` variant that appends the
+    /// `· N/M ok · Xs wall` summary in-place on batch completion
+    /// instead of pushing a separate row.
+    #[allow(dead_code)]
+    header_idx: usize,
+    /// `call_id` → index into `body_lines` for each child row. Indices
+    /// are absolute; they remain valid as long as no rows are drained
+    /// from the front of `body_lines` while the group is live.
+    child_indices: std::collections::HashMap<String, usize>,
 }
 
 impl RetainedRenderer<BufWriter<Stdout>> {
@@ -351,6 +379,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_spinner_active: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
+            live_group: None,
         }
     }
 
@@ -1094,6 +1123,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// transient, the new row takes its slot without scrolling other
     /// history up by one.
     fn push_body_row(&mut self, row: Vec<Cell>) {
+        // Any external body push freezes an active live-group: the
+        // group's child rows are no longer guaranteed to sit at the
+        // bottom (they may have scrolled into native scrollback the
+        // moment this push commits a `\n`). Future ToolGroupChildUpdate
+        // events fall back to no-op rather than CUP-rewriting some
+        // unrelated row that took the group child's screen position.
+        self.live_group = None;
         if self.clear_live_spinner() {
             // In-place overwrite at `body_bottom` — `emit_body_line_inner`
             // honours this flag to skip its LF and just CUP+EL+write at
@@ -1815,6 +1851,117 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     self.commit_inflight_tool();
                 }
             }
+            UiLine::ToolGroupRender {
+                batch_id,
+                header,
+                children,
+            } => {
+                self.flush_assistant_remainder();
+                // Push header + N child rows as single-line rows so
+                // body_lines indices map 1:1 with terminal positions.
+                // push_body_row clears any prior live_group, including
+                // ours mid-loop, so we set live_group AFTER the loop.
+                //
+                // Style:
+                // - header: bold + bright white (用户偏好，NOT brand
+                //   red/purple — those clash with the theme; bright
+                //   white is theme-neutral and reads cleanly on both
+                //   light and dark terminals)
+                // - children: muted (high-frequency rows, not anchors)
+                // - summary: bright white but NOT bold (see Summary
+                //   arm below)
+                let header_style = CellStyle {
+                    fg: Some(crossterm::style::Color::White),
+                    bold: true,
+                    ..Default::default()
+                };
+                let muted = self.style_for(Role::Muted);
+                let screen_w = self.screen.width();
+                let header_row = build_one_row(&header, &header_style, screen_w);
+                self.push_body_row(header_row);
+                let header_idx = self.body_lines.len() - 1;
+
+                let mut child_indices: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for c in &children {
+                    let row = build_one_row(&c.text, &muted, screen_w);
+                    self.push_body_row(row);
+                    child_indices.insert(c.call_id.clone(), self.body_lines.len() - 1);
+                }
+                self.live_group = Some(LiveGroup {
+                    batch_id,
+                    header_idx,
+                    child_indices,
+                });
+            }
+            UiLine::ToolGroupChildUpdate {
+                batch_id,
+                call_id,
+                new_text,
+            } => {
+                self.flush_assistant_remainder();
+                // Resolve via the active live-group. Three guards:
+                // 1. live_group still active (no foreign push happened)
+                // 2. batch_id matches (defensive — shouldn't ever
+                //    mismatch, but guard against event-order glitches)
+                // 3. call_id is in the child map
+                // Any miss = silent no-op; the model still got the full
+                // ToolResult through the conversation, only the visual
+                // ✓ light-up is dropped.
+                let group = match self.live_group.as_ref() {
+                    Some(g) if g.batch_id == batch_id => g.clone(),
+                    _ => return,
+                };
+                let row_idx = match group.child_indices.get(&call_id) {
+                    Some(&i) => i,
+                    None => return,
+                };
+
+                let muted = self.style_for(Role::Muted);
+                let new_row = build_one_row(&new_text, &muted, self.screen.width());
+
+                // Update in-memory.
+                if let Some(slot) = self.body_lines.get_mut(row_idx) {
+                    *slot = new_row.clone();
+                }
+
+                // Compute terminal row position. body_bottom_row is the
+                // bottom of the visible body strip; the live-group
+                // children sit just above it. body_lines maps to
+                // terminal rows from `body_bottom - (len-1)` upwards.
+                self.ensure_scroll_region();
+                let bottom = self.body_bottom_row();
+                if bottom == 0 {
+                    return;
+                }
+                let n = self.body_lines.len();
+                let offset_from_bottom = (n - 1).saturating_sub(row_idx);
+                if (bottom as usize) <= offset_from_bottom {
+                    // Row has scrolled past the visible body strip
+                    // into native scrollback — can't rewrite.
+                    return;
+                }
+                let target_row = (bottom as usize) - offset_from_bottom;
+                let seq = format!("\x1b[{};1H\x1b[K", target_row);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(&new_row);
+                let _ = self.out.write_all(&bytes);
+            }
+            UiLine::ToolGroupSummary { text } => {
+                self.flush_assistant_remainder();
+                // Bright white but NOT bold — distinguishable from the
+                // muted children, but quieter than the bold header.
+                // The header marks batch START with strong emphasis;
+                // the summary marks batch END with lighter emphasis.
+                // 用户偏好：亮 + 不加粗。
+                let style = CellStyle {
+                    fg: Some(crossterm::style::Color::White),
+                    bold: false,
+                    ..Default::default()
+                };
+                let row = build_one_row(&text, &style, self.screen.width());
+                self.push_body_row(row);
+            }
             UiLine::ToolCall { name, detail } => {
                 self.flush_assistant_remainder();
                 let muted = self.style_for(Role::Muted);
@@ -2406,6 +2553,29 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.last_painted_footer_rows = self.current_footer_rows();
         self.dirty = false;
     }
+}
+
+/// Build a single-line row from `text`, padded to the body's PAD_COL
+/// indent and truncated with `…` when the text overflows the screen
+/// width. Used by the live-group rendering path where each child must
+/// be exactly one terminal row so child indices map 1:1 with terminal
+/// positions for in-place CUP rewrites.
+fn build_one_row(text: &str, style: &CellStyle, screen_w: u16) -> Vec<Cell> {
+    let avail = (screen_w as usize).saturating_sub(PAD_COL * 2);
+    let safe = scrub_controls(text);
+    let truncated = if safe.chars().count() > avail.max(1) {
+        let take_n = avail.saturating_sub(1).max(1);
+        let mut s: String = safe.chars().take(take_n).collect();
+        s.push('…');
+        s
+    } else {
+        safe
+    };
+    let mut row = Vec::new();
+    let pad = CellStyle::default();
+    push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+    push_str_cells(&mut row, &truncated, style);
+    row
 }
 
 /// Truncate `body_str` to at most `max_chars` display-width characters,
@@ -4356,19 +4526,23 @@ mod tests {
             cell,
             vterm.dump()
         );
-        // Inline code: markdown crate wraps it in truecolor blue-500
-        // (RGB 59,130,246) so the colour stays readable on both light
-        // and dark terminal themes (bright-XX SGR colours got remapped
-        // by individual themes — bright-white invisible on iTerm2 light,
-        // bright-cyan washed-out pastel there).
+        // Inline code: bold ONLY (no fg color). Markdown crate dropped
+        // both the `\x1b[1;97m` (bright white) and the later truecolor
+        // blue-500 attempts to stop the colour load from competing
+        // with code blocks for the eye's anchor in long mixed outputs.
+        // Inline code stays distinguishable via the bold weight alone.
         let code_pos = row_text
             .find("code")
             .expect("expected 'code' in rendered text");
         let code_cell = vterm.cell_at(row_idx, code_pos);
+        assert!(
+            code_cell.bold,
+            "inline code cell should be bold: {:?}",
+            code_cell
+        );
         assert_eq!(
-            code_cell.fg,
-            Some(crossterm::style::Color::Rgb { r: 59, g: 130, b: 246 }),
-            "inline code cell should be truecolor blue-500: {:?}",
+            code_cell.fg, None,
+            "inline code cell must NOT carry any fg colour: {:?}",
             code_cell
         );
     }
@@ -5178,6 +5352,149 @@ mod tests {
              transition left a ghost:\n{}",
             rule_rows,
             vterm.dump()
+        );
+    }
+
+    /// Live-group flow:
+    /// 1. ToolGroupRender pushes header + 3 child rows
+    /// 2. ToolGroupChildUpdate on the MIDDLE child rewrites that row
+    ///    in place via CUP — peers (rows above/below) untouched.
+    ///
+    /// Pinpoints CC-style "✓ trickles into existing row" behavior so
+    /// any future regression (e.g. accidental `push_body_row` for
+    /// child updates) gets caught.
+    #[test]
+    fn tool_group_render_then_child_update_in_place() {
+        use crate::render::ToolGroupChild;
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+
+        r.render(UiLine::ToolGroupRender {
+            batch_id: "b1".into(),
+            header: "▸ Running 3 read_file calls in parallel".into(),
+            children: vec![
+                ToolGroupChild {
+                    call_id: "c1".into(),
+                    text: "  ↳ Read File foo.rs".into(),
+                },
+                ToolGroupChild {
+                    call_id: "c2".into(),
+                    text: "  ↳ Read File bar.rs".into(),
+                },
+                ToolGroupChild {
+                    call_id: "c3".into(),
+                    text: "  ↳ Read File baz.rs".into(),
+                },
+            ],
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let dump_before = vterm.dump();
+        assert!(
+            dump_before.contains("Running 3 read_file"),
+            "header missing:\n{}",
+            dump_before
+        );
+        assert!(dump_before.contains("Read File foo.rs"));
+        assert!(dump_before.contains("Read File bar.rs"));
+        assert!(dump_before.contains("Read File baz.rs"));
+        // No ✓ yet — every child still shows its initial dispatched row.
+        assert!(
+            !dump_before.contains("✓"),
+            "no checkmark expected pre-update:\n{}",
+            dump_before
+        );
+
+        // In-place update of the middle child — CUPs to that row and
+        // rewrites without pushing a new body row.
+        r.render(UiLine::ToolGroupChildUpdate {
+            batch_id: "b1".into(),
+            call_id: "c2".into(),
+            new_text: "  ↳ ✓ Read File bar.rs".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let dump_after = vterm.dump();
+        assert!(
+            dump_after.contains("✓ Read File bar.rs"),
+            "✓ on bar.rs row missing after update:\n{}",
+            dump_after
+        );
+        // Other two children untouched — exactly one ✓ in the dump.
+        let check_count = dump_after.matches("✓").count();
+        assert_eq!(
+            check_count, 1,
+            "expected exactly 1 ✓ (middle child only); got {}:\n{}",
+            check_count, dump_after
+        );
+    }
+
+    /// Foreign body push between ToolGroupRender and ChildUpdate
+    /// freezes the group. Subsequent updates must no-op (rather than
+    /// CUP-rewrite some unrelated row that took the child's screen
+    /// position). Model still has the ToolResult — only the visual
+    /// ✓ light-up is dropped, which is the safe outcome.
+    #[test]
+    fn tool_group_freezes_after_unrelated_body_push() {
+        use crate::render::ToolGroupChild;
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+
+        r.render(UiLine::ToolGroupRender {
+            batch_id: "b1".into(),
+            header: "▸ batch header".into(),
+            children: vec![
+                ToolGroupChild {
+                    call_id: "c1".into(),
+                    text: "  ↳ child one".into(),
+                },
+                ToolGroupChild {
+                    call_id: "c2".into(),
+                    text: "  ↳ child two".into(),
+                },
+            ],
+        });
+        // Foreign push — freezes the group.
+        r.render(UiLine::CommandOutput("foreign output line".into()));
+        // This update would have rewritten child1 in place, but the
+        // group is now frozen → must be a no-op.
+        r.render(UiLine::ToolGroupChildUpdate {
+            batch_id: "b1".into(),
+            call_id: "c1".into(),
+            new_text: "  ↳ ✓ child one (should NOT appear)".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let dump = vterm.dump();
+        assert!(
+            dump.contains("foreign output line"),
+            "foreign push should still show:\n{}",
+            dump
+        );
+        assert!(
+            !dump.contains("(should NOT appear)"),
+            "frozen group must not apply child update; got:\n{}",
+            dump
+        );
+        assert!(
+            !dump.contains("✓ child one"),
+            "no ✓ should appear on the child after freeze:\n{}",
+            dump
         );
     }
 }
