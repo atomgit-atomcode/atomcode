@@ -1323,22 +1323,40 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         }
     }
 
-    // Terminal keyboard hint: when the terminal doesn't support Kitty
-    // keyboard protocol (CSI u), Shift+Enter is indistinguishable from
-    // plain Enter. Show a hint so users know to use Alt+Enter or
-    // Ctrl+Enter for newline insertion instead.
-    if std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok() {
+    // Terminal keyboard hint: shown when crossterm couldn't negotiate
+    // the Kitty keyboard protocol (CSI u). The previous copy claimed
+    // "Shift+Enter won't work" — but Kitty is only ONE of several ways
+    // a terminal can disambiguate modifier+Enter. Windows Terminal,
+    // VSCode (xterm.js), mintty/Git Bash, and modern PowerShell hosts
+    // all forward Shift/Alt/Ctrl+Enter via VT modifyOtherKeys without
+    // ever negotiating CSI u, so the user sees Shift+Enter work in
+    // their daily session yet boots into a banner asserting it can't.
+    // Re-frame as informational guidance rather than a definitive
+    // "won't work" claim, and surface `\<Enter>` as the universal
+    // fallback so legacy-conhost users (where modifier+Enter IS
+    // genuinely swallowed at the OS layer) have a guaranteed path.
+    //
+    // Also suppressed when the legacy-conhost hint is firing — that
+    // hint already covers the only environment where the chord
+    // truly fails, so dual-firing produced wall-of-text noise (see
+    // user feedback 2026-05-09 "全部展示的是…可以更精细化下").
+    let kbd_hint_set = std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok();
+    let legacy_conhost_set = std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok();
+    if kbd_hint_set {
         std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
-        // Show platform-appropriate hint. On macOS, Option+Enter may not work
-        // in all terminals, so we recommend Ctrl+Enter as the primary fallback.
+    }
+    if kbd_hint_set && !legacy_conhost_set {
+        // Generic Kitty-not-negotiated hint for non-conhost terminals
+        // (Mac Terminal.app default, older xterm, plain SSH session,
+        // etc.). Modifier+Enter usually works through VT modifyOtherKeys
+        // — phrase the chord list as "try" rather than "must use",
+        // and document `\<Enter>` for the corner cases where the host
+        // strips every chord.
         #[cfg(target_os = "macos")]
-        renderer.render(UiLine::CommandOutput(
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
-        ));
+        let line = "  ⓘ Newline insertion: try Ctrl+Enter (or Option+Enter on terminals\n    that forward Option as Meta). Universal fallback: end the line\n    with `\\` then press Enter.\n\n";
         #[cfg(not(target_os = "macos"))]
-        renderer.render(UiLine::CommandOutput(
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
-        ));
+        let line = "  ⓘ Newline insertion: try Shift+Enter, Alt+Enter, or Ctrl+Enter\n    (Windows Terminal / VSCode / mintty forward these without Kitty\n    CSI u). Universal fallback: end the line with `\\` then press Enter.\n\n";
+        renderer.render(UiLine::CommandOutput(line.into()));
     }
 
     // JediTerm auto-fallback hint: lib.rs detected
@@ -1373,8 +1391,17 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // `!is_jediterm`).
     if std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok() {
         std::env::remove_var("ATOMCODE_LEGACY_CONHOST_FALLBACK");
+        // Includes the newline-insertion guidance because legacy
+        // conhost is the ONE environment where modifier+Enter is
+        // genuinely swallowed by the OS (every Shift/Alt/Ctrl+Enter
+        // chord collapses to bare Enter before reaching the app).
+        // The trailing `\<Enter>` is the only reliable path — call
+        // it out explicitly here so the keyboard-hint suppression
+        // above doesn't leave conhost users without that information.
         renderer.render(UiLine::CommandOutput(
             "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
+            Newlines: end the line with `\\` then press Enter (modifier+Enter is\n    \
+            swallowed by conhost; Shift / Alt / Ctrl+Enter all collapse to Enter).\n    \
             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
             Native terminal scrollback is unavailable while atomcode runs.\n    \
             For full host-terminal scrollback support, install Windows Terminal\n    \
