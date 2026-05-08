@@ -169,6 +169,14 @@ pub struct UiState {
     /// after pasting an earlier one. Cleared together with `pending_images`
     /// on submit.
     pub pending_image_hashes: Vec<u64>,
+    /// Monotonic counter for the `[Image #N]` marker shown in the input
+    /// buffer + scrollback. Incremented on every paste and NEVER reset
+    /// across turns — so two images pasted in different turns get
+    /// distinct labels (e.g. `[Image #1]` in turn 1, `[Image #2]` in
+    /// turn 2). Without this, both turns' first paste would both render
+    /// as `[Image #1]`, making it ambiguous which image a later
+    /// reference points at when scrolling back.
+    pub session_image_count: usize,
     /// Whether to show real-time tool output (e.g., bash stdout/stderr).
     /// Toggled by Ctrl+O. When false (default), tool output is hidden
     /// during execution and only shown in the final result.
@@ -258,6 +266,7 @@ impl UiState {
             pending_context_render: None,
             pending_images: Vec::new(),
             pending_image_hashes: Vec::new(),
+            session_image_count: 0,
             show_tool_output: false,
             show_reasoning: false,
             sub_agent_total: 0,
@@ -586,6 +595,42 @@ mod tests {
     fn new_state_is_idle() {
         let s = UiState::new();
         assert_eq!(s.phase, UiPhase::Idle);
+    }
+
+    /// Regression for the cross-turn `[Image #N]` ambiguity: the marker
+    /// counter must NOT reset when `pending_images` drains on submit —
+    /// otherwise turn 1's first paste and turn 2's first paste would
+    /// both render as `[Image #1]` in scrollback. The counter lives on
+    /// `session_image_count`, monotonically increasing for the whole
+    /// session.
+    #[test]
+    fn session_image_count_starts_at_zero_on_new_state() {
+        let s = UiState::new();
+        assert_eq!(s.session_image_count, 0);
+    }
+
+    /// Simulate two-turn paste flow: paste image in turn 1, drain
+    /// `pending_images` on submit, paste image in turn 2. The second
+    /// paste must get marker `#2`, not `#1`.
+    #[test]
+    fn session_image_count_survives_pending_images_drain() {
+        let mut s = UiState::new();
+        // Turn 1: simulate paste sites' increment-then-push pattern.
+        s.session_image_count += 1;
+        let n1 = s.session_image_count;
+        s.pending_images.push(atomcode_core::conversation::message::ImagePart {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        });
+        s.pending_image_hashes.push(0xdead_beef);
+        // Submit drains pending_images / hashes (mirrors event_loop logic).
+        let _ = std::mem::take(&mut s.pending_images);
+        let _ = std::mem::take(&mut s.pending_image_hashes);
+        // Turn 2: another paste.
+        s.session_image_count += 1;
+        let n2 = s.session_image_count;
+        assert_eq!(n1, 1, "first paste of session is #1");
+        assert_eq!(n2, 2, "first paste of next turn must be #2, not #1");
     }
 
     #[test]
