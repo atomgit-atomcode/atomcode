@@ -319,6 +319,66 @@ fn normalize_newlines(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// Per-terminal newline-chord recommendation, emitted on startup when
+/// crossterm couldn't negotiate the Kitty CSI u protocol. Generic
+/// "try Shift/Alt/Ctrl+Enter" works but makes the user iterate; naming
+/// the host terminal and the chord most likely to work there gets them
+/// to a working keystroke on first try.
+///
+/// Detection priority is from "highest signal of which keyboard
+/// path is actually in use" downwards:
+///
+///   1. `MSYSTEM` — Git Bash / mintty. Recognised before WT_SESSION
+///      because Git Bash inside Windows Terminal sets BOTH; the
+///      keyboard input still flows through mintty's xterm-compatible
+///      decoder, so mintty's chord recommendations apply.
+///   2. `WT_SESSION` — Windows Terminal. Forwards modifier+Enter via
+///      VT input mode even without Kitty.
+///   3. `ConEmuPID` — ConEmu. Has known Shift+Enter / Alt+Enter
+///      bindings that intercept the chord; Ctrl+Enter is the
+///      reliable path here.
+///   4. `TERM_PROGRAM` — VSCode / Cursor / Hyper / WezTerm / etc.
+///      Each known program gets a tailored line.
+///   5. Anything else → generic Shift/Alt/Ctrl trio with `\<Enter>`
+///      as universal fallback.
+///
+/// Legacy conhost (cmd.exe / classic Windows console) is handled by
+/// the `ATOMCODE_LEGACY_CONHOST_FALLBACK` banner upstream of this
+/// helper — it's the one environment where modifier+Enter is fully
+/// swallowed at the OS layer, so the conhost banner names `\<Enter>`
+/// as the only working path.
+fn recommended_newline_chord_blurb() -> String {
+    if std::env::var("MSYSTEM").is_ok() {
+        return "  ⓘ Git Bash / mintty detected. Newline: Shift+Enter (also: Alt+Enter,\n    Ctrl+Enter, or end the line with `\\` then press Enter).\n\n"
+            .into();
+    }
+    if std::env::var("WT_SESSION").is_ok() {
+        return "  ⓘ Windows Terminal detected. Newline: Shift+Enter (also: Alt+Enter,\n    Ctrl+Enter, or end the line with `\\` then press Enter).\n\n"
+            .into();
+    }
+    if std::env::var("ConEmuPID").is_ok() {
+        return "  ⓘ ConEmu detected. Newline: Ctrl+Enter (Shift+Enter is often\n    intercepted by ConEmu's host bindings; Alt+Enter toggles fullscreen by\n    default). Universal fallback: end the line with `\\` then press Enter.\n\n"
+            .into();
+    }
+    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    match term_program.as_str() {
+        "vscode" | "Cursor" => {
+            return "  ⓘ VSCode / Cursor terminal detected. Newline: Alt+Enter\n    (Shift+Enter may be intercepted by editor inline-suggestion bindings).\n    Universal fallback: end the line with `\\` then press Enter.\n\n"
+                .into();
+        }
+        "Hyper" => {
+            return "  ⓘ Hyper detected. Newline: Shift+Enter (also: Alt+Enter,\n    Ctrl+Enter, or end the line with `\\` then press Enter).\n\n"
+                .into();
+        }
+        "WezTerm" => {
+            return "  ⓘ WezTerm detected. Newline: Shift+Enter (also: Alt+Enter,\n    Ctrl+Enter, or end the line with `\\` then press Enter).\n\n"
+                .into();
+        }
+        _ => {}
+    }
+    "  ⓘ Newline insertion: try Shift+Enter, Alt+Enter, or Ctrl+Enter.\n    Universal fallback: end the line with `\\` then press Enter.\n\n".into()
+}
+
 impl Buffer {
     fn new() -> Self {
         Self {
@@ -1342,20 +1402,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // user feedback 2026-05-09 "全部展示的是…可以更精细化下").
     let kbd_hint_set = std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok();
     let legacy_conhost_set = std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok();
+    let jediterm_set = std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok();
     if kbd_hint_set {
         std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
     }
-    if kbd_hint_set && !legacy_conhost_set {
-        // Generic Kitty-not-negotiated hint. Single platform-agnostic
-        // copy — Mac terminals (iTerm2, modern Terminal.app, Alacritty,
-        // kitty) almost always negotiate the protocol successfully, so
-        // `kbd_enhanced=false` on macOS is a vanishing edge case that
-        // doesn't justify a separate platform branch. The trailing
-        // `\<Enter>` covers any host (mac or otherwise) that swallows
-        // modifier+Enter chords.
-        renderer.render(UiLine::CommandOutput(
-            "  ⓘ Newline insertion: try Shift+Enter, Alt+Enter, or Ctrl+Enter\n    (Windows Terminal / VSCode / mintty forward these without Kitty\n    CSI u). Universal fallback: end the line with `\\` then press Enter.\n\n".into(),
-        ));
+    // Suppress the standalone keyboard hint when either the legacy-
+    // conhost or JediTerm banner is firing — both of those banners
+    // include their own newline guidance, so dual-firing produced the
+    // wall-of-text the user flagged. Otherwise, dispatch on the host
+    // terminal's env-var fingerprint and emit chord advice tailored
+    // to that terminal: users reach for the right chord on first try
+    // instead of cycling through the generic Shift/Alt/Ctrl trio.
+    if kbd_hint_set && !legacy_conhost_set && !jediterm_set {
+        renderer.render(UiLine::CommandOutput(recommended_newline_chord_blurb()));
     }
 
     // JediTerm auto-fallback hint: lib.rs detected
@@ -1370,8 +1429,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // informed choices don't get lectured.
     if std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok() {
         std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
+        // Includes newline-insertion guidance because the keyboard hint
+        // is suppressed when this banner fires (see kbd_hint_set block
+        // above). JediTerm forwards Shift+Enter via xterm escapes even
+        // without negotiating Kitty CSI u, so name it as the primary
+        // chord here; trailing `\<Enter>` documented as universal
+        // fallback.
         renderer.render(UiLine::CommandOutput(
             "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
+            Newlines: Shift+Enter (also: Alt+Enter, Ctrl+Enter, or end the line\n    \
+            with `\\` then press Enter).\n    \
             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
             Native terminal scrollback is unavailable while atomcode runs;\n    \
             on exit your host terminal restores its pre-atomcode state.\n    \
@@ -1579,6 +1646,20 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     #[cfg(unix)]
     let mut sigcont =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGCONT))?;
+
+    // Windows-only OS-level Ctrl+C fallback. The keyboard path
+    // (crossterm KeyEvent → handle_input → 2-press confirm) is the
+    // primary route, but on legacy conhost the Ctrl+C keystroke is
+    // sometimes swallowed before reaching the input buffer when raw
+    // mode + ENABLE_VIRTUAL_TERMINAL_INPUT are both active — users
+    // report "completely no reaction" with no hint shown.
+    // `tokio::signal::windows::ctrl_c` hooks SetConsoleCtrlHandler so
+    // the OS signal still lands here regardless of whether the
+    // keystroke ever made it into the console input queue. Single-press
+    // exit on this path: when the keypress chain is broken, this is the
+    // user's only escape — a 2-press confirm would just trap them.
+    #[cfg(windows)]
+    let mut win_ctrl_c = tokio::signal::windows::ctrl_c()?;
 
     loop {
         #[cfg(unix)]
