@@ -25,6 +25,7 @@ pub mod stream;
 pub mod telemetry_bootstrap;
 pub mod tool;
 pub mod turn;
+pub mod uninstall;
 pub mod version_check;
 
 /// User-Agent identifier for every outbound HTTP request the app makes.
