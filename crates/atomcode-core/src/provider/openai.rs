@@ -403,8 +403,18 @@ impl LlmProvider for OpenAiProvider {
             "max_tokens": self.max_tokens,
         });
 
+        // Skip the `tools` field entirely for models known to reject it
+        // (OCR / embedding / reranker endpoints exposed via the same
+        // OpenAI-compatible gateway). Without this gate the upstream
+        // returns hard 400s like
+        //   {"code":20037,"message":"Function call is not supported for this model."}
+        // and atomcode emits the raw error twice (initial + resilience
+        // retry) — confusing for users who just want to chat / translate.
+        // See `provider::model_name_suggests_no_tools` for the matched
+        // patterns.
+        let omit_tools = crate::provider::model_name_suggests_no_tools(&self.model);
         if let Some(tool_defs) = tools {
-            if !tool_defs.is_empty() {
+            if !tool_defs.is_empty() && !omit_tools {
                 body["tools"] = json!(tool_defs
                     .iter()
                     .map(|td| json!({

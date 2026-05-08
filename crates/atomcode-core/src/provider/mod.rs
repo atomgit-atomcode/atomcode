@@ -334,9 +334,49 @@ pub fn model_name_suggests_vision(name: &str) -> bool {
         || n.contains("qvq")
 }
 
+/// Heuristic: does this model name look like a model that does NOT
+/// support function-calling / tool definitions in the request body?
+///
+/// Some specialised vision-language models (OCR, dedicated translation,
+/// embedding endpoints exposed via the same OpenAI-compatible gateway)
+/// reject every request that ships a `tools` array with a hard 400 like
+/// `{"code":20037,"message":"Function call is not supported for this model."}`.
+/// User asks "translate this image", atomcode dutifully attaches the
+/// full tool registry, the upstream rejects, the agent surfaces the
+/// raw 400 plus a "stream ended without close marker" pair (one for
+/// the original turn, one for the resilience-layer retry).
+///
+/// When this returns true, the OpenAI provider omits the `tools`
+/// field entirely; the model just sees text + (optional) image + a
+/// system prompt and replies in plain text. Suitable for chat-only /
+/// translation / OCR sessions where the user doesn't need the agent
+/// loop to drive any file edits.
+///
+/// Conservative — match obvious specialised-model name patterns only.
+/// False positives lose tool support for that model (the user can no
+/// longer have it run shell / read files), so the trade-off is worth
+/// it ONLY for models that genuinely can't accept tools. New patterns
+/// should be added when a fresh upstream surfaces the same 400 class.
+pub fn model_name_suggests_no_tools(name: &str) -> bool {
+    let n = name.to_lowercase();
+    // OCR families — Baidu PaddleOCR-VL series, Microsoft TrOCR, etc.
+    n.contains("paddleocr")
+        || n.contains("paddle-ocr")
+        || n.contains("trocr")
+        // Dedicated embedding endpoints exposed via OpenAI-compat
+        // gateways. These never accept tools either.
+        || n.contains("embedding")
+        || n.starts_with("bge-")
+        || n.contains("/bge-")
+        || n.starts_with("text-embedding-")
+        // Reranker endpoints (same pattern).
+        || n.contains("reranker")
+        || n.contains("rerank-")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{model_name_suggests_vision, unavailable_provider};
+    use super::{model_name_suggests_no_tools, model_name_suggests_vision, unavailable_provider};
 
     /// Test that auth token is loaded from the correct unified path.
     /// This prevents regressions where OAuth login token persistence breaks
@@ -496,5 +536,55 @@ mod tests {
         assert!(!model_name_suggests_vision("kimi-k2-thinking"));
         assert!(!model_name_suggests_vision("o1-preview")); // not a vision tag
         assert!(!model_name_suggests_vision(""));
+    }
+
+    // ── model_name_suggests_no_tools ──────────────────────────────
+
+    /// Regression for the user's exact failure: `paddlepaddle/PaddleOCR-VL-1.5`
+    /// returned `{"code":20037,"message":"Function call is not supported
+    /// for this model."}` because atomcode shipped the full tools array.
+    /// The heuristic must classify OCR / embedding / reranker model
+    /// names as no-tools so the OpenAI provider omits the field.
+    #[test]
+    fn no_tools_heuristic_recognises_ocr_and_embedding_models() {
+        // PaddleOCR family — the screenshot-49 case.
+        assert!(model_name_suggests_no_tools(
+            "paddlepaddle/PaddleOCR-VL-1.5"
+        ));
+        assert!(model_name_suggests_no_tools("PaddleOCR-VL-0.9"));
+        assert!(model_name_suggests_no_tools("paddle-ocr-v3"));
+        // Other OCR series.
+        assert!(model_name_suggests_no_tools("microsoft/trocr-base"));
+        // Embedding endpoints.
+        assert!(model_name_suggests_no_tools("text-embedding-3-small"));
+        assert!(model_name_suggests_no_tools("text-embedding-ada-002"));
+        assert!(model_name_suggests_no_tools("bge-m3"));
+        assert!(model_name_suggests_no_tools("BAAI/bge-large-en"));
+        assert!(model_name_suggests_no_tools(
+            "company.local/embedding-v1"
+        ));
+        // Reranker endpoints.
+        assert!(model_name_suggests_no_tools("bge-reranker-large"));
+        assert!(model_name_suggests_no_tools("rerank-multilingual-v3.0"));
+    }
+
+    /// Counterpart: regular chat / coding / vision models that DO
+    /// support tools must NOT be classified as no-tools (else we'd
+    /// silently drop tool defs and the agent loop would stop working
+    /// for the user's actual driver model).
+    #[test]
+    fn no_tools_heuristic_keeps_tool_capable_models() {
+        assert!(!model_name_suggests_no_tools("gpt-4o"));
+        assert!(!model_name_suggests_no_tools("claude-sonnet-4-6"));
+        assert!(!model_name_suggests_no_tools("claude-3-5-sonnet"));
+        assert!(!model_name_suggests_no_tools("deepseek-v4-flash"));
+        assert!(!model_name_suggests_no_tools("glm-5.1"));
+        // Vision models that DO support tools (Qwen-VL, Claude vision,
+        // GPT-4o etc.) must stay tool-capable — they're not OCR-only.
+        assert!(!model_name_suggests_no_tools("Qwen2-VL-7B"));
+        assert!(!model_name_suggests_no_tools("gpt-4-vision-preview"));
+        assert!(!model_name_suggests_no_tools("gemini-2.0-flash"));
+        assert!(!model_name_suggests_no_tools("kimi-k2-thinking"));
+        assert!(!model_name_suggests_no_tools(""));
     }
 }
