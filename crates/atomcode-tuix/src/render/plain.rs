@@ -383,9 +383,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::VisionPreprocessSuccess { msg, model } => {
                 // Plain mode loses styling distinctions; print
                 // message + model as one line, same indent as
-                // ImageAttachment.
+                // ImageAttachment, then a blank line so the next
+                // event's output reads as a separate paragraph.
                 self.drop_transient();
                 let _ = writeln!(self.out, "  {}  {}", msg, model);
+                let _ = writeln!(self.out);
             }
         }
     }

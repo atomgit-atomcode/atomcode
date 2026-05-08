@@ -2334,10 +2334,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // handles the two styles in a single visual line and
                 // continues onto wrapped rows with the prefix's display
                 // width as continuation pad.
+                //
+                // Trailing blank: without it the next event's row (e.g.
+                // `● Pondering…` spinner or assistant text) butts right
+                // up against the success notice — user reported it felt
+                // too cramped. The blank lets the success line breathe
+                // as its own paragraph.
                 let default_style = CellStyle::default();
                 let muted_style = self.style_for(Role::Muted);
                 let prefix = format!("{msg}  ");
                 self.push_body_prefixed(&prefix, &default_style, &model, &muted_style);
+                self.push_body_row(Vec::new());
             }
         }
         // Phase 5: widget state updated → mark frame dirty. No

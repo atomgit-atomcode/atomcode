@@ -1451,7 +1451,11 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // model. Loses the gray styling but preserves the
                 // information. Acceptable for the alt-screen path
                 // (used in non-retained terminals).
+                //
+                // Trailing blank: paragraph separation before the next
+                // event (spinner / assistant text). Mirrors retained.
                 self.push_command_output(&format!("{}  {}", msg, model));
+                self.push_body_row(String::new());
             }
             UiLine::Error(msg) => {
                 self.push_error(&msg);
