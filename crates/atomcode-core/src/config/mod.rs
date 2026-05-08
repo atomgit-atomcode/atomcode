@@ -133,6 +133,30 @@ pub struct Config {
     pub vision_preprocessor_provider: Option<String>,
 }
 
+impl Config {
+    /// True iff attaching an image to the active turn will reach a model
+    /// that can process it — either the active provider accepts images
+    /// directly, or `vision_preprocessor_provider` points at a real entry
+    /// in `providers` that will OCR them before forwarding. Used by the
+    /// TUIX Ctrl+V paste gate to decide whether to accept the image or
+    /// reject with the "switch to a vision-capable model" hint.
+    pub fn can_handle_attached_images(&self) -> bool {
+        let active_accepts = self
+            .providers
+            .get(&self.default_provider)
+            .map(|p| p.accepts_images())
+            .unwrap_or(false);
+        if active_accepts {
+            return true;
+        }
+        let vp_key = match self.vision_preprocessor_provider.as_deref() {
+            Some(k) if !k.is_empty() => k,
+            _ => return false,
+        };
+        self.providers.contains_key(vp_key)
+    }
+}
+
 /// Controls the per-turn markdown datalog writer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatalogConfig {
@@ -896,6 +920,100 @@ mod tests {
         );
     }
 
+    /// Helper: minimal Config with one provider, configurable model name +
+    /// optional preprocessor key. Used by the can_handle_attached_images tests.
+    fn cfg_with(active_model: &str, preprocessor_key: Option<&str>) -> Config {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "active".to_string(),
+            crate::config::provider::ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: Some("sk-test".into()),
+                model: active_model.into(),
+                base_url: Some("http://127.0.0.1/".into()),
+                system_prompt: None,
+                user_agent: None,
+                context_window: 8000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral: false,
+            },
+        );
+        Config {
+            default_provider: "active".into(),
+            default_workdir: None,
+            providers,
+            datalog: Default::default(),
+            auto_update: true,
+            notifications: Default::default(),
+            telemetry: Default::default(),
+            lsp: Default::default(),
+            auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: preprocessor_key.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn can_handle_attached_images_true_when_active_provider_accepts_images() {
+        // Vision-capable main provider — preprocessor irrelevant.
+        let cfg = cfg_with("claude-sonnet-4-5", None);
+        assert!(cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn can_handle_attached_images_false_for_text_only_main_and_no_preprocessor() {
+        // The original gate's behaviour: refuse paste.
+        let cfg = cfg_with("deepseek-v4-flash", None);
+        assert!(!cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn can_handle_attached_images_false_when_preprocessor_key_does_not_resolve() {
+        // Configured but the key is missing from `providers`. Must NOT
+        // accept the paste — the user would just hit `[图片识别失败]` on
+        // every send. Better to surface the error at paste time.
+        let cfg = cfg_with("deepseek-v4-flash", Some("NoSuchProvider"));
+        assert!(!cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn can_handle_attached_images_false_when_preprocessor_key_is_empty_string() {
+        let cfg = cfg_with("deepseek-v4-flash", Some(""));
+        assert!(!cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn can_handle_attached_images_true_when_preprocessor_resolves() {
+        // Main is text-only but a preprocessor is configured + present.
+        let mut cfg = cfg_with("deepseek-v4-flash", Some("vl-helper"));
+        cfg.providers.insert(
+            "vl-helper".into(),
+            crate::config::provider::ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: Some("sk-vl".into()),
+                model: "Qwen/Qwen3-VL-32B-Instruct".into(),
+                base_url: Some("http://127.0.0.1/".into()),
+                system_prompt: None,
+                user_agent: None,
+                context_window: 8000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral: false,
+            },
+        );
+        assert!(cfg.can_handle_attached_images());
+    }
 }
 
 #[cfg(test)]

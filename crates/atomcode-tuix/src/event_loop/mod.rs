@@ -2188,16 +2188,12 @@ fn handle_input(
                 // Ctrl+V never arrives as a key event there.
                 if text.trim().is_empty() {
                     if let Some((img, hash)) = try_paste_clipboard_image() {
-                        let supports = ctx
-                            .config
-                            .providers
-                            .get(&ctx.config.default_provider)
-                            .map(|p| p.accepts_images())
-                            .unwrap_or(false);
-                        if !supports {
+                        if !ctx.config.can_handle_attached_images() {
                             renderer.render(UiLine::Error(format!(
-                                "Current model \"{}\" does not appear to support image input. \
-                                 Use /model to switch to a vision-capable model.",
+                                "Current model \"{}\" does not support image input and no \
+                                 vision_preprocessor_provider is configured. Use /model to \
+                                 switch to a vision-capable model, or set \
+                                 vision_preprocessor_provider in config.",
                                 ctx.model_name
                             )));
                             renderer.flush();
@@ -2779,22 +2775,20 @@ fn handle_idle_key(
     // Ctrl+V: try clipboard image first, fall back to text paste.
     if code == KeyCode::Char('v') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         if let Some((img, hash)) = try_paste_clipboard_image() {
-            // Refuse to attach an image when the active model almost
-            // certainly can't accept one — sending it anyway burns a
-            // turn on a 400 from the upstream's param validator (e.g.
+            // Refuse to attach an image when there is no path for it to
+            // reach a vision-capable model — neither the active provider
+            // accepts images, nor a vision_preprocessor is configured to
+            // OCR them first. Without this gate, sending burns a turn on
+            // a 400 from the upstream's param validator (e.g.
             // ModelArts.81001 "message[N].content[0] has invalid
-            // field(s): text, type" for GLM-5.1). Gated by the model-name
-            // heuristic in `provider::model_name_suggests_vision`.
-            let supports = ctx
-                .config
-                .providers
-                .get(&ctx.config.default_provider)
-                .map(|p| p.accepts_images())
-                .unwrap_or(false);
-            if !supports {
+            // field(s): text, type" for GLM-5.1). Helper in
+            // `Config::can_handle_attached_images`.
+            if !ctx.config.can_handle_attached_images() {
                 renderer.render(UiLine::Error(format!(
-                    "Current model \"{}\" does not appear to support image input. \
-                     Use /model to switch to a vision-capable model.",
+                    "Current model \"{}\" does not support image input and no \
+                     vision_preprocessor_provider is configured. Use /model to \
+                     switch to a vision-capable model, or set \
+                     vision_preprocessor_provider in config.",
                     ctx.model_name
                 )));
                 renderer.flush();
