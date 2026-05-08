@@ -7,6 +7,10 @@
 #   ATOMCODE_VERSION   release tag to install (default: v4.21.2)
 #   ATOMCODE_PREFIX    install dir (absolute path; default: /usr/local/bin if writable,
 #                        else ~/.local/bin). On HarmonyOS as non-root, default is ~/.local/bin.
+# IMPORTANT: when changing install paths, the PATH-rc edit format, or filenames here,
+# also update scripts/uninstall.sh AND
+# crates/atomcode-core/src/uninstall/paths.rs. The CI parity test guards
+# the manifest, but binary path / rc-edit format are not checked.
 set -eu
 
 VERSION="${ATOMCODE_VERSION:-v4.21.2}"
