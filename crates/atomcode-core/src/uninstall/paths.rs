@@ -14,15 +14,15 @@ pub fn atomcode_dir() -> PathBuf {
 }
 
 /// Filenames inside `~/.atomcode/` that the uninstaller knows about, grouped.
-pub struct Manifest {
+pub struct UninstallManifest {
     pub credential_files: &'static [&'static str],
     pub state_files: &'static [&'static str],
     pub state_dirs: &'static [&'static str],
     pub state_prefixes: &'static [&'static str],
 }
 
-pub fn manifest() -> Manifest {
-    Manifest {
+pub fn uninstall_manifest() -> UninstallManifest {
+    UninstallManifest {
         credential_files: &["auth.toml", "mcp.json", "config.toml", "ATOMCODE.md"],
         state_files: &[
             "history",
@@ -80,15 +80,18 @@ pub fn windows_install_dir_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn atomcode_dir_under_home() {
-        // We don't override $HOME here — just sanity-check the suffix.
+        // Note: with no $HOME this returns "./.atomcode" — test passes vacuously then.
         let p = atomcode_dir();
         assert!(p.ends_with(".atomcode"), "got {:?}", p);
     }
 
     #[test]
+    #[serial]
     fn atomcode_home_override_wins() {
         std::env::set_var("ATOMCODE_HOME_OVERRIDE", "/tmp/override");
         assert_eq!(atomcode_dir(), std::path::PathBuf::from("/tmp/override"));
@@ -97,7 +100,7 @@ mod tests {
 
     #[test]
     fn manifest_groups_credentials_correctly() {
-        let m = manifest();
+        let m = uninstall_manifest();
         for f in ["auth.toml", "mcp.json", "config.toml", "ATOMCODE.md"] {
             assert!(m.credential_files.contains(&f), "missing {f}");
         }
@@ -105,7 +108,7 @@ mod tests {
 
     #[test]
     fn manifest_groups_state_correctly() {
-        let m = manifest();
+        let m = uninstall_manifest();
         for f in ["history", "input_history.txt", "recent_dirs.txt",
                   "codingplan_sync.json", "device_id"] {
             assert!(m.state_files.contains(&f), "missing {f}");
