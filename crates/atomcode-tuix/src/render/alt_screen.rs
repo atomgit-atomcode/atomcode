@@ -1432,7 +1432,18 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // spaces explicitly here. Mirrors retained's render
                 // visually: same `└` column, same indent under the
                 // parent user message.
+                //
+                // Tight grouping: `push_user` always emits a trailing
+                // blank spacer row. Pop it if present so the attachment
+                // sits flush under the user message (no orphan blank
+                // between `❯ msg` and `└ [Image #N]`), then re-emit a
+                // fresh trailing blank so the next turn's content still
+                // has paragraph separation.
+                if self.body_lines.last().map_or(false, |r| r.is_empty()) {
+                    self.body_lines.pop();
+                }
                 self.push_command_output(&format!("  └ [Image #{}]", n));
+                self.push_body_row(String::new());
             }
             UiLine::Error(msg) => {
                 self.push_error(&msg);

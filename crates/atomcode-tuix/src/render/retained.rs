@@ -2297,8 +2297,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // PAD_COL (2 spaces), so emitting "└ [Image #N]" lands
                 // the glyph at col 2. Muted style — visually
                 // subordinate to the user message it's anchoring.
+                //
+                // Tight grouping: `UiLine::User` always emits a trailing
+                // blank spacer row. Pop it if present so the attachment
+                // sits flush under the user message (no orphan blank
+                // between `❯ msg` and `└ [Image #N]`), then re-emit a
+                // fresh trailing blank so the next turn's content still
+                // has paragraph separation.
+                if self.body_lines.last().map_or(false, |r| r.is_empty()) {
+                    self.body_lines.pop();
+                }
                 let body = format!("└ [Image #{}]", n);
                 self.push_body_text(&body, &self.style_for(Role::Muted));
+                self.push_body_row(Vec::new());
             }
         }
         // Phase 5: widget state updated → mark frame dirty. No
