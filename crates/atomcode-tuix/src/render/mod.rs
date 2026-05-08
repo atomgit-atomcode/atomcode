@@ -99,6 +99,11 @@ pub enum UiLine {
         detail: String,
     },
     Error(String),
+    /// Non-fatal advisory line (yellow). Visually distinct from `Error`
+    /// so the user can tell "we saw something fishy and want you to
+    /// know" apart from "the turn died." Currently used by the OpenAI
+    /// provider's truncation detector.
+    Warning(String),
     TurnCancelled,
     TurnComplete,
     /// Legacy single-line spinner (kept for tests / PlainRenderer fallback).

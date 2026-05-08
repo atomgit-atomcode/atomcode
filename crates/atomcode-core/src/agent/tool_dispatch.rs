@@ -236,6 +236,10 @@ impl AgentLoop {
             TurnEvent::Error(e) => {
                 let _ = self.event_tx.send(AgentEvent::Error(e));
             }
+            TurnEvent::Warning(w) => {
+                self.datalog.log_warning(&w);
+                let _ = self.event_tx.send(AgentEvent::Warning(w));
+            }
             TurnEvent::WorkingDirChanged(new_dir) => {
                 // The tool itself (change_dir / bash cd) already mutated
                 // the shared `ctx.working_dir`. Just surface the new path

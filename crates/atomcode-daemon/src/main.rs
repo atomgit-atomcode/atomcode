@@ -2055,6 +2055,17 @@ async fn process_chat_request(
             TurnEvent::Error(e) => {
                 let _ = event_tx.send(ChatEvent::Error { message: e });
             }
+            TurnEvent::Warning(w) => {
+                // Non-fatal advisory — surface as an Error-shaped event
+                // for now (HTTP API clients only need to see it; we're
+                // not adding a dedicated `Warning` event variant on the
+                // wire until a consumer asks for it). Prefix makes the
+                // advisory nature explicit in case a client renders the
+                // string verbatim.
+                let _ = event_tx.send(ChatEvent::Error {
+                    message: format!("[warning] {}", w),
+                });
+            }
             TurnEvent::ContextStats { .. } => {
                 // Ignore context stats in API mode
             }

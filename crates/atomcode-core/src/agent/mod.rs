@@ -227,6 +227,11 @@ pub enum AgentEvent {
     },
     /// An error occurred.
     Error(String),
+    /// Non-fatal advisory from a provider or other subsystem. UI renders
+    /// this as a one-line yellow banner; does not abort the turn.
+    /// Currently sourced from the OpenAI provider's truncation detector
+    /// when the proxy reports implausibly few prompt_tokens.
+    Warning(String),
     /// Sub-agent batch began. `tasks` is the ordered list of children
     /// the dispatcher is about to fork — same order as the resulting
     /// `SubAgentTaskDone`/`SubAgentTaskFailed` events will arrive in,
@@ -1724,6 +1729,10 @@ impl AgentLoop {
                                 }
                                 TurnEvent::Error(e) => {
                                     let _ = event_tx.send(AgentEvent::Error(e));
+                                }
+                                TurnEvent::Warning(w) => {
+                                    datalog.log_warning(&w);
+                                    let _ = event_tx.send(AgentEvent::Warning(w));
                                 }
                                 TurnEvent::WorkingDirChanged(new_dir) => {
                                     // A tool (change_dir / bash cd) mutated the shared

@@ -331,6 +331,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::DiffBlock(_) => "DiffBlock",
         UiLine::ApprovalPrompt { .. } => "ApprovalPrompt",
         UiLine::Error(_) => "Error",
+        UiLine::Warning(_) => "Warning",
         UiLine::TurnCancelled => "TurnCancelled",
         UiLine::TurnComplete => "TurnComplete",
         UiLine::Spinner { .. } => "Spinner",

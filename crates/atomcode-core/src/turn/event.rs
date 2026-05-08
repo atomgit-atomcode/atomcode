@@ -59,6 +59,10 @@ pub enum TurnEvent {
     },
     /// Non-fatal error during execution
     Error(String),
+    /// Non-fatal advisory surfaced from a provider or other subsystem.
+    /// TUI renders this as a one-line yellow banner; no turn failure.
+    /// Currently used for "provider may be truncating input" detection.
+    Warning(String),
     /// Token usage update
     TokenUsage {
         prompt_tokens: usize,

@@ -1190,6 +1190,20 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         self.push_body_row(row);
     }
 
+    fn push_warning(&mut self, msg: &str) {
+        self.flush_assistant_remainder();
+        let safe = scrub_controls(msg);
+        // Bold yellow `! …` advisory. Visually softer than the red
+        // [Error: …] but still high-contrast — meant to be impossible
+        // to scroll past without noticing.
+        let row = if self.caps.colors {
+            format!("\x1b[1;33m! {}{}", safe, SGR_RESET)
+        } else {
+            format!("! {}", safe)
+        };
+        self.push_body_row(row);
+    }
+
     /// `(cancelled)` marker row.
     fn push_cancelled(&mut self) {
         self.flush_assistant_remainder();
@@ -1369,6 +1383,9 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             }
             UiLine::Error(msg) => {
                 self.push_error(&msg);
+            }
+            UiLine::Warning(msg) => {
+                self.push_warning(&msg);
             }
 
             // ── footer: input box ──

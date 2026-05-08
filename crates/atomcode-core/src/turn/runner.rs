@@ -616,6 +616,15 @@ impl TurnRunner {
                                         tel_return!(TurnResult::Failed(e), 0u32);
                                     }
 
+                                    Some(Ok(StreamEvent::Warning(w))) => {
+                                        // Advisory only — keep streaming. The
+                                        // TUI surfaces this to the user so a
+                                        // truncating proxy is visible at the
+                                        // moment of the bad request, not three
+                                        // hours later in the datalog.
+                                        let _ = event_tx.send(TurnEvent::Warning(w));
+                                    }
+
                                     Some(Err(e)) => {
                                         conversation.finalize_stream();
                                         tel_return!(TurnResult::Failed(e.to_string()), 0u32);

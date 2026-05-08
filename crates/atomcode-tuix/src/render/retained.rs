@@ -2254,6 +2254,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let body = format!("[Error: {}]", scrub_controls(&msg));
                 self.push_body_text(&body, &err_style);
             }
+            UiLine::Warning(msg) => {
+                // Yellow advisory — distinct from Error (red) so users
+                // can tell "noticed something" from "turn died". Renders
+                // with a `!` glyph + bold yellow body. Always-visible:
+                // we deliberately don't dim it because the whole point
+                // is to put a truncating-proxy or similar provider
+                // pathology in front of the user immediately.
+                let warn_style = CellStyle {
+                    fg: Some(crossterm::style::Color::Yellow),
+                    bold: true,
+                    ..CellStyle::default()
+                };
+                let body = format!("! {}", scrub_controls(&msg));
+                self.push_body_text(&body, &warn_style);
+            }
             UiLine::CommandOutput(text) => {
                 let safe = scrub_controls(&text);
                 self.push_body_text(&safe, &CellStyle::default());
