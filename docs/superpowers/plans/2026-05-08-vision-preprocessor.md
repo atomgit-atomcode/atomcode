@@ -16,7 +16,7 @@ Full design at `docs/superpowers/specs/2026-05-08-vision-preprocessor-design.md`
 
 - Trigger = `!model_name_suggests_vision(provider.model_name())` AND `!images.is_empty()` AND config field is `Some(non_empty)`.
 - VL receives **only** the current-turn caption + images; no main-conversation history.
-- VL output appended to user text wrapped as `"\n\n[图片内容（由 Qwen3-VL 识别）]\n{text}"`. Original images dropped.
+- VL output appended to user text wrapped as `"\n\n[图片内容（由 VL 模型识别）]\n{text}"`. Original images dropped.
 - On failure: append `"\n\n[图片识别失败]"` to user text, drop images, emit `AgentEvent::Warning(...)`, continue the turn.
 - Config field: `vision_preprocessor_provider: Option<String>` at top level of `Config`; `None`/empty string → feature off.
 
@@ -188,7 +188,7 @@ pub enum PreprocessOutcome {
     Skipped,
     /// VL call succeeded. `text` is the raw VL output (no wrapping). Caller
     /// is responsible for splicing it into the user message — recommended
-    /// shape: `format!("{caption}\n\n[图片内容（由 Qwen3-VL 识别）]\n{text}")`
+    /// shape: `format!("{caption}\n\n[图片内容（由 VL 模型识别）]\n{text}")`
     /// — and clearing the images vec.
     Replaced { text: String },
     /// VL call failed (provider missing, network error, timeout, empty
@@ -864,9 +864,9 @@ Replace with:
                 PreprocessOutcome::Skipped => (clean, images),
                 PreprocessOutcome::Replaced { text } => {
                     let merged = if clean.is_empty() {
-                        format!("[图片内容（由 Qwen3-VL 识别）]\n{text}")
+                        format!("[图片内容（由 VL 模型识别）]\n{text}")
                     } else {
-                        format!("{clean}\n\n[图片内容（由 Qwen3-VL 识别）]\n{text}")
+                        format!("{clean}\n\n[图片内容（由 VL 模型识别）]\n{text}")
                     };
                     (merged, Vec::new())
                 }
@@ -997,7 +997,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 4. Add a top-level `vision_preprocessor_provider = "AtomGit-Qwen-Qwen3-VL-32B-Instruct"` (or whatever key you used).
 5. `/model AtomGit-DeepSeek-V4-flash` (or any non-vision provider).
 6. Ctrl+V paste a code-screenshot, append caption "解释这段代码", press Enter.
-7. **Expected:** scrollback shows the user message containing both `解释这段代码` and a `[图片内容（由 Qwen3-VL 识别）]\n...` block; `/datalog tail` shows the request to DeepSeek is plain text only (no `image_url` block); main model replies coherently about the code.
+7. **Expected:** scrollback shows the user message containing both `解释这段代码` and a `[图片内容（由 VL 模型识别）]\n...` block; `/datalog tail` shows the request to DeepSeek is plain text only (no `image_url` block); main model replies coherently about the code.
 8. Comment out `vision_preprocessor_provider` in config and re-run step 6. **Expected:** DeepSeek receives `[image attached]` placeholder (existing fallback path); main model has no image context.
 9. Set `vision_preprocessor_provider = "AtomGit-NoSuchModel"` (typo). Re-run step 6. **Expected:** yellow `Warning` line: `VL 预处理失败：VL provider 'AtomGit-NoSuchModel' not found in config.providers`; user message ends with `[图片识别失败]`; main model still replies (asking for clarification, presumably).
 10. With `/model claude-sonnet-4-5` (vision-capable) and `vision_preprocessor_provider` set, re-run step 6. **Expected:** preprocessing skipped (no Notice, no `[图片内容...]` wrapper); image goes natively to Claude.

@@ -56,7 +56,7 @@ pub enum PreprocessOutcome {
     /// 不需要做预处理：未配置、主 provider 已支持视觉、images 为空 —— 上层走原路径。
     Skipped,
     /// VL 调用成功，`text` 是 VL 原始输出（未做包裹）。上层负责把 `text` 接到 caption 后、
-    /// 清空 images、决定包裹文案（如 `"\n\n[图片内容（由 Qwen3-VL 识别）]\n{text}"`）。
+    /// 清空 images、决定包裹文案（如 `"\n\n[图片内容（由 VL 模型识别）]\n{text}"`）。
     Replaced { text: String },
     /// VL 调用失败（找不到 provider、网络错误、超时、空响应）。reason 用于 Notice 日志；
     /// 上层应清空 images，按降级文案 `[图片识别失败：{reason}]` 拼接。
@@ -94,7 +94,7 @@ vision_preprocessor::maybe_preprocess(config, &*provider, &clean, &images)
    │     → (clean, images) 不变 → 走原 MultiPart 路径
    │
    ├── Replaced { text }
-   │     → clean = format!("{clean}\n\n[图片内容（由 Qwen3-VL 识别）]\n{text}")
+   │     → clean = format!("{clean}\n\n[图片内容（由 VL 模型识别）]\n{text}")
    │       images = vec![]
    │       → 走纯文本路径 add_user_message(&clean)
    │
@@ -172,7 +172,7 @@ let (clean, images) = if !images.is_empty() {
     ).await {
         PreprocessOutcome::Skipped => (clean, images),
         PreprocessOutcome::Replaced { text } => (
-            format!("{clean}\n\n[图片内容（由 Qwen3-VL 识别）]\n{text}"),
+            format!("{clean}\n\n[图片内容（由 VL 模型识别）]\n{text}"),
             vec![],
         ),
         PreprocessOutcome::Failed { reason } => {
@@ -191,7 +191,7 @@ let (clean, images) = if !images.is_empty() {
 
 ## UX
 
-VL 调用通常 1–3s，主模型在等待期间无任何输出，用户体验类似"卡死"。在 `maybe_preprocess` 入口（即将真正发起 HTTP 之前）发一条 `AgentEvent::Notice("正在用 Qwen3-VL 识别图片…")`，让 TUIX 显示一条临时状态行。VL 完成后用户消息正常落入 scrollback 时，临时状态行被覆盖。
+VL 调用通常 1–3s，主模型在等待期间无任何输出，用户体验类似"卡死"。在 `maybe_preprocess` 入口（即将真正发起 HTTP 之前）发一条 `AgentEvent::Notice("正在用 VL 模型识别图片…")`，让 TUIX 显示一条临时状态行。VL 完成后用户消息正常落入 scrollback 时，临时状态行被覆盖。
 
 **待实现期确认**：现有 `AgentEvent` 枚举是否已有合适的 Notice / Status 变体；若没有，在实现 PR 中新增 `AgentEvent::VisionPreprocessing { stage: VisionStage }`，`stage = Started | Completed | Failed`，TUIX 端做对应渲染。这部分细节不阻塞 design 评审，留给写 plan 时确定。
 
@@ -233,8 +233,8 @@ VL 调用通常 1–3s，主模型在等待期间无任何输出，用户体验�
 4. `/model AtomGit-DeepSeek-V4-flash`（或其它 `!accepts_images()` 的 entry）。
 5. Ctrl+V 粘一张代码截图，附 caption "解释这段代码"，回车。
 6. 期望：
-   - scrollback 出现 "正在用 Qwen3-VL 识别图片…" 状态行。
-   - 用户消息以 `解释这段代码\n\n[图片内容（由 Qwen3-VL 识别）]\n...` 形式落入对话。
+   - scrollback 出现 "正在用 VL 模型识别图片…" 状态行。
+   - 用户消息以 `解释这段代码\n\n[图片内容（由 VL 模型识别）]\n...` 形式落入对话。
    - DeepSeek 收到的请求体（用 `/datalog tail` 验证）只有纯文本，无 `image_url` 块。
    - 主模型回答合理。
 7. 关掉 `vision_preprocessor_provider`，重复步骤 5。
