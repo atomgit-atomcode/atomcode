@@ -3641,7 +3641,7 @@ fn handle_agent_event(
                 // back to no-op if the group has been frozen —
                 // model still gets the full ToolResult through the
                 // conversation.
-                let child_glyph = if state.unicode_symbols { "⎿" } else { "\\" };
+                let child_glyph = if state.unicode_symbols { "└" } else { "\\" };
                 let arrow = if state.unicode_symbols { "→" } else { "->" };
                 let suffix = if success {
                     let n = output.lines().count().max(1);
@@ -4097,12 +4097,20 @@ fn handle_agent_event(
             // - CON: user doesn't see batch contents until first child
             //   completes. Acceptable: footer spinner conveys "working",
             //   contents become visible immediately on first result.
-            // CC-aligned glyphs: ⏺ for batch header (filled circle),
-            // ⎿ for each child row (pipe-corner). Windows-legacy
-            // fallback: > and \ keeps the layout intact when SGR
-            // glyphs render as tofu.
-            let head_glyph = if state.unicode_symbols { "⏺" } else { ">" };
-            let child_glyph = if state.unicode_symbols { "⎿" } else { "\\" };
+            // Glyphs: ● (BLACK CIRCLE U+25CF) for batch header,
+            // └ (BOX DRAWINGS LIGHT UP AND RIGHT U+2514) for each
+            // child row. Picked over ⏺/⎿ because Cascadia Code
+            // (Windows VSCode default) renders ⏺ as a flat oval and
+            // ⎿ as a backslash-shaped fallback -- both are widely
+            // supported monospace glyphs that survive the same fonts
+            // where the dental-symbols block tofu's. Aligns with the
+            // single-tool-call ● glyph (retained::ToolCall arm) so
+            // batched and single calls share one visual anchor, and
+            // with `└` for tool-result rows below the call.
+            // Windows-legacy fallback: > and \ keeps the layout
+            // intact when even these render as tofu.
+            let head_glyph = if state.unicode_symbols { "●" } else { ">" };
+            let child_glyph = if state.unicode_symbols { "└" } else { "\\" };
             // Build header + child rows; renderer keeps the group
             // "live" while it's the bottom of body_lines, so each
             // ToolCallResult below can update the matching child row

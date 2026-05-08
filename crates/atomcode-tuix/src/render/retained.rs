@@ -2168,19 +2168,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     format!("✗ {}", safe)
                 };
-                // Align the `⎿` glyph with the `B` of the `Bash` (or
+                // Align the `└` glyph with the `B` of the `Bash` (or
                 // any tool name) in the row above: the tool-call row is
-                // `▸ Bash(...)` with `▸` at col 0 and the tool name at
-                // col 2, so the result prefix `"  ⎿ "` (2 spaces +
-                // glyph + space) lands `⎿` at col 2 — visually anchored
-                // under the tool name. Matches Claude Code's tool-result
-                // alignment (screenshot 46) and reads tighter than the
-                // previous 4-space indent which left `⎿` floating two
-                // cols past the tool name. Width reserves PAD_COL for
-                // the right gutter + 4 for the prefix `"  ⎿ "`.
+                // `● Bash(...)` with `●` at col 0 and the tool name at
+                // col 2, so the result prefix `"  └ "` (2 spaces +
+                // glyph + space) lands `└` at col 2 — visually anchored
+                // under the tool name. Width reserves PAD_COL for
+                // the right gutter + 4 for the prefix `"  └ "`. Was
+                // `⎿` (U+23BF, dental symbols block) but Cascadia Code
+                // and other Windows monospace defaults render it as a
+                // backslash-shaped fallback glyph (user screenshot
+                // showed `\` instead of corner). `└` (U+2514, Box
+                // Drawing block) ships in every monospace font.
                 let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 4);
                 // Muted (dim gray) for the result prefix — visually subordinate
-                // to the tool-call header above (▸ ToolName).
+                // to the tool-call header above (● ToolName).
                 let prefix_style = self.style_for(Role::Muted);
                 for (line_idx, phys) in body_str.split('\n').enumerate() {
                     // First physical line of a failure body is the
@@ -2203,7 +2205,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     };
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        push_str_cells(&mut row, "  ⎿ ", &prefix_style);
+                        push_str_cells(&mut row, "  └ ", &prefix_style);
                         push_str_cells(&mut row, &chunk, line_style);
                         self.push_body_row(row);
                     }
@@ -2304,7 +2306,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Other symbol rows hold '▸' (tool call) or '❯' (user turn)
         // at col 0 — distinct glyphs. All remaining body rows
         // (assistant prose, errors, cmd output, diff, turn separator
-        // with '─' at col 2, tool result with '⎿' at col 4) have
+        // with '─' at col 2, tool result with '└' at col 4) have
         // whitespace at col 0. None match '▶'. Checking the tail is
         // safe because the agent doesn't append further body rows
         // between `ApprovalNeeded` and the user's Y/A/N reply.
@@ -4219,7 +4221,7 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        let found = vterm.any_row(|row| row.contains("⎿") && row.contains("3 files changed"));
+        let found = vterm.any_row(|row| row.contains("└") && row.contains("3 files changed"));
         assert!(found, "tool result missing\ndump:\n{}", vterm.dump());
     }
 
@@ -4248,11 +4250,11 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let row_idx = (0..vterm.height() as usize)
-            .find(|&i| vterm.row_text(i).contains("⎿") && vterm.row_text(i).contains("3 files"))
+            .find(|&i| vterm.row_text(i).contains("└") && vterm.row_text(i).contains("3 files"))
             .unwrap_or_else(|| panic!("tool result row missing\ndump:\n{}", vterm.dump()));
         assert_eq!(
             vterm.cell_at(row_idx, 2).ch,
-            '⎿',
+            '└',
             "tool-result glyph must land at col 2, got row: {:?}\ndump:\n{}",
             vterm.row_text(row_idx),
             vterm.dump()
@@ -4325,7 +4327,7 @@ mod tests {
                     panic!("[{tool_name}] tool call row missing\ndump:\n{}", vterm.dump())
                 });
             let result_row = (0..vterm.height() as usize)
-                .find(|&i| vterm.row_text(i).contains("⎿"))
+                .find(|&i| vterm.row_text(i).contains("└"))
                 .unwrap_or_else(|| {
                     panic!("[{tool_name}] tool result row missing\ndump:\n{}", vterm.dump())
                 });
@@ -4340,16 +4342,16 @@ mod tests {
                     )
                 });
             let arrow_col = (0..vterm.width() as usize)
-                .find(|&c| vterm.cell_at(result_row, c).ch == '⎿')
+                .find(|&c| vterm.cell_at(result_row, c).ch == '└')
                 .unwrap_or_else(|| {
                     panic!(
-                        "[{tool_name}] '⎿' not found on result row: {:?}",
+                        "[{tool_name}] '└' not found on result row: {:?}",
                         vterm.row_text(result_row)
                     )
                 });
             assert_eq!(
                 arrow_col, name_col,
-                "[{tool_name}] result '⎿' col {} must match tool name {:?} col {} \
+                "[{tool_name}] result '└' col {} must match tool name {:?} col {} \
                  (tool row: {:?}, result row: {:?})",
                 arrow_col,
                 first_char,
