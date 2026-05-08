@@ -4022,6 +4022,31 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
+        AgentEvent::RestorePendingImages { images } => {
+            // VL preprocessing failed — re-attach the user's images to
+            // the input state so they can retry without re-pasting from
+            // clipboard. The `[Image #N]` text marker is gone (lives in
+            // the conversation history echo at this point), so the user
+            // typically UP-recalls or retypes the caption + Enter to
+            // resubmit. The attached image bytes ride along automatically
+            // with the next submit.
+            //
+            // Hash table is rebuilt as best-effort: we hash the base64
+            // payload (not raw RGBA), which means a fresh clipboard copy
+            // of the same image won't dedupe against this restored entry.
+            // Minor UX nit, not a correctness issue.
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            for img in images {
+                let mut hasher = DefaultHasher::new();
+                img.data.hash(&mut hasher);
+                state.pending_image_hashes.push(hasher.finish());
+                state.pending_images.push(img);
+            }
+            // Don't redraw — TUI is in Streaming phase here (turn isn't
+            // over yet); the next idle/streaming redraw picks up the new
+            // pending state on its own.
+        }
         AgentEvent::TokenUsage(u) => {
             state.prompt_tokens += u.prompt_tokens;
             state.completion_tokens += u.completion_tokens;

@@ -232,6 +232,15 @@ pub enum AgentEvent {
     /// Currently sourced from the OpenAI provider's truncation detector
     /// when the proxy reports implausibly few prompt_tokens.
     Warning(String),
+    /// VL preprocessing failed; the agent is returning the user's pending
+    /// images so the TUI can re-attach them to the input state. Lets the
+    /// user retry the same image without re-pasting from clipboard. Hashes
+    /// are TUI-side state, so the renderer recomputes them from the
+    /// returned base64 bytes (best-effort; clipboard-equality dedup may
+    /// fire on a fresh paste of the same image — minor UX, not breaking).
+    RestorePendingImages {
+        images: Vec<crate::conversation::message::ImagePart>,
+    },
     /// Sub-agent batch began. `tasks` is the ordered list of children
     /// the dispatcher is about to fork — same order as the resulting
     /// `SubAgentTaskDone`/`SubAgentTaskFailed` events will arrive in,
@@ -1289,7 +1298,16 @@ impl AgentLoop {
                     (merged, Vec::new())
                 }
                 PreprocessOutcome::Failed { reason } => {
-                    vision_warning = Some(format!("VL 预处理失败：{reason}"));
+                    vision_warning = Some(format!(
+                        "VL 预处理失败：{reason} · 图片已自动保留，可直接重试",
+                    ));
+                    // Layer-1 retry support: hand the image bytes back to
+                    // TUIX so the user doesn't have to re-paste from
+                    // clipboard. Without this the bytes are gone after
+                    // submit and Ctrl+V is the only way to re-attach.
+                    let _ = self.event_tx.send(AgentEvent::RestorePendingImages {
+                        images: images.clone(),
+                    });
                     let merged = if clean.is_empty() {
                         "[图片识别失败]".to_string()
                     } else {
