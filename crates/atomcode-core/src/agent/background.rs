@@ -90,6 +90,7 @@ async fn run_background_inner(
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::new(hooks)
         ),
+        loop_guard: Default::default(),
     };
 
     let mut conversation = Conversation::new();

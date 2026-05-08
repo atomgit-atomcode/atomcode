@@ -15,6 +15,7 @@ use crate::tool::{
 };
 
 use super::event::{TurnEvent, TurnResult};
+use super::loop_guard::{LoopGuardDecision, LoopGuardState};
 use super::permission::PermissionDecider;
 
 /// Core LLM streaming + tool execution primitive.
@@ -44,6 +45,11 @@ pub struct TurnRunner {
     pub recently_edited_files: Vec<String>,
     /// Hook executor — runs user-configured lifecycle hooks at tool execution boundaries.
     pub hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
+    /// Cross-batch tool-call loop guard. Cleared per user-message by the
+    /// agent (see `handle_send_message`); records every executed tool's
+    /// `(name, args, output_hash)` triple and short-circuits the third
+    /// identical attempt. See `loop_guard.rs` for the full rationale.
+    pub loop_guard: LoopGuardState,
 }
 
 impl TurnRunner {
@@ -719,7 +725,19 @@ impl TurnRunner {
             std::collections::HashMap::new();
         let mut is_dup: Vec<bool> = vec![false; tool_calls_buf.len()];
         for (i, call) in tool_calls_buf.iter().enumerate() {
-            let key = (call.name.clone(), call.arguments.clone());
+            // Key on the *canonicalised* argument JSON so that semantically
+            // identical calls with cosmetically different formatting collapse.
+            // Weak/streaming models routinely re-emit the same call with
+            // different whitespace, key order, or escape style:
+            //   {"pattern":"foo"}   vs   {"pattern": "foo"}
+            //   {"a":1,"b":2}       vs   {"b":2,"a":1}
+            // The byte-identical comparison below would treat those as
+            // distinct and let N ghost in-flight rows leak into the UI.
+            // serde_json::to_string with a BTreeMap-backed Value sorts keys
+            // and strips whitespace, so two formattings of the same object
+            // yield the same canonical string. Non-JSON args fall back to
+            // the raw string (no regression for free-form tools).
+            let key = (call.name.clone(), normalize_tool_args(&call.arguments));
             if seen_calls.contains_key(&key) {
                 is_dup[i] = true;
             } else {
@@ -785,6 +803,31 @@ impl TurnRunner {
                 continue;
             }
 
+            // ── Cross-batch loop guard ──
+            // The in-batch `is_dup` above only catches a model emitting
+            // the same call N times *within one assistant message*. The
+            // 22-identical-`Bash(cargo check)` symptom from weak models
+            // is the orthogonal case: identical (name, args) repeating
+            // across many sequential turns with no progress between.
+            // See `loop_guard.rs` for the false-positive avoidance rules
+            // (output-hash + state-change reset) that make this safe to
+            // gate before execution. Same ghost-row reasoning as is_dup:
+            // blocked attempts must not emit ToolCallStarted, otherwise
+            // the UI renders a spinner row that never receives a result.
+            if let LoopGuardDecision::Block(msg) =
+                self.loop_guard.check(&call.name, &call.arguments)
+            {
+                let result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: msg,
+                    // success=false so the model treats this as a soft
+                    // error and is more likely to change strategy.
+                    success: false,
+                };
+                conversation.add_tool_result(result);
+                continue;
+            }
+
             // Send ToolCallStarted event when the tool actually starts executing.
             // This ensures tool call and result are paired correctly in the UI.
             let _ = event_tx.send(TurnEvent::ToolCallStarted {
@@ -840,6 +883,14 @@ impl TurnRunner {
                     }
                 }
             }
+
+            // Record into the cross-batch loop guard. Must run on every
+            // real execution (success OR failure) so the next turn's
+            // check() sees the full history. The guard's own state-
+            // change reset rule lives inside record() — runner doesn't
+            // need to know the tool taxonomy.
+            self.loop_guard
+                .record(&call.name, &call.arguments, &result.output, result.success);
 
             conversation.add_tool_result(result);
         }
@@ -1239,6 +1290,29 @@ impl TurnRunner {
             session_id: String::new(),
             working_dir: wd,
         }
+    }
+}
+
+/// Canonicalise a tool-call `arguments` string for in-batch dedup keying.
+///
+/// Weak/streaming models routinely re-emit the same call with cosmetically
+/// different formatting — `{"pattern":"foo"}` vs `{"pattern": "foo"}` vs
+/// `{"a":1,"b":2}` vs `{"b":2,"a":1}`. Byte-comparison treats them as
+/// distinct, the in-batch `is_dup` misses, and N ghost ToolCallInFlight
+/// rows leak into the UI (the symptom from the deepseek-v4-flash
+/// screenshot: 2 empty `Glob(**/*.rs)` rows + 1 with body).
+///
+/// We re-parse and serialise compact. `serde_json::Map` is BTreeMap-backed
+/// when the `preserve_order` feature is off (it is — see workspace
+/// Cargo.toml), so object keys come out alphabetically — two re-orderings
+/// of the same object hash to the same canonical string. Non-JSON args
+/// (free-form text, garbage from broken streams) round-trip through the
+/// fallback unchanged so we don't regress free-form tools or accidentally
+/// merge two genuinely different malformed payloads.
+fn normalize_tool_args(args: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| args.to_string()),
+        Err(_) => args.to_string(),
     }
 }
 
@@ -1687,6 +1761,63 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     removed_ids
 }
 
+
+#[cfg(test)]
+mod normalize_tool_args_tests {
+    use super::normalize_tool_args;
+
+    #[test]
+    fn whitespace_variants_collapse() {
+        // The deepseek-v4-flash screenshot symptom: same call, different
+        // whitespace → must dedup.
+        let a = r#"{"pattern":"**/*.rs"}"#;
+        let b = r#"{"pattern": "**/*.rs"}"#;
+        let c = r#"{ "pattern":"**/*.rs" }"#;
+        let d = r#"{
+  "pattern": "**/*.rs"
+}"#;
+        let na = normalize_tool_args(a);
+        assert_eq!(normalize_tool_args(b), na);
+        assert_eq!(normalize_tool_args(c), na);
+        assert_eq!(normalize_tool_args(d), na);
+    }
+
+    #[test]
+    fn key_order_collapses() {
+        // serde_json::Map is BTreeMap-backed (no preserve_order feature),
+        // so re-serialising sorts keys alphabetically.
+        let a = r#"{"a":1,"b":2}"#;
+        let b = r#"{"b":2,"a":1}"#;
+        assert_eq!(normalize_tool_args(a), normalize_tool_args(b));
+    }
+
+    #[test]
+    fn nested_objects_normalize_recursively() {
+        let a = r#"{"outer":{"x":1,"y":2}}"#;
+        let b = r#"{"outer":{"y":2,"x":1}}"#;
+        assert_eq!(normalize_tool_args(a), normalize_tool_args(b));
+    }
+
+    #[test]
+    fn semantically_different_args_stay_different() {
+        // Don't over-collapse — different values must remain distinct so a
+        // legitimate batch of `Glob(**/*.rs)` + `Glob(**/*.toml)` doesn't
+        // dedup.
+        let a = r#"{"pattern":"**/*.rs"}"#;
+        let b = r#"{"pattern":"**/*.toml"}"#;
+        assert_ne!(normalize_tool_args(a), normalize_tool_args(b));
+    }
+
+    #[test]
+    fn non_json_args_pass_through_unchanged() {
+        // Free-form / malformed payloads must not panic or merge.
+        // (Two genuinely different garbage strings must stay distinct so
+        // we don't accidentally dedup unrelated calls.)
+        let raw = "not even json {{{";
+        assert_eq!(normalize_tool_args(raw), raw);
+        assert_ne!(normalize_tool_args("garbage A"), normalize_tool_args("garbage B"));
+    }
+}
 
 #[cfg(test)]
 mod tool_call_text_rescue_tests {

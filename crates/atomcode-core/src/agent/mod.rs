@@ -329,7 +329,6 @@ pub(crate) struct DisciplineState {
     pub model_produced_text: bool,
     pub silent_tool_rounds: usize,
     pub is_negative_feedback: bool,
-    pub recent_calls: Vec<(String, u64)>,
     pub build_fail_count: usize,
     pub scouting_count: usize,
     pub api_confirmed_working: bool,
@@ -653,6 +652,7 @@ impl AgentLoop {
             permission: interactive_permission,
             recently_edited_files: Vec::new(),
             hook_executor: hook_executor.clone(),
+            loop_guard: Default::default(),
         };
 
         // Capture session-start env snapshot (git status, branch, HEAD).
@@ -1278,10 +1278,14 @@ impl AgentLoop {
         self.turn_count = 0;
         self.retry_count = 0;
         self.emitted_tool_ids.clear();
-        self.discipline_state.recent_calls.clear();
         self.files_read_this_turn.clear();
         self.files_edited_this_turn.clear();
         self.turn_runner.recently_edited_files.clear();
+        // Cross-batch loop guard is scoped to a single user-message
+        // turn — every new user message = fresh slate. See
+        // `turn::loop_guard` for why this clear() is the entire
+        // per-turn-only contract on the caller side.
+        self.turn_runner.loop_guard.clear();
         self.discipline_state.consecutive_reads = 0;
         self.discipline_state.verify_injected = false;
         self.discipline_state.model_produced_text = false;
