@@ -336,4 +336,146 @@ mod tests {
             other => panic!("expected Replaced, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn failed_when_vl_returns_500() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream error"))
+            // Existing OpenAI provider may retry per its retry::RetryPolicy.
+            // Don't pin .expect(N); just assert the eventual outcome.
+            .mount(&server)
+            .await;
+
+        let mut cfg = blank_config();
+        cfg.providers.insert(
+            "vl".into(),
+            vl_provider_cfg(&format!("{}/", server.uri())),
+        );
+        cfg.vision_preprocessor_provider = Some("vl".into());
+
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result =
+            maybe_preprocess(&cfg, &provider, "x", &[sample_image()]).await;
+
+        match result {
+            PreprocessOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("VL call error") || reason.contains("500"),
+                    "expected error reason mentioning failure, got: {reason}",
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_when_vl_returns_empty_string() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_one_token("")), // empty token then [DONE]
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = blank_config();
+        cfg.providers.insert(
+            "vl".into(),
+            vl_provider_cfg(&format!("{}/", server.uri())),
+        );
+        cfg.vision_preprocessor_provider = Some("vl".into());
+
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result =
+            maybe_preprocess(&cfg, &provider, "x", &[sample_image()]).await;
+
+        match result {
+            PreprocessOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("empty"),
+                    "expected 'empty' in reason, got: {reason}",
+                );
+            }
+            other => panic!("expected Failed for empty response, got {other:?}"),
+        }
+    }
+
+    /// Custom matcher for request body containing a substring.
+    use wiremock::Match;
+    struct BodyContains(String);
+    impl Match for BodyContains {
+        fn matches(&self, req: &wiremock::Request) -> bool {
+            String::from_utf8_lossy(&req.body).contains(&self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn caption_is_included_in_vl_prompt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(BodyContains("用户的当前请求：解释这段代码".into()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_one_token("ok")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = blank_config();
+        cfg.providers.insert(
+            "vl".into(),
+            vl_provider_cfg(&format!("{}/", server.uri())),
+        );
+        cfg.vision_preprocessor_provider = Some("vl".into());
+
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result = maybe_preprocess(
+            &cfg,
+            &provider,
+            "解释这段代码",
+            &[sample_image()],
+        )
+        .await;
+
+        // Replaced confirms the body matched the caption pattern (otherwise
+        // wiremock would reject the request and the call would fail).
+        assert!(matches!(result, PreprocessOutcome::Replaced { .. }));
+    }
+
+    #[tokio::test]
+    async fn empty_caption_uses_pure_describe_prompt() {
+        let server = MockServer::start().await;
+        // Pure describe prompt — must NOT contain the "用户的当前请求：" prefix.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(BodyContains("请详细描述这张图片的内容".into()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_one_token("ok")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = blank_config();
+        cfg.providers.insert(
+            "vl".into(),
+            vl_provider_cfg(&format!("{}/", server.uri())),
+        );
+        cfg.vision_preprocessor_provider = Some("vl".into());
+
+        let provider = StubProvider { model: "deepseek-v4-flash" };
+        let result = maybe_preprocess(&cfg, &provider, "  ", &[sample_image()]).await;
+
+        assert!(matches!(result, PreprocessOutcome::Replaced { .. }));
+    }
 }
