@@ -80,6 +80,55 @@ fn normalize_path_entry(s: &str) -> String {
     trimmed.to_ascii_lowercase()
 }
 
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+}
+
+pub fn matches_atomcode_name(name: &str) -> bool {
+    let stripped = name.strip_suffix(".exe").unwrap_or(name);
+    matches!(stripped, "atomcode" | "atomcode-daemon")
+}
+
+/// List all atomcode-family processes excluding the calling process.
+pub fn list_atomcode_processes() -> Vec<ProcessInfo> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::new(),
+    );
+    let me = sysinfo::get_current_pid().ok();
+    let mut out = Vec::new();
+    for (pid, proc_) in sys.processes() {
+        if Some(*pid) == me { continue; }
+        let name = proc_.name().to_string_lossy();
+        if matches_atomcode_name(&name) {
+            out.push(ProcessInfo { pid: pid.as_u32(), name: name.into_owned() });
+        }
+    }
+    out
+}
+
+/// Best-effort kill (SIGTERM on Unix, TerminateProcess on Windows) by PID.
+pub fn kill_process(pid: u32) -> std::io::Result<()> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::new(),
+    );
+    if let Some(p) = sys.process(Pid::from_u32(pid)) {
+        if p.kill() {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::Other, format!("could not kill pid {pid}")))
+}
+
 #[cfg(test)]
 mod path_line_tests {
     use super::strip_atomcode_path_block;
@@ -210,5 +259,29 @@ mod windows_path_tests {
             r"C:\Users\theo\AppData\Local\AtomCode",
             r"C:\Users\theo\AppData\Local\AtomCode");
         assert_eq!(out, Some(r"C:\AtomCodeStuff\bin;C:\Windows".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[test]
+    fn excludes_self() {
+        let me = std::process::id();
+        let procs = list_atomcode_processes();
+        for p in procs {
+            assert_ne!(p.pid, me);
+        }
+    }
+
+    #[test]
+    fn name_matcher_recognizes_atomcode_variants() {
+        assert!(matches_atomcode_name("atomcode"));
+        assert!(matches_atomcode_name("atomcode.exe"));
+        assert!(matches_atomcode_name("atomcode-daemon"));
+        assert!(matches_atomcode_name("atomcode-daemon.exe"));
+        assert!(!matches_atomcode_name("vscode"));
+        assert!(!matches_atomcode_name("atomcode-stuff"));
     }
 }
