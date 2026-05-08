@@ -1617,8 +1617,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             let name = name.clone();
                             let tx = registry.event_sender();
                             tokio::spawn(async move {
+                                let list_timeout = registry.list_tools_timeout(&name).await;
                                 let server_tools = match tokio::time::timeout(
-                                    Duration::from_secs(15),
+                                    list_timeout,
                                     registry.list_tools_for_server(&name),
                                 )
                                 .await
@@ -1628,8 +1629,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                         if let Some(tx) = tx {
                                             let _ = tx.send(McpConnectEvent::Warning {
                                                 name,
-                                                message: "tools/list timed out after 15s during auto-registration"
-                                                    .to_string(),
+                                                message: format!(
+                                                    "tools/list timed out after {}s during auto-registration",
+                                                    list_timeout.as_secs()
+                                                ),
                                             });
                                         }
                                         return;
@@ -1861,8 +1864,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             let name = name.clone();
                             let tx = registry.event_sender();
                             tokio::spawn(async move {
+                                let list_timeout = registry.list_tools_timeout(&name).await;
                                 let server_tools = match tokio::time::timeout(
-                                    Duration::from_secs(15),
+                                    list_timeout,
                                     registry.list_tools_for_server(&name),
                                 )
                                 .await
@@ -1872,8 +1876,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                         if let Some(tx) = tx {
                                             let _ = tx.send(McpConnectEvent::Warning {
                                                 name,
-                                                message: "tools/list timed out after 15s during auto-registration"
-                                                    .to_string(),
+                                                message: format!(
+                                                    "tools/list timed out after {}s during auto-registration",
+                                                    list_timeout.as_secs()
+                                                ),
                                             });
                                         }
                                         return;
@@ -3687,30 +3693,56 @@ fn handle_agent_event(
             // DiffLine renders each trigger a full footer redraw and
             // tens of KB of ANSI, which blocks the event loop long
             // enough to stall the spinner during edit tool results.
-            let diff_entries: Vec<crate::render::DiffEntry> = output
-                .lines()
-                .take(120)
-                .filter_map(|line| {
-                    if let Some(rest) = line.strip_prefix("+ ") {
-                        Some(crate::render::DiffEntry {
-                            added: true,
-                            text: rest.to_string(),
-                        })
-                    } else if let Some(rest) = line.strip_prefix("- ") {
-                        Some(crate::render::DiffEntry {
-                            added: false,
-                            text: rest.to_string(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !diff_entries.is_empty() {
-                renderer.render(UiLine::DiffBlock(diff_entries));
+            //
+            // Gated on edit-class tools because the `+ ` / `- ` line
+            // detection is purely textual: markdown bullet lists
+            // (`- item`) inside non-edit tool outputs trip the same
+            // pattern. The deepseek-v4-flash screenshot symptom was a
+            // 162-line `UseSkill(brainstorming)` template — every `- `
+            // bullet got rendered as a removed-diff line and the whole
+            // skill body leaked into the scrollback. Restricting to
+            // tools that actually emit diff payloads (`edit_file`,
+            // `write_file`, `create_file`, `search_replace`) closes
+            // that without losing the diff render where it's wanted.
+            let emits_diff = matches!(
+                name.as_str(),
+                "edit_file" | "write_file" | "create_file" | "search_replace"
+            );
+            if emits_diff {
+                let diff_entries: Vec<crate::render::DiffEntry> = output
+                    .lines()
+                    .take(120)
+                    .filter_map(|line| {
+                        if let Some(rest) = line.strip_prefix("+ ") {
+                            Some(crate::render::DiffEntry {
+                                added: true,
+                                text: rest.to_string(),
+                            })
+                        } else if let Some(rest) = line.strip_prefix("- ") {
+                            Some(crate::render::DiffEntry {
+                                added: false,
+                                text: rest.to_string(),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !diff_entries.is_empty() {
+                    renderer.render(UiLine::DiffBlock(diff_entries));
+                }
             }
-            // Show hint for bash commands if real-time output is disabled
-            // Display AFTER the result so user sees the command first
+            // Show hint for bash commands if real-time output is disabled.
+            // Display AFTER the result so user sees the command first.
+            // Trailing `\n` is intentional: `push_body_text` splits on
+            // `\n` and the empty chunk after the `\n` pushes ONE blank
+            // row, which becomes the breathing-room separator between
+            // consecutive bash blocks. Without it adjacent bash results
+            // visually run together (screenshot 47.png) and the eye
+            // can't tell where one block ends and the next begins.
+            // The previous over-correction (screenshot 44 → 47) showed
+            // that "looks like 2 blank lines" is just font line-height
+            // padding — the actual row count is 1, which is correct.
             if name == "bash" && !state.show_tool_output {
                 renderer.render(UiLine::CommandOutput(
                     "  ◯ Press Ctrl+O to show real-time output\n".to_string(),

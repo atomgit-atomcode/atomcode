@@ -715,28 +715,50 @@ pub(super) fn execute_slash_command(
                     renderer.flush();
                     return Ok(());
                 }
-                if server != "github" {
+                let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
+                    Ok(configs) => configs,
+                    Err(e) => {
+                        renderer.render(UiLine::Error(format!(
+                            "  MCP OAuth login failed to load config: {:#}\n",
+                            e
+                        )));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                };
+                let Some(config) = configs.into_iter().find(|config| config.name == server) else {
                     renderer.render(UiLine::Error(format!(
-                        "  unsupported MCP OAuth provider/server: {}\n",
+                        "  MCP OAuth login failed: server '{}' not found in config.\n",
                         server
                     )));
                     renderer.flush();
                     return Ok(());
-                }
-                let Some(client_id) = std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok() else {
-                    renderer.render(UiLine::Error(
-                        "  GitHub MCP OAuth requires ATOMCODE_GITHUB_MCP_CLIENT_ID.\n".into(),
-                    ));
-                    renderer.flush();
-                    return Ok(());
                 };
-                renderer.render(UiLine::CommandOutput(
-                    "  Starting GitHub MCP OAuth in your browser...\n".into(),
-                ));
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  Starting MCP OAuth for '{}' in your browser...\n",
+                    server
+                )));
                 renderer.flush();
-                let scopes = Vec::<String>::new();
+                let is_github_server = matches!(
+                    &config.config,
+                    atomcode_core::mcp::McpTransportConfig::Http {
+                        auth: Some(atomcode_core::mcp::McpHttpAuthConfig::OAuth(auth)),
+                        ..
+                    } if auth.provider.as_deref() == Some("github")
+                );
                 let result = tokio::task::block_in_place(|| {
-                    atomcode_core::mcp::login_github_oauth(server, &client_id, &scopes)
+                    atomcode_core::mcp::login_mcp_oauth(
+                        &config,
+                        atomcode_core::mcp::McpOAuthLoginOptions {
+                            client_id: if is_github_server {
+                                std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok()
+                            } else {
+                                None
+                            },
+                            client_secret_env: None,
+                            scopes: Vec::new(),
+                        },
+                    )
                 });
                 match result {
                     Ok(token) => renderer.render(UiLine::CommandOutput(format!(
@@ -744,7 +766,7 @@ pub(super) fn execute_slash_command(
                         token.provider, server
                     ))),
                     Err(e) => renderer.render(UiLine::Error(format!(
-                        "  GitHub MCP OAuth failed: {:#}\n",
+                        "  MCP OAuth failed: {:#}\n",
                         e
                     ))),
                 }
@@ -874,8 +896,9 @@ pub(super) fn execute_slash_command(
                     let registry = registry.clone();
                     let tx = registry.event_sender();
                     tokio::spawn(async move {
+                        let list_timeout = registry.list_tools_timeout(&server).await;
                         let tools = match tokio::time::timeout(
-                            std::time::Duration::from_secs(15),
+                            list_timeout,
                             registry.list_tools_for_server(&server),
                         )
                         .await
@@ -885,9 +908,10 @@ pub(super) fn execute_slash_command(
                                 if let Some(tx) = &tx {
                                     let _ = tx.send(atomcode_core::mcp::McpConnectEvent::Warning {
                                         name: server.clone(),
-                                        message:
-                                            "tools/list timed out after 15s (server connected but tools not listed yet)"
-                                                .to_string(),
+                                        message: format!(
+                                            "tools/list timed out after {}s (server connected but tools not listed yet)",
+                                            list_timeout.as_secs()
+                                        ),
                                     });
                                 }
                                 return;

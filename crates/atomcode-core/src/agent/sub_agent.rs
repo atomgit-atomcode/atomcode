@@ -512,6 +512,7 @@ impl SubAgentTask {
             hook_executor: std::sync::Arc::new(
                 crate::hook::executor::HookExecutor::new(hooks)
             ),
+            loop_guard: Default::default(),
         };
 
         // 4. Event channel (we drain but don't forward — sub-agent is silent)

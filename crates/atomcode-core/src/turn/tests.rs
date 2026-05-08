@@ -345,6 +345,7 @@ fn make_runner(
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::empty()
         ),
+        loop_guard: Default::default(),
     }
 }
 
@@ -518,6 +519,55 @@ async fn test_turn_runner_unknown_tool_returns_error_result() {
         }
         other => panic!("Expected UsedTools, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_turn_runner_loop_guard_blocks_third_identical_call() {
+    // Integration-level pin for the cross-batch loop guard wired into
+    // `run_with_filter` (see runner.rs). Three sequential `run()`
+    // invocations using the same MockProvider produce three identical
+    // tool calls (same name + same args) with identical EchoTool
+    // output. The first two execute (so the model gets two "maybe
+    // this time will differ" chances on real flakes), the third must
+    // be short-circuited with a synthetic Loop guard ToolResult — no
+    // EchoTool output should appear in the third result.
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(EchoTool { name: "grep" })).await;
+    let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
+    let mut runner = make_runner(provider, tools, auto_bypass());
+    let mut conv = Conversation::new();
+    conv.add_user_message("search");
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    for _ in 0..3 {
+        runner
+            .run(&mut conv, "system", &tx, CancellationToken::new())
+            .await;
+    }
+
+    // Walk the conversation, collect every ToolResult body in order.
+    let mut results: Vec<String> = Vec::new();
+    for msg in &conv.messages {
+        if let crate::conversation::message::MessageContent::ToolResult(r) = &msg.content {
+            results.push(r.output.clone());
+        }
+    }
+    assert_eq!(results.len(), 3, "expected 3 tool results, got {}", results.len());
+    assert!(
+        results[0].contains("executed grep"),
+        "1st call should run normally, got: {:?}",
+        results[0]
+    );
+    assert!(
+        results[1].contains("executed grep"),
+        "2nd call should run normally, got: {:?}",
+        results[1]
+    );
+    assert!(
+        results[2].contains("Loop guard"),
+        "3rd identical call should be blocked by loop guard, got: {:?}",
+        results[2]
+    );
 }
 
 #[tokio::test]
@@ -1440,6 +1490,7 @@ mod telemetry_tests {
             hook_executor: std::sync::Arc::new(
                 crate::hook::executor::HookExecutor::empty()
             ),
+            loop_guard: Default::default(),
         };
         (runner, captured)
     }

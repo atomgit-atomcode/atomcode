@@ -448,6 +448,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// tool lines from `body_lines` first so the spinner animation
     /// replaces in-place rather than accumulating rows.
     fn render_inflight_tool(&mut self, icon: &str, name: &str, detail: &str) {
+        // Spinner ticks fire at ~80ms cadence and re-call this fn with a
+        // new icon glyph each time. The OLD implementation truncated
+        // `body_lines` and called `push_body_prefixed` → `push_body_row`
+        // → `emit_body_line_inner` which uses `\n` to scroll new content
+        // into the DECSTBM body region. The model-state truncation hid
+        // the leak from the existing in-process test (`body_lines.len()`
+        // stayed flat) but the *terminal output* path scrolled a fresh
+        // copy of the inflight row IN every tick. After ~30s of cargo
+        // build, the user's scrollback held 30+ identical
+        // `▸ Bash(... cargo build ...)` rows even though the model only
+        // emitted ONE call (verified via datalog).
+        //
+        // Fix: when re-rendering on top of a prior inflight render with
+        // matching row count (the 99% case — only the icon glyph
+        // changes, all 1-cell-wide), bypass `push_body_row` entirely.
+        // Position the cursor at each previously-rendered row, erase
+        // the line, write the new cells. No `\n`, no scroll, no
+        // scrollback growth — same approach `push_or_update_live_spinner`
+        // already uses for the ordinary spinner row.
+        //
+        // Fallback (`prev_rows == 0`, or row count differs because
+        // the terminal was resized between ticks) keeps the original
+        // scroll-push semantics so layout still settles correctly; the
+        // one-frame scrollback ghost on a resize is acceptable since
+        // it doesn't accumulate across ticks.
         let safe_name = scrub_controls(name);
         let safe_detail = scrub_controls(detail);
         let body_str = if safe_detail.is_empty() {
@@ -460,122 +485,53 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // This is a rendering safeguard only — the actual command
         // execution uses the original, untruncated arguments.
         let body_str = truncate_body_str(&body_str, 500);
-
-        // Build the rows the same way push_body_prefixed would, but
-        // without committing them yet. We need this so subsequent
-        // ticks can rewrite them in place without scrolling.
         let prefix = format!("{} ", icon);
         let prefix_style = self.style_for(Role::Muted);
         let body_style = self.style_bold(Role::ToolName);
         let new_rows = self.build_prefixed_rows(&prefix, &prefix_style, &body_str, &body_style);
 
-        // First tick (no previous inflight rows on screen): push
-        // normally — emit_body_line_inner scrolls and writes at body
-        // bottom, body_lines tracks them. The data side ends up
-        // matching what's on terminal.
-        //
-        // Subsequent tick (previous inflight rows already painted):
-        // CUP+EL+write at the SAME absolute terminal positions. NO
-        // scrolling, NO truncate-then-push (which used to leave the
-        // previous spinner frames piling up because emit_body_line_inner
-        // couldn't undo earlier scrolls — confirmed via 5/8 atomgr
-        // session: a long bash `find` wrapped to 2 rows produced one
-        // stacked row per spinner tick).
-        if self.inflight_tool_rows == 0 || new_rows.is_empty() {
-            // First-tick path. Just push and count.
-            let pushed = new_rows.len();
-            for row in new_rows {
-                self.push_body_row(row);
-            }
-            self.inflight_tool_rows = pushed;
-            return;
-        }
-
-        // In-place rewrite path.
-        let bottom = self.body_bottom_row();
-        let prev_n = self.inflight_tool_rows;
-        if bottom == 0 || (prev_n as u16) > bottom {
-            // Pathological viewport (footer ate the body) or count
-            // mismatch — fall back to truncate+push so we degrade to
-            // the old behaviour rather than write off-screen. The
-            // caller will see the stacking but at least nothing is
-            // garbled.
-            let remove = prev_n.min(self.body_lines.len());
+        let prev_rows = self.inflight_tool_rows;
+        let n = new_rows.len();
+        if n == 0 {
+            // Nothing to render (zero-width terminal etc.) — drop any
+            // prior inflight rows so state stays consistent.
+            let remove = prev_rows.min(self.body_lines.len());
             self.body_lines.truncate(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
-            let pushed = new_rows.len();
+            return;
+        }
+
+        self.ensure_scroll_region();
+        let bottom = self.body_bottom_row();
+        let inplace_ok = prev_rows > 0 && n == prev_rows && bottom >= n as u16;
+        if inplace_ok {
+            // In-place rewrite: the prior render's terminal rows are at
+            // (bottom - n + 1 ..= bottom). Update model state by
+            // swapping the trailing slice; then walk each terminal row
+            // with a position + erase + write triple.
+            let keep = self.body_lines.len().saturating_sub(prev_rows);
+            self.body_lines.truncate(keep);
+            let first = bottom - n as u16 + 1;
+            for (i, row) in new_rows.iter().enumerate() {
+                let r = first + i as u16;
+                let seq = format!("\x1b[{};1H\x1b[2K", r);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(row);
+                let _ = self.out.write_all(&bytes);
+                self.body_lines.push(row.clone());
+            }
+        } else {
+            // First render or row-count mismatch — fall back to scroll-push.
+            // Drop any prior inflight rows from model state; push new rows
+            // via the standard path so DECSTBM scrolling lands them at the
+            // bottom of the body region.
+            let remove = prev_rows.min(self.body_lines.len());
+            self.body_lines.truncate(self.body_lines.len() - remove);
             for row in new_rows {
                 self.push_body_row(row);
             }
-            self.inflight_tool_rows = pushed;
-            return;
         }
-        let first_term_row = bottom - prev_n as u16 + 1;
-
-        // Update body_lines in place: drop the prev_n entries and
-        // append new ones. Same total length only when new_rows.len()
-        // == prev_n (the common case — body_str is identical across
-        // ticks, only the icon char changes width 1→1).
-        let base = self.body_lines.len() - prev_n;
-        self.body_lines.truncate(base);
-        for row in &new_rows {
-            self.body_lines.push(row.clone());
-        }
-
-        // Terminal write: position cursor + EL + serialize each row.
-        // We always overwrite up to max(prev_n, new_rows.len()) rows
-        // so that any leftover rows from a longer prev frame get
-        // wiped (an icon character that happens to be wider could
-        // change wrap count; rare but cheap to be safe).
-        let total = prev_n.max(new_rows.len());
-        for i in 0..total {
-            let term_row = first_term_row + i as u16;
-            let cup_el = format!("\x1b[{};1H\x1b[K", term_row);
-            let _ = self.out.write_all(cup_el.as_bytes());
-            if let Some(row) = new_rows.get(i) {
-                let bytes = serialize_row(row);
-                let _ = self.out.write_all(&bytes);
-            }
-        }
-
-        self.inflight_tool_rows = new_rows.len();
-    }
-
-    /// Build the `prefix + body` rows the same way push_body_prefixed
-    /// emits them, but return them instead of pushing. Used by
-    /// `render_inflight_tool` to overwrite previous spinner rows in
-    /// place without going through push_body_row's scroll path.
-    fn build_prefixed_rows(
-        &self,
-        prefix: &str,
-        prefix_style: &CellStyle,
-        body: &str,
-        body_style: &CellStyle,
-    ) -> Vec<Vec<Cell>> {
-        let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
-        if w == 0 {
-            return Vec::new();
-        }
-        let prefix_w = crate::width::display_width(prefix);
-        let first_budget = w.saturating_sub(prefix_w);
-        let cont_pad: String = " ".repeat(prefix_w);
-        let mut out_rows = Vec::new();
-        let mut first_emitted = false;
-        for phys in body.split('\n') {
-            for chunk in crate::width::wrap_line_to_width(phys, first_budget.max(1)) {
-                let mut row = Vec::new();
-                let pad = CellStyle::default();
-                if !first_emitted {
-                    push_str_cells(&mut row, prefix, prefix_style);
-                    first_emitted = true;
-                } else {
-                    push_str_cells(&mut row, &cont_pad, &pad);
-                }
-                push_str_cells(&mut row, chunk.as_str(), body_style);
-                out_rows.push(row);
-            }
-        }
-        out_rows
+        self.inflight_tool_rows = n;
     }
 
     /// Pad a partially-built row with blank default-style cells until it
@@ -925,11 +881,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cursor_abs_row = (footer_top + 1 + cursor_row_in_middle + 1) as u16;
         let cursor_abs_col = (2 + cursor_col_in_row + 1) as u16;
         self.screen.set_cursor(cursor_abs_row, cursor_abs_col);
-        // Hide the terminal cursor while the body spinner is animating.
-        // Otherwise it sits at the end of "Pondering… · 5s" and blinks.
-        // render_diff reasserts DECTCEM every frame, so this single flip
-        // propagates correctly until the spinner clears.
-        self.screen.set_cursor_visible(!self.live_spinner_active);
+        // Hide the terminal cursor while EITHER a live spinner OR an
+        // inflight-tool row is animating. The inflight branch was added
+        // when `render_inflight_tool` switched to direct cursor-position
+        // writes (to fix the scrollback-leak bug): those writes leave
+        // the real terminal cursor at end-of-row, but `screen` doesn't
+        // know that since it bypasses the cell-diff path. Without
+        // hiding, the user sees a blinking caret floating at the right
+        // edge of the active `▸ Bash(...)` row in addition to the input
+        // box's caret. `inflight_tool.is_none()` flips back as soon as
+        // the call commits, so the cursor reappears at the input box on
+        // the very next 5ms paint tick.
+        let suppress_cursor = self.live_spinner_active || self.inflight_tool.is_some();
+        self.screen.set_cursor_visible(!suppress_cursor);
     }
 
     /// Footer total height — mirrors the computation inside
@@ -1390,6 +1354,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if w == 0 {
             return;
         }
+        // `text.split('\n')` on `"foo\n"` yields `["foo", ""]` and the
+        // empty chunk pushes a blank row. Callers rely on this to add
+        // a trailing breathing-row after their content (e.g. the
+        // bash `Ctrl+O` hint, status echoes from `/model`/`/login`).
+        // Internal `\n`s split into multiple rows. Don't pre-strip the
+        // trailing `\n` — that's a meaningful "give me a separator"
+        // signal at the call site, not noise.
         for phys in text.split('\n') {
             for chunk in crate::width::wrap_line_to_width(phys, w) {
                 let mut row = Vec::new();
@@ -1419,17 +1390,35 @@ impl<W: Write + Send> RetainedRenderer<W> {
         body: &str,
         body_style: &CellStyle,
     ) {
-        // Symbol-anchored rows (user echo, tool call, approval) sit
-        // flush-left at col 0 to align with the input-box chevron.
-        // We keep a PAD_COL right-gutter so long text never touches
-        // the terminal's right edge.
+        let rows = self.build_prefixed_rows(prefix, prefix_style, body, body_style);
+        for row in rows {
+            self.push_body_row(row);
+        }
+    }
+
+    /// Symbol-anchored row builder. Wraps `body` to `screen_width − PAD_COL`,
+    /// emits the leading row with `prefix`, continuation rows with a blank
+    /// pad of equal display width. Pure: no side effects on `body_lines`
+    /// or terminal output. Used by `push_body_prefixed` (which appends each
+    /// row via push_body_row) and `render_inflight_tool` (which writes
+    /// in-place over previously-rendered inflight rows during spinner
+    /// ticks — see that fn's doc comment for the scrollback-leak bug
+    /// this split addresses).
+    fn build_prefixed_rows(
+        &self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        body: &str,
+        body_style: &CellStyle,
+    ) -> Vec<Vec<Cell>> {
         let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
         if w == 0 {
-            return;
+            return Vec::new();
         }
         let prefix_w = crate::width::display_width(prefix);
         let first_budget = w.saturating_sub(prefix_w);
         let cont_pad: String = " ".repeat(prefix_w);
+        let mut rows = Vec::new();
         let mut first_emitted = false;
         for phys in body.split('\n') {
             let chunks: Vec<String> = crate::width::wrap_line_to_width(phys, first_budget.max(1))
@@ -1446,9 +1435,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, &cont_pad, &pad);
                 }
                 push_str_cells(&mut row, chunk.as_str(), body_style);
-                self.push_body_row(row);
+                rows.push(row);
             }
         }
+        rows
     }
 
     /// Flush complete lines (those terminated by `\n`) from the
@@ -2162,11 +2152,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 } else {
                     format!("✗ {}", safe)
                 };
-                // Indent result rows 4 cols past the tool-call row at
-                // col 0: "    ⎿ " is 4 spaces + glyph + space, so ⎿
-                // lands at col 4. Width reserves PAD_COL for the right
-                // gutter + 6 for "    ⎿ ".
-                let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 6);
+                // Align the `⎿` glyph with the `B` of the `Bash` (or
+                // any tool name) in the row above: the tool-call row is
+                // `▸ Bash(...)` with `▸` at col 0 and the tool name at
+                // col 2, so the result prefix `"  ⎿ "` (2 spaces +
+                // glyph + space) lands `⎿` at col 2 — visually anchored
+                // under the tool name. Matches Claude Code's tool-result
+                // alignment (screenshot 46) and reads tighter than the
+                // previous 4-space indent which left `⎿` floating two
+                // cols past the tool name. Width reserves PAD_COL for
+                // the right gutter + 4 for the prefix `"  ⎿ "`.
+                let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 4);
                 // Muted (dim gray) for the result prefix — visually subordinate
                 // to the tool-call header above (▸ ToolName).
                 let prefix_style = self.style_for(Role::Muted);
@@ -2191,7 +2187,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     };
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        push_str_cells(&mut row, "    ⎿ ", &prefix_style);
+                        push_str_cells(&mut row, "  ⎿ ", &prefix_style);
                         push_str_cells(&mut row, &chunk, line_style);
                         self.push_body_row(row);
                     }
@@ -3305,6 +3301,150 @@ mod tests {
         );
     }
 
+    /// Regression (datalog 2026-05-08_02-39-44 + screenshots 40.png/41.jpeg):
+    /// the model emitted ONE `cargo build 2>&1 | tail -5` call that ran
+    /// for 39.6s, but the user's terminal ended up with 30+ identical
+    /// `▸ Bash(...)` rows stacked in scrollback. Root cause was
+    /// `render_inflight_tool` calling `push_body_row` →
+    /// `emit_body_line_inner` whose default branch issues a `\n` to
+    /// scroll new content into the DECSTBM body region. Each spinner
+    /// tick (~80ms) emitted a fresh copy of the inflight row, scrolling
+    /// the previous tick's row up — those rows STAY in the terminal's
+    /// scrollback even after the renderer truncates them out of
+    /// `body_lines`. The pre-existing `retained_inflight_tool_row_*`
+    /// test only checked `body_lines.len()`; the actual leak was on
+    /// the terminal output stream.
+    ///
+    /// Fix: when re-rendering on top of a prior inflight render with
+    /// matching row count, write each row in-place via cursor-position +
+    /// erase-line (no `\n`, no scroll), so the terminal's scrollback
+    /// stays clean across ticks. This test captures the output bytes
+    /// and asserts their length doesn't blow up — a stream of N ticks
+    /// must produce at most O(N) bytes of update sequences, not O(N)
+    /// full row scrolls of accumulated content.
+    #[test]
+    fn retained_inflight_tool_does_not_grow_terminal_output_across_ticks() {
+        let term_w: u16 = 80;
+        let (mut r, buf) = new_capturing(term_w, 24);
+        let detail = "cd /Users/theo/Documents/workspace/atomcode && cargo build 2>&1 | tail -5";
+
+        // First render: pushes scroll-style (prev_rows=0 → fallback path).
+        r.render_inflight_tool("⠋", "bash", detail);
+        let bytes_after_first = buf.lock().unwrap().len();
+        assert!(
+            bytes_after_first > 0,
+            "first render must emit some bytes"
+        );
+
+        // Drain so subsequent measurements are tick-only.
+        buf.lock().unwrap().clear();
+
+        // Simulate 50 spinner ticks (~4 seconds at 80ms cadence). Each
+        // must take the in-place branch — no `\n`, no scroll, no
+        // accumulation. We bound the total bytes by the per-tick budget
+        // (~80 bytes for cursor-pos + erase + serialised row) times
+        // tick count + headroom for SGR resets and wrapped continuation
+        // rows. A scroll-leak would emit hundreds of bytes per tick
+        // (full row content + SGR + position) and blow this bound by
+        // an order of magnitude.
+        for i in 0..50 {
+            // Cycle through the standard braille spinner glyphs so the
+            // icon arg actually changes each call. Same display width,
+            // so prev_rows == new_rows and the in-place branch fires.
+            let icon = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][i % 10];
+            r.render_inflight_tool(icon, "bash", detail);
+        }
+        let bytes_per_tick = buf.lock().unwrap().len() / 50;
+        // ~150 bytes/tick is a comfortable upper bound for the in-place
+        // path (CUP + EL + serialised row + SGR resets, per wrapped row).
+        // The pre-fix scroll path emitted ~600+ bytes/tick on this input
+        // because each push_body_row scrolled and re-styled a fresh full
+        // row at body_bottom, plus DECSTBM scroll + cursor reposition.
+        assert!(
+            bytes_per_tick < 300,
+            "per-tick byte budget exceeded ({} bytes/tick, 50 ticks total \
+             {} bytes) — render_inflight_tool is scrolling fresh rows in \
+             instead of overwriting the existing ones",
+            bytes_per_tick,
+            buf.lock().unwrap().len()
+        );
+
+        // body_lines stays bounded too (existing invariant).
+        assert!(
+            r.body_lines.len() <= 4,
+            "body_lines grew to {} rows across 50 ticks — should stay at \
+             prev_rows count for in-place path",
+            r.body_lines.len()
+        );
+    }
+
+    /// Regression (screenshot 42.png): user reported a stray blinking
+    /// caret at the right edge of the active `▸ Bash(...)` row, sitting
+    /// alongside the legitimate input-box caret. Root cause: the
+    /// in-place path in `render_inflight_tool` writes raw cursor-position
+    /// bytes via `self.out.write_all` to overwrite each row, leaving the
+    /// terminal cursor at end-of-row. `paint_footer` repositions the
+    /// cell-model cursor to the input box but `set_cursor_visible(true)`
+    /// keeps the terminal blinking — so for every 5ms paint window
+    /// before the next CUP lands, the user saw two carets.
+    ///
+    /// Fix: hide the cursor whenever an inflight tool is active, in
+    /// addition to the existing live-spinner gate. `inflight_tool.is_none()`
+    /// flips back at commit time, so the cursor reappears at the input
+    /// box on the next paint without a leftover blink.
+    #[test]
+    fn retained_inflight_tool_hides_terminal_cursor() {
+        let term_w: u16 = 80;
+        let (mut r, buf) = new_capturing(term_w, 24);
+        let detail = "cd /Users/theo/Documents/workspace/atomcode && cargo check 2>&1 | tail -80";
+
+        // Seed input prompt + ToolCallInFlight so paint_footer has a
+        // sensible cursor position to consult.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.render(UiLine::ToolCallInFlight {
+            id: "call_1".into(),
+            name: "Bash".into(),
+            detail: detail.into(),
+        });
+        // A spinner tick to exercise the in-place branch.
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running Bash".into(),
+        });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            !vterm.cursor_visible(),
+            "terminal cursor must be hidden while a tool call is in flight \
+             (otherwise it blinks at end-of-row alongside the input caret)"
+        );
+
+        // Commit the inflight tool — cursor must come back at the next
+        // paint so the user sees their input-box caret again.
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call_1".into()),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "terminal cursor must be visible again after the inflight tool \
+             commits — `inflight_tool.is_none()` flips the gate back"
+        );
+    }
+
     /// Regression: user reported that after a terminal resize two
     /// footers appeared stacked on screen — old footer at pre-resize
     /// absolute rows kept its chars, new footer painted at new rows,
@@ -4028,10 +4168,14 @@ mod tests {
         assert!(found, "tool result missing\ndump:\n{}", vterm.dump());
     }
 
-    /// ToolResult `⎿` glyph sits at col 4 — four spaces indent under
-    /// the tool call at col 0, mirroring CC's nested-result layout.
+    /// ToolResult `⎿` glyph sits at col 2 — directly under the tool
+    /// name's leading character (a `▸ Bash(...)` row puts `▸` at col 0
+    /// and `B` at col 2, so the result body's `⎿` aligns vertically
+    /// with the `B`). Matches Claude Code's tool-result layout
+    /// (screenshot 46) and reads tighter than the previous 4-space
+    /// indent which left `⎿` floating two columns past the tool name.
     #[test]
-    fn retained_tool_result_arrow_at_col_4() {
+    fn retained_tool_result_arrow_at_col_2() {
         let (mut r, buf) = new_capturing(80, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
@@ -4052,19 +4196,111 @@ mod tests {
             .find(|&i| vterm.row_text(i).contains("⎿") && vterm.row_text(i).contains("3 files"))
             .unwrap_or_else(|| panic!("tool result row missing\ndump:\n{}", vterm.dump()));
         assert_eq!(
-            vterm.cell_at(row_idx, 4).ch,
+            vterm.cell_at(row_idx, 2).ch,
             '⎿',
-            "tool-result glyph must land at col 4, got row: {:?}\ndump:\n{}",
+            "tool-result glyph must land at col 2, got row: {:?}\ndump:\n{}",
             vterm.row_text(row_idx),
             vterm.dump()
         );
-        for c in 0..4 {
+        for c in 0..2 {
             assert_eq!(
                 vterm.cell_at(row_idx, c).ch,
                 ' ',
-                "cols 0..4 before ⎿ must be blank, col {} is {:?}",
+                "cols 0..2 before ⎿ must be blank, col {} is {:?}",
                 c,
                 vterm.cell_at(row_idx, c).ch,
+            );
+        }
+    }
+
+    /// End-to-end alignment pin: the `⎿` glyph of a `ToolResult` must
+    /// land in the same column as the first character of the tool
+    /// name in the `▸ Tool(...)` row directly above it. Catches future
+    /// drift in either the tool-call prefix (`"▸ "`) or the result
+    /// prefix (`"  ⎿ "`) — they have to stay coupled or the visual
+    /// "tool name ↔ ⎿ (its result)" anchor breaks.
+    ///
+    /// Iterates over a representative cross-section of tool types
+    /// (Bash, Grep, Glob, ReadFile, EditFile) — the result-row prefix
+    /// is dispatched from a single generic `UiLine::ToolResult` arm,
+    /// not branched on tool name, so any drift would surface here for
+    /// every tool simultaneously. Test names that are NOT verified
+    /// here (e.g. WriteFile, SearchReplace, TraceCallers) all share
+    /// the same code path — covering the cross-section is enough to
+    /// prove universality.
+    #[test]
+    fn retained_tool_result_arrow_aligns_for_every_tool_type() {
+        // Each entry: tool name + a sample summary. The first
+        // character of `name` is the alignment anchor on the tool-call
+        // row; the `⎿` on the result row must sit in the same column.
+        let cases: &[(&str, &str)] = &[
+            ("Bash", "[elapsed: 0.0s, exit: 0] (1 line)"),
+            ("Grep", "203 matches in 18 files"),
+            ("Glob", "12 files found:"),
+            ("ReadFile", "1| use anyhow::Result;"),
+            ("EditFile", "Edited /tmp/foo.rs (3 lines changed)"),
+        ];
+
+        for (tool_name, summary) in cases {
+            let (mut r, buf) = new_capturing(120, 24);
+            let mut vterm = crate::test_term::VirtualTerminal::new(120, 24);
+            let status = status_basic();
+            r.render(UiLine::ToolCall {
+                name: (*tool_name).into(),
+                detail: "args".into(),
+            });
+            r.render(UiLine::ToolResult {
+                success: true,
+                summary: (*summary).into(),
+            });
+            r.render(UiLine::InputPrompt {
+                buf: String::new(),
+                cursor_byte: 0,
+                menu: None,
+                status: status.clone(),
+            });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+
+            let tool_row = (0..vterm.height() as usize)
+                .find(|&i| {
+                    vterm.row_text(i).contains("▸") && vterm.row_text(i).contains(tool_name)
+                })
+                .unwrap_or_else(|| {
+                    panic!("[{tool_name}] tool call row missing\ndump:\n{}", vterm.dump())
+                });
+            let result_row = (0..vterm.height() as usize)
+                .find(|&i| vterm.row_text(i).contains("⎿"))
+                .unwrap_or_else(|| {
+                    panic!("[{tool_name}] tool result row missing\ndump:\n{}", vterm.dump())
+                });
+
+            let first_char = tool_name.chars().next().unwrap();
+            let name_col = (0..vterm.width() as usize)
+                .find(|&c| vterm.cell_at(tool_row, c).ch == first_char)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "[{tool_name}] first char {first_char:?} not found on tool row: {:?}",
+                        vterm.row_text(tool_row)
+                    )
+                });
+            let arrow_col = (0..vterm.width() as usize)
+                .find(|&c| vterm.cell_at(result_row, c).ch == '⎿')
+                .unwrap_or_else(|| {
+                    panic!(
+                        "[{tool_name}] '⎿' not found on result row: {:?}",
+                        vterm.row_text(result_row)
+                    )
+                });
+            assert_eq!(
+                arrow_col, name_col,
+                "[{tool_name}] result '⎿' col {} must match tool name {:?} col {} \
+                 (tool row: {:?}, result row: {:?})",
+                arrow_col,
+                first_char,
+                name_col,
+                vterm.row_text(tool_row),
+                vterm.row_text(result_row),
             );
         }
     }
@@ -4212,6 +4448,67 @@ mod tests {
         assert!(
             cell.fg.is_some(),
             "error text should have a foreground color"
+        );
+    }
+
+    /// Regression (screenshot 47.png): adjacent bash blocks with NO
+    /// blank line between them — the previous fix (screenshot 44)
+    /// over-corrected by stripping the trailing `\n` from the Ctrl+O
+    /// hint, removing the breathing-row separator. The `\n` IS
+    /// load-bearing: callers append it to mean "give me one blank row
+    /// after this for visual separation." Internal `\n`s split into
+    /// multiple rows; a trailing `\n` adds a single blank tail row.
+    #[test]
+    fn retained_command_output_trailing_newline_pushes_blank_separator() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let before = r.body_lines.len();
+        r.render(UiLine::CommandOutput(
+            "  ◯ Press Ctrl+O to show real-time output\n".into(),
+        ));
+        let pushed = r.body_lines.len() - before;
+        assert_eq!(
+            pushed, 2,
+            "trailing \\n must push 1 content row + 1 blank separator — \
+             expected 2 rows, got {}. Adjacent bash blocks rely on this \
+             blank to visually break apart in scrollback.",
+            pushed
+        );
+
+        // Confirm the second row is actually blank (whitespace only),
+        // so future drift in `wrap_line_to_width` for `""` would still
+        // be caught here.
+        let last = r.body_lines.last().unwrap();
+        assert!(
+            last.iter().all(|c| c.ch == ' '),
+            "second row must be whitespace-only, got: {:?}",
+            last.iter().map(|c| c.ch).collect::<String>()
+        );
+    }
+
+    /// Internal `\n`s split into rows (existing invariant — separate
+    /// from the trailing-`\n` behavior above): `"a\nb\nc"` is three
+    /// content rows, `"a\nb\nc\n"` is three content rows + one blank
+    /// tail row.
+    #[test]
+    fn retained_command_output_internal_newlines_split_into_rows() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let before = r.body_lines.len();
+        r.render(UiLine::CommandOutput("line one\nline two\nline three".into()));
+        let pushed = r.body_lines.len() - before;
+        assert_eq!(
+            pushed, 3,
+            "three internal lines, no trailing \\n → 3 rows, got {}",
+            pushed
+        );
+
+        // Trailing `\n` adds one blank to the existing three lines.
+        let before = r.body_lines.len();
+        r.render(UiLine::CommandOutput("a\nb\nc\n".into()));
+        let pushed = r.body_lines.len() - before;
+        assert_eq!(
+            pushed, 4,
+            "three internal lines + trailing \\n → 4 rows (3 content + 1 blank), got {}",
+            pushed
         );
     }
 

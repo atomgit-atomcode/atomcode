@@ -1893,6 +1893,7 @@ async fn process_chat_request(
         hook_executor: std::sync::Arc::new(atomcode_core::hook::executor::HookExecutor::new(
             atomcode_core::hook::json_config::load_hooks_config(&working_dir),
         )),
+        loop_guard: Default::default(),
     };
 
     // Build system prompt (minimal for API)
