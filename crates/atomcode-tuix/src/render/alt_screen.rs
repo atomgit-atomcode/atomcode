@@ -794,7 +794,25 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let _ = self.out.write_all(cup.as_bytes());
         let chev = self.caps.prompt_chevron();
         let buf_str = self.pending_input.as_ref().map(|(b, _)| b.as_str()).unwrap_or("");
-        let safe_buf = scrub_controls(buf_str).replace('\n', " ");
+        // Show `\n` as a visible marker so users typing `\<Enter>` (the
+        // line-continuation escape, used when Shift/Alt+Enter are
+        // swallowed by the host terminal — typical on Windows
+        // cmd.exe / legacy conhost without Kitty keyboard protocol)
+        // get visual feedback that the newline was inserted.
+        // Replacing with a plain space made the input box render
+        // `abc def` regardless of whether the user typed a space or
+        // `\<Enter>`, so users on Windows cmd reported "shift+enter
+        // / alt+enter / \<Enter> 都无法换行" — they had no UI signal
+        // that `\<Enter>` actually worked. `↵` (U+21B5) is one
+        // display cell in modern fonts; ASCII fallback uses two
+        // chars `\n` so the marker stays readable on legacy conhost
+        // with NSimSun.
+        let nl_marker = if self.caps.unicode_symbols {
+            "↵"
+        } else {
+            "\\n"
+        };
+        let safe_buf = scrub_controls(buf_str).replace('\n', nl_marker);
         let max_cols = (self.width as usize).saturating_sub(chev.chars().count());
         let trimmed = truncate_to_width(&safe_buf, max_cols);
         let input_line = if self.caps.colors {
@@ -1127,19 +1145,38 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     }
 
     /// User echo row: `❯ {text}` (or `> {text}` on dumb caps) + blank
-    /// spacer. Resets markdown state so a previous turn's stuck-open
-    /// fence / buffered table can't bleed into this turn's prose.
+    /// spacer. Multi-line input (`\<Enter>` line-continuation,
+    /// Shift/Alt+Enter on terminals that disambiguate, paste with
+    /// embedded newlines) splits each physical line into its own
+    /// body row — `paint_body` CUPs every body line to a distinct
+    /// terminal row, so a single body string with embedded `\n`
+    /// would corrupt the alt-screen layout: the literal LF in raw
+    /// mode advances row but not column, then the next paint_body
+    /// iteration CUP+EL-erases whatever landed below. Windows cmd
+    /// users reported "abc<\><Enter>def" submitted as echo only
+    /// showed `❯ abc`, the `def` flashed and disappeared.
+    /// Continuation lines indent under the chevron-and-space prefix
+    /// so multi-line user messages read as one paragraph rather than
+    /// orphaned rows.
     fn push_user(&mut self, text: &str) {
         self.flush_assistant_remainder();
         self.md_state.reset();
         let chev = self.caps.prompt_chevron();
         let safe = scrub_controls(text);
-        let row = if self.caps.colors {
-            format!("{}{}{}{}", SGR_CYAN, chev, SGR_RESET, safe)
-        } else {
-            format!("{}{}", chev, safe)
-        };
-        self.push_body_row(row);
+        let chev_w = crate::width::display_width(chev);
+        let cont_pad: String = " ".repeat(chev_w);
+        for (i, line) in safe.split('\n').enumerate() {
+            let row = if i == 0 {
+                if self.caps.colors {
+                    format!("{}{}{}{}", SGR_CYAN, chev, SGR_RESET, line)
+                } else {
+                    format!("{}{}", chev, line)
+                }
+            } else {
+                format!("{}{}", cont_pad, line)
+            };
+            self.push_body_row(row);
+        }
         self.push_body_row(String::new());
     }
 
@@ -1709,6 +1746,38 @@ mod tests {
         assert!(
             s.contains("/tmp/proj"),
             "welcome banner must include the working dir. got: {:?}",
+            s
+        );
+    }
+
+    /// Multiline user input (`\<Enter>` on terminals that swallow
+    /// Shift/Alt+Enter — typical Windows cmd.exe / legacy conhost,
+    /// where the modifier bits never reach the application — plus
+    /// pasted content with embedded newlines) MUST split into one
+    /// body row per physical line. Was a single body string with
+    /// embedded `\n`, which `paint_body` writes verbatim — the
+    /// terminal interprets LF as row-advance, and the next CUP+EL
+    /// for the following body row erases whatever landed there.
+    /// User-reported on Windows cmd: "abc<\><Enter>def" submitted as
+    /// echo only showed `❯ abc`, the `def` flashed and disappeared.
+    #[test]
+    fn push_user_splits_on_newline_into_separate_body_rows() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::User("first\nsecond\nthird".into()));
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("first"), "first line missing. got: {:?}", s);
+        assert!(s.contains("second"), "second line missing. got: {:?}", s);
+        assert!(s.contains("third"), "third line missing. got: {:?}", s);
+        // No raw `\n` survives into a single painted body row —
+        // `paint_body` CUPs each row independently, so multi-line
+        // echo must emit each line through `push_body_row` separately.
+        assert!(
+            !s.contains("first\nsecond"),
+            "multiline echo must not embed raw \\n in a single body row \
+             (would corrupt alt-screen layout). got: {:?}",
             s
         );
     }
