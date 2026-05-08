@@ -374,6 +374,12 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     let _ = self.out.write_all(b"\n");
                 }
             }
+            UiLine::ImageAttachment(n) => {
+                // Plain mode echoes attachment markers with the same
+                // 2-space indent as the TTY renderers, then a newline.
+                self.drop_transient();
+                let _ = writeln!(self.out, "  └ [Image #{}]", n);
+            }
         }
     }
 

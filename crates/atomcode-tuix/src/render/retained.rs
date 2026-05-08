@@ -2291,6 +2291,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let safe = scrub_controls(&text);
                 self.push_body_text(&safe, &CellStyle::default());
             }
+            UiLine::ImageAttachment(n) => {
+                // `└` at col 2, under the `[` of `[Image #N]` in the
+                // user-message echo above. push_body_text auto-prefixes
+                // PAD_COL (2 spaces), so emitting "└ [Image #N]" lands
+                // the glyph at col 2. Muted style — visually
+                // subordinate to the user message it's anchoring.
+                let body = format!("└ [Image #{}]", n);
+                self.push_body_text(&body, &self.style_for(Role::Muted));
+            }
         }
         // Phase 5: widget state updated → mark frame dirty. No
         // paint, no emit. The event loop's 5ms tick (via

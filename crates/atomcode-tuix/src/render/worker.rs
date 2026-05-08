@@ -340,6 +340,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::InputPrompt { .. } => "InputPrompt",
         UiLine::InputCommit => "InputCommit",
         UiLine::CommandOutput(_) => "CommandOutput",
+        UiLine::ImageAttachment(_) => "ImageAttachment",
         UiLine::TurnSeparator { .. } => "TurnSeparator",
     }
 }

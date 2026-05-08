@@ -1423,6 +1423,17 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             UiLine::CommandOutput(text) => {
                 self.push_command_output(&text);
             }
+            UiLine::ImageAttachment(n) => {
+                // `└` at col 2, aligned under the `[` of `[Image #N]`
+                // in the user-message echo above (push_user prefixes
+                // `❯ ` so user content starts at col 2). alt-screen's
+                // push_command_output passes through verbatim — no
+                // PAD_COL auto-prefix — so we emit the leading 2
+                // spaces explicitly here. Mirrors retained's render
+                // visually: same `└` column, same indent under the
+                // parent user message.
+                self.push_command_output(&format!("  └ [Image #{}]", n));
+            }
             UiLine::Error(msg) => {
                 self.push_error(&msg);
             }

@@ -144,6 +144,17 @@ pub enum UiLine {
     InputCommit,
     /// Slash-command output (arbitrary text, already sanitised by caller).
     CommandOutput(String),
+    /// Image-attachment echo (`└ [Image #N]`). Emitted right after the
+    /// `UiLine::User` row that contains the matching `[Image #N]`
+    /// marker, so each renderer can align the `└` glyph at the same
+    /// column as the `[` of the marker in the user message above
+    /// (col 2). A dedicated variant rather than `CommandOutput` so
+    /// alignment stays consistent across renderers — retained's
+    /// `push_body_text` auto-prefixes PAD_COL (2 spaces) but
+    /// alt-screen's `push_command_output` does not, so the same
+    /// CommandOutput payload would land at col 2 in one and col 4
+    /// (or col 0) in the other.
+    ImageAttachment(usize),
     /// A visible separator between turns: `────── {label} ──────`.
     TurnSeparator {
         label: String,

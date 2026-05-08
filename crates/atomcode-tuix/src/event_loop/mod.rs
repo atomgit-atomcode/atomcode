@@ -2968,16 +2968,16 @@ fn handle_idle_key(
                 for (i, img) in pending.into_iter().enumerate() {
                     let n = i + 1;
                     if line.contains(&format!("[Image #{}]", n)) {
-                        // Format string has NO leading space — push_body_text
-                        // already prepends PAD_COL (2 spaces) to every row,
-                        // so emitting "└ [Image #N]" lands `└` at col 2,
-                        // directly under the `[` of `[Image #N]` from the
-                        // user-message echo above (`❯` col 0, ` ` col 1,
-                        // `[` col 2). Was "  └ ..." which double-indented
-                        // to col 4 — user reported `└` floating two cols
-                        // right of the `[` it was meant to anchor under.
-                        renderer
-                            .render(UiLine::CommandOutput(format!("└ [Image #{}]", n)));
+                        // Dedicated UiLine variant so each renderer
+                        // can position `└` at col 2 — directly under
+                        // the `[` of `[Image #N]` from the user-message
+                        // echo above. CommandOutput would have been
+                        // simpler but the two renderers have different
+                        // auto-indent behaviour (retained's
+                        // push_body_text prepends PAD_COL, alt-screen's
+                        // push_command_output passes through verbatim),
+                        // so a single format string can't satisfy both.
+                        renderer.render(UiLine::ImageAttachment(n));
                         images.push(img);
                     }
                 }
