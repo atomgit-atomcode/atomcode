@@ -45,6 +45,19 @@ pub enum ReasoningPolicy {
     Exclude,
 }
 
+/// Sentinel emitted on outbound `reasoning_content` when we have nothing to
+/// echo (cross-provider handoff, pre-fix session, non-thinking model that
+/// still tool-called) but the receiving API requires the field to be
+/// non-empty (DeepSeek V4 thinking mode rejects empty strings).
+///
+/// `TurnRunner::Done` checks reasoning_buf against this exact value and
+/// refuses to promote it back into the assistant text channel — without that
+/// gate, a buggy gateway echoing our placeholder caused silent
+/// `Nailed it · 0 tok` mid-task stops (user reported `(no reasoning
+/// recorded)` showing up as the only assistant output after 17 reading
+/// rounds).
+pub const REASONING_PLACEHOLDER: &str = "(no reasoning recorded)";
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn chat_stream(
@@ -304,8 +317,18 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
 /// `ModelArts.81001` `message[3].content[0] has invalid field(s):
 /// text, type` failure pattern that surfaced in production.
 ///
-/// Conservative — only matches well-known vision-capable patterns.
-/// False-negatives are safe: extend this list when a new vision model
+/// Also used by `vision_preprocessor::maybe_preprocess` to decide
+/// whether the active main provider needs preprocessing (vision-capable
+/// → skip) and by `coding_plan::setup` to auto-pick a VL preprocessor
+/// from the AtomGit model list.
+///
+/// "OCR" is included because OCR-on-VLM endpoints (PaddleOCR-VL,
+/// GOT-OCR, MonkeyOCR, etc.) accept image input via the same
+/// OpenAI-compatible `image_url` schema and are first-class candidates
+/// for the vision-preprocessor role.
+///
+/// Conservative — only matches well-known vision/OCR patterns.
+/// False-negatives are safe: extend this list when a new vision/OCR model
 /// ships rather than threading a per-provider config knob (no
 /// user-discoverable opt-in exists). False-positives waste a turn on
 /// a 400, so when in doubt this returns false.
@@ -314,6 +337,7 @@ pub fn model_name_suggests_vision(name: &str) -> bool {
     n.contains("vision")
         || n.contains("-vl")
         || n.contains("vl-")
+        || n.contains("ocr")
         || n.contains("-4v")
         || n.contains("-4.1v")
         || n.starts_with("gpt-4o")
@@ -496,5 +520,34 @@ mod tests {
         assert!(!model_name_suggests_vision("kimi-k2-thinking"));
         assert!(!model_name_suggests_vision("o1-preview")); // not a vision tag
         assert!(!model_name_suggests_vision(""));
+    }
+
+    /// OCR family: PaddleOCR-VL is already covered by the `-vl` clause,
+    /// but pure-OCR names (no VL/vision substring) need the dedicated
+    /// `ocr` clause to be recognized as vision-eligible.
+    #[test]
+    fn vision_heuristic_recognises_ocr_models() {
+        // Names with both ocr + vl/vision (already worked, regression check).
+        assert!(model_name_suggests_vision("PaddleOCR-VL-0.9B"));
+        assert!(model_name_suggests_vision("Qwen2-VL-OCR-7B"));
+        // Pure OCR names — should now match via the dedicated clause.
+        assert!(model_name_suggests_vision("GOT-OCR-2.0"));
+        assert!(model_name_suggests_vision("PaddleOCR-2.0"));
+        assert!(model_name_suggests_vision("MinerU-OCR"));
+        assert!(model_name_suggests_vision("MonkeyOCR-1.2B"));
+        assert!(model_name_suggests_vision("got-ocr-1.0")); // lowercase
+    }
+
+    /// Documented false-positive risk on the new `ocr` clause: any model
+    /// name containing the substring `ocr` would match. None of today's
+    /// well-known text-only models trigger this. If a future text-only
+    /// model name does, this test will fail and a maintainer will know
+    /// to tighten the heuristic.
+    #[test]
+    fn vision_heuristic_documented_false_positives() {
+        // Contrived placeholder — `focar` contains `ocar`, not `ocr`,
+        // so this is actually safe. Kept here so the comment lives in
+        // a real test and a future false-positive case can be added.
+        assert!(!model_name_suggests_vision("focar-text-7b"));
     }
 }
