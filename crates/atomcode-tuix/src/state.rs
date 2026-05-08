@@ -169,6 +169,15 @@ pub struct UiState {
     /// after pasting an earlier one. Cleared together with `pending_images`
     /// on submit.
     pub pending_image_hashes: Vec<u64>,
+    /// Parallel to `pending_images` — the marker number `N` originally
+    /// printed for each image at paste time. Submit-time matching does
+    /// `line.contains("[Image #N]")` against this number to decide
+    /// whether the image survived editing. Must NOT be `i + 1` from the
+    /// vec position — once `session_image_count` became monotonic across
+    /// turns, paste-time numbers diverge from positional indices, and
+    /// using the index dropped images on every retry that wasn't the
+    /// first paste of the session.
+    pub pending_image_markers: Vec<usize>,
     /// Monotonic counter for the `[Image #N]` marker shown in the input
     /// buffer + scrollback. Incremented on every paste and NEVER reset
     /// across turns — so two images pasted in different turns get
@@ -266,6 +275,7 @@ impl UiState {
             pending_context_render: None,
             pending_images: Vec::new(),
             pending_image_hashes: Vec::new(),
+            pending_image_markers: Vec::new(),
             session_image_count: 0,
             show_tool_output: false,
             show_reasoning: false,

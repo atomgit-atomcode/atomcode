@@ -1100,7 +1100,7 @@ pub(super) fn execute_slash_command(
                 if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
                     ctx.agent
                         .cmd_tx
-                        .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
+                        .send(AgentCommand::SendMessage { text: rendered, images: vec![], image_markers: vec![] })
                         .ok();
                     state.on_submit();
                 } else {
@@ -1120,13 +1120,13 @@ pub(super) fn execute_slash_command(
             if let Some(rendered) = ctx.custom_commands.render(other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
+                    .send(AgentCommand::SendMessage { text: rendered, images: vec![], image_markers: vec![] })
                     .ok();
                 state.on_submit();
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage { text: rendered, images: vec![] })
+                    .send(AgentCommand::SendMessage { text: rendered, images: vec![], image_markers: vec![] })
                     .ok();
                 state.on_submit();
             } else {
@@ -1769,7 +1769,7 @@ pub(crate) fn launch_fixissue(
             fixissue_buffer.clear();
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SendMessage { text: prompt, images: vec![] })
+                .send(AgentCommand::SendMessage { text: prompt, images: vec![], image_markers: vec![] })
                 .ok();
             state.on_submit();
         }

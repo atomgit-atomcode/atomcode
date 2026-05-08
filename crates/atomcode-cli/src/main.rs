@@ -1391,6 +1391,7 @@ async fn run_headless(
     cmd_tx.send(AgentCommand::SendMessage {
         text: prompt,
         images: vec![],
+        image_markers: vec![],
     })?;
 
     let mut exit_code: i32 = 0;

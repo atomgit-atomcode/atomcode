@@ -36,9 +36,18 @@ use crate::turn::runner::TurnRunner;
 #[derive(Debug)]
 pub enum AgentCommand {
     /// User sent a message (may include attached file content and/or images).
+    /// `image_markers[i]` is the `[Image #N]` number printed for `images[i]`
+    /// at paste time. Round-tripped through `AgentEvent::RestorePendingImages`
+    /// so that on VL preprocess failure the TUI can re-attach images with
+    /// their ORIGINAL markers — otherwise an UP-recalled `[Image #5]` text
+    /// wouldn't match a freshly-renumbered restored image. Empty when the
+    /// caller has no images (slash commands, queued text from streaming,
+    /// CLI single-shot).
     SendMessage {
         text: String,
         images: Vec<crate::conversation::message::ImagePart>,
+        #[allow(dead_code)] // used in 2026-05-09 vision-preprocessor retry; agent reflects on Failed
+        image_markers: Vec<usize>,
     },
     /// Cancel current operation.
     Cancel,
@@ -240,6 +249,11 @@ pub enum AgentEvent {
     /// fire on a fresh paste of the same image — minor UX, not breaking).
     RestorePendingImages {
         images: Vec<crate::conversation::message::ImagePart>,
+        /// Original `[Image #N]` numbers, parallel to `images`. Round-tripped
+        /// from `AgentCommand::SendMessage::image_markers` so the TUI can
+        /// re-attach with the SAME marker numbers — keeps UP-recalled
+        /// caption text matching after retry.
+        markers: Vec<usize>,
     },
     /// VL preprocessing succeeded — surface a one-line success notice
     /// without dumping the (possibly long, sometimes uninformative) VL
@@ -814,8 +828,8 @@ impl AgentLoop {
 
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
-                AgentCommand::SendMessage { text, images } => {
-                    self.handle_send_message(text, images).await;
+                AgentCommand::SendMessage { text, images, image_markers } => {
+                    self.handle_send_message(text, images, image_markers).await;
                 }
                 AgentCommand::Cancel => {
                     self.cancel_token.cancel();
@@ -1147,6 +1161,7 @@ impl AgentLoop {
         &mut self,
         mut content: String,
         images: Vec<crate::conversation::message::ImagePart>,
+        image_markers: Vec<usize>,
     ) {
         self.current_task = content.clone();
 
@@ -1321,6 +1336,7 @@ impl AgentLoop {
                     // submit and Ctrl+V is the only way to re-attach.
                     let _ = self.event_tx.send(AgentEvent::RestorePendingImages {
                         images: images.clone(),
+                        markers: image_markers.clone(),
                     });
                     let merged = if clean.is_empty() {
                         "[图片识别失败]".to_string()

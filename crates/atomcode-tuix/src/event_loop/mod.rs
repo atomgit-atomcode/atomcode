@@ -1778,7 +1778,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![] }).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![], image_markers: vec![] }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -2020,7 +2020,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
                         renderer.render(UiLine::User(queued.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![] }).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![], image_markers: vec![] }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -2246,6 +2246,7 @@ fn handle_input(
                         let n = app.state.session_image_count;
                         app.state.pending_images.push(img);
                         app.state.pending_image_hashes.push(hash);
+                        app.state.pending_image_markers.push(n);
                         let marker = format!("[Image #{}]", n);
                         app.buf.text.insert_str(app.buf.cursor, &marker);
                         app.buf.cursor += marker.len();
@@ -2852,6 +2853,7 @@ fn handle_idle_key(
             let n = app.state.session_image_count;
             app.state.pending_images.push(img);
             app.state.pending_image_hashes.push(hash);
+            app.state.pending_image_markers.push(n);
             let marker = format!("[Image #{}]", n);
             app.buf.text.insert_str(app.buf.cursor, &marker);
             app.buf.cursor += marker.len();
@@ -2963,27 +2965,29 @@ fn handle_idle_key(
                 // the kept images as `└ [Image #N]` sub-lines so scrollback
                 // shows what was actually sent.
                 let pending = std::mem::take(&mut app.state.pending_images);
+                let pending_markers = std::mem::take(&mut app.state.pending_image_markers);
                 app.state.pending_image_hashes.clear();
                 let mut images: Vec<ImagePart> = Vec::with_capacity(pending.len());
-                for (i, img) in pending.into_iter().enumerate() {
-                    let n = i + 1;
+                let mut kept_markers: Vec<usize> = Vec::with_capacity(pending.len());
+                // Use the marker `n` recorded at paste time, NOT the index.
+                // Once `session_image_count` became monotonic, paste-time
+                // markers diverge from positional indices — using the index
+                // would silently drop every image after the first turn that
+                // had a paste.
+                for (img, n) in pending.into_iter().zip(pending_markers.into_iter()) {
                     if line.contains(&format!("[Image #{}]", n)) {
-                        // Dedicated UiLine variant so each renderer
-                        // can position `└` at col 2 — directly under
-                        // the `[` of `[Image #N]` from the user-message
-                        // echo above. CommandOutput would have been
-                        // simpler but the two renderers have different
-                        // auto-indent behaviour (retained's
-                        // push_body_text prepends PAD_COL, alt-screen's
-                        // push_command_output passes through verbatim),
-                        // so a single format string can't satisfy both.
                         renderer.render(UiLine::ImageAttachment(n));
                         images.push(img);
+                        kept_markers.push(n);
                     }
                 }
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage { text: expanded, images })
+                    .send(AgentCommand::SendMessage {
+                        text: expanded,
+                        images,
+                        image_markers: kept_markers,
+                    })
                     .ok();
                 app.state.on_submit();
                 // CodingPlan drift check — fire before every turn sent
@@ -4034,7 +4038,7 @@ fn handle_agent_event(
             });
             renderer.flush();
         }
-        AgentEvent::RestorePendingImages { images } => {
+        AgentEvent::RestorePendingImages { images, markers } => {
             // VL preprocessing failed — re-attach the user's images to
             // the input state so they can retry without re-pasting from
             // clipboard. The `[Image #N]` text marker is gone (lives in
@@ -4049,11 +4053,14 @@ fn handle_agent_event(
             // Minor UX nit, not a correctness issue.
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
-            for img in images {
+            // markers length should match images length (agent passed them
+            // back); zip is best-effort if it doesn't (truncates).
+            for (img, marker) in images.into_iter().zip(markers.into_iter()) {
                 let mut hasher = DefaultHasher::new();
                 img.data.hash(&mut hasher);
                 state.pending_image_hashes.push(hasher.finish());
                 state.pending_images.push(img);
+                state.pending_image_markers.push(marker);
             }
             // Don't redraw — TUI is in Streaming phase here (turn isn't
             // over yet); the next idle/streaming redraw picks up the new
