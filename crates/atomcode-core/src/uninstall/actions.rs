@@ -51,6 +51,35 @@ pub fn strip_atomcode_path_block(content: &str, prefix: &str) -> Option<String> 
     Some(out)
 }
 
+/// Remove an entry equal to `target_literal` (e.g. `%LOCALAPPDATA%\AtomCode`)
+/// or `target_expanded` (e.g. `C:\Users\theo\AppData\Local\AtomCode`) from a
+/// Windows PATH-style string. Comparison is case-insensitive and ignores
+/// trailing slashes. Returns `None` if no entry matched.
+pub fn strip_path_entry(path: &str, target_literal: &str, target_expanded: &str) -> Option<String> {
+    let needles = [
+        normalize_path_entry(target_literal),
+        normalize_path_entry(target_expanded),
+    ];
+    let entries: Vec<&str> = path.split(';').collect();
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut removed = false;
+    for e in entries {
+        let n = normalize_path_entry(e);
+        if needles.iter().any(|nd| nd == &n) {
+            removed = true;
+            continue;
+        }
+        kept.push(e);
+    }
+    if !removed { return None; }
+    Some(kept.join(";"))
+}
+
+fn normalize_path_entry(s: &str) -> String {
+    let trimmed = s.trim().trim_end_matches(['\\', '/']);
+    trimmed.to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod path_line_tests {
     use super::strip_atomcode_path_block;
@@ -123,5 +152,63 @@ export PATH=\"/opt/somewhere/else:$PATH\"
         let input = "alias x=1\n\n# Added by AtomCode installer\nexport PATH=\"/Users/test/.local/bin:$PATH\"\n";
         let out = strip_atomcode_path_block(input, PREFIX).unwrap();
         assert_eq!(out.trim_end(), "alias x=1");
+    }
+}
+
+#[cfg(test)]
+mod windows_path_tests {
+    use super::strip_path_entry;
+
+    #[test]
+    fn strips_exact_match() {
+        let path = r"C:\Program Files\Git\cmd;C:\Users\theo\AppData\Local\AtomCode;C:\Windows";
+        let target = r"C:\Users\theo\AppData\Local\AtomCode";
+        let expanded = r"C:\Users\theo\AppData\Local\AtomCode";
+        let out = strip_path_entry(path, target, expanded);
+        assert_eq!(out, Some(r"C:\Program Files\Git\cmd;C:\Windows".to_string()));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        let path = r"c:\users\Theo\appdata\local\atomcode;C:\Windows";
+        let out = strip_path_entry(path,
+            r"C:\Users\theo\AppData\Local\AtomCode",
+            r"C:\Users\theo\AppData\Local\AtomCode");
+        assert_eq!(out, Some(r"C:\Windows".to_string()));
+    }
+
+    #[test]
+    fn ignores_trailing_backslash() {
+        let path = r"C:\Users\theo\AppData\Local\AtomCode\;C:\Windows";
+        let out = strip_path_entry(path,
+            r"C:\Users\theo\AppData\Local\AtomCode",
+            r"C:\Users\theo\AppData\Local\AtomCode");
+        assert_eq!(out, Some(r"C:\Windows".to_string()));
+    }
+
+    #[test]
+    fn matches_unexpanded_localappdata() {
+        let path = r"%LOCALAPPDATA%\AtomCode;C:\Windows";
+        let out = strip_path_entry(path,
+            r"%LOCALAPPDATA%\AtomCode",
+            r"C:\Users\theo\AppData\Local\AtomCode");
+        assert!(out.unwrap().eq_ignore_ascii_case(r"C:\Windows"));
+    }
+
+    #[test]
+    fn returns_none_when_not_present() {
+        let path = r"C:\Windows;C:\Program Files\Git\cmd";
+        let out = strip_path_entry(path, r"C:\nope", r"C:\nope");
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn preserves_other_atomcode_substring_entries() {
+        // A directory that *contains* AtomCode in its name but isn't the install dir.
+        let path = r"C:\AtomCodeStuff\bin;C:\Users\theo\AppData\Local\AtomCode;C:\Windows";
+        let out = strip_path_entry(path,
+            r"C:\Users\theo\AppData\Local\AtomCode",
+            r"C:\Users\theo\AppData\Local\AtomCode");
+        assert_eq!(out, Some(r"C:\AtomCodeStuff\bin;C:\Windows".to_string()));
     }
 }
