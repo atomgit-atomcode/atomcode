@@ -122,6 +122,15 @@ pub struct Config {
     /// enabled=true, initial_turns=4, max_turns=12, max_concurrent=3, timeout_secs=300.
     #[serde(default)]
     pub subagent: SubAgentConfig,
+    /// Provider key (matches a key in `Config.providers`) of a vision-language
+    /// model used to preprocess images before forwarding to a non-vision main
+    /// provider. When `None` or empty, image preprocessing is disabled — pasted
+    /// images either go directly to a vision-capable main provider, or get
+    /// degraded to `"[image attached]"` placeholder by the existing path.
+    ///
+    /// Example value: `"AtomGit-Qwen-Qwen3-VL-32B-Instruct"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_preprocessor_provider: Option<String>,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -576,6 +585,7 @@ mod tests {
             lsp,
             auto_commit: false,
             subagent: Default::default(),
+            vision_preprocessor_provider: None,
         }
     }
 
@@ -736,6 +746,7 @@ mod tests {
             lsp: Default::default(),
             auto_commit: false,
             subagent: Default::default(),
+            vision_preprocessor_provider: None,
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -849,6 +860,39 @@ mod tests {
         assert!(
             err.to_string().contains("No providers configured"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vision_preprocessor_provider_defaults_to_none() {
+        // Existing config.toml files (pre-feature) must parse cleanly with
+        // `vision_preprocessor_provider` defaulting to None — feature is opt-in
+        // and absence must not break load.
+        let toml_str = r#"
+            default_provider = "claude"
+            [providers.claude]
+            type = "claude"
+            model = "claude-sonnet-4-5"
+            api_key = "sk-test"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse minimal config");
+        assert_eq!(cfg.vision_preprocessor_provider, None);
+    }
+
+    #[test]
+    fn vision_preprocessor_provider_round_trips_through_toml() {
+        let toml_str = r#"
+            default_provider = "claude"
+            vision_preprocessor_provider = "AtomGit-Qwen-Qwen3-VL-32B-Instruct"
+            [providers.claude]
+            type = "claude"
+            model = "claude-sonnet-4-5"
+            api_key = "sk-test"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            cfg.vision_preprocessor_provider.as_deref(),
+            Some("AtomGit-Qwen-Qwen3-VL-32B-Instruct"),
         );
     }
 

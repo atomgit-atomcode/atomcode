@@ -584,6 +584,7 @@ mod tests {
             lsp: Default::default(),
             auto_commit: false,
             subagent: Default::default(),
+            vision_preprocessor_provider: None,
         }
     }
 
