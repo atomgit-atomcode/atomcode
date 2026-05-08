@@ -8,7 +8,6 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = "0.4"
 futures = "0.3"
-is-terminal = "0.4"
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "blocking"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
