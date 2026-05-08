@@ -2720,13 +2720,24 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 }
 
-/// Build a single-line row from `text`, padded to the body's PAD_COL
-/// indent and truncated with `…` when the text overflows the screen
-/// width. Used by the live-group rendering path where each child must
-/// be exactly one terminal row so child indices map 1:1 with terminal
-/// positions for in-place CUP rewrites.
+/// Build a single-line row from `text`, flush-left at col 0, truncated
+/// with `…` when the text overflows the screen width. Used by the
+/// live-group rendering path (ToolGroupRender header / children /
+/// summary, ToolGroupChildUpdate) where each child must be exactly
+/// one terminal row so child indices map 1:1 with terminal positions
+/// for in-place CUP rewrites.
+///
+/// Flush-left, no leading PAD_COL: header glyph (●) sits at col 0
+/// aligned with the user-message ❯ chevron and the single tool-call
+/// ● glyph (push_body_prefixed paths). Children carry a 2-space
+/// prefix in their own text (event_loop builds `"  └ Bash(...)"`),
+/// so they still indent under the header without extra padding here.
+/// The previous PAD_COL leading pad pushed the header glyph to col 2
+/// and the children to col 4, breaking visual alignment with the
+/// rest of the body which lives at col 0 (user messages, single
+/// tool calls).
 fn build_one_row(text: &str, style: &CellStyle, screen_w: u16) -> Vec<Cell> {
-    let avail = (screen_w as usize).saturating_sub(PAD_COL * 2);
+    let avail = (screen_w as usize).saturating_sub(PAD_COL);
     let safe = scrub_controls(text);
     let truncated = if safe.chars().count() > avail.max(1) {
         let take_n = avail.saturating_sub(1).max(1);
@@ -2737,8 +2748,6 @@ fn build_one_row(text: &str, style: &CellStyle, screen_w: u16) -> Vec<Cell> {
         safe
     };
     let mut row = Vec::new();
-    let pad = CellStyle::default();
-    push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
     push_str_cells(&mut row, &truncated, style);
     row
 }
