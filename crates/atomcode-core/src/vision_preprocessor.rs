@@ -22,11 +22,13 @@ pub enum PreprocessOutcome {
     /// accepts images, or no images attached. Caller must use the original
     /// `(caption, images)` tuple unchanged.
     Skipped,
-    /// VL call succeeded. `text` is the raw VL output (no wrapping). Caller
-    /// is responsible for splicing it into the user message — recommended
-    /// shape: `format!("{caption}\n\n[图片内容（由 VL 模型识别）]\n{text}")`
+    /// VL call succeeded. `text` is the raw VL output (no wrapping);
+    /// `vl_key` is the provider key used (so the caller can show "by
+    /// {model}" in the splice wrapper). Caller is responsible for
+    /// splicing both into the user message — recommended shape:
+    /// `format!("{caption}\n\n[图片内容（由 {vl_key} 识别）]\n{text}")`
     /// — and clearing the images vec.
-    Replaced { text: String },
+    Replaced { text: String, vl_key: String },
     /// VL call failed (provider missing, network error, timeout, empty
     /// response). `reason` is intended for `AgentEvent::Warning`. Caller
     /// should append `"\n\n[图片识别失败]"` to the user message and clear
@@ -126,20 +128,24 @@ pub async fn maybe_preprocess(
 
     match tokio::time::timeout(timeout, call).await {
         Err(_) => PreprocessOutcome::Failed {
-            reason: format!("VL call timed out after {}s", timeout.as_secs()),
+            reason: format!(
+                "provider '{vl_key}' timed out after {}s",
+                timeout.as_secs(),
+            ),
         },
         Ok(Err(e)) => PreprocessOutcome::Failed {
-            reason: format!("VL call error: {e:#}"),
+            reason: format!("provider '{vl_key}' call error: {e:#}"),
         },
         Ok(Ok(text)) => {
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 PreprocessOutcome::Failed {
-                    reason: "VL returned empty response".into(),
+                    reason: format!("provider '{vl_key}' returned empty response"),
                 }
             } else {
                 PreprocessOutcome::Replaced {
                     text: trimmed.to_string(),
+                    vl_key: vl_key.to_string(),
                 }
             }
         }
@@ -327,11 +333,12 @@ mod tests {
             maybe_preprocess(&cfg, &provider, "explain this", &[sample_image()]).await;
 
         match result {
-            PreprocessOutcome::Replaced { text } => {
+            PreprocessOutcome::Replaced { text, vl_key } => {
                 assert_eq!(
                     text,
                     "Python stack trace showing ZeroDivisionError on line 42"
                 );
+                assert_eq!(vl_key, "vl", "Replaced must carry the configured key");
             }
             other => panic!("expected Replaced, got {other:?}"),
         }

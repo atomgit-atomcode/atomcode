@@ -1272,11 +1272,11 @@ impl AgentLoop {
             use crate::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
             match maybe_preprocess(&self.config, &*self.turn_runner.provider, &clean, &images).await {
                 PreprocessOutcome::Skipped => (clean, images),
-                PreprocessOutcome::Replaced { text } => {
+                PreprocessOutcome::Replaced { text, vl_key } => {
                     let merged = if clean.is_empty() {
-                        format!("[图片内容（由 VL 模型识别）]\n{text}")
+                        format!("[图片内容（由 {vl_key} 识别）]\n{text}")
                     } else {
-                        format!("{clean}\n\n[图片内容（由 VL 模型识别）]\n{text}")
+                        format!("{clean}\n\n[图片内容（由 {vl_key} 识别）]\n{text}")
                     };
                     (merged, Vec::new())
                 }
