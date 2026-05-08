@@ -414,6 +414,16 @@ mod tests {
         }
     }
 
+    /// Inverse of `BodyContains` — matches when the request body does NOT
+    /// include the substring. Pairs with `BodyContains` to assert that one
+    /// prompt template was selected and the other was not.
+    struct BodyNotContains(String);
+    impl Match for BodyNotContains {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            !String::from_utf8_lossy(&request.body).contains(&self.0)
+        }
+    }
+
     #[tokio::test]
     async fn caption_is_included_in_vl_prompt() {
         let server = MockServer::start().await;
@@ -457,6 +467,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(BodyContains("请详细描述这张图片的内容".into()))
+            .and(BodyNotContains("用户的当前请求：".into()))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
