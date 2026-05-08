@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
+mod uninstall;
 
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
@@ -483,6 +484,24 @@ enum Commands {
     /// slash command — anything installed via either path is visible to both.
     #[command(subcommand)]
     Plugin(PluginCli),
+    /// Uninstall AtomCode: remove the binary, PATH edit, and (interactively)
+    /// data under ~/.atomcode/. With no flags, runs interactively and asks
+    /// per-group; pass --yes / --purge / --keep-data for non-interactive use.
+    Uninstall {
+        /// Skip prompts; use per-group default decisions
+        /// (binary=yes, credentials=no, state=yes).
+        #[arg(long)]
+        yes: bool,
+        /// Wipe ~/.atomcode/ entirely.
+        #[arg(long, conflicts_with = "keep_data")]
+        purge: bool,
+        /// Keep ~/.atomcode/ entirely (only remove binary + PATH edit).
+        #[arg(long)]
+        keep_data: bool,
+        /// Print the plan; do nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -928,6 +947,7 @@ async fn run() -> Result<i32> {
                 lsp: Default::default(),
                 auto_commit: false,
                 subagent: Default::default(),
+                vision_preprocessor_provider: None,
             }
         })
     } else {
@@ -943,6 +963,7 @@ async fn run() -> Result<i32> {
             lsp: Default::default(),
             auto_commit: false,
             subagent: Default::default(),
+            vision_preprocessor_provider: None,
         }
     };
 
@@ -1672,6 +1693,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Upgrade { force } => run_upgrade_cli(force).await,
         Commands::Rollback => run_rollback_cli(),
+        Commands::Uninstall { yes, purge, keep_data, dry_run } => {
+            uninstall::run(uninstall::Args { yes, purge, keep_data, dry_run })
+        }
         Commands::Fixissue { .. } => {
             unreachable!("Fixissue is handled inline in run() before handle_command")
         }
@@ -1997,6 +2021,7 @@ fn run_codingplan_core(
             lsp: Default::default(),
             auto_commit: false,
             subagent: Default::default(),
+            vision_preprocessor_provider: None,
         },
     };
 
