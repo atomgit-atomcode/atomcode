@@ -421,6 +421,16 @@ impl SkillRegistry {
         self.load_skills_dir(&working_dir.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
         self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), LOOSE_NS, &mut warnings);
 
+        // Claude Code plugin layer — read-only scan of the plugins Claude
+        // Code has installed in its own cache directory.  Each plugin's
+        // `skills/` and `commands/` are loaded under its own namespace
+        // (e.g. `superpowers:brainstorming`) matching Claude Code's
+        // `<plugin>:<skill>` convention.
+        for assets in crate::plugin::claude::iter_claude_code_plugins() {
+            self.load_skills_dir(&assets.skills_dir(), Some(&assets.plugin), &mut warnings);
+            self.load_flat_commands(&assets.commands_dir(), Some(&assets.plugin), &mut warnings);
+        }
+
         // Plugin layer — installed plugins contribute namespaced skills.
         for assets in crate::plugin::loader::iter_installed_plugin_assets() {
             self.load_skills_dir(&assets.skills_dir(), Some(&assets.plugin), &mut warnings);

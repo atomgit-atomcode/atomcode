@@ -11,6 +11,7 @@ pub mod marketplace;
 // helpers. Not part of the public API; if a downstream consumer needs one
 // of these symbols, re-export it explicitly above.
 pub(crate) mod manifest;
+pub(crate) mod claude;
 pub(crate) mod paths;
 pub(crate) mod state;
 pub(crate) mod url;
