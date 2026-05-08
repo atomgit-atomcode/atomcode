@@ -1346,17 +1346,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
     }
     if kbd_hint_set && !legacy_conhost_set {
-        // Generic Kitty-not-negotiated hint for non-conhost terminals
-        // (Mac Terminal.app default, older xterm, plain SSH session,
-        // etc.). Modifier+Enter usually works through VT modifyOtherKeys
-        // — phrase the chord list as "try" rather than "must use",
-        // and document `\<Enter>` for the corner cases where the host
-        // strips every chord.
-        #[cfg(target_os = "macos")]
-        let line = "  ⓘ Newline insertion: try Ctrl+Enter (or Option+Enter on terminals\n    that forward Option as Meta). Universal fallback: end the line\n    with `\\` then press Enter.\n\n";
-        #[cfg(not(target_os = "macos"))]
-        let line = "  ⓘ Newline insertion: try Shift+Enter, Alt+Enter, or Ctrl+Enter\n    (Windows Terminal / VSCode / mintty forward these without Kitty\n    CSI u). Universal fallback: end the line with `\\` then press Enter.\n\n";
-        renderer.render(UiLine::CommandOutput(line.into()));
+        // Generic Kitty-not-negotiated hint. Single platform-agnostic
+        // copy — Mac terminals (iTerm2, modern Terminal.app, Alacritty,
+        // kitty) almost always negotiate the protocol successfully, so
+        // `kbd_enhanced=false` on macOS is a vanishing edge case that
+        // doesn't justify a separate platform branch. The trailing
+        // `\<Enter>` covers any host (mac or otherwise) that swallows
+        // modifier+Enter chords.
+        renderer.render(UiLine::CommandOutput(
+            "  ⓘ Newline insertion: try Shift+Enter, Alt+Enter, or Ctrl+Enter\n    (Windows Terminal / VSCode / mintty forward these without Kitty\n    CSI u). Universal fallback: end the line with `\\` then press Enter.\n\n".into(),
+        ));
     }
 
     // JediTerm auto-fallback hint: lib.rs detected
