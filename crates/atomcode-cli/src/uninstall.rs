@@ -32,8 +32,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         std::process::exit(EXIT_BAD_ARGS as i32);
     }
 
-    let decision_mode = decision_mode(&args, tty);
-    let decisions = match decision_mode {
+    let mode = decision_mode(&args, tty);
+    let tty_mode = matches!(mode, DecisionMode::Tty);
+    let decisions = match mode {
         DecisionMode::Tty => None,
         DecisionMode::Flag(d) => Some(d),
         DecisionMode::AbortNoTty => {
@@ -68,6 +69,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         std::process::exit(EXIT_USER_DECLINED as i32);
     }
 
+    if tty_mode {
+        if !confirm_and_kill_running_processes()? {
+            eprintln!("aborted: running processes were not terminated.");
+            std::process::exit(EXIT_USER_DECLINED as i32);
+        }
+    }
+
     let ctx = build_context(&plan)?;
 
     let strategy: Box<dyn SelfDeleteStrategy> = Box::new(PlatformSelfDelete);
@@ -93,6 +101,40 @@ fn decision_mode(args: &Args, tty: bool) -> DecisionMode {
     if args.dry_run { return DecisionMode::Flag(Decisions::DEFAULTS); }
     if !tty { return DecisionMode::AbortNoTty; }
     DecisionMode::Tty
+}
+
+fn confirm_and_kill_running_processes() -> anyhow::Result<bool> {
+    use atomcode_core::uninstall::actions::{kill_process, list_atomcode_processes};
+    use std::io::{BufRead, Write};
+
+    let procs = list_atomcode_processes();
+    if procs.is_empty() { return Ok(true); }
+
+    println!("\nFound {} running atomcode process(es):", procs.len());
+    for p in &procs {
+        println!("  pid {}  {}", p.pid, p.name);
+    }
+    print!("Kill them and continue? [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    if !line.trim().eq_ignore_ascii_case("y") {
+        return Ok(false);
+    }
+    for p in procs {
+        if let Err(e) = kill_process(p.pid) {
+            #[cfg(windows)]
+            {
+                eprintln!("could not kill pid {}: {}", p.pid, e);
+                return Ok(false); // Windows: must succeed or rename will fail
+            }
+            #[cfg(not(windows))]
+            {
+                eprintln!("warn: could not kill pid {}: {} (continuing — Unix unlink doesn't need it)", p.pid, e);
+            }
+        }
+    }
+    Ok(true)
 }
 
 // ----- Task 9 implementations -----
