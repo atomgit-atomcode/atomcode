@@ -20,10 +20,14 @@ pub fn strip_atomcode_path_block(content: &str, prefix: &str) -> Option<String> 
         if lines[i].trim() == comment {
             // Look ahead for the export line; allow at most one blank line between.
             let mut j = i + 1;
-            while j < lines.len() && lines[j].trim().is_empty() { j += 1; }
+            while j < lines.len() && lines[j].trim().is_empty() {
+                j += 1;
+            }
             if j < lines.len() && lines[j].trim() == target_export.trim() {
                 // Drop comment + intervening blanks + export line.
-                for k in i..=j { keep[k] = false; }
+                for flag in keep.iter_mut().take(j + 1).skip(i) {
+                    *flag = false;
+                }
                 // Also drop one trailing blank line if present, to avoid leaving a double blank.
                 if j + 1 < lines.len() && lines[j + 1].trim().is_empty() {
                     keep[j + 1] = false;
@@ -36,7 +40,9 @@ pub fn strip_atomcode_path_block(content: &str, prefix: &str) -> Option<String> 
         i += 1;
     }
 
-    if !removed_any { return None; }
+    if !removed_any {
+        return None;
+    }
 
     let mut out = String::with_capacity(content.len());
     for (idx, line) in lines.iter().enumerate() {
@@ -46,7 +52,9 @@ pub fn strip_atomcode_path_block(content: &str, prefix: &str) -> Option<String> 
         }
     }
     if !content.ends_with('\n') {
-        if let Some(last) = out.strip_suffix('\n') { out = last.to_string(); }
+        if let Some(last) = out.strip_suffix('\n') {
+            out = last.to_string();
+        }
     }
     Some(out)
 }
@@ -71,7 +79,9 @@ pub fn strip_path_entry(path: &str, target_literal: &str, target_expanded: &str)
         }
         kept.push(e);
     }
-    if !removed { return None; }
+    if !removed {
+        return None;
+    }
     Some(kept.join(";"))
 }
 
@@ -95,18 +105,19 @@ pub fn matches_atomcode_name(name: &str) -> bool {
 pub fn list_atomcode_processes() -> Vec<ProcessInfo> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
     let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::new(),
-    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
     let me = sysinfo::get_current_pid().ok();
     let mut out = Vec::new();
     for (pid, proc_) in sys.processes() {
-        if Some(*pid) == me { continue; }
+        if Some(*pid) == me {
+            continue;
+        }
         let name = proc_.name().to_string_lossy();
         if matches_atomcode_name(&name) {
-            out.push(ProcessInfo { pid: pid.as_u32(), name: name.into_owned() });
+            out.push(ProcessInfo {
+                pid: pid.as_u32(),
+                name: name.into_owned(),
+            });
         }
     }
     out
@@ -116,17 +127,13 @@ pub fn list_atomcode_processes() -> Vec<ProcessInfo> {
 pub fn kill_process(pid: u32) -> std::io::Result<()> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::new(),
-    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
     if let Some(p) = sys.process(Pid::from_u32(pid)) {
         if p.kill() {
             return Ok(());
         }
     }
-    Err(std::io::Error::new(std::io::ErrorKind::Other, format!("could not kill pid {pid}")))
+    Err(std::io::Error::other(format!("could not kill pid {pid}")))
 }
 
 // ── Filesystem mutators ──────────────────────────────────────────────────────
@@ -161,7 +168,10 @@ pub fn sudo_rm(paths: &[&Path]) -> io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(io::ErrorKind::PermissionDenied, "sudo rm failed"))
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "sudo rm failed",
+        ))
     }
 }
 
@@ -223,12 +233,7 @@ pub fn apply_windows_path_cleanup(
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let env = hkcu
         .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("open Environment key: {e}"),
-            )
-        })?;
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open Environment key: {e}")))?;
     let cur: String = env.get_value("Path").unwrap_or_default();
     let new = match strip_path_entry(&cur, install_dir_literal, install_dir_expanded) {
         Some(s) => s,
@@ -304,10 +309,7 @@ impl SelfDeleteStrategy for PlatformSelfDelete {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no parent dir"))?;
         let dir_str = install_dir.to_string_lossy().to_string();
 
-        let cmd_arg = format!(
-            "ping -n 2 127.0.0.1 >nul & rmdir /S /Q \"{}\"",
-            dir_str
-        );
+        let cmd_arg = format!("ping -n 2 127.0.0.1 >nul & rmdir /S /Q \"{}\"", dir_str);
         Command::new("cmd")
             .args(["/C", &cmd_arg])
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
@@ -353,7 +355,10 @@ alias gs=\"git status\"
 
 # more user stuff
 ";
-        assert_eq!(strip_atomcode_path_block(input, PREFIX).as_deref(), Some(expect));
+        assert_eq!(
+            strip_atomcode_path_block(input, PREFIX).as_deref(),
+            Some(expect)
+        );
     }
 
     #[test]
@@ -415,33 +420,42 @@ mod windows_path_tests {
         let target = r"C:\Users\theo\AppData\Local\AtomCode";
         let expanded = r"C:\Users\theo\AppData\Local\AtomCode";
         let out = strip_path_entry(path, target, expanded);
-        assert_eq!(out, Some(r"C:\Program Files\Git\cmd;C:\Windows".to_string()));
+        assert_eq!(
+            out,
+            Some(r"C:\Program Files\Git\cmd;C:\Windows".to_string())
+        );
     }
 
     #[test]
     fn case_insensitive() {
         let path = r"c:\users\Theo\appdata\local\atomcode;C:\Windows";
-        let out = strip_path_entry(path,
+        let out = strip_path_entry(
+            path,
             r"C:\Users\theo\AppData\Local\AtomCode",
-            r"C:\Users\theo\AppData\Local\AtomCode");
+            r"C:\Users\theo\AppData\Local\AtomCode",
+        );
         assert_eq!(out, Some(r"C:\Windows".to_string()));
     }
 
     #[test]
     fn ignores_trailing_backslash() {
         let path = r"C:\Users\theo\AppData\Local\AtomCode\;C:\Windows";
-        let out = strip_path_entry(path,
+        let out = strip_path_entry(
+            path,
             r"C:\Users\theo\AppData\Local\AtomCode",
-            r"C:\Users\theo\AppData\Local\AtomCode");
+            r"C:\Users\theo\AppData\Local\AtomCode",
+        );
         assert_eq!(out, Some(r"C:\Windows".to_string()));
     }
 
     #[test]
     fn matches_unexpanded_localappdata() {
         let path = r"%LOCALAPPDATA%\AtomCode;C:\Windows";
-        let out = strip_path_entry(path,
+        let out = strip_path_entry(
+            path,
             r"%LOCALAPPDATA%\AtomCode",
-            r"C:\Users\theo\AppData\Local\AtomCode");
+            r"C:\Users\theo\AppData\Local\AtomCode",
+        );
         assert!(out.unwrap().eq_ignore_ascii_case(r"C:\Windows"));
     }
 
@@ -456,9 +470,11 @@ mod windows_path_tests {
     fn preserves_other_atomcode_substring_entries() {
         // A directory that *contains* AtomCode in its name but isn't the install dir.
         let path = r"C:\AtomCodeStuff\bin;C:\Users\theo\AppData\Local\AtomCode;C:\Windows";
-        let out = strip_path_entry(path,
+        let out = strip_path_entry(
+            path,
             r"C:\Users\theo\AppData\Local\AtomCode",
-            r"C:\Users\theo\AppData\Local\AtomCode");
+            r"C:\Users\theo\AppData\Local\AtomCode",
+        );
         assert_eq!(out, Some(r"C:\AtomCodeStuff\bin;C:\Windows".to_string()));
     }
 }
@@ -527,7 +543,11 @@ mod rc_apply_tests {
     fn backup_created_and_block_removed() {
         let tmp = TempDir::new().unwrap();
         let rc = tmp.path().join(".zshrc");
-        std::fs::write(&rc, "# Added by AtomCode installer\nexport PATH=\"/p:$PATH\"\n").unwrap();
+        std::fs::write(
+            &rc,
+            "# Added by AtomCode installer\nexport PATH=\"/p:$PATH\"\n",
+        )
+        .unwrap();
         let res = apply_unix_path_cleanup(&rc, "/p").unwrap();
         assert!(res.modified);
         assert!(rc.with_file_name(".zshrc.atomcode-uninstall.bak").exists());
@@ -607,16 +627,28 @@ mod execute_tests {
         // Removed list ordering proves the spec-mandated order.
         // history (state) must appear before auth.toml (credentials), which
         // must appear before the binary path itself.
-        let pos_history = outcome.removed.iter()
+        let pos_history = outcome
+            .removed
+            .iter()
             .position(|p| p.file_name().and_then(|n| n.to_str()) == Some("history"))
             .expect("history was not removed");
-        let pos_auth = outcome.removed.iter()
+        let pos_auth = outcome
+            .removed
+            .iter()
             .position(|p| p.file_name().and_then(|n| n.to_str()) == Some("auth.toml"))
             .expect("auth.toml was not removed");
-        let pos_bin = outcome.removed.iter()
+        let pos_bin = outcome
+            .removed
+            .iter()
             .position(|p| p == &exe)
             .expect("binary was not removed");
-        assert!(pos_history < pos_auth, "state should be removed before credentials");
-        assert!(pos_auth < pos_bin, "credentials should be removed before binary");
+        assert!(
+            pos_history < pos_auth,
+            "state should be removed before credentials"
+        );
+        assert!(
+            pos_auth < pos_bin,
+            "credentials should be removed before binary"
+        );
     }
 }

@@ -36,9 +36,21 @@ pub struct Decisions {
 }
 
 impl Decisions {
-    pub const DEFAULTS: Self = Self { binary: true, credentials: false, state: true };
-    pub const PURGE: Self = Self { binary: true, credentials: true, state: true };
-    pub const KEEP_DATA: Self = Self { binary: true, credentials: false, state: false };
+    pub const DEFAULTS: Self = Self {
+        binary: true,
+        credentials: false,
+        state: true,
+    };
+    pub const PURGE: Self = Self {
+        binary: true,
+        credentials: true,
+        state: true,
+    };
+    pub const KEEP_DATA: Self = Self {
+        binary: true,
+        credentials: false,
+        state: false,
+    };
 }
 
 // ── Outcome ───────────────────────────────────────────────────────────────────
@@ -53,6 +65,7 @@ pub struct Outcome {
 
 // ── ExecuteContext ────────────────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct ExecuteContext {
     /// Pairs of (rc file path, install prefix) to clean.
     pub rc_files: Vec<(PathBuf, String)>,
@@ -62,18 +75,6 @@ pub struct ExecuteContext {
     /// Expanded install dir string for Windows registry filter (e.g., "C:\\Users\\theo\\AppData\\Local\\AtomCode").
     #[cfg(windows)]
     pub windows_install_dir_expanded: Option<String>,
-}
-
-impl Default for ExecuteContext {
-    fn default() -> Self {
-        ExecuteContext {
-            rc_files: Vec::new(),
-            #[cfg(windows)]
-            windows_install_dir_literal: None,
-            #[cfg(windows)]
-            windows_install_dir_expanded: None,
-        }
-    }
 }
 
 // ── execute() ────────────────────────────────────────────────────────────────
@@ -180,9 +181,7 @@ pub fn execute(
         // --- 6. Self-delete (last) ---
         match self_delete.run(&plan.binary_path) {
             Ok(()) => out.removed.push(plan.binary_path.clone()),
-            Err(e) => out
-                .failed
-                .push((plan.binary_path.clone(), e.to_string())),
+            Err(e) => out.failed.push((plan.binary_path.clone(), e.to_string())),
         }
     } else {
         for it in plan.items.iter().filter(|i| i.group == Group::Binary) {

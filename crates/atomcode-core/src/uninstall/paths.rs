@@ -50,7 +50,10 @@ pub fn unix_rc_paths() -> UnixRcPaths {
 
 #[cfg(unix)]
 pub fn unix_rc_paths_for_home(home: &Path) -> UnixRcPaths {
-    UnixRcPaths { zshrc: home.join(".zshrc"), bashrc: home.join(".bashrc") }
+    UnixRcPaths {
+        zshrc: home.join(".zshrc"),
+        bashrc: home.join(".bashrc"),
+    }
 }
 
 // Test-only counterpart so the test compiles cross-platform.
@@ -61,7 +64,10 @@ pub struct UnixRcPaths {
 }
 #[cfg(all(not(unix), test))]
 pub fn unix_rc_paths_for_home(home: &Path) -> UnixRcPaths {
-    UnixRcPaths { zshrc: home.join(".zshrc"), bashrc: home.join(".bashrc") }
+    UnixRcPaths {
+        zshrc: home.join(".zshrc"),
+        bashrc: home.join(".bashrc"),
+    }
 }
 
 /// Default Windows install-dir candidates (matches install.ps1).
@@ -109,8 +115,13 @@ mod tests {
     #[test]
     fn manifest_groups_state_correctly() {
         let m = uninstall_manifest();
-        for f in ["history", "input_history.txt", "recent_dirs.txt",
-                  "codingplan_sync.json", "device_id"] {
+        for f in [
+            "history",
+            "input_history.txt",
+            "recent_dirs.txt",
+            "codingplan_sync.json",
+            "device_id",
+        ] {
             assert!(m.state_files.contains(&f), "missing {f}");
         }
         for d in ["staged", "telemetry", "plugins", "commands", "skills"] {

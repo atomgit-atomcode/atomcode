@@ -32,7 +32,9 @@ pub fn scan(binary_path: &Path, atomcode_dir: &Path) -> Result<Plan> {
             s
         };
         let p = dir.join(&bak_name);
-        if p.exists() { items.push(item(Group::Binary, p, "self-update backup")?); }
+        if p.exists() {
+            items.push(item(Group::Binary, p, "self-update backup")?);
+        }
 
         for (name, note) in [
             (".atomcode.rolling", "self-update rename slot"),
@@ -40,7 +42,9 @@ pub fn scan(binary_path: &Path, atomcode_dir: &Path) -> Result<Plan> {
             (".atomcode.writable-probe", "self-update probe leftover"),
         ] {
             let p = dir.join(name);
-            if p.exists() { items.push(item(Group::Binary, p, note)?); }
+            if p.exists() {
+                items.push(item(Group::Binary, p, note)?);
+            }
         }
     }
 
@@ -49,18 +53,22 @@ pub fn scan(binary_path: &Path, atomcode_dir: &Path) -> Result<Plan> {
     for fname in m.credential_files {
         let p = atomcode_dir.join(fname);
         if p.exists() {
-            items.push(item(Group::Credentials, p, *fname)?);
+            items.push(item(Group::Credentials, p, fname)?);
         }
     }
 
     // ---- Group::State ----
     for fname in m.state_files {
         let p = atomcode_dir.join(fname);
-        if p.exists() { items.push(item(Group::State, p, *fname)?); }
+        if p.exists() {
+            items.push(item(Group::State, p, fname)?);
+        }
     }
     for dname in m.state_dirs {
         let p = atomcode_dir.join(dname);
-        if p.exists() { items.push(item(Group::State, p, *dname)?); }
+        if p.exists() {
+            items.push(item(Group::State, p, dname)?);
+        }
     }
     if atomcode_dir.exists() {
         for entry in fs::read_dir(atomcode_dir)? {
@@ -90,7 +98,13 @@ fn item(group: Group, path: PathBuf, note: &'static str) -> Result<Item> {
         fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
     };
     let needs_privilege = needs_privilege_to_remove(&path);
-    Ok(Item { group, path, size_bytes: size, note, needs_privilege })
+    Ok(Item {
+        group,
+        path,
+        size_bytes: size,
+        note,
+        needs_privilege,
+    })
 }
 
 fn dir_size(p: &Path) -> Result<u64> {
@@ -123,7 +137,9 @@ fn needs_privilege_to_remove(p: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn needs_privilege_to_remove(_p: &Path) -> bool { false }
+fn needs_privilege_to_remove(_p: &Path) -> bool {
+    false
+}
 
 #[cfg(test)]
 mod tests {
@@ -156,7 +172,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (exe, data) = make_fake_install(&tmp);
         let plan = scan(&exe, &data).unwrap();
-        let bin_paths: Vec<_> = plan.items.iter()
+        let bin_paths: Vec<_> = plan
+            .items
+            .iter()
             .filter(|i| i.group == Group::Binary)
             .map(|i| i.path.clone())
             .collect();
@@ -170,14 +188,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (exe, data) = make_fake_install(&tmp);
         let plan = scan(&exe, &data).unwrap();
-        let creds: Vec<_> = plan.items.iter()
+        let creds: Vec<_> = plan
+            .items
+            .iter()
             .filter(|i| i.group == Group::Credentials)
             .map(|i| i.path.clone())
             .collect();
         assert!(creds.contains(&data.join("auth.toml")));
         assert!(creds.contains(&data.join("config.toml")));
 
-        let state: Vec<_> = plan.items.iter()
+        let state: Vec<_> = plan
+            .items
+            .iter()
             .filter(|i| i.group == Group::State)
             .map(|i| i.path.clone())
             .collect();
@@ -194,8 +216,20 @@ mod tests {
         let data = tmp.path().join("nonexistent");
         let plan = scan(&exe, &data).unwrap();
         // Only binary present (no .bak, no .rolling, no data dir).
-        assert_eq!(plan.items.iter().filter(|i| i.group == Group::Binary).count(), 1);
-        assert_eq!(plan.items.iter().filter(|i| i.group != Group::Binary).count(), 0);
+        assert_eq!(
+            plan.items
+                .iter()
+                .filter(|i| i.group == Group::Binary)
+                .count(),
+            1
+        );
+        assert_eq!(
+            plan.items
+                .iter()
+                .filter(|i| i.group != Group::Binary)
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -226,7 +260,11 @@ mod tests {
         let first_cred = groups.iter().position(|g| *g == Group::Credentials);
         let first_state = groups.iter().position(|g| *g == Group::State);
         let last_bin = groups.iter().rposition(|g| *g == Group::Binary);
-        if let (Some(lb), Some(fc)) = (last_bin, first_cred) { assert!(lb < fc); }
-        if let (Some(fc), Some(fs)) = (first_cred, first_state) { assert!(fc < fs); }
+        if let (Some(lb), Some(fc)) = (last_bin, first_cred) {
+            assert!(lb < fc);
+        }
+        if let (Some(fc), Some(fs)) = (first_cred, first_state) {
+            assert!(fc < fs);
+        }
     }
 }

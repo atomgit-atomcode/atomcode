@@ -20,10 +20,22 @@ fn parse_kv(output: &str) -> HashMap<String, HashSet<String>> {
 fn rust_manifest_as_kv() -> HashMap<String, HashSet<String>> {
     let m = uninstall_manifest();
     let mut out = HashMap::new();
-    out.insert("group2_files".into(), m.credential_files.iter().map(|s| (*s).into()).collect());
-    out.insert("group3_files".into(), m.state_files.iter().map(|s| (*s).into()).collect());
-    out.insert("group3_dirs".into(), m.state_dirs.iter().map(|s| (*s).into()).collect());
-    out.insert("group3_prefixes".into(), m.state_prefixes.iter().map(|s| (*s).into()).collect());
+    out.insert(
+        "group2_files".into(),
+        m.credential_files.iter().map(|s| (*s).into()).collect(),
+    );
+    out.insert(
+        "group3_files".into(),
+        m.state_files.iter().map(|s| (*s).into()).collect(),
+    );
+    out.insert(
+        "group3_dirs".into(),
+        m.state_dirs.iter().map(|s| (*s).into()).collect(),
+    );
+    out.insert(
+        "group3_prefixes".into(),
+        m.state_prefixes.iter().map(|s| (*s).into()).collect(),
+    );
     out
 }
 
@@ -42,18 +54,26 @@ fn shell_script_matches_rust() {
         .arg("--print-manifest")
         .output()
         .expect("run uninstall.sh --print-manifest");
-    assert!(out.status.success(),
+    assert!(
+        out.status.success(),
         "uninstall.sh failed: stderr: {}",
-        String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(parse_kv(&stdout), rust_manifest_as_kv(),
-        "scripts/uninstall.sh manifest drift detected");
+    assert_eq!(
+        parse_kv(&stdout),
+        rust_manifest_as_kv(),
+        "scripts/uninstall.sh manifest drift detected"
+    );
 }
 
 #[test]
 fn powershell_script_matches_rust() {
     let script = workspace_root().join("scripts/uninstall.ps1");
-    let pwsh = match which::which("pwsh").ok().or_else(|| which::which("powershell").ok()) {
+    let pwsh = match which::which("pwsh")
+        .ok()
+        .or_else(|| which::which("powershell").ok())
+    {
         Some(p) => p,
         None => {
             eprintln!("skipping: no pwsh or powershell on PATH");
@@ -66,10 +86,15 @@ fn powershell_script_matches_rust() {
         .arg("-PrintManifest")
         .output()
         .expect("run uninstall.ps1 -PrintManifest");
-    assert!(out.status.success(),
+    assert!(
+        out.status.success(),
         "uninstall.ps1 failed: stderr: {}",
-        String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(parse_kv(&stdout), rust_manifest_as_kv(),
-        "scripts/uninstall.ps1 manifest drift detected");
+    assert_eq!(
+        parse_kv(&stdout),
+        rust_manifest_as_kv(),
+        "scripts/uninstall.ps1 manifest drift detected"
+    );
 }

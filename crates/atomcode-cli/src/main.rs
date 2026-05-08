@@ -20,6 +20,7 @@ use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
+use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
     merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpHttpAuthConfig,
@@ -29,6 +30,7 @@ use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::bash::BashTool;
 use atomcode_core::tool::cd::CdTool;
+use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::glob::GlobTool;
 use atomcode_core::tool::grep::GrepTool;
@@ -38,9 +40,7 @@ use atomcode_core::tool::search_replace::SearchReplaceTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
 use atomcode_core::tool::web_search::WebSearchTool;
 use atomcode_core::tool::write::WriteFileTool;
-use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::lsp::manager::build_lsp_manager;
 
 use atomcode_core::auth;
 use atomcode_telemetry::{
@@ -809,9 +809,7 @@ async fn run() -> Result<i32> {
                 let repo = atomcode_core::telemetry_bootstrap::detect_repo_origin(
                     &std::env::current_dir().unwrap_or_default(),
                 );
-                telemetry.set_account_id(
-                    auth::get_stored_auth().map(|a| a.user.id.to_string()),
-                );
+                telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id.to_string()));
                 let scope_ctx = CurrentContext {
                     repo_origin: Some(repo),
                     mode: Some(SessionMode::Headless),
@@ -923,7 +921,9 @@ async fn run() -> Result<i32> {
                 // Flush any events emitted by the subcommand (e.g. login_success)
                 // before the process exits. Bounded by the same 500ms budget as
                 // other exit paths.
-                telemetry.shutdown(std::time::Duration::from_millis(500)).await;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
                 return result;
             }
         }
@@ -991,8 +991,7 @@ async fn run() -> Result<i32> {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
-
-},
+            },
             String::new(),
         )
     } else {
@@ -1389,7 +1388,10 @@ async fn run_headless(
     tokio::spawn(async move {
         atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
     });
-    cmd_tx.send(AgentCommand::SendMessage { text: prompt, images: vec![] })?;
+    cmd_tx.send(AgentCommand::SendMessage {
+        text: prompt,
+        images: vec![],
+    })?;
 
     let mut exit_code: i32 = 0;
     let mut had_denial = false;
@@ -1693,9 +1695,17 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Upgrade { force } => run_upgrade_cli(force).await,
         Commands::Rollback => run_rollback_cli(),
-        Commands::Uninstall { yes, purge, keep_data, dry_run } => {
-            uninstall::run(uninstall::Args { yes, purge, keep_data, dry_run })
-        }
+        Commands::Uninstall {
+            yes,
+            purge,
+            keep_data,
+            dry_run,
+        } => uninstall::run(uninstall::Args {
+            yes,
+            purge,
+            keep_data,
+            dry_run,
+        }),
         Commands::Fixissue { .. } => {
             unreachable!("Fixissue is handled inline in run() before handle_command")
         }
@@ -1945,7 +1955,11 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
             UpgradeEvent::Replacing => {
                 println!("==> Replacing binary");
             }
-            UpgradeEvent::Done { version, backup, exe: _ } => {
+            UpgradeEvent::Done {
+                version,
+                backup,
+                exe: _,
+            } => {
                 println!(
                     "\n✓ Upgraded to {} (previous version kept at {})",
                     version,
