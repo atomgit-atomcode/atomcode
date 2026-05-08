@@ -1962,18 +1962,24 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // ours mid-loop, so we set live_group AFTER the loop.
                 //
                 // Style:
-                // - header: bold + bright white (用户偏好，NOT brand
-                //   red/purple — those clash with the theme; bright
-                //   white is theme-neutral and reads cleanly on both
-                //   light and dark terminals)
+                // Style:
+                // - header: bold, terminal default fg. SGR Color::White
+                //   was tried for "亮白" emphasis but on iTerm2's light
+                //   preset the terminal maps it to the same shade as
+                //   the background — the entire `● Running 3 read_file
+                //   calls in parallel` line went invisible (user
+                //   screenshot: child rows visible, header line blank).
+                //   Same root cause as the inline-code bright-white→
+                //   invisible bug fixed in commit 25e9e41 for markdown
+                //   code, but unfixed for batch headers until now.
+                //   Switching to Role::Secondary (fg=None = `\x1b[39m`
+                //   terminal default) means the row picks up whatever
+                //   foreground the user's theme set for regular text
+                //   — black on light themes, white-ish on dark themes
+                //   — and bold supplies the emphasis on both.
                 // - children: muted (high-frequency rows, not anchors)
-                // - summary: bright white but NOT bold (see Summary
-                //   arm below)
-                let header_style = CellStyle {
-                    fg: Some(crossterm::style::Color::White),
-                    bold: true,
-                    ..Default::default()
-                };
+                // - summary: same fix as header (see Summary arm below)
+                let header_style = self.style_bold(Role::Secondary);
                 let muted = self.style_for(Role::Muted);
                 let screen_w = self.screen.width();
                 let header_row = build_one_row(&header, &header_style, screen_w);
@@ -2065,16 +2071,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::ToolGroupSummary { text } => {
                 self.flush_assistant_remainder();
-                // Bright white but NOT bold — distinguishable from the
-                // muted children, but quieter than the bold header.
-                // The header marks batch START with strong emphasis;
-                // the summary marks batch END with lighter emphasis.
-                // 用户偏好：亮 + 不加粗。
-                let style = CellStyle {
-                    fg: Some(crossterm::style::Color::White),
-                    bold: false,
-                    ..Default::default()
-                };
+                // Terminal default fg, NOT bold — distinguishable from
+                // the muted children (which apply faint), but quieter
+                // than the bold header. Three-tier emphasis: bold
+                // header → plain summary → faint children. Was
+                // bold-bright-white before; same iTerm2-light invisible
+                // bug as the header (see header_style comment above for
+                // the full rationale and screenshot).
+                let style = self.style_for(Role::Secondary);
                 let row = build_one_row(&text, &style, self.screen.width());
                 self.push_body_row(row);
             }
