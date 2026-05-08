@@ -109,6 +109,19 @@
   font-weight: 400;
 }
 
+.user-message-wrapper.is-queued .user-message-bubble {
+  border-style: dashed;
+  opacity: 0.72;
+}
+
+.user-message-status {
+  margin-bottom: 6px;
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
 .user-message-text {
   white-space: pre-wrap;
 }

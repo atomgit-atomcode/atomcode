@@ -73510,6 +73510,12 @@
   function nextId() {
     return `msg-${Date.now()}-${++_msgCounter}`;
   }
+  function lastAssistantIndex(messages) {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === "assistant") return i;
+    }
+    return -1;
+  }
   function normalizeRole(role) {
     const normalized = String(role || "").toLowerCase();
     if (normalized === "user" || normalized === "assistant" || normalized === "tool" || normalized === "system") {
@@ -73535,6 +73541,7 @@
   }
   var initialState = {
     messages: [],
+    queuedMessages: [],
     isGenerating: false,
     viewMode: document.body.dataset.viewMode === "sidebar" ? "sidebar" : "tab",
     currentModel: "default",
@@ -73569,6 +73576,31 @@
         };
         return { ...state, messages: [...state.messages, msg] };
       }
+      case "ADD_QUEUED_MESSAGE": {
+        const msg = {
+          id: action.id,
+          role: "user",
+          text: action.text,
+          queued: true,
+          contextFiles: action.contextFiles,
+          timestamp: Date.now()
+        };
+        return { ...state, queuedMessages: [...state.queuedMessages, msg] };
+      }
+      case "SEND_QUEUED_MESSAGE": {
+        const queued = state.queuedMessages.find((msg) => msg.id === action.id);
+        if (!queued) return state;
+        return {
+          ...state,
+          messages: [...state.messages, { ...queued, queued: false }],
+          queuedMessages: state.queuedMessages.filter((msg) => msg.id !== action.id)
+        };
+      }
+      case "CLEAR_QUEUED_MESSAGES":
+        return {
+          ...state,
+          queuedMessages: []
+        };
       case "ADD_ASSISTANT_MESSAGE": {
         const msg = {
           id: nextId(),
@@ -73598,37 +73630,40 @@
       }
       case "APPEND_TEXT": {
         const msgs = [...state.messages];
-        const last = msgs[msgs.length - 1];
-        if (last?.role === "assistant") {
-          msgs[msgs.length - 1] = { ...last, text: last.text + action.content };
+        const assistantIndex = lastAssistantIndex(msgs);
+        const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : void 0;
+        if (assistant) {
+          msgs[assistantIndex] = { ...assistant, text: assistant.text + action.content };
         }
         return { ...state, messages: msgs };
       }
       case "TOOL_START": {
         const msgs = [...state.messages];
-        const last = msgs[msgs.length - 1];
-        if (last?.role === "assistant") {
+        const assistantIndex = lastAssistantIndex(msgs);
+        const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : void 0;
+        if (assistant) {
           const tool = {
             id: action.id,
             name: action.name,
             args: action.args,
             status: "running"
           };
-          msgs[msgs.length - 1] = {
-            ...last,
-            toolCalls: [...last.toolCalls ?? [], tool]
+          msgs[assistantIndex] = {
+            ...assistant,
+            toolCalls: [...assistant.toolCalls ?? [], tool]
           };
         }
         return { ...state, messages: msgs };
       }
       case "TOOL_RESULT": {
         const msgs = [...state.messages];
-        const last = msgs[msgs.length - 1];
-        if (last?.role === "assistant" && last.toolCalls) {
-          const tools = last.toolCalls.map(
+        const assistantIndex = lastAssistantIndex(msgs);
+        const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : void 0;
+        if (assistant?.toolCalls) {
+          const tools = assistant.toolCalls.map(
             (t) => t.id === action.id ? { ...t, output: action.output, success: action.success, durationMs: action.durationMs, status: "done" } : t
           );
-          msgs[msgs.length - 1] = { ...last, toolCalls: tools };
+          msgs[assistantIndex] = { ...assistant, toolCalls: tools };
         }
         return { ...state, messages: msgs };
       }
@@ -73639,9 +73674,10 @@
         };
       case "GENERATION_DONE": {
         const msgs = [...state.messages];
-        const last = msgs[msgs.length - 1];
-        if (last?.role === "assistant") {
-          msgs[msgs.length - 1] = { ...last, streaming: false };
+        const assistantIndex = lastAssistantIndex(msgs);
+        const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : void 0;
+        if (assistant) {
+          msgs[assistantIndex] = { ...assistant, streaming: false };
         }
         const tokenCount = typeof action.tokens === "number" ? { prompt: 0, completion: 0, total: action.tokens } : state.tokenCount;
         return {
@@ -73653,17 +73689,19 @@
       }
       case "GENERATION_STOPPED": {
         const msgs = [...state.messages];
-        const last = msgs[msgs.length - 1];
-        if (last?.role === "assistant") {
-          msgs[msgs.length - 1] = { ...last, streaming: false };
+        const assistantIndex = lastAssistantIndex(msgs);
+        const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : void 0;
+        if (assistant) {
+          msgs[assistantIndex] = { ...assistant, streaming: false };
         }
-        return { ...state, isGenerating: false, messages: msgs };
+        return { ...state, isGenerating: false, messages: msgs, queuedMessages: [] };
       }
       case "GENERATION_ERROR": {
         const msgs = [...state.messages];
-        const last = msgs[msgs.length - 1];
-        if (last?.role === "assistant") {
-          msgs[msgs.length - 1] = { ...last, streaming: false };
+        const assistantIndex = lastAssistantIndex(msgs);
+        const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : void 0;
+        if (assistant) {
+          msgs[assistantIndex] = { ...assistant, streaming: false };
         }
         const errMsg = {
           id: nextId(),
@@ -73671,11 +73709,11 @@
           text: action.message,
           timestamp: Date.now()
         };
-        return { ...state, isGenerating: false, messages: [...msgs, errMsg] };
+        return { ...state, isGenerating: false, messages: [...msgs, errMsg], queuedMessages: [] };
       }
       // ─── Session management ─────────────────────────
       case "CLEAR_CHAT":
-        return { ...state, messages: [], tokenCount: void 0, contextFiles: [] };
+        return { ...state, messages: [], queuedMessages: [], tokenCount: void 0, contextFiles: [] };
       case "SET_MODELS":
         return { ...state, models: action.models };
       case "SET_PROVIDERS": {
@@ -73880,6 +73918,9 @@
           case "userMessage":
             dispatch({ type: "ADD_USER_MESSAGE", text: msg.text });
             break;
+          case "queuedMessageSent":
+            dispatch({ type: "SEND_QUEUED_MESSAGE", id: msg.id });
+            break;
           case "assistantMessage":
             dispatch({ type: "ADD_ASSISTANT_MESSAGE", text: msg.text });
             break;
@@ -73973,7 +74014,7 @@
           case "codingPlanResult":
             dispatch({
               type: "SET_SETUP_STATUS",
-              status: msg.result.success ? "CodingPlan models synced." : msg.result.report_text
+              status: msg.result.report_text
             });
             break;
           case "setupError":
@@ -74013,9 +74054,17 @@
     }, []);
     const send = (0, import_react.useCallback)(
       (text2) => {
+        const state2 = stateRef.current;
         const ctx = stateRef.current.contextFiles.length > 0 ? stateRef.current.contextFiles.map((f) => ({ path: f.path, type: f.type })) : void 0;
-        dispatch({ type: "ADD_USER_MESSAGE", text: text2, contextFiles: stateRef.current.contextFiles });
-        postMessage({ type: "send", text: text2, context: ctx });
+        const contextFiles = state2.contextFiles;
+        const isQueued = state2.isGenerating;
+        const clientMessageId = `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        if (isQueued) {
+          dispatch({ type: "ADD_QUEUED_MESSAGE", id: clientMessageId, text: text2, contextFiles });
+        } else {
+          dispatch({ type: "ADD_USER_MESSAGE", text: text2, contextFiles });
+        }
+        postMessage({ type: "send", text: text2, context: ctx, clientMessageId: isQueued ? clientMessageId : void 0 });
         dispatch({ type: "CLEAR_CONTEXT" });
       },
       []
@@ -74219,7 +74268,8 @@
       const lineCount = message.text.split("\n").length;
       return message.text.length > 1200 || lineCount > 18;
     }, [message.text]);
-    return /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { className: `user-message-wrapper${className}`, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("div", { className: "user-message-bubble", children: [
+    return /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { className: `user-message-wrapper${message.queued ? " is-queued" : ""}${className}`, children: /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("div", { className: "user-message-bubble", children: [
+      message.queued && /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { className: "user-message-status", children: "Queued" }),
       message.contextFiles && message.contextFiles.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("div", { className: "user-message-attachments", children: message.contextFiles.map((file) => /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("span", { className: "user-message-attachment", title: file.path, children: [
         /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("span", { className: "user-message-attachment-icon", children: file.type === "selection" ? "Selection" : "File" }),
         /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("span", { className: "user-message-attachment-name", children: file.fileName })
@@ -77343,13 +77393,14 @@ ${content}</tr>
     breaks: false
   });
   var renderer = new marked.Renderer();
-  renderer.code = function({ text: text2, lang }) {
-    const code = text2 ?? "";
-    if (!code.trim()) {
+  renderer.code = function(code, infostring) {
+    const text2 = code ?? "";
+    if (!text2.trim()) {
       return "";
     }
+    const lang = (infostring ?? "").split(/\s+/)[0] ?? "";
     const language = lang && es_default.getLanguage(lang) ? lang : "";
-    const highlighted = language ? es_default.highlight(code, { language }).value : es_default.highlightAuto(code).value;
+    const highlighted = language ? es_default.highlight(text2, { language }).value : es_default.highlightAuto(text2).value;
     const id = `cb-${Math.random().toString(36).slice(2, 8)}`;
     return `<div class="code-block-wrapper" data-code-id="${id}"><pre><code class="hljs${language ? ` language-${language}` : ""}">${highlighted}</code></pre><button class="copy-button" data-action="copy" title="Copy"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4 4v8h8V4H4zm7 7H5V5h6v6zM2 2v8h1V3h7V2H2z"/></svg></button></div>`;
   };
@@ -77707,7 +77758,7 @@ ${content}</tr>
     const bottomRef = (0, import_react9.useRef)(null);
     (0, import_react9.useEffect)(() => {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [state.messages, state.isGenerating]);
+    }, [state.messages, state.queuedMessages, state.isGenerating]);
     const query = state.searchQuery.toLowerCase();
     const hasSearch = query.length > 0;
     const lastMessageId = state.messages[state.messages.length - 1]?.id;
@@ -77723,6 +77774,11 @@ ${content}</tr>
             return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: `timeline-message dot-error${highlightClass}`, children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "error-message-content", children: msg.text }) }, msg.id);
           }
           return null;
+        }),
+        state.queuedMessages.map((msg) => {
+          const matches = hasSearch && msg.text.toLowerCase().includes(query);
+          const highlightClass = matches ? " highlighted" : "";
+          return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(UserMessage, { message: msg, className: highlightClass }, msg.id);
         }),
         /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { ref: bottomRef })
       ] }),
@@ -77904,14 +77960,15 @@ ${content}</tr>
     }, []);
     const handleSend = (0, import_react12.useCallback)(() => {
       const trimmed = text2.trim();
-      if (!trimmed || state.isGenerating) return;
+      if (!trimmed) return;
       send(trimmed);
       setText("");
       setShowSlash(false);
-    }, [text2, state.isGenerating, send]);
+    }, [text2, send]);
     const handleKeyDown = (0, import_react12.useCallback)(
       (e) => {
         if (showSlash) return;
+        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
           handleSend();
@@ -77930,6 +77987,7 @@ ${content}</tr>
       setShowSlash((open) => !open);
       textareaRef.current?.focus();
     }, []);
+    const hasText = Boolean(text2.trim());
     return /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "input-container", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "input-box", ref: inputBoxRef, children: [
       showSlash && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(SlashPicker, { filter: slashFilter, onSelect: handleSlashSelect, onClose: () => setShowSlash(false) }),
       state.contextFiles.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "attached-files", children: state.contextFiles.map((f) => /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("span", { className: "attached-file-pill", title: f.path, children: [
@@ -77947,8 +78005,7 @@ ${content}</tr>
           onChange: handleChange,
           onKeyDown: handleKeyDown,
           placeholder: "Type a message...",
-          rows: 1,
-          disabled: state.isGenerating
+          rows: 1
         }
       ),
       /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "input-footer", children: [
@@ -77956,7 +78013,13 @@ ${content}</tr>
         /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "footer-spacer" }),
         state.tokenCount && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "footer-tokens", children: formatTokenCount(state.tokenCount.total) }),
         /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(ModelSelector, { placement: "up", onOpen: () => setShowSlash(false) }),
-        state.isGenerating ? /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "btn-stop", onClick: stop, title: "Stop", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { style: { width: 8, height: 8, background: "currentColor", borderRadius: 1 } }) }) : /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "btn-send", onClick: handleSend, disabled: !text2.trim(), title: "Send", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("svg", { width: "12", height: "12", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "3", strokeLinecap: "round", strokeLinejoin: "round", children: [
+        state.isGenerating ? /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)(import_jsx_runtime14.Fragment, { children: [
+          hasText && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "btn-send", onClick: handleSend, title: "Queue message", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("svg", { width: "12", height: "12", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "3", strokeLinecap: "round", strokeLinejoin: "round", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("line", { x1: "12", y1: "19", x2: "12", y2: "5" }),
+            /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("polyline", { points: "5 12 12 5 19 12" })
+          ] }) }),
+          /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "btn-stop", onClick: stop, title: "Stop", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { style: { width: 8, height: 8, background: "currentColor", borderRadius: 1 } }) })
+        ] }) : /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "btn-send", onClick: handleSend, disabled: !hasText, title: "Send", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("svg", { width: "12", height: "12", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "3", strokeLinecap: "round", strokeLinejoin: "round", children: [
           /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("line", { x1: "12", y1: "19", x2: "12", y2: "5" }),
           /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("polyline", { points: "5 12 12 5 19 12" })
         ] }) })

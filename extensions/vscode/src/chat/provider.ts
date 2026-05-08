@@ -15,6 +15,7 @@ import {
 } from '../daemon/types';
 
 type WebviewMode = 'sidebar' | 'tab';
+type QueuedChatMessage = { text: string; contextPaths?: string[]; clientMessageId?: string };
 const PANEL_READY_TIMEOUT_MS = 5000;
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -25,6 +26,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _sessionId?: string;
   private _loadedMessages?: MessageInfo[];
   private _isGenerating = false;
+  private _queuedMessages: QueuedChatMessage[] = [];
   private _loginId?: string;
   private _loginPoll?: ReturnType<typeof setInterval>;
   private _loginStartedFromCommand = false;
@@ -119,7 +121,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     webview.onDidReceiveMessage(async (msg) => {
       switch (msg.type) {
         case 'send':
-          await this._handleSend(msg.text, msg.context?.map((c: { path: string }) => c.path));
+          await this._handleSend(
+            msg.text,
+            msg.context?.map((c: { path: string }) => c.path),
+            msg.clientMessageId,
+          );
           break;
         case 'stop':
           this.stopGeneration();
@@ -237,6 +243,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.openInTab();
     this._sessionId = undefined;
     this._loadedMessages = undefined;
+    this._queuedMessages = [];
 
     try {
       const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -254,6 +261,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   public stopGeneration() {
     this._currentAbort?.abort();
+    this._queuedMessages = [];
     if (this._sessionId) {
       void this._client.stopGeneration(this._sessionId).catch(() => undefined);
     }
@@ -270,9 +278,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   // Private
-  private async _handleSend(text: string, contextPaths?: string[]) {
+  private async _handleSend(text: string, contextPaths?: string[], clientMessageId?: string) {
     const trimmed = text.trim();
-    if (!trimmed || this._isGenerating) return;
+    if (!trimmed) return;
+
+    if (this._isGenerating) {
+      this._queuedMessages.push({ text: trimmed, contextPaths, clientMessageId });
+      return;
+    }
+
+    if (clientMessageId) {
+      this._postMessage({ type: 'queuedMessageSent', id: clientMessageId });
+    }
 
     if (await this._handleLocalCommand(trimmed)) {
       return;
@@ -332,16 +349,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._isGenerating = false;
         this._postMessage({ type: 'done', tokens, toolCalls, sessionId });
         void this._refreshSessions();
+        setTimeout(() => void this._sendNextQueuedMessage(), 75);
       },
       onStopped: () => {
         this._isGenerating = false;
+        this._queuedMessages = [];
         this._postMessage({ type: 'stopped' });
       },
       onError: (message) => {
         this._isGenerating = false;
+        this._queuedMessages = [];
         this._postMessage({ type: 'error', message });
       },
     });
+  }
+
+  private async _sendNextQueuedMessage() {
+    if (this._isGenerating) return;
+
+    const next = this._queuedMessages.shift();
+    if (!next) return;
+
+    await this._handleSend(next.text, next.contextPaths, next.clientMessageId);
+
+    // A queued local command may complete synchronously without starting a
+    // generation, so keep draining until a real chat turn starts or the queue
+    // is empty.
+    if (!this._isGenerating) {
+      void this._sendNextQueuedMessage();
+    }
   }
 
   private async _ensureSession() {
@@ -749,7 +785,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (result) {
             this._postMessage({
               type: 'assistantMessage',
-              text: result.success ? 'CodingPlan models synced.' : result.report_text,
+              text: '```\n' + result.report_text + '\n```',
             });
           }
         }

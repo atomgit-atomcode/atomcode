@@ -11,15 +11,16 @@ marked.setOptions({
 
 const renderer = new marked.Renderer();
 
-renderer.code = function ({ text, lang }: { text: string; lang?: string }) {
-  const code = text ?? '';
-  if (!code.trim()) {
+renderer.code = function (code: string, infostring?: string) {
+  const text = code ?? '';
+  if (!text.trim()) {
     return '';
   }
+  const lang = (infostring ?? '').split(/\s+/)[0] ?? '';
   const language = lang && hljs.getLanguage(lang) ? lang : '';
   const highlighted = language
-    ? hljs.highlight(code, { language }).value
-    : hljs.highlightAuto(code).value;
+    ? hljs.highlight(text, { language }).value
+    : hljs.highlightAuto(text).value;
   const id = `cb-${Math.random().toString(36).slice(2, 8)}`;
   return (
     `<div class="code-block-wrapper" data-code-id="${id}">` +

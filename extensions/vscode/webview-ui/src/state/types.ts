@@ -81,6 +81,7 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'error';
   text: string;
+  queued?: boolean;
   toolCalls?: ToolCallData[];
   permissionRequest?: PermissionRequestData;
   contextFiles?: ContextFile[];
@@ -91,6 +92,7 @@ export interface ChatMessage {
 /** Root chat state */
 export interface ChatState {
   messages: ChatMessage[];
+  queuedMessages: ChatMessage[];
   isGenerating: boolean;
   viewMode: 'sidebar' | 'tab';
   currentModel: string;
@@ -117,6 +119,9 @@ export interface ChatState {
 
 export type ChatAction =
   | { type: 'ADD_USER_MESSAGE'; text: string; contextFiles?: ContextFile[] }
+  | { type: 'ADD_QUEUED_MESSAGE'; id: string; text: string; contextFiles?: ContextFile[] }
+  | { type: 'SEND_QUEUED_MESSAGE'; id: string }
+  | { type: 'CLEAR_QUEUED_MESSAGES' }
   | { type: 'ADD_ASSISTANT_MESSAGE'; text: string }
   | { type: 'START_GENERATION' }
   | { type: 'APPEND_TEXT'; content: string }
@@ -153,6 +158,7 @@ export type ChatAction =
 export type ExtensionMessage =
   | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string }
   | { type: 'userMessage'; text: string }
+  | { type: 'queuedMessageSent'; id: string }
   | { type: 'assistantMessage'; text: string }
   | { type: 'generationStarted' }
   | { type: 'text'; content: string }

@@ -5,6 +5,13 @@ function nextId(): string {
   return `msg-${Date.now()}-${++_msgCounter}`;
 }
 
+function lastAssistantIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === 'assistant') return i;
+  }
+  return -1;
+}
+
 function normalizeRole(role: string): 'user' | 'assistant' | 'tool' | 'system' | 'unknown' {
   const normalized = String(role || '').toLowerCase();
   if (normalized === 'user' || normalized === 'assistant' || normalized === 'tool' || normalized === 'system') {
@@ -40,6 +47,7 @@ function textFromContent(content: unknown): string {
 
 export const initialState: ChatState = {
   messages: [],
+  queuedMessages: [],
   isGenerating: false,
   viewMode: document.body.dataset.viewMode === 'sidebar' ? 'sidebar' : 'tab',
   currentModel: 'default',
@@ -76,6 +84,34 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return { ...state, messages: [...state.messages, msg] };
     }
 
+    case 'ADD_QUEUED_MESSAGE': {
+      const msg: ChatMessage = {
+        id: action.id,
+        role: 'user',
+        text: action.text,
+        queued: true,
+        contextFiles: action.contextFiles,
+        timestamp: Date.now(),
+      };
+      return { ...state, queuedMessages: [...state.queuedMessages, msg] };
+    }
+
+    case 'SEND_QUEUED_MESSAGE': {
+      const queued = state.queuedMessages.find((msg) => msg.id === action.id);
+      if (!queued) return state;
+      return {
+        ...state,
+        messages: [...state.messages, { ...queued, queued: false }],
+        queuedMessages: state.queuedMessages.filter((msg) => msg.id !== action.id),
+      };
+    }
+
+    case 'CLEAR_QUEUED_MESSAGES':
+      return {
+        ...state,
+        queuedMessages: [],
+      };
+
     case 'ADD_ASSISTANT_MESSAGE': {
       const msg: ChatMessage = {
         id: nextId(),
@@ -107,26 +143,28 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'APPEND_TEXT': {
       const msgs = [...state.messages];
-      const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant') {
-        msgs[msgs.length - 1] = { ...last, text: last.text + action.content };
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = { ...assistant, text: assistant.text + action.content };
       }
       return { ...state, messages: msgs };
     }
 
     case 'TOOL_START': {
       const msgs = [...state.messages];
-      const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant') {
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
         const tool: ToolCallData = {
           id: action.id,
           name: action.name,
           args: action.args,
           status: 'running',
         };
-        msgs[msgs.length - 1] = {
-          ...last,
-          toolCalls: [...(last.toolCalls ?? []), tool],
+        msgs[assistantIndex] = {
+          ...assistant,
+          toolCalls: [...(assistant.toolCalls ?? []), tool],
         };
       }
       return { ...state, messages: msgs };
@@ -134,14 +172,15 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'TOOL_RESULT': {
       const msgs = [...state.messages];
-      const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant' && last.toolCalls) {
-        const tools = last.toolCalls.map((t) =>
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant?.toolCalls) {
+        const tools = assistant.toolCalls.map((t) =>
           t.id === action.id
             ? { ...t, output: action.output, success: action.success, durationMs: action.durationMs, status: 'done' as const }
             : t,
         );
-        msgs[msgs.length - 1] = { ...last, toolCalls: tools };
+        msgs[assistantIndex] = { ...assistant, toolCalls: tools };
       }
       return { ...state, messages: msgs };
     }
@@ -154,9 +193,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'GENERATION_DONE': {
       const msgs = [...state.messages];
-      const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant') {
-        msgs[msgs.length - 1] = { ...last, streaming: false };
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = { ...assistant, streaming: false };
       }
       // action.tokens is a number (total), not a tokenCount object
       const tokenCount = typeof action.tokens === 'number'
@@ -172,18 +212,20 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'GENERATION_STOPPED': {
       const msgs = [...state.messages];
-      const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant') {
-        msgs[msgs.length - 1] = { ...last, streaming: false };
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = { ...assistant, streaming: false };
       }
-      return { ...state, isGenerating: false, messages: msgs };
+      return { ...state, isGenerating: false, messages: msgs, queuedMessages: [] };
     }
 
     case 'GENERATION_ERROR': {
       const msgs = [...state.messages];
-      const last = msgs[msgs.length - 1];
-      if (last?.role === 'assistant') {
-        msgs[msgs.length - 1] = { ...last, streaming: false };
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        msgs[assistantIndex] = { ...assistant, streaming: false };
       }
       const errMsg: ChatMessage = {
         id: nextId(),
@@ -191,12 +233,12 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         text: action.message,
         timestamp: Date.now(),
       };
-      return { ...state, isGenerating: false, messages: [...msgs, errMsg] };
+      return { ...state, isGenerating: false, messages: [...msgs, errMsg], queuedMessages: [] };
     }
 
     // ─── Session management ─────────────────────────
     case 'CLEAR_CHAT':
-      return { ...state, messages: [], tokenCount: undefined, contextFiles: [] };
+      return { ...state, messages: [], queuedMessages: [], tokenCount: undefined, contextFiles: [] };
 
     case 'SET_MODELS':
       return { ...state, models: action.models };

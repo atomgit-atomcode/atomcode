@@ -10,7 +10,7 @@ export function MessageList() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [state.messages, state.isGenerating]);
+  }, [state.messages, state.queuedMessages, state.isGenerating]);
 
   const query = state.searchQuery.toLowerCase();
   const hasSearch = query.length > 0;
@@ -34,6 +34,11 @@ export function MessageList() {
             );
           }
           return null;
+        })}
+        {state.queuedMessages.map((msg) => {
+          const matches = hasSearch && msg.text.toLowerCase().includes(query);
+          const highlightClass = matches ? ' highlighted' : '';
+          return <UserMessage key={msg.id} message={msg} className={highlightClass} />;
         })}
         <div ref={bottomRef} />
       </div>

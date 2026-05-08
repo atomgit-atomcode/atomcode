@@ -14,8 +14,9 @@ export function UserMessage({ message, className = '' }: UserMessageProps) {
   }, [message.text]);
 
   return (
-    <div className={`user-message-wrapper${className}`}>
+    <div className={`user-message-wrapper${message.queued ? ' is-queued' : ''}${className}`}>
       <div className="user-message-bubble">
+        {message.queued && <div className="user-message-status">Queued</div>}
         {message.contextFiles && message.contextFiles.length > 0 && (
           <div className="user-message-attachments">
             {message.contextFiles.map((file) => (

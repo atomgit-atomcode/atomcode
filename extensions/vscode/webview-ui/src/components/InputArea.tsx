@@ -53,15 +53,16 @@ export function InputArea() {
 
   const handleSend = useCallback(() => {
     const trimmed = text.trim();
-    if (!trimmed || state.isGenerating) return;
+    if (!trimmed) return;
     send(trimmed);
     setText('');
     setShowSlash(false);
-  }, [text, state.isGenerating, send]);
+  }, [text, send]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (showSlash) return;
+      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
     },
     [handleSend, showSlash],
@@ -79,6 +80,8 @@ export function InputArea() {
     setShowSlash((open) => !open);
     textareaRef.current?.focus();
   }, []);
+
+  const hasText = Boolean(text.trim());
 
   return (
     <div className="input-container">
@@ -104,7 +107,6 @@ export function InputArea() {
           onKeyDown={handleKeyDown}
           placeholder="Type a message..."
           rows={1}
-          disabled={state.isGenerating}
         />
         <div className="input-footer">
           <button className="footer-slash-btn" onClick={handleSlashButton} title="Commands">
@@ -114,11 +116,20 @@ export function InputArea() {
           {state.tokenCount && <span className="footer-tokens">{formatTokenCount(state.tokenCount.total)}</span>}
           <ModelSelector placement="up" onOpen={() => setShowSlash(false)} />
           {state.isGenerating ? (
-            <button className="btn-stop" onClick={stop} title="Stop">
-              <div style={{ width: 8, height: 8, background: 'currentColor', borderRadius: 1 }} />
-            </button>
+            <>
+              {hasText && (
+                <button className="btn-send" onClick={handleSend} title="Queue message">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" />
+                  </svg>
+                </button>
+              )}
+              <button className="btn-stop" onClick={stop} title="Stop">
+                <div style={{ width: 8, height: 8, background: 'currentColor', borderRadius: 1 }} />
+              </button>
+            </>
           ) : (
-            <button className="btn-send" onClick={handleSend} disabled={!text.trim()} title="Send">
+            <button className="btn-send" onClick={handleSend} disabled={!hasText} title="Send">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                 <line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" />
               </svg>

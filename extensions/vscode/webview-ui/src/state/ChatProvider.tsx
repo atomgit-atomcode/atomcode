@@ -56,6 +56,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         case 'userMessage':
           dispatch({ type: 'ADD_USER_MESSAGE', text: msg.text });
           break;
+        case 'queuedMessageSent':
+          dispatch({ type: 'SEND_QUEUED_MESSAGE', id: msg.id });
+          break;
         case 'assistantMessage':
           dispatch({ type: 'ADD_ASSISTANT_MESSAGE', text: msg.text });
           break;
@@ -152,7 +155,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         case 'codingPlanResult':
           dispatch({
             type: 'SET_SETUP_STATUS',
-            status: msg.result.success ? 'CodingPlan models synced.' : msg.result.report_text,
+            status: msg.result.report_text,
           });
           break;
         case 'setupError':
@@ -198,11 +201,19 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   // ── Outbound actions ──
   const send = useCallback(
     (text: string) => {
+      const state = stateRef.current;
       const ctx = stateRef.current.contextFiles.length > 0
         ? stateRef.current.contextFiles.map((f) => ({ path: f.path, type: f.type }))
         : undefined;
-      dispatch({ type: 'ADD_USER_MESSAGE', text, contextFiles: stateRef.current.contextFiles });
-      postMessage({ type: 'send', text, context: ctx });
+      const contextFiles = state.contextFiles;
+      const isQueued = state.isGenerating;
+      const clientMessageId = `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      if (isQueued) {
+        dispatch({ type: 'ADD_QUEUED_MESSAGE', id: clientMessageId, text, contextFiles });
+      } else {
+        dispatch({ type: 'ADD_USER_MESSAGE', text, contextFiles });
+      }
+      postMessage({ type: 'send', text, context: ctx, clientMessageId: isQueued ? clientMessageId : undefined });
       // Clear context after sending
       dispatch({ type: 'CLEAR_CONTEXT' });
     },
