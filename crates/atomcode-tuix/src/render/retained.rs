@@ -460,18 +460,122 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // This is a rendering safeguard only — the actual command
         // execution uses the original, untruncated arguments.
         let body_str = truncate_body_str(&body_str, 500);
-        // Remove previously rendered inflight tool rows.
-        let remove = self.inflight_tool_rows.min(self.body_lines.len());
-        self.body_lines.truncate(self.body_lines.len() - remove);
-        self.inflight_tool_rows = 0;
-        let before = self.body_lines.len();
-        self.push_body_prefixed(
-            &format!("{} ", icon),
-            &self.style_for(Role::Muted),
-            &body_str,
-            &self.style_bold(Role::ToolName),
-        );
-        self.inflight_tool_rows = self.body_lines.len().saturating_sub(before);
+
+        // Build the rows the same way push_body_prefixed would, but
+        // without committing them yet. We need this so subsequent
+        // ticks can rewrite them in place without scrolling.
+        let prefix = format!("{} ", icon);
+        let prefix_style = self.style_for(Role::Muted);
+        let body_style = self.style_bold(Role::ToolName);
+        let new_rows = self.build_prefixed_rows(&prefix, &prefix_style, &body_str, &body_style);
+
+        // First tick (no previous inflight rows on screen): push
+        // normally — emit_body_line_inner scrolls and writes at body
+        // bottom, body_lines tracks them. The data side ends up
+        // matching what's on terminal.
+        //
+        // Subsequent tick (previous inflight rows already painted):
+        // CUP+EL+write at the SAME absolute terminal positions. NO
+        // scrolling, NO truncate-then-push (which used to leave the
+        // previous spinner frames piling up because emit_body_line_inner
+        // couldn't undo earlier scrolls — confirmed via 5/8 atomgr
+        // session: a long bash `find` wrapped to 2 rows produced one
+        // stacked row per spinner tick).
+        if self.inflight_tool_rows == 0 || new_rows.is_empty() {
+            // First-tick path. Just push and count.
+            let pushed = new_rows.len();
+            for row in new_rows {
+                self.push_body_row(row);
+            }
+            self.inflight_tool_rows = pushed;
+            return;
+        }
+
+        // In-place rewrite path.
+        let bottom = self.body_bottom_row();
+        let prev_n = self.inflight_tool_rows;
+        if bottom == 0 || (prev_n as u16) > bottom {
+            // Pathological viewport (footer ate the body) or count
+            // mismatch — fall back to truncate+push so we degrade to
+            // the old behaviour rather than write off-screen. The
+            // caller will see the stacking but at least nothing is
+            // garbled.
+            let remove = prev_n.min(self.body_lines.len());
+            self.body_lines.truncate(self.body_lines.len() - remove);
+            self.inflight_tool_rows = 0;
+            let pushed = new_rows.len();
+            for row in new_rows {
+                self.push_body_row(row);
+            }
+            self.inflight_tool_rows = pushed;
+            return;
+        }
+        let first_term_row = bottom - prev_n as u16 + 1;
+
+        // Update body_lines in place: drop the prev_n entries and
+        // append new ones. Same total length only when new_rows.len()
+        // == prev_n (the common case — body_str is identical across
+        // ticks, only the icon char changes width 1→1).
+        let base = self.body_lines.len() - prev_n;
+        self.body_lines.truncate(base);
+        for row in &new_rows {
+            self.body_lines.push(row.clone());
+        }
+
+        // Terminal write: position cursor + EL + serialize each row.
+        // We always overwrite up to max(prev_n, new_rows.len()) rows
+        // so that any leftover rows from a longer prev frame get
+        // wiped (an icon character that happens to be wider could
+        // change wrap count; rare but cheap to be safe).
+        let total = prev_n.max(new_rows.len());
+        for i in 0..total {
+            let term_row = first_term_row + i as u16;
+            let cup_el = format!("\x1b[{};1H\x1b[K", term_row);
+            let _ = self.out.write_all(cup_el.as_bytes());
+            if let Some(row) = new_rows.get(i) {
+                let bytes = serialize_row(row);
+                let _ = self.out.write_all(&bytes);
+            }
+        }
+
+        self.inflight_tool_rows = new_rows.len();
+    }
+
+    /// Build the `prefix + body` rows the same way push_body_prefixed
+    /// emits them, but return them instead of pushing. Used by
+    /// `render_inflight_tool` to overwrite previous spinner rows in
+    /// place without going through push_body_row's scroll path.
+    fn build_prefixed_rows(
+        &self,
+        prefix: &str,
+        prefix_style: &CellStyle,
+        body: &str,
+        body_style: &CellStyle,
+    ) -> Vec<Vec<Cell>> {
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL);
+        if w == 0 {
+            return Vec::new();
+        }
+        let prefix_w = crate::width::display_width(prefix);
+        let first_budget = w.saturating_sub(prefix_w);
+        let cont_pad: String = " ".repeat(prefix_w);
+        let mut out_rows = Vec::new();
+        let mut first_emitted = false;
+        for phys in body.split('\n') {
+            for chunk in crate::width::wrap_line_to_width(phys, first_budget.max(1)) {
+                let mut row = Vec::new();
+                let pad = CellStyle::default();
+                if !first_emitted {
+                    push_str_cells(&mut row, prefix, prefix_style);
+                    first_emitted = true;
+                } else {
+                    push_str_cells(&mut row, &cont_pad, &pad);
+                }
+                push_str_cells(&mut row, chunk.as_str(), body_style);
+                out_rows.push(row);
+            }
+        }
+        out_rows
     }
 
     /// Pad a partially-built row with blank default-style cells until it
@@ -1899,7 +2003,24 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 call_id,
                 new_text,
             } => {
-                self.flush_assistant_remainder();
+                // CRITICAL: do NOT call flush_assistant_remainder here.
+                // It would push pending assistant text via push_body_row,
+                // which clears live_group (per the freeze invariant), and
+                // the lookup below would silent-return → child never gets
+                // its `→ N lines` data. ToolGroupChildUpdate only does a
+                // CUP rewrite on an EXISTING body row; it does not create
+                // new rows, so there is nothing to flush against. Pending
+                // streaming text stays in assistant_line_buf for whoever
+                // legitimately pushes a new row next.
+                //
+                // Bug seen in 5-8 atomgr session: batch 2 had two bash
+                // calls; assistant_line_buf had leftover streamed text
+                // ("工具响应持续被截断"-style prose from prior turn). The
+                // first ToolCallResult flushed that text → push_body_row
+                // → live_group=None → both children's updates silent
+                // no-opped. Visual: children stuck without `→ N lines`,
+                // user (and model) thought tool results were truncated.
+
                 // Resolve via the active live-group. Three guards:
                 // 1. live_group still active (no foreign push happened)
                 // 2. batch_id matches (defensive — shouldn't ever
