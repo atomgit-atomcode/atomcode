@@ -780,8 +780,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         }
 
         // Top rule: full-width cyan ━ above the input box. Mirrors
-        // retained's `build_rule_row`. ASCII fallback to `-` when the
-        // terminal can't render unicode glyphs.
+        // retained's `build_rule_row`.
         //
         // U+2501 (━ HEAVY HORIZONTAL) instead of U+2500 (─ LIGHT
         // HORIZONTAL): on legacy Windows conhost with the default
@@ -795,8 +794,14 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // supports it). Bright cyan alone was insufficient — the
         // gap between glyphs persisted regardless of colour. See
         // commit fcf6a7e for the prior dim→bright attempt.
-        let rule_char = if self.caps.unicode_symbols { "━" } else { "-" };
-        let rule = rule_char.repeat(self.width as usize);
+        //
+        // No ASCII fallback: U+2501 is in WGL4, present on every
+        // Windows monospace font (Consolas, NSimSun, Cascadia,
+        // Microsoft YaHei). Falling back to `-` here on legacy conhost
+        // produced a literal hyphen-dotted line that users read as
+        // "broken/dashed border" — exactly what the heavy variant was
+        // chosen to avoid.
+        let rule = "\u{2501}".repeat(self.width as usize);
         let cup = format!("\x1b[{};1H\x1b[K", top_rule_row);
         let _ = self.out.write_all(cup.as_bytes());
         if self.caps.colors {
@@ -1295,33 +1300,27 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         self.push_body_row(row);
     }
 
-    /// Wrap `text` in muted-grey SGR (90) when colours are on, leaving
-    /// embedded SGR sequences in the input intact at the boundaries
-    /// (caller's nested colours win until they reset; we only paint
-    /// the unstyled spans). When colours are off, returns the input
-    /// untouched.
-    ///
-    /// Used for ToolGroup child rows so they read as subordinate
-    /// detail under the bold header, mirroring retained's
-    /// `style_for(Role::Muted)` styling for the same row class.
-    fn style_muted(&self, text: &str) -> String {
-        if self.caps.colors {
-            format!("{}{}{}", SGR_GREY, text, SGR_RESET)
-        } else {
-            text.to_string()
-        }
-    }
-
-    /// Wrap `text` in bold (SGR 1) when colours are on, leaving the
-    /// terminal's default foreground intact. Used for ToolGroup
-    /// header / summary rows — bold supplies the emphasis without
-    /// committing to a colour that might conflict with the user's
-    /// theme (matches retained's `style_bold(Role::Secondary)`).
-    fn style_bold_default(&self, text: &str) -> String {
-        if self.caps.colors {
-            format!("{}{}{}", SGR_BOLD, text, SGR_RESET)
-        } else {
-            text.to_string()
+    /// Push `text` as command-output rows wrapped in `sgr_open` (e.g.
+    /// `SGR_GREY` or `SGR_BOLD`). Scrubs first, soft-wraps each line,
+    /// THEN paints SGR around every wrapped chunk — this ordering is
+    /// load-bearing: `push_command_output` runs `scrub_controls` which
+    /// would otherwise strip caller-supplied SGR if the styling were
+    /// applied first. Used for ToolGroup header (bold) and child
+    /// rows (muted gray), mirroring retained's role-based styling.
+    fn push_styled_command_output(&mut self, text: &str, sgr_open: &str) {
+        self.flush_assistant_remainder();
+        let safe = scrub_controls(text);
+        let max_w = (self.width as usize).max(1);
+        let style_on = self.caps.colors && !sgr_open.is_empty();
+        for line in safe.split('\n') {
+            for chunk in wrap_to_width_sgr_aware(line, max_w) {
+                let row = if style_on {
+                    format!("{}{}{}", sgr_open, chunk, SGR_RESET)
+                } else {
+                    chunk
+                };
+                self.push_body_row(row);
+            }
         }
     }
 
@@ -1472,21 +1471,21 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 //     header. User reported children rendered in
                 //     default fg here, so the visual hierarchy was
                 //     flattened relative to retained.
-                self.push_command_output(&self.style_bold_default(&header));
+                self.push_styled_command_output(&header, SGR_BOLD);
                 for c in children {
-                    self.push_command_output(&self.style_muted(&c.text));
+                    self.push_styled_command_output(&c.text, SGR_GREY);
                 }
             }
             UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
                 // Update inherits the muted child styling so the row
                 // stays visually subordinate after the result lands.
-                self.push_command_output(&self.style_muted(&new_text));
+                self.push_styled_command_output(&new_text, SGR_GREY);
             }
             UiLine::ToolGroupSummary { text } => {
                 // Summary mirrors header: bold default-fg anchor row
                 // closing the group. Matches retained's
                 // `style_bold(Role::Secondary)` choice.
-                self.push_command_output(&self.style_bold_default(&text));
+                self.push_styled_command_output(&text, SGR_BOLD);
             }
             UiLine::ToolResult { success, summary } => {
                 self.push_tool_result(success, &summary);
