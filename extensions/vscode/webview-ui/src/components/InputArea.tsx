@@ -10,6 +10,7 @@ export function InputArea() {
   const [showSlash, setShowSlash] = useState(false);
   const [slashFilter, setSlashFilter] = useState('');
   const inputBoxRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -25,6 +26,28 @@ export function InputArea() {
     }
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
+  }, []);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const sessionBody = container.closest<HTMLElement>('.session-body');
+    if (!sessionBody) return;
+
+    const updateInputInset = () => {
+      sessionBody.style.setProperty('--input-inset', `${container.offsetHeight + 32}px`);
+    };
+
+    updateInputInset();
+    const resizeObserver = new ResizeObserver(updateInputInset);
+    resizeObserver.observe(container);
+    window.addEventListener('resize', updateInputInset);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', updateInputInset);
+      sessionBody.style.removeProperty('--input-inset');
+    };
   }, []);
 
   useEffect(() => {
@@ -84,7 +107,7 @@ export function InputArea() {
   const hasText = Boolean(text.trim());
 
   return (
-    <div className="input-container">
+    <div className="input-container" ref={containerRef}>
       <div className="input-box" ref={inputBoxRef}>
         {showSlash && (
           <SlashPicker filter={slashFilter} onSelect={handleSlashSelect} onClose={() => setShowSlash(false)} />
