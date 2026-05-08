@@ -1263,6 +1263,40 @@ impl AgentLoop {
             }
         }
 
+        // Vision preprocessing: when the active provider can't accept images
+        // and the user pasted some, run them through the configured VL model
+        // first and turn the result into plain text. See
+        // `vision_preprocessor` module doc for the data-flow contract.
+        let mut vision_warning: Option<String> = None;
+        let (clean, images) = if !images.is_empty() {
+            use crate::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+            match maybe_preprocess(&self.config, &*self.turn_runner.provider, &clean, &images).await {
+                PreprocessOutcome::Skipped => (clean, images),
+                PreprocessOutcome::Replaced { text } => {
+                    let merged = if clean.is_empty() {
+                        format!("[图片内容（由 VL 模型识别）]\n{text}")
+                    } else {
+                        format!("{clean}\n\n[图片内容（由 VL 模型识别）]\n{text}")
+                    };
+                    (merged, Vec::new())
+                }
+                PreprocessOutcome::Failed { reason } => {
+                    vision_warning = Some(format!("VL 预处理失败：{reason}"));
+                    let merged = if clean.is_empty() {
+                        "[图片识别失败]".to_string()
+                    } else {
+                        format!("{clean}\n\n[图片识别失败]")
+                    };
+                    (merged, Vec::new())
+                }
+            }
+        } else {
+            (clean, images)
+        };
+        if let Some(w) = vision_warning {
+            let _ = self.event_tx.send(AgentEvent::Warning(w));
+        }
+
         if images.is_empty() {
             self.conversation.add_user_message(&clean);
         } else {
