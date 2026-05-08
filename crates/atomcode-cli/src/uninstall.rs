@@ -95,26 +95,149 @@ fn decision_mode(args: &Args, tty: bool) -> DecisionMode {
     DecisionMode::Tty
 }
 
-// ----- Stubs filled in Task 9 -----
+// ----- Task 9 implementations -----
 
-fn print_plan(_plan: &atomcode_core::uninstall::scan::Plan, _decisions: Decisions) {
-    println!("DRY RUN — Task 9 will render the plan here.");
+fn print_plan(plan: &atomcode_core::uninstall::scan::Plan, decisions: Decisions) {
+    println!("DRY RUN — no changes will be made.\n");
+
+    print_group(plan, Group::Binary, "[Group 1] Binary + PATH edit", decisions.binary);
+    print_group(plan, Group::Credentials, "[Group 2] Credentials and global config", decisions.credentials);
+    print_group(plan, Group::State, "[Group 3] Local state and extensions", decisions.state);
 }
 
-fn prompt_user(_plan: &atomcode_core::uninstall::scan::Plan) -> anyhow::Result<Option<Decisions>> {
-    // Task 9 implements interactive prompts. For now, this is unreachable
-    // because `decision_mode` returns `Tty` only when no flag is set, and
-    // until Task 9 we should never get here without flags. Keep a safe default.
-    Ok(Some(Decisions::DEFAULTS))
+fn print_group(plan: &atomcode_core::uninstall::scan::Plan, g: Group, label: &str, will_remove: bool) {
+    let items: Vec<_> = plan.items.iter().filter(|i| i.group == g).collect();
+    if items.is_empty() { return; }
+    println!("{label}  [{}]", if will_remove { "WILL REMOVE" } else { "KEEP" });
+    for it in &items {
+        let mark = if it.needs_privilege { " (sudo)" } else { "" };
+        println!("  {}  ({}){}", it.path.display(), human_size(it.size_bytes), mark);
+    }
+    println!();
 }
 
-fn print_summary(_outcome: &Outcome) {
-    println!("(summary printer is implemented in Task 9)");
+fn human_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 { v /= 1024.0; u += 1; }
+    if u == 0 { format!("{} B", bytes) } else { format!("{:.1} {}", v, UNITS[u]) }
 }
 
-fn build_context(_plan: &atomcode_core::uninstall::scan::Plan) -> anyhow::Result<ExecuteContext> {
-    Ok(ExecuteContext::default())
+fn prompt_user(plan: &atomcode_core::uninstall::scan::Plan) -> anyhow::Result<Option<Decisions>> {
+    use std::io::{BufRead, Write};
+
+    println!("This will uninstall AtomCode from your system.\n");
+
+    let g1 = ask_group(plan, Group::Binary,
+        "[Group 1] Remove binary and PATH edit?", true)?;
+    if !g1 {
+        eprintln!("Group 1 declined; aborting (cannot keep binary while removing data).");
+        return Ok(None);
+    }
+    let g2 = ask_group(plan, Group::Credentials,
+        "[Group 2] Remove credentials and global config?", false)?;
+    let g3 = ask_group(plan, Group::State,
+        "[Group 3] Remove local state and extensions?", true)?;
+
+    println!("\nSummary:");
+    summarize_decision(plan, Group::Binary, true);
+    summarize_decision(plan, Group::Credentials, g2);
+    summarize_decision(plan, Group::State, g3);
+
+    print!("\nContinue? [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    if !line.trim().eq_ignore_ascii_case("y") {
+        return Ok(None);
+    }
+    Ok(Some(Decisions { binary: true, credentials: g2, state: g3 }))
 }
 
-#[allow(dead_code)]
-fn _used_in_task_9(_g: Group) {}
+fn ask_group(
+    plan: &atomcode_core::uninstall::scan::Plan,
+    g: Group,
+    prompt: &str,
+    default_yes: bool,
+) -> anyhow::Result<bool> {
+    use std::io::{BufRead, Write};
+    let items: Vec<_> = plan.items.iter().filter(|i| i.group == g).collect();
+    if items.is_empty() {
+        return Ok(default_yes);
+    }
+    println!("\n{prompt}");
+    for it in &items {
+        let mark = if it.needs_privilege { " (sudo)" } else { "" };
+        println!("  {}  ({}){}", it.path.display(), human_size(it.size_bytes), mark);
+    }
+    let prompt_suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    print!("Proceed? {prompt_suffix}: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let answer = line.trim();
+    Ok(match answer {
+        "" => default_yes,
+        s if s.eq_ignore_ascii_case("y") || s.eq_ignore_ascii_case("yes") => true,
+        s if s.eq_ignore_ascii_case("n") || s.eq_ignore_ascii_case("no") => false,
+        _ => default_yes,
+    })
+}
+
+fn summarize_decision(plan: &atomcode_core::uninstall::scan::Plan, g: Group, will_remove: bool) {
+    let count = plan.items.iter().filter(|i| i.group == g).count();
+    if count == 0 { return; }
+    let action = if will_remove { "Remove" } else { "Keep" };
+    let label = match g {
+        Group::Binary => "binary + PATH",
+        Group::Credentials => "credentials",
+        Group::State => "local state",
+    };
+    println!("  {action}: {count} items ({label})");
+}
+
+fn print_summary(outcome: &Outcome) {
+    println!("\n──────────────────");
+    if !outcome.removed.is_empty() {
+        println!("Removed:");
+        for p in &outcome.removed { println!("  {}", p.display()); }
+    }
+    if !outcome.kept.is_empty() {
+        println!("Kept (use --purge to remove later):");
+        for p in &outcome.kept { println!("  {}", p.display()); }
+    }
+    if !outcome.failed.is_empty() {
+        println!("Failed:");
+        for (p, e) in &outcome.failed { println!("  {}  ({})", p.display(), e); }
+    }
+    if !outcome.backups.is_empty() {
+        println!("Backups:");
+        for p in &outcome.backups { println!("  {}", p.display()); }
+    }
+}
+
+fn build_context(plan: &atomcode_core::uninstall::scan::Plan) -> anyhow::Result<ExecuteContext> {
+    let mut rc_files = Vec::new();
+    #[cfg(unix)]
+    {
+        let prefix = plan.binary_path.parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let rc = atomcode_core::uninstall::paths::unix_rc_paths();
+        for path in [rc.zshrc, rc.bashrc] {
+            if path.exists() {
+                rc_files.push((path, prefix.clone()));
+            }
+        }
+    }
+    let _ = plan; // suppress unused-var warning on non-unix builds
+    let ctx = ExecuteContext {
+        rc_files,
+        #[cfg(windows)]
+        windows_install_dir_literal: plan.binary_path.parent().map(|p| p.to_string_lossy().into_owned()),
+        #[cfg(windows)]
+        windows_install_dir_expanded: plan.binary_path.parent().map(|p| p.to_string_lossy().into_owned()),
+    };
+    Ok(ctx)
+}
