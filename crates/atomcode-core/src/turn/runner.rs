@@ -552,7 +552,39 @@ impl TurnRunner {
                                             && tool_calls_buf.is_empty()
                                             && !rescued_tools
                                             && !reasoning_buf.trim().is_empty()
+                                            && reasoning_buf.trim()
+                                                != crate::provider::REASONING_PLACEHOLDER
                                         {
+                                            // Skip-promotion guard: when the reasoning
+                                            // channel carries ONLY our own outbound
+                                            // placeholder (`(no reasoning recorded)`),
+                                            // don't promote it to the assistant text
+                                            // channel. Some gateways echo back the
+                                            // placeholder as the response's
+                                            // reasoning_content (or the model mimics
+                                            // the pattern from a context full of
+                                            // historical placeholder copies — DeepSeek
+                                            // V4 thinking-mode requires non-empty
+                                            // reasoning_content on every historical
+                                            // assistant tool_call message, so a
+                                            // 17-round session has 17 copies of the
+                                            // placeholder in context). Promoting it
+                                            // would commit a meaningless string to
+                                            // history AND present `Responded { text:
+                                            // "(no reasoning recorded)" }` to the
+                                            // agent loop, which then calls
+                                            // finish_turn(Natural) and the user sees
+                                            // a silent "Nailed it" mid-task stop
+                                            // (user-reported on DeepSeek V4 Flash,
+                                            // 17 rounds 20 tools, screenshot showed
+                                            // the placeholder as the only assistant
+                                            // text before TurnComplete fired). With
+                                            // the guard: text_buf stays empty, falls
+                                            // through to the empty-response Failed
+                                            // branch below, the agent loop's existing
+                                            // 3-retry-with-backoff path takes over
+                                            // and surfaces the issue to the user
+                                            // instead of burying it as success.
                                             let promoted = std::mem::take(&mut reasoning_buf);
                                             conversation.push_delta(&promoted);
                                             text_buf.push_str(&promoted);

@@ -1484,6 +1484,25 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_send_side_matches_shared_constant() {
+        // `TurnRunner::Done` skips reasoning→text promotion when the
+        // accumulated reasoning_buf equals exactly this placeholder.
+        // Send-side (format_messages, three call sites) MUST emit the
+        // same byte string — otherwise a buggy gateway echoing it
+        // back would slip past the guard and cause silent
+        // "(no reasoning recorded) · Nailed it" stops. Pin the
+        // contract by routing both sides through one constant.
+        use super::{OpenAiProvider, ReasoningPolicy};
+        use crate::provider::REASONING_PLACEHOLDER;
+        let msgs = vec![atc_message(None)];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
+        assert_eq!(
+            out[0]["reasoning_content"].as_str().unwrap(),
+            REASONING_PLACEHOLDER,
+        );
+    }
+
+    #[test]
     fn format_messages_include_with_none_reasoning_emits_placeholder() {
         // Kimi's check is "field missing" (empty ok). DeepSeek V4's check is
         // stricter — rejects an empty string on tool_call messages. When we
