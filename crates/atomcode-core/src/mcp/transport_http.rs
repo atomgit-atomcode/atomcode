@@ -12,7 +12,7 @@ use tokio::time::timeout;
 
 use super::client::McpClient;
 use super::config::McpHttpAuthConfig;
-use super::oauth::{token_is_expired, McpTokenStore};
+use super::oauth::{refresh_mcp_oauth_token, token_is_expired, McpTokenStore};
 use super::types::{CallToolResult, InitializeResult, ListToolsResult, ServerStatus};
 
 /// Default timeout for HTTP operations (30 seconds).
@@ -191,18 +191,21 @@ impl HttpClient {
     }
 
     fn load_oauth_token(&self) -> Result<Option<String>> {
-        let Some(McpHttpAuthConfig::OAuth { .. }) = &self.auth else {
+        let Some(McpHttpAuthConfig::OAuth(_)) = &self.auth else {
             return Ok(None);
         };
         let Some(token) = McpTokenStore::default().load_token(&self.server_name)? else {
             return Ok(None);
         };
         if token_is_expired(&token) {
-            bail!(
-                "MCP server {} OAuth token is expired; run `atomcode mcp login {}`",
-                self.server_name,
-                self.server_name
-            );
+            let refreshed =
+                refresh_mcp_oauth_token(&self.server_name, &token).with_context(|| {
+                    format!(
+                        "MCP server {} OAuth token is expired; run `atomcode mcp login {}`",
+                        self.server_name, self.server_name
+                    )
+                })?;
+            return Ok(Some(refreshed.access_token));
         }
         Ok(Some(token.access_token))
     }

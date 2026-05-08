@@ -20,8 +20,9 @@ use atomcode_core::config::provider::{default_context_window_for, ProviderConfig
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::mcp::{
-    login_github_oauth, merge_http_oauth_mcp_server_into_json_file,
-    merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpRegistry, McpTokenStore,
+    load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
+    merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpHttpAuthConfig,
+    McpOAuthLoginOptions, McpRegistry, McpTokenStore, McpTransportConfig,
 };
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
@@ -560,6 +561,9 @@ enum McpCli {
         /// OAuth client id. Defaults to ATOMCODE_GITHUB_MCP_CLIENT_ID.
         #[arg(long)]
         client_id: Option<String>,
+        /// Environment variable containing the OAuth client secret.
+        #[arg(long)]
+        client_secret_env: Option<String>,
         /// OAuth scopes. Defaults to GitHub MCP's broad repo-oriented set.
         #[arg(long, value_delimiter = ',')]
         scopes: Vec<String>,
@@ -1728,19 +1732,36 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             name,
             provider,
             client_id,
+            client_secret_env,
             scopes,
         }) => {
-            if provider != "github" {
-                anyhow::bail!("unsupported MCP OAuth provider: {}", provider);
-            }
-            let client_id =
-                client_id.or_else(|| std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok());
-            let Some(client_id) = client_id else {
-                anyhow::bail!(
-                    "GitHub MCP OAuth requires --client-id or ATOMCODE_GITHUB_MCP_CLIENT_ID"
-                );
-            };
-            let token = login_github_oauth(&name, &client_id, &scopes)?;
+            let configs = load_mcp_config(&std::env::current_dir()?)?;
+            let server = configs
+                .into_iter()
+                .find(|config| config.name == name)
+                .ok_or_else(|| anyhow::anyhow!("MCP server {:?} not found in config", name))?;
+            let is_github_server = matches!(
+                &server.config,
+                McpTransportConfig::Http {
+                    auth: Some(McpHttpAuthConfig::OAuth(auth)),
+                    ..
+                } if auth.provider.as_deref() == Some("github")
+            );
+            let client_id = client_id.or_else(|| {
+                if is_github_server && provider == "github" {
+                    std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok()
+                } else {
+                    None
+                }
+            });
+            let token = login_mcp_oauth(
+                &server,
+                McpOAuthLoginOptions {
+                    client_id,
+                    client_secret_env,
+                    scopes,
+                },
+            )?;
             println!(
                 "  Saved {} OAuth token for MCP server {:?} with {} scope(s)",
                 token.provider,

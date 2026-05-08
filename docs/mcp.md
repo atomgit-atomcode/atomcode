@@ -9,14 +9,14 @@
 ### 1.1 已实现
 
 - **配置**：项目根 `.mcp.json` 与用户目录 `~/.atomcode/mcp.json`；顶层键 **`mcpServers`**（与 Cursor 等一致）；旧键 `servers` 仍可解析；同名 server **项目覆盖用户**；支持 `disabled`；字符串中 `${VAR}`、`${VAR:-default}` 展开。
-- **传输**：`stdio`（`command` + `args` + `env`）、`HTTP`（`url` + `headers`）；默认超时 30s，可用 `timeout_ms` 覆盖。HTTP 请求在未自定义 `Accept` 时默认带 `Accept: application/json, text/event-stream`（与 Playwright 等要求 Streamable HTTP / SSE 协商的端点一致）。**stdio 消息格式**与 MCP 规范一致：每条 JSON-RPC 为 **一行 NDJSON**（末尾换行）；仍兼容读取旧式 **`Content-Length:` + 正文** 的服务端响应。
+- **传输**：`stdio`（`command` + `args` + `env`）、`HTTP`（`url` + `headers`）；默认超时 30s，可用 `timeout_ms` 覆盖。HTTP 请求在未自定义 `Accept` 时默认带 `Accept: application/json, text/event-stream`（与 Playwright 等要求 Streamable HTTP / SSE 协商的端点一致）。HTTP OAuth 支持 `auth.type = "oauth"`、Bearer 注入、401 metadata discovery、PKCE 登录、动态客户端注册与 refresh token。**stdio 消息格式**与 MCP 规范一致：每条 JSON-RPC 为 **一行 NDJSON**（末尾换行）；仍兼容读取旧式 **`Content-Length:` + 正文** 的服务端响应。
 - **协议**：JSON-RPC；`initialize`、`tools/list`、`tools/call`；`initialize` 结果里解析 `capabilities`（当前仅用到 tools 能力标记）。
 - **兼容性细节**：当某个请求不需要参数时，客户端会**省略** `params` 字段（不会发送 `"params": null`），避免部分 JS SDK 服务端在收到 `null` 时卡住（例如 `tools/list`）。
 - **工具注册**：每个远端 tool 映射为 `mcp__{server_key}__{tool_name}`，经 `McpToolAdapter` 注册到 `ToolRegistry`。
 - **权限**：MCP 适配器对每次调用返回 `RequireApproval`（说明里带 server / tool / 参数摘要），走现有交互式审批；`PermissionStore` 的 session grant / override 按键为 **完整工具名** `mcp__...`（与内建工具相同），**不是** `mcp:server:tool` 形式。
 - **无头模式**（`-p` / `--prompt-file` / `fixissue`）：启动时 **`McpRegistry::from_config` 同步连接**启用中的 server，连接成功后再 `list_tools` 并一次性注册 MCP 工具。
 - **TUI 模式**：**后台并行连接**（`from_config_background_with_events`），不阻塞进入界面；连接成功或失败通过 `McpConnectEvent` 写入会话区；**每连上一个 server 就 `register_mcp_tools_async` 动态追加**该 server 的工具。
-- **`/mcp`**：列出当前 registry 中 **已成功 `initialize` 并入表** 的 server 及其 `ServerStatus`（见下节限制）；`/mcp reload` 重新加载 `.mcp.json` / `~/.atomcode/mcp.json` 并后台重连启用中的 server；`/mcp tools <server>` 异步列出该 server 的远端 tools（若超时/失败会提示）。
+- **`/mcp`**：列出当前 registry 中 **已成功 `initialize` 并入表** 的 server 及其 `ServerStatus`（见下节限制）；`/mcp reload` 重新加载 `.mcp.json` / `~/.atomcode/mcp.json` 并后台重连启用中的 server；`/mcp tools <server>` 异步列出该 server 的远端 tools（若超时/失败会提示）。TUI 动态注册和 `/mcp tools` 的外层 `tools/list` 等待时间按该 server 的 `timeout_ms + 5s` 计算（默认 35s），避免早于 transport 自身超时取消。
 
 ### 1.2 未实现 / 限制（与代码一致）
 
@@ -25,7 +25,8 @@
 - **`tools/list` 变更**：无 `list_changed` 动态刷新。
 - **`/mcp` 展示**：registry 里**只保存连接成功**（`initialize` 成功）的 server，因此 `/mcp` 只会展示**已连接**的 server；失败/未连上/正在连接的 server **不会**出现在列表中（失败仅通过会话行 `✗ MCP server '…' failed: …` 可见）。
 - **工具结果内容**：`call_tool` 仅将 **text** 类型 content 块拼接为字符串；image/resource 块当前不参与输出。
-- **OAuth / roots / elicitation**、daemon 侧 MCP API、插件捆绑 server：未实现。
+- **roots / elicitation**、daemon 侧 MCP API、插件捆绑 server：未实现。
+- **OAuth 限制**：通用 OAuth 只覆盖 HTTP MCP；登录需显式执行 `atomcode mcp login <server>` 或 `/mcp login <server>`，后台连接不会自动弹浏览器。若授权服务器不提供 dynamic client registration，需要在配置或命令行提供 `client_id`；confidential client 需要通过环境变量提供 secret。
 
 ---
 
@@ -71,7 +72,7 @@ CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞�
 顶层为 `{ "mcpServers": { "<name>": { ... } } }`（亦兼容旧键 `"servers"`）。每个 server 建议只写一种 transport：
 
 - **stdio**：`command`（必填）+ 可选 `args`、`env`、`timeout_ms`、`disabled`
-- **HTTP**：`url`（必填）+ 可选 `headers`、`timeout_ms`、`disabled`
+- **HTTP**：`url`（必填）+ 可选 `headers`、`auth`、`timeout_ms`、`disabled`
 
 如果同一个 server 同时写了 `command` 和 `url`，当前实现会优先按 stdio（`command`）处理；为避免歧义，对外配置请不要双写。
 
@@ -82,8 +83,19 @@ CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞�
   "mcpServers": {
     "github": {
       "url": "https://api.githubcopilot.com/mcp/",
-      "headers": {
-        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      "auth": {
+        "type": "oauth",
+        "provider": "github",
+        "client_secret_env": "GITHUB_MCP_CLIENT_SECRET"
+      },
+      "timeout_ms": 60000
+    },
+    "notion": {
+      "url": "https://mcp.notion.com/mcp",
+      "auth": {
+        "type": "oauth",
+        "issuer": "https://mcp.notion.com",
+        "resource": "https://mcp.notion.com/mcp"
       },
       "timeout_ms": 30000
     },
@@ -98,6 +110,19 @@ CLI 入口（`crates/atomcode-cli/src/main.rs`）根据是否无头选择阻塞�
   }
 }
 ```
+
+OAuth 字段：
+
+- `type = "oauth"`：启用 HTTP OAuth。
+- `issuer`：可选授权服务器 issuer；省略时客户端会先请求 MCP server 并从 `WWW-Authenticate` 发现 resource metadata。
+- `resource`：可选 resource identifier 或 metadata URL；token 请求会带上 resource。
+- `client_id`：可选预注册客户端 ID；若省略，客户端会尝试 dynamic client registration。
+- `client_secret_env`：可选环境变量名，用于 confidential client 的 secret。
+- `scopes`：可选 scope 列表；省略时不主动请求 scope，由授权服务器使用默认授权范围。
+
+GitHub OAuth App 使用 authorization-code flow 时需要 client secret；可在配置中写 `"client_secret_env": "GITHUB_MCP_CLIENT_SECRET"`，或登录时传 `--client-secret-env GITHUB_MCP_CLIENT_SECRET`。
+
+GitHub MCP 的完整配置和排错流程见 [mcp/github.md](./mcp/github.md)。
 
 ### 5.3 用户级配置
 
@@ -123,6 +148,24 @@ atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo
 - 与 `claude mcp add <name> <command> [args…]` 同一思路：首参为 server 键名，其后为可执行文件及参数。
 - **同名会整段覆盖**该键（仅写入 `command` / `args`，不保留该键下原 `env` 等字段）；HTTP 型 `url` 条目请仍用手写 JSON 或编辑器。
 - 合并时会读入已有 `servers` + `mcpServers`，写回时只保留 **`mcpServers`**（去掉顶层 `servers`）。
+
+### 5.5 CLI：HTTP OAuth 登录
+
+```bash
+# GitHub remote MCP（client id 也可由 ATOMCODE_GITHUB_MCP_CLIENT_ID 提供）
+atomcode mcp add-github-oauth github --global
+atomcode mcp login github \
+  --client-id "$ATOMCODE_GITHUB_MCP_CLIENT_ID" \
+  --client-secret-env GITHUB_MCP_CLIENT_SECRET
+
+# 通用 HTTP OAuth MCP
+atomcode mcp login notion
+
+# 需要 confidential client 的服务
+atomcode mcp login slack --client-id "$SLACK_CLIENT_ID" --client-secret-env SLACK_CLIENT_SECRET
+```
+
+登录成功后 token 存在 `~/.atomcode/mcp_auth.toml`，后续 HTTP 请求自动加 `Authorization: Bearer ...`。token 过期且有 refresh token 时会自动刷新；刷新失败时重新执行 login。
 
 ---
 
@@ -151,7 +194,7 @@ atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo
 |------|------|------|
 | Phase 1 MVP | stdio/HTTP、tools、配置、审批、TUI 连接提示与 `/mcp`（已连 server） | **已落地** |
 | Phase 2 | resources/prompts 工具、动态 list_changed、HTTP 重连、更完整的 MCP 面板 | 未做 |
-| Phase 3 | OAuth、roots、elicitation、daemon MCP API、插件携带 server | 未做 |
+| Phase 3 | roots、elicitation、daemon MCP API、插件携带 server | 未做 |
 
 ---
 
@@ -222,7 +265,15 @@ EOF
 
 ---
 
-## 11. 同类产品参考
+## 11. 服务文档
+
+特定 MCP 服务的配置、OAuth 登录和排错步骤放在 `docs/mcp/` 目录：
+
+- [GitHub MCP OAuth 使用说明](./mcp/github.md)
+
+---
+
+## 12. 同类产品参考
 
 | 产品 | 配置 | Transport | 备注 |
 |------|------|-------------|------|
