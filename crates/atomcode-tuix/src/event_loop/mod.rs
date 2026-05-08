@@ -2237,7 +2237,13 @@ fn handle_input(
                         // so the scrollback echo shows where in the message
                         // each image was attached. Image bytes ride alongside
                         // in `pending_images`, drained at submit.
-                        let n = app.state.pending_images.len() + 1;
+                        // N comes from `session_image_count` (monotonic
+                        // across turns), NOT `pending_images.len()+1` —
+                        // otherwise turn 1's first paste and turn 2's first
+                        // paste would both render as `[Image #1]` in
+                        // scrollback, ambiguous when scrolling back.
+                        app.state.session_image_count += 1;
+                        let n = app.state.session_image_count;
                         app.state.pending_images.push(img);
                         app.state.pending_image_hashes.push(hash);
                         let marker = format!("[Image #{}]", n);
@@ -2828,7 +2834,12 @@ fn handle_idle_key(
             // cursor — same pattern as `insert_paste` for long text.
             // The marker echoes through to scrollback on submit; image
             // bytes are stashed in `pending_images` and drained then.
-            let n = app.state.pending_images.len() + 1;
+            // N comes from `session_image_count` (monotonic across
+            // turns), NOT `pending_images.len()+1` — otherwise turn 1's
+            // first paste and turn 2's first paste would both render as
+            // `[Image #1]` in scrollback, ambiguous when scrolling back.
+            app.state.session_image_count += 1;
+            let n = app.state.session_image_count;
             app.state.pending_images.push(img);
             app.state.pending_image_hashes.push(hash);
             let marker = format!("[Image #{}]", n);
@@ -4216,7 +4227,7 @@ fn handle_agent_event(
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0);
             if total > 0 {
-                let arrow = if state.unicode_symbols { "▸" } else { ">" };
+                let arrow = if state.unicode_symbols { "●" } else { ">" };
                 let summary = if failed == 0 {
                     format!(
                         "{} ParallelEditFiles · {}/{} ok · {} wall",

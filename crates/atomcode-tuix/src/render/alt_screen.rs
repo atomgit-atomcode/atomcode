@@ -1186,7 +1186,12 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// until commit). Spinner animation for in-flight ships in Phase 3.
     fn push_tool_call(&mut self, name: &str, detail: &str) {
         self.flush_assistant_remainder();
-        let arrow = "\u{25b8}"; // ▸
+        // ● (U+25CF) — Geometric Shapes block, broadly available
+        // across Windows monospace fonts. Was ▸ (U+25B8) but rendered
+        // as `□` tofu on Windows VSCode/cmd.exe defaults; see the
+        // matching comment in retained.rs ToolCall arm for the
+        // Windows-font rationale.
+        let arrow = "\u{25cf}";
         let name_safe = scrub_controls(name);
         let detail_safe = scrub_controls(detail);
         let row = match (self.caps.colors, detail_safe.is_empty()) {

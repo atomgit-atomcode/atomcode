@@ -176,12 +176,16 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let detail = scrub_controls(&detail);
                 let arrow_color = if self.caps.colors { SGR_CYAN } else { "" };
                 let reset = if self.caps.colors { SGR_RESET } else { "" };
+                // ● (U+25CF) — Geometric Shapes block; broadly available
+                // across Windows monospace fonts. Aligns with retained
+                // and alt-screen renderers (see retained.rs ToolCall
+                // arm for the Windows-font tofu rationale).
                 if detail.is_empty() {
-                    let _ = writeln!(self.out, "{}▸ {}{}", arrow_color, name, reset);
+                    let _ = writeln!(self.out, "{}● {}{}", arrow_color, name, reset);
                 } else {
                     let _ = writeln!(
                         self.out,
-                        "{}▸ {}{}({})",
+                        "{}● {}{}({})",
                         arrow_color, name, reset, detail
                     );
                 }
@@ -456,7 +460,7 @@ mod tests {
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert!(!s.contains('\x1b'), "dumb mode must emit zero SGR. got: {}", s);
-        assert!(s.contains("▸ read_file(x.rs)"));
+        assert!(s.contains("● read_file(x.rs)"));
         assert!(s.contains("✓ done"));
     }
 

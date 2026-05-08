@@ -1288,7 +1288,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let _ = self.out.write_all(seq.as_bytes());
             }
             self.push_body_prefixed(
-                "\u{25b8} ",
+                // Frozen icon matches the static ToolCall arm — see its
+                // comment for the Windows-font rationale that picked ●
+                // (U+25CF, Geometric Shapes block) over ▸ (U+25B8,
+                // missing from Consolas/NSimSun and rendered as `□`
+                // tofu in screenshots).
+                "\u{25cf} ",
                 &self.style_for(Role::Muted),
                 &body_str,
                 &self.style_bold(Role::ToolName),
@@ -2091,8 +2096,19 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // for the tool-call line (acceptable in Phase 4,
                 // tightens in Phase 5/6).
                 let _ = muted;
+                // ● (U+25CF, Geometric Shapes block) replaces the
+                // earlier ▸ (U+25B8). ▸ ships in Cascadia Code / SF
+                // Mono but is missing from Consolas / NSimSun /
+                // legacy conhost defaults — Windows users saw the
+                // tool-call row prefixed by `□` tofu (screenshot
+                // bug report). ● has near-universal monospace
+                // coverage, same reason state.tick_spinner picked
+                // half-moons over Braille (state.rs:528-544). Bonus:
+                // unifies the visual anchor with the parallel-batch
+                // header (also ●), matching Claude Code's single-glyph
+                // model for tool-call entries.
                 self.push_body_prefixed(
-                    "▸ ",
+                    "● ",
                     &self.style_for(Role::Muted),
                     &body_str,
                     &tool_name_style,
@@ -4126,7 +4142,7 @@ mod tests {
         );
     }
 
-    /// ToolCall: `▸ name(detail)` formatted. Grid-verifies the
+    /// ToolCall: `● name(detail)` formatted. Grid-verifies the
     /// marker + name + parens appear together on one row.
     #[test]
     fn retained_tool_call_renders_via_vterm() {
@@ -4146,11 +4162,11 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         let found = vterm
-            .any_row(|row| row.contains("▸") && row.contains("bash") && row.contains("ls -la"));
+            .any_row(|row| row.contains("●") && row.contains("bash") && row.contains("ls -la"));
         assert!(found, "tool call missing\ndump:\n{}", vterm.dump());
     }
 
-    /// ToolCall arrow `▸` must sit at col 0, same baseline as user
+    /// ToolCall glyph `●` must sit at col 0, same baseline as user
     /// echo and input chevron.
     #[test]
     fn retained_tool_call_arrow_at_col_0() {
@@ -4171,12 +4187,12 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let row_idx = (0..vterm.height() as usize)
-            .find(|&i| vterm.row_text(i).contains("▸") && vterm.row_text(i).contains("bash"))
+            .find(|&i| vterm.row_text(i).contains("●") && vterm.row_text(i).contains("bash"))
             .unwrap_or_else(|| panic!("tool call row missing\ndump:\n{}", vterm.dump()));
         assert_eq!(
             vterm.cell_at(row_idx, 0).ch,
-            '▸',
-            "tool-call arrow must land at col 0, got row: {:?}\ndump:\n{}",
+            '●',
+            "tool-call glyph must land at col 0, got row: {:?}\ndump:\n{}",
             vterm.row_text(row_idx),
             vterm.dump()
         );
@@ -4303,7 +4319,7 @@ mod tests {
 
             let tool_row = (0..vterm.height() as usize)
                 .find(|&i| {
-                    vterm.row_text(i).contains("▸") && vterm.row_text(i).contains(tool_name)
+                    vterm.row_text(i).contains("●") && vterm.row_text(i).contains(tool_name)
                 })
                 .unwrap_or_else(|| {
                     panic!("[{tool_name}] tool call row missing\ndump:\n{}", vterm.dump())
