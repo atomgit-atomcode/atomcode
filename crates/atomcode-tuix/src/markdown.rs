@@ -76,29 +76,23 @@ pub fn render_line_with_width(
         return prefix_only();
     }
 
-    // Inside code block: CC-style left-bar marker `│` (faint/SGR 2)
-    // + default-color content. The bar makes the block visually
-    // distinct without painting every line bold+bright white. A
-    // 30-line code block previously dominated screen attention with
-    // 30 bright-white rows; now it reads as a quiet quoted region
-    // with a thin gutter, the way CC renders fenced blocks.
+    // Inside code block: CC-style — plain code, no gutter glyph,
+    // default foreground. Two-space leading indent provides the
+    // visual offset that makes the block readable against
+    // surrounding prose; that's all CC does and it's what the user
+    // expects. We previously emitted `│` (U+2502 BOX DRAWINGS LIGHT
+    // VERTICAL) as a faint left bar, which renders cleanly on
+    // modern terminals but turns into garbage on Windows cmd.exe
+    // under non-UTF-8 codepages — the simplest fix is to not emit
+    // any non-ASCII chrome around code at all.
     //
     // Earlier iterations tried bright white (`\x1b[1;97m`) and
-    // truecolor blue-500 (`\x1b[1;38;2;59;130;246m`) to dodge palette
-    // remap issues on various terminals — both still painted every
-    // code line in a bright colour, dominating attention when 30+
-    // lines of code shared the screen with markdown headings + emoji.
-    // The light-preset readability problem is now solved by NOT
-    // picking a foreground colour — terminal default fg works on
-    // every theme. Bar uses faint (SGR 2) so it reads as a quiet
-    // marker, not a competing element.
+    // truecolor blue-500 to dodge palette remap; both painted every
+    // code line in a competing colour, drowning the surrounding
+    // markdown. Plain default-colour text wins on every theme and
+    // every terminal, including bare cmd.exe.
     if state.in_code_block {
-        let body = if caps.colors {
-            format!("\x1b[2m│\x1b[22m {}", line)
-        } else {
-            format!("│ {}", line)
-        };
-        return Some(prepend(body));
+        return Some(prepend(format!("  {}", line)));
     }
 
     // Horizontal rule — render as a blank separator line, not a visible
@@ -579,27 +573,34 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_block_uses_faint_left_bar_marker() {
-        // CC-style: code blocks render as `│ <line>` with a faint
-        // (SGR 2) bar marker, NOT bold+bright white nor truecolor
-        // blue-500 per line. Pin the exact prefix shape so a future
-        // "let's brighten it again" refactor catches itself in CI.
+    fn fenced_code_block_renders_as_plain_indented_code() {
+        // CC-style: code blocks are plain text with a 2-space
+        // left margin and default foreground colour. No `│` gutter
+        // (turns to mojibake on Windows cmd.exe under non-UTF-8
+        // codepage), no bold+bright white, no truecolor blue. Pin
+        // the shape so a future "let's add a fancy bar" refactor
+        // catches itself in CI.
         let mut state = MdState::new();
         let _ = render_line("```", &mut state, caps()); // open fence
         let inside = render_line("let x = 1;", &mut state, caps()).unwrap_or_default();
         assert!(
-            inside.contains("\x1b[2m│\x1b[22m"),
-            "fenced code block should use faint `│` left bar: {}",
+            inside.contains("  let x = 1;"),
+            "fenced code body should appear with 2-space indent: {:?}",
+            inside
+        );
+        assert!(
+            !inside.contains('│'),
+            "fenced code block must NOT emit `│` left bar (Windows cmd compat): {:?}",
             inside
         );
         assert!(
             !inside.contains("\x1b[1;97m"),
-            "fenced code block must NOT bold+bright-white the content: {}",
+            "fenced code block must NOT bold+bright-white the content: {:?}",
             inside
         );
         assert!(
             !inside.contains("\x1b[1;38;2;"),
-            "fenced code block must NOT truecolor-blue the content: {}",
+            "fenced code block must NOT truecolor-blue the content: {:?}",
             inside
         );
     }
