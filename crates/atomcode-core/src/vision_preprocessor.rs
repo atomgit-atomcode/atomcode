@@ -11,8 +11,9 @@
 //! `caption + images` and contains exactly one user turn.
 
 use crate::config::Config;
-use crate::conversation::message::ImagePart;
-use crate::provider::{model_name_suggests_vision, LlmProvider};
+use crate::conversation::message::{ImagePart, Message, MessageContent, Role};
+use crate::provider::{create_provider, model_name_suggests_vision, LlmProvider};
+use futures::StreamExt;
 
 /// Outcome of a preprocessing attempt.
 #[derive(Debug, Clone)]
@@ -67,10 +68,6 @@ pub async fn maybe_preprocess(
         }
     };
 
-    use crate::conversation::message::{Message, MessageContent, Role};
-    use crate::provider::create_provider;
-    use futures::StreamExt;
-
     // Build a one-off VL provider. `create_provider` handles auth-token
     // loading (api_key=None) for the AtomGit gateway case.
     let vl_provider = match create_provider(&vl_cfg) {
@@ -113,7 +110,15 @@ pub async fn maybe_preprocess(
                 crate::stream::StreamEvent::Reasoning(_) => {}
                 crate::stream::StreamEvent::Done { .. } => break,
                 crate::stream::StreamEvent::Error(e) => anyhow::bail!("{e}"),
-                _ => {}
+                // VL is a one-shot OCR call — Warnings (e.g., proxy truncation
+                // heuristics) and Usage stats are not actionable for the user
+                // here; tool-call variants don't apply because we pass `None`
+                // for tools. Drop them.
+                crate::stream::StreamEvent::Warning(_)
+                | crate::stream::StreamEvent::Usage(_)
+                | crate::stream::StreamEvent::ToolCallStart { .. }
+                | crate::stream::StreamEvent::ToolCallDelta(_)
+                | crate::stream::StreamEvent::ToolCallDone(_) => {}
             }
         }
         Ok::<_, anyhow::Error>(buf)
