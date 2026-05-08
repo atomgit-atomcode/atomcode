@@ -77,6 +77,27 @@ impl<T> StepResult<T> {
     }
 }
 
+/// Describes how the auto-detected vision_preprocessor_provider was
+/// (or was not) updated by `step_models_and_register`. Surfaces in
+/// `SetupReport::render` so the user can see what happened to that
+/// config knob across the /codingplan flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VisionPreprocessorOutcome {
+    /// Field was None and remains None (no VL/OCR in list).
+    UnchangedNone,
+    /// Field was a non-AtomGit user-supplied value; preserved.
+    /// Carries the value for display.
+    UserSupplied(String),
+    /// Field was None or a stale AtomGit-* key; auto-pointed at a
+    /// vision-capable provider in the freshly-installed list.
+    /// Carries the new key.
+    AutoSet(String),
+    /// Field was an AtomGit-* key but the new list has no VL/OCR
+    /// candidate, so the field was cleared to None to avoid pointing
+    /// at a wiped provider key.
+    Cleared,
+}
+
 impl SetupReport {
     /// Render as a multi-line plain-text block for stdout / TUI body.
     /// Shared by the CLI subcommand and the `/codingplan` slash command
@@ -148,6 +169,30 @@ impl SetupReport {
                         ""
                     };
                     out.push_str(&format!("      • {}  →  {}{}\n", pname, model, suffix));
+                }
+                // Vision-preprocessor outcome line.
+                match &info.vision_preprocessor {
+                    VisionPreprocessorOutcome::AutoSet(k) => {
+                        out.push_str(&format!(
+                            "  ✔ Vision preprocessor → {}  (auto-detected)\n",
+                            k,
+                        ));
+                    }
+                    VisionPreprocessorOutcome::UserSupplied(k) => {
+                        out.push_str(&format!(
+                            "  ✔ Vision preprocessor → {}  (user setting kept)\n",
+                            k,
+                        ));
+                    }
+                    VisionPreprocessorOutcome::Cleared => {
+                        out.push_str(
+                            "  ⚠ Vision preprocessor cleared — no VL/OCR model in current list\n",
+                        );
+                    }
+                    VisionPreprocessorOutcome::UnchangedNone => {
+                        // No-op: nothing to say when both the previous and
+                        // new state are "no preprocessor configured".
+                    }
                 }
             }
             StepResult::Skipped(reason) if reason == CASCADE_FROM_UPSTREAM_FAIL => {
@@ -262,6 +307,9 @@ pub struct ModelsInfo {
     pub provider_names: Vec<String>,
     /// Which of `provider_names` was set as `default_provider`.
     pub default_provider: String,
+    /// Outcome of vision_preprocessor_provider auto-config. Drives the
+    /// "Vision preprocessor → ..." line in the rendered report.
+    pub vision_preprocessor: VisionPreprocessorOutcome,
 }
 
 /// Entry point. Mutates `config` in place (providers + default_provider);
@@ -461,10 +509,49 @@ fn step_models_and_register(config: &mut Config) -> StepResult<ModelsInfo> {
     }
     config.default_provider = default_provider.clone();
 
+    // Auto-detect a vision_preprocessor candidate from the freshly
+    // installed list. Precedence:
+    //   - User-supplied non-AtomGit value: leave alone.
+    //   - None / AtomGit-* (i.e. previous /codingplan run): replace
+    //     with first VL/OCR model's provider key from the new list,
+    //     or clear to None when the new list has no VL candidate.
+    let vl_idx = names
+        .iter()
+        .position(|n| crate::provider::model_name_suggests_vision(n));
+    let new_vl_key = vl_idx.map(|i| provider_names[i].clone());
+
+    let vision_preprocessor = {
+        let current = config.vision_preprocessor_provider.clone();
+        let user_supplied_non_atomgit = current
+            .as_deref()
+            .map(|k| !k.is_empty() && !is_codingplan_provider_name(k))
+            .unwrap_or(false);
+
+        if user_supplied_non_atomgit {
+            VisionPreprocessorOutcome::UserSupplied(current.unwrap())
+        } else {
+            match new_vl_key {
+                Some(k) => {
+                    config.vision_preprocessor_provider = Some(k.clone());
+                    VisionPreprocessorOutcome::AutoSet(k)
+                }
+                None => {
+                    if current.is_some() {
+                        config.vision_preprocessor_provider = None;
+                        VisionPreprocessorOutcome::Cleared
+                    } else {
+                        VisionPreprocessorOutcome::UnchangedNone
+                    }
+                }
+            }
+        }
+    };
+
     StepResult::Ok(ModelsInfo {
         display_names: names,
         provider_names,
         default_provider,
+        vision_preprocessor,
     })
 }
 
@@ -723,6 +810,7 @@ mod tests {
                 display_names: vec!["moonshotai/Kimi-K2-Instruct".into()],
                 provider_names: vec!["AtomGit".into()],
                 default_provider: "AtomGit".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
             }),
             status: StepResult::Ok(crate::coding_plan::types::StatusResponse {
                 codingplan_free: Some(crate::coding_plan::types::PlanInfo {
@@ -775,6 +863,7 @@ mod tests {
                 display_names: vec!["a/b".into()],
                 provider_names: vec!["AtomGit".into()],
                 default_provider: "AtomGit".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
             }),
             status: StepResult::Err("request timeout".into()),
         };
@@ -808,6 +897,7 @@ mod tests {
                 display_names: vec!["a/b".into()],
                 provider_names: vec!["AtomGit".into()],
                 default_provider: "AtomGit".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
             }),
             status: StepResult::Ok(crate::coding_plan::types::StatusResponse {
                 codingplan_free: Some(crate::coding_plan::types::PlanInfo {
@@ -891,6 +981,7 @@ mod tests {
                     "AtomGit-openai-gpt-5".into(),
                 ],
                 default_provider: "AtomGit-moonshotai-Kimi-K2-Instruct".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
             }),
             status: StepResult::Err("status endpoint 500".into()),
         };
@@ -964,6 +1055,7 @@ mod tests {
                 display_names: vec!["a/b".into()],
                 provider_names: vec!["AtomGit".into()],
                 default_provider: "AtomGit".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
             }),
             status: StepResult::Err(huge),
         };
@@ -1005,5 +1097,260 @@ mod tests {
         // 5 CJK chars = 5 chars (regardless of byte count). No char-boundary panic.
         let r = truncate_inline("一二三四五六七八", 5);
         assert_eq!(r, "一二三四五…");
+    }
+
+    // ── Vision-preprocessor auto-config tests ────────────────────────────
+
+    fn vl_model_entry(model: &str) -> super::super::types::ModelEntry {
+        super::super::types::ModelEntry {
+            id: 1,
+            is_infinity: 0,
+            is_atomcode_exclusive: 0,
+            display_model_name: model.to_string(),
+        }
+    }
+
+    /// Helper that mirrors `step_models_and_register`'s wipe-and-insert
+    /// + auto-detect body, sans network call. Tests the precedence logic
+    /// in isolation.
+    fn run_register(
+        config: &mut Config,
+        models: Vec<super::super::types::ModelEntry>,
+    ) -> ModelsInfo {
+        let stale: Vec<String> = config
+            .providers
+            .keys()
+            .filter(|k| is_codingplan_provider_name(k))
+            .cloned()
+            .collect();
+        for k in stale {
+            config.providers.remove(&k);
+        }
+        let names: Vec<String> = models.iter().map(|m| m.display_model_name.clone()).collect();
+        let provider_names = provider_names_for(&names);
+        let default_provider = provider_names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PROVIDER_PREFIX.to_string());
+        for (pname, m) in provider_names.iter().zip(models.iter()) {
+            config
+                .providers
+                .insert(pname.clone(), build_codingplan_provider(&m.display_model_name));
+        }
+        config.default_provider = default_provider.clone();
+
+        let vl_idx = names
+            .iter()
+            .position(|n| crate::provider::model_name_suggests_vision(n));
+        let new_vl_key = vl_idx.map(|i| provider_names[i].clone());
+        let vision_preprocessor = {
+            let current = config.vision_preprocessor_provider.clone();
+            let user_supplied_non_atomgit = current
+                .as_deref()
+                .map(|k| !k.is_empty() && !is_codingplan_provider_name(k))
+                .unwrap_or(false);
+            if user_supplied_non_atomgit {
+                VisionPreprocessorOutcome::UserSupplied(current.unwrap())
+            } else {
+                match new_vl_key {
+                    Some(k) => {
+                        config.vision_preprocessor_provider = Some(k.clone());
+                        VisionPreprocessorOutcome::AutoSet(k)
+                    }
+                    None => {
+                        if current.is_some() {
+                            config.vision_preprocessor_provider = None;
+                            VisionPreprocessorOutcome::Cleared
+                        } else {
+                            VisionPreprocessorOutcome::UnchangedNone
+                        }
+                    }
+                }
+            }
+        };
+
+        ModelsInfo {
+            display_names: names,
+            provider_names,
+            default_provider,
+            vision_preprocessor,
+        }
+    }
+
+    #[test]
+    fn vision_preprocessor_auto_set_when_none_and_list_has_vl() {
+        let mut config = blank_config();
+        let models = vec![
+            vl_model_entry("moonshotai/Kimi-K2-Instruct"),
+            vl_model_entry("Qwen/Qwen3-VL-32B-Instruct"),
+            vl_model_entry("deepseek/deepseek-v4-flash"),
+        ];
+        let info = run_register(&mut config, models);
+        let expected = "AtomGit-Qwen-Qwen3-VL-32B-Instruct".to_string();
+        assert_eq!(
+            info.vision_preprocessor,
+            VisionPreprocessorOutcome::AutoSet(expected.clone())
+        );
+        assert_eq!(config.vision_preprocessor_provider, Some(expected));
+    }
+
+    #[test]
+    fn vision_preprocessor_unchanged_none_when_list_has_no_vl() {
+        let mut config = blank_config();
+        let models = vec![vl_model_entry("moonshotai/Kimi-K2-Instruct")];
+        let info = run_register(&mut config, models);
+        assert_eq!(info.vision_preprocessor, VisionPreprocessorOutcome::UnchangedNone);
+        assert_eq!(config.vision_preprocessor_provider, None);
+    }
+
+    #[test]
+    fn vision_preprocessor_overwrites_stale_atomgit_value() {
+        let mut config = blank_config();
+        config.vision_preprocessor_provider = Some("AtomGit-Qwen-Qwen2-VL-72B".into());
+        let models = vec![
+            vl_model_entry("Kimi-K2-Instruct"),
+            vl_model_entry("Qwen/Qwen3-VL-32B-Instruct"),
+        ];
+        let info = run_register(&mut config, models);
+        let expected = "AtomGit-Qwen-Qwen3-VL-32B-Instruct".to_string();
+        assert_eq!(
+            info.vision_preprocessor,
+            VisionPreprocessorOutcome::AutoSet(expected.clone())
+        );
+        assert_eq!(config.vision_preprocessor_provider, Some(expected));
+    }
+
+    #[test]
+    fn vision_preprocessor_cleared_when_stale_atomgit_and_list_has_no_vl() {
+        let mut config = blank_config();
+        config.vision_preprocessor_provider = Some("AtomGit-Qwen-Qwen2-VL-72B".into());
+        let models = vec![vl_model_entry("moonshotai/Kimi-K2-Instruct")];
+        let info = run_register(&mut config, models);
+        assert_eq!(info.vision_preprocessor, VisionPreprocessorOutcome::Cleared);
+        assert_eq!(config.vision_preprocessor_provider, None);
+    }
+
+    #[test]
+    fn vision_preprocessor_preserves_user_set_non_atomgit() {
+        let mut config = blank_config();
+        config.vision_preprocessor_provider = Some("Qwen3-VL-32B-Instruct".into());
+        let models = vec![
+            vl_model_entry("Kimi-K2-Instruct"),
+            vl_model_entry("Qwen/Qwen3-VL-32B-Instruct"),
+        ];
+        let info = run_register(&mut config, models);
+        assert_eq!(
+            info.vision_preprocessor,
+            VisionPreprocessorOutcome::UserSupplied("Qwen3-VL-32B-Instruct".into())
+        );
+        assert_eq!(
+            config.vision_preprocessor_provider.as_deref(),
+            Some("Qwen3-VL-32B-Instruct")
+        );
+    }
+
+    #[test]
+    fn vision_preprocessor_recognises_pure_ocr_model_name() {
+        let mut config = blank_config();
+        let models = vec![
+            vl_model_entry("Kimi-K2-Instruct"),
+            vl_model_entry("PaddleOCR-2.0"),
+        ];
+        let info = run_register(&mut config, models);
+        let expected = "AtomGit-PaddleOCR-2.0".to_string();
+        assert_eq!(
+            info.vision_preprocessor,
+            VisionPreprocessorOutcome::AutoSet(expected.clone())
+        );
+        assert_eq!(config.vision_preprocessor_provider, Some(expected));
+    }
+
+    #[test]
+    fn render_includes_vision_preprocessor_auto_set_line() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false }),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec![
+                    "Kimi-K2-Instruct".into(),
+                    "Qwen/Qwen3-VL-32B-Instruct".into(),
+                ],
+                provider_names: vec![
+                    "AtomGit-Kimi-K2-Instruct".into(),
+                    "AtomGit-Qwen-Qwen3-VL-32B-Instruct".into(),
+                ],
+                default_provider: "AtomGit-Kimi-K2-Instruct".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::AutoSet(
+                    "AtomGit-Qwen-Qwen3-VL-32B-Instruct".into(),
+                ),
+            }),
+            status: StepResult::Skipped("status check skipped for this test".into()),
+        };
+        let out = report.render();
+        assert!(
+            out.contains("Vision preprocessor → AtomGit-Qwen-Qwen3-VL-32B-Instruct"),
+            "render must include the auto-detected line: {out}",
+        );
+        assert!(out.contains("(auto-detected)"));
+    }
+
+    #[test]
+    fn render_includes_vision_preprocessor_cleared_line_when_stale_dropped() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false }),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec!["Kimi-K2-Instruct".into()],
+                provider_names: vec!["AtomGit-Kimi-K2-Instruct".into()],
+                default_provider: "AtomGit-Kimi-K2-Instruct".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::Cleared,
+            }),
+            status: StepResult::Skipped("test skip".into()),
+        };
+        let out = report.render();
+        assert!(out.contains("Vision preprocessor cleared"));
+    }
+
+    #[test]
+    fn render_includes_vision_preprocessor_user_supplied_line() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false }),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec![
+                    "Kimi-K2-Instruct".into(),
+                    "Qwen/Qwen3-VL-32B-Instruct".into(),
+                ],
+                provider_names: vec![
+                    "AtomGit-Kimi-K2-Instruct".into(),
+                    "AtomGit-Qwen-Qwen3-VL-32B-Instruct".into(),
+                ],
+                default_provider: "AtomGit-Kimi-K2-Instruct".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UserSupplied(
+                    "Qwen3-VL-32B-Instruct".into(),
+                ),
+            }),
+            status: StepResult::Skipped("test skip".into()),
+        };
+        let out = report.render();
+        assert!(out.contains("Vision preprocessor → Qwen3-VL-32B-Instruct"));
+        assert!(out.contains("(user setting kept)"));
+    }
+
+    #[test]
+    fn render_omits_vision_preprocessor_line_when_unchanged_none() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false }),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec!["Kimi-K2-Instruct".into()],
+                provider_names: vec!["AtomGit-Kimi-K2-Instruct".into()],
+                default_provider: "AtomGit-Kimi-K2-Instruct".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+            }),
+            status: StepResult::Skipped("test skip".into()),
+        };
+        let out = report.render();
+        assert!(!out.contains("Vision preprocessor"));
     }
 }
