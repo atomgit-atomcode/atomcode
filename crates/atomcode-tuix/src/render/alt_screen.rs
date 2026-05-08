@@ -1445,6 +1445,14 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 self.push_command_output(&format!("  └ [Image #{}]", n));
                 self.push_body_row(String::new());
             }
+            UiLine::VisionPreprocessSuccess { msg, model } => {
+                // alt-screen has no two-style row primitive; degrade to
+                // a plain command-output line concatenating message and
+                // model. Loses the gray styling but preserves the
+                // information. Acceptable for the alt-screen path
+                // (used in non-retained terminals).
+                self.push_command_output(&format!("{}  {}", msg, model));
+            }
             UiLine::Error(msg) => {
                 self.push_error(&msg);
             }

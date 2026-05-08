@@ -2311,6 +2311,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&body, &self.style_for(Role::Muted));
                 self.push_body_row(Vec::new());
             }
+            UiLine::VisionPreprocessSuccess { msg, model } => {
+                // `{msg}  ` in default text style; `{model}` in Muted
+                // (gray) so the model identity reads as metadata, not
+                // as part of the success sentence. push_body_prefixed
+                // handles the two styles in a single visual line and
+                // continues onto wrapped rows with the prefix's display
+                // width as continuation pad.
+                let default_style = CellStyle::default();
+                let muted_style = self.style_for(Role::Muted);
+                let prefix = format!("{msg}  ");
+                self.push_body_prefixed(&prefix, &default_style, &model, &muted_style);
+            }
         }
         // Phase 5: widget state updated → mark frame dirty. No
         // paint, no emit. The event loop's 5ms tick (via

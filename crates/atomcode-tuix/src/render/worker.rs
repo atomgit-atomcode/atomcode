@@ -341,6 +341,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::InputCommit => "InputCommit",
         UiLine::CommandOutput(_) => "CommandOutput",
         UiLine::ImageAttachment(_) => "ImageAttachment",
+        UiLine::VisionPreprocessSuccess { .. } => "VisionPreprocessSuccess",
         UiLine::TurnSeparator { .. } => "TurnSeparator",
     }
 }

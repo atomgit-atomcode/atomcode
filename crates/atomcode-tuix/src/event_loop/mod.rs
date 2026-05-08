@@ -4022,6 +4022,18 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
+        AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
+            // Format here (not in agent) so we can localize / restyle
+            // without bumping the AgentEvent contract. Char count helps
+            // users notice degenerate near-zero VL outputs that would
+            // mislead the main model into "image failed" responses.
+            let msg = format!("✓ VL 识别图片成功，返回 {} chars", char_count);
+            renderer.render(UiLine::VisionPreprocessSuccess {
+                msg,
+                model: vl_key,
+            });
+            renderer.flush();
+        }
         AgentEvent::RestorePendingImages { images } => {
             // VL preprocessing failed — re-attach the user's images to
             // the input state so they can retry without re-pasting from

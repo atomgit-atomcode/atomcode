@@ -241,6 +241,16 @@ pub enum AgentEvent {
     RestorePendingImages {
         images: Vec<crate::conversation::message::ImagePart>,
     },
+    /// VL preprocessing succeeded — surface a one-line success notice
+    /// without dumping the (possibly long, sometimes uninformative) VL
+    /// description into the UI. The description still rides into
+    /// conversation history for the main model. `vl_key` is the provider
+    /// key from config; `char_count` is `text.chars().count()` so users
+    /// can spot zero/near-zero outputs that would mislead the main model.
+    VisionPreprocessSuccess {
+        vl_key: String,
+        char_count: usize,
+    },
     /// Sub-agent batch began. `tasks` is the ordered list of children
     /// the dispatcher is about to fork — same order as the resulting
     /// `SubAgentTaskDone`/`SubAgentTaskFailed` events will arrive in,
@@ -1282,14 +1292,18 @@ impl AgentLoop {
             match maybe_preprocess(&self.config, &*self.turn_runner.provider, &clean, &images).await {
                 PreprocessOutcome::Skipped => (clean, images),
                 PreprocessOutcome::Replaced { text, vl_key } => {
-                    // Surface the VL output to the user — the splice text
-                    // below only enters the conversation history (visible
-                    // to the main model), not the TUIX scrollback. Without
-                    // this Warning, success is silent and the user has no
-                    // way to see what was OCR'd.
-                    vision_warning = Some(format!(
-                        "✓ VL 识别成功（{vl_key}）：\n{text}",
-                    ));
+                    // Surface a one-line success notice (provider key in
+                    // muted gray, char count for sanity-check). The full
+                    // description is intentionally NOT shown in the UI —
+                    // it would either be redundant with what the main
+                    // model proceeds to discuss or, on bad VL output,
+                    // mislead the user that "success" means useful
+                    // content. Description still rides into conversation
+                    // history below.
+                    let _ = self.event_tx.send(AgentEvent::VisionPreprocessSuccess {
+                        vl_key: vl_key.clone(),
+                        char_count: text.chars().count(),
+                    });
                     let merged = if clean.is_empty() {
                         format!("[图片内容（由 {vl_key} 识别）]\n{text}")
                     } else {

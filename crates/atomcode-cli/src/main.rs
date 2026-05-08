@@ -1646,6 +1646,13 @@ async fn run_headless(
             // surfaced as AgentEvent::Warning above, and the conversation
             // proceeds with the placeholder. No retry path exists in CLI.
             AgentEvent::RestorePendingImages { .. } => {}
+            // VL preprocessor success notice. Mirror the TUI behaviour
+            // briefly to stderr so non-interactive users (CI, scripts)
+            // still see that VL ran. Char count helps spot degenerate
+            // outputs.
+            AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
+                eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
+            }
         }
     }
 
