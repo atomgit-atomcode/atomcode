@@ -48,7 +48,6 @@ pub async fn maybe_preprocess(
     caption: &str,
     images: &[ImagePart],
 ) -> PreprocessOutcome {
-    let _ = caption; // used in Task 3 prompt template
     if images.is_empty() {
         return PreprocessOutcome::Skipped;
     }
@@ -59,15 +58,86 @@ pub async fn maybe_preprocess(
         Some(k) if !k.is_empty() => k,
         _ => return PreprocessOutcome::Skipped,
     };
-    if !config.providers.contains_key(vl_key) {
-        return PreprocessOutcome::Failed {
-            reason: format!("VL provider '{vl_key}' not found in config.providers"),
-        };
-    }
-    // VL HTTP call lands in Task 3 — for now, signal that we got past all
-    // short-circuits but haven't yet implemented the call.
-    PreprocessOutcome::Failed {
-        reason: "VL call not yet implemented".into(),
+    let vl_cfg = match config.providers.get(vl_key) {
+        Some(c) => c.clone(),
+        None => {
+            return PreprocessOutcome::Failed {
+                reason: format!("VL provider '{vl_key}' not found in config.providers"),
+            };
+        }
+    };
+
+    use crate::conversation::message::{Message, MessageContent, Role};
+    use crate::provider::create_provider;
+    use futures::StreamExt;
+
+    // Build a one-off VL provider. `create_provider` handles auth-token
+    // loading (api_key=None) for the AtomGit gateway case.
+    let vl_provider = match create_provider(&vl_cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            return PreprocessOutcome::Failed {
+                reason: format!("VL provider build failed: {e:#}"),
+            };
+        }
+    };
+
+    let prompt = if caption.trim().is_empty() {
+        "请详细描述这张图片的内容。如果是代码、报错截图或终端输出，请逐字转录文本。"
+            .to_string()
+    } else {
+        format!(
+            "用户的当前请求：{caption}\n\n请详细描述这张图片的内容。如果是代码、\
+             报错截图或终端输出，请逐字转录文本。",
+        )
+    };
+
+    // Local one-shot conversation — explicitly NOT linked to the main
+    // `agent.conversation.messages`. This is the structural guarantee that
+    // VL only sees the current image + caption, never history.
+    let messages = vec![Message {
+        role: Role::User,
+        content: MessageContent::MultiPart {
+            text: Some(prompt),
+            images: images.to_vec(),
+        },
+    }];
+
+    let timeout = std::time::Duration::from_secs(30);
+    let call = async {
+        let mut stream = vl_provider.chat_stream(&messages, None)?;
+        let mut buf = String::new();
+        while let Some(event) = stream.next().await {
+            match event? {
+                crate::stream::StreamEvent::Delta(s) => buf.push_str(&s),
+                crate::stream::StreamEvent::Reasoning(_) => {}
+                crate::stream::StreamEvent::Done { .. } => break,
+                crate::stream::StreamEvent::Error(e) => anyhow::bail!("{e}"),
+                _ => {}
+            }
+        }
+        Ok::<_, anyhow::Error>(buf)
+    };
+
+    match tokio::time::timeout(timeout, call).await {
+        Err(_) => PreprocessOutcome::Failed {
+            reason: format!("VL call timed out after {}s", timeout.as_secs()),
+        },
+        Ok(Err(e)) => PreprocessOutcome::Failed {
+            reason: format!("VL call error: {e:#}"),
+        },
+        Ok(Ok(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                PreprocessOutcome::Failed {
+                    reason: "VL returned empty response".into(),
+                }
+            } else {
+                PreprocessOutcome::Replaced {
+                    text: trimmed.to_string(),
+                }
+            }
+        }
     }
 }
 
@@ -182,36 +252,83 @@ mod tests {
         }
     }
 
-    /// Regression marker for Task 3: this test currently passes the "VL call
-    /// not yet implemented" placeholder branch. After Task 3 lands, it must
-    /// be replaced/removed since the placeholder branch goes away.
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Minimal SSE chunk fixture for an OpenAI-compatible /chat/completions
+    /// endpoint that returns one `delta.content` token then a stop chunk
+    /// then `[DONE]`. Mirrors the wire shape `OpenAiProvider` consumes.
+    fn sse_one_token(text: &str) -> String {
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": { "content": text },
+                "finish_reason": null,
+            }],
+        });
+        let done = serde_json::json!({
+            "choices": [{
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+        });
+        format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n", chunk, done)
+    }
+
+    fn vl_provider_cfg(base_url: &str) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-test".into()),
+            model: "Qwen/Qwen3-VL-32B-Instruct".into(),
+            base_url: Some(base_url.to_string()),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 8000,
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        }
+    }
+
     #[tokio::test]
-    async fn key_present_currently_hits_unimplemented_placeholder() {
+    async fn replaced_when_vl_returns_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_one_token(
+                        "Python stack trace showing ZeroDivisionError on line 42",
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
         let mut cfg = blank_config();
         cfg.providers.insert(
-            "vl-stub".into(),
-            ProviderConfig {
-                provider_type: "openai".into(),
-                api_key: Some("sk-test".into()),
-                model: "Qwen/Qwen3-VL-32B-Instruct".into(),
-                base_url: Some("http://127.0.0.1:1/".into()),
-                system_prompt: None,
-                user_agent: None,
-                context_window: 8000,
-                max_tokens: None,
-                thinking_type: None,
-                thinking_keep: None,
-                reasoning_history: None,
-                thinking_enabled: None,
-                thinking_budget: None,
-                skip_tls_verify: false,
-                ephemeral: false,
-            },
+            "vl".into(),
+            vl_provider_cfg(&server.uri()),
         );
-        cfg.vision_preprocessor_provider = Some("vl-stub".into());
+        cfg.vision_preprocessor_provider = Some("vl".into());
+
         let provider = StubProvider { model: "deepseek-v4-flash" };
         let result =
-            maybe_preprocess(&cfg, &provider, "describe", &[sample_image()]).await;
-        assert!(matches!(result, PreprocessOutcome::Failed { .. }));
+            maybe_preprocess(&cfg, &provider, "explain this", &[sample_image()]).await;
+
+        match result {
+            PreprocessOutcome::Replaced { text } => {
+                assert_eq!(
+                    text,
+                    "Python stack trace showing ZeroDivisionError on line 42"
+                );
+            }
+            other => panic!("expected Replaced, got {other:?}"),
+        }
     }
 }
