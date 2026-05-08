@@ -109,14 +109,17 @@ fn dir_size(p: &Path) -> Result<u64> {
 
 #[cfg(unix)]
 fn needs_privilege_to_remove(p: &Path) -> bool {
-    if let Some(parent) = p.parent() {
-        match parent.metadata() {
-            Ok(md) => md.permissions().readonly(),
-            Err(_) => true,
-        }
-    } else {
-        false
-    }
+    use std::os::unix::ffi::OsStrExt;
+    let parent = match p.parent() {
+        Some(parent) => parent,
+        None => return false,
+    };
+    let c_path = match std::ffi::CString::new(parent.as_os_str().as_bytes()) {
+        Ok(s) => s,
+        Err(_) => return true, // path contains an interior NUL — treat conservatively
+    };
+    // SAFETY: access(2) reads from c_path, which is a valid CString; no allocations.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) != 0 }
 }
 
 #[cfg(not(unix))]
@@ -193,6 +196,25 @@ mod tests {
         // Only binary present (no .bak, no .rolling, no data dir).
         assert_eq!(plan.items.iter().filter(|i| i.group == Group::Binary).count(), 1);
         assert_eq!(plan.items.iter().filter(|i| i.group != Group::Binary).count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn needs_privilege_false_for_user_writable_tempdir() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("file");
+        std::fs::write(&p, b"x").unwrap();
+        // Tempdir is user-writable, so we don't need privilege.
+        assert!(!needs_privilege_to_remove(&p));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn needs_privilege_true_for_path_with_no_parent() {
+        // A path with no parent (e.g. just "/") returns false (no rm needed).
+        let p = std::path::Path::new("/");
+        // We don't expect needs_privilege to crash here.
+        let _ = needs_privilege_to_remove(p);
     }
 
     #[test]
