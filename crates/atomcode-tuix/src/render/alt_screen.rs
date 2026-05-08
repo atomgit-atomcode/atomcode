@@ -316,6 +316,12 @@ const SGR_CYAN: &str = "\x1b[96m"; // Role::Border / Accent — bright variant; 
                                    // (Color::Cyan ≡ SGR 96 in crossterm) and
                                    // closes the cross-renderer drift.
 const SGR_DIM: &str = "\x1b[2m";
+const SGR_GREY: &str = "\x1b[90m"; // Role::Muted — bright black / mid-gray.
+                                   // Prefer over SGR 2m on Windows conhost
+                                   // (< 1809 historically swallowed dim);
+                                   // matches retained's `Palette::MUTED`
+                                   // which crossterm emits as SGR 90.
+const SGR_BOLD: &str = "\x1b[1m";
 
 /// Default cap on `body_lines` length. ~5000 rows × ~200 bytes/row
 /// (rough average for SGR-decorated text) is ~1 MB per session — fine
@@ -773,12 +779,23 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let _ = self.out.write_all(line.as_bytes());
         }
 
-        // Top rule: full-width cyan ─ above the input box. Mirrors
+        // Top rule: full-width cyan ━ above the input box. Mirrors
         // retained's `build_rule_row`. ASCII fallback to `-` when the
-        // terminal can't render unicode glyphs (rare in alt-screen
-        // since the auto-fallback target — JediTerm / conhost — both
-        // support unicode, but cheap to handle).
-        let rule_char = if self.caps.unicode_symbols { "─" } else { "-" };
+        // terminal can't render unicode glyphs.
+        //
+        // U+2501 (━ HEAVY HORIZONTAL) instead of U+2500 (─ LIGHT
+        // HORIZONTAL): on legacy Windows conhost with the default
+        // Consolas / Lucida Console fonts the light variant renders
+        // with visible vertical gaps between cells (the glyph stroke
+        // doesn't span the full cell width), so the rule reads as a
+        // dashed line even at full brightness. The heavy variant has
+        // a thicker stroke that fills the cell, eliminating the
+        // dashed look while still living in the same Box Drawing
+        // block (every modern terminal + conhost-with-unicode-font
+        // supports it). Bright cyan alone was insufficient — the
+        // gap between glyphs persisted regardless of colour. See
+        // commit fcf6a7e for the prior dim→bright attempt.
+        let rule_char = if self.caps.unicode_symbols { "━" } else { "-" };
         let rule = rule_char.repeat(self.width as usize);
         let cup = format!("\x1b[{};1H\x1b[K", top_rule_row);
         let _ = self.out.write_all(cup.as_bytes());
@@ -1246,6 +1263,36 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         self.push_body_row(row);
     }
 
+    /// Wrap `text` in muted-grey SGR (90) when colours are on, leaving
+    /// embedded SGR sequences in the input intact at the boundaries
+    /// (caller's nested colours win until they reset; we only paint
+    /// the unstyled spans). When colours are off, returns the input
+    /// untouched.
+    ///
+    /// Used for ToolGroup child rows so they read as subordinate
+    /// detail under the bold header, mirroring retained's
+    /// `style_for(Role::Muted)` styling for the same row class.
+    fn style_muted(&self, text: &str) -> String {
+        if self.caps.colors {
+            format!("{}{}{}", SGR_GREY, text, SGR_RESET)
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Wrap `text` in bold (SGR 1) when colours are on, leaving the
+    /// terminal's default foreground intact. Used for ToolGroup
+    /// header / summary rows — bold supplies the emphasis without
+    /// committing to a colour that might conflict with the user's
+    /// theme (matches retained's `style_bold(Role::Secondary)`).
+    fn style_bold_default(&self, text: &str) -> String {
+        if self.caps.colors {
+            format!("{}{}{}", SGR_BOLD, text, SGR_RESET)
+        } else {
+            text.to_string()
+        }
+    }
+
     /// `(cancelled)` marker row.
     fn push_cancelled(&mut self) {
         self.flush_assistant_remainder();
@@ -1382,16 +1429,32 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // virtual-buffer based; live-group rewrite would need
                 // its own row tracking). Header + children print
                 // statically; ChildUpdate appends a new row.
-                self.push_command_output(&header);
+                //
+                // Style parity with retained (`UiLine::ToolGroupRender`
+                // arm in retained.rs):
+                //   - header: bold, default fg — emphasises the
+                //     `● Running N tools in parallel` anchor row
+                //   - children: muted gray (SGR 90) — high-frequency
+                //     per-call rows (`▸ bash(cmd…)`) that should read
+                //     as subordinate detail, not compete with the
+                //     header. User reported children rendered in
+                //     default fg here, so the visual hierarchy was
+                //     flattened relative to retained.
+                self.push_command_output(&self.style_bold_default(&header));
                 for c in children {
-                    self.push_command_output(&c.text);
+                    self.push_command_output(&self.style_muted(&c.text));
                 }
             }
             UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
-                self.push_command_output(&new_text);
+                // Update inherits the muted child styling so the row
+                // stays visually subordinate after the result lands.
+                self.push_command_output(&self.style_muted(&new_text));
             }
             UiLine::ToolGroupSummary { text } => {
-                self.push_command_output(&text);
+                // Summary mirrors header: bold default-fg anchor row
+                // closing the group. Matches retained's
+                // `style_bold(Role::Secondary)` choice.
+                self.push_command_output(&self.style_bold_default(&text));
             }
             UiLine::ToolResult { success, summary } => {
                 self.push_tool_result(success, &summary);
@@ -2147,7 +2210,9 @@ mod tests {
         assert!(s.contains("\x1b[2m"), "status should be dim. got: {:?}", s);
     }
 
-    /// Phase 4.5: top + bottom rules render as cyan ─ across full width.
+    /// Phase 4.5: top + bottom rules render as cyan ━ across full width.
+    /// (Heavy variant ━ U+2501 instead of light ─ U+2500 — see
+    /// `paint_footer` for the legacy-conhost dashed-look rationale.)
     #[test]
     fn input_box_has_top_and_bottom_rules() {
         let mut buf = Vec::new();
@@ -2161,13 +2226,13 @@ mod tests {
         r.flush();
         drop(r);
         let s = String::from_utf8_lossy(&buf);
-        // top_rule at row 7, bot_rule at row 9. Each row has 20 ─.
-        let twenty_dashes = "─".repeat(20);
+        // top_rule at row 7, bot_rule at row 9. Each row has 20 ━.
+        let twenty_heavy = "━".repeat(20);
         assert!(s.contains("\x1b[7;1H"), "top rule row CUP missing. got: {:?}", s);
         assert!(s.contains("\x1b[9;1H"), "bot rule row CUP missing. got: {:?}", s);
         assert!(
-            s.contains(&twenty_dashes),
-            "20 ─ chars missing. got: {:?}",
+            s.contains(&twenty_heavy),
+            "20 ━ chars missing. got: {:?}",
             s
         );
         // Bright cyan (96) — matches retained's `Palette::BORDER`.
