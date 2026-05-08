@@ -3187,7 +3187,7 @@ fn handle_streaming_key(
         let status = if app.state.show_tool_output {
             "  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+O to hide)\n"
         } else {
-            "  ◯ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
+            "  ○ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
         };
         renderer.render(UiLine::CommandOutput(status.to_string()));
         renderer.flush();
@@ -3801,7 +3801,7 @@ fn handle_agent_event(
             // padding — the actual row count is 1, which is correct.
             if name == "bash" && !state.show_tool_output {
                 renderer.render(UiLine::CommandOutput(
-                    "  ◯ Press Ctrl+O to show real-time output\n".to_string(),
+                    "  ○ Press Ctrl+O to show real-time output\n".to_string(),
                 ));
             }
             renderer.flush();

@@ -4588,7 +4588,7 @@ mod tests {
         let (mut r, _buf) = new_capturing(80, 24);
         let before = r.body_lines.len();
         r.render(UiLine::CommandOutput(
-            "  ◯ Press Ctrl+O to show real-time output\n".into(),
+            "  ○ Press Ctrl+O to show real-time output\n".into(),
         ));
         let pushed = r.body_lines.len() - before;
         assert_eq!(
