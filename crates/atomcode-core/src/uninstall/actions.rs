@@ -129,6 +129,207 @@ pub fn kill_process(pid: u32) -> std::io::Result<()> {
     Err(std::io::Error::new(std::io::ErrorKind::Other, format!("could not kill pid {pid}")))
 }
 
+// ── Filesystem mutators ──────────────────────────────────────────────────────
+
+use std::io;
+use std::path::Path;
+
+/// Remove a file or directory. If `needs_privilege` is true on Unix, shells
+/// out to `sudo rm -rf <path>`; otherwise uses Rust stdlib.
+pub fn remove_path(p: &Path, needs_privilege: bool) -> io::Result<()> {
+    if !p.exists() {
+        return Ok(());
+    }
+    if needs_privilege {
+        return sudo_rm(&[p]);
+    }
+    if p.is_dir() {
+        std::fs::remove_dir_all(p)
+    } else {
+        std::fs::remove_file(p)
+    }
+}
+
+#[cfg(unix)]
+pub fn sudo_rm(paths: &[&Path]) -> io::Result<()> {
+    use std::process::Command;
+    let status = Command::new("sudo")
+        .arg("rm")
+        .arg("-rf")
+        .args(paths)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "sudo rm failed"))
+    }
+}
+
+#[cfg(not(unix))]
+pub fn sudo_rm(_paths: &[&Path]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        "sudo not supported on this platform",
+    ))
+}
+
+#[derive(Debug)]
+pub struct PathCleanupResult {
+    pub modified: bool,
+    pub backup_path: Option<std::path::PathBuf>,
+}
+
+/// Read an rc file, strip the AtomCode installer block targeting `prefix`,
+/// write a `.atomcode-uninstall.bak` next to it, then write the cleaned file.
+/// No-op (returns `modified=false`) if the file is missing or no block found.
+pub fn apply_unix_path_cleanup(rc_path: &Path, prefix: &str) -> io::Result<PathCleanupResult> {
+    if !rc_path.exists() {
+        return Ok(PathCleanupResult {
+            modified: false,
+            backup_path: None,
+        });
+    }
+    let content = std::fs::read_to_string(rc_path)?;
+    let new_content = match strip_atomcode_path_block(&content, prefix) {
+        Some(c) => c,
+        None => {
+            return Ok(PathCleanupResult {
+                modified: false,
+                backup_path: None,
+            })
+        }
+    };
+    let backup = {
+        let mut s = rc_path.as_os_str().to_os_string();
+        s.push(".atomcode-uninstall.bak");
+        std::path::PathBuf::from(s)
+    };
+    std::fs::copy(rc_path, &backup)?;
+    std::fs::write(rc_path, new_content)?;
+    Ok(PathCleanupResult {
+        modified: true,
+        backup_path: Some(backup),
+    })
+}
+
+#[cfg(windows)]
+pub fn apply_windows_path_cleanup(
+    install_dir_literal: &str,
+    install_dir_expanded: &str,
+) -> io::Result<bool> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let env = hkcu
+        .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("open Environment key: {e}"),
+            )
+        })?;
+    let cur: String = env.get_value("Path").unwrap_or_default();
+    let new = match strip_path_entry(&cur, install_dir_literal, install_dir_expanded) {
+        Some(s) => s,
+        None => return Ok(false),
+    };
+    env.set_value("Path", &new)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("write Path: {e}")))?;
+    broadcast_setting_change();
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn broadcast_setting_change() {
+    use std::ffi::CString;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutA, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    };
+    let env = CString::new("Environment").unwrap();
+    unsafe {
+        let mut result: usize = 0;
+        SendMessageTimeoutA(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            env.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            5000,
+            &mut result,
+        );
+    }
+}
+
+// ── Self-delete strategy ─────────────────────────────────────────────────────
+
+/// Strategy abstraction so tests can override the actual self-delete step.
+pub trait SelfDeleteStrategy {
+    fn run(&self, exe: &Path) -> io::Result<()>;
+}
+
+pub struct PlatformSelfDelete;
+
+impl SelfDeleteStrategy for PlatformSelfDelete {
+    #[cfg(unix)]
+    fn run(&self, exe: &Path) -> io::Result<()> {
+        // POSIX: we can unlink ourselves; the inode lives until exit.
+        if let Some(parent) = exe.parent() {
+            // If parent is not effectively writable, sudo it.
+            use std::os::unix::ffi::OsStrExt;
+            let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes())
+                .unwrap_or_else(|_| std::ffi::CString::new(".").unwrap());
+            let writable = unsafe { libc::access(parent_c.as_ptr(), libc::W_OK) == 0 };
+            if !writable {
+                return sudo_rm(&[exe]);
+            }
+        }
+        std::fs::remove_file(exe)
+    }
+
+    #[cfg(windows)]
+    fn run(&self, exe: &Path) -> io::Result<()> {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+
+        // Rename live exe to .atomcode.rolling so the install dir can be deleted.
+        let rolling = crate::self_update::rolling_path(exe);
+        if exe.file_name() != rolling.file_name() {
+            let _ = std::fs::rename(exe, &rolling);
+        }
+        let install_dir = exe
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no parent dir"))?;
+        let dir_str = install_dir.to_string_lossy().to_string();
+
+        let cmd_arg = format!(
+            "ping -n 2 127.0.0.1 >nul & rmdir /S /Q \"{}\"",
+            dir_str
+        );
+        Command::new("cmd")
+            .args(["/C", &cmd_arg])
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn run(&self, exe: &Path) -> io::Result<()> {
+        std::fs::remove_file(exe)
+    }
+}
+
+/// Test stub strategy used by integration tests to avoid actually self-deleting.
+pub struct NoopSelfDelete;
+
+impl SelfDeleteStrategy for NoopSelfDelete {
+    fn run(&self, _exe: &Path) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod path_line_tests {
     use super::strip_atomcode_path_block;
@@ -283,5 +484,64 @@ mod process_tests {
         assert!(matches_atomcode_name("atomcode-daemon.exe"));
         assert!(!matches_atomcode_name("vscode"));
         assert!(!matches_atomcode_name("atomcode-stuff"));
+    }
+}
+
+#[cfg(test)]
+mod remove_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn removes_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("x");
+        std::fs::write(&p, b"hi").unwrap();
+        remove_path(&p, false).unwrap();
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn removes_dir_recursively() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("a"), b"a").unwrap();
+        remove_path(&d, false).unwrap();
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn nonexistent_path_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        remove_path(&tmp.path().join("missing"), false).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod rc_apply_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn backup_created_and_block_removed() {
+        let tmp = TempDir::new().unwrap();
+        let rc = tmp.path().join(".zshrc");
+        std::fs::write(&rc, "# Added by AtomCode installer\nexport PATH=\"/p:$PATH\"\n").unwrap();
+        let res = apply_unix_path_cleanup(&rc, "/p").unwrap();
+        assert!(res.modified);
+        assert!(rc.with_file_name(".zshrc.atomcode-uninstall.bak").exists());
+        let new = std::fs::read_to_string(&rc).unwrap();
+        assert!(!new.contains("AtomCode"));
+    }
+
+    #[test]
+    fn no_change_when_block_absent() {
+        let tmp = TempDir::new().unwrap();
+        let rc = tmp.path().join(".zshrc");
+        std::fs::write(&rc, "alias x=1\n").unwrap();
+        let res = apply_unix_path_cleanup(&rc, "/p").unwrap();
+        assert!(!res.modified);
+        assert!(!rc.with_file_name(".zshrc.atomcode-uninstall.bak").exists());
     }
 }

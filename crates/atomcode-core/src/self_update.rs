@@ -176,7 +176,7 @@ fn download_path(exe: &Path) -> PathBuf {
 }
 
 /// Same-dir temp used during a three-way rollback swap.
-fn rolling_path(exe: &Path) -> PathBuf {
+pub(crate) fn rolling_path(exe: &Path) -> PathBuf {
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
     dir.join(".atomcode.rolling")
 }
