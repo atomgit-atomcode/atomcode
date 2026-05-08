@@ -258,17 +258,16 @@ pub fn build_messages(
     // Microcompact: condense PRIOR-TURN ToolResults to one-line stubs.
     // Current turn (everything from last User message onward) is always
     // full-fidelity — see the microcompact() docstring for the
-    // turn-aware boundary rationale.
+    // turn-aware boundary rationale (this fixes the pre-5-8
+    // `HELLO_TEST_12345` bug where fixed-window stubbing could clip
+    // the in-flight turn).
     //
-    // Threshold is 70% of the model's token budget converted to chars
-    // (no cap). This means microcompact only fires when the
-    // conversation is genuinely approaching the context window —
-    // below 70% it's a no-op. The pre-5-8 design used a 100K-char cap
-    // which triggered at ~20% of a 131K-token window, far too eagerly
-    // (5-8 atomgr session: model echoed `HELLO_TEST_12345` to verify
-    // it could see anything because earlier tool results in the same
-    // turn had already been stubbed).
-    let microcompact_threshold = (token_budget as u64 * 4 * 70 / 100) as usize;
+    // Threshold = min(budget × 70%, 100K chars). The 100K cap keeps
+    // long-session token savings (kicks in around ~25K tokens of
+    // history); the 70%-of-budget floor protects small-context models
+    // from compacting too eagerly.
+    let microcompact_threshold =
+        ((token_budget as u64 * 4 * 70 / 100) as usize).min(100_000);
     microcompact(&mut result, conv.messages.len(), microcompact_threshold);
 
     replace_stale_reads(&mut result);
