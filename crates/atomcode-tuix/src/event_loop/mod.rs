@@ -2857,6 +2857,26 @@ fn handle_idle_key(
                             redraw_with_menu(&app.buf, &items, 0, &app.state, ctx, renderer);
                             return Ok(());
                         }
+                        // Empty sub-mode: build_menu_items returned None
+                        // for the `/skills ` form, which at this point
+                        // can only mean the registry has zero
+                        // user-invocable skills (the filter is empty —
+                        // we just appended a space — so there's no
+                        // "no matches" case here, only "no skills").
+                        // Without feedback the user sees `/skills `
+                        // with no menu and concludes the feature is
+                        // broken (reported by a Windows user with a
+                        // clean install). Emit a one-time scrollback
+                        // hint pointing at the install paths so they
+                        // know what to do next; keep the buffer at
+                        // `/skills ` so backspace still recovers.
+                        renderer.render(UiLine::CommandOutput(
+                            "  \u{24d8} No user-invocable skills installed yet.\n    \
+                            \u{2022} Drop SKILL.md into ~/.atomcode/skills/<name>/ \n      \
+                              (Windows: %USERPROFILE%\\.atomcode\\skills\\<name>\\)\n    \
+                            \u{2022} Or install a plugin that ships skills via /plugin install <git-url>\n\n"
+                                .into(),
+                        ));
                     }
 
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
