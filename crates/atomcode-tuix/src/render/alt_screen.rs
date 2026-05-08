@@ -811,6 +811,11 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let _ = self.out.write_all(cup.as_bytes());
         let chev = self.caps.prompt_chevron();
         let buf_str = self.pending_input.as_ref().map(|(b, _)| b.as_str()).unwrap_or("");
+        let cursor_byte = self
+            .pending_input
+            .as_ref()
+            .map(|(_, c)| (*c).min(buf_str.len()))
+            .unwrap_or(0);
         // Show `\n` as a visible marker so users typing `\<Enter>` (the
         // line-continuation escape, used when Shift/Alt+Enter are
         // swallowed by the host terminal — typical on Windows
@@ -831,7 +836,34 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         };
         let safe_buf = scrub_controls(buf_str).replace('\n', nl_marker);
         let max_cols = (self.width as usize).saturating_sub(chev.chars().count());
-        let trimmed = truncate_to_width(&safe_buf, max_cols);
+        // Display column of the cursor *within* `safe_buf`, computed
+        // with the SAME `\n → nl_marker` substitution as the rendered
+        // line. The previous implementation replaced `\n` with a single
+        // space here while the rendered line used `\\n` (two cols on
+        // legacy conhost without unicode-capable fonts), so every
+        // newline in the buffer slid the cursor one column to the left
+        // of where the user could see they were typing.
+        let prefix_safe = scrub_controls(&buf_str[..cursor_byte]).replace('\n', nl_marker);
+        let cursor_col_in_buf = display_width(&prefix_safe);
+        // Horizontal scroll: when the user types past `max_cols` (or
+        // moves the cursor past it), slide the visible window so the
+        // cursor stays at the right edge instead of falling off.
+        // Without this, `truncate_to_width(&safe_buf, max_cols)` kept
+        // only the leading window and the user's recent typing simply
+        // disappeared — they reported "input box gets too long, can't
+        // see what I'm typing anymore". The window ends at the cursor
+        // (cursor visible at the rightmost col); if the cursor is in
+        // the early portion of the buffer, no scrolling kicks in and
+        // we render the head as before.
+        let (trimmed, visible_cursor_col) = if cursor_col_in_buf < max_cols {
+            (truncate_to_width(&safe_buf, max_cols), cursor_col_in_buf)
+        } else {
+            let start_col = cursor_col_in_buf + 1 - max_cols;
+            (
+                crate::width::slice_cols(&safe_buf, start_col, max_cols),
+                max_cols.saturating_sub(1),
+            )
+        };
         let input_line = if self.caps.colors {
             format!("{}{}{}{}", SGR_CYAN, chev, SGR_RESET, trimmed)
         } else {
@@ -966,15 +998,15 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         }
 
         // Position the terminal cursor inside the input row so the
-        // user sees where their typing will land.
-        if let Some((buf, cursor_byte)) = &self.pending_input {
-            let prefix = if *cursor_byte <= buf.len() {
-                &buf[..*cursor_byte]
-            } else {
-                buf.as_str()
-            };
-            let prefix_safe = scrub_controls(prefix).replace('\n', " ");
-            let cursor_col = chev.chars().count() + display_width(&prefix_safe);
+        // user sees where their typing will land. `visible_cursor_col`
+        // is the cursor's column *within the visible window* — already
+        // accounts for both the `\n → nl_marker` rendering and any
+        // horizontal scroll (when the buffer overflowed `max_cols` and
+        // we slid the window so the cursor stays at the right edge).
+        // Adding `chev.chars().count()` skips past the prompt glyph;
+        // the `+ 1` converts to the 1-indexed CSI CUP coordinate.
+        if self.pending_input.is_some() {
+            let cursor_col = chev.chars().count() + visible_cursor_col;
             let cup = format!("\x1b[{};{}H\x1b[?25h", input_row, cursor_col + 1);
             let _ = self.out.write_all(cup.as_bytes());
         } else {
