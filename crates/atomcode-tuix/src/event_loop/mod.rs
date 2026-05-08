@@ -2661,7 +2661,17 @@ fn handle_idle_key(
                 );
                 return Ok(());
             }
-            (KeyCode::Enter, m) if !m.contains(crossterm::event::KeyModifiers::SHIFT) => {
+            (KeyCode::Enter | KeyCode::Tab, m)
+                if !m.contains(crossterm::event::KeyModifiers::SHIFT) =>
+            {
+                // Tab and Enter both confirm the highlighted entry —
+                // Tab matches the muscle memory of pickers in fzf /
+                // shell completion / IDE menus where Tab loads the
+                // candidate. Shift+Enter (hard newline) is excluded
+                // by the modifier guard; crossterm reports Shift+Tab
+                // as `KeyCode::BackTab` so it doesn't match this arm
+                // either.
+                //
                 // `@`-mention selection: insert `@<full_path> ` at the
                 // token range, with trailing space as terminator.
                 // Backspace on the trailing space lets the user re-open
