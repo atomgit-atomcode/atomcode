@@ -2298,14 +2298,30 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // the glyph at col 2. Muted style — visually
                 // subordinate to the user message it's anchoring.
                 //
-                // Tight grouping: `UiLine::User` always emits a trailing
-                // blank spacer row. Pop it if present so the attachment
-                // sits flush under the user message (no orphan blank
-                // between `❯ msg` and `└ [Image #N]`), then re-emit a
-                // fresh trailing blank so the next turn's content still
-                // has paragraph separation.
+                // Tight grouping: `UiLine::User` already wrote a trailing
+                // blank spacer to the terminal (LF + EL at body_bottom)
+                // and pushed an empty row to body_lines. To make the
+                // attachment sit flush under the user message we have to
+                // physically REPLACE that visible blank row, not just
+                // pop it from memory — popping body_lines leaves the LF
+                // already in scrollback and the gap on screen.
+                //
+                // Mirror the `clear_live_spinner` pattern (see line
+                // ~1167): pop body_lines, EL-erase the row at
+                // body_bottom, then arm `skip_next_body_scroll` so the
+                // next push_body_row overwrites in-place (no LF) instead
+                // of scrolling. After the attachment row, push a fresh
+                // trailing blank so the next turn's content still has
+                // paragraph separation.
                 if self.body_lines.last().map_or(false, |r| r.is_empty()) {
                     self.body_lines.pop();
+                    self.ensure_scroll_region();
+                    let bottom = self.body_bottom_row();
+                    if bottom > 0 {
+                        let seq = format!("\x1b[{};1H\x1b[K", bottom);
+                        let _ = self.out.write_all(seq.as_bytes());
+                    }
+                    self.skip_next_body_scroll = true;
                 }
                 let body = format!("└ [Image #{}]", n);
                 self.push_body_text(&body, &self.style_for(Role::Muted));
