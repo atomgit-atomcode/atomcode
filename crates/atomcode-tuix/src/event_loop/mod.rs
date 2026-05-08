@@ -3961,6 +3961,15 @@ fn handle_agent_event(
             // aborted turn is another way to leave `<think>` half-open.
             think.reset();
         }
+        AgentEvent::Warning(w) => {
+            // Non-fatal — flush a yellow advisory line and let the turn
+            // continue. Don't touch state/think/buffers; the warning is
+            // purely informational. Used today for the OpenAI provider's
+            // truncation detector (`prompt_tokens` reported by the proxy
+            // is implausibly low for the body we sent).
+            renderer.render(UiLine::Warning(w));
+            renderer.flush();
+        }
         AgentEvent::TokenUsage(u) => {
             state.prompt_tokens += u.prompt_tokens;
             state.completion_tokens += u.completion_tokens;

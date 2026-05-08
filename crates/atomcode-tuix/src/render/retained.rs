@@ -1993,7 +1993,24 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 call_id,
                 new_text,
             } => {
-                self.flush_assistant_remainder();
+                // CRITICAL: do NOT call flush_assistant_remainder here.
+                // It would push pending assistant text via push_body_row,
+                // which clears live_group (per the freeze invariant), and
+                // the lookup below would silent-return → child never gets
+                // its `→ N lines` data. ToolGroupChildUpdate only does a
+                // CUP rewrite on an EXISTING body row; it does not create
+                // new rows, so there is nothing to flush against. Pending
+                // streaming text stays in assistant_line_buf for whoever
+                // legitimately pushes a new row next.
+                //
+                // Bug seen in 5-8 atomgr session: batch 2 had two bash
+                // calls; assistant_line_buf had leftover streamed text
+                // ("工具响应持续被截断"-style prose from prior turn). The
+                // first ToolCallResult flushed that text → push_body_row
+                // → live_group=None → both children's updates silent
+                // no-opped. Visual: children stuck without `→ N lines`,
+                // user (and model) thought tool results were truncated.
+
                 // Resolve via the active live-group. Three guards:
                 // 1. live_group still active (no foreign push happened)
                 // 2. batch_id matches (defensive — shouldn't ever
@@ -2232,6 +2249,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let err_style = self.style_for(Role::Error);
                 let body = format!("[Error: {}]", scrub_controls(&msg));
                 self.push_body_text(&body, &err_style);
+            }
+            UiLine::Warning(msg) => {
+                // Yellow advisory — distinct from Error (red) so users
+                // can tell "noticed something" from "turn died". Renders
+                // with a `!` glyph + bold yellow body. Always-visible:
+                // we deliberately don't dim it because the whole point
+                // is to put a truncating-proxy or similar provider
+                // pathology in front of the user immediately.
+                let warn_style = CellStyle {
+                    fg: Some(crossterm::style::Color::Yellow),
+                    bold: true,
+                    ..CellStyle::default()
+                };
+                let body = format!("! {}", scrub_controls(&msg));
+                self.push_body_text(&body, &warn_style);
             }
             UiLine::CommandOutput(text) => {
                 let safe = scrub_controls(&text);

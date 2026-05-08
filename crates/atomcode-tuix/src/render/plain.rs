@@ -10,6 +10,7 @@ use crate::terminal::TerminalCaps;
 // a shorter frame doesn't leave glyphs from a longer previous frame.
 const SGR_RESET: &str = "\x1b[0m";
 const SGR_RED: &str = "\x1b[31m";
+const SGR_BOLD_YELLOW: &str = "\x1b[1;33m";
 const SGR_GREEN: &str = "\x1b[32m";
 const SGR_CYAN: &str = "\x1b[36m";
 const SGR_DIM: &str = "\x1b[2m";
@@ -282,6 +283,18 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let _ = writeln!(
                     self.out,
                     "{}[Error: {}]{}",
+                    color,
+                    scrub_controls(&msg),
+                    reset
+                );
+            }
+            UiLine::Warning(msg) => {
+                self.drop_transient();
+                let color = if self.caps.colors { SGR_BOLD_YELLOW } else { "" };
+                let reset = if self.caps.colors { SGR_RESET } else { "" };
+                let _ = writeln!(
+                    self.out,
+                    "{}! {}{}",
                     color,
                     scrub_controls(&msg),
                     reset

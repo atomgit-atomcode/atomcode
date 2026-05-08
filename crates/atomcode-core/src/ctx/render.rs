@@ -255,18 +255,19 @@ pub fn build_messages(
         result.extend(conv.messages[survived_start..].iter().cloned());
     }
 
-    // Microcompact: condense old turn ToolResults to one-liners.
-    // Recent 5 turns keep full fidelity. Older turns' large tool results
-    // (read_file full content, bash output) are replaced with compact summaries.
-    // This reduces context growth without LLM calls.
-    // View replacement runs AFTER microcompact — edited files stay fresh.
-    // Microcompact threshold scales with ctx_window: small-window
-    // ctx (Ollama 8K) needs to microcompact much earlier than the
-    // old hardcoded 100K-char gate implied. Formula: 40% of budget
-    // in chars (assuming ~4 chars/token), capped at 100K so large
-    // windows don't over-compact. Default (128K tokens) → 100K;
-    // Ollama (8K tokens) → 12.8K; small tunes in between.
-    let microcompact_threshold = (token_budget * 4 * 40 / 100).min(100_000);
+    // Microcompact: condense PRIOR-TURN ToolResults to one-line stubs.
+    // Current turn (everything from last User message onward) is always
+    // full-fidelity — see the microcompact() docstring for the
+    // turn-aware boundary rationale (this fixes the pre-5-8
+    // `HELLO_TEST_12345` bug where fixed-window stubbing could clip
+    // the in-flight turn).
+    //
+    // Threshold = min(budget × 70%, 100K chars). The 100K cap keeps
+    // long-session token savings (kicks in around ~25K tokens of
+    // history); the 70%-of-budget floor protects small-context models
+    // from compacting too eagerly.
+    let microcompact_threshold =
+        ((token_budget as u64 * 4 * 70 / 100) as usize).min(100_000);
     microcompact(&mut result, conv.messages.len(), microcompact_threshold);
 
     replace_stale_reads(&mut result);
@@ -793,39 +794,30 @@ pub(crate) fn compact_old_tool_results_in_place(
     }
 }
 
-/// Microcompact: condense old `ToolResult` messages to one-line semantic
-/// summaries. Zero LLM calls — purely mechanical compression.
+/// Microcompact: condense **prior-turn** `ToolResult` messages to one-line
+/// semantic summaries. Zero LLM calls — purely mechanical compression.
 ///
-/// **The atomcode "weak-model attention" lever** (introduced 2026-04-11
-/// in commit a8ccd7b, P5.5). Long conversations buried key signals (bash
-/// errors, grep hits) under tens of thousands of tokens of raw output.
-/// Weak models like glm-5.1 with smaller effective windows lose track of
-/// "did the previous build succeed? what error did the last grep find?"
-/// once the answer scrolls past their attention horizon. Replacing old
-/// tool_results with semantic stubs (e.g. `[bash FAILED: 45 lines, first:
-/// error: cannot find type Foo]`) keeps the signal at the surface while
-/// dropping the verbose carry — a model can scan the stubs and recall
-/// past exploration without re-running tools.
+/// **Turn-aware boundary (5-8 redesign).** Earlier versions used a
+/// fixed `OTHER_KEEP = 20` last-messages window. That window slid every
+/// LLM round, so within ONE user turn the model's earlier tool results
+/// got progressively stubbed as the model emitted more tool calls —
+/// the "model echoes HELLO_TEST_12345 to verify it can see anything"
+/// 5-8 atomgr session was caused by this. Now we anchor on the last
+/// `Role::User` message in the rendered Vec: everything from that
+/// message onward IS the current turn and stays full-fidelity; only
+/// strictly older content is eligible for stubbing.
 ///
-/// **Why this exists despite "no tool-name hardcoding" project rule**:
-/// the tool name in the stub comes from the model's own `tool_calls.name`
-/// (already recorded in `AssistantWithToolCalls` messages), NOT from a
-/// `match` on hardcoded strings inside the framework. Whatever the model
-/// called the tool — `bash`, `Bash`, `mcp_server.run` — that label flows
-/// through to the stub. Generic format with `success` flag preserves
-/// retry-failed-then-succeeded reasoning chains for the model.
+/// **Threshold (5-8 redesign).** Earlier capped at 100K chars (~25K
+/// tokens) → triggered at ~20% of a 131K-token window, way too eager.
+/// Now `threshold_chars = 70% × token_budget × 4` (uncapped) so
+/// microcompact only fires when the conversation is genuinely close
+/// to filling the model's window. Below 70% it's a no-op.
 ///
-/// `threshold_chars` — compaction gate. Below this total-char count the
-/// function is a no-op. Scales with `ctx_window` (40% × budget × 4,
-/// capped at 100K) so small-window deployments compact earlier.
-///
-/// `read_file` is INCLUDED in compaction now (post-D3): re-reading a
-/// previously-read file is FileStore-served (no disk hit), so collapsing
-/// the original ToolResult is safe — model can always re-read for line
-/// numbers when needed.
-fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars: usize) {
-    const OTHER_KEEP: usize = 20;
-
+/// **Stub format.** `[<tool_name> <ok|FAILED>: N lines, first: <80c>]`.
+/// Tool name comes from the model's own `tool_calls.name` (no
+/// `match tool_name { "bash" => ... }` framework branches). `read_file`
+/// is exempted by hardcoded skip — see in-line comment for rationale.
+fn microcompact(msgs: &mut Vec<Message>, _total_msg_count: usize, threshold_chars: usize) {
     let total_chars: usize = msgs
         .iter()
         .map(|m| match &m.content {
@@ -837,29 +829,33 @@ fn microcompact(msgs: &mut Vec<Message>, total_msg_count: usize, threshold_chars
     if total_chars < threshold_chars {
         return;
     }
-    if total_msg_count <= OTHER_KEEP {
-        return;
-    }
 
-    let other_cutoff = total_msg_count.saturating_sub(OTHER_KEEP);
-    let call_id_to_tool = build_call_id_to_tool_map(msgs);
+    // Anchor on the last User message — everything after it is the
+    // ACTIVE turn and must stay full. If no User message (cold start
+    // / system-only), there's nothing to compress yet.
+    let current_turn_start = match msgs
+        .iter()
+        .rposition(|m| matches!(m.role, Role::User))
+    {
+        Some(i) => i,
+        None => return,
+    };
 
     let cold_msgs = msgs
         .iter()
         .position(|m| !matches!(m.role, Role::System))
         .unwrap_or(0);
 
-    let condense_end = cold_msgs + other_cutoff;
+    if cold_msgs >= current_turn_start {
+        return; // nothing between system and current turn
+    }
 
-    for i in cold_msgs..condense_end.min(msgs.len()) {
+    let call_id_to_tool = build_call_id_to_tool_map(msgs);
+
+    for i in cold_msgs..current_turn_start {
         let MessageContent::ToolResult(ref r) = msgs[i].content else {
             continue;
         };
-
-        let msg_idx = i.saturating_sub(cold_msgs);
-        if msg_idx >= other_cutoff {
-            continue;
-        }
 
         if r.output.len() <= MIN_COLLAPSE_SIZE {
             continue;
@@ -1533,14 +1529,14 @@ mod tests {
         // build "伪自信" from `first: 205| pub async fn dynamic_connect(`
         // and edit blind). Skip behavior is covered by
         // `microcompact_skips_read_file_to_preserve_long_session_context`.
+        //
+        // Calls `microcompact` directly so the test isolates stub format
+        // from the rendering pipeline's drop / compression logic.
         use crate::tool::{ToolCall, ToolResult};
-        let mut conv = Conversation::new();
 
-        conv.add_user_message("explore");
+        let mut msgs: Vec<Message> = vec![Message::new(Role::System, "sys")];
+        msgs.push(Message::new(Role::User, "explore"));
 
-        // Mix of tool calls — bash (success), bash (failure), grep,
-        // and an unknown `mcp_remote.exec`. Each gets its own large
-        // body so all should be eligible for compaction.
         let kinds = [
             ("c_bok", "bash", true),
             ("c_bfail", "bash", false),
@@ -1548,46 +1544,36 @@ mod tests {
             ("c_mcp", "mcp_remote.exec", true),
         ];
         for (id, name, success) in &kinds {
-            conv.add_assistant_tool_calls(
-                None,
-                vec![ToolCall {
-                    id: (*id).to_string(),
-                    name: (*name).to_string(),
-                    arguments: "{}".into(),
-                }],
-                None,
-            );
-            conv.add_tool_result(ToolResult {
-                call_id: (*id).to_string(),
-                output: format!("first line for {}\n{}", name, "x".repeat(4_000)),
-                success: *success,
+            msgs.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: (*id).to_string(),
+                        name: (*name).to_string(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning_content: None,
+                },
+            });
+            msgs.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: (*id).to_string(),
+                    output: format!("first line for {}\n{}", name, "x".repeat(4_000)),
+                    success: *success,
+                }),
             });
         }
 
-        // Pad with extra bash to push total_msg_count past OTHER_KEEP=20
-        // and total_chars past the 100K threshold.
-        for i in 0..30 {
-            let id = format!("c_pad{}", i);
-            conv.add_assistant_tool_calls(
-                None,
-                vec![ToolCall {
-                    id: id.clone(),
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                }],
-                None,
-            );
-            conv.add_tool_result(ToolResult {
-                call_id: id,
-                output: format!("[elapsed: 0.1s, exit: 0]\n{}", "x".repeat(4_000)),
-                success: true,
-            });
-        }
-        conv.add_user_message("now what");
+        // Anchor the next turn so the prior tool results above are
+        // eligible for compaction (turn-aware boundary).
+        msgs.push(Message::new(Role::User, "now what"));
 
-        let (msgs, _) = build_messages(&conv, "sys", 131_072, "");
+        let n = msgs.len();
+        // Low threshold so microcompact fires deterministically.
+        microcompact(&mut msgs, n, 1_000);
 
-        // Helper: find a ToolResult by call_id in the rendered messages.
         let find_by_id = |id: &str| -> Option<String> {
             msgs.iter().find_map(|m| {
                 if let MessageContent::ToolResult(r) = &m.content {
@@ -1722,9 +1708,10 @@ mod tests {
             success: true,
         });
 
-        // Pad with bash so total_msg_count crosses OTHER_KEEP=20 and
-        // total_chars crosses the threshold — guaranteeing microcompact
-        // would otherwise compact the read_file result.
+        // Pad with bash so total_chars crosses microcompact's
+        // threshold. Use a small budget (8K tokens → 22_400 char
+        // threshold) so the 30 padding bashes + the read_file body
+        // (~125K chars total) reliably triggers microcompact.
         for i in 0..30 {
             let id = format!("c_pad{}", i);
             conv.add_assistant_tool_calls(
@@ -1744,7 +1731,11 @@ mod tests {
         }
         conv.add_user_message("now what");
 
-        let (msgs, _) = build_messages(&conv, "sys", 131_072, "");
+        // 40K budget → 112K char threshold. Payload (read body 5K +
+        // 30 × 4K padding ≈ 125K chars / ~31K tokens) crosses
+        // threshold but fits budget without triggering build_messages
+        // pre-microcompact drops.
+        let (msgs, _) = build_messages(&conv, "sys", 40_000, "");
 
         // Locate the read_file ToolResult in the rendered messages.
         let body = msgs
@@ -1793,6 +1784,141 @@ mod tests {
              threshold isn't actually triggering and read_file passing \
              through is a false positive"
         );
+    }
+
+    /// 5-8 atomgr session bug — microcompact was stubbing the CURRENT
+    /// turn's earlier tool results, leading the model to echo
+    /// `HELLO_TEST_12345` self-checks because mid-turn it could no
+    /// longer see what it had just done. The fix: anchor on the last
+    /// `Role::User` message in the rendered Vec — everything from
+    /// that message onward is the active turn and stays full-fidelity.
+    /// Only strictly older content is eligible for stubbing.
+    ///
+    /// Calls `microcompact` directly (not through `build_messages`) so
+    /// the test isolates the boundary logic from the rendering
+    /// pipeline's drop / token-budget handling.
+    #[test]
+    fn microcompact_preserves_current_turn_in_full() {
+        use crate::tool::{ToolCall, ToolResult};
+
+        // Build a Vec<Message> manually with a clear turn boundary:
+        // System | User#1 | (Asst tool_calls + Tool results)×15 | User#2 | (Asst+Tool)×10
+        // Last User is User#2 → current turn is everything after it.
+        let mut msgs: Vec<Message> = vec![Message::new(Role::System, "sys")];
+
+        // ── PRIOR turn ────────────────────────────────────────
+        msgs.push(Message::new(Role::User, "first task"));
+        for i in 0..15 {
+            let id = format!("prior_{}", i);
+            msgs.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: id.clone(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning_content: None,
+                },
+            });
+            msgs.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: id,
+                    output: format!("[elapsed: 0.0s, exit: 0]\n{}", "p".repeat(4_000)),
+                    success: true,
+                }),
+            });
+        }
+
+        // ── CURRENT turn (must stay full) ──────────────────────
+        msgs.push(Message::new(Role::User, "second task"));
+        for i in 0..10 {
+            let id = format!("current_{}", i);
+            msgs.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: id.clone(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning_content: None,
+                },
+            });
+            msgs.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: id,
+                    output: format!("[elapsed: 0.0s, exit: 0]\n{}", "c".repeat(4_000)),
+                    success: true,
+                }),
+            });
+        }
+
+        let total_chars: usize = msgs
+            .iter()
+            .map(|m| match &m.content {
+                MessageContent::ToolResult(r) => r.output.len(),
+                MessageContent::Text(t) => t.len(),
+                _ => 100,
+            })
+            .sum();
+        // Set threshold low so microcompact fires deterministically.
+        let n = msgs.len();
+        microcompact(&mut msgs, n, 1_000);
+
+        let collect = |prefix: &str| -> Vec<(String, String)> {
+            msgs.iter()
+                .filter_map(|m| match &m.content {
+                    MessageContent::ToolResult(r) if r.call_id.starts_with(prefix) => {
+                        Some((r.call_id.clone(), r.output.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // PRIOR turn: every tool result must be stubbed.
+        let prior = collect("prior_");
+        assert_eq!(prior.len(), 15, "expected 15 prior tool results");
+        for (cid, body) in &prior {
+            assert!(
+                body.starts_with("[bash "),
+                "prior turn `{}` must be stubbed; got body of len={} starting {:?}\n\
+                 (total_chars before microcompact was {})",
+                cid,
+                body.len(),
+                &body[..body.len().min(80)],
+                total_chars
+            );
+            assert!(
+                body.len() < 200,
+                "prior stub should be < 200 bytes, got {}",
+                body.len()
+            );
+        }
+
+        // CURRENT turn: every tool result must remain FULL.
+        let current = collect("current_");
+        assert_eq!(current.len(), 10, "expected 10 current tool results");
+        for (cid, body) in &current {
+            assert!(
+                !body.starts_with("[bash "),
+                "current turn `{}` must NOT be stubbed (turn-aware preservation): \
+                 got {:?}",
+                cid,
+                &body[..body.len().min(80)]
+            );
+            assert!(
+                body.len() > 4_000,
+                "current tool result must keep its full payload (>4K chars), \
+                 got {} bytes",
+                body.len()
+            );
+        }
     }
 
     /// Running compaction twice MUST be idempotent — the upgraded

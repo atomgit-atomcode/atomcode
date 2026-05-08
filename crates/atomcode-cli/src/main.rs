@@ -1525,6 +1525,12 @@ async fn run_headless(
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
+            AgentEvent::Warning(w) => {
+                // Headless CLI: warnings go to stderr always (they're
+                // meant to be loud). No exit-code change, no shutdown —
+                // we expect the turn to keep running.
+                eprintln!("[warning] {}", w);
+            }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 if verbose {
                     eprintln!("[cwd] {}", new_dir.display());
