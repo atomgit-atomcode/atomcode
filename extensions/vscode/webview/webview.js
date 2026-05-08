@@ -77924,6 +77924,7 @@ ${content}</tr>
     const [showSlash, setShowSlash] = (0, import_react12.useState)(false);
     const [slashFilter, setSlashFilter] = (0, import_react12.useState)("");
     const inputBoxRef = (0, import_react12.useRef)(null);
+    const containerRef = (0, import_react12.useRef)(null);
     const textareaRef = (0, import_react12.useRef)(null);
     (0, import_react12.useEffect)(() => {
       const el = textareaRef.current;
@@ -77937,6 +77938,24 @@ ${content}</tr>
       }
       window.addEventListener("message", handleMessage);
       return () => window.removeEventListener("message", handleMessage);
+    }, []);
+    (0, import_react12.useEffect)(() => {
+      const container = containerRef.current;
+      if (!container) return;
+      const sessionBody = container.closest(".session-body");
+      if (!sessionBody) return;
+      const updateInputInset = () => {
+        sessionBody.style.setProperty("--input-inset", `${container.offsetHeight + 32}px`);
+      };
+      updateInputInset();
+      const resizeObserver = new ResizeObserver(updateInputInset);
+      resizeObserver.observe(container);
+      window.addEventListener("resize", updateInputInset);
+      return () => {
+        resizeObserver.disconnect();
+        window.removeEventListener("resize", updateInputInset);
+        sessionBody.style.removeProperty("--input-inset");
+      };
     }, []);
     (0, import_react12.useEffect)(() => {
       if (!showSlash) return void 0;
@@ -77988,7 +78007,7 @@ ${content}</tr>
       textareaRef.current?.focus();
     }, []);
     const hasText = Boolean(text2.trim());
-    return /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "input-container", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "input-box", ref: inputBoxRef, children: [
+    return /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "input-container", ref: containerRef, children: /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "input-box", ref: inputBoxRef, children: [
       showSlash && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(SlashPicker, { filter: slashFilter, onSelect: handleSlashSelect, onClose: () => setShowSlash(false) }),
       state.contextFiles.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "attached-files", children: state.contextFiles.map((f) => /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("span", { className: "attached-file-pill", title: f.path, children: [
         f.type === "selection" ? "\u{1F4CB}" : "\u{1F4C4}",

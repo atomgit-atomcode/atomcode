@@ -147,7 +147,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this._cancelLogin();
           break;
         case 'codingPlanSetup':
-          await this._setupCodingPlan();
+          await this._setupCodingPlan({ loginIfNeeded: true });
           break;
         case 'providerCreate':
           await this._createProvider(msg.provider);
@@ -547,8 +547,76 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async _setupCodingPlan(): Promise<CodingPlanSetupResponse | undefined> {
+  private async _ensureLoggedInForCodingPlan(announceInChat = false): Promise<boolean> {
     try {
+      const auth = await this._client.authStatus();
+      if (auth.logged_in) {
+        return true;
+      }
+
+      if (announceInChat) {
+        this._postMessage({
+          type: 'assistantMessage',
+          text: 'Opening AtomGit sign-in in your browser. Complete authorization there, then return to VS Code.',
+        });
+      }
+      this._postMessage({ type: 'setupWorking', message: 'Waiting for AtomGit sign-in...' });
+
+      await this._cancelLogin();
+      const login = await this._client.startLogin(true);
+      this._loginId = login.login_id;
+      this._postMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
+
+      while (this._loginId === login.login_id) {
+        const result = await this._client.pollLogin(login.login_id);
+        if (result.status === 'pending') {
+          this._postMessage({ type: 'loginPending' });
+          await delay(2000);
+          continue;
+        }
+
+        this._loginId = undefined;
+        this._postMessage({ type: 'loginAuthorized', user: result.user });
+        if (announceInChat) {
+          this._postMessage({
+            type: 'assistantMessage',
+            text: `Signed in as ${result.user?.name || result.user?.username || 'AtomGit user'}.`,
+          });
+        }
+        await this._sendSetupState();
+        return true;
+      }
+
+      return false;
+    } catch (e) {
+      this._clearLoginPoll();
+      this._loginId = undefined;
+      const message = this._messageFromError(e);
+      this._postMessage({ type: 'setupError', message });
+      if (announceInChat) {
+        this._postMessage({ type: 'error', message });
+      }
+      return false;
+    }
+  }
+
+  private async _setupCodingPlan(
+    options: { loginIfNeeded?: boolean; announceInChat?: boolean } = {},
+  ): Promise<CodingPlanSetupResponse | undefined> {
+    try {
+      if (options.loginIfNeeded) {
+        const loggedIn = await this._ensureLoggedInForCodingPlan(options.announceInChat);
+        if (!loggedIn) {
+          return undefined;
+        }
+      }
+
+      if (options.announceInChat) {
+        this._postMessage({
+          type: 'assistantMessage',
+          text: 'Syncing CodingPlan models...',
+        });
+      }
       this._postMessage({ type: 'setupWorking', message: 'Syncing CodingPlan models...' });
       const result: CodingPlanSetupResponse = await this._client.setupCodingPlan(this._loginId);
       this._postMessage({ type: 'codingPlanResult', result });
@@ -776,12 +844,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this._startLogin();
         return true;
       case '/codingplan':
-        this._postMessage({
-          type: 'assistantMessage',
-          text: 'Syncing CodingPlan models...',
-        });
         {
-          const result = await this._setupCodingPlan();
+          const result = await this._setupCodingPlan({ loginIfNeeded: true, announceInChat: true });
           if (result) {
             this._postMessage({
               type: 'assistantMessage',
@@ -894,4 +958,8 @@ function getNonce(): string {
     text += possible.charAt(Math.floor(Math.random() * possible.length));
   }
   return text;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
