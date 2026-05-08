@@ -1925,6 +1925,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         tokio::select! {
             biased;
 
+            // ── Windows OS-level Ctrl+C ──
+            // Fallback for conhost configurations where the keystroke
+            // never lands in the input buffer. Healthy terminals fire
+            // the keypress arm in `handle_input` first; this only wins
+            // when that path is silent. Single-press exit: skips the
+            // 2-press confirm because if we got here, the user has no
+            // working keyboard route to confirm with anyway.
+            #[cfg(windows)]
+            Some(()) = win_ctrl_c.recv() => {
+                crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
+                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            }
+
             // ── Deferred-render trailing edge ──
             // Drains any InputPrompt / StreamingBox payload the
             // renderer parked during its 20ms throttle window. No-op
