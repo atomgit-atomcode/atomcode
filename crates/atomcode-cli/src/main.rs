@@ -1640,6 +1640,12 @@ async fn run_headless(
                     eprintln!("[background files={}]", files_edited.join(","));
                 }
             }
+            // VL preprocessor failure restores pending image bytes for the
+            // TUI to re-attach. CLI has no interactive input buffer to put
+            // them in, so just ignore — the failure itself was already
+            // surfaced as AgentEvent::Warning above, and the conversation
+            // proceeds with the placeholder. No retry path exists in CLI.
+            AgentEvent::RestorePendingImages { .. } => {}
         }
     }
 
