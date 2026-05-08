@@ -1273,6 +1273,14 @@ impl AgentLoop {
             match maybe_preprocess(&self.config, &*self.turn_runner.provider, &clean, &images).await {
                 PreprocessOutcome::Skipped => (clean, images),
                 PreprocessOutcome::Replaced { text, vl_key } => {
+                    // Surface the VL output to the user — the splice text
+                    // below only enters the conversation history (visible
+                    // to the main model), not the TUIX scrollback. Without
+                    // this Warning, success is silent and the user has no
+                    // way to see what was OCR'd.
+                    vision_warning = Some(format!(
+                        "✓ VL 识别成功（{vl_key}）：\n{text}",
+                    ));
                     let merged = if clean.is_empty() {
                         format!("[图片内容（由 {vl_key} 识别）]\n{text}")
                     } else {
