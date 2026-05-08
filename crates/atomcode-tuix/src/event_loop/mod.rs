@@ -2155,12 +2155,41 @@ fn handle_input(
         InputEvent::MouseUp => {
             renderer.end_selection();
         }
-        InputEvent::Resize(cols, rows) => {
+        InputEvent::Resize(mut cols, mut rows) => {
+            // Coalesce burst-fired SIGWINCH events. gnome-terminal /
+            // alacritty / iTerm2 send a Resize per pixel during a
+            // window drag — a 200ms drag fires 30+ events. Without
+            // coalescing each one runs `on_resize` (per-row CUP+EL
+            // wipe + body re-emit + footer repaint), which the user
+            // sees as flicker / 刷屏 (Linux Mint bug report).
+            //
+            // Drain whatever is already queued in `input_rx`:
+            //   - adjacent Resize events collapse to the latest size
+            //     (intermediate sizes are discarded — only the final
+            //     geometry matters)
+            //   - non-Resize events are buffered and dispatched AFTER
+            //     `on_resize` settles, so they read `screen.width()` /
+            //     `screen.height()` at the new geometry rather than
+            //     an in-flight intermediate.
+            //
             // Forward to the renderer so DECSTBM-based backends can
             // re-issue their scroll region and repaint the footer at
             // the new geometry. Fire-and-forget; the render worker
             // serialises this against in-flight content writes.
+            let mut deferred: Vec<InputEvent> = Vec::new();
+            while let Ok(next) = ctx.input_rx.try_recv() {
+                match next {
+                    InputEvent::Resize(w, h) => {
+                        cols = w;
+                        rows = h;
+                    }
+                    other => deferred.push(other),
+                }
+            }
             renderer.on_resize(cols, rows);
+            for ev in deferred {
+                handle_input(app, ctx, renderer, ev)?;
+            }
         }
         InputEvent::Paste(text) => {
             // Route paste to the active modal when one is installed — the

@@ -1585,6 +1585,14 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
+        // No-op if size unchanged. Pairs with the burst coalescing in
+        // `event_loop::handle_input`; same-size events still arrive
+        // (focus changes, tab cycles, multiplexer pane shuffles) and
+        // the `\x1b[2J\x1b[H` wipe below is visible flicker even when
+        // the result is byte-identical.
+        if cols == self.width && rows == self.height {
+            return;
+        }
         // Resize is the simplest of all renderers in alt-screen mode:
         // no DECSTBM region to renegotiate, no scroll-region edge
         // cases, no auto-wrap-into-footer issues. We just:
@@ -2499,6 +2507,53 @@ mod tests {
         // actually rendered (not skipped via some empty-status path).
         assert!(s.contains("glm-5"));
         assert!(s.contains("~/proj"));
+    }
+
+    /// `on_resize` is a no-op when the size hasn't actually changed.
+    /// Some terminals fire spurious Resize events on focus / tab /
+    /// pane-shuffle (no grid change), and the `\x1b[2J\x1b[H` wipe
+    /// inside the resize handler is visible flicker even when the
+    /// outcome would be byte-identical. Pairs with the burst-coalesce
+    /// in `event_loop::handle_input`. Linux Mint / gnome-terminal
+    /// users reported "拉伸窗口刷屏" for exactly this reason.
+    #[test]
+    fn on_resize_same_size_emits_nothing() {
+        // Drive two AltScreenRenderer instances against separate
+        // capture buffers — one runs a same-size on_resize, the other
+        // runs a real resize. Compare their output. (Single-renderer
+        // pattern doesn't work because `with_writer` keeps the &mut
+        // Vec borrow alive for the renderer's lifetime.)
+        let mut baseline = Vec::new();
+        {
+            let mut r = AltScreenRenderer::with_writer(&mut baseline, caps_default(), 80, 24);
+            r.render(UiLine::User("hi".into()));
+            r.flush();
+            r.on_resize(80, 24); // same size — should be a no-op
+            drop(r);
+        }
+
+        let mut real_resize = Vec::new();
+        {
+            let mut r = AltScreenRenderer::with_writer(&mut real_resize, caps_default(), 80, 24);
+            r.render(UiLine::User("hi".into()));
+            r.flush();
+            r.on_resize(60, 16); // different size — should emit wipe + repaint
+            drop(r);
+        }
+
+        let baseline_str = String::from_utf8_lossy(&baseline);
+        let real_str = String::from_utf8_lossy(&real_resize);
+        assert!(
+            !baseline_str.contains("\x1b[2J\x1b[H"),
+            "same-size on_resize must not emit \\x1b[2J\\x1b[H wipe (flicker source). \
+             baseline: {:?}",
+            baseline_str
+        );
+        assert!(
+            real_str.contains("\x1b[2J\x1b[H"),
+            "real resize MUST still emit \\x1b[2J\\x1b[H wipe; got: {:?}",
+            real_str
+        );
     }
 
     /// Phase 4: `on_resize` updates cached dimensions, wipes the

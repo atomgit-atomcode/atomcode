@@ -2611,6 +2611,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
+        // No-op if size unchanged. Some terminals fire `Resize` for
+        // shape changes that don't actually alter the cell grid (tab
+        // toggles, font-size cycles, focus events on multiplexers);
+        // the per-row CUP+EL wipe below is visible flicker even when
+        // the result would be byte-identical, so skip the work
+        // entirely. Pairs with the burst coalescing in
+        // `event_loop::handle_input` — together they collapse a
+        // window-drag's 30+ same-size tail events into a single paint.
+        if cols == self.screen.width() && rows == self.screen.height() {
+            return;
+        }
         // Terminal-side wipe: resize leaves pre-resize chars at old
         // absolute positions. Use per-row CUP+EL instead of `\x1b[2J`
         // for the same reason as `reset()` — iTerm2 3.5+ has been
@@ -3156,6 +3167,34 @@ mod tests {
     /// on every `\n`, a full tail-repaint injected `tail.len() - 1`
     /// blank rows into scrollback for every resize event.
     ///
+    /// `on_resize` is a no-op when geometry is unchanged. Some
+    /// terminals fire spurious `Resize` events on tab/focus/pane
+    /// shuffles where the cell grid doesn't actually change; the
+    /// per-row CUP+EL wipe inside `on_resize` is a visible flash even
+    /// when the outcome would be byte-identical. Pairs with the
+    /// burst-coalesce in `event_loop::handle_input` to collapse a
+    /// window-drag's same-size tail into a single paint.
+    #[test]
+    fn retained_resize_same_size_emits_nothing() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let status = status_basic();
+        r.render(UiLine::User("hi".into()));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+        });
+        r.flush_deferred();
+        let bytes_before = buf.lock().unwrap().len();
+        r.on_resize(80, 24);
+        let bytes_after = buf.lock().unwrap().len();
+        assert_eq!(
+            bytes_before, bytes_after,
+            "same-size on_resize must not emit any bytes (flicker source)"
+        );
+    }
+
     /// Fix: position each tail row with absolute CUP + EL instead of
     /// LF-scrolling, so scrollback is never touched during resize.
     #[test]
