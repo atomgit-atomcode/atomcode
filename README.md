@@ -153,6 +153,27 @@ and the binary will be generated at `target/release/atomcode`.
 - Rust 1.75+ (for building)
 - An API key from any supported provider (or an AtomGit account for `/login`)
 
+### Uninstall
+
+Remove AtomCode and (optionally) its data:
+
+```bash
+atomcode uninstall                # interactive: per-group prompts
+atomcode uninstall --keep-data    # only remove binary + PATH edit
+atomcode uninstall --purge        # remove everything, including ~/.atomcode
+atomcode uninstall --dry-run      # show plan, change nothing
+```
+
+If the binary is already broken or missing:
+
+```bash
+curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.sh | sh
+# Windows:
+irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.ps1 | iex
+```
+
+By default credentials (`auth.toml`, `mcp.json`, `config.toml`, `ATOMCODE.md`) are kept; pass `--purge` to remove them too.
+
 ## Quick Start
 
 ### 1. First Run

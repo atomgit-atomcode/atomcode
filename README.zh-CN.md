@@ -153,6 +153,27 @@ cargo build --release
 - Rust 1.75+（用于构建）
 - 任一支持的模型提供方的 API Key（或使用 `/login` 的 AtomGit 账号）
 
+### 卸载
+
+移除 AtomCode 及（可选）其数据：
+
+```bash
+atomcode uninstall                # 交互模式：分组询问
+atomcode uninstall --keep-data    # 仅删除二进制 + PATH 配置
+atomcode uninstall --purge        # 一并删除 ~/.atomcode/
+atomcode uninstall --dry-run      # 仅打印计划，不实际删除
+```
+
+二进制已损坏或丢失时使用兜底脚本：
+
+```bash
+curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.sh | sh
+# Windows:
+irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.ps1 | iex
+```
+
+默认保留凭据（`auth.toml`、`mcp.json`、`config.toml`、`ATOMCODE.md`），传 `--purge` 才会一起清除。
+
 ## 快速开始
 
 ### 1. 首次运行
