@@ -98,11 +98,31 @@ pub enum VisionPreprocessorOutcome {
     Cleared,
 }
 
+/// JetBrains JediTerm doesn't render SGR 9 strikethrough reliably
+/// (older versions silently parse-and-drop it; newer versions render
+/// inconsistently depending on font + theme). Detected via the
+/// `TERMINAL_EMULATOR=JetBrains-JediTerm` env var that JetBrains IDEs
+/// export into their integrated terminal. When true, the locked-model
+/// row falls back to an ASCII `✗` prefix + `(Locked: ...)` text marker
+/// so the meaning carries even with no visual styling.
+pub(crate) fn detect_jediterm() -> bool {
+    std::env::var("TERMINAL_EMULATOR")
+        .map(|v| v == "JetBrains-JediTerm")
+        .unwrap_or(false)
+}
+
 impl SetupReport {
     /// Render as a multi-line plain-text block for stdout / TUI body.
     /// Shared by the CLI subcommand and the `/codingplan` slash command
     /// so the visual contract stays consistent.
     pub fn render(&self) -> String {
+        self.render_with_terminal_caps(detect_jediterm())
+    }
+
+    /// Test-friendly variant of `render()` that takes terminal capability
+    /// flags as parameters so unit tests don't have to mutate process
+    /// env to exercise the JediTerm fallback path.
+    pub(crate) fn render_with_terminal_caps(&self, is_jediterm: bool) -> String {
         let mut out = String::new();
         out.push_str("  AtomCode CodingPlan setup:\n\n");
 
@@ -131,7 +151,7 @@ impl SetupReport {
         match &self.claim {
             StepResult::Ok(info) => {
                 out.push_str(&format!(
-                    "  ✔ CodingPlan claimed — {} ({})\n",
+                    "  ✔ CodingPlan claimed — {} (CodingPlan {})\n",
                     if info.message.is_empty() {
                         "success".to_string()
                     } else {
@@ -172,6 +192,33 @@ impl SetupReport {
                 // the user's plan tier and renders with strikethrough.
                 let registered: std::collections::HashSet<&str> =
                     info.display_names.iter().map(|s| s.as_str()).collect();
+                // Locked models render FIRST so the upgrade prompt is the
+                // first thing the eye lands on under "Added N providers:".
+                // ANSI SGR 9 for strikethrough (\x1b[9m...\x1b[29m); terminals
+                // that don't honour it (e.g., JediTerm, legacy conhost) still
+                // get the explicit "(require plan upgrade)" suffix so the
+                // meaning never relies on the SGR alone.
+                let locked: Vec<&ModelEntry> = info
+                    .all_models
+                    .iter()
+                    .filter(|m| !m.plan_available && !registered.contains(m.display_model_name.as_str()))
+                    .collect();
+                for m in &locked {
+                    if is_jediterm {
+                        // JediTerm fallback: ✗ + "(Locked: ...)" text
+                        // marker, no SGR 9 (which JediTerm renders
+                        // inconsistently or not at all).
+                        out.push_str(&format!(
+                            "      ✗ {}  (Locked: require plan upgrade)\n",
+                            m.display_model_name,
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "      • \x1b[9m{}\x1b[29m  (require plan upgrade)\n",
+                            m.display_model_name,
+                        ));
+                    }
+                }
                 for (pname, model) in info.provider_names.iter().zip(info.display_names.iter()) {
                     let suffix = if pname == &info.default_provider {
                         "  (default)"
@@ -179,29 +226,6 @@ impl SetupReport {
                         ""
                     };
                     out.push_str(&format!("      • {}  →  {}{}\n", pname, model, suffix));
-                }
-                // Locked models — surface so users can see what a plan
-                // upgrade would unlock. ANSI SGR 9 for strikethrough
-                // (\x1b[9m...\x1b[29m); terminals that don't honour it
-                // still get the text + the explicit "(locked)" suffix
-                // so the meaning never relies on the SGR alone.
-                let locked: Vec<&ModelEntry> = info
-                    .all_models
-                    .iter()
-                    .filter(|m| !m.plan_available && !registered.contains(m.display_model_name.as_str()))
-                    .collect();
-                if !locked.is_empty() {
-                    out.push_str(&format!(
-                        "  ◯ {} locked model{} (require plan upgrade):\n",
-                        locked.len(),
-                        if locked.len() == 1 { "" } else { "s" },
-                    ));
-                    for m in &locked {
-                        out.push_str(&format!(
-                            "      ✗ \x1b[9m{}\x1b[29m  (locked)\n",
-                            m.display_model_name,
-                        ));
-                    }
                 }
                 // Vision-preprocessor outcome line.
                 match &info.vision_preprocessor {
@@ -1498,9 +1522,10 @@ mod tests {
 
     /// Locked models (plan_available=false on a higher tier) must
     /// surface in the rendered report with strikethrough + the
-    /// explicit "(locked)" tag, AND must NOT be listed under the
-    /// "Added N provider(s)" section. Pins the v2 spec's "若不可用
-    /// 的模型也展示出来（用横线划掉）" requirement.
+    /// explicit "(require plan upgrade)" tag, appended to the same
+    /// `Added N provider(s)` bullet list as the available models so
+    /// users see the full slate at a glance. Pins the v2 spec's "若
+    /// 不可用的模型也展示出来（用横线划掉）" requirement.
     #[test]
     fn render_shows_locked_models_with_strikethrough() {
         let avail = super::super::types::ModelEntry {
@@ -1533,27 +1558,84 @@ mod tests {
         };
         let out = report.render();
         // Plan tier appears next to claim line.
-        assert!(out.contains("(Lite)"), "claim row must show tier:\n{out}");
+        assert!(out.contains("(CodingPlan Lite)"), "claim row must show tier:\n{out}");
         // Available model: standard provider line.
         assert!(out.contains("AtomGit") && out.contains("lite/foo"));
         // Locked model: strikethrough SGR + explicit suffix. Both
         // must be present so terminals that ignore SGR 9 still see
-        // "(locked)".
+        // "(require plan upgrade)".
         assert!(
             out.contains("\x1b[9mmax/super-secret\x1b[29m"),
             "locked model must have SGR 9 strikethrough wrap:\n{out}"
         );
-        assert!(out.contains("(locked)"));
-        // Locked count line.
-        assert!(out.contains("1 locked model"));
-        // Available models list must NOT mention the locked one.
-        let added_section = out
-            .split("locked model")
-            .next()
-            .unwrap_or("");
+        assert!(out.contains("(require plan upgrade)"));
+        // Locked model appears INSIDE the providers bullet list — its
+        // line must come after the "Added N provider(s):" header and
+        // before the next top-level section (Vision preprocessor /
+        // CodingPlan status). The strikethrough + suffix already mark
+        // it as unavailable; no separate "locked model" header.
         assert!(
-            !added_section.contains("max/super-secret"),
-            "locked model must not appear in the Added providers list:\n{added_section}"
+            !out.contains("locked model"),
+            "no separate locked-model section expected:\n{out}"
+        );
+        let added_idx = out.find("Added 1 provider").expect("Added header");
+        let locked_idx = out.find("max/super-secret").expect("locked model line");
+        let avail_idx = out.find("lite/foo").expect("available model line");
+        assert!(
+            locked_idx > added_idx,
+            "locked model must render after the Added header:\n{out}"
+        );
+        assert!(
+            locked_idx < avail_idx,
+            "locked model must render BEFORE available providers (top-of-list upgrade prompt):\n{out}"
+        );
+    }
+
+    /// JediTerm fallback: when `TERMINAL_EMULATOR=JetBrains-JediTerm`
+    /// is detected, the locked-model row drops SGR 9 strikethrough and
+    /// switches to `✗ <name>  (Locked: require plan upgrade)`. Pins the
+    /// fallback so terminals that don't honour SGR 9 still convey the
+    /// "this needs an upgrade" semantic.
+    #[test]
+    fn render_jediterm_fallback_uses_ascii_marker_no_strikethrough() {
+        let avail = super::super::types::ModelEntry {
+            id: 1,
+            is_atomcode_exclusive: 0,
+            display_model_name: "lite/foo".into(),
+            plan_available: true,
+        };
+        let locked = super::super::types::ModelEntry {
+            id: 2,
+            is_atomcode_exclusive: 0,
+            display_model_name: "max/super-secret".into(),
+            plan_available: false,
+        };
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Ok(ClaimInfo {
+                message: "claimed".into(),
+                duplicate: false,
+                plan_type: PlanType::Lite,
+            }),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec!["lite/foo".into()],
+                provider_names: vec!["AtomGit".into()],
+                default_provider: "AtomGit".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![avail, locked],
+            }),
+            status: StepResult::Skipped("test skip".into()),
+        };
+        let out = report.render_with_terminal_caps(true);
+        // No SGR 9 escapes anywhere in the output.
+        assert!(
+            !out.contains("\x1b[9m"),
+            "JediTerm fallback must not emit SGR 9:\n{out}"
+        );
+        // Explicit ASCII marker + "(Locked: ...)" suffix.
+        assert!(
+            out.contains("✗ max/super-secret  (Locked: require plan upgrade)"),
+            "expected ASCII fallback line:\n{out}"
         );
     }
 }
