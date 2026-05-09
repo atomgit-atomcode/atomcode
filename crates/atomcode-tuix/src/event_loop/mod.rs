@@ -1877,7 +1877,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // truly fails, so dual-firing produced wall-of-text noise (see
     // user feedback 2026-05-09 "全部展示的是…可以更精细化下").
     let kbd_hint_set = std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok();
-    let legacy_conhost_set = std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok();
     let jediterm_set = std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok();
     if kbd_hint_set {
         std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
@@ -1903,7 +1902,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // use them. The startup hint targets the user who doesn't know,
     // and for them a guaranteed-works recommendation beats a
     // sometimes-wrong terminal-specific one.
-    if kbd_hint_set && !legacy_conhost_set && !jediterm_set {
+    if kbd_hint_set && !jediterm_set {
         renderer.render(UiLine::CommandOutput(
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
             Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \
@@ -1944,35 +1943,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         ));
     }
 
-    // Legacy Windows console (cmd.exe / classic conhost) auto-fallback
-    // hint: lib.rs detected Windows + neither WT_SESSION nor
-    // TERM_PROGRAM, which means the user is on stock conhost where
-    // DECSTBM misbehaves (rows duplicate in scrollback on Page-Up).
-    // Phase 5: now routes to AltScreenRenderer. Mutually exclusive
-    // with the JediTerm hint (lib.rs gates legacy_conhost on
-    // `!is_jediterm`).
-    if std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok() {
-        std::env::remove_var("ATOMCODE_LEGACY_CONHOST_FALLBACK");
-        // Includes the newline-insertion guidance because legacy
-        // conhost is the ONE environment where modifier+Enter is
-        // genuinely swallowed by the OS (every Shift/Alt/Ctrl+Enter
-        // chord collapses to bare Enter before reaching the app).
-        // The trailing `\<Enter>` is the only reliable path — call
-        // it out explicitly here so the keyboard-hint suppression
-        // above doesn't leave conhost users without that information.
-        renderer.render(UiLine::CommandOutput(
-            "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
-            Newlines: end the line with `\\` then press Enter (modifier+Enter is\n    \
-            swallowed by conhost; Shift / Alt / Ctrl+Enter all collapse to Enter).\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs.\n    \
-            For full host-terminal scrollback support, install Windows Terminal\n    \
-            (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
-            bypass this fallback (may show duplicated content on scroll).\n\n"
-                .into(),
-        ));
-    }
+    // The legacy-Windows-conhost fallback banner used to fire here
+    // (gated on ATOMCODE_LEGACY_CONHOST_FALLBACK set by lib.rs). It
+    // walked the user through wheel-scroll, PageUp/Down, third-party
+    // terminal alternatives, and the ATOMCODE_PLAIN / ATOMCODE_RETAIN
+    // bypass switches. Removed in v4.22 once alt-screen on conhost
+    // shipped working wheel + PageUp/Down + SGR mouse: the wall of
+    // text became dead weight (every conhost user immediately
+    // wanted it gone). Newline guidance still reaches them via the
+    // universal `\<Enter>` block above (kbd_hint_set arm), which is
+    // one line and terminal-agnostic.
 
     // Auto-continue: if the CLI loaded the most recent session for this
     // working dir (via `atomcode -c` / `--continue`), replay its messages

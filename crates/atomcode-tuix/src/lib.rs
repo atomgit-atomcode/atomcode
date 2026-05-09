@@ -269,13 +269,18 @@ pub async fn run(
     // explaining what just happened and how to recover. Only set
     // when the auto-fallback fired — if the user explicitly opted
     // in via ATOMCODE_PLAIN they already know; lecturing would be
-    // noise. Mutually exclusive (legacy_conhost is gated on
-    // !is_jediterm above) so at most one hint fires.
+    // noise.
+    //
+    // The conhost banner used to fire here too (gated on
+    // is_legacy_conhost), but as of v4.22 alt-screen on conhost
+    // covers wheel-scroll + PageUp/Down + ?1006 SGR mouse
+    // coordinates well enough that the wall-of-text hint became
+    // dead weight — users see it once and immediately want it
+    // gone. Removed in favour of the universal `\<Enter>` hint
+    // (kbd_hint block in event_loop) which is one line and
+    // terminal-agnostic.
     if is_jediterm && !force_retain && !force_plain_env {
         std::env::set_var("ATOMCODE_JEDITERM_FALLBACK", "1");
-    }
-    if is_legacy_conhost && !force_retain && !force_plain_env {
-        std::env::set_var("ATOMCODE_LEGACY_CONHOST_FALLBACK", "1");
     }
 
     // Capture whether stdout was a real TTY BEFORE we mutate caps.
