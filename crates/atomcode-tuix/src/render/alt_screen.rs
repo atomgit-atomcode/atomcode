@@ -344,6 +344,15 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// Drop pops only when this is true so a failed enter doesn't try
     /// to pop a buffer we never owned.
     alt_screen_active: bool,
+    /// Saved Win32 console-input mode captured when we flipped the
+    /// mouse-capture bits. `Drop` / `leave_alt_screen` write this back
+    /// so the parent shell gets its quick-edit / line-input state
+    /// returned exactly as it was, not approximated. `None` means we
+    /// never successfully read the original (e.g. stdin not a console)
+    /// — in that case we don't try to restore. Windows-only because
+    /// other platforms route mouse capture through VT escape codes.
+    #[cfg(windows)]
+    prior_console_in_mode: Option<u32>,
     /// Cached width / height. Updated by resize in Phase 4.
     width: u16,
     height: u16,
@@ -457,12 +466,82 @@ impl AltScreenRenderer<BufWriter<Stdout>> {
     }
 }
 
+/// Read STD_INPUT_HANDLE's current console mode, OR-in the bits required
+/// for mouse-event delivery on conhost, AND-out `ENABLE_QUICK_EDIT_MODE`,
+/// and write the result back. Returns the original mode on success so
+/// `leave_alt_screen` can restore it byte-for-byte; returns `None` if
+/// either GetConsoleMode or SetConsoleMode fails (typically: stdin was
+/// redirected and isn't a console handle, e.g. running under a pipe).
+///
+/// All results are mirrored to `tuix_trace!` (gated on
+/// `ATOMCODE_TUIX_LOG`) so a "wheel still doesn't work" report shows
+/// exactly which syscall returned what mask.
+#[cfg(windows)]
+fn enable_conhost_mouse_capture() -> Option<u32> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS,
+        ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT, STD_INPUT_HANDLE,
+    };
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        // GetStdHandle returns INVALID_HANDLE_VALUE (`!0 as HANDLE`) on
+        // failure; on Windows that's `-1isize as *mut c_void`. Treat
+        // null and "all bits set" as failure shapes.
+        if h.is_null() || h as isize == -1 {
+            crate::tuix_trace!("REN", "conhost-mouse: GetStdHandle returned invalid");
+            return None;
+        }
+        let mut original: u32 = 0;
+        if GetConsoleMode(h, &mut original) == 0 {
+            let err = std::io::Error::last_os_error();
+            crate::tuix_trace!("REN", "conhost-mouse: GetConsoleMode failed: {}", err);
+            return None;
+        }
+        let new_mode = (original | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
+            & !ENABLE_QUICK_EDIT_MODE;
+        if SetConsoleMode(h, new_mode) == 0 {
+            let err = std::io::Error::last_os_error();
+            crate::tuix_trace!(
+                "REN",
+                "conhost-mouse: SetConsoleMode(0x{:08x}) failed: {}",
+                new_mode,
+                err
+            );
+            return None;
+        }
+        crate::tuix_trace!(
+            "REN",
+            "conhost-mouse: ok prev=0x{:08x} new=0x{:08x}",
+            original,
+            new_mode
+        );
+        Some(original)
+    }
+}
+
+/// Restore STD_INPUT_HANDLE's console mode to the value `enable_conhost_
+/// mouse_capture` returned. Best-effort — failure here just means the
+/// shell mode bits drift slightly on exit; better than aborting.
+#[cfg(windows)]
+fn restore_conhost_console_in_mode(prior: u32) {
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE};
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        if h.is_null() || h as isize == -1 {
+            return;
+        }
+        let _ = SetConsoleMode(h, prior);
+    }
+}
+
 impl<W: Write + Send> AltScreenRenderer<W> {
     pub fn with_writer(out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
         let mut r = Self {
             out,
             caps,
             alt_screen_active: false,
+            #[cfg(windows)]
+            prior_console_in_mode: None,
             width: w,
             height: h,
             body_lines: Vec::new(),
@@ -532,27 +611,42 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1002h\x1b[?1006h";
         if self.out.write_all(seq.as_bytes()).is_ok() && self.out.flush().is_ok() {
             self.alt_screen_active = true;
-            // Legacy Windows conhost (Win10 PowerShell, cmd.exe) does
-            // NOT implement the VT mouse-mode toggles above — `?1002h`
-            // and `?1006h` parse as no-ops there. Mouse events only
+            // Legacy Windows conhost (Win10 PowerShell 5/7, cmd.exe)
+            // does NOT implement the VT mouse-mode toggles above —
+            // `?1002h` / `?1006h` parse as no-ops. Mouse events only
             // flow when `ENABLE_MOUSE_INPUT` is set on the console
-            // input handle via `SetConsoleMode`. crossterm's
-            // `EnableMouseCapture` overrides `is_ansi_code_supported`
-            // to false on Windows, so `execute!` takes the Win32 path
-            // (`enable_mouse_capture()` → set_mode with
-            // ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS |
-            // ENABLE_WINDOW_INPUT) instead of writing the same VT
-            // codes conhost ignores. Without this the banner promises
-            // mouse-wheel scrolling in alt-screen but no MouseScroll
-            // event ever reaches the input reader on conhost. Modern
-            // Windows Terminal handled the VT codes already, so it's
-            // unaffected; this just unblocks the legacy host. Best-
-            // effort — if the SetConsoleMode call fails (e.g. stdin
-            // not a console) we leave the renderer running without
-            // mouse capture rather than aborting startup.
+            // input handle via `SetConsoleMode`, AND when
+            // `ENABLE_QUICK_EDIT_MODE` is cleared (otherwise conhost
+            // intercepts mouse for text-selection and never delivers
+            // events to the program — wheel ticks included on some
+            // versions).
+            //
+            // We previously routed this through crossterm's
+            // `EnableMouseCapture`. Field reports (Win10 PS7) showed
+            // wheel still didn't work even after that fix shipped.
+            // crossterm's Windows path calls `set_mode(ENABLE_MOUSE_
+            // INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)` —
+            // an OVERWRITE of the entire mode. That:
+            //   1. drops `ENABLE_VIRTUAL_TERMINAL_INPUT` and any
+            //      other bits raw_mode set up,
+            //   2. doesn't surface SetConsoleMode failures (we
+            //      `let _ =` the result),
+            //   3. relies on `ENABLE_QUICK_EDIT_MODE` being clearable
+            //      via implicit-absent semantics in the new mask,
+            //      which works on most conhost builds but isn't the
+            //      shape Microsoft's own samples use.
+            //
+            // Switch to read-modify-write through windows-sys: read
+            // the current mode, OR in the mouse bits, AND-out
+            // `ENABLE_QUICK_EDIT_MODE` explicitly, write back. Save
+            // the original for `leave_alt_screen` so the parent shell
+            // gets its mode restored exactly. Surface the
+            // GetConsoleMode/SetConsoleMode return codes via the
+            // trace log so a "still doesn't work" report tells us
+            // immediately whether the syscalls even succeeded.
             #[cfg(windows)]
             {
-                let _ = crossterm::execute!(self.out, crossterm::event::EnableMouseCapture);
+                self.prior_console_in_mode = enable_conhost_mouse_capture();
             }
         }
     }
@@ -567,14 +661,16 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             // Disable mouse capture FIRST — if alt-screen pops while
             // mouse mode is still on, some terminals leak `\x1b[<...M`
             // events into the main screen until something resets them.
-            // On Windows we additionally restore the original
-            // SetConsoleMode bits we clobbered in `enter_alt_screen`;
-            // crossterm's `disable_mouse_capture` reads back the
-            // saved `ORIGINAL_CONSOLE_MODE` so the user's shell gets
-            // its quick-edit / line-input flags back on exit.
+            // On Windows we additionally restore the exact pre-enter
+            // SetConsoleMode bitmask we saved in `enter_alt_screen`,
+            // so the parent shell gets its quick-edit / line-input
+            // flags back as they were (not "approximated" by
+            // crossterm's saved-original snapshot).
             #[cfg(windows)]
             {
-                let _ = crossterm::execute!(self.out, crossterm::event::DisableMouseCapture);
+                if let Some(prior) = self.prior_console_in_mode.take() {
+                    restore_conhost_console_in_mode(prior);
+                }
             }
             let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1049l");
             let _ = self.out.flush();

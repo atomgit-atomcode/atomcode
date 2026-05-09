@@ -298,6 +298,7 @@ dependencies = [
  "unicode-width",
  "uuid",
  "vte",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

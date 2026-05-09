@@ -491,6 +491,12 @@ fn run(
 }
 
 fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
+    // Trace EVERY arrival, regardless of kind. The kind-specific arms
+    // below only log scroll/down/drag/up; on Windows conhost a wheel
+    // tick can arrive as `Moved` or another variant we silently drop,
+    // and without this top-of-function trace there's no way to tell
+    // "no mouse events arriving" from "events arriving but ignored".
+    crate::tuix_trace!("RD", "mouse kind={:?} col={} row={}", m.kind, m.column, m.row);
     match m.kind {
         crossterm::event::MouseEventKind::ScrollUp => {
             crate::tuix_trace!("RD", "mouse scroll up");

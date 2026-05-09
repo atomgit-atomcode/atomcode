@@ -22,6 +22,19 @@ arboard = "3"
 png = "0.17"
 base64 = "0.22"
 
+[target.'cfg(windows)'.dependencies]
+# Direct Win32 console-mode access for the conhost mouse-capture path.
+# crossterm's EnableMouseCapture uses `set_mode(ENABLE_MOUSE_MODE)` which
+# OVERWRITES the entire input mode mask — that drops bits raw_mode set
+# up and silently eats SetConsoleMode failures (we `let _ =` the result
+# at the call site). The conhost regression report shows that path
+# isn't reliably enabling wheel events on legacy Win10 console even
+# though crossterm thinks it succeeded. Read-modify-write through
+# windows-sys preserves the existing mode, ORs in the mouse bits,
+# explicitly clears ENABLE_QUICK_EDIT_MODE (which can intercept mouse
+# selection on conhost), and surfaces errors via the trace log.
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
 [dev-dependencies]
 tempfile = "3"
 vte = "0.15.0"
