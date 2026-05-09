@@ -1668,7 +1668,7 @@ pub struct App {
     /// Drained one-at-a-time from the head whenever the current turn
     /// finishes. Matches CC's "type-ahead" UX — queue the next prompt
     /// while the model is still thinking and it fires automatically.
-    pub message_queue: VecDeque<String>,
+    pub message_queue: VecDeque<crate::state::QueuedMessage>,
     /// Streaming-state `<think>…</think>` stripper. Kept on App (not
     /// a local in the streaming arm) because it carries state across
     /// agent events — a tag straddling two chunks would break if the
@@ -2298,9 +2298,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     // fire in order on subsequent completions.
                     if let Some(queued) = app.message_queue.pop_front() {
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.clone()));
+                        renderer.render(UiLine::User(queued.text.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![], image_markers: vec![] }).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                            text: queued.text,
+                            images: queued.images,
+                            image_markers: queued.image_markers,
+                        }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -2553,9 +2557,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if matches!(app.state.phase, UiPhase::Idle) {
                     if let Some(queued) = app.message_queue.pop_front() {
                         crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.clone()));
+                        renderer.render(UiLine::User(queued.text.clone()));
                         renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage { text: queued, images: vec![], image_markers: vec![] }).ok();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                            text: queued.text,
+                            images: queued.images,
+                            image_markers: queued.image_markers,
+                        }).ok();
                         app.state.on_submit();
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                     } else {
@@ -3962,11 +3970,42 @@ fn handle_streaming_key(
             // Expand any paste placeholders — agent sees full payload,
             // scrollback echo stays compact.
             let expanded = app.buf.expand_pastes(&line);
+            // Mirror the main submit path's image filtering: only
+            // attachments whose `[Image #N]` marker survived editing
+            // travel with this submission, both into the queue
+            // payload and into the persisted history entry.
+            let pending = std::mem::take(&mut app.state.pending_images);
+            let pending_markers = std::mem::take(&mut app.state.pending_image_markers);
+            let pending_hashes = std::mem::take(&mut app.state.pending_image_hashes);
+            let mut q_images: Vec<ImagePart> = Vec::with_capacity(pending.len());
+            let mut q_markers: Vec<usize> = Vec::with_capacity(pending.len());
+            let mut q_refs: Vec<crate::input::history::HistoryImageRef> =
+                Vec::with_capacity(pending.len());
+            for ((img, n), hash) in pending
+                .into_iter()
+                .zip(pending_markers.into_iter())
+                .zip(pending_hashes.into_iter())
+            {
+                if line.contains(&format!("[Image #{}]", n)) {
+                    renderer.render(UiLine::ImageAttachment(n));
+                    q_refs.push(crate::input::history::HistoryImageRef {
+                        hash: format!("{:016x}", hash),
+                        mt: img.media_type.clone(),
+                        n,
+                    });
+                    q_images.push(img);
+                    q_markers.push(n);
+                }
+            }
             ctx.history.push(crate::input::history::HistoryEntry {
                 text: line.clone(),
-                images: vec![], // populated by Task 13 (queue carries images)
+                images: q_refs,
             });
-            app.message_queue.push_back(expanded);
+            app.message_queue.push_back(crate::state::QueuedMessage {
+                text: expanded,
+                images: q_images,
+                image_markers: q_markers,
+            });
             crate::tuix_trace!("QUE", "push_back len={}", app.message_queue.len());
             app.buf.text.clear();
             app.buf.cursor = 0;

@@ -109,6 +109,17 @@ pub struct ContextSnapshot {
     pub system_prompt: String,
 }
 
+/// One entry in `message_queue`. Replaces the prior `String`-only
+/// representation so queued messages can carry their pasted images +
+/// markers — otherwise queueing a message during streaming silently
+/// drops attachments.
+#[derive(Debug, Clone)]
+pub struct QueuedMessage {
+    pub text: String,
+    pub images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub image_markers: Vec<usize>,
+}
+
 pub struct UiState {
     pub phase: UiPhase,
     pub agent_mode: AgentMode,
@@ -853,5 +864,19 @@ mod tests {
     fn pending_recalled_attachments_starts_empty() {
         let s = UiState::new();
         assert!(s.pending_recalled_attachments.is_empty());
+    }
+
+    #[test]
+    fn queued_message_carries_images() {
+        let q = QueuedMessage {
+            text: "hi".into(),
+            images: vec![atomcode_core::conversation::message::ImagePart {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+            image_markers: vec![1],
+        };
+        assert_eq!(q.images.len(), 1);
+        assert_eq!(q.image_markers, vec![1]);
     }
 }
