@@ -178,6 +178,12 @@ pub struct UiState {
     /// using the index dropped images on every retry that wasn't the
     /// first paste of the session.
     pub pending_image_markers: Vec<usize>,
+    /// Image attachments to re-attach when the user submits a recalled
+    /// history entry. Populated by the up-arrow handler from the
+    /// recalled `HistoryEntry::images`; drained on submit by the
+    /// hydrate prelude in `event_loop/mod.rs`. Lazy by design — disk
+    /// reads happen at submit time, not on every navigation.
+    pub pending_recalled_attachments: Vec<crate::input::history::HistoryImageRef>,
     /// Monotonic counter for the `[Image #N]` marker shown in the input
     /// buffer + scrollback. Incremented on every paste and NEVER reset
     /// across turns — so two images pasted in different turns get
@@ -276,6 +282,7 @@ impl UiState {
             pending_images: Vec::new(),
             pending_image_hashes: Vec::new(),
             pending_image_markers: Vec::new(),
+            pending_recalled_attachments: Vec::new(),
             session_image_count: 0,
             show_tool_output: false,
             show_reasoning: false,
@@ -840,5 +847,11 @@ mod tests {
     #[test]
     fn agent_mode_double_toggle_returns_to_original() {
         assert_eq!(AgentMode::Build.toggle().toggle(), AgentMode::Build);
+    }
+
+    #[test]
+    fn pending_recalled_attachments_starts_empty() {
+        let s = UiState::new();
+        assert!(s.pending_recalled_attachments.is_empty());
     }
 }
