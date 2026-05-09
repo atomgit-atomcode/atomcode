@@ -532,6 +532,28 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1002h\x1b[?1006h";
         if self.out.write_all(seq.as_bytes()).is_ok() && self.out.flush().is_ok() {
             self.alt_screen_active = true;
+            // Legacy Windows conhost (Win10 PowerShell, cmd.exe) does
+            // NOT implement the VT mouse-mode toggles above — `?1002h`
+            // and `?1006h` parse as no-ops there. Mouse events only
+            // flow when `ENABLE_MOUSE_INPUT` is set on the console
+            // input handle via `SetConsoleMode`. crossterm's
+            // `EnableMouseCapture` overrides `is_ansi_code_supported`
+            // to false on Windows, so `execute!` takes the Win32 path
+            // (`enable_mouse_capture()` → set_mode with
+            // ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS |
+            // ENABLE_WINDOW_INPUT) instead of writing the same VT
+            // codes conhost ignores. Without this the banner promises
+            // mouse-wheel scrolling in alt-screen but no MouseScroll
+            // event ever reaches the input reader on conhost. Modern
+            // Windows Terminal handled the VT codes already, so it's
+            // unaffected; this just unblocks the legacy host. Best-
+            // effort — if the SetConsoleMode call fails (e.g. stdin
+            // not a console) we leave the renderer running without
+            // mouse capture rather than aborting startup.
+            #[cfg(windows)]
+            {
+                let _ = crossterm::execute!(self.out, crossterm::event::EnableMouseCapture);
+            }
         }
     }
 
@@ -545,6 +567,15 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             // Disable mouse capture FIRST — if alt-screen pops while
             // mouse mode is still on, some terminals leak `\x1b[<...M`
             // events into the main screen until something resets them.
+            // On Windows we additionally restore the original
+            // SetConsoleMode bits we clobbered in `enter_alt_screen`;
+            // crossterm's `disable_mouse_capture` reads back the
+            // saved `ORIGINAL_CONSOLE_MODE` so the user's shell gets
+            // its quick-edit / line-input flags back on exit.
+            #[cfg(windows)]
+            {
+                let _ = crossterm::execute!(self.out, crossterm::event::DisableMouseCapture);
+            }
             let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1049l");
             let _ = self.out.flush();
             self.alt_screen_active = false;
