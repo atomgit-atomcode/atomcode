@@ -271,6 +271,22 @@ pub fn build_messages(
     microcompact(&mut result, conv.messages.len(), microcompact_threshold);
 
     replace_stale_reads(&mut result);
+    // sanitize_messages drops AssistantWithToolCalls whose tool_calls
+    // didn't all get followed by matching tool_result messages before
+    // a non-tool boundary (next ATC / Text / MultiPart). Required to
+    // satisfy DeepSeek's strict `insufficient tool messages following
+    // tool_calls message` 400 and the equivalent Claude/OpenAI/Gemini
+    // pairing contracts. Several upstream paths can leave the
+    // conversation in this state (cancel mid-batch, hard-truncate
+    // landing between ATC and its results, /resume of an old session)
+    // — sanitizing at send time is the defensive backstop that catches
+    // them all uniformly. Already wired into the fallback path
+    // (`build_messages_fallback`); this call extends the same safety net
+    // to the main turn-tracked path. Runs BEFORE clean_message_pipeline
+    // so the consecutive-User merger downstream can collapse any
+    // adjacent User messages that the dropped ATC was previously
+    // separating.
+    sanitize_messages(&mut result);
     clean_message_pipeline(&mut result);
 
     // ── ABSOLUTE FLOOR (runs AFTER all cleanup, right before sent_tokens calc) ──
@@ -2460,6 +2476,97 @@ mod tests {
         let len_before = msgs.len();
         sanitize_messages(&mut msgs);
         assert_eq!(msgs.len(), len_before, "must not drop fully-paired history");
+    }
+
+    /// End-to-end regression for the DeepSeek `insufficient tool
+    /// messages following tool_calls message` 400 via the main
+    /// turn-tracked `build_messages` path. The function-level
+    /// `sanitize_messages` tests cover the unit; this test pins the
+    /// wiring — sanitize_messages must run from `build_messages`, not
+    /// just from the fallback. Constructs a Conversation with a
+    /// turn-bearing under-paired ATC mid-history (ATC(3) + only 2
+    /// tool_results, then a fresh user turn) and verifies the wire-
+    /// level invariant holds in the output: every surviving ATC is
+    /// followed by exactly N tool messages.
+    #[test]
+    fn build_messages_satisfies_atc_pairing_after_under_paired_mid_history() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+        conv.add_user_message("first task");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![
+                ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() },
+                ToolCall { id: "c2".into(), name: "bash".into(), arguments: "{}".into() },
+                ToolCall { id: "c3".into(), name: "bash".into(), arguments: "{}".into() },
+            ],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "c1".into(),
+            output: "ok1".into(),
+            success: true,
+        });
+        conv.add_tool_result(ToolResult {
+            call_id: "c2".into(),
+            output: "ok2".into(),
+            success: true,
+        });
+        // c3's ToolResult never lands — repro for DeepSeek 400.
+        conv.add_user_message("second task");
+
+        let (msgs, _stats) = build_messages(&conv, "sys", 8000, "");
+
+        // Walk the result and assert every ATC is followed by exactly
+        // N consecutive tool-role messages — the wire invariant
+        // OpenAI / DeepSeek / Claude / Gemini all require.
+        let mut i = 0;
+        while i < msgs.len() {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msgs[i].content {
+                let n = tool_calls.len();
+                for j in 0..n {
+                    let next_idx = i + 1 + j;
+                    assert!(
+                        next_idx < msgs.len(),
+                        "ATC at {} expects {} tool_results but messages end at {}: {:?}",
+                        i,
+                        n,
+                        msgs.len(),
+                        msgs.iter().map(|m| &m.role).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        matches!(
+                            msgs[next_idx].content,
+                            MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_)
+                        ),
+                        "ATC at {} expects tool_result at {} but found {:?}",
+                        i,
+                        next_idx,
+                        msgs[next_idx].role
+                    );
+                }
+                i += 1 + n;
+            } else {
+                i += 1;
+            }
+        }
+
+        // Defensive: the orphan c3 must NOT appear as a tool_call_id
+        // anywhere in the output (the under-paired ATC was dropped, so
+        // c1 and c2 are gone with it).
+        for m in &msgs {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &m.content {
+                for tc in tool_calls {
+                    assert_ne!(tc.id, "c3", "dropped ATC's call_ids must not survive");
+                    assert_ne!(tc.id, "c1");
+                    assert_ne!(tc.id, "c2");
+                }
+            }
+            if let MessageContent::ToolResult(r) = &m.content {
+                assert_ne!(r.call_id, "c1", "partial tool_results must not survive");
+                assert_ne!(r.call_id, "c2");
+            }
+        }
     }
 
     /// Regression: `microcompact` gate tied to `threshold_chars`.
