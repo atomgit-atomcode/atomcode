@@ -21,6 +21,22 @@ ignore = "0.4"
 arboard = "3"
 png = "0.17"
 base64 = "0.22"
+urlencoding = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# NSPasteboard access for the Ctrl+V → file-URL fallback path. arboard's
+# `get_image()` only returns Some when the system clipboard carries
+# raw image bytes (PNG / TIFF / NSImage), but the iTerm2 image-clipboard
+# workflow and Finder `Cmd+C` on an image file leave only
+# `public.file-url` on the pasteboard — no bytes. Cmd+V handles it
+# through bracketed paste (iTerm2 dumps the temp path as text), but
+# Ctrl+V is intercepted at the key layer before iTerm2's paste handler
+# runs, so we read `public.file-url` directly through AppKit, decode
+# the percent-encoded path with `urlencoding`, and feed it into the
+# same `try_attach_image_from_path` we already use for bracketed paste.
+# Already present transitively via arboard, so no fresh registry fetch.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSPasteboard"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString"] }
 
 [target.'cfg(windows)'.dependencies]
 # Direct Win32 console-mode access for the conhost mouse-capture path.

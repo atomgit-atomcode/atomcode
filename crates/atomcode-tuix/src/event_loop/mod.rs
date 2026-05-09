@@ -66,10 +66,18 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 /// poll uses, so paste-side and poll-side fingerprints line up for the
 /// "is this the same image we already attached?" check.
 fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
+    // Three-tier fallback chain for Ctrl+V → image attach. Each tier
+    // covers a real-world clipboard shape Cmd+V already handled via
+    // bracketed paste; Ctrl+V is intercepted at the key layer before
+    // the terminal's paste pipeline runs, so we have to reproduce
+    // those shapes from the clipboard ourselves.
     let mut clipboard = arboard::Clipboard::new().ok()?;
-    
-    // First try: image bytes directly in clipboard
-    if let Some(img) = clipboard.get_image().ok() {
+
+    // Tier 1: raw bytes (NSPasteboardTypePNG / TIFF / NSImage).
+    //   Sources: Cmd+Shift+Ctrl+4 screenshot, Preview "Copy", browser
+    //   "Copy image", any app's Edit-menu Copy on a bitmap. arboard's
+    //   get_image decodes these into RGBA.
+    if let Ok(img) = clipboard.get_image() {
         let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
         let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
@@ -81,20 +89,58 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
             hash,
         ));
     }
-    
-    // Second try: file:// URL in clipboard text (Finder Cmd+C case)
-    // Re-create clipboard instance as the previous get_image consumed it
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    if let Some(text) = clipboard.get_text().ok() {
-        // Strip file:// prefix if present
-        let path_text = text.trim();
-        let path_text = path_text.strip_prefix("file://").unwrap_or(path_text);
-        // URL-decode the path (macOS puts file URLs in clipboard)
-        let path_text = urlencoding::decode(path_text).ok()?;
-        return try_attach_image_from_path(&path_text);
+
+    // Tier 2: file URL / path arriving via the text type (`public.utf8-
+    // plain-text` on macOS, `text/uri-list` on X11/Wayland through
+    // arboard's text bridge). Some apps mirror their file-URL into
+    // text as a courtesy ("Copy as path" tools, browser drag-source,
+    // certain file managers). Trim, strip `file://`, percent-decode,
+    // hand off to the existing path attachment helper.
+    if let Ok(text) = clipboard.get_text() {
+        let trimmed = text.trim();
+        let stripped = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+        if let Ok(decoded) = urlencoding::decode(stripped) {
+            if let Some(result) = try_attach_image_from_path(&decoded) {
+                return Some(result);
+            }
+        }
     }
-    
+
+    // Tier 3 (macOS only): read NSPasteboard's `public.file-url` type
+    // directly. This is the case Finder `Cmd+C` on an image file
+    // produces — there are NO image bytes and the text type is
+    // typically NOT auto-populated. iTerm2's Cmd+V handles this by
+    // querying the file-URL type and writing the temp path to the
+    // PTY; we read the same type via AppKit so Ctrl+V matches.
+    #[cfg(target_os = "macos")]
+    if let Some(path) = read_macos_clipboard_file_url() {
+        if let Some(result) = try_attach_image_from_path(&path) {
+            return Some(result);
+        }
+    }
+
     None
+}
+
+/// Read NSPasteboard's `public.file-url` type and return the decoded
+/// filesystem path. Returns `None` when the type isn't on the
+/// pasteboard, the value isn't a `file://` URL, or percent-decoding
+/// fails — caller should fall through, not abort.
+///
+/// Why AppKit instead of arboard: arboard 3.x doesn't expose any
+/// pasteboard type beyond `image` and `text`. Finder `Cmd+C` writes
+/// to `public.file-url` exclusively, so we have to query that type
+/// directly. The `objc2-app-kit` / `objc2-foundation` deps are
+/// already in the tree transitively (arboard pulls them on macOS),
+/// so this is cheap to add — just wires up a binding we own.
+#[cfg(target_os = "macos")]
+fn read_macos_clipboard_file_url() -> Option<String> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
+    let pb = NSPasteboard::generalPasteboard();
+    let raw = unsafe { pb.stringForType(NSPasteboardTypeFileURL) }?.to_string();
+    let stripped = raw.strip_prefix("file://").unwrap_or(&raw);
+    let decoded = urlencoding::decode(stripped).ok()?;
+    Some(decoded.into_owned())
 }
 
 /// Map an `ImagePart::media_type` to a cache filename extension.
