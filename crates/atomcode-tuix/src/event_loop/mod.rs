@@ -2745,13 +2745,19 @@ fn handle_idle_key(
             (KeyCode::Enter | KeyCode::Tab, m)
                 if !m.contains(crossterm::event::KeyModifiers::SHIFT) =>
             {
-                // Tab and Enter both confirm the highlighted entry —
-                // Tab matches the muscle memory of pickers in fzf /
-                // shell completion / IDE menus where Tab loads the
-                // candidate. Shift+Enter (hard newline) is excluded
-                // by the modifier guard; crossterm reports Shift+Tab
-                // as `KeyCode::BackTab` so it doesn't match this arm
-                // either.
+                // Tab and Enter both pick the highlighted entry, but
+                // they diverge on no-arg top-level commands:
+                //   * Enter   → execute immediately (legacy behavior).
+                //   * Tab     → complete only — rewrite the buffer to
+                //               `/name ` and park the cursor, mirroring
+                //               shell tab-completion. The user reviews
+                //               the line and presses Enter to fire.
+                // For @-mentions, `needs_args` commands, and the
+                // `/skills` palette, both keys behave identically
+                // because those branches were already complete-only.
+                // Shift+Enter (hard newline) is excluded by the
+                // modifier guard; crossterm reports Shift+Tab as
+                // `KeyCode::BackTab` so it doesn't match this arm.
                 //
                 // `@`-mention selection: insert `@<full_path> ` at the
                 // token range, with trailing space as terminator.
@@ -2862,8 +2868,21 @@ fn handle_idle_key(
                     return Ok(());
                 }
 
-                // Top-level no-arg command (e.g. /quit, /help): execute
-                // immediately, as before.
+                // Top-level no-arg command (e.g. /quit, /help).
+                // Tab → complete-only: insert `/name ` and park the
+                // cursor so the user can review/edit before pressing
+                // Enter to fire. The trailing space causes
+                // build_menu_items to hide the menu on the next redraw
+                // (parse_slash_line treats `/name ` as a fully-named
+                // command with empty arg).
+                if code == KeyCode::Tab {
+                    app.buf.text = format!("/{} ", name);
+                    app.buf.cursor = app.buf.text.len();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
+
+                // Enter: execute immediately, as before.
                 let committed = format!("/{}", name);
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
