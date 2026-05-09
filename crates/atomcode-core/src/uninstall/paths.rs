@@ -1,6 +1,12 @@
 //! Install-location detection mirroring scripts/install.sh and install.ps1.
 
-use std::path::{Path, PathBuf};
+// `Path` only appears in `unix_rc_paths_for_home`, which is gated to
+// `cfg(unix)` for the production path and `cfg(all(not(unix), test))`
+// for the cross-platform test stub. A Windows non-test build sees
+// neither, so the import would be flagged unused.
+use std::path::PathBuf;
+#[cfg(any(unix, test))]
+use std::path::Path;
 
 /// Return `~/.atomcode/` (or override via `ATOMCODE_HOME_OVERRIDE` env var,
 /// used by tests).
