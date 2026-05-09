@@ -389,11 +389,9 @@ pub fn run(
         });
     }
 
-    // Step 2: claim. Single call — the v2 backend doesn't differentiate
-    // tiers at the claim layer, so there's nothing useful to derive
-    // from the response itself. Real tier comes from /status-v2 next.
-    let claim_initial = step_claim();
-    if claim_initial.is_err() {
+    // Step 2: claim — cascade Max → Pro → Lite, first success wins.
+    let claim = step_claim();
+    if claim.is_err() {
         // Claim failed — adding providers / fetching status both make
         // no sense without an active plan. Bail with cascade markers
         // (rendered as no-op in format() so the report stays focused
@@ -401,60 +399,48 @@ pub fn run(
         // claim failed" lines).
         return Ok(SetupReport {
             login,
-            claim: claim_initial,
+            claim,
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         });
     }
 
-    // Step 3: status — moved BEFORE models because we need its
-    // `plan_type` to query `models-v2?plan_type=<tier>`. Status was
-    // warn-only in the v1 flow; here it becomes load-bearing for the
-    // model-list query. If status fails or returns no plan_type, we
-    // fall back to `Max` — the broadest view, so users see the
-    // maximum set of models with `plan_available` correctly gated by
-    // the backend (it computes the gate from the user's actual tier
-    // regardless of what we asked for).
-    let status = step_status();
-    let actual_tier = match &status {
-        StepResult::Ok(s) => s
-            .plan_type
-            .or_else(|| s.codingplan_free.as_ref().and_then(|p| p.plan_type))
-            .unwrap_or(PlanType::Max),
+    // Decide the plan_type to send to /models-v2. Three sources:
+    //   * Fresh `Ok` claim: use the tier the cascade landed on.
+    //   * `Skipped` (server returned `duplicate=true` at one of the
+    //     tiers): step_claim picked the tier it stopped at; we don't
+    //     have the structured value here, so fall back to Max — the
+    //     server will gate availability the same way regardless. Pro
+    //     and Lite users will see Pro/Max-tier models marked
+    //     `plan_available=false` and rendered with strikethrough,
+    //     which matches the spec ("show locked models too").
+    //   * (Err is unreachable here — handled above.)
+    let plan_type_for_models = match &claim {
+        StepResult::Ok(info) => info.plan_type,
         _ => PlanType::Max,
     };
 
-    // Bake the discovered tier into ClaimInfo so the rendered claim
-    // row shows `(Lite)` even though the cascade-style request body
-    // sent `Max`. Source of truth: status. Falls back gracefully
-    // when status came back as Skipped/Err.
-    let claim = match claim_initial {
-        StepResult::Ok(mut info) => {
-            info.plan_type = actual_tier;
-            StepResult::Ok(info)
-        }
-        other => other,
-    };
-
-    // Step 4: models — critical. Without models there's nothing to
-    // set up. Pass the tier we just learned from status.
-    let models = step_models_and_register(config, actual_tier);
+    // Step 3: models — critical. Without models there's nothing to set up.
+    let models = step_models_and_register(config, plan_type_for_models);
     if models.is_err() {
         if let Some(t) = tel {
             t.track(atomcode_telemetry::Event::TakeCodingplan {
                 type_: atomcode_telemetry::CodingplanResult::Fail,
             });
         }
-        // Models failed; status already ran and may carry useful info
-        // (e.g. quota exhausted), so keep the status result rather
-        // than masking it.
+        // Same cascade pattern: the models-failure line above is the
+        // explanation; "Status fetch failed — skipped: models step
+        // failed" adds nothing.
         return Ok(SetupReport {
             login,
             claim,
             models,
-            status,
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         });
     }
+
+    // Step 4: status — warn-only.
+    let status = step_status();
 
     // All critical steps (login + models) succeeded. Emit success event.
     if let Some(t) = tel {
@@ -509,57 +495,78 @@ fn step_login(tel: Option<&Arc<atomcode_telemetry::Telemetry>>) -> StepResult<Lo
     }
 }
 
-/// Single `claim-v2` call. The pre-prod backend returns an identical
-/// `{success:true, duplicate:false, message:"领取成功"}` for ANY of
-/// `Max` / `Pro` / `Lite` request bodies — it does not distinguish
-/// "you got Max" from "you got the lower-tier you actually qualify
-/// for". The actual entitlement is server-determined and surfaces
-/// only via `/status-v2`. So this step doesn't try to derive a tier
-/// from the claim response — that's `step_status`'s job, and the
-/// orchestrator runs it before `step_models` so the model list query
-/// gets the right `?plan_type=`.
+/// Walk `PlanType::CASCADE_ORDER` (Max → Pro → Lite), POSTing
+/// `claim-v2` for each tier, and stop at the first that lands the
+/// user with an entitlement. Two outcomes count as "stop":
 ///
-/// We send `Max` as a placeholder request body because (a) the server
-/// ignores it, (b) it's the most permissive intent if the contract
-/// later starts honouring the request shape.
+///   * `success=true`              — fresh claim of this tier.
+///   * `duplicate=true`            — user already holds this tier (or
+///                                   higher). Treat as success and use
+///                                   this tier as the working tier;
+///                                   trying lower tiers wouldn't help.
+///
+/// `success=false && duplicate=false` for a 2xx response is a per-tier
+/// "you can't have this" signal (e.g. quota exhausted at the Max tier
+/// but Pro/Lite slots still open). Try the next tier with the message
+/// preserved as the "last error" we'll show if everything below also
+/// fails.
+///
+/// Transport / 5xx errors abort the whole cascade — those mean the
+/// server is in a bad state, not "this tier is unavailable", so
+/// retrying lower tiers would just stack identical failures.
 fn step_claim() -> StepResult<ClaimInfo> {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
         Err(e) => return StepResult::Err(format!("build client: {:#}", e)),
     };
-    match client.claim_v2(PlanType::Max) {
-        Ok(resp) => {
-            if resp.duplicate {
-                return StepResult::Skipped(if resp.message.is_empty() {
-                    "already claimed (or under review)".into()
-                } else {
-                    resp.message
-                });
-            }
-            if resp.success {
-                return StepResult::Ok(ClaimInfo {
-                    message: if resp.message.is_empty() {
-                        "claimed".into()
+    let mut last_msg = String::new();
+    for &tier in PlanType::CASCADE_ORDER {
+        match client.claim_v2(tier) {
+            Ok(resp) => {
+                if resp.duplicate {
+                    // Already holds this (or a higher) tier.
+                    return StepResult::Skipped(if resp.message.is_empty() {
+                        format!(
+                            "already claimed (or under review) — using {}",
+                            tier.as_str()
+                        )
                     } else {
-                        resp.message
-                    },
-                    duplicate: false,
-                    // Placeholder — the orchestrator overwrites this with
-                    // the value from `step_status` before the report
-                    // renders. If status fails we leave it as Max (the
-                    // broadest view); the report itself still surfaces
-                    // the actual `plan_name` from the status block.
-                    plan_type: PlanType::Max,
-                });
+                        format!("{} ({})", resp.message, tier.as_str())
+                    });
+                }
+                if resp.success {
+                    return StepResult::Ok(ClaimInfo {
+                        message: if resp.message.is_empty() {
+                            format!("claimed {}", tier.as_str())
+                        } else {
+                            resp.message
+                        },
+                        duplicate: false,
+                        plan_type: tier,
+                    });
+                }
+                // 2xx + success=false + duplicate=false: per-tier
+                // refusal (quota / not eligible). Remember the
+                // message and keep walking; if every tier refuses
+                // we surface this last reason.
+                last_msg = if resp.message.is_empty() {
+                    format!("{} claim refused", tier.as_str())
+                } else {
+                    format!("{}: {}", tier.as_str(), resp.message)
+                };
             }
-            StepResult::Err(if resp.message.is_empty() {
-                "claim failed without explanation".into()
-            } else {
-                resp.message
-            })
+            Err(e) => {
+                // Transport / 5xx / parse failure — bail. These don't
+                // get more useful when retried at a lower tier.
+                return StepResult::Err(format!("claim {} request: {:#}", tier.as_str(), e));
+            }
         }
-        Err(e) => StepResult::Err(format!("claim request: {:#}", e)),
     }
+    StepResult::Err(if last_msg.is_empty() {
+        "claim failed at every tier (Max/Pro/Lite)".into()
+    } else {
+        format!("claim failed at every tier — {}", last_msg)
+    })
 }
 
 fn step_models_and_register(
@@ -930,7 +937,6 @@ mod tests {
             status: StepResult::Ok(crate::coding_plan::types::StatusResponse {
                 codingplan_free: Some(crate::coding_plan::types::PlanInfo {
                     plan_name: "CodingPlan Free".into(),
-                    plan_type: Some(PlanType::Lite),
                     status: 1,
                     claimed_at: "2026-04-22".into(),
                     expires_at: "2026-05-22".into(),
@@ -953,7 +959,6 @@ mod tests {
                 audit_status: 1,
                 expires_at: Some("2026-05-22".into()),
                 window_quota_exhausted: false,
-                plan_type: Some(PlanType::Lite),
                 window_quota_hint: None,
             }),
         };
@@ -1022,7 +1027,6 @@ mod tests {
             status: StepResult::Ok(crate::coding_plan::types::StatusResponse {
                 codingplan_free: Some(crate::coding_plan::types::PlanInfo {
                     plan_name: "CodingPlan Free".into(),
-                    plan_type: None,
                     status: 0,
                     claimed_at: String::new(),
                     expires_at: String::new(),
@@ -1035,7 +1039,6 @@ mod tests {
                 expires_at: None,
                 window_quota_exhausted: false,
                 window_quota_hint: None,
-                plan_type: None,
             }),
         };
         let out = report.render();
