@@ -46,7 +46,7 @@ pub fn spawn_check(slot: Arc<Mutex<Option<UsageInfo>>>, wake_tx: mpsc::Sender<()
         let fetched: Result<UsageInfo, ()> = tokio::task::spawn_blocking(|| {
             let client = atomcode_core::coding_plan::client::Client::from_stored_auth()
                 .map_err(|_| ())?;
-            let resp = client.status().map_err(|_| ())?;
+            let resp = client.status_v2().map_err(|_| ())?;
             resp.current_usage.ok_or(())
         })
         .await

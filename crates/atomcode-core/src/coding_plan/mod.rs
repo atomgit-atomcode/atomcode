@@ -20,4 +20,4 @@ pub mod types;
 pub use client::{Client, API_BASE};
 pub use setup::{run, SetupReport, StepResult};
 pub use sync_marker::{read_last_sync, write_last_sync_now};
-pub use types::{ClaimResponse, ModelEntry, PlanInfo, StatusResponse, UsageInfo};
+pub use types::{ClaimResponse, ModelEntry, PlanInfo, PlanType, StatusResponse, UsageInfo};

@@ -33,7 +33,7 @@ use anyhow::Result;
 use std::sync::Arc;
 
 use super::client::Client;
-use super::types::StatusResponse;
+use super::types::{ModelEntry, PlanType, StatusResponse};
 use crate::auth;
 use crate::config::provider::ProviderConfig;
 use crate::config::Config;
@@ -124,16 +124,20 @@ impl SetupReport {
             }
         }
 
-        // Step 2: claim
+        // Step 2: claim. Show the tier the cascade landed on so users
+        // can see whether Max / Pro / Lite was actually granted (the
+        // cascade walks highest-first; landing on Pro means Max
+        // refused).
         match &self.claim {
             StepResult::Ok(info) => {
                 out.push_str(&format!(
-                    "  ✔ CodingPlan claimed — {}\n",
+                    "  ✔ CodingPlan claimed — {} ({})\n",
                     if info.message.is_empty() {
-                        "success"
+                        "success".to_string()
                     } else {
-                        &info.message
+                        info.message.clone()
                     },
+                    info.plan_type.as_str(),
                 ));
             }
             StepResult::Skipped(reason) if reason == CASCADE_FROM_UPSTREAM_FAIL => {
@@ -162,6 +166,12 @@ impl SetupReport {
                         "s"
                     },
                 ));
+                // Build a quick lookup of which display names made it
+                // into the registered provider list — anything in
+                // `all_models` but NOT in this set is locked behind
+                // the user's plan tier and renders with strikethrough.
+                let registered: std::collections::HashSet<&str> =
+                    info.display_names.iter().map(|s| s.as_str()).collect();
                 for (pname, model) in info.provider_names.iter().zip(info.display_names.iter()) {
                     let suffix = if pname == &info.default_provider {
                         "  (default)"
@@ -169,6 +179,29 @@ impl SetupReport {
                         ""
                     };
                     out.push_str(&format!("      • {}  →  {}{}\n", pname, model, suffix));
+                }
+                // Locked models — surface so users can see what a plan
+                // upgrade would unlock. ANSI SGR 9 for strikethrough
+                // (\x1b[9m...\x1b[29m); terminals that don't honour it
+                // still get the text + the explicit "(locked)" suffix
+                // so the meaning never relies on the SGR alone.
+                let locked: Vec<&ModelEntry> = info
+                    .all_models
+                    .iter()
+                    .filter(|m| !m.plan_available && !registered.contains(m.display_model_name.as_str()))
+                    .collect();
+                if !locked.is_empty() {
+                    out.push_str(&format!(
+                        "  ◯ {} locked model{} (require plan upgrade):\n",
+                        locked.len(),
+                        if locked.len() == 1 { "" } else { "s" },
+                    ));
+                    for m in &locked {
+                        out.push_str(&format!(
+                            "      ✗ \x1b[9m{}\x1b[29m  (locked)\n",
+                            m.display_model_name,
+                        ));
+                    }
                 }
                 // Vision-preprocessor outcome line.
                 match &info.vision_preprocessor {
@@ -297,19 +330,32 @@ pub struct ClaimInfo {
     /// true when server reported `duplicate=true` — surfaces in the
     /// rendered report as "(already claimed)" rather than "(just claimed)".
     pub duplicate: bool,
+    /// The CodingPlan tier the cascade landed on. `Max` if the
+    /// highest-tier claim succeeded, `Pro` / `Lite` for fallbacks.
+    /// Threaded into `step_models_and_register` as the `?plan_type=`
+    /// argument so the model list comes back with availability gated
+    /// to the user's actual entitlement.
+    pub plan_type: PlanType,
 }
 
 #[derive(Debug, Clone)]
 pub struct ModelsInfo {
-    /// Model names in server order (first is default).
+    /// Model names of the **available** subset, in server order.
+    /// Parallel to `provider_names` — these are the entries that
+    /// actually got registered as providers.
     pub display_names: Vec<String>,
-    /// Provider keys actually inserted into Config.
+    /// Provider keys actually inserted into Config (available only).
     pub provider_names: Vec<String>,
     /// Which of `provider_names` was set as `default_provider`.
     pub default_provider: String,
     /// Outcome of vision_preprocessor_provider auto-config. Drives the
     /// "Vision preprocessor → ..." line in the rendered report.
     pub vision_preprocessor: VisionPreprocessorOutcome,
+    /// Full v2 model list — including `plan_available=false` entries
+    /// that we didn't register as providers. Renderer iterates this
+    /// to show locked models with strikethrough so users see what
+    /// upgrading the plan would unlock.
+    pub all_models: Vec<ModelEntry>,
 }
 
 /// Entry point. Mutates `config` in place (providers + default_provider);
@@ -343,7 +389,7 @@ pub fn run(
         });
     }
 
-    // Step 2: claim
+    // Step 2: claim — cascade Max → Pro → Lite, first success wins.
     let claim = step_claim();
     if claim.is_err() {
         // Claim failed — adding providers / fetching status both make
@@ -359,8 +405,23 @@ pub fn run(
         });
     }
 
+    // Decide the plan_type to send to /models-v2. Three sources:
+    //   * Fresh `Ok` claim: use the tier the cascade landed on.
+    //   * `Skipped` (server returned `duplicate=true` at one of the
+    //     tiers): step_claim picked the tier it stopped at; we don't
+    //     have the structured value here, so fall back to Max — the
+    //     server will gate availability the same way regardless. Pro
+    //     and Lite users will see Pro/Max-tier models marked
+    //     `plan_available=false` and rendered with strikethrough,
+    //     which matches the spec ("show locked models too").
+    //   * (Err is unreachable here — handled above.)
+    let plan_type_for_models = match &claim {
+        StepResult::Ok(info) => info.plan_type,
+        _ => PlanType::Max,
+    };
+
     // Step 3: models — critical. Without models there's nothing to set up.
-    let models = step_models_and_register(config);
+    let models = step_models_and_register(config, plan_type_for_models);
     if models.is_err() {
         if let Some(t) = tel {
             t.track(atomcode_telemetry::Event::TakeCodingplan {
@@ -434,52 +495,110 @@ fn step_login(tel: Option<&Arc<atomcode_telemetry::Telemetry>>) -> StepResult<Lo
     }
 }
 
+/// Walk `PlanType::CASCADE_ORDER` (Max → Pro → Lite), POSTing
+/// `claim-v2` for each tier, and stop at the first that lands the
+/// user with an entitlement. Two outcomes count as "stop":
+///
+///   * `success=true`              — fresh claim of this tier.
+///   * `duplicate=true`            — user already holds this tier (or
+///                                   higher). Treat as success and use
+///                                   this tier as the working tier;
+///                                   trying lower tiers wouldn't help.
+///
+/// `success=false && duplicate=false` for a 2xx response is a per-tier
+/// "you can't have this" signal (e.g. quota exhausted at the Max tier
+/// but Pro/Lite slots still open). Try the next tier with the message
+/// preserved as the "last error" we'll show if everything below also
+/// fails.
+///
+/// Transport / 5xx errors abort the whole cascade — those mean the
+/// server is in a bad state, not "this tier is unavailable", so
+/// retrying lower tiers would just stack identical failures.
 fn step_claim() -> StepResult<ClaimInfo> {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
         Err(e) => return StepResult::Err(format!("build client: {:#}", e)),
     };
-    match client.claim() {
-        Ok(resp) => {
-            if resp.duplicate {
-                // Already claimed / in review — idempotent skip.
-                StepResult::Skipped(if resp.message.is_empty() {
-                    "already claimed (or under review)".into()
+    let mut last_msg = String::new();
+    for &tier in PlanType::CASCADE_ORDER {
+        match client.claim_v2(tier) {
+            Ok(resp) => {
+                if resp.duplicate {
+                    // Already holds this (or a higher) tier.
+                    return StepResult::Skipped(if resp.message.is_empty() {
+                        format!(
+                            "already claimed (or under review) — using {}",
+                            tier.as_str()
+                        )
+                    } else {
+                        format!("{} ({})", resp.message, tier.as_str())
+                    });
+                }
+                if resp.success {
+                    return StepResult::Ok(ClaimInfo {
+                        message: if resp.message.is_empty() {
+                            format!("claimed {}", tier.as_str())
+                        } else {
+                            resp.message
+                        },
+                        duplicate: false,
+                        plan_type: tier,
+                    });
+                }
+                // 2xx + success=false + duplicate=false: per-tier
+                // refusal (quota / not eligible). Remember the
+                // message and keep walking; if every tier refuses
+                // we surface this last reason.
+                last_msg = if resp.message.is_empty() {
+                    format!("{} claim refused", tier.as_str())
                 } else {
-                    resp.message
-                })
-            } else if resp.success {
-                StepResult::Ok(ClaimInfo {
-                    message: resp.message,
-                    duplicate: false,
-                })
-            } else {
-                // success=false + duplicate=false — something else went wrong
-                // (e.g. 全平台日限额已满 per the API docs).
-                StepResult::Err(if resp.message.is_empty() {
-                    "claim failed without explanation".into()
-                } else {
-                    resp.message
-                })
+                    format!("{}: {}", tier.as_str(), resp.message)
+                };
+            }
+            Err(e) => {
+                // Transport / 5xx / parse failure — bail. These don't
+                // get more useful when retried at a lower tier.
+                return StepResult::Err(format!("claim {} request: {:#}", tier.as_str(), e));
             }
         }
-        Err(e) => StepResult::Err(format!("claim request: {:#}", e)),
     }
+    StepResult::Err(if last_msg.is_empty() {
+        "claim failed at every tier (Max/Pro/Lite)".into()
+    } else {
+        format!("claim failed at every tier — {}", last_msg)
+    })
 }
 
-fn step_models_and_register(config: &mut Config) -> StepResult<ModelsInfo> {
+fn step_models_and_register(
+    config: &mut Config,
+    plan_type: PlanType,
+) -> StepResult<ModelsInfo> {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
         Err(e) => return StepResult::Err(format!("build client: {:#}", e)),
     };
-    let models = match client.list_models() {
+    let all_models = match client.list_models_v2(plan_type) {
         Ok(v) => v,
-        Err(e) => return StepResult::Err(format!("list models: {:#}", e)),
+        Err(e) => return StepResult::Err(format!("list models-v2: {:#}", e)),
     };
-    if models.is_empty() {
+    if all_models.is_empty() {
         return StepResult::Err(
             "server returned an empty model list — cannot set up any provider".into(),
         );
+    }
+
+    // Available subset — only these become providers. Locked ones
+    // (`plan_available=false`) survive in `all_models` for the
+    // strikethrough-display path; registering them as providers would
+    // give the user something they can `/model` into that 403s on the
+    // first request.
+    let available: Vec<&ModelEntry> = all_models.iter().filter(|m| m.plan_available).collect();
+    if available.is_empty() {
+        return StepResult::Err(format!(
+            "no models available on plan {} — server returned {} locked entries",
+            plan_type.as_str(),
+            all_models.len()
+        ));
     }
 
     // Wipe any stale AtomGit* entries so we don't accumulate old names.
@@ -493,7 +612,7 @@ fn step_models_and_register(config: &mut Config) -> StepResult<ModelsInfo> {
         config.providers.remove(&k);
     }
 
-    let names: Vec<String> = models
+    let names: Vec<String> = available
         .iter()
         .map(|m| m.display_model_name.clone())
         .collect();
@@ -503,7 +622,7 @@ fn step_models_and_register(config: &mut Config) -> StepResult<ModelsInfo> {
         .cloned()
         .unwrap_or_else(|| PROVIDER_PREFIX.to_string());
 
-    for (pname, m) in provider_names.iter().zip(models.iter()) {
+    for (pname, m) in provider_names.iter().zip(available.iter()) {
         let pc = build_codingplan_provider(&m.display_model_name);
         config.providers.insert(pname.clone(), pc);
     }
@@ -552,6 +671,7 @@ fn step_models_and_register(config: &mut Config) -> StepResult<ModelsInfo> {
         provider_names,
         default_provider,
         vision_preprocessor,
+        all_models,
     })
 }
 
@@ -560,9 +680,9 @@ fn step_status() -> StepResult<StatusResponse> {
         Ok(c) => c,
         Err(e) => return StepResult::Err(format!("build client: {:#}", e)),
     };
-    match client.status() {
+    match client.status_v2() {
         Ok(s) => StepResult::Ok(s),
-        Err(e) => StepResult::Err(format!("status: {:#}", e)),
+        Err(e) => StepResult::Err(format!("status-v2: {:#}", e)),
     }
 }
 
@@ -805,12 +925,14 @@ mod tests {
             claim: StepResult::Ok(ClaimInfo {
                 message: "领取成功".into(),
                 duplicate: false,
+                plan_type: PlanType::Max,
             }),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["moonshotai/Kimi-K2-Instruct".into()],
                 provider_names: vec!["AtomGit".into()],
                 default_provider: "AtomGit".into(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![],
             }),
             status: StepResult::Ok(crate::coding_plan::types::StatusResponse {
                 codingplan_free: Some(crate::coding_plan::types::PlanInfo {
@@ -864,6 +986,7 @@ mod tests {
                 provider_names: vec!["AtomGit".into()],
                 default_provider: "AtomGit".into(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![],
             }),
             status: StepResult::Err("request timeout".into()),
         };
@@ -892,12 +1015,14 @@ mod tests {
             claim: StepResult::Ok(ClaimInfo {
                 message: "claimed".into(),
                 duplicate: false,
+                plan_type: PlanType::Max,
             }),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
                 provider_names: vec!["AtomGit".into()],
                 default_provider: "AtomGit".into(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![],
             }),
             status: StepResult::Ok(crate::coding_plan::types::StatusResponse {
                 codingplan_free: Some(crate::coding_plan::types::PlanInfo {
@@ -968,6 +1093,7 @@ mod tests {
             claim: StepResult::Ok(ClaimInfo {
                 message: String::new(),
                 duplicate: false,
+                plan_type: PlanType::Max,
             }),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec![
@@ -982,6 +1108,7 @@ mod tests {
                 ],
                 default_provider: "AtomGit-moonshotai-Kimi-K2-Instruct".into(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![],
             }),
             status: StepResult::Err("status endpoint 500".into()),
         };
@@ -1050,12 +1177,14 @@ mod tests {
             claim: StepResult::Ok(ClaimInfo {
                 message: "ok".into(),
                 duplicate: false,
+                plan_type: PlanType::Max,
             }),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
                 provider_names: vec!["AtomGit".into()],
                 default_provider: "AtomGit".into(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![],
             }),
             status: StepResult::Err(huge),
         };
@@ -1104,9 +1233,14 @@ mod tests {
     fn vl_model_entry(model: &str) -> super::super::types::ModelEntry {
         super::super::types::ModelEntry {
             id: 1,
-            is_infinity: 0,
             is_atomcode_exclusive: 0,
             display_model_name: model.to_string(),
+            // Tests in this section drive `run_register` directly with
+            // a curated `Vec<ModelEntry>` — they're testing the
+            // post-availability-filter logic, so every entry counts as
+            // "available". The split-by-`plan_available` happens
+            // upstream in the real `step_models_and_register`.
+            plan_available: true,
         }
     }
 
@@ -1174,6 +1308,10 @@ mod tests {
             provider_names,
             default_provider,
             vision_preprocessor,
+            // Test helper doesn't exercise the locked-model rendering
+            // path; mirror the input slice into all_models so the
+            // shape stays consistent if any future assertion peeks.
+            all_models: models,
         }
     }
 
@@ -1269,7 +1407,7 @@ mod tests {
     fn render_includes_vision_preprocessor_auto_set_line() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false }),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec![
                     "Kimi-K2-Instruct".into(),
@@ -1283,6 +1421,7 @@ mod tests {
                 vision_preprocessor: VisionPreprocessorOutcome::AutoSet(
                     "AtomGit-Qwen-Qwen3-VL-32B-Instruct".into(),
                 ),
+                all_models: vec![],
             }),
             status: StepResult::Skipped("status check skipped for this test".into()),
         };
@@ -1298,12 +1437,13 @@ mod tests {
     fn render_includes_vision_preprocessor_cleared_line_when_stale_dropped() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false }),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["Kimi-K2-Instruct".into()],
                 provider_names: vec!["AtomGit-Kimi-K2-Instruct".into()],
                 default_provider: "AtomGit-Kimi-K2-Instruct".into(),
                 vision_preprocessor: VisionPreprocessorOutcome::Cleared,
+                all_models: vec![],
             }),
             status: StepResult::Skipped("test skip".into()),
         };
@@ -1315,7 +1455,7 @@ mod tests {
     fn render_includes_vision_preprocessor_user_supplied_line() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false }),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec![
                     "Kimi-K2-Instruct".into(),
@@ -1329,6 +1469,7 @@ mod tests {
                 vision_preprocessor: VisionPreprocessorOutcome::UserSupplied(
                     "Qwen3-VL-32B-Instruct".into(),
                 ),
+                all_models: vec![],
             }),
             status: StepResult::Skipped("test skip".into()),
         };
@@ -1341,16 +1482,78 @@ mod tests {
     fn render_omits_vision_preprocessor_line_when_unchanged_none() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false }),
+            claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["Kimi-K2-Instruct".into()],
                 provider_names: vec!["AtomGit-Kimi-K2-Instruct".into()],
                 default_provider: "AtomGit-Kimi-K2-Instruct".into(),
                 vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![],
             }),
             status: StepResult::Skipped("test skip".into()),
         };
         let out = report.render();
         assert!(!out.contains("Vision preprocessor"));
+    }
+
+    /// Locked models (plan_available=false on a higher tier) must
+    /// surface in the rendered report with strikethrough + the
+    /// explicit "(locked)" tag, AND must NOT be listed under the
+    /// "Added N provider(s)" section. Pins the v2 spec's "若不可用
+    /// 的模型也展示出来（用横线划掉）" requirement.
+    #[test]
+    fn render_shows_locked_models_with_strikethrough() {
+        let avail = super::super::types::ModelEntry {
+            id: 1,
+            is_atomcode_exclusive: 0,
+            display_model_name: "lite/foo".into(),
+            plan_available: true,
+        };
+        let locked = super::super::types::ModelEntry {
+            id: 2,
+            is_atomcode_exclusive: 0,
+            display_model_name: "max/super-secret".into(),
+            plan_available: false,
+        };
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Ok(ClaimInfo {
+                message: "claimed".into(),
+                duplicate: false,
+                plan_type: PlanType::Lite,
+            }),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec!["lite/foo".into()],
+                provider_names: vec!["AtomGit".into()],
+                default_provider: "AtomGit".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![avail, locked],
+            }),
+            status: StepResult::Skipped("test skip".into()),
+        };
+        let out = report.render();
+        // Plan tier appears next to claim line.
+        assert!(out.contains("(Lite)"), "claim row must show tier:\n{out}");
+        // Available model: standard provider line.
+        assert!(out.contains("AtomGit") && out.contains("lite/foo"));
+        // Locked model: strikethrough SGR + explicit suffix. Both
+        // must be present so terminals that ignore SGR 9 still see
+        // "(locked)".
+        assert!(
+            out.contains("\x1b[9mmax/super-secret\x1b[29m"),
+            "locked model must have SGR 9 strikethrough wrap:\n{out}"
+        );
+        assert!(out.contains("(locked)"));
+        // Locked count line.
+        assert!(out.contains("1 locked model"));
+        // Available models list must NOT mention the locked one.
+        let added_section = out
+            .split("locked model")
+            .next()
+            .unwrap_or("");
+        assert!(
+            !added_section.contains("max/super-secret"),
+            "locked model must not appear in the Added providers list:\n{added_section}"
+        );
     }
 }

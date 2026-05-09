@@ -1558,7 +1558,7 @@ fn render_codingplan_status_for_status_cmd() -> String {
             return "  CodingPlan: (not signed in — run /codingplan to set up)\n".into();
         }
     };
-    let status = match client.status() {
+    let status = match client.status_v2() {
         Ok(s) => s,
         Err(e) => {
             return format!("  CodingPlan: (status fetch failed — {:#})\n", e);
