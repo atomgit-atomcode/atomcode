@@ -102,52 +102,78 @@ pub async fn maybe_preprocess(
         },
     }];
 
-    let timeout = std::time::Duration::from_secs(30);
-    let call = async {
-        let mut stream = vl_provider.chat_stream(&messages, None)?;
-        let mut buf = String::new();
-        while let Some(event) = stream.next().await {
-            match event? {
-                crate::stream::StreamEvent::Delta(s) => buf.push_str(&s),
-                crate::stream::StreamEvent::Reasoning(_) => {}
-                crate::stream::StreamEvent::Done { .. } => break,
-                crate::stream::StreamEvent::Error(e) => anyhow::bail!("{e}"),
-                // VL is a one-shot OCR call — Warnings (e.g., proxy truncation
-                // heuristics) and Usage stats are not actionable for the user
-                // here; tool-call variants don't apply because we pass `None`
-                // for tools. Drop them.
-                crate::stream::StreamEvent::Warning(_)
-                | crate::stream::StreamEvent::Usage(_)
-                | crate::stream::StreamEvent::ToolCallStart { .. }
-                | crate::stream::StreamEvent::ToolCallDelta(_)
-                | crate::stream::StreamEvent::ToolCallDone(_) => {}
-            }
+    // Idle (no-progress) timeout, NOT wall-clock. A VL call can take any
+    // total duration as long as the stream keeps producing chunks — we only
+    // abort when no event has arrived for `IDLE_TIMEOUT`. The previous 30s
+    // wall-clock killed perfectly healthy slow gateways: a Qwen3-VL cold
+    // start can spend 10-15s on TTFT, then another 10-20s OCR-ing a dense
+    // screenshot, easily clearing 30s end-to-end while streaming the whole
+    // way through. Idle-timeout still catches genuinely stuck sockets
+    // (gateway accepted the request, holds the connection, never produces
+    // tokens) — that's the failure mode worth aborting on.
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let mut stream = match vl_provider.chat_stream(&messages, None) {
+        Ok(s) => s,
+        Err(e) => {
+            return PreprocessOutcome::Failed {
+                reason: format!("provider '{vl_key}' stream init failed: {e:#}"),
+            };
         }
-        Ok::<_, anyhow::Error>(buf)
     };
 
-    match tokio::time::timeout(timeout, call).await {
-        Err(_) => PreprocessOutcome::Failed {
-            reason: format!(
-                "provider '{vl_key}' timed out after {}s",
-                timeout.as_secs(),
-            ),
-        },
-        Ok(Err(e)) => PreprocessOutcome::Failed {
-            reason: format!("provider '{vl_key}' call error: {e:#}"),
-        },
-        Ok(Ok(text)) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                PreprocessOutcome::Failed {
-                    reason: format!("provider '{vl_key}' returned empty response"),
-                }
-            } else {
-                PreprocessOutcome::Replaced {
-                    text: trimmed.to_string(),
-                    vl_key: vl_key.to_string(),
-                }
+    let mut buf = String::new();
+    loop {
+        let next = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+            Ok(n) => n,
+            Err(_) => {
+                return PreprocessOutcome::Failed {
+                    reason: format!(
+                        "provider '{vl_key}' no progress for {}s",
+                        IDLE_TIMEOUT.as_secs(),
+                    ),
+                };
             }
+        };
+        let event = match next {
+            None => break,
+            Some(Ok(ev)) => ev,
+            Some(Err(e)) => {
+                return PreprocessOutcome::Failed {
+                    reason: format!("provider '{vl_key}' call error: {e:#}"),
+                };
+            }
+        };
+        match event {
+            crate::stream::StreamEvent::Delta(s) => buf.push_str(&s),
+            crate::stream::StreamEvent::Reasoning(_) => {}
+            crate::stream::StreamEvent::Done { .. } => break,
+            crate::stream::StreamEvent::Error(e) => {
+                return PreprocessOutcome::Failed {
+                    reason: format!("provider '{vl_key}' call error: {e}"),
+                };
+            }
+            // VL is a one-shot OCR call — Warnings (e.g., proxy truncation
+            // heuristics) and Usage stats are not actionable for the user
+            // here; tool-call variants don't apply because we pass `None`
+            // for tools. Drop them.
+            crate::stream::StreamEvent::Warning(_)
+            | crate::stream::StreamEvent::Usage(_)
+            | crate::stream::StreamEvent::ToolCallStart { .. }
+            | crate::stream::StreamEvent::ToolCallDelta(_)
+            | crate::stream::StreamEvent::ToolCallDone(_) => {}
+        }
+    }
+
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        PreprocessOutcome::Failed {
+            reason: format!("provider '{vl_key}' returned empty response"),
+        }
+    } else {
+        PreprocessOutcome::Replaced {
+            text: trimmed.to_string(),
+            vl_key: vl_key.to_string(),
         }
     }
 }
