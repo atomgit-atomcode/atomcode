@@ -688,7 +688,7 @@ impl Buffer {
     pub(crate) fn apply(
         &mut self,
         action: Action,
-        history: &[String],
+        history: &[crate::input::history::HistoryEntry],
         commands: &CommandRegistry,
     ) -> BufferResult {
         match action {
@@ -817,7 +817,7 @@ impl Buffer {
                 };
                 self.history_idx = new_idx;
                 if let Some(i) = new_idx {
-                    self.text = history[i].clone();
+                    self.text = history[i].text.clone();
                     // Park cursor at column 0 — recalled history is for
                     // re-running, not editing in place. A `/session foo`
                     // pulled from history would otherwise leave the
@@ -836,7 +836,7 @@ impl Buffer {
                         // Still inside history — same cursor-at-0 rule
                         // as HistoryPrev.
                         self.history_idx = Some(i + 1);
-                        self.text = history[i + 1].clone();
+                        self.text = history[i + 1].text.clone();
                         self.cursor = 0;
                     } else {
                         // Past the newest entry — restore the user's
@@ -946,7 +946,7 @@ mod buffer_tests {
         // give users a `\<Enter>` continuation escape. The `\` itself
         // must not survive into the buffer.
         let reg = CommandRegistry::builtin();
-        let history: Vec<String> = Vec::new();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
         let mut b = Buffer::new();
         b.text = "hello\\".to_string();
         b.cursor = b.text.len();
@@ -959,7 +959,7 @@ mod buffer_tests {
     #[test]
     fn submit_with_backslash_mid_buffer_inserts_newline_at_cursor() {
         let reg = CommandRegistry::builtin();
-        let history: Vec<String> = Vec::new();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
         let mut b = Buffer::new();
         b.text = "abc\\def".to_string();
         b.cursor = 4; // right after the backslash
@@ -972,7 +972,7 @@ mod buffer_tests {
     #[test]
     fn submit_without_trailing_backslash_commits_normally() {
         let reg = CommandRegistry::builtin();
-        let history: Vec<String> = Vec::new();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
         let mut b = Buffer::new();
         b.text = "ship it".to_string();
         b.cursor = b.text.len();
@@ -988,7 +988,7 @@ mod buffer_tests {
         // Backslash exists in the buffer but cursor isn't right after
         // it — Enter should still submit, not insert a newline.
         let reg = CommandRegistry::builtin();
-        let history: Vec<String> = Vec::new();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
         let mut b = Buffer::new();
         b.text = "abc\\def".to_string();
         b.cursor = b.text.len(); // at end, byte before is 'f'
@@ -1208,7 +1208,7 @@ mod menu_tests {
     fn history_prev_parks_cursor_at_zero_and_marks_history_mode() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec!["/session foo".to_string()];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
 
@@ -1221,7 +1221,7 @@ mod menu_tests {
     fn history_next_back_to_stash_restores_cursor_to_end() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec!["/session foo".to_string()];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
 
         // Type a partial draft, then scroll into history and back out.
         let _ = buf.apply(Action::Insert('h'), &history, &reg);
@@ -1243,7 +1243,7 @@ mod menu_tests {
         // re-appear naturally once the user starts editing the recall.
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec!["/session foo".to_string()];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
         assert!(buf.is_in_history());
