@@ -4,6 +4,37 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+/// One row in the input history file. Replaces the prior plain `String`
+/// representation so we can carry image attachments alongside the text.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    pub text: String,
+    /// Image attachments associated with this submission. Skipped on
+    /// serialization when empty so plain text-only history rows stay
+    /// compact (`{"text":"hi"}` rather than `{"text":"hi","images":[]}`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<HistoryImageRef>,
+}
+
+/// Reference to a single image cached on disk under
+/// `~/.atomcode/image-cache/<hash>.<ext>`. Recorded on submit; consumed
+/// on up-arrow recall to rehydrate `pending_images`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryImageRef {
+    /// u64 content hash, lowercase hex, 16 chars. Same value that's
+    /// pushed into `UiState::pending_image_hashes` at paste time.
+    /// Stored as a string for direct serde without a custom hex codec.
+    pub hash: String,
+    /// MIME type. Drives the cache filename extension via
+    /// `ext_for_mt()`.
+    pub mt: String,
+    /// The `[Image #N]` marker the entry was originally submitted with.
+    /// On hydrate the marker is renumbered to a fresh
+    /// `session_image_count` value to avoid collisions; this field is
+    /// the lookup key for `line.replace("[Image #<n>]", ...)`.
+    pub n: usize,
+}
+
 pub const HISTORY_MAX: usize = 1000;
 
 pub struct History {
@@ -160,5 +191,32 @@ mod tests {
         h.push("  ".into());
         h.push("real".into());
         assert_eq!(h.entries(), &vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn history_entry_serde_roundtrip_with_images() {
+        let e = HistoryEntry {
+            text: "look [Image #2]".to_string(),
+            images: vec![HistoryImageRef {
+                hash: "deadbeef12345678".to_string(),
+                mt: "image/png".to_string(),
+                n: 2,
+            }],
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        let back: HistoryEntry = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.text, e.text);
+        assert_eq!(back.images.len(), 1);
+        assert_eq!(back.images[0].hash, "deadbeef12345678");
+        assert_eq!(back.images[0].mt, "image/png");
+        assert_eq!(back.images[0].n, 2);
+    }
+
+    #[test]
+    fn history_entry_text_only_serializes_without_images_field() {
+        let e = HistoryEntry { text: "hi".to_string(), images: vec![] };
+        let j = serde_json::to_string(&e).unwrap();
+        assert!(!j.contains("images"), "empty images vec must be skipped: {}", j);
+        assert_eq!(j, r#"{"text":"hi"}"#);
     }
 }
