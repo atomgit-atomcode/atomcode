@@ -1498,14 +1498,92 @@ mod menu_tests {
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
         super::sync_recalled_attachments(&mut state, &buf, &history);
         assert_eq!(state.pending_recalled_attachments.len(), 1);
-        // ↑ again → idx=0, no images.
+        // ↑ again → idx=0 (no images) → wholesale replace empties the vec.
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
         super::sync_recalled_attachments(&mut state, &buf, &history);
         assert!(state.pending_recalled_attachments.is_empty());
-        // Type a char → history_idx clears → recalled clears too.
+        // Type a char on an empty-images entry → history_idx clears
+        // but the retain pass keeps the (already empty) vec empty.
         let _ = buf.apply(Action::Insert('a'), &history, &reg);
         super::sync_recalled_attachments(&mut state, &buf, &history);
         assert!(state.pending_recalled_attachments.is_empty());
+    }
+
+    /// Regression: arrow-up recalls `[Image #1]这是什么？`, user appends
+    /// ` 现在不清楚为啥...`, submits — the trailing edit must NOT drop
+    /// the recalled image. Pre-fix, `Insert` cleared `history_idx` and
+    /// the wholesale `clear()` wiped `pending_recalled_attachments`,
+    /// so the marker text reached the model as literal `[Image #1]`
+    /// without bytes. Post-fix, the retain pass keeps refs whose
+    /// marker is still in `buf.text`.
+    #[test]
+    fn sync_recalled_attachments_retains_on_edit_when_marker_present() {
+        use crate::input::history::{HistoryEntry, HistoryImageRef};
+        let history: Vec<HistoryEntry> = vec![HistoryEntry {
+            text: "[Image #1]hello".into(),
+            images: vec![HistoryImageRef {
+                hash: "deadbeef12345678".into(),
+                mt: "image/png".into(),
+                n: 1,
+            }],
+        }];
+        let reg = CommandRegistry::builtin();
+        let mut buf = Buffer::new();
+        let mut state = UiState::new();
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert_eq!(state.pending_recalled_attachments.len(), 1);
+        // Append a char — history_idx clears, but `[Image #1]` is still
+        // in buf, so the recalled ref must survive.
+        let _ = buf.apply(Action::Insert('!'), &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert_eq!(
+            state.pending_recalled_attachments.len(),
+            1,
+            "edit that leaves marker intact must preserve recalled ref"
+        );
+    }
+
+    /// Companion to the retain-on-edit test: when the user backspaces
+    /// over the `[Image #N]` marker itself, the recalled ref tied to
+    /// that marker should drop — otherwise `hydrate_recalled_attachments`
+    /// would inject orphan bytes the user explicitly removed.
+    #[test]
+    fn sync_recalled_attachments_drops_when_marker_removed() {
+        use crate::input::history::{HistoryEntry, HistoryImageRef};
+        let history: Vec<HistoryEntry> = vec![HistoryEntry {
+            text: "[Image #1]hi".into(),
+            images: vec![HistoryImageRef {
+                hash: "deadbeef12345678".into(),
+                mt: "image/png".into(),
+                n: 1,
+            }],
+        }];
+        let reg = CommandRegistry::builtin();
+        let mut buf = Buffer::new();
+        let mut state = UiState::new();
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert_eq!(state.pending_recalled_attachments.len(), 1);
+        // Replace the buffer text so the marker is gone — simulates the
+        // user backspacing over `[Image #1]`. We use a direct edit
+        // through Action::Insert + delete is overkill; mutating the
+        // buf's text via a fresh Buffer simulates the same end state.
+        // Drop history_idx by inserting a char then verify retain
+        // strips the ref since the marker is no longer present.
+        // We force buf.text to a no-marker string by replaying from
+        // empty + Insert sequence:
+        let mut buf2 = Buffer::new();
+        let _ = buf2.apply(Action::Insert('h'), &history, &reg);
+        let _ = buf2.apply(Action::Insert('i'), &history, &reg);
+        // pending_recalled_attachments still has the entry from earlier
+        // (state isn't reset between buffer swaps in the real loop —
+        // sync runs on each apply).
+        super::sync_recalled_attachments(&mut state, &buf2, &history);
+        assert!(
+            state.pending_recalled_attachments.is_empty(),
+            "removed marker must drop the matching recalled ref"
+        );
     }
 
     #[test]
@@ -3955,7 +4033,13 @@ fn redraw_with_menu(
 /// history entry the buffer is currently showing. Called after every
 /// `buf.apply()` so:
 ///   - HistoryPrev/Next sets the recalled attachments to the new entry
-///   - Insert/Delete (which clear `history_idx` to None) clear them
+///   - Insert/Delete (which clear `history_idx` to None) only drop the
+///     refs whose `[Image #N]` marker is no longer in `buf.text`. A
+///     user who arrow-up'd a `[Image #1]这是什么？` entry and then
+///     appended `还有一个问题` should keep the image attached on
+///     submit — the marker is still there, so `hydrate_recalled_attachments`
+///     can still match it. Wiping wholesale (the prior behaviour) sent
+///     the literal `[Image #1]` as text and silently dropped the bytes.
 pub(crate) fn sync_recalled_attachments(
     state: &mut UiState,
     buf: &Buffer,
@@ -3966,7 +4050,9 @@ pub(crate) fn sync_recalled_attachments(
             state.pending_recalled_attachments = history[i].images.clone();
         }
         _ => {
-            state.pending_recalled_attachments.clear();
+            state
+                .pending_recalled_attachments
+                .retain(|r| buf.text.contains(&format!("[Image #{}]", r.n)));
         }
     }
 }
