@@ -120,6 +120,31 @@ atomcode
         <p>不确定要问什么?试试:"<em>修复 README 里所有的拼写错误</em>"、"<em>把 src/utils.ts 里的函数加上 TypeScript 类型</em>"、"<em>跑一下测试并修复失败用例</em>"。</p>
       </div>
 
+      <h2>卸载</h2>
+      <p>不再需要 AtomCode 时,用内置的 <code>uninstall</code> 子命令一步清理。它会按组询问你是否删除以下三类内容:二进制本身 + 安装脚本写入的 <code>PATH</code> 编辑、<code>~/.atomcode/auth.toml</code> 等凭据、<code>~/.atomcode/sessions/</code> 等运行状态。</p>
+
+      <h3>交互式(推荐)</h3>
+      <pre><code>atomcode uninstall</code></pre>
+      <p>每个组单独询问 y/N,按当前默认决策(二进制=是、凭据=否、状态=是)预填 — 直接回车也是合理选择。</p>
+
+      <h3>非交互式</h3>
+      <pre><code># 全自动:按默认决策走,不弹任何提示
+atomcode uninstall --yes
+
+# 一键全清(包括 ~/.atomcode/ 整个目录)
+atomcode uninstall --purge
+
+# 只删二进制和 PATH 编辑,~/.atomcode/ 完整保留
+atomcode uninstall --keep-data
+
+# 只打印执行计划,什么都不做
+atomcode uninstall --dry-run</code></pre>
+
+      <div class="callout callout-warn">
+        <strong>注意</strong>
+        <p><code>--purge</code> 会连带删除<strong>所有会话历史、记忆、自定义 provider 配置、OAuth token</strong>;不可逆。如果以后还可能用 AtomCode,优先用默认交互式或 <code>--keep-data</code>。</p>
+      </div>
+
       <h2>下一步</h2>
       <ul>
         <li><a href="./configuration.html">配置文件</a> —— 学会管理多个 provider 和模型。</li>
