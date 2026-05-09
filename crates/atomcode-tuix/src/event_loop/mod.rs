@@ -75,6 +75,266 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     ))
 }
 
+/// Upper bound on a single attached image (20 MB raw bytes). OpenAI's
+/// chat/completions cap is 20 MB per image; Anthropic's is 5 MB. We pick
+/// the looser of the two as the tool-side gate so the attempt at least
+/// reaches the API — the server's 413 with a clearer reason is a better
+/// signal than a silent local rejection.
+const MAX_PATH_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Try to interpret a paste payload as a filesystem path to an image
+/// file and load it as an [`ImagePart`]. Returns `Some` only when the
+/// payload looks unambiguously like an image-attachment intent, never
+/// for plain prose that happens to mention a file name.
+///
+/// The two real-world flows this covers:
+///
+/// 1. **iTerm2 Cmd+V on image clipboard** — iTerm2 saves the clipboard
+///    image to a temp file under `/var/folders/.../T/com.googlecode.iterm2/`
+///    and pastes the **file path** as plaintext through the PTY. The
+///    image bytes never travel through `InputEvent::Paste`'s text payload
+///    or through the system clipboard's "text" slot, so the existing
+///    `try_paste_clipboard_image()` empty-text fallback wouldn't fire.
+///    Recognising the path is the only way to attach the image. This is
+///    the workflow Claude Code / Aider / cursor-cli all support.
+/// 2. **Finder drag-and-drop into the terminal** — terminal types the
+///    file's absolute path as plaintext, optionally quoted (paths with
+///    spaces wrap in `'...'`) or shell-escaped (`\ ` for spaces).
+///
+/// Acceptance criteria — all must hold:
+/// * Single-line content (no `\n`).
+/// * After trimming + stripping balanced outer quotes + unescaping
+///   `\<space>`, the remainder is an absolute path.
+/// * Extension is one of png/jpg/jpeg/gif/webp (case-insensitive).
+/// * The path resolves to an existing regular file.
+/// * File size ≤ `MAX_PATH_IMAGE_BYTES`.
+///
+/// Returns `None` for anything that fails any of these — including
+/// legitimate text pastes, relative paths (a literal `notes.png` typed
+/// at the prompt is ambiguous: text or attachment?), missing files, and
+/// oversized files.
+///
+/// The fingerprint is hashed off the raw file bytes via the same
+/// [`rgba_fingerprint`] helper. Identical paste of the same path
+/// produces the same hash so the dedup check in `pending_image_hashes`
+/// works; collisions with a clipboard-paste of the same image (which
+/// hashes RGBA, not file bytes) are out of scope — the hash is a
+/// per-source dedup signal, not a global content identity.
+fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    // Strip a single layer of matched outer quotes. Finder drag of paths
+    // containing spaces wraps in `'...'`; some shells produce `"..."`.
+    let unquoted: &str = if trimmed.len() >= 2
+        && ((trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    // Unescape shell-escaped spaces (iTerm2 / drag-and-drop emit
+    // `/path/with\ space.png`). Backslash before any other char is left
+    // alone — no other shell-escape forms occur in real-world drag
+    // pastes.
+    let unescaped = unquoted.replace("\\ ", " ");
+    let candidate = unescaped.trim();
+    let path = std::path::Path::new(candidate);
+    if !path.is_absolute() {
+        return None;
+    }
+    let media_type = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => return None,
+    };
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_PATH_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let hash = rgba_fingerprint(0, 0, &bytes);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some((
+        ImagePart {
+            media_type: media_type.into(),
+            data: b64,
+        },
+        hash,
+    ))
+}
+
+#[cfg(test)]
+mod image_path_tests {
+    use super::*;
+    use std::io::Write as _;
+    use tempfile::tempdir;
+
+    /// Materialise a small file at `<dir>/<name>` whose contents are
+    /// `bytes`. Returned absolute path is what the user-facing paste
+    /// detector sees on iTerm2 Cmd+V or Finder drag.
+    fn write_tmp_file(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        let mut f = std::fs::File::create(&p).expect("create tmp file");
+        f.write_all(bytes).expect("write tmp file");
+        p
+    }
+
+    /// PNG path → ImagePart with `image/png` media type. The single
+    /// happy-path covering iTerm2's Cmd+V-of-image temp-file shape.
+    #[test]
+    fn png_path_attaches_as_image_png() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "snap.png", b"\x89PNG\r\n\x1a\nstub-bytes");
+        let res = try_attach_image_from_path(p.to_str().unwrap());
+        let (img, _) = res.expect("PNG path must be recognised");
+        assert_eq!(img.media_type, "image/png");
+        assert!(!img.data.is_empty(), "base64 data must be populated");
+    }
+
+    /// JPG and JPEG both map to `image/jpeg` (case-insensitive ext).
+    #[test]
+    fn jpg_and_jpeg_map_to_image_jpeg() {
+        let dir = tempdir().unwrap();
+        for name in ["a.jpg", "b.JPEG", "c.Jpg"] {
+            let p = write_tmp_file(&dir, name, b"\xff\xd8\xff\xe0\x00\x10JFIF stub");
+            let (img, _) = try_attach_image_from_path(p.to_str().unwrap())
+                .unwrap_or_else(|| panic!("expected attachment for {name}"));
+            assert_eq!(
+                img.media_type, "image/jpeg",
+                "{name} must map to image/jpeg"
+            );
+        }
+    }
+
+    /// Quoted absolute path (Finder drag of paths-with-spaces) is
+    /// recognised after a single layer of outer quotes is stripped.
+    /// Both ASCII single and double quotes are accepted.
+    #[test]
+    fn quoted_absolute_path_is_recognised() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "shot with space.png", b"stub");
+        let path_str = p.to_str().unwrap();
+        let single_quoted = format!("'{}'", path_str);
+        let double_quoted = format!("\"{}\"", path_str);
+        assert!(try_attach_image_from_path(&single_quoted).is_some());
+        assert!(try_attach_image_from_path(&double_quoted).is_some());
+    }
+
+    /// Shell-escaped spaces (`\ `) are unescaped before fs lookup —
+    /// matches the form some terminals emit on drag-and-drop.
+    #[test]
+    fn shell_escaped_space_is_unescaped() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "shot with space.png", b"stub");
+        let abs = p.to_str().unwrap();
+        // Replace each space in the absolute path with `\<space>` to
+        // simulate the drag-paste form.
+        let escaped = abs.replace(' ', "\\ ");
+        assert!(
+            try_attach_image_from_path(&escaped).is_some(),
+            "shell-escaped path must be unescaped before fs lookup"
+        );
+    }
+
+    /// Trailing whitespace (iTerm2 often appends a space after the
+    /// path) must not defeat detection.
+    #[test]
+    fn trailing_whitespace_is_trimmed() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "snap.png", b"stub");
+        let with_trailing_ws = format!("{}   \t  ", p.to_str().unwrap());
+        assert!(try_attach_image_from_path(&with_trailing_ws).is_some());
+    }
+
+    /// Same path pasted twice → same fingerprint, so the dedup check in
+    /// `pending_image_hashes` works.
+    #[test]
+    fn same_path_yields_same_fingerprint() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "snap.png", b"stub-bytes");
+        let path_str = p.to_str().unwrap();
+        let (_, h1) = try_attach_image_from_path(path_str).unwrap();
+        let (_, h2) = try_attach_image_from_path(path_str).unwrap();
+        assert_eq!(h1, h2, "deterministic hash for the same file");
+    }
+
+    /// Plain prose containing words must NOT be treated as a path.
+    #[test]
+    fn prose_paste_is_not_an_image() {
+        assert!(try_attach_image_from_path("hello world").is_none());
+        assert!(try_attach_image_from_path("see /tmp/notes for context").is_none());
+        assert!(try_attach_image_from_path("").is_none());
+        assert!(try_attach_image_from_path("   ").is_none());
+    }
+
+    /// Multi-line paste (real text content) is rejected — the path
+    /// detector is a single-line gate.
+    #[test]
+    fn multi_line_paste_is_not_an_image() {
+        let two_lines = "/tmp/snap.png\nsecond line";
+        assert!(try_attach_image_from_path(two_lines).is_none());
+    }
+
+    /// Relative paths are ambiguous (could be intentional text). Must
+    /// not be auto-attached — only absolute paths flip the switch.
+    #[test]
+    fn relative_path_is_not_attached() {
+        assert!(try_attach_image_from_path("snap.png").is_none());
+        assert!(try_attach_image_from_path("./snap.png").is_none());
+        assert!(try_attach_image_from_path("../snap.png").is_none());
+    }
+
+    /// Non-image extensions are rejected even when the file exists.
+    /// Defends against the user pasting an absolute path to a `.txt` /
+    /// `.json` / etc. — that's clearly text-attachment intent, not
+    /// image-attachment intent.
+    #[test]
+    fn non_image_extension_is_rejected() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "notes.txt", b"hello");
+        assert!(try_attach_image_from_path(p.to_str().unwrap()).is_none());
+        let p2 = write_tmp_file(&dir, "data.json", b"{}");
+        assert!(try_attach_image_from_path(p2.to_str().unwrap()).is_none());
+    }
+
+    /// Absolute path with image extension but no file on disk — the
+    /// paste was just a literal-looking path string that happens to
+    /// match the shape. Reject so we don't silently swallow the text.
+    #[test]
+    fn missing_file_is_rejected() {
+        // Nonexistent path under a real tempdir prefix — guaranteed
+        // unique and unwriteable in normal test layout.
+        assert!(
+            try_attach_image_from_path("/this/path/definitely/does/not/exist/snap.png").is_none()
+        );
+    }
+
+    /// Files larger than `MAX_PATH_IMAGE_BYTES` are rejected. The cap
+    /// is the looser of OpenAI / Anthropic's per-image limits — beyond
+    /// it, server-side rejection is certain and round-tripping the
+    /// payload wastes bandwidth.
+    #[test]
+    fn oversized_file_is_rejected() {
+        let dir = tempdir().unwrap();
+        let huge = vec![0u8; (MAX_PATH_IMAGE_BYTES + 1) as usize];
+        let p = write_tmp_file(&dir, "huge.png", &huge);
+        assert!(
+            try_attach_image_from_path(p.to_str().unwrap()).is_none(),
+            "files over MAX_PATH_IMAGE_BYTES must be rejected before read"
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct McpReloadProgress {
     pub total: usize,
@@ -2291,59 +2551,74 @@ fn handle_input(
             // No modal: paste goes into the type-ahead buffer just like
             // keyboard input (Idle or Streaming, both consume it).
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
-                // When the pasted text is empty (clipboard holds an image,
-                // not text), try to grab the image via arboard. This is the
-                // primary path on terminals with bracketed paste enabled —
-                // Ctrl+V never arrives as a key event there.
-                if text.trim().is_empty() {
-                    if let Some((img, hash)) = try_paste_clipboard_image() {
-                        if !ctx.config.can_handle_attached_images() {
-                            renderer.render(UiLine::Error(format!(
-                                "Current model \"{}\" does not support image input and no \
-                                 vision_preprocessor_provider is configured. Use /model to \
-                                 switch to a vision-capable model, or set \
-                                 vision_preprocessor_provider in config.",
-                                ctx.model_name
-                            )));
-                            renderer.flush();
-                            if matches!(app.state.phase, UiPhase::Idle) {
-                                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-                            }
-                            return Ok(());
-                        }
-                        // Insert `[Image #N]` directly into the input buffer
-                        // at cursor — same UX as bracketed-paste folding for
-                        // long text. The marker stays inline through submit
-                        // so the scrollback echo shows where in the message
-                        // each image was attached. Image bytes ride alongside
-                        // in `pending_images`, drained at submit.
-                        // N comes from `session_image_count` (monotonic
-                        // across turns), NOT `pending_images.len()+1` —
-                        // otherwise turn 1's first paste and turn 2's first
-                        // paste would both render as `[Image #1]` in
-                        // scrollback, ambiguous when scrolling back.
-                        app.state.session_image_count += 1;
-                        let n = app.state.session_image_count;
-                        app.state.pending_images.push(img);
-                        app.state.pending_image_hashes.push(hash);
-                        app.state.pending_image_markers.push(n);
-                        let marker = format!("[Image #{}]", n);
-                        app.buf.text.insert_str(app.buf.cursor, &marker);
-                        app.buf.cursor += marker.len();
-                        if matches!(app.state.phase, UiPhase::Streaming) {
-                            draw_spinner_now(
-                                &mut app.state,
-                                &app.buf,
-                                ctx,
-                                renderer,
-                                app.message_queue.len(),
-                                app.menu.selected,
-                            );
-                        } else {
+                // Image-paste detection — two parallel providers, mutually
+                // exclusive on `text` shape:
+                //   * `text` empty → terminal sent bracketed paste with
+                //     no payload because the system clipboard holds image
+                //     bytes, not text. Pull via `arboard`. Terminals with
+                //     bracketed paste enabled go through here on Cmd+V.
+                //   * `text` non-empty + parses as an image filesystem
+                //     path → iTerm2 Cmd+V on image clipboard (saves to a
+                //     temp file under
+                //     `/var/folders/.../T/com.googlecode.iterm2/` and
+                //     pastes the path instead of bytes), Finder
+                //     drag-and-drop, kitty/wezterm drag-and-drop. Without
+                //     this branch the user just sees the literal path
+                //     string land in their input buffer — Cmd+V on iTerm2
+                //     felt broken vs. Claude Code / Aider, which all do
+                //     this same path-recognition.
+                let image_paste: Option<(ImagePart, u64)> = if text.trim().is_empty() {
+                    try_paste_clipboard_image()
+                } else {
+                    try_attach_image_from_path(&text)
+                };
+                if let Some((img, hash)) = image_paste {
+                    if !ctx.config.can_handle_attached_images() {
+                        renderer.render(UiLine::Error(format!(
+                            "Current model \"{}\" does not support image input and no \
+                             vision_preprocessor_provider is configured. Use /model to \
+                             switch to a vision-capable model, or set \
+                             vision_preprocessor_provider in config.",
+                            ctx.model_name
+                        )));
+                        renderer.flush();
+                        if matches!(app.state.phase, UiPhase::Idle) {
                             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                         }
                         return Ok(());
                     }
+                    // Insert `[Image #N]` directly into the input buffer
+                    // at cursor — same UX as bracketed-paste folding for
+                    // long text. The marker stays inline through submit
+                    // so the scrollback echo shows where in the message
+                    // each image was attached. Image bytes ride alongside
+                    // in `pending_images`, drained at submit.
+                    // N comes from `session_image_count` (monotonic
+                    // across turns), NOT `pending_images.len()+1` —
+                    // otherwise turn 1's first paste and turn 2's first
+                    // paste would both render as `[Image #1]` in
+                    // scrollback, ambiguous when scrolling back.
+                    app.state.session_image_count += 1;
+                    let n = app.state.session_image_count;
+                    app.state.pending_images.push(img);
+                    app.state.pending_image_hashes.push(hash);
+                    app.state.pending_image_markers.push(n);
+                    let marker = format!("[Image #{}]", n);
+                    app.buf.text.insert_str(app.buf.cursor, &marker);
+                    app.buf.cursor += marker.len();
+                    if matches!(app.state.phase, UiPhase::Streaming) {
+                        draw_spinner_now(
+                            &mut app.state,
+                            &app.buf,
+                            ctx,
+                            renderer,
+                            app.message_queue.len(),
+                            app.menu.selected,
+                        );
+                    } else {
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    }
+                    return Ok(());
                 }
                 app.buf.insert_paste(text);
                 if matches!(app.state.phase, UiPhase::Streaming) {
