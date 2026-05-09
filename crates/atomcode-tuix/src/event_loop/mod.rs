@@ -3449,7 +3449,6 @@ fn handle_idle_key(
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
             } else {
-                ctx.history.push(line.clone());
                 // Cache the full expanded form before dispatch. If the
                 // user hits Ctrl+C / Esc mid-stream, `handle_streaming_key`
                 // takes this Option and restores it to `app.buf.text`
@@ -3462,21 +3461,36 @@ fn handle_idle_key(
                 // shows what was actually sent.
                 let pending = std::mem::take(&mut app.state.pending_images);
                 let pending_markers = std::mem::take(&mut app.state.pending_image_markers);
-                app.state.pending_image_hashes.clear();
+                let pending_hashes = std::mem::take(&mut app.state.pending_image_hashes);
                 let mut images: Vec<ImagePart> = Vec::with_capacity(pending.len());
                 let mut kept_markers: Vec<usize> = Vec::with_capacity(pending.len());
+                let mut kept_refs: Vec<crate::input::history::HistoryImageRef> =
+                    Vec::with_capacity(pending.len());
                 // Use the marker `n` recorded at paste time, NOT the index.
                 // Once `session_image_count` became monotonic, paste-time
                 // markers diverge from positional indices — using the index
                 // would silently drop every image after the first turn that
                 // had a paste.
-                for (img, n) in pending.into_iter().zip(pending_markers.into_iter()) {
+                for ((img, n), hash) in pending
+                    .into_iter()
+                    .zip(pending_markers.into_iter())
+                    .zip(pending_hashes.into_iter())
+                {
                     if line.contains(&format!("[Image #{}]", n)) {
                         renderer.render(UiLine::ImageAttachment(n));
+                        kept_refs.push(crate::input::history::HistoryImageRef {
+                            hash: format!("{:016x}", hash),
+                            mt: img.media_type.clone(),
+                            n,
+                        });
                         images.push(img);
                         kept_markers.push(n);
                     }
                 }
+                ctx.history.push(crate::input::history::HistoryEntry {
+                    text: line.clone(),
+                    images: kept_refs,
+                });
                 ctx.agent
                     .cmd_tx
                     .send(AgentCommand::SendMessage {
@@ -3846,7 +3860,10 @@ fn handle_streaming_key(
             // Expand any paste placeholders — agent sees full payload,
             // scrollback echo stays compact.
             let expanded = app.buf.expand_pastes(&line);
-            ctx.history.push(line.clone());
+            ctx.history.push(crate::input::history::HistoryEntry {
+                text: line.clone(),
+                images: vec![], // populated by Task 13 (queue carries images)
+            });
             app.message_queue.push_back(expanded);
             crate::tuix_trace!("QUE", "push_back len={}", app.message_queue.len());
             app.buf.text.clear();
