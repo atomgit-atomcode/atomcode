@@ -2701,6 +2701,79 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
     ctx.usage_last_check_at = None;
 }
 
+/// Common attach-orchestration shared by every "I just got an image
+/// from somewhere" entry point: bracketed-paste with empty payload
+/// (clipboard image), bracketed-paste with file-path payload (iTerm2
+/// Cmd+V on image / Finder drag-and-drop), and the explicit Ctrl+V
+/// keystroke that pulls the clipboard image without going through any
+/// paste event at all (the iTerm2 default-Cmd+V case where iTerm2
+/// sends nothing through the PTY for image-only clipboards).
+///
+/// `img_hash` is the result of whichever provider the caller used —
+/// `None` means no image was found and the caller should fall through
+/// to its own non-image handling. When `Some`, this function takes
+/// over: capability-checks the active model, emits a `[Image #N]`
+/// marker into the input buffer, pushes the image bytes to
+/// `pending_images` (drained at submit), writes the bytes to the
+/// shared image cache so /resume can rehydrate, and triggers a
+/// redraw appropriate to the current phase.
+///
+/// Returns:
+///   - `Ok(true)`  — image was attached OR rejected with an error
+///                    message; caller must `return Ok(())`.
+///   - `Ok(false)` — no image to attach (`img_hash == None`); caller
+///                    continues with its non-image flow.
+fn attach_image_to_input(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    img_hash: Option<(ImagePart, u64)>,
+) -> Result<bool> {
+    let Some((img, hash)) = img_hash else {
+        return Ok(false);
+    };
+    if !ctx.config.can_handle_attached_images() {
+        renderer.render(UiLine::Error(format!(
+            "Current model \"{}\" does not support image input and no \
+             vision_preprocessor_provider is configured. Use /model to \
+             switch to a vision-capable model, or set \
+             vision_preprocessor_provider in config.",
+            ctx.model_name
+        )));
+        renderer.flush();
+        if matches!(app.state.phase, UiPhase::Idle) {
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        return Ok(true);
+    }
+    // N comes from `session_image_count` (monotonic across turns), NOT
+    // `pending_images.len()+1` — otherwise turn 1's first paste and
+    // turn 2's first paste would both render as `[Image #1]` in
+    // scrollback, ambiguous when scrolling back.
+    app.state.session_image_count += 1;
+    let n = app.state.session_image_count;
+    app.state.pending_images.push(img.clone());
+    app.state.pending_image_hashes.push(hash);
+    app.state.pending_image_markers.push(n);
+    cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
+    let marker = format!("[Image #{}]", n);
+    app.buf.text.insert_str(app.buf.cursor, &marker);
+    app.buf.cursor += marker.len();
+    if matches!(app.state.phase, UiPhase::Streaming) {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+    } else {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    }
+    Ok(true)
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -2829,53 +2902,7 @@ fn handle_input(
                 } else {
                     try_attach_image_from_path(&text)
                 };
-                if let Some((img, hash)) = image_paste {
-                    if !ctx.config.can_handle_attached_images() {
-                        renderer.render(UiLine::Error(format!(
-                            "Current model \"{}\" does not support image input and no \
-                             vision_preprocessor_provider is configured. Use /model to \
-                             switch to a vision-capable model, or set \
-                             vision_preprocessor_provider in config.",
-                            ctx.model_name
-                        )));
-                        renderer.flush();
-                        if matches!(app.state.phase, UiPhase::Idle) {
-                            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-                        }
-                        return Ok(());
-                    }
-                    // Insert `[Image #N]` directly into the input buffer
-                    // at cursor — same UX as bracketed-paste folding for
-                    // long text. The marker stays inline through submit
-                    // so the scrollback echo shows where in the message
-                    // each image was attached. Image bytes ride alongside
-                    // in `pending_images`, drained at submit.
-                    // N comes from `session_image_count` (monotonic
-                    // across turns), NOT `pending_images.len()+1` —
-                    // otherwise turn 1's first paste and turn 2's first
-                    // paste would both render as `[Image #1]` in
-                    // scrollback, ambiguous when scrolling back.
-                    app.state.session_image_count += 1;
-                    let n = app.state.session_image_count;
-                    app.state.pending_images.push(img.clone());
-                    app.state.pending_image_hashes.push(hash);
-                    app.state.pending_image_markers.push(n);
-                    cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
-                    let marker = format!("[Image #{}]", n);
-                    app.buf.text.insert_str(app.buf.cursor, &marker);
-                    app.buf.cursor += marker.len();
-                    if matches!(app.state.phase, UiPhase::Streaming) {
-                        draw_spinner_now(
-                            &mut app.state,
-                            &app.buf,
-                            ctx,
-                            renderer,
-                            app.message_queue.len(),
-                            app.menu.selected,
-                        );
-                    } else {
-                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-                    }
+                if attach_image_to_input(app, ctx, renderer, image_paste)? {
                     return Ok(());
                 }
                 app.buf.insert_paste(text);
@@ -3000,6 +3027,48 @@ fn handle_input(
             // before — those rely on the host terminal's native
             // scrollback). We intercept BEFORE phase dispatch so
             // scrolling works in Idle / Streaming alike.
+
+            // Ctrl+V: pull the system clipboard image and attach as
+            // `[Image #N]` — independent of whether the host terminal
+            // forwarded a Paste event for the keystroke. The status
+            // line hint "Image in clipboard · ctrl+v to paste"
+            // already promises this chord, but iTerm2's default Cmd+V
+            // on an image-only clipboard sends NOTHING through the
+            // PTY (no plaintext to paste, so iTerm2's Paste action
+            // becomes a no-op), which made Cmd+V feel broken vs.
+            // Claude Code on the same setup. Catching the literal
+            // Ctrl+V (\x16, KeyCode::Char('v') + CONTROL) here closes
+            // the gap on every terminal in one place — no per-host
+            // OSC negotiation needed.
+            //
+            // For users who want Cmd+V muscle memory: remap iTerm2's
+            // Cmd+V to "Send: 0x16" in Preferences → Profiles → Keys
+            // → Key Mappings, then Cmd+V → Ctrl+V → this handler.
+            //
+            // Gated to Idle / Streaming. Approval and Suspended don't
+            // accept input; modals (handled above) get first refusal.
+            // Shift / Alt with Ctrl+V are excluded so reserved chords
+            // (e.g. terminal-emulator-defined Ctrl+Shift+V "Paste as
+            // Plain Text") still pass through to whatever else might
+            // bind them in the future.
+            if matches!(
+                app.state.phase,
+                UiPhase::Idle | UiPhase::Streaming
+            ) && code == crossterm::event::KeyCode::Char('v')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
+            {
+                let img_hash = try_paste_clipboard_image();
+                if attach_image_to_input(app, ctx, renderer, img_hash)? {
+                    return Ok(());
+                }
+                // No image on the clipboard — Ctrl+V has no other
+                // binding (key_action::classify maps it to NoOp), so
+                // swallow silently rather than insert a literal `v`.
+                return Ok(());
+            }
+
             if let Some(handled) = handle_scroll_key(code, modifiers, renderer, &app.buf) {
                 if handled {
                     return Ok(());
