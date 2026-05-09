@@ -76,3 +76,4 @@ docs/superpowers
 .superpowers/
 .plan_docs
 extensions/vscode/resources/bin/
+.kiro
