@@ -229,8 +229,10 @@ pub struct AppState {
     pub chat_tasks: ChatTasksStore,
     /// Sessions that were stopped - their messages should not be saved
     pub stopped_sessions: StoppedSessionsStore,
-    /// MCP server registry (shared across chat requests)
+    /// MCP server registry (global, used for /mcp/status backward compat)
     pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
+    /// Per-project MCP registry cache (keyed by working_dir)
+    pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     /// In-flight OAuth login sessions (login_id -> entry)
     pub login_sessions: LoginSessionsStore,
     /// Shared telemetry handle (R1.4)
@@ -244,6 +246,15 @@ pub struct AppState {
     /// Number of active SSE streaming connections (chat in progress)
     pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// Cached MCP registry for a specific project directory.
+pub struct CachedMcpRegistry {
+    pub registry: Arc<McpRegistry>,
+    pub last_used: std::time::Instant,
+}
+
+/// Maximum number of per-project MCP registries to cache.
+const MCP_CACHE_MAX: usize = 5;
 
 /// Get default working directory
 fn default_working_dir() -> PathBuf {
@@ -725,7 +736,27 @@ async fn activity_tracker_middleware(
         }
     }
 
+    // Resolve client mode from X-AtomCode-Client header
+    let client_mode = req
+        .headers()
+        .get("x-atomcode-client")
+        .and_then(|v| v.to_str().ok())
+        .map(resolve_client_mode)
+        .unwrap_or(SessionMode::Ide);
+    let mut req = req;
+    req.extensions_mut().insert(client_mode);
+
     next.run(req).await
+}
+
+/// Map X-AtomCode-Client header value to SessionMode.
+/// Unknown values fall back to Ide.
+fn resolve_client_mode(header: &str) -> SessionMode {
+    match header {
+        "vscode" => SessionMode::Vscode,
+        "atomcode-air" => SessionMode::AtomcodeAir,
+        _ => SessionMode::Ide,
+    }
 }
 
 fn is_loopback_origin(origin: &HeaderValue, _request_parts: &RequestParts) -> bool {
@@ -989,7 +1020,7 @@ async fn change_dir(
     Json(req): Json<ChangeDirRequest>,
 ) -> impl IntoResponse {
     let state_clone = state.clone();
-    daemon_scope(&state, None, || async move {
+    daemon_scope(&state, None, SessionMode::Ide, || async move {
         let state = state_clone;
         let mut project = state.project.write().await;
 
@@ -1075,13 +1106,7 @@ async fn change_dir(
         let hash = hash_path(&new_path);
         state.telemetry.track(Event::UseCommand { type_: "cd".into() });
 
-        // Async reload MCP registry for the new project directory
-        let mcp_working_dir = new_path.clone();
-        let mcp_reg = state.mcp_registry.clone();
-        tokio::spawn(async move {
-            let new_registry = McpRegistry::from_config_background(&mcp_working_dir);
-            *mcp_reg.write().await = Arc::new(new_registry);
-        });
+        // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
         Json(ChangeDirResponse {
             success: true,
@@ -1303,7 +1328,7 @@ async fn delete_session(
 ) -> impl IntoResponse {
     let session_uuid = uuid::Uuid::parse_str(&id).ok();
     let state_clone = state.clone();
-    daemon_scope(&state, session_uuid, || async move {
+    daemon_scope(&state, session_uuid, SessionMode::Ide, || async move {
         match delete_session_file(&hash, &id) {
             Ok(()) => {
                 state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into() });
@@ -1361,7 +1386,7 @@ async fn rename_session(
 ) -> impl IntoResponse {
     let session_uuid = uuid::Uuid::parse_str(&id).ok();
     let state_clone = state.clone();
-    daemon_scope(&state, session_uuid, || async move {
+    daemon_scope(&state, session_uuid, SessionMode::Ide, || async move {
         match rename_session_file(&hash, &id, &req.name) {
             Ok(()) => {
                 state_clone.telemetry.track(Event::UseCommand { type_: "rename".into() });
@@ -1733,6 +1758,7 @@ type SessionStore = Arc<RwLock<std::collections::HashMap<String, Conversation>>>
 /// POST /chat - Stream chat response with SSE
 async fn chat_stream(
     State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
     Json(mut req): Json<ChatRequest>,
 ) -> impl IntoResponse {
     // Parse session UUID for telemetry scope
@@ -1762,7 +1788,7 @@ async fn chat_stream(
     // Clone state for the spawned task
     let chat_tasks = state.chat_tasks.clone();
     let stopped_sessions = state.stopped_sessions.clone();
-    let mcp_registry = state.mcp_registry.read().await.clone();
+    let mcp_cache = state.mcp_cache.clone();
     let telemetry = state.telemetry.clone();
 
     // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
@@ -1772,7 +1798,7 @@ async fn chat_stream(
         req.working_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."))
     );
     let ctx_for_task = CurrentContext {
-        mode: Some(SessionMode::Ide),
+        mode: Some(client_mode),
         repo_origin: Some(chat_repo_origin),
         session_id: session_uuid,
         ..CurrentContext::current()
@@ -1786,7 +1812,7 @@ async fn chat_stream(
                 tx.clone(),
                 cancel_token,
                 stopped_sessions.clone(),
-                mcp_registry,
+                mcp_cache,
                 telemetry,
             )
             .await
@@ -1836,7 +1862,7 @@ async fn process_chat_request(
     event_tx: mpsc::UnboundedSender<ChatEvent>,
     cancel_token: CancellationToken,
     stopped_sessions: StoppedSessionsStore,
-    mcp_registry: Arc<McpRegistry>,
+    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
@@ -1951,27 +1977,45 @@ async fn process_chat_request(
         }));
     }
 
-    // Register MCP tools from connected servers.
-    // If tools are empty, wait briefly for background connections to complete (first request grace period).
-    // If still empty but servers are configured, attempt a reload (handles server crash recovery).
-    let mut mcp_tools = mcp_registry.list_all_tools().await;
-    if mcp_tools.is_empty() {
-        mcp_registry.wait_for_initial_connections(Duration::from_secs(5)).await;
-        mcp_tools = mcp_registry.list_all_tools().await;
-    }
-    // P2-1: If tools are still empty but registry has servers (possibly crashed), try reload
-    if mcp_tools.is_empty() && !mcp_registry.server_statuses().await.is_empty() {
-        tracing::info!("MCP tools empty despite configured servers, attempting reload");
-        let new_registry = McpRegistry::from_config_background(&working_dir);
-        new_registry.wait_for_initial_connections(Duration::from_secs(5)).await;
-        mcp_tools = new_registry.list_all_tools().await;
-        if !mcp_tools.is_empty() {
-            // Replace the shared registry so future requests use the reconnected one
-            // Note: we can't update state.mcp_registry here because we only have Arc<McpRegistry>,
-            // not the RwLock wrapper. The tools are registered for this request only.
-            register_mcp_tools(&mut tool_registry, Arc::new(new_registry), mcp_tools);
+    // Register MCP tools using per-project cache.
+    // Each project directory gets its own MCP registry (loaded from its .mcp.json + global).
+    let mcp_registry: Arc<McpRegistry> = {
+        let cache = mcp_cache.read().await;
+        if let Some(cached) = cache.get(&working_dir) {
+            cached.registry.clone()
+        } else {
+            drop(cache);
+            // Cache miss — create new registry for this project
+            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
+            new_registry.wait_for_initial_connections(Duration::from_secs(5)).await;
+            // Store in cache
+            let mut cache = mcp_cache.write().await;
+            // Evict LRU if cache is full
+            if cache.len() >= MCP_CACHE_MAX {
+                if let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, v)| v.last_used)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest_key);
+                }
+            }
+            cache.insert(working_dir.clone(), CachedMcpRegistry {
+                registry: new_registry.clone(),
+                last_used: std::time::Instant::now(),
+            });
+            new_registry
         }
-    } else if !mcp_tools.is_empty() {
+    };
+    // Update last_used timestamp
+    {
+        let mut cache = mcp_cache.write().await;
+        if let Some(entry) = cache.get_mut(&working_dir) {
+            entry.last_used = std::time::Instant::now();
+        }
+    }
+    let mcp_tools = mcp_registry.list_all_tools().await;
+    if !mcp_tools.is_empty() {
         register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
     }
 
@@ -2331,7 +2375,7 @@ async fn stop_chat(
 ) -> impl IntoResponse {
     let session_uuid = uuid::Uuid::parse_str(&req.session_id).ok();
     let state_clone = state.clone();
-    daemon_scope(&state, session_uuid, || async move {
+    daemon_scope(&state, session_uuid, SessionMode::Ide, || async move {
         // Add to stopped sessions set
         state_clone
             .stopped_sessions
@@ -2666,6 +2710,7 @@ async fn main() {
         chat_tasks: Arc::new(RwLock::new(HashMap::new())),
         stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
+        mcp_cache: Arc::new(RwLock::new(HashMap::new())),
         login_sessions: Arc::new(RwLock::new(HashMap::new())),
         telemetry: telemetry.clone(),
         repo_origin: repo_origin.clone(),

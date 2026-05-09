@@ -17,6 +17,8 @@ pub enum SessionMode {
     Headless,
     Tui,
     Ide,
+    Vscode,
+    AtomcodeAir,
 }
 
 // ---------- Envelope (common to every event) ----------

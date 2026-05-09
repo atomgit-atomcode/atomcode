@@ -65,6 +65,7 @@ export class DaemonClient {
         method,
         headers: {
           'Content-Type': 'application/json',
+          'X-AtomCode-Client': 'vscode',
           ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
         },
         timeout: REST_TIMEOUT,
@@ -277,6 +278,7 @@ export class DaemonClient {
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'text/event-stream',
+        'X-AtomCode-Client': 'vscode',
         'Content-Length': Buffer.byteLength(payload),
       },
     };

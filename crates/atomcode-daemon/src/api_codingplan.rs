@@ -53,7 +53,7 @@ pub(crate) async fn codingplan_setup(
     Json(req): Json<CodingPlanSetupRequest>,
 ) -> impl IntoResponse {
     let state_clone = state.clone();
-    daemon_scope(&state, None, || async move {
+    daemon_scope(&state, None, atomcode_telemetry::SessionMode::Ide, || async move {
         let state = state_clone;
         // Clean up expired sessions
         cleanup_expired_sessions(&state.login_sessions).await;

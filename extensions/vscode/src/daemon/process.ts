@@ -200,9 +200,14 @@ export class DaemonProcess {
       return false;
     }
 
+    // Use the first workspace folder as cwd so the daemon can find project-level
+    // .mcp.json and detect repo_origin correctly.
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
     this.process = child_process.spawn(binary.path, binary.args, {
       detached: true,
       stdio: 'ignore',
+      ...(cwd ? { cwd } : {}),
     });
     this.process.unref();
 
