@@ -115,6 +115,53 @@ fn cache_write_image(cache_dir: &std::path::Path, img: &atomcode_core::conversat
     }
 }
 
+/// Drain `state.pending_recalled_attachments`. For each entry: read the
+/// cache file, allocate a fresh marker via `session_image_count`, rewrite
+/// `[Image #old]` → `[Image #new]` in `line`, and push into the live
+/// pending_* vecs. On cache miss, strip the marker and accumulate a
+/// notice string for the caller to render.
+///
+/// Returns the list of notice strings (empty when every attachment hit).
+pub(crate) fn hydrate_recalled_attachments(
+    state: &mut UiState,
+    line: &mut String,
+    cache_dir: &std::path::Path,
+) -> Vec<String> {
+    use base64::Engine;
+    let mut notices = Vec::new();
+    if state.pending_recalled_attachments.is_empty() {
+        return notices;
+    }
+    for refed in std::mem::take(&mut state.pending_recalled_attachments) {
+        let cache_path = cache_dir.join(format!("{}.{}", refed.hash, ext_for_mt(&refed.mt)));
+        match std::fs::read(&cache_path) {
+            Ok(raw) => {
+                state.session_image_count += 1;
+                let new_marker = state.session_image_count;
+                *line = line.replace(
+                    &format!("[Image #{}]", refed.n),
+                    &format!("[Image #{}]", new_marker),
+                );
+                let hash_u64 = u64::from_str_radix(&refed.hash, 16).unwrap_or(0);
+                state.pending_images.push(atomcode_core::conversation::message::ImagePart {
+                    media_type: refed.mt.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(&raw),
+                });
+                state.pending_image_hashes.push(hash_u64);
+                state.pending_image_markers.push(new_marker);
+            }
+            Err(_) => {
+                *line = line.replace(&format!("[Image #{}]", refed.n), "");
+                notices.push(format!(
+                    "[Image #{}] 缓存已丢失，已从消息中移除",
+                    refed.n
+                ));
+            }
+        }
+    }
+    notices
+}
+
 /// Upper bound on a single attached image (20 MB raw bytes). OpenAI's
 /// chat/completions cap is 20 MB per image; Anthropic's is 5 MB. We pick
 /// the looser of the two as the tool-side gate so the attempt at least
@@ -1348,6 +1395,55 @@ mod menu_tests {
         super::cache_write_image(dir.path(), &img, 0xdead_beef_1234_5678);
         let mtime2 = std::fs::metadata(&p).unwrap().modified().unwrap();
         assert_eq!(mtime1, mtime2, "second call must short-circuit on exists");
+    }
+
+    #[test]
+    fn hydrate_renumbers_and_rewrites_line() {
+        use crate::input::history::HistoryImageRef;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        // Write a fake cache file at hash=deadbeef12345678.
+        std::fs::write(cache_dir.join("deadbeef12345678.png"), b"\x89PNG").unwrap();
+
+        let mut state = UiState::new();
+        state.session_image_count = 5; // current session already used #1..#5
+        state.pending_recalled_attachments.push(HistoryImageRef {
+            hash: "deadbeef12345678".into(),
+            mt: "image/png".into(),
+            n: 2, // recalled marker number from the saved entry
+        });
+        let mut line = "look at [Image #2] please".to_string();
+        let notice = super::hydrate_recalled_attachments(&mut state, &mut line, &cache_dir);
+
+        assert_eq!(notice.len(), 0, "no cache miss expected");
+        assert_eq!(line, "look at [Image #6] please", "marker renumbered to #6");
+        assert_eq!(state.pending_images.len(), 1);
+        assert_eq!(state.pending_image_markers, vec![6]);
+        assert_eq!(state.session_image_count, 6);
+        assert!(state.pending_recalled_attachments.is_empty());
+    }
+
+    #[test]
+    fn hydrate_strips_marker_on_cache_miss() {
+        use crate::input::history::HistoryImageRef;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        // No cache file written → cache miss.
+        let mut state = UiState::new();
+        state.pending_recalled_attachments.push(HistoryImageRef {
+            hash: "0000000000000000".into(),
+            mt: "image/png".into(),
+            n: 3,
+        });
+        let mut line = "before [Image #3] after".to_string();
+        let notice = super::hydrate_recalled_attachments(&mut state, &mut line, &cache_dir);
+
+        assert_eq!(line, "before  after", "marker stripped on cache miss");
+        assert_eq!(state.pending_images.len(), 0);
+        assert!(state.pending_recalled_attachments.is_empty());
+        assert_eq!(notice.len(), 1, "expected one cache-miss notice");
+        assert!(notice[0].contains("[Image #3]"));
+        assert!(notice[0].contains("缓存"));
     }
 }
 
@@ -3409,9 +3505,6 @@ fn handle_idle_key(
             }
         }
         BufferResult::Commit(line) => {
-            // Expand paste placeholders so the agent sees full content
-            // while the echoed user line and history stay compact.
-            let expanded = app.buf.expand_pastes(&line);
             renderer.render(UiLine::ClearTransient);
             renderer.render(UiLine::User(line.clone()));
             app.buf.text.clear();
@@ -3449,6 +3542,15 @@ fn handle_idle_key(
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
             } else {
+                // Hydrate recalled attachments BEFORE building the submit
+                // payload, so renumbered `[Image #N]` markers appear in
+                // both `line` and `expanded`.
+                let cache_dir = crate::platform::image_cache_dir();
+                let mut line = line; // shadow as mutable so hydrate can rewrite it
+                for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
+                    renderer.render(UiLine::Warning(n));
+                }
+                let expanded = app.buf.expand_pastes(&line);
                 // Cache the full expanded form before dispatch. If the
                 // user hits Ctrl+C / Esc mid-stream, `handle_streaming_key`
                 // takes this Option and restores it to `app.buf.text`
