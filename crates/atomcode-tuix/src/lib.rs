@@ -399,9 +399,12 @@ pub async fn run(
     // inside `platform::history_path`), so the explicit else-branch
     // with a hardcoded Unix path is gone — Windows used to fall here
     // and then fail to write to `/tmp`.
-    let history = History::default_path()
-        .map(History::load)
-        .unwrap_or_else(|| History::load(crate::platform::history_path()));
+    let history = {
+        let path = History::default_path()
+            .unwrap_or_else(crate::platform::history_path);
+        let cache = crate::platform::image_cache_dir();
+        crate::input::history::History::load_with_cache(path, cache)
+    };
 
     let session_manager = atomcode_core::session::SessionManager::new(&working_dir);
     // Fresh session by default; `/resume` replaces this on load.
