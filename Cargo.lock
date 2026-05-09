@@ -290,6 +290,7 @@ dependencies = [
  "libc",
  "png 0.17.16",
  "qrcode",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
