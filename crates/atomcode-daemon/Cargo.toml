@@ -25,3 +25,7 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
 regex = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }

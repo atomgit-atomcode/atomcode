@@ -6,6 +6,9 @@ mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
+mod telemetry_scope;
+
+pub(crate) use telemetry_scope::daemon_scope;
 
 use axum::{
     extract::{Path, Query, State},
@@ -20,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -36,7 +39,13 @@ use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
 use atomcode_core::turn::runner::TurnRunner;
-use atomcode_telemetry::{ResolvedConfig, Telemetry, TelemetryState};
+use atomcode_telemetry::{
+    config::{resolve, ProcessEnv},
+    CliOverride, CurrentContext, Event, RepoOrigin, SessionMode,
+    Telemetry, TelemetryState,
+};
+use atomcode_core::auth;
+use atomcode_core::telemetry_bootstrap::detect_repo_origin;
 
 // ============================================================================
 // Shared DTOs for P0 API endpoints
@@ -202,6 +211,15 @@ type StoppedSessionsStore = Arc<RwLock<HashSet<String>>>;
 
 const DANGEROUS_TOOLS_ENV: &str = "ATOMCODE_DAEMON_ENABLE_DANGEROUS_TOOLS";
 
+/// RAII guard that decrements `active_connections` on drop, ensuring the counter
+/// is always decremented even if the SSE client disconnects abruptly (TCP RST).
+struct SseConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Combined app state for Axum
 #[derive(Clone)]
 pub struct AppState {
@@ -215,6 +233,16 @@ pub struct AppState {
     pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
     /// In-flight OAuth login sessions (login_id -> entry)
     pub login_sessions: LoginSessionsStore,
+    /// Shared telemetry handle (R1.4)
+    pub telemetry: Arc<Telemetry>,
+    /// Repo origin detected at daemon launch (R4.2)
+    pub repo_origin: RepoOrigin,
+    /// Sender to trigger graceful shutdown via POST /shutdown (R7.1, R7.2)
+    pub shutdown_tx: watch::Sender<bool>,
+    /// Timestamp (unix ms) of last non-health HTTP request — used for idle timeout
+    pub last_activity: Arc<std::sync::atomic::AtomicI64>,
+    /// Number of active SSE streaming connections (chat in progress)
+    pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Get default working directory
@@ -682,6 +710,24 @@ fn cors_layer() -> CorsLayer {
         .allow_headers([header::CONTENT_TYPE])
 }
 
+/// Middleware that updates `last_activity` timestamp on every request except
+/// GET /health and POST /shutdown (these should not prevent idle timeout).
+async fn activity_tracker_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let skip = (req.method() == Method::GET && req.uri().path() == "/health")
+        || (req.method() == Method::POST && req.uri().path() == "/shutdown");
+
+    if !skip {
+        if let Some(activity) = req.extensions().get::<Arc<std::sync::atomic::AtomicI64>>() {
+            activity.store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    next.run(req).await
+}
+
 fn is_loopback_origin(origin: &HeaderValue, _request_parts: &RequestParts) -> bool {
     let Ok(origin) = origin.to_str() else {
         return false;
@@ -920,6 +966,12 @@ async fn health() -> impl IntoResponse {
     })
 }
 
+/// POST /shutdown - Trigger graceful shutdown via HTTP (R7.1, R7.2)
+async fn shutdown_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.shutdown_tx.send(true).ok();
+    Json(serde_json::json!({"success": true}))
+}
+
 /// GET /project - Get current project state
 async fn get_project_state(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.project.read().await;
@@ -936,94 +988,100 @@ async fn change_dir(
     State(state): State<AppState>,
     Json(req): Json<ChangeDirRequest>,
 ) -> impl IntoResponse {
-    let mut project = state.project.write().await;
+    let state_clone = state.clone();
+    daemon_scope(&state, None, || async move {
+        let state = state_clone;
+        let mut project = state.project.write().await;
 
-    // Handle "-" to go back to previous directory
-    let new_path = if req.path == "-" {
-        match &project.previous_dir {
-            Some(prev) => prev.clone(),
-            None => {
+        // Handle "-" to go back to previous directory
+        let new_path = if req.path == "-" {
+            match &project.previous_dir {
+                Some(prev) => prev.clone(),
+                None => {
+                    return Json(ChangeDirResponse {
+                        success: false,
+                        message: "No previous directory to go back to".to_string(),
+                        current_dir: project.working_dir.clone(),
+                        project_hash: hash_path(&project.working_dir),
+                    });
+                }
+            }
+        } else {
+            // Expand ~ and make absolute
+            let expanded = if req.path.starts_with('~') {
+                atomcode_core::tool::real_home_dir()
+                    .map(|h| {
+                        h.join(
+                            req.path
+                                .strip_prefix('~')
+                                .unwrap_or("")
+                                .trim_start_matches('/'),
+                        )
+                    })
+                    .unwrap_or_else(|| PathBuf::from(&req.path))
+            } else {
+                PathBuf::from(&req.path)
+            };
+
+            let resolved = if expanded.is_absolute() {
+                expanded
+            } else {
+                project.working_dir.join(&expanded)
+            };
+
+            // Check if directory exists
+            if !resolved.exists() {
                 return Json(ChangeDirResponse {
                     success: false,
-                    message: "No previous directory to go back to".to_string(),
+                    message: format!("Directory does not exist: {}", resolved.display()),
                     current_dir: project.working_dir.clone(),
                     project_hash: hash_path(&project.working_dir),
                 });
             }
-        }
-    } else {
-        // Expand ~ and make absolute
-        let expanded = if req.path.starts_with('~') {
-            atomcode_core::tool::real_home_dir()
-                .map(|h| {
-                    h.join(
-                        req.path
-                            .strip_prefix('~')
-                            .unwrap_or("")
-                            .trim_start_matches('/'),
-                    )
-                })
-                .unwrap_or_else(|| PathBuf::from(&req.path))
-        } else {
-            PathBuf::from(&req.path)
+
+            if !resolved.is_dir() {
+                return Json(ChangeDirResponse {
+                    success: false,
+                    message: format!("Not a directory: {}", resolved.display()),
+                    current_dir: project.working_dir.clone(),
+                    project_hash: hash_path(&project.working_dir),
+                });
+            }
+
+            resolved
         };
 
-        let resolved = if expanded.is_absolute() {
-            expanded
-        } else {
-            project.working_dir.join(&expanded)
-        };
+        // Update state
+        let old_dir = project.working_dir.clone();
+        project.previous_dir = Some(old_dir);
+        project.working_dir = new_path.clone();
+        project.name = new_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
 
-        // Check if directory exists
-        if !resolved.exists() {
-            return Json(ChangeDirResponse {
-                success: false,
-                message: format!("Directory does not exist: {}", resolved.display()),
-                current_dir: project.working_dir.clone(),
-                project_hash: hash_path(&project.working_dir),
-            });
+        // Update recent dirs (max 5, deduplicated)
+        project.recent_dirs.retain(|d| d != &new_path);
+        project.recent_dirs.insert(0, new_path.clone());
+        project.recent_dirs.truncate(5);
+
+        // Persist to config
+        let config_path = Config::default_path();
+        if let Ok(mut config) = Config::load(&config_path) {
+            config.default_workdir = Some(new_path.to_string_lossy().to_string());
+            let _ = config.save(&config_path);
         }
 
-        if !resolved.is_dir() {
-            return Json(ChangeDirResponse {
-                success: false,
-                message: format!("Not a directory: {}", resolved.display()),
-                current_dir: project.working_dir.clone(),
-                project_hash: hash_path(&project.working_dir),
-            });
-        }
-
-        resolved
-    };
-
-    // Update state
-    let old_dir = project.working_dir.clone();
-    project.previous_dir = Some(old_dir);
-    project.working_dir = new_path.clone();
-    project.name = new_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "project".to_string());
-
-    // Update recent dirs (max 5, deduplicated)
-    project.recent_dirs.retain(|d| d != &new_path);
-    project.recent_dirs.insert(0, new_path.clone());
-    project.recent_dirs.truncate(5);
-
-    // Persist to config
-    let config_path = Config::default_path();
-    if let Ok(mut config) = Config::load(&config_path) {
-        config.default_workdir = Some(new_path.to_string_lossy().to_string());
-        let _ = config.save(&config_path);
-    }
-
-    let hash = hash_path(&new_path);
-    Json(ChangeDirResponse {
-        success: true,
-        message: format!("Changed to {}", new_path.display()),
-        current_dir: new_path,
-        project_hash: hash,
+        let hash = hash_path(&new_path);
+        state.telemetry.track(Event::UseCommand { type_: "cd".into() });
+        Json(ChangeDirResponse {
+            success: true,
+            message: format!("Changed to {}", new_path.display()),
+            current_dir: new_path,
+            project_hash: hash,
+        })
     })
+    .await
 }
 
 /// GET /projects - List all projects (historical, from sessions directory)
@@ -1230,17 +1288,26 @@ fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<
 }
 
 /// DELETE /projects/:hash/sessions/:id - Delete a session
-async fn delete_session(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
-    match delete_session_file(&hash, &id) {
-        Ok(()) => {
-            let msg = format!("Session {} deleted successfully", id);
-            (StatusCode::OK, Json(msg)).into_response()
+async fn delete_session(
+    State(state): State<AppState>,
+    Path((hash, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, || async move {
+        match delete_session_file(&hash, &id) {
+            Ok(()) => {
+                state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into() });
+                let msg = format!("Session {} deleted successfully", id);
+                (StatusCode::OK, Json(msg)).into_response()
+            }
+            Err(e) => {
+                let msg = format!("Failed to delete session: {}", e);
+                (StatusCode::NOT_FOUND, Json(msg)).into_response()
+            }
         }
-        Err(e) => {
-            let msg = format!("Failed to delete session: {}", e);
-            (StatusCode::NOT_FOUND, Json(msg)).into_response()
-        }
-    }
+    })
+    .await
 }
 
 /// Rename request body
@@ -1279,19 +1346,26 @@ fn rename_session_file(
 
 /// PATCH /projects/:hash/sessions/:id/rename - Rename a session
 async fn rename_session(
+    State(state): State<AppState>,
     Path((hash, id)): Path<(String, String)>,
     Json(req): Json<RenameRequest>,
 ) -> impl IntoResponse {
-    match rename_session_file(&hash, &id, &req.name) {
-        Ok(()) => {
-            let msg = format!("Session {} renamed to '{}'", id, req.name);
-            (StatusCode::OK, Json(msg)).into_response()
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, || async move {
+        match rename_session_file(&hash, &id, &req.name) {
+            Ok(()) => {
+                state_clone.telemetry.track(Event::UseCommand { type_: "rename".into() });
+                let msg = format!("Session {} renamed to '{}'", id, req.name);
+                (StatusCode::OK, Json(msg)).into_response()
+            }
+            Err(e) => {
+                let msg = format!("Failed to rename session: {}", e);
+                (StatusCode::NOT_FOUND, Json(msg)).into_response()
+            }
         }
-        Err(e) => {
-            let msg = format!("Failed to rename session: {}", e);
-            (StatusCode::NOT_FOUND, Json(msg)).into_response()
-        }
-    }
+    })
+    .await
 }
 
 /// Model info for API response
@@ -1652,6 +1726,9 @@ async fn chat_stream(
     State(state): State<AppState>,
     Json(mut req): Json<ChatRequest>,
 ) -> impl IntoResponse {
+    // Parse session UUID for telemetry scope
+    let session_uuid = req.session_id.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+
     // Use current project working directory if not specified
     if req.working_dir.is_none() {
         let project = state.project.read().await;
@@ -1677,34 +1754,67 @@ async fn chat_stream(
     let chat_tasks = state.chat_tasks.clone();
     let stopped_sessions = state.stopped_sessions.clone();
     let mcp_registry = state.mcp_registry.read().await.clone();
+    let telemetry = state.telemetry.clone();
+
+    // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
+    // Use the request's working_dir to detect repo_origin dynamically (not the
+    // startup-time cached value), because the user may switch projects via /cd.
+    let chat_repo_origin = detect_repo_origin(
+        req.working_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."))
+    );
+    let ctx_for_task = CurrentContext {
+        mode: Some(SessionMode::Ide),
+        repo_origin: Some(chat_repo_origin),
+        session_id: session_uuid,
+        ..CurrentContext::current()
+    };
 
     // Spawn the chat processing task
     tokio::spawn(async move {
-        if let Err(e) = process_chat_request(
-            req,
-            tx.clone(),
-            cancel_token,
-            stopped_sessions.clone(),
-            mcp_registry,
-        )
-        .await
-        {
-            let _ = tx.send(ChatEvent::Error {
-                message: e.to_string(),
-            });
-        }
+        CurrentContext::scope(ctx_for_task, || async move {
+            if let Err(e) = process_chat_request(
+                req,
+                tx.clone(),
+                cancel_token,
+                stopped_sessions.clone(),
+                mcp_registry,
+                telemetry,
+            )
+            .await
+            {
+                let _ = tx.send(ChatEvent::Error {
+                    message: e.to_string(),
+                });
+            }
 
-        // Cleanup: remove from chat_tasks
-        if let Some(sid) = session_id {
-            chat_tasks.write().await.remove(&sid);
-        }
+            // Cleanup: remove from chat_tasks
+            if let Some(sid) = session_id {
+                chat_tasks.write().await.remove(&sid);
+            }
+        }).await;
     });
+
+    // Track active SSE connections for idle timeout using a Drop guard
+    // to ensure decrement happens even if the client disconnects abruptly.
+    let active_conns = state.active_connections.clone();
+    active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let stream = UnboundedReceiverStream::new(rx).map(|event| {
         let json = serde_json::to_string(&event).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
 
-    Sse::new(stream).keep_alive(
+    // The guard must outlive the stream. We achieve this by chaining a final
+    // item that captures the guard — when the stream is dropped (client disconnect
+    // or natural end), the guard's Drop fires and decrements the counter.
+    let conn_guard = SseConnectionGuard(active_conns);
+    let guarded_stream = stream.chain(futures::stream::once(async move {
+        drop(conn_guard); // explicitly drop to decrement
+        // This event is never actually sent because the stream ends here
+        Ok(axum::response::sse::Event::default().comment("bye"))
+    }));
+
+    Sse::new(guarded_stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("ping"),
@@ -1718,6 +1828,7 @@ async fn process_chat_request(
     cancel_token: CancellationToken,
     stopped_sessions: StoppedSessionsStore,
     mcp_registry: Arc<McpRegistry>,
+    telemetry: Arc<Telemetry>,
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
@@ -1772,17 +1883,9 @@ async fn process_chat_request(
         conv
     }));
     conversation.lock().await.add_user_message(&req.message);
-    // Build tool registry and context
-    let daemon_telemetry = Telemetry::init(
-        ResolvedConfig {
-            state: TelemetryState::Disabled("daemon"),
-            endpoint: "http://localhost/v1/events".into(),
-            atomcode_dir: std::path::PathBuf::from("/tmp"),
-        },
-        env!("CARGO_PKG_VERSION").into(),
-    );
+    // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
     let mut tool_context =
-        ToolContext::with_telemetry(working_dir.clone(), "default", daemon_telemetry);
+        ToolContext::with_telemetry(working_dir.clone(), req.session_id.as_deref().unwrap_or("default"), telemetry);
     let mut tool_registry = ToolRegistry::new();
     // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
     // the CLI's --disable-tools behaviour. Comma-separated tool names.
@@ -1922,8 +2025,12 @@ async fn process_chat_request(
     // Clone conversation Arc for the spawn task
     let conversation_clone = conversation.clone();
 
+    // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
+    let tel_ctx = CurrentContext::current();
+
     // Run turn(s) in background task - may need multiple turns if tools are used
     tokio::spawn(async move {
+        CurrentContext::scope(tel_ctx, || async move {
         let mut conv = conversation_clone.lock().await;
 
         // Loop until LLM produces text without tool calls
@@ -1952,6 +2059,7 @@ async fn process_chat_request(
                 }
             }
         }
+        }).await;
     });
 
     // Forward turn events to chat events
@@ -2193,36 +2301,43 @@ async fn stop_chat(
     State(state): State<AppState>,
     Json(req): Json<StopChatRequest>,
 ) -> impl IntoResponse {
-    // Add to stopped sessions set
-    state
-        .stopped_sessions
-        .write()
-        .await
-        .insert(req.session_id.clone());
+    let session_uuid = uuid::Uuid::parse_str(&req.session_id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, || async move {
+        // Add to stopped sessions set
+        state_clone
+            .stopped_sessions
+            .write()
+            .await
+            .insert(req.session_id.clone());
 
-    // Cancel the chat task if it exists
-    if let Some(cancel_token) = state.chat_tasks.read().await.get(&req.session_id) {
-        cancel_token.cancel();
-        (
-            axum::http::StatusCode::OK,
-            Json(StopChatResponse {
-                success: true,
-                message: format!("Chat session {} stopped", req.session_id),
-            }),
-        )
-    } else {
-        // Session wasn't running, but we marked it as stopped
-        (
-            axum::http::StatusCode::OK,
-            Json(StopChatResponse {
-                success: true,
-                message: format!(
-                    "Chat session {} marked as stopped (was not running)",
-                    req.session_id
-                ),
-            }),
-        )
-    }
+        // Cancel the chat task if it exists
+        if let Some(cancel_token) = state_clone.chat_tasks.read().await.get(&req.session_id) {
+            cancel_token.cancel();
+            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into() });
+            (
+                axum::http::StatusCode::OK,
+                Json(StopChatResponse {
+                    success: true,
+                    message: format!("Chat session {} stopped", req.session_id),
+                }),
+            )
+        } else {
+            // Session wasn't running, but we marked it as stopped
+            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into() });
+            (
+                axum::http::StatusCode::OK,
+                Json(StopChatResponse {
+                    success: true,
+                    message: format!(
+                        "Chat session {} marked as stopped (was not running)",
+                        req.session_id
+                    ),
+                }),
+            )
+        }
+    })
+    .await
 }
 
 // --- MCP API handlers ---
@@ -2276,12 +2391,132 @@ async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "reloading"}))
 }
 
-fn daemon_addr_from_args() -> (String, u16) {
+/// Wait for the first shutdown signal (Ctrl-C, SIGTERM on Unix, or watch channel).
+/// Once received, log and return so that `axum::serve(...).with_graceful_shutdown(...)`
+/// can begin draining in-flight connections. (R10.1, R7.2, R7.3)
+async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    let http_shutdown = async {
+        // Wait until the watch channel value becomes true (sent by POST /shutdown)
+        while !*shutdown_rx.borrow_and_update() {
+            if shutdown_rx.changed().await.is_err() {
+                // Sender dropped — treat as shutdown
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => { tracing::info!("Received Ctrl-C, starting graceful shutdown"); }
+        _ = terminate => { tracing::info!("Received SIGTERM, starting graceful shutdown"); }
+        _ = http_shutdown => { tracing::info!("Received /shutdown request, starting graceful shutdown"); }
+    }
+}
+
+/// Install a panic hook that emits a scrubbed `Event::Panic` telemetry event
+/// before delegating to the default hook (preserving stderr output). (R9.1-R9.4)
+fn install_panic_hook(telemetry: Arc<Telemetry>) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let home = atomcode_telemetry::identity::real_home_dir();
+        let cwd = std::env::current_dir().ok();
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".into());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let scrubbed_loc =
+            atomcode_telemetry::scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
+        let scrubbed_msg = atomcode_telemetry::scrub::truncate_head(
+            &atomcode_telemetry::scrub::scrub_path(&msg, home.as_deref(), cwd.as_deref()),
+            atomcode_telemetry::scrub::HEAD_MAX,
+        );
+        let frames =
+            atomcode_telemetry::scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
+        telemetry.track(Event::Panic {
+            location: scrubbed_loc,
+            message_head: scrubbed_msg,
+            thread: std::thread::current().name().unwrap_or("unknown").into(),
+            backtrace_top_5: frames,
+        });
+        default_hook(info); // R9.4: preserve stderr output
+    }));
+}
+
+/// Default idle timeout: 30 minutes (in seconds). Set to 0 to disable.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Get current unix timestamp in milliseconds.
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Spawn a background task that checks for idle timeout and triggers shutdown.
+fn spawn_idle_timeout_task(
+    idle_timeout_secs: u64,
+    last_activity: Arc<std::sync::atomic::AtomicI64>,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    if idle_timeout_secs == 0 {
+        return; // Disabled
+    }
+    let timeout_ms = (idle_timeout_secs * 1000) as i64;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await; // consume immediate first tick
+        loop {
+            interval.tick().await;
+            let conns = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            if conns > 0 {
+                continue; // Active streaming connections, not idle
+            }
+            let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
+            let elapsed = now_unix_ms() - last;
+            if elapsed >= timeout_ms {
+                tracing::info!(
+                    elapsed_mins = elapsed / 60_000,
+                    timeout_mins = idle_timeout_secs / 60,
+                    "Daemon idle timeout reached, shutting down"
+                );
+                shutdown_tx.send(true).ok();
+                break;
+            }
+        }
+    });
+}
+
+fn parse_daemon_args() -> (String, u16, CliOverride, u64) {
     const DEFAULT_HOST: &str = "127.0.0.1";
     const DEFAULT_PORT: u16 = 13456;
 
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
+    let mut no_telemetry = false;
+    let mut idle_timeout: Option<u64> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -2308,9 +2543,40 @@ fn daemon_addr_from_args() -> (String, u16) {
             port = value.parse().ok();
             continue;
         }
+
+        if arg == "--no-telemetry" {
+            no_telemetry = true;
+            continue;
+        }
+
+        if arg == "--idle-timeout" {
+            if let Some(value) = args.next() {
+                idle_timeout = value.parse().ok();
+            }
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--idle-timeout=") {
+            idle_timeout = value.parse().ok();
+            continue;
+        }
     }
 
-    (host.unwrap_or_else(|| DEFAULT_HOST.to_string()), port.unwrap_or(DEFAULT_PORT))
+    let cli_override = if no_telemetry {
+        CliOverride { disabled: true }
+    } else {
+        CliOverride::default()
+    };
+
+    // Allow env var override: ATOMCODE_DAEMON_IDLE_TIMEOUT=<seconds>
+    // 0 = disabled; non-zero values are clamped to a minimum of 60s to prevent
+    // accidental rapid cycling from misconfigured environments.
+    let raw_timeout = idle_timeout
+        .or_else(|| std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT").ok()?.parse().ok())
+        .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+    let timeout = if raw_timeout == 0 { 0 } else { raw_timeout.max(60) };
+
+    (host.unwrap_or_else(|| DEFAULT_HOST.to_string()), port.unwrap_or(DEFAULT_PORT), cli_override, timeout)
 }
 
 #[tokio::main]
@@ -2321,22 +2587,68 @@ async fn main() {
     // are migrated to the canonical location (~/.atomcode/sessions) before any handler reads it.
     SessionManager::migrate_from_legacy();
 
+    // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default
+    let cfg_telemetry = match Config::load(&Config::default_path()) {
+        Ok(c) => c.telemetry,
+        Err(e) => {
+            tracing::warn!(?e, "Failed to load config, using defaults");
+            atomcode_telemetry::TelemetryConfig::default()
+        }
+    };
+
+    // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
+    let (host, port, cli_override, idle_timeout_secs) = parse_daemon_args();
+    let resolved = resolve(&cfg_telemetry, &cli_override, Config::config_dir(), &ProcessEnv);
+
+    // Step 3: Print telemetry status line (R2.6)
+    match &resolved.state {
+        TelemetryState::Enabled => println!("Telemetry: enabled"),
+        TelemetryState::Disabled(reason) => println!("Telemetry: disabled (reason: {})", reason),
+    }
+
+    // Step 4: Initialize telemetry runtime (R1.3, R1.6)
+    let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
+
+    // Step 4.5: Install panic hook (R9.1, R9.2, R9.3, R9.4)
+    install_panic_hook(telemetry.clone());
+
+    // Step 5: Precompute repo_origin (R4.2)
+    // Use the project working directory (from config or cwd) rather than the
+    // raw process cwd, because VS Code may spawn the daemon with a cwd that
+    // is not inside a git repository (e.g. the extension install directory).
+    let project_state = init_project_state();
+    let repo_origin = detect_repo_origin(&project_state.working_dir);
+
+    // Step 6: Seed account_id from stored auth (R4.3)
+    telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id));
+
     // Initialize MCP registry from user config (~/.atomcode/mcp.json)
     let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let mcp_registry = McpRegistry::from_config_background(&home_dir);
 
+    // Step 7: Build AppState (R1.4)
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms()));
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let state = AppState {
         sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        project: Arc::new(RwLock::new(init_project_state())),
+        project: Arc::new(RwLock::new(project_state)),
         chat_tasks: Arc::new(RwLock::new(HashMap::new())),
         stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
         login_sessions: Arc::new(RwLock::new(HashMap::new())),
+        telemetry: telemetry.clone(),
+        repo_origin: repo_origin.clone(),
+        shutdown_tx: shutdown_tx.clone(),
+        last_activity: last_activity.clone(),
+        active_connections: active_connections.clone(),
     };
 
     let app = Router::new()
         // Health check
         .route("/health", get(health))
+        // Shutdown endpoint (R7.1)
+        .route("/shutdown", post(shutdown_handler))
         // Session APIs
         .route("/sessions", get(get_all_sessions).post(create_session))
         .route("/sessions/search", get(search_sessions))
@@ -2391,7 +2703,22 @@ async fn main() {
         // CodingPlan API (P0)
         .route("/codingplan/setup", post(api_codingplan::codingplan_setup))
         .with_state(state)
+        .layer(axum::middleware::from_fn(activity_tracker_middleware))
+        .layer(axum::Extension(last_activity.clone()))
         .layer(cors_layer());
+
+    // Spawn idle timeout watchdog task
+    spawn_idle_timeout_task(
+        idle_timeout_secs,
+        last_activity,
+        active_connections,
+        shutdown_tx,
+    );
+    if idle_timeout_secs > 0 {
+        println!("Idle timeout: {} minutes", idle_timeout_secs / 60);
+    } else {
+        println!("Idle timeout: disabled");
+    }
 
     // Default to loopback-only for security. The daemon hosts chat / file-edit /
     // tool-execution endpoints that should not be reachable from another host on
@@ -2402,7 +2729,6 @@ async fn main() {
     // Users can override the bind address via --host <ip>. When binding a
     // non-loopback address, a security warning is printed. For production use,
     // consider running a reverse proxy in front instead.
-    let (host, port) = daemon_addr_from_args();
     let addr = format!("{host}:{port}");
     if host != "127.0.0.1" && host != "localhost" && host != "::1" {
         eprintln!(
@@ -2453,8 +2779,51 @@ async fn main() {
     println!("\nChat request body:");
     println!("  {{\"message\": \"your question\", \"provider\": \"optional\"}}");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // Step 9: Bind listener (R4.1 gate)
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Fatal: failed to bind to {}: {}", addr, e);
+            // Step 12: On bind failure, still emit OpenAtomcode (R4.4) then exit
+            CurrentContext::scope(
+                CurrentContext {
+                    mode: Some(SessionMode::Ide),
+                    repo_origin: Some(repo_origin.clone()),
+                    session_id: None,
+                    ..CurrentContext::default()
+                },
+                || async {
+                    telemetry.track(Event::OpenAtomcode);
+                },
+            )
+            .await;
+            telemetry.shutdown(Duration::from_millis(500)).await;
+            std::process::exit(1);
+        }
+    };
+
+    // Steps 10-11: Enter CurrentContext scope and emit OpenAtomcode (R4.1, R4.2)
+    CurrentContext::scope(
+        CurrentContext {
+            mode: Some(SessionMode::Ide),
+            repo_origin: Some(repo_origin.clone()),
+            session_id: None,
+            ..CurrentContext::default()
+        },
+        || async {
+            telemetry.track(Event::OpenAtomcode);
+        },
+    )
+    .await;
+
+    // Step 13: Serve with graceful shutdown (R10.1-R10.5)
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await
+        .unwrap_or_else(|e| tracing::error!(?e, "axum::serve error"));
+
+    // Step 14: Final telemetry flush before process exit (R10.2-R10.5)
+    telemetry.shutdown(Duration::from_millis(500)).await;
 }
 
 #[cfg(test)]
