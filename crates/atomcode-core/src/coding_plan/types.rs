@@ -22,10 +22,19 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// CodingPlan tier the user is attempting to claim or has claimed.
-/// Wire form is the literal `Max` / `Pro` / `Lite` strings the v2
-/// endpoints accept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// CodingPlan tier the user holds — the source of truth is
+/// `StatusResponse::plan_type` (server-determined). The wire form is
+/// the literal `Max` / `Pro` / `Lite` strings, both on `?plan_type=`
+/// query args and in JSON bodies.
+///
+/// Pre-prod's `claim-v2` accepts and acks any of the three with an
+/// identical success response — it does NOT downgrade-on-ineligible
+/// at the claim layer. The actual entitlement is computed elsewhere
+/// and surfaces only via `/status-v2`. So `step_claim` doesn't try to
+/// derive a tier from the claim response; the orchestrator runs
+/// `step_status` BEFORE `step_models` and feeds `status.plan_type`
+/// into `models-v2?plan_type=` — the only authoritative path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum PlanType {
     Max,
     Pro,
@@ -42,11 +51,6 @@ impl PlanType {
             PlanType::Lite => "Lite",
         }
     }
-
-    /// Cascade order: highest tier first. Used by `step_claim` to walk
-    /// `Max → Pro → Lite` and stop at the first successful claim.
-    pub const CASCADE_ORDER: &'static [PlanType] =
-        &[PlanType::Max, PlanType::Pro, PlanType::Lite];
 }
 
 /// `POST /api/v5/coding-plan/claim-v2` response.
@@ -81,7 +85,7 @@ pub struct ModelEntry {
     pub plan_available: bool,
 }
 
-/// `GET /api/v5/coding-plan/status` response envelope.
+/// `GET /api/v5/coding-plan/status-v2` response envelope.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StatusResponse {
     /// Current CodingPlan summary. `None` when the user hasn't claimed
@@ -98,6 +102,15 @@ pub struct StatusResponse {
     pub window_quota_exhausted: bool,
     #[serde(default)]
     pub window_quota_hint: Option<String>,
+    /// Top-level tier marker added in v2 — same value as
+    /// `codingplan_free.plan_type` when both are present. The
+    /// orchestrator reads this preferentially so the field stays
+    /// available even on edge cases where the backend omits the
+    /// nested PlanInfo (rare; observed during fresh-claim
+    /// propagation windows). `None` when the user has no active
+    /// entitlement at all.
+    #[serde(default)]
+    pub plan_type: Option<PlanType>,
 }
 
 /// CodingPlan entitlement summary (inside `StatusResponse`).
@@ -105,6 +118,12 @@ pub struct StatusResponse {
 pub struct PlanInfo {
     #[serde(default)]
     pub plan_name: String,
+    /// Tier classifier added in v2 — `Max` / `Pro` / `Lite`. Same
+    /// value as the top-level `StatusResponse::plan_type` when both
+    /// are present; we keep both because the backend ships the
+    /// duplicate field and we want the renderer free to read either.
+    #[serde(default)]
+    pub plan_type: Option<PlanType>,
     #[serde(default)]
     pub status: i32,
     /// Backend sends JSON `null` for unactivated claims — must absorb
@@ -221,17 +240,51 @@ mod tests {
 
     /// PlanType wire form must match the literal strings the v2
     /// endpoints accept — case-sensitive, no internal aliasing.
-    /// Cascade order is the contract `step_claim` walks Max-first.
+    /// Both as the outgoing `?plan_type=` arg form and as a Deserialize
+    /// target on incoming `status-v2` payloads.
     #[test]
-    fn plan_type_wire_form_and_cascade() {
+    fn plan_type_wire_form_round_trip() {
         assert_eq!(PlanType::Max.as_str(), "Max");
         assert_eq!(PlanType::Pro.as_str(), "Pro");
         assert_eq!(PlanType::Lite.as_str(), "Lite");
-        assert_eq!(
-            PlanType::CASCADE_ORDER,
-            &[PlanType::Max, PlanType::Pro, PlanType::Lite],
-            "cascade must walk highest tier first"
-        );
+        // Deserialize: bare JSON string → enum variant.
+        let max: PlanType = serde_json::from_str("\"Max\"").unwrap();
+        let pro: PlanType = serde_json::from_str("\"Pro\"").unwrap();
+        let lite: PlanType = serde_json::from_str("\"Lite\"").unwrap();
+        assert_eq!(max, PlanType::Max);
+        assert_eq!(pro, PlanType::Pro);
+        assert_eq!(lite, PlanType::Lite);
+    }
+
+    /// Real `/status-v2` response from pre-prod (snapshot 2026-05-09):
+    /// the source of truth for the user's tier is the top-level
+    /// `plan_type` field AND the nested `codingplan_free.plan_type`
+    /// (both carry the same value). Parser must lift both.
+    #[test]
+    fn status_v2_lifts_plan_type_at_both_levels() {
+        let body = r#"{
+            "codingplan_free": {
+                "plan_name": "CodingPlan Lite",
+                "plan_type": "Lite",
+                "status": 1,
+                "claimed_at": "2026-04-22",
+                "expires_at": "2026-05-22",
+                "remaining_days": 13,
+                "total_days": 30,
+                "apply_id": 92
+            },
+            "current_usage": null,
+            "audit_status": 1,
+            "plan_type": "Lite",
+            "expires_at": "2026-05-22",
+            "window_quota_exhausted": false,
+            "window_quota_hint": null
+        }"#;
+        let s: StatusResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(s.plan_type, Some(PlanType::Lite));
+        let plan = s.codingplan_free.unwrap();
+        assert_eq!(plan.plan_type, Some(PlanType::Lite));
+        assert_eq!(plan.plan_name, "CodingPlan Lite");
     }
 
     #[test]
