@@ -1499,6 +1499,33 @@ mod menu_tests {
         assert_eq!(line, "describe [Image #1]");
         assert_eq!(state.pending_image_markers, vec![1]);
     }
+
+    #[test]
+    fn hydrate_runs_for_streaming_queued_submit_too() {
+        // Regression: handle_streaming_key's Commit branch must also
+        // hydrate `pending_recalled_attachments` so a user who pressed
+        // ↑ during streaming and queued the recalled message travels
+        // with their image. Pre-fix, the queue carried empty images.
+        use crate::input::history::HistoryImageRef;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        std::fs::write(cache_dir.join("deadbeef12345678.png"), b"\x89PNG").unwrap();
+
+        let mut state = UiState::new();
+        state.pending_recalled_attachments.push(HistoryImageRef {
+            hash: "deadbeef12345678".into(),
+            mt: "image/png".into(),
+            n: 4,
+        });
+        let mut line = "describe [Image #4]".to_string();
+        let _ = super::hydrate_recalled_attachments(&mut state, &mut line, &cache_dir);
+        // After hydrate, the line + pending state should match what the
+        // queued-submit pending-drain loop expects to see.
+        assert_eq!(state.pending_images.len(), 1);
+        assert_eq!(line, "describe [Image #1]"); // first paste this session
+        assert_eq!(state.pending_image_markers, vec![1]);
+        assert!(line.contains("[Image #1]"), "marker survives in line for the survival filter");
+    }
 }
 
 #[cfg(test)]
@@ -2394,7 +2421,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
         }
 
-        #[cfg(not(unix))]
+        // Was `cfg(not(unix))` to bracket the whole non-Unix select.
+        // Narrowed to `cfg(windows)` because the only arm that needs
+        // this branch (`win_ctrl_c.recv()`) is itself Windows-only,
+        // and tokio's `select!` macro doesn't accept arm-level
+        // `#[cfg(...)]` attributes — it tries to expand them inside
+        // its own ruleset and fails with "no rules expected `#`".
+        // We only support Unix + Windows, so cfg(not(unix)) ≡
+        // cfg(windows) for our build matrix anyway.
+        #[cfg(windows)]
         tokio::select! {
             biased;
 
@@ -2405,7 +2440,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // when that path is silent. Single-press exit: skips the
             // 2-press confirm because if we got here, the user has no
             // working keyboard route to confirm with anyway.
-            #[cfg(windows)]
             Some(()) = win_ctrl_c.recv() => {
                 crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
                 ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
@@ -4090,8 +4124,16 @@ fn handle_streaming_key(
                 );
                 return Ok(());
             }
-            // Expand any paste placeholders — agent sees full payload,
-            // scrollback echo stays compact.
+            // Hydrate recalled attachments BEFORE building the queue
+            // payload — same prelude as the idle submit path, so a user
+            // who pressed ↑ during streaming sees their recalled images
+            // travel with the queued message instead of being silently
+            // dropped on dispatch.
+            let mut line = line;
+            let cache_dir_for_hydrate = crate::platform::image_cache_dir();
+            for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir_for_hydrate) {
+                renderer.render(UiLine::Warning(n));
+            }
             let expanded = app.buf.expand_pastes(&line);
             // Mirror the main submit path's image filtering: only
             // attachments whose `[Image #N]` marker survived editing
