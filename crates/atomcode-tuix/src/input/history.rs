@@ -129,7 +129,37 @@ impl History {
             }))
             .collect::<Vec<_>>()
             .join("\n");
-        fs::write(&self.path, contents)
+        fs::write(&self.path, contents)?;
+        let _ = self.gc(); // best-effort; never fails the save
+        Ok(())
+    }
+
+    /// Best-effort garbage collection: remove any file in `cache_dir`
+    /// whose 16-char-hex prefix is not referenced by any current
+    /// history entry. Called automatically after each `save()`.
+    fn gc(&self) -> io::Result<()> {
+        use std::collections::HashSet;
+        let referenced: HashSet<&str> = self
+            .entries
+            .iter()
+            .flat_map(|e| e.images.iter().map(|i| i.hash.as_str()))
+            .collect();
+        let dir = match fs::read_dir(&self.cache_dir) {
+            Ok(d) => d,
+            Err(_) => return Ok(()), // dir missing — nothing to GC
+        };
+        for entry in dir.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let prefix = match name_str.split('.').next() {
+                Some(p) if p.len() == 16 && p.chars().all(|c| c.is_ascii_hexdigit()) => p,
+                _ => continue, // unrecognized — leave it alone
+            };
+            if !referenced.contains(prefix) {
+                let _ = fs::remove_file(entry.path()); // best-effort
+            }
+        }
+        Ok(())
     }
 }
 
@@ -282,5 +312,60 @@ mod tests {
         assert_eq!(h.entries()[0].images[0].hash, "deadbeef12345678");
         assert_eq!(h.entries()[1].text, "b");
         assert!(h.entries()[1].images.is_empty());
+    }
+
+    #[test]
+    fn gc_removes_orphan_cache_files() {
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join("image-cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("aaaaaaaaaaaaaaaa.png"), b"a").unwrap();
+        fs::write(cache.join("bbbbbbbbbbbbbbbb.png"), b"b").unwrap();
+        fs::write(cache.join("cccccccccccccccc.png"), b"c").unwrap();
+        let mut h = History::load_with_cache(dir.path().join("hist"), cache.clone());
+        // Reference only `aaaa…` and `bbbb…`.
+        h.push(HistoryEntry {
+            text: "x".into(),
+            images: vec![HistoryImageRef {
+                hash: "aaaaaaaaaaaaaaaa".into(),
+                mt: "image/png".into(),
+                n: 1,
+            }],
+        });
+        h.push(HistoryEntry {
+            text: "y".into(),
+            images: vec![HistoryImageRef {
+                hash: "bbbbbbbbbbbbbbbb".into(),
+                mt: "image/png".into(),
+                n: 1,
+            }],
+        });
+        h.save().unwrap();
+        assert!(cache.join("aaaaaaaaaaaaaaaa.png").exists());
+        assert!(cache.join("bbbbbbbbbbbbbbbb.png").exists());
+        assert!(!cache.join("cccccccccccccccc.png").exists(), "orphan should be GC'd");
+    }
+
+    #[test]
+    fn gc_keeps_unparseable_files() {
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join("image-cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("garbage.txt"), b"not a hash").unwrap();
+        fs::write(cache.join("short.png"), b"too short hex prefix").unwrap();
+        let h = History::load_with_cache(dir.path().join("hist"), cache.clone());
+        h.save().unwrap();
+        assert!(cache.join("garbage.txt").exists());
+        assert!(cache.join("short.png").exists());
+    }
+
+    #[test]
+    fn gc_skips_when_cache_dir_missing() {
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join("image-cache");  // does not exist
+        let mut h = History::load_with_cache(dir.path().join("hist"), cache);
+        h.push(HistoryEntry { text: "x".into(), images: vec![] });
+        // Must not error.
+        h.save().unwrap();
     }
 }
