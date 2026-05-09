@@ -54,6 +54,24 @@ pub fn render_line_with_width(
         return None;
     }
 
+    // Pre-drawn Unicode box-drawing table row (`┌─┬─┐ │ ├─┼─┤ └─┴─┘`).
+    // Some models — usually weaker ones mimicking earlier-turn output that
+    // we ourselves rendered — emit tables fully drawn in box characters
+    // instead of `|`-form markdown. Without detection, those rows fall
+    // through to the inline-only branch and `push_markdown_body`'s
+    // wrap-at-cell-level chops them at terminal width, shattering the
+    // borders (the macOS overflow case in the screenshot). Convert each
+    // row to the equivalent pipe form (│ → |, ─ → -, junctions → |) and
+    // route through the same buffer + flush path the `|`-form takes;
+    // `flush_aligned_table_with_width` then enforces flat-mode fallback
+    // for narrow terminals exactly like a real markdown table would get.
+    if !state.in_code_block {
+        if let Some(converted) = box_drawing_table_row(trimmed) {
+            state.table_buf.push(converted);
+            return None;
+        }
+    }
+
     // Non-table line arriving after buffered rows: flush as aligned block.
     let prefix = if !state.table_buf.is_empty() {
         let t = flush_aligned_table_with_width(&state.table_buf, caps, max_width);
@@ -153,6 +171,52 @@ pub fn finalize_with_width(
     let t = flush_aligned_table_with_width(&state.table_buf, caps, max_width);
     state.table_buf.clear();
     Some(t)
+}
+
+/// Recognise a pre-drawn Unicode box-drawing table line and return the
+/// equivalent `|`-pipe form so it can join the same buffering path as
+/// real markdown tables. Returns None for lines that aren't part of a box
+/// table.
+///
+/// Two row shapes accepted:
+///   1. **Data row** — starts with `│`. Each `│` becomes `|`; cell content
+///      passes through unchanged. Caller buffers the result and the
+///      existing flush logic splits on `|` and trims as usual.
+///   2. **Border row** — starts with `┌`/`├`/`└` AND every char is in the
+///      box-drawing set (`─┌┬┐├┼┤└┴┘`) plus spaces. Junctions become `|`
+///      and `─` becomes `-`, producing a `|---|---|`-style separator that
+///      `flush_aligned_table_with_width`'s `is_sep` matcher already
+///      recognises (its predicate is `[-: ]+` per cell).
+///
+/// The "every char is box-drawing" guard on border rows defends against
+/// false positives: a stray paragraph that happens to begin with `├` for
+/// some unrelated reason would NOT match (it has letters too).
+fn box_drawing_table_row(trimmed: &str) -> Option<String> {
+    let first = trimmed.chars().next()?;
+    match first {
+        '│' => Some(trimmed.replace('│', "|")),
+        '┌' | '├' | '└' => {
+            if trimmed.chars().all(|c| {
+                matches!(
+                    c,
+                    '─' | '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' | ' '
+                )
+            }) {
+                let converted: String = trimmed
+                    .chars()
+                    .map(|c| match c {
+                        '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' => '|',
+                        '─' => '-',
+                        other => other,
+                    })
+                    .collect();
+                Some(converted)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Flush a buffered markdown table as a column-aligned block. Computes the
@@ -756,5 +820,89 @@ mod tests {
 
         let narrow = flush_aligned_table_with_width(&rows, plain_caps(), 20);
         assert!(!narrow.contains('│'), "20 cols should fall back to flat");
+    }
+
+    /// Pre-drawn Unicode box-drawing tables (the `┌─┬─┐ │ ├─┼─┤ └─┴─┘`
+    /// shape some weak models emit instead of `|`-form markdown) must
+    /// route through the same flat-mode-aware flush path: at narrow widths
+    /// they collapse to `header：cell` records — no box characters survive.
+    /// This is the macOS-overflow regression captured in the screenshot.
+    #[test]
+    fn box_drawing_table_collapses_to_flat_when_narrow() {
+        let mut st = MdState::new();
+        let lines = [
+            "┌──────────────┬──────────────────────────────────────────┐",
+            "│ 场景         │ 作用                                     │",
+            "├──────────────┼──────────────────────────────────────────┤",
+            "│ 多文件并行编辑 │ parallel_edit_files 工具触发时分发给子智能体 │",
+            "├──────────────┼──────────────────────────────────────────┤",
+            "│ 弹性预算控制 │ 每个 SubAgent 有初始 4 轮对话预算          │",
+            "└──────────────┴──────────────────────────────────────────┘",
+            "", // boundary line triggers flush
+        ];
+        let mut out = String::new();
+        for line in &lines {
+            if let Some(r) = render_line_with_width(line, &mut st, plain_caps(), 30) {
+                out.push_str(&r);
+                out.push('\n');
+            }
+        }
+        // Narrow → flat-mode kicks in. No box corners survive.
+        assert!(
+            !out.contains('┌') && !out.contains('└'),
+            "narrow box-drawing table must collapse to flat:\n{out}"
+        );
+        // Each header label appears once per data row (2 data rows here).
+        assert_eq!(
+            out.matches("场景").count(),
+            2,
+            "header `场景` should label each data record:\n{out}"
+        );
+        assert_eq!(out.matches("作用").count(), 2);
+        // Cell content survives in full — no truncation.
+        assert!(out.contains("parallel_edit_files"));
+        assert!(out.contains("初始 4 轮"));
+    }
+
+    /// Wide terminal: a box-drawing table re-renders as a clean box at
+    /// natural widths (the input is converted to pipe form, then
+    /// `flush_aligned_table_with_width` re-emits its own box drawing).
+    #[test]
+    fn box_drawing_table_re_renders_as_box_when_fits() {
+        let mut st = MdState::new();
+        let lines = [
+            "┌─────┬─────┐",
+            "│ a   │ b   │",
+            "├─────┼─────┤",
+            "│ 1   │ 2   │",
+            "└─────┴─────┘",
+            "",
+        ];
+        let mut out = String::new();
+        for line in &lines {
+            if let Some(r) = render_line_with_width(line, &mut st, plain_caps(), 80) {
+                out.push_str(&r);
+                out.push('\n');
+            }
+        }
+        assert!(out.contains('┌'), "wide terminal should keep box rendering:\n{out}");
+        assert!(out.contains('└'));
+        assert!(out.contains("a") && out.contains("2"));
+    }
+
+    /// False-positive guard: a paragraph whose first character happens to
+    /// be `├` (or any junction) but has surrounding prose must NOT be
+    /// pulled into the box-table buffer. The border-row matcher requires
+    /// the entire trimmed line to consist of box-drawing chars + spaces.
+    #[test]
+    fn box_drawing_detection_does_not_swallow_prose_with_stray_box_char() {
+        let mut st = MdState::new();
+        // Prose that starts with `├` followed by regular words. Real-world
+        // probability is near-zero but the guard matters.
+        let line = "├ hello, this is not a table line";
+        let out = render_line_with_width(line, &mut st, plain_caps(), 80);
+        // Must render inline (Some), not buffer (None).
+        assert!(out.is_some(), "prose with stray junction must not buffer");
+        assert!(st.table_buf.is_empty(), "table_buf must stay empty");
     }
 }

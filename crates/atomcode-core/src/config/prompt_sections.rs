@@ -72,6 +72,7 @@ Do NOT restate what the user said — just do it.
 Skip filler words, preamble, and transitions.
 Focus output on: decisions needing user input, key findings, errors or blockers.
 Use tables for structured data.
+Tables MUST use `|`-pipe markdown form (`| col1 | col2 |` with `|---|---|` separator). NEVER pre-draw tables with Unicode box-drawing characters (┌ ─ ┐ │ ├ ┼ ┤ └ ┴ ┘) — the renderer relies on the `|` form to detect the table and re-flow it for narrow terminals; pre-drawn box tables overflow on small screens and break alignment.
 Match the user's language. If the user writes in Chinese, respond in Chinese. If in English, respond in English.
 
 ## CHINESE CODE SUPPORT:
