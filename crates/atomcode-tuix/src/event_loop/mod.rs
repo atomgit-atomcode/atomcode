@@ -601,6 +601,15 @@ impl Buffer {
         self.history_idx.is_some()
     }
 
+    /// The index into history of the entry currently being displayed,
+    /// or `None` if the buffer is showing the user's own draft. Used
+    /// by `event_loop` to look up `HistoryEntry::images` after every
+    /// `apply()` so `pending_recalled_attachments` mirrors what the
+    /// buffer is showing.
+    pub fn history_idx(&self) -> Option<usize> {
+        self.history_idx
+    }
+
     /// Insert a pasted block. Folds into a `[Pasted …]` placeholder if
     /// the block exceeds the fold threshold, keeping the visible input
     /// terse. Returns the placeholder that was inserted (or the raw
@@ -1249,6 +1258,37 @@ mod menu_tests {
         assert!(buf.is_in_history());
         let _ = buf.apply(Action::Insert('x'), &history, &reg);
         assert!(!buf.is_in_history());
+    }
+
+    #[test]
+    fn sync_recalled_attachments_mirrors_buffer_history_idx() {
+        use crate::input::history::{HistoryEntry, HistoryImageRef};
+        let history: Vec<HistoryEntry> = vec![
+            HistoryEntry { text: "no img".into(), images: vec![] },
+            HistoryEntry {
+                text: "with img".into(),
+                images: vec![HistoryImageRef {
+                    hash: "deadbeef12345678".into(),
+                    mt: "image/png".into(),
+                    n: 1,
+                }],
+            },
+        ];
+        let reg = CommandRegistry::builtin();
+        let mut buf = Buffer::new();
+        let mut state = UiState::new();
+        // ↑ once → newest entry (idx=1, has image).
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert_eq!(state.pending_recalled_attachments.len(), 1);
+        // ↑ again → idx=0, no images.
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert!(state.pending_recalled_attachments.is_empty());
+        // Type a char → history_idx clears → recalled clears too.
+        let _ = buf.apply(Action::Insert('a'), &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert!(state.pending_recalled_attachments.is_empty());
     }
 }
 
@@ -3260,6 +3300,7 @@ fn handle_idle_key(
 
     let action = classify(code, modifiers);
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
         "KEY",
         "idle result={} buf_len={} cursor={}",
@@ -3453,6 +3494,26 @@ fn redraw_with_menu(
         status: build_status(state, ctx),
     });
     renderer.flush();
+}
+
+/// Synchronize `state.pending_recalled_attachments` with whatever
+/// history entry the buffer is currently showing. Called after every
+/// `buf.apply()` so:
+///   - HistoryPrev/Next sets the recalled attachments to the new entry
+///   - Insert/Delete (which clear `history_idx` to None) clear them
+pub(crate) fn sync_recalled_attachments(
+    state: &mut UiState,
+    buf: &Buffer,
+    history: &[crate::input::history::HistoryEntry],
+) {
+    match buf.history_idx() {
+        Some(i) if i < history.len() => {
+            state.pending_recalled_attachments = history[i].images.clone();
+        }
+        _ => {
+            state.pending_recalled_attachments.clear();
+        }
+    }
 }
 
 /// Idle prompt without any menu/picker — used by the common
@@ -3671,7 +3732,9 @@ fn handle_streaming_key(
     }
 
     let action = classify(code, modifiers);
-    match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
+    let apply_result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
+    match apply_result {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it

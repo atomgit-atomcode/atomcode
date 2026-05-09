@@ -405,7 +405,7 @@ fn handle_key(
                 }
             }
             // Forward other keys to the buffer so typing / editing works.
-            forward_to_buffer(code, _mods, buf, ctx);
+            forward_to_buffer(code, _mods, buf, state, ctx);
             *wizard = ProviderWizard::Add { step, draft };
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
@@ -454,7 +454,7 @@ fn handle_key(
                     }
                 }
             }
-            forward_to_buffer(code, _mods, buf, ctx);
+            forward_to_buffer(code, _mods, buf, state, ctx);
             *wizard = ProviderWizard::Edit {
                 target,
                 step,
@@ -672,7 +672,8 @@ fn advance_edit(
 
 /// Route a keystroke into `Buffer::apply` so text-input wizard steps
 /// support the usual editing shortcuts (Backspace / Left / Right / etc).
-fn forward_to_buffer(code: KeyCode, modifiers: KeyModifiers, buf: &mut Buffer, ctx: &LoopCtx) {
+fn forward_to_buffer(code: KeyCode, modifiers: KeyModifiers, buf: &mut Buffer, state: &mut UiState, ctx: &LoopCtx) {
     let action = classify(code, modifiers);
     let _ = buf.apply(action, ctx.history.entries(), &ctx.commands);
+    crate::event_loop::sync_recalled_attachments(state, buf, ctx.history.entries());
 }
