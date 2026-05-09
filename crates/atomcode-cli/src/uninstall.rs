@@ -344,6 +344,10 @@ fn print_summary(outcome: &Outcome) {
 }
 
 fn build_context(plan: &atomcode_core::uninstall::scan::Plan) -> anyhow::Result<ExecuteContext> {
+    // `mut` is only used by the `#[cfg(unix)]` branch below — Windows
+    // builds compile this as a never-mutated `Vec`. Suppress the lint
+    // there rather than duplicate the let with cfg gates.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut rc_files = Vec::new();
     #[cfg(unix)]
     {
