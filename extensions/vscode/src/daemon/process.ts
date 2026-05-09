@@ -4,7 +4,10 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import { DaemonClient } from './client';
+import { HealthResponse } from './types';
 import { DEFAULT_PORT } from '../config';
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 interface DaemonBinary {
   path: string;
@@ -28,15 +31,163 @@ export class DaemonProcess {
   }
 
   async ensureRunning(): Promise<boolean> {
-    if (await this.client.isRunning()) {
+    const health = await this.tryGetHealth();
+
+    if (health) {
+      const expected = this.getExpectedVersion();
+      if (!expected || health.version === expected) {
+        // Version matches (or we can't determine expected version), reuse running daemon
+        return true;
+      }
+
+      // Version mismatch — restart
+      console.log(`[AtomCode] Daemon version mismatch: running=${health.version}, expected=${expected}. Restarting...`);
+
+      const shutdownOk = await this.shutdownDaemon();
+      if (shutdownOk) {
+        console.log('[AtomCode] Old daemon stopped successfully');
+      }
+
+      const started = await this.start();
+      if (!started) {
+        // start() failed — check if another window already started the correct version
+        const postHealth = await this.tryGetHealth();
+        if (postHealth && postHealth.version === expected) {
+          console.log(`[AtomCode] Daemon restarted to version ${expected}`);
+          return true;
+        }
+        return false;
+      }
+
+      // Verify new version after start
+      const newHealth = await this.tryGetHealth();
+      if (newHealth && newHealth.version === expected) {
+        console.log(`[AtomCode] Daemon restarted to version ${expected}`);
+        return true;
+      }
+
+      // Another window may have started a different version, but daemon is running
+      if (newHealth) {
+        console.warn(`[AtomCode] New daemon version ${newHealth.version} does not match expected ${expected}`);
+      }
       return true;
     }
 
+    // Daemon not running
     if (!this.autoStart) {
       return false;
     }
 
     return this.start();
+  }
+
+  private getExpectedVersion(): string {
+    // Read the daemon version from the bundled manifest file written by
+    // bundle-daemon.js at package time. This is the CARGO_PKG_VERSION of
+    // the daemon binary shipped with this extension — NOT the extension's
+    // own package.json version (which uses a different versioning scheme).
+    const versionFile = path.join(this.extensionUri.fsPath, 'resources', 'bin', 'daemon-version.txt');
+    try {
+      const version = fs.readFileSync(versionFile, 'utf-8').trim();
+      if (version) {
+        return version;
+      }
+    } catch {
+      // File missing — extension may not have been packaged with bundle-daemon
+    }
+    console.warn('[AtomCode] Could not read daemon-version.txt, skipping version check');
+    return '';
+  }
+
+  private async tryGetHealth(): Promise<HealthResponse | null> {
+    try {
+      return await this.client.health();
+    } catch {
+      return null;
+    }
+  }
+
+  private async shutdownDaemon(): Promise<boolean> {
+    // Step 1: Try graceful shutdown via HTTP endpoint
+    try {
+      await this.client.shutdown();
+    } catch {
+      // Old daemon may not support /shutdown, or already exiting — ignore
+    }
+
+    // Step 2: Poll until daemon exits or timeout (3s for graceful)
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      await sleep(100);
+      if (!(await this.client.isRunning())) {
+        return true;
+      }
+    }
+
+    // Step 3: Graceful shutdown failed — force kill the process on the port
+    console.warn('[AtomCode] Graceful shutdown timed out, attempting force kill');
+    try {
+      if (process.platform === 'win32') {
+        // Windows: find and kill process on port
+        child_process.execSync(
+          `for /f "tokens=5" %a in ('netstat -aon ^| findstr :${this.defaultPort} ^| findstr LISTENING') do taskkill /F /PID %a`,
+          { stdio: 'ignore', shell: 'cmd.exe' }
+        );
+      } else {
+        // macOS/Linux: lsof to find PID(s), then kill
+        const output = child_process.execSync(
+          `lsof -ti tcp:${this.defaultPort} -sTCP:LISTEN`,
+          { encoding: 'utf-8' }
+        ).trim();
+        if (output) {
+          for (const line of output.split('\n')) {
+            const pid = parseInt(line.trim(), 10);
+            if (pid > 0) {
+              try { process.kill(pid, 'SIGTERM'); } catch { /* already exited */ }
+            }
+          }
+        }
+      }
+    } catch {
+      // kill failed — process may have already exited or we lack permissions
+    }
+
+    // Step 4: Wait briefly for SIGTERM to take effect
+    const forceDeadline = Date.now() + 2000;
+    while (Date.now() < forceDeadline) {
+      await sleep(100);
+      if (!(await this.client.isRunning())) {
+        return true;
+      }
+    }
+
+    // Step 5: SIGTERM didn't work — escalate to SIGKILL (Unix only)
+    if (process.platform !== 'win32') {
+      console.warn('[AtomCode] SIGTERM failed, sending SIGKILL');
+      try {
+        const output = child_process.execSync(
+          `lsof -ti tcp:${this.defaultPort} -sTCP:LISTEN`,
+          { encoding: 'utf-8' }
+        ).trim();
+        if (output) {
+          for (const line of output.split('\n')) {
+            const pid = parseInt(line.trim(), 10);
+            if (pid > 0) {
+              try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
+            }
+          }
+        }
+      } catch { /* ignore */ }
+
+      // Brief wait for SIGKILL to take effect
+      await sleep(500);
+      if (!(await this.client.isRunning())) {
+        return true;
+      }
+    }
+
+    console.warn('[AtomCode] Daemon did not exit after force kill. Manual intervention may be needed.');
+    return false;
   }
 
   private async start(): Promise<boolean> {

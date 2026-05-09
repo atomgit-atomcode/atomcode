@@ -73,3 +73,18 @@ if (copied === 0 && requireBinary) {
   console.error('[bundle-daemon] no daemon binaries were bundled.');
   process.exit(1);
 }
+
+// Write daemon-version.txt from workspace Cargo.toml so the extension can
+// compare the bundled daemon version against the running daemon's /health.
+const cargoToml = path.join(repoRoot, 'Cargo.toml');
+if (fs.existsSync(cargoToml)) {
+  const content = fs.readFileSync(cargoToml, 'utf-8');
+  const match = content.match(/^\[workspace\.package\]\s*\n(?:.*\n)*?version\s*=\s*"([^"]+)"/m);
+  if (match) {
+    const versionFile = path.join(outRoot, 'daemon-version.txt');
+    fs.writeFileSync(versionFile, match[1].trim());
+    console.log(`[bundle-daemon] wrote daemon-version.txt: ${match[1].trim()}`);
+  } else {
+    console.warn('[bundle-daemon] could not parse version from workspace Cargo.toml');
+  }
+}

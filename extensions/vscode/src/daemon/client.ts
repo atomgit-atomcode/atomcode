@@ -28,6 +28,8 @@ export class DaemonClient {
   private baseUrl: string;
   private host: string;
   private port: number;
+  /** Called when a request fails with ECONNREFUSED. If set, the client retries once after this resolves. */
+  public onConnectionLost?: () => Promise<boolean>;
 
   constructor(port: number) {
     this.port = port;
@@ -38,6 +40,22 @@ export class DaemonClient {
   // ── REST helpers ──────────────────────────────────────────────
 
   private request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    return this.requestOnce<T>(method, path, body).catch(async (err) => {
+      // Auto-reconnect: if daemon is down and we have a reconnect handler, try to restart it.
+      // Skip reconnect for health/shutdown endpoints to avoid infinite recursion.
+      if (err instanceof Error && err.message === 'Daemon not running'
+          && this.onConnectionLost
+          && path !== '/health' && path !== '/shutdown') {
+        const restarted = await this.onConnectionLost();
+        if (restarted) {
+          return this.requestOnce<T>(method, path, body);
+        }
+      }
+      throw err;
+    });
+  }
+
+  private requestOnce<T>(method: string, path: string, body?: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
       const payload = body ? JSON.stringify(body) : undefined;
       const options: http.RequestOptions = {
@@ -127,6 +145,12 @@ export class DaemonClient {
 
   health(): Promise<HealthResponse> {
     return this.get<HealthResponse>('/health');
+  }
+
+  // ── Shutdown ───────────────────────────────────────────────────
+
+  shutdown(): Promise<{ success: boolean }> {
+    return this.post<{ success: boolean }>('/shutdown');
   }
 
   // ── Project ───────────────────────────────────────────────────
@@ -308,7 +332,23 @@ export class DaemonClient {
 
     httpReq.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'ECONNREFUSED') {
-        callbacks.onError('Daemon not running');
+        // Try auto-reconnect for streaming too
+        if (this.onConnectionLost) {
+          this.onConnectionLost().then((restarted) => {
+            if (restarted) {
+              // Retry the stream by calling streamChat again
+              const retryController = this.streamChat(req, callbacks);
+              // Forward abort from original controller to retry
+              controller.signal.addEventListener('abort', () => retryController.abort());
+            } else {
+              callbacks.onError('Daemon not running');
+            }
+          }).catch(() => {
+            callbacks.onError('Daemon not running');
+          });
+        } else {
+          callbacks.onError('Daemon not running');
+        }
       } else if (controller.signal.aborted) {
         // Intentional abort, don't report as error
         callbacks.onStopped();

@@ -29,6 +29,17 @@ export async function activate(context: vscode.ExtensionContext) {
     autoStart: config.autoStart,
   });
 
+  // Wire auto-reconnect: if daemon exits (idle timeout), restart it on next request.
+  // Use a shared promise to prevent concurrent reconnection attempts from spawning
+  // multiple daemon processes.
+  let reconnecting: Promise<boolean> | null = null;
+  extensionState.client.onConnectionLost = async () => {
+    if (!reconnecting) {
+      reconnecting = extensionState.daemonProcess.ensureRunning().finally(() => { reconnecting = null; });
+    }
+    return reconnecting;
+  };
+
   // 2. Initialize status bar
   extensionState.statusBar = new StatusBarManager();
   context.subscriptions.push({ dispose: () => extensionState.statusBar.dispose() });
