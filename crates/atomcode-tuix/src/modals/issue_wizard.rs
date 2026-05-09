@@ -148,6 +148,7 @@ impl Modal for IssueWizard {
             cursor_byte: buf.cursor,
             menu: None,
             status: build_status(state, ctx),
+            attachments: Vec::new(),
         });
         renderer.flush();
     }

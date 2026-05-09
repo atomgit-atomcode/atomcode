@@ -242,6 +242,17 @@ pub struct RetainedRenderer<W: Write + Send> {
     input_cursor_byte: usize,
     menu: Option<MenuPayload>,
     status: StatusLine,
+    /// Marker numbers (`N`) that should render as `└ [Image #N]`
+    /// preview rows directly under the input box. Pre-computed by
+    /// `event_loop::compute_input_attachments` (intersect of buffer
+    /// `[Image #N]` markers with `pending_image_markers` +
+    /// `pending_recalled_attachments`), so we draw a row only when
+    /// the buffer text really maps to image bytes ready to ship —
+    /// not for literal `[Image #N]` strings the user typed by hand.
+    /// Always rendered in `Role::Muted`, mirroring the post-submit
+    /// `UiLine::ImageAttachment` echo style so the visual contract
+    /// pre- and post-submit reads identically.
+    input_attachments: Vec<usize>,
     // ── body history ──
     /// Pre-wrapped body rows, oldest first. Trimmed when exceeds
     /// 2× screen height. Symbol-bearing rows (`❯`, `▸`, `▶`, `⎿`)
@@ -367,6 +378,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             input_cursor_byte: 0,
             menu: None,
             status: StatusLine::default(),
+            input_attachments: Vec::new(),
             body_lines: Vec::new(),
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
@@ -806,11 +818,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // longer reserves a spinner slot. Footer layout:
         //   top_rule / middle... / bot_rule / menu... / status
         let menu_rows = menu_items.len().min(4);
+        // Attachment-preview rows: one `└ [Image #N]` per kept marker,
+        // sitting between bot_rule and the menu. The list arrives
+        // pre-filtered by `compute_input_attachments` (only markers
+        // backed by real bytes survive), so we trust it directly here
+        // and don't re-validate against `input_buf`.
+        let attachment_rows = self.input_attachments.len();
         let has_status = !self.status.model.is_empty()
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        let total_rows = 1 + middle_rows + 1 + menu_rows + status_rows;
+        let total_rows = 1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows;
         let footer_top = h.saturating_sub(total_rows);
 
         // Pre-build every row vector (immutable borrows of self).
@@ -840,6 +858,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 self.build_menu_row(name, desc, selected, rule_width, menu_kind)
             })
             .collect();
+        // Attachment rows: `  └ [Image #N]` in muted gray, identical
+        // visual treatment to the post-submit `UiLine::ImageAttachment`
+        // echo. PAD_COL is the leading 2-space indent every body /
+        // footer info row uses; the `└` then sits at col 2, aligned
+        // with the `[` of `[Image #N]` in the user input above.
+        let attachment_cells: Vec<Vec<Cell>> = self
+            .input_attachments
+            .iter()
+            .map(|n| {
+                let mut row = Vec::new();
+                let pad = CellStyle::default();
+                push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
+                let muted = self.style_for(Role::Muted);
+                push_str_cells(&mut row, &format!("└ [Image #{}]", n), &muted);
+                row
+            })
+            .collect();
 
         // Mutate screen (now &mut self). Every footer row is padded to
         // screen width before emit so blank cells overwrite any stale
@@ -860,16 +895,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self::pad_row_to_width(&mut bot_rule, w);
         self.screen.draw_row(bot_rule_row, 0, &bot_rule);
 
-        for (i, r) in menu_cells.into_iter().enumerate() {
+        for (i, r) in attachment_cells.into_iter().enumerate() {
             let mut padded = r;
             Self::pad_row_to_width(&mut padded, w);
             self.screen.draw_row(bot_rule_row + 1 + i, 0, &padded);
         }
+
+        let menu_top = bot_rule_row + 1 + attachment_rows;
+        for (i, r) in menu_cells.into_iter().enumerate() {
+            let mut padded = r;
+            Self::pad_row_to_width(&mut padded, w);
+            self.screen.draw_row(menu_top + i, 0, &padded);
+        }
         if let Some(st) = status_cells {
             let mut padded = st;
             Self::pad_row_to_width(&mut padded, w);
-            self.screen
-                .draw_row(bot_rule_row + 1 + menu_rows, 0, &padded);
+            self.screen.draw_row(menu_top + menu_rows, 0, &padded);
         }
 
         // Cursor park — 1-indexed, inside middle row at the input cell.
@@ -919,10 +960,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || !self.status.cwd.is_empty()
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
-        // 1 top rule + middle + 1 bot rule + menu + status.
+        let attachment_rows = self.input_attachments.len();
+        // 1 top rule + middle + 1 bot rule + attachments + menu + status.
         // (Spinner used to reserve a row here but now lives in body as
         // a live paragraph — see `push_or_update_live_spinner`.)
-        1 + middle_rows + 1 + menu_rows + status_rows
+        1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows
     }
 
     /// Single-entry-point for painting a full frame. Body is already
@@ -1770,6 +1812,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 cursor_byte,
                 menu,
                 status,
+                attachments,
             } => {
                 // Returning to idle input: the spinner row served its
                 // purpose — clear it from both body history and the
@@ -1780,6 +1823,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
+                self.input_attachments = attachments;
             }
             UiLine::StreamingBox {
                 buf,
@@ -1788,12 +1832,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 label,
                 status,
                 menu,
+                attachments,
             } => {
                 // Input box / status / menu still belong in the footer.
                 self.input_buf = buf;
                 self.input_cursor_byte = cursor_byte;
                 self.menu = menu;
                 self.status = status;
+                self.input_attachments = attachments;
                 // Spinner (frame + label) goes into body as a live
                 // paragraph header. Each tick replaces the previous
                 // wrapped rows via render_inflight_tool so long
@@ -3031,6 +3077,7 @@ mod tests {
             cursor_byte: 1,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let before = sample(&counter);
@@ -3041,6 +3088,7 @@ mod tests {
                 cursor_byte: s.len(),
                 menu: None,
                 status: status.clone(),
+                attachments: Vec::new(),
             });
         }
         r.flush_deferred();
@@ -3071,6 +3119,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
 
@@ -3084,6 +3133,7 @@ mod tests {
                     kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let open_cost = sample(&counter) - before_open;
@@ -3094,6 +3144,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let close_cost = sample(&counter) - before_close;
@@ -3108,6 +3159,7 @@ mod tests {
                     kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let before_nav = sample(&counter);
@@ -3121,6 +3173,7 @@ mod tests {
                     kind: crate::render::MenuKind::SlashCommand,
                 }),
                 status: status.clone(),
+                attachments: Vec::new(),
             });
         }
         r.flush_deferred();
@@ -3153,6 +3206,7 @@ mod tests {
             label: "Thinking".into(),
             status: status.clone(),
             menu: None,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let before_burst = sample(&counter);
@@ -3165,6 +3219,7 @@ mod tests {
                 label: "Thinking".into(),
                 status: status.clone(),
                 menu: None,
+                attachments: Vec::new(),
             });
         }
         r.flush_deferred();
@@ -3195,6 +3250,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
 
@@ -3210,6 +3266,7 @@ mod tests {
                 cursor_byte: buf.len(),
                 menu: None,
                 status: status.clone(),
+                attachments: Vec::new(),
             });
         }
         // Zero byte count so far — coalesce should hold every
@@ -3270,6 +3327,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let bytes_before = buf.lock().unwrap().len();
@@ -3296,6 +3354,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
 
@@ -3314,6 +3373,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let mut vterm_after = crate::test_term::VirtualTerminal::new(60, 16);
@@ -3360,6 +3420,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
 
@@ -3530,6 +3591,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.render(UiLine::ToolCallInFlight {
             id: "call_1".into(),
@@ -3560,6 +3622,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3596,6 +3659,7 @@ mod tests {
             cursor_byte: 11,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3610,6 +3674,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
 
@@ -3651,6 +3716,7 @@ mod tests {
             cursor_byte: 2,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3665,6 +3731,7 @@ mod tests {
             cursor_byte: long.len(),
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3703,6 +3770,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3713,6 +3781,7 @@ mod tests {
             cursor_byte: 9,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3761,6 +3830,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3775,6 +3845,7 @@ mod tests {
                     kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3847,6 +3918,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3894,6 +3966,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -3934,6 +4007,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let mut pre = crate::test_term::VirtualTerminal::new(40, 18);
@@ -3979,6 +4053,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let mut pre = crate::test_term::VirtualTerminal::new(80, 18);
@@ -4038,6 +4113,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         // Discard pre-resize bytes — this test only asserts on what
@@ -4113,6 +4189,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4163,6 +4240,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4194,6 +4272,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4228,6 +4307,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4252,6 +4332,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4286,6 +4367,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4313,6 +4395,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4383,6 +4466,7 @@ mod tests {
                 cursor_byte: 0,
                 menu: None,
                 status: status.clone(),
+                attachments: Vec::new(),
             });
             r.flush_deferred();
             drain_into_vterm(&buf, &mut vterm);
@@ -4450,6 +4534,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4512,6 +4597,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4536,6 +4622,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4557,6 +4644,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4652,6 +4740,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4712,6 +4801,7 @@ mod tests {
             label: "Thinking".into(),
             status: status.clone(),
             menu: None,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4766,6 +4856,7 @@ mod tests {
             label: "Thinking".into(),
             status: status.clone(),
             menu: None,
+            attachments: Vec::new(),
         });
         let after_first = r.body_lines.len();
         assert!(
@@ -4783,6 +4874,7 @@ mod tests {
                 label: "Thinking".into(),
                 status: status.clone(),
                 menu: None,
+                attachments: Vec::new(),
             });
         }
         assert_eq!(
@@ -4811,6 +4903,7 @@ mod tests {
             label: "Pondering".into(),
             status: status.clone(),
             menu: None,
+            attachments: Vec::new(),
         });
         r.render(UiLine::AssistantText("Hello world\n".into()));
         r.render(UiLine::InputPrompt {
@@ -4818,6 +4911,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4871,6 +4965,7 @@ mod tests {
             label: "Pondering".into(),
             status: status.clone(),
             menu: None,
+            attachments: Vec::new(),
         });
         // Leading `\n` warm-up from the model — this is the case
         // that produces the ghost blank before the fix.
@@ -4920,6 +5015,7 @@ mod tests {
             label: "Pondering".into(),
             status: status.clone(),
             menu: None,
+            attachments: Vec::new(),
         });
         r.render(UiLine::AssistantText("Hello world\n".into()));
         r.render(UiLine::InputPrompt {
@@ -4927,6 +5023,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -4978,6 +5075,7 @@ mod tests {
             label: "Pondering".into(),
             status: status.clone(),
             menu: None,
+            attachments: Vec::new(),
         });
         // Several animation ticks, then a final flush.
         for frame in ["⠙", "⠹", "⠸", "⠼"] {
@@ -4988,6 +5086,7 @@ mod tests {
                 label: "Pondering".into(),
                 status: status.clone(),
                 menu: None,
+                attachments: Vec::new(),
             });
         }
         r.flush_deferred();
@@ -5026,6 +5125,7 @@ mod tests {
             label: "Pondering".into(),
             status: status.clone(),
             menu: None,
+            attachments: Vec::new(),
         });
         // Directly back to input with no assistant output between.
         r.render(UiLine::InputPrompt {
@@ -5033,6 +5133,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5062,6 +5163,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5120,6 +5222,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5155,6 +5258,7 @@ mod tests {
             cursor_byte: 2,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
 
@@ -5165,6 +5269,7 @@ mod tests {
             cursor_byte: long.len(),
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
 
@@ -5212,6 +5317,7 @@ mod tests {
             cursor_byte: long.len(),
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
 
@@ -5255,6 +5361,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         buf.lock().unwrap().clear();
@@ -5264,6 +5371,7 @@ mod tests {
             cursor_byte: 9,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let stream_bytes = std::mem::take(&mut *buf.lock().unwrap());
@@ -5313,6 +5421,7 @@ mod tests {
                 kind: crate::render::MenuKind::SlashCommand,
             }),
             status,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
 
@@ -5359,6 +5468,7 @@ mod tests {
             cursor_byte: 1,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         chunks.lock().unwrap().clear();
@@ -5369,6 +5479,7 @@ mod tests {
             cursor_byte: 2,
             menu: None,
             status,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         let sizes = chunks.lock().unwrap().clone();
@@ -5409,6 +5520,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5431,6 +5543,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5470,6 +5583,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5523,6 +5637,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5565,6 +5680,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5586,6 +5702,7 @@ mod tests {
                     kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5598,6 +5715,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5663,6 +5781,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5698,6 +5817,7 @@ mod tests {
             cursor_byte: long.len(),
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5744,6 +5864,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status,
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5805,6 +5926,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5865,6 +5987,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5876,6 +5999,7 @@ mod tests {
             cursor_byte: 1,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5887,6 +6011,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status.clone(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -5950,6 +6075,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -6034,6 +6160,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: status_basic(),
+            attachments: Vec::new(),
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -6053,6 +6180,92 @@ mod tests {
             !dump.contains("✓ child one"),
             "no ✓ should appear on the child after freeze:\n{}",
             dump
+        );
+    }
+
+    /// `attachments` from `UiLine::InputPrompt` paints a `└ [Image #N]`
+    /// preview row between the bot_rule and the menu — same string the
+    /// post-submit body echoes via `UiLine::ImageAttachment`. This is
+    /// the only visual signal users have pre-submit that a paste
+    /// actually attached an image (vs `[Image #N]` that they typed as
+    /// literal text).
+    #[test]
+    fn input_prompt_attachments_render_preview_rows() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "see [Image #3] please".into(),
+            cursor_byte: 21,
+            menu: None,
+            status: status_basic(),
+            attachments: vec![3],
+        });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        assert!(
+            dump.contains("└ [Image #3]"),
+            "preview row must render the muted `└ [Image #N]` echo string; got:\n{}",
+            dump
+        );
+    }
+
+    /// Empty `attachments` keeps the footer at its prior height — no
+    /// blank preview row, no off-by-one in `current_footer_rows()`.
+    /// Regression guard: an earlier draft would have incremented the
+    /// row count even when the vec was empty, pushing the input box
+    /// up by one row whenever `attachments` was wired through.
+    #[test]
+    fn input_prompt_no_attachments_keeps_footer_height() {
+        let (mut r, _) = new_capturing(80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "before".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        let baseline = r.current_footer_rows();
+        r.render(UiLine::InputPrompt {
+            buf: "no images here".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        assert_eq!(
+            r.current_footer_rows(),
+            baseline,
+            "empty attachments must not change footer height"
+        );
+    }
+
+    /// Footer height grows by exactly one row per attachment, so the
+    /// body anchor (computed from `current_footer_rows()`) tracks the
+    /// preview rows. Without this, a user with two attachments would
+    /// see the topmost body row clipped under the input box.
+    #[test]
+    fn input_prompt_each_attachment_adds_one_row() {
+        let (mut r, _) = new_capturing(80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        let baseline = r.current_footer_rows();
+        r.render(UiLine::InputPrompt {
+            buf: "[Image #1] [Image #2]".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: vec![1, 2],
+        });
+        assert_eq!(
+            r.current_footer_rows(),
+            baseline + 2,
+            "two attachments must add exactly two preview rows"
         );
     }
 }

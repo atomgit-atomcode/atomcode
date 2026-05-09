@@ -527,6 +527,7 @@ fn redraw(
         cursor_byte: buf.cursor,
         menu,
         status: build_status(state, ctx),
+        attachments: Vec::new(),
     });
     renderer.flush();
 }

@@ -576,6 +576,7 @@ mod tests {
             cursor_byte: 2,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
@@ -589,6 +590,7 @@ mod tests {
             cursor_byte: 2,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
@@ -654,6 +656,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();

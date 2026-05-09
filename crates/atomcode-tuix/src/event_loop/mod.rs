@@ -115,6 +115,71 @@ fn cache_write_image(cache_dir: &std::path::Path, img: &atomcode_core::conversat
     }
 }
 
+/// Compute the set of `[Image #N]` markers in `buf_text` whose `N`
+/// actually corresponds to image bytes that will be sent on submit.
+///
+/// Two sources count as "real attachment":
+///   1. Freshly-attached this session — the marker `N` lives in
+///      `state.pending_image_markers`, with bytes in
+///      `state.pending_images` at the same index.
+///   2. Cache-recalled via arrow-up — the marker `N` lives in
+///      `state.pending_recalled_attachments[*].n` (still using the
+///      saved-history numbering; will be renumbered on submit by
+///      `hydrate_recalled_attachments`).
+///
+/// Markers in `buf_text` that match neither (e.g. user typed
+/// `[Image #99]` literally as text) are excluded. Result preserves
+/// the order markers appear in `buf_text` and de-duplicates so the
+/// same marker referenced twice surfaces a single preview row.
+///
+/// Used by `redraw_idle_plain` / `draw_spinner_now` / similar to
+/// populate `UiLine::InputPrompt { attachments }`, which the
+/// renderer then turns into `└ [Image #N]` preview rows under the
+/// input box. Mirror of the post-submit echo (`UiLine::ImageAttachment`)
+/// — same visual treatment so users see the attachment status pre-
+/// AND post-submit identically.
+pub(crate) fn compute_input_attachments(
+    state: &crate::state::UiState,
+    buf_text: &str,
+) -> Vec<usize> {
+    let mut available: std::collections::HashSet<usize> =
+        state.pending_image_markers.iter().copied().collect();
+    for refed in &state.pending_recalled_attachments {
+        available.insert(refed.n);
+    }
+    if available.is_empty() {
+        return Vec::new();
+    }
+    // Walk `buf_text` once collecting `[Image #N]` markers in order.
+    // De-dupe while preserving first-occurrence order.
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let bytes = buf_text.as_bytes();
+    let needle = b"[Image #";
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let mut j = i + needle.len();
+            let mut n: usize = 0;
+            let mut had_digit = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n.saturating_mul(10).saturating_add((bytes[j] - b'0') as usize);
+                j += 1;
+                had_digit = true;
+            }
+            if had_digit && j < bytes.len() && bytes[j] == b']' {
+                if available.contains(&n) && seen.insert(n) {
+                    out.push(n);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Drain `state.pending_recalled_attachments`. For each entry: read the
 /// cache file, allocate a fresh marker via `session_image_count`, rewrite
 /// `[Image #old]` → `[Image #new]` in `line`, and push into the live
@@ -419,6 +484,71 @@ mod image_path_tests {
             try_attach_image_from_path(p.to_str().unwrap()).is_none(),
             "files over MAX_PATH_IMAGE_BYTES must be rejected before read"
         );
+    }
+}
+
+#[cfg(test)]
+mod compute_input_attachments_tests {
+    use super::compute_input_attachments;
+    use crate::input::history::HistoryImageRef;
+    use crate::state::UiState;
+
+    fn recalled(n: usize) -> HistoryImageRef {
+        HistoryImageRef {
+            hash: "0".repeat(16),
+            mt: "image/png".into(),
+            n,
+        }
+    }
+
+    #[test]
+    fn fresh_paste_marker_emits_preview() {
+        let mut s = UiState::default();
+        s.pending_image_markers.push(3);
+        let attachments = compute_input_attachments(&s, "look [Image #3] here");
+        assert_eq!(attachments, vec![3]);
+    }
+
+    #[test]
+    fn cache_recalled_marker_emits_preview() {
+        let mut s = UiState::default();
+        s.pending_recalled_attachments.push(recalled(7));
+        let attachments = compute_input_attachments(&s, "[Image #7] from history");
+        assert_eq!(attachments, vec![7]);
+    }
+
+    #[test]
+    fn typed_marker_with_no_pending_emits_no_preview() {
+        let s = UiState::default();
+        let attachments = compute_input_attachments(&s, "I typed [Image #99] literally");
+        assert!(attachments.is_empty(), "literal text must not surface a preview row");
+    }
+
+    #[test]
+    fn marker_deleted_from_buffer_disappears_from_preview() {
+        let mut s = UiState::default();
+        s.pending_image_markers.push(1);
+        let with_marker = compute_input_attachments(&s, "see [Image #1]");
+        assert_eq!(with_marker, vec![1]);
+        let without_marker = compute_input_attachments(&s, "no marker now");
+        assert!(without_marker.is_empty(), "removing marker text must drop preview row");
+    }
+
+    #[test]
+    fn duplicate_markers_dedup_to_first_occurrence() {
+        let mut s = UiState::default();
+        s.pending_image_markers.push(2);
+        let attachments = compute_input_attachments(&s, "[Image #2] then [Image #2] again");
+        assert_eq!(attachments, vec![2], "same marker referenced twice must surface a single preview row");
+    }
+
+    #[test]
+    fn preserves_first_occurrence_order_across_sources() {
+        let mut s = UiState::default();
+        s.pending_image_markers.push(5);
+        s.pending_recalled_attachments.push(recalled(3));
+        let attachments = compute_input_attachments(&s, "first [Image #5] then [Image #3]");
+        assert_eq!(attachments, vec![5, 3], "preview rows follow buffer text order, not source order");
     }
 }
 
@@ -2009,6 +2139,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             cursor_byte: 0,
             menu: None,
             status: build_status(&app.state, &ctx),
+            attachments: Vec::new(),
         });
         renderer.flush();
     }
@@ -3809,11 +3940,13 @@ fn redraw_with_menu(
         selected,
         kind,
     };
+    let attachments = compute_input_attachments(state, &buf.text);
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         menu: Some(payload),
         status: build_status(state, ctx),
+        attachments,
     });
     renderer.flush();
 }
@@ -3842,11 +3975,13 @@ pub(crate) fn sync_recalled_attachments(
 /// "Redraw" path and the post-event-loop fallback after an agent
 /// event returns the UI to Idle.
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    let attachments = compute_input_attachments(state, &buf.text);
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         menu: None,
         status: build_status(state, ctx),
+        attachments,
     });
     renderer.flush();
 }
@@ -5419,6 +5554,7 @@ fn draw_spinner_now(
         };
         crate::render::MenuPayload { items, selected, kind }
     });
+    let attachments = compute_input_attachments(state, &buf.text);
     renderer.render(UiLine::StreamingBox {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
@@ -5426,6 +5562,7 @@ fn draw_spinner_now(
         label,
         status,
         menu,
+        attachments,
     });
     renderer.flush();
 }

@@ -411,6 +411,12 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// field. None → no menu paint. Up to 4 items shown at once;
     /// pagination around `selected` when there are more.
     pending_menu: Option<MenuPayload>,
+    /// Image-attachment marker numbers currently visible inside the
+    /// input buffer (intersection of typed `[Image #N]` literals with
+    /// real pending bytes — see `event_loop::compute_input_attachments`).
+    /// Each gets a `└ [Image #N]` preview row rendered between the
+    /// bot_rule and the menu, mirroring the retained renderer.
+    pending_attachments: Vec<usize>,
     /// True when footer state changed since the last paint. Same role
     /// as `body_dirty` but for the footer strip.
     footer_dirty: bool,
@@ -555,6 +561,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             pending_status: StatusLine::default(),
             pending_spinner: None,
             pending_menu: None,
+            pending_attachments: Vec::new(),
             footer_dirty: true,
             selection: None,
             selection_active: false,
@@ -574,12 +581,13 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     }
 
     /// Total rows reserved for the footer. Variable because the
-    /// slash-menu palette grows / shrinks the footer dynamically:
+    /// slash-menu palette + attachment preview rows grow / shrink the
+    /// footer dynamically:
     ///   spinner (1) + top_rule (1) + input (1) + bot_rule (1)
-    ///   + menu (0..4) + status (1) = 5..9
+    ///   + attachments (0..N) + menu (0..4) + status (1) = 5..N+9
     fn footer_rows(&self) -> u16 {
         // spinner + top_rule + input + bot_rule + status = 5 base
-        5 + self.menu_paint_rows()
+        5 + self.menu_paint_rows() + self.pending_attachments.len() as u16
     }
 
     /// Body region height = total rows − footer rows. Always at least 1
@@ -880,12 +888,18 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let total_footer = self.footer_rows();
         let footer_top = h.saturating_sub(total_footer) + 1; // 1-indexed
         let menu_rows = self.menu_paint_rows();
+        let attachment_rows = self.pending_attachments.len() as u16;
         let spinner_row = footer_top;
         let top_rule_row = footer_top + 1;
         let input_row = footer_top + 2;
         let bot_rule_row = footer_top + 3;
-        let menu_first_row = footer_top + 4;
-        let status_row = footer_top + 4 + menu_rows;
+        // Attachment preview rows (`└ [Image #N]`) sit between the
+        // bot_rule and the menu — same slot the retained renderer uses
+        // (see `RetainedRenderer::paint_footer`). Count is variable so
+        // menu_first_row / status_row shift accordingly.
+        let attach_first_row = footer_top + 4;
+        let menu_first_row = footer_top + 4 + attachment_rows;
+        let status_row = footer_top + 4 + attachment_rows + menu_rows;
 
         // Row 1 of footer: spinner during streaming, blank otherwise.
         // Frame glyph in brand magenta (Role::Brand) supplies the
@@ -1014,6 +1028,25 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let _ = write!(self.out, "{}{}{}", SGR_CYAN, rule, SGR_RESET);
         } else {
             let _ = self.out.write_all(rule.as_bytes());
+        }
+
+        // Attachment preview rows — `└ [Image #N]` in dim/muted style.
+        // Pre-filtered upstream (see `event_loop::compute_input_attachments`)
+        // to only include marker numbers whose bytes are actually pending,
+        // so showing a row is a real visual confirmation that an image is
+        // attached (not just literal `[Image #N]` text the user typed).
+        // Mirrors the post-submit muted echo of the same string in the
+        // body, so users see a consistent look pre- and post-submit.
+        for (i, n) in self.pending_attachments.iter().enumerate() {
+            let row_n = attach_first_row + i as u16;
+            let cup = format!("\x1b[{};1H\x1b[K", row_n);
+            let _ = self.out.write_all(cup.as_bytes());
+            let line = format!("  \u{2514} [Image #{}]", n);
+            if self.caps.colors {
+                let _ = write!(self.out, "{}{}{}", SGR_DIM, line, SGR_RESET);
+            } else {
+                let _ = self.out.write_all(line.as_bytes());
+            }
         }
 
         // Menu rows: 0..4 of `/{name}  {desc}`. Selected gets `▸` prefix
@@ -1695,14 +1728,17 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 cursor_byte,
                 menu,
                 status,
+                attachments,
             } => {
                 self.pending_input = Some((buf, cursor_byte));
                 self.pending_status = status;
                 self.pending_menu = menu; // slash-palette payload
+                self.pending_attachments = attachments;
                 self.pending_spinner = None; // input takes over from spinner
                 self.footer_dirty = true;
-                // Menu state changes the footer height (variable rows).
-                // Repaint body too so it shrinks/grows correspondingly.
+                // Menu / attachment state changes the footer height
+                // (variable rows). Repaint body too so it shrinks/grows
+                // correspondingly.
                 self.body_dirty = true;
             }
             UiLine::StreamingBox {
@@ -1712,10 +1748,12 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 label,
                 status,
                 menu,
+                attachments,
             } => {
                 self.pending_input = Some((buf, cursor_byte));
                 self.pending_status = status;
                 self.pending_menu = menu;
+                self.pending_attachments = attachments;
                 self.pending_spinner = Some((frame, label));
                 self.footer_dirty = true;
                 self.body_dirty = true;
@@ -2330,6 +2368,7 @@ mod tests {
             cursor_byte: 5,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
@@ -2359,6 +2398,7 @@ mod tests {
                 cwd: "/tmp/proj".into(),
                 ..Default::default()
             },
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
@@ -2384,6 +2424,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
@@ -2509,6 +2550,7 @@ mod tests {
                     kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         // 3 menu items → footer = 5 + 3 = 8 → body = 24 - 8 = 16.
         assert_eq!(r.body_height(), 24 - 8);
@@ -2533,6 +2575,7 @@ mod tests {
                     kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
@@ -2576,6 +2619,7 @@ mod tests {
                     kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         // Assert each menu row's writeable payload between CUPs fits
@@ -2721,6 +2765,7 @@ mod tests {
                 hint: None,
                 mode_indicator: Some("PLAN".into()),
             },
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
@@ -2772,6 +2817,7 @@ mod tests {
                 hint: None,
                 mode_indicator: None,
             },
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
@@ -3090,6 +3136,7 @@ mod tests {
             cursor_byte: 5,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         // Push enough body to give scrollback room.
         for i in 0..20 {

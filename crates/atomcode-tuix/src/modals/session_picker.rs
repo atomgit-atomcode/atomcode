@@ -250,6 +250,7 @@ impl Modal for SessionPicker {
             cursor_byte: buf.cursor,
             menu: Some(payload),
             status: build_status(state, ctx),
+            attachments: Vec::new(),
         });
         renderer.flush();
     }

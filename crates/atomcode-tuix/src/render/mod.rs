@@ -126,6 +126,16 @@ pub enum UiLine {
         cursor_byte: usize,
         menu: Option<MenuPayload>,
         status: StatusLine,
+        /// Marker numbers (`N` from `[Image #N]`) that actually have
+        /// image bytes ready to ship — either freshly attached this
+        /// turn or recalled from cache via arrow-up. Renderers cross-
+        /// reference each marker against `buf` and draw a `└ [Image #N]`
+        /// preview row for the intersection right under the input box,
+        /// so users can tell "real attachment" from "literal text" at
+        /// a glance, before submit. Empty means no preview rows. Only
+        /// the main idle / streaming compose paths populate this; modal
+        /// flows that reuse `InputPrompt` for text entry pass `Vec::new()`.
+        attachments: Vec<usize>,
     },
     /// Streaming chrome: spinner line above a (possibly multi-line)
     /// input box. Same `cursor_byte` semantics as `InputPrompt`.
@@ -139,6 +149,10 @@ pub enum UiLine {
         label: String,
         status: StatusLine,
         menu: Option<MenuPayload>,
+        /// Same semantics as `InputPrompt::attachments` — type-ahead
+        /// during streaming can carry pasted attachments too, so the
+        /// preview path needs to fire here as well.
+        attachments: Vec<usize>,
     },
     /// User pressed Enter: commit the current InputPrompt to scrollback.
     InputCommit,
