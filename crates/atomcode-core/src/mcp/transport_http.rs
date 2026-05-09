@@ -209,6 +209,37 @@ impl HttpClient {
         }
         Ok(Some(token.access_token))
     }
+
+    /// Send a JSON-RPC notification (no `id` field, no response expected).
+    /// Used for protocol lifecycle messages like `notifications/initialized`.
+    async fn send_notification(&self, method: &str) -> Result<()> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method
+        });
+
+        let mut req = self.client.post(&self.url).json(&request);
+
+        let user_has_accept = self.headers.keys().any(|k| k.eq_ignore_ascii_case("accept"));
+        if !user_has_accept {
+            req = req.header("Accept", MCP_HTTP_ACCEPT);
+        }
+
+        let user_has_authorization = self.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+        for (key, value) in &self.headers {
+            req = req.header(key, value);
+        }
+
+        if !user_has_authorization {
+            if let Some(token) = self.load_oauth_token()? {
+                req = req.bearer_auth(token);
+            }
+        }
+
+        // Fire and forget — ignore response
+        let _ = req.send().await;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -233,6 +264,9 @@ impl McpClient for HttpClient {
 
         let init_result: InitializeResult =
             serde_json::from_value(result).context("Failed to parse initialize result")?;
+
+        // Send initialized notification (MCP spec requirement — fire and forget)
+        let _ = self.send_notification("notifications/initialized").await;
 
         let mut status = self.status.lock().await;
         *status = ServerStatus::Connected;

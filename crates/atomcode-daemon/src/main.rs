@@ -1074,6 +1074,15 @@ async fn change_dir(
 
         let hash = hash_path(&new_path);
         state.telemetry.track(Event::UseCommand { type_: "cd".into() });
+
+        // Async reload MCP registry for the new project directory
+        let mcp_working_dir = new_path.clone();
+        let mcp_reg = state.mcp_registry.clone();
+        tokio::spawn(async move {
+            let new_registry = McpRegistry::from_config_background(&mcp_working_dir);
+            *mcp_reg.write().await = Arc::new(new_registry);
+        });
+
         Json(ChangeDirResponse {
             success: true,
             message: format!("Changed to {}", new_path.display()),
@@ -1942,9 +1951,27 @@ async fn process_chat_request(
         }));
     }
 
-    // Register MCP tools from connected servers
-    let mcp_tools = mcp_registry.list_all_tools().await;
-    if !mcp_tools.is_empty() {
+    // Register MCP tools from connected servers.
+    // If tools are empty, wait briefly for background connections to complete (first request grace period).
+    // If still empty but servers are configured, attempt a reload (handles server crash recovery).
+    let mut mcp_tools = mcp_registry.list_all_tools().await;
+    if mcp_tools.is_empty() {
+        mcp_registry.wait_for_initial_connections(Duration::from_secs(5)).await;
+        mcp_tools = mcp_registry.list_all_tools().await;
+    }
+    // P2-1: If tools are still empty but registry has servers (possibly crashed), try reload
+    if mcp_tools.is_empty() && !mcp_registry.server_statuses().await.is_empty() {
+        tracing::info!("MCP tools empty despite configured servers, attempting reload");
+        let new_registry = McpRegistry::from_config_background(&working_dir);
+        new_registry.wait_for_initial_connections(Duration::from_secs(5)).await;
+        mcp_tools = new_registry.list_all_tools().await;
+        if !mcp_tools.is_empty() {
+            // Replace the shared registry so future requests use the reconnected one
+            // Note: we can't update state.mcp_registry here because we only have Arc<McpRegistry>,
+            // not the RwLock wrapper. The tools are registered for this request only.
+            register_mcp_tools(&mut tool_registry, Arc::new(new_registry), mcp_tools);
+        }
+    } else if !mcp_tools.is_empty() {
         register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
     }
 
@@ -1957,9 +1984,10 @@ async fn process_chat_request(
 
     let shared_tools = Arc::new(tool_registry);
 
-    // API mode has no interactive approval channel. Auto-approved tools can run,
-    // but anything that explicitly requires approval is denied by default.
-    let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::DenyAll));
+    // API/daemon mode: no interactive approval channel. All tools (including MCP)
+    // are auto-approved. Users implicitly authorize MCP tools by configuring them
+    // in .mcp.json. This matches the CLI sub-agent behavior (BypassAll).
+    let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
     // Same ctx selection as interactive AgentLoop: walk config.providers
     // for the active provider, fallback to synthetic 128K config if absent.
     let daemon_ctx = match config.providers.get(&config.default_provider) {
@@ -2385,8 +2413,10 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
 }
 
 async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let new_registry = McpRegistry::from_config_background(&home_dir);
+    let project = state.project.read().await;
+    let project_dir = project.working_dir.clone();
+    drop(project);
+    let new_registry = McpRegistry::from_config_background(&project_dir);
     *state.mcp_registry.write().await = Arc::new(new_registry);
     Json(serde_json::json!({"status": "reloading"}))
 }
@@ -2622,9 +2652,9 @@ async fn main() {
     // Step 6: Seed account_id from stored auth (R4.3)
     telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id));
 
-    // Initialize MCP registry from user config (~/.atomcode/mcp.json)
-    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let mcp_registry = McpRegistry::from_config_background(&home_dir);
+    // Initialize MCP registry from project working directory config
+    // This reads both ~/.atomcode/mcp.json (user-level) and <project>/.mcp.json (project-level)
+    let mcp_registry = McpRegistry::from_config_background(&project_state.working_dir);
 
     // Step 7: Build AppState (R1.4)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

@@ -30,6 +30,8 @@ pub struct McpRegistry {
     server_timeouts_ms: Arc<RwLock<BTreeMap<String, u64>>>,
     /// Channel for connection status events (used by TUI to display in scrollback).
     connect_events: Option<mpsc::UnboundedSender<McpConnectEvent>>,
+    /// Signals when all initial background connections have completed (or failed).
+    initial_ready: Arc<tokio::sync::Notify>,
 }
 
 impl McpRegistry {
@@ -39,6 +41,7 @@ impl McpRegistry {
             servers: Arc::new(RwLock::new(BTreeMap::new())),
             server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
             connect_events: None,
+            initial_ready: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -50,6 +53,7 @@ impl McpRegistry {
                 servers: Arc::new(RwLock::new(BTreeMap::new())),
                 server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
                 connect_events: Some(tx),
+                initial_ready: Arc::new(tokio::sync::Notify::new()),
             },
             rx,
         )
@@ -94,6 +98,7 @@ impl McpRegistry {
         if !configs.is_empty() {
             let servers = registry.servers.clone();
             let server_timeouts_ms = registry.server_timeouts_ms.clone();
+            let initial_ready = registry.initial_ready.clone();
             tokio::spawn(async move {
                 // Connect servers in parallel
                 let tasks: Vec<_> = configs
@@ -160,7 +165,12 @@ impl McpRegistry {
 
                 // Wait for all connections to complete (each has its own timeout)
                 futures::future::join_all(tasks).await;
+                // Signal that initial connections are done
+                initial_ready.notify_waiters();
             });
+        } else {
+            // No servers configured — signal immediately
+            registry.initial_ready.notify_waiters();
         }
 
         registry
@@ -364,12 +374,19 @@ impl McpRegistry {
             .collect()
     }
 
+    /// Wait for initial background connections to complete (or timeout).
+    /// Returns immediately if no background connections are pending.
+    pub async fn wait_for_initial_connections(&self, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, self.initial_ready.notified()).await;
+    }
+
     /// Get an Arc clone for sharing across threads.
     pub fn share(&self) -> Arc<Self> {
         Arc::new(Self {
             servers: self.servers.clone(),
             server_timeouts_ms: self.server_timeouts_ms.clone(),
             connect_events: self.connect_events.clone(),
+            initial_ready: self.initial_ready.clone(),
         })
     }
 }
