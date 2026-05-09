@@ -57,22 +57,44 @@ fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 /// Try to grab an image from the system clipboard via `arboard`.
 /// Returns `Some((ImagePart, fingerprint))` if the clipboard holds an
 /// image, `None` otherwise. The fingerprint is hashed off the raw RGBA
+/// Try to get an image from the clipboard. First attempts to read image
+/// bytes directly (screenshots, Preview Copy). If that fails, falls back
+/// to reading a file:// URL from the clipboard text (Finder Cmd+C case)
+/// and loading the image from that path.
+/// Returns the image data and a fingerprint hash.
 /// bytes (not the PNG-encoded base64) — same hash function the status
 /// poll uses, so paste-side and poll-side fingerprints line up for the
 /// "is this the same image we already attached?" check.
 fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
-    let img = clipboard.get_image().ok()?;
-    let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
-    let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-    Some((
-        ImagePart {
-            media_type: "image/png".into(),
-            data: b64,
-        },
-        hash,
-    ))
+    
+    // First try: image bytes directly in clipboard
+    if let Some(img) = clipboard.get_image().ok() {
+        let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
+        let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+        return Some((
+            ImagePart {
+                media_type: "image/png".into(),
+                data: b64,
+            },
+            hash,
+        ));
+    }
+    
+    // Second try: file:// URL in clipboard text (Finder Cmd+C case)
+    // Re-create clipboard instance as the previous get_image consumed it
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    if let Some(text) = clipboard.get_text().ok() {
+        // Strip file:// prefix if present
+        let path_text = text.trim();
+        let path_text = path_text.strip_prefix("file://").unwrap_or(path_text);
+        // URL-decode the path (macOS puts file URLs in clipboard)
+        let path_text = urlencoding::decode(path_text).ok()?;
+        return try_attach_image_from_path(&path_text);
+    }
+    
+    None
 }
 
 /// Map an `ImagePart::media_type` to a cache filename extension.
@@ -3860,7 +3882,6 @@ fn handle_idle_key(
         }
         BufferResult::Commit(line) => {
             renderer.render(UiLine::ClearTransient);
-            renderer.render(UiLine::User(line.clone()));
             app.buf.text.clear();
             app.buf.cursor = 0;
             app.buf.clear_pastes();
@@ -3882,6 +3903,9 @@ fn handle_idle_key(
                         .unwrap_or(false)
             });
             if let Some((cmd, arg)) = as_slash {
+                // Slash commands carry no image markers — echo the
+                // user line as-typed, before dispatch.
+                renderer.render(UiLine::User(line.clone()));
                 execute_slash_command(
                     cmd,
                     arg,
@@ -3896,14 +3920,21 @@ fn handle_idle_key(
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
             } else {
-                // Hydrate recalled attachments BEFORE building the submit
-                // payload, so renumbered `[Image #N]` markers appear in
-                // both `line` and `expanded`.
+                // Hydrate recalled attachments BEFORE echoing the user
+                // line, so `[Image #N]` markers in the visible body
+                // match the renumbered markers that the
+                // `└ [Image #N]` post-submit echo (and the actual
+                // submit payload) use. Without this, an arrow-up
+                // recall + edit would render `[Image #1]` in the body
+                // while the echo + payload carry `[Image #2]` — the
+                // user reasonably reads that as a bug ("two different
+                // numbers for the same image").
                 let cache_dir = crate::platform::image_cache_dir();
                 let mut line = line; // shadow as mutable so hydrate can rewrite it
                 for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
                     renderer.render(UiLine::Warning(n));
                 }
+                renderer.render(UiLine::User(line.clone()));
                 let expanded = app.buf.expand_pastes(&line);
                 // Cache the full expanded form before dispatch. If the
                 // user hits Ctrl+C / Esc mid-stream, `handle_streaming_key`
