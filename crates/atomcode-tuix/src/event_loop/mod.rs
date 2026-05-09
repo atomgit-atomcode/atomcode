@@ -1445,6 +1445,60 @@ mod menu_tests {
         assert!(notice[0].contains("[Image #3]"));
         assert!(notice[0].contains("缓存"));
     }
+
+    #[test]
+    fn paste_submit_recall_submit_rehydrates_image() {
+        use crate::input::history::{History, HistoryEntry, HistoryImageRef};
+        use base64::Engine;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("image-cache");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let hist_path = tmp.path().join("hist");
+        let mut history = History::load_with_cache(&hist_path, cache_dir.clone());
+
+        // ── Turn 1: paste image, submit ────────────────────────────────
+        let raw_bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        let img = atomcode_core::conversation::message::ImagePart {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(&raw_bytes),
+        };
+        let hash: u64 = 0xdead_beef_1234_5678;
+        super::cache_write_image(&cache_dir, &img, hash);
+        history.push(HistoryEntry {
+            text: "describe [Image #1]".into(),
+            images: vec![HistoryImageRef {
+                hash: format!("{:016x}", hash),
+                mt: img.media_type.clone(),
+                n: 1,
+            }],
+        });
+        history.save().unwrap();
+        // GC must NOT delete our file (it's referenced).
+        assert!(cache_dir.join(format!("{:016x}.png", hash)).exists());
+
+        // ── Reload (new "session") ─────────────────────────────────────
+        let history2 = History::load_with_cache(&hist_path, cache_dir.clone());
+        assert_eq!(history2.entries().len(), 1);
+        assert_eq!(history2.entries()[0].images.len(), 1);
+
+        // ── Turn 2: simulate up-arrow + submit ─────────────────────────
+        let mut state = UiState::new();
+        // Up-arrow handler would do this:
+        state.pending_recalled_attachments = history2.entries()[0].images.clone();
+        let mut line = history2.entries()[0].text.clone();
+        let notices = super::hydrate_recalled_attachments(&mut state, &mut line, &cache_dir);
+        assert!(notices.is_empty(), "cache hit, no notice expected");
+        assert_eq!(state.pending_images.len(), 1, "image rehydrated");
+        let rehydrated = base64::engine::general_purpose::STANDARD
+            .decode(&state.pending_images[0].data)
+            .unwrap();
+        assert_eq!(rehydrated, raw_bytes, "bytes round-trip exact");
+        // Marker renumbered (recalled was #1, new session also starts at #1
+        // but session_image_count was 0 → bumped to 1, so new marker = 1).
+        assert_eq!(line, "describe [Image #1]");
+        assert_eq!(state.pending_image_markers, vec![1]);
+    }
 }
 
 #[cfg(test)]
