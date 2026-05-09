@@ -75,6 +75,46 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     ))
 }
 
+/// Map an `ImagePart::media_type` to a cache filename extension.
+/// Unknown MIMEs degrade to `bin` — they still round-trip via the
+/// stored `media_type` field on `HistoryImageRef`, so the extension is
+/// purely informational for humans poking at `~/.atomcode/image-cache/`.
+fn ext_for_mt(mt: &str) -> &'static str {
+    match mt {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "bin",
+    }
+}
+
+/// Best-effort cache write. Decodes `img.data` (base64) and persists
+/// the raw bytes to `<cache_dir>/<hex_hash>.<ext>`. Skips if the file
+/// already exists (cache is content-addressable). Failures are
+/// trace-logged and swallowed — the in-memory pending_images path is
+/// the source of truth for the current submit.
+fn cache_write_image(cache_dir: &std::path::Path, img: &atomcode_core::conversation::message::ImagePart, hash: u64) {
+    let path = cache_dir.join(format!("{:016x}.{}", hash, ext_for_mt(&img.media_type)));
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        crate::tuix_trace!("IMG", "cache mkdir failed: {}", e);
+        return;
+    }
+    let raw = match base64::engine::general_purpose::STANDARD.decode(&img.data) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::tuix_trace!("IMG", "cache base64 decode failed: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&path, &raw) {
+        crate::tuix_trace!("IMG", "cache write failed: {}", e);
+    }
+}
+
 /// Upper bound on a single attached image (20 MB raw bytes). OpenAI's
 /// chat/completions cap is 20 MB per image; Anthropic's is 5 MB. We pick
 /// the looser of the two as the tool-side gate so the attempt at least
@@ -1289,6 +1329,25 @@ mod menu_tests {
         let _ = buf.apply(Action::Insert('a'), &history, &reg);
         super::sync_recalled_attachments(&mut state, &buf, &history);
         assert!(state.pending_recalled_attachments.is_empty());
+    }
+
+    #[test]
+    fn cache_write_image_writes_and_is_idempotent() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let img = atomcode_core::conversation::message::ImagePart {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"hello"),
+        };
+        super::cache_write_image(dir.path(), &img, 0xdead_beef_1234_5678);
+        let p = dir.path().join("deadbeef12345678.png");
+        assert!(p.exists());
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        // Calling again must not error and not change the file mtime.
+        let mtime1 = std::fs::metadata(&p).unwrap().modified().unwrap();
+        super::cache_write_image(dir.path(), &img, 0xdead_beef_1234_5678);
+        let mtime2 = std::fs::metadata(&p).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2, "second call must short-circuit on exists");
     }
 }
 
@@ -2640,9 +2699,10 @@ fn handle_input(
                     // scrollback, ambiguous when scrolling back.
                     app.state.session_image_count += 1;
                     let n = app.state.session_image_count;
-                    app.state.pending_images.push(img);
+                    app.state.pending_images.push(img.clone());
                     app.state.pending_image_hashes.push(hash);
                     app.state.pending_image_markers.push(n);
+                    cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
                     let marker = format!("[Image #{}]", n);
                     app.buf.text.insert_str(app.buf.cursor, &marker);
                     app.buf.cursor += marker.len();
@@ -3285,9 +3345,10 @@ fn handle_idle_key(
             // `[Image #1]` in scrollback, ambiguous when scrolling back.
             app.state.session_image_count += 1;
             let n = app.state.session_image_count;
-            app.state.pending_images.push(img);
+            app.state.pending_images.push(img.clone());
             app.state.pending_image_hashes.push(hash);
             app.state.pending_image_markers.push(n);
+            cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
             let marker = format!("[Image #{}]", n);
             app.buf.text.insert_str(app.buf.cursor, &marker);
             app.buf.cursor += marker.len();
@@ -4520,7 +4581,9 @@ fn handle_agent_event(
             for (img, marker) in images.into_iter().zip(markers.into_iter()) {
                 let mut hasher = DefaultHasher::new();
                 img.data.hash(&mut hasher);
-                state.pending_image_hashes.push(hasher.finish());
+                let h = hasher.finish();
+                cache_write_image(&crate::platform::image_cache_dir(), &img, h);
+                state.pending_image_hashes.push(h);
                 state.pending_images.push(img);
                 state.pending_image_markers.push(marker);
             }
