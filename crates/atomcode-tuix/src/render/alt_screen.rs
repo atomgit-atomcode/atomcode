@@ -438,6 +438,25 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// shift `head` to wherever the cursor was when the buffered
     /// frame arrived.
     selection_active: bool,
+    /// Tracks whether the terminal cursor is currently shown (`?25h`
+    /// last emitted) or hidden (`?25l`). Used to dedupe visibility
+    /// toggles per frame: re-emitting `?25h` at streaming framerate
+    /// restarts the host terminal's hardware cursor blink animation,
+    /// which on macOS Terminal.app reads as constant flicker even
+    /// after `?12l` disabled hardware blink (the show pulse itself is
+    /// the visible flash). Initialised to `true` because terminals
+    /// default to a visible cursor.
+    cursor_shown: bool,
+    /// True on terminals that process CUP sequences synchronously
+    /// (JediTerm, legacy conhost) — paint_body's per-row CUPs would
+    /// otherwise visibly trail the cursor through every body row.
+    /// On those we hide cursor before paint_body and re-show in
+    /// paint_footer's tail. False on fast terminals (macOS Terminal.app,
+    /// iTerm2, modern xterm, WezTerm, Kitty), where paint completes in
+    /// well under a frame and the per-frame hide/show toggle reads
+    /// instead as flicker — we leave cursor visible the whole time
+    /// and only reposition it via a CUP at frame end.
+    slow_paint_terminal: bool,
 }
 
 /// Mouse-drag selection range. See `AltScreenRenderer::selection` for
@@ -466,9 +485,11 @@ impl Selection {
 }
 
 impl AltScreenRenderer<BufWriter<Stdout>> {
-    pub fn new(caps: TerminalCaps) -> Self {
+    pub fn new(caps: TerminalCaps, slow_paint_terminal: bool) -> Self {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-        Self::with_writer(BufWriter::new(io::stdout()), caps, w, h)
+        let mut r = Self::with_writer(BufWriter::new(io::stdout()), caps, w, h);
+        r.slow_paint_terminal = slow_paint_terminal;
+        r
     }
 }
 
@@ -565,6 +586,8 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             footer_dirty: true,
             selection: None,
             selection_active: false,
+            cursor_shown: true,
+            slow_paint_terminal: false,
         };
         r.enter_alt_screen();
         r
@@ -612,11 +635,15 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     ///     unaffected by the upgrade.
     ///   * `\x1b[?1006h` — SGR-extended coordinates (replaces the
     ///     legacy fixed-byte format that breaks past col 223)
+    ///   * `\x1b[?12l` — disable cursor blinking. macOS Terminal.app's
+    ///     hardware blink restarts on every show-cursor (`\x1b[?25h`),
+    ///     so paint_frame's hide→repaint→show cycle (one per keystroke)
+    ///     looked like a non-stop flicker. Restored to `?12h` on leave.
     ///
     /// Best-effort: if the writer fails, `alt_screen_active` stays
     /// false and Drop won't try to pop.
     fn enter_alt_screen(&mut self) {
-        let seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1002h\x1b[?1006h";
+        let seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1002h\x1b[?1006h\x1b[?12l";
         if self.out.write_all(seq.as_bytes()).is_ok() && self.out.flush().is_ok() {
             self.alt_screen_active = true;
             // Legacy Windows conhost (Win10 PowerShell 5/7, cmd.exe)
@@ -680,7 +707,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                     restore_conhost_console_in_mode(prior);
                 }
             }
-            let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1049l");
+            let _ = self.out.write_all(b"\x1b[?25h\x1b[?12h\x1b[?1006l\x1b[?1002l\x1b[?1049l");
             let _ = self.out.flush();
             self.alt_screen_active = false;
         }
@@ -915,11 +942,11 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let cleaned = scrub_controls(label);
             let line = if self.caps.colors {
                 format!(
-                    "  {}{}{} {}{}{}",
+                    "{}{}{} {}{}{}",
                     SGR_MAGENTA, frame, SGR_RESET, SGR_BOLD, cleaned, SGR_RESET
                 )
             } else {
-                format!("  {} {}", frame, cleaned)
+                format!("{} {}", frame, cleaned)
             };
             let _ = self.out.write_all(line.as_bytes());
         }
@@ -1176,10 +1203,22 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // the `+ 1` converts to the 1-indexed CSI CUP coordinate.
         if self.pending_input.is_some() {
             let cursor_col = chev.chars().count() + visible_cursor_col;
-            let cup = format!("\x1b[{};{}H\x1b[?25h", input_row, cursor_col + 1);
-            let _ = self.out.write_all(cup.as_bytes());
-        } else {
+            if self.cursor_shown {
+                // Cursor already visible from a prior frame — just
+                // reposition it. Skipping the `?25h` re-emit avoids
+                // restarting the host terminal's hardware cursor blink
+                // animation, which on macOS Terminal.app at streaming
+                // framerate reads as constant flicker.
+                let cup = format!("\x1b[{};{}H", input_row, cursor_col + 1);
+                let _ = self.out.write_all(cup.as_bytes());
+            } else {
+                let cup = format!("\x1b[{};{}H\x1b[?25h", input_row, cursor_col + 1);
+                let _ = self.out.write_all(cup.as_bytes());
+                self.cursor_shown = true;
+            }
+        } else if self.cursor_shown {
             let _ = self.out.write_all(b"\x1b[?25l");
+            self.cursor_shown = false;
         }
 
         let _ = self.out.flush();
@@ -1189,24 +1228,29 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// Combined frame paint: body first, footer second so the cursor
     /// final-position belongs to the footer (typically the input row).
     ///
-    /// Hides the cursor for the duration of the paint so the user
-    /// doesn't see it dart through every intermediate CUP. body + footer
-    /// emit roughly `body_rows + 5..9` CUP sequences per frame; on
-    /// slow terminals (JediTerm in JetBrains IDEs in particular) each
-    /// CUP is processed synchronously, and the cursor is briefly
-    /// visible at every row 1, 2, 3, …, 7, then through every footer
-    /// row before settling. paint_footer's tail emits show-cursor +
-    /// the final input-row CUP atomically, so re-revealing it there
-    /// gives a single visible position per frame instead of a moving
-    /// trail. Reported in Android Studio's terminal as "cursor jumps
-    /// around when scrolling history".
+    /// Cursor visibility handling depends on `slow_paint_terminal`:
+    ///
+    /// **Slow terminals (JediTerm, legacy conhost, `slow_paint_terminal=true`):**
+    /// hide cursor before paint_body so its journey through every
+    /// intermediate CUP isn't visible. paint_footer's tail re-emits
+    /// show-cursor (`?25h`) at the final input-row position when
+    /// `pending_input` is set. Without this, JediTerm rendered the
+    /// cursor's trail as visible "jumping" — Android Studio bug.
+    ///
+    /// **Fast terminals (macOS Terminal.app / iTerm2 / xterm /
+    /// WezTerm / Kitty, `slow_paint_terminal=false`):** leave cursor
+    /// visible the whole time; just reposition via final CUP. The
+    /// per-row CUPs DO still flash the cursor through body cells but
+    /// they execute in well under a refresh interval so the trail is
+    /// imperceptible. Avoiding the per-frame `?25l`/`?25h` toggle is
+    /// what matters here — at streaming framerate (~30 Hz) that
+    /// toggle reads as constant flicker on macOS Terminal.app even
+    /// after `?12l` disabled the hardware cursor blink.
     fn paint_frame(&mut self) {
-        // Hide cursor up-front so paint_body's per-row CUPs aren't
-        // visible to the user. paint_footer's tail re-emits show-
-        // cursor (`\x1b[?25h`) at the final input-row position when
-        // `pending_input` is set, or leaves it hidden otherwise
-        // (e.g. during streaming with no input prompt to anchor on).
-        let _ = self.out.write_all(b"\x1b[?25l");
+        if self.slow_paint_terminal && self.cursor_shown {
+            let _ = self.out.write_all(b"\x1b[?25l");
+            self.cursor_shown = false;
+        }
         self.paint_body();
         self.paint_footer();
     }
@@ -3163,18 +3207,19 @@ mod tests {
         );
     }
 
-    /// Regression: every paint_frame must start by hiding the cursor
-    /// so its journey through ~10+ intermediate CUP positions (one
-    /// per body row, one per footer row) isn't visible to the user.
-    /// Synchronous-CUP terminals like JediTerm rendered the cursor's
-    /// trail as visible "jumping" — Android Studio bug report.
-    /// paint_footer re-emits show-cursor at its tail when
-    /// pending_input is set, so the cursor only appears once at its
-    /// final position.
+    /// Regression: on slow-paint terminals (JediTerm, legacy conhost),
+    /// every paint_frame must start by hiding the cursor so its
+    /// journey through ~10+ intermediate CUP positions (one per body
+    /// row, one per footer row) isn't visible to the user. paint_footer
+    /// re-emits show-cursor at its tail when pending_input is set, so
+    /// the cursor only appears once at its final position. Reported in
+    /// Android Studio's terminal as "cursor jumps around when scrolling
+    /// history".
     #[test]
-    fn paint_frame_hides_cursor_before_painting() {
+    fn paint_frame_hides_cursor_before_painting_on_slow_terminal() {
         let mut buf = Vec::new();
         let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.slow_paint_terminal = true;
         // Force a paint via any body push.
         r.render(UiLine::User("hello".into()));
         drop(r);
@@ -3189,6 +3234,81 @@ mod tests {
             "hide-cursor must come before the first body CUP. hide@{}, body@{}, output: {:?}",
             hide_pos,
             first_body_cup,
+            s
+        );
+    }
+
+    /// Regression: on fast terminals (default), paint_frame must NOT
+    /// emit `?25l` before paint_body — at streaming framerate the
+    /// per-frame `?25l` / `?25h` toggle reads as constant cursor
+    /// flicker on macOS Terminal.app even with hardware blink
+    /// disabled (`?12l`). Painting body without hiding is safe on
+    /// fast terminals because the per-row CUPs flash the cursor
+    /// through cells in well under one refresh interval.
+    #[test]
+    fn paint_frame_does_not_hide_cursor_on_fast_terminal() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // slow_paint_terminal stays false (default).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        // Trigger a streaming-style repaint by pushing more body.
+        r.render(UiLine::User("hello".into()));
+        r.render(UiLine::User("world".into()));
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // No `?25l` before the first body CUP. Drop's leave_alt_screen
+        // emits `?25h\x1b[?12h…?1049l` at the end, which contains
+        // `?25h` but no `?25l`, so the only way `?25l` could be in the
+        // output is from paint_frame — which we don't want.
+        if let Some(first_body_cup) = s.find("\x1b[1;1H\x1b[K") {
+            let pre = &s[..first_body_cup];
+            assert!(
+                !pre.contains("\x1b[?25l"),
+                "fast terminal must not hide cursor before body paint. output: {:?}",
+                s
+            );
+        }
+    }
+
+    /// Regression: on fast terminals, the `?25h` show-cursor sequence
+    /// must be emitted at most once for repeated input-prompt frames
+    /// — re-emitting it every frame restarts the host terminal's
+    /// hardware cursor blink animation, producing visible flicker on
+    /// macOS Terminal.app. Subsequent frames must reposition via a
+    /// bare CUP only.
+    #[test]
+    fn fast_terminal_dedupes_show_cursor_across_frames() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // slow_paint_terminal stays false (default).
+        for i in 0..5 {
+            r.render(UiLine::InputPrompt {
+                buf: format!("typed{}", i),
+                cursor_byte: 6,
+                menu: None,
+                status: crate::render::StatusLine::default(),
+                attachments: Vec::new(),
+            });
+        }
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // Drop's leave_alt_screen emits one `?25h`. paint_footer
+        // emits at most one more (on the first frame, transitioning
+        // from initial cursor_shown=true → still true via no-op,
+        // actually never re-emits because cursor_shown starts true).
+        // So the count should be exactly 1 (from leave). If paint_footer
+        // were re-emitting per frame we'd see 6+.
+        let show_count = s.matches("\x1b[?25h").count();
+        assert!(
+            show_count <= 1,
+            "fast terminal must dedupe show-cursor; got {} occurrences. output: {:?}",
+            show_count,
             s
         );
     }

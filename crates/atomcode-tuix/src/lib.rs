@@ -343,7 +343,16 @@ pub async fn run(
         // without depending on DECSTBM scroll regions. Trade-off:
         // host terminal's native scrollback is unavailable while the
         // app runs (in-app PageUp/PageDown ships in Phase 2).
-        Box::new(crate::render::alt_screen::AltScreenRenderer::new(caps))
+        // Slow-paint flag controls per-frame cursor hide/show in
+        // alt-screen renderer. JediTerm + legacy conhost process CUP
+        // sequences synchronously and need the hide to avoid a visible
+        // cursor trail through paint_body's per-row CUPs; everywhere
+        // else we leave the cursor visible to avoid the per-frame
+        // toggle reading as flicker on hardware cursors.
+        let slow_paint = is_jediterm || is_legacy_conhost;
+        Box::new(crate::render::alt_screen::AltScreenRenderer::new(
+            caps, slow_paint,
+        ))
     } else if caps.tty {
         Box::new(RetainedRenderer::new(caps))
     } else {
