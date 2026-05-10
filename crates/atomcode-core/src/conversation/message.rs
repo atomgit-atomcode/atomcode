@@ -18,6 +18,27 @@ pub struct ImagePart {
     pub data: String,
 }
 
+/// One Anthropic-style extended-thinking content block. Anthropic's API
+/// returns thinking output as a sequence of `{type:"thinking", thinking,
+/// signature}` blocks; the `signature` is a server-issued cryptographic
+/// token that we MUST echo back unchanged on every subsequent assistant
+/// turn or the API rejects the request with `400 The content[].thinking
+/// in the thinking mode must be passed back to the API`. Per Anthropic
+/// docs, thinking blocks must also appear before text/tool_use blocks
+/// inside the assistant message — `provider/claude.rs::format_messages`
+/// enforces that ordering.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ThinkingBlock {
+    /// The thinking text streamed via `thinking_delta` events.
+    pub text: String,
+    /// Server-issued signature received via `signature_delta`. Required
+    /// for round-trip; an empty string means we never received one (older
+    /// session files, non-Anthropic provider) — emit anyway, the upstream
+    /// either accepts empty or rejects only when thinking + tool_use is
+    /// active (in which case we already had a signature).
+    pub signature: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MessageContent {
     Text(String),
@@ -34,6 +55,15 @@ pub enum MessageContent {
         /// Always captured on the receive side so we don't lose data.
         #[serde(default)]
         reasoning_content: Option<String>,
+        /// Anthropic-style extended-thinking blocks received alongside this
+        /// turn. Carries the cryptographic `signature` that Claude (and
+        /// Anthropic-compatible proxies routing models like deepseek-v4-pro
+        /// through claude.rs) require us to echo verbatim on every
+        /// subsequent request. Empty when the upstream isn't Anthropic
+        /// or thinking was disabled. `provider/claude.rs::format_messages`
+        /// emits these as the first elements of the `content` array.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking_blocks: Vec<ThinkingBlock>,
     },
     ToolResult(ToolResult),
     /// Lightweight reference to a tool result whose full output is cached on disk.
@@ -86,6 +116,7 @@ impl Message {
                 text,
                 tool_calls,
                 reasoning_content,
+                ..
             } => {
                 let text_len = text.as_ref().map_or(0, |t| t.len());
                 // Each tool_use contributes name + JSON-stringified args + a

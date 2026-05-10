@@ -262,6 +262,13 @@ impl TurnRunner {
         // responses through `reasoning_content` for MiniMax-M2.7 / DeepSeek-R1,
         // and without the fallback we'd return a silent 0-token "Nailed it".
         let mut reasoning_buf = String::new();
+        // Anthropic extended-thinking blocks (text + signature) accumulated
+        // from `StreamEvent::ThinkingBlock`. Carried into the message via
+        // `finalize_stream_with_tool_calls_and_thinking` so the next
+        // request can echo them back — Anthropic 400s otherwise (`The
+        // content[].thinking in the thinking mode must be passed back`).
+        let mut thinking_blocks: Vec<crate::conversation::message::ThinkingBlock> =
+            Vec::new();
         let mut total_tokens: usize = 0;
         // Telemetry: per-turn token counters populated from StreamEvent::Usage.
         let mut tel_input_tokens: u32 = 0;
@@ -413,6 +420,19 @@ impl TurnRunner {
                                         // content ends up empty.
                                         let _ = event_tx.send(TurnEvent::ReasoningDelta(text.clone()));
                                         reasoning_buf.push_str(&text);
+                                    }
+                                    Some(Ok(StreamEvent::ThinkingBlock { text, signature })) => {
+                                        got_any_event = true;
+                                        // Anthropic-only path: store the block (with
+                                        // its signature) for echo-back. Don't emit a
+                                        // UI event — the text was already streamed
+                                        // through ReasoningDelta during the deltas.
+                                        thinking_blocks.push(
+                                            crate::conversation::message::ThinkingBlock {
+                                                text,
+                                                signature,
+                                            },
+                                        );
                                     }
                                     Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
                                         got_any_event = true;
@@ -638,10 +658,12 @@ impl TurnRunner {
                                             } else {
                                                 Some(reasoning_buf.as_str())
                                             };
-                                            conversation.finalize_stream_with_tool_calls(
-                                                &tool_calls_buf,
-                                                reasoning,
-                                            );
+                                            conversation
+                                                .finalize_stream_with_tool_calls_and_thinking(
+                                                    &tool_calls_buf,
+                                                    reasoning,
+                                                    std::mem::take(&mut thinking_blocks),
+                                                );
                                         } else {
                                             conversation.finalize_stream();
                                         }

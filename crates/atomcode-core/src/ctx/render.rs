@@ -1570,6 +1570,7 @@ mod tests {
                         arguments: "{}".into(),
                     }],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             });
             msgs.push(Message {
@@ -1836,6 +1837,7 @@ mod tests {
                         arguments: "{}".into(),
                     }],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             });
             msgs.push(Message {
@@ -1862,6 +1864,7 @@ mod tests {
                         arguments: "{}".into(),
                     }],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             });
             msgs.push(Message {
@@ -2235,6 +2238,7 @@ mod tests {
                         arguments: "{}".to_string(),
                     }],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             },
             Message {
@@ -2285,6 +2289,7 @@ mod tests {
                         },
                     ],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             },
             Message {
@@ -2339,6 +2344,7 @@ mod tests {
                         },
                     ],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             },
             Message {
@@ -2360,6 +2366,7 @@ mod tests {
                         arguments: "{}".into(),
                     }],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             },
             Message {
@@ -2408,6 +2415,7 @@ mod tests {
                         },
                     ],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             },
             Message {
@@ -2452,6 +2460,7 @@ mod tests {
                         },
                     ],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             },
             Message {
@@ -2597,6 +2606,7 @@ mod tests {
                             arguments: "{}".to_string(),
                         }],
                         reasoning_content: None,
+                        thinking_blocks: Vec::new(),
                     },
                 });
                 msgs.push(Message {

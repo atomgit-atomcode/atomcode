@@ -878,6 +878,7 @@ mod tests {
                     arguments: args.into(),
                 }],
                 reasoning_content: None,
+                thinking_blocks: Vec::new(),
             },
         }
     }

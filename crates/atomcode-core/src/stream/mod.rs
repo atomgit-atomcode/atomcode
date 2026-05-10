@@ -17,6 +17,19 @@ pub enum StreamEvent {
     /// final text on `Done` if `content` ends up empty, which keeps us from
     /// silently returning 0-token "Nailed it" responses for reasoning models.
     Reasoning(String),
+    /// One complete Anthropic extended-thinking content block. Emitted at
+    /// `content_block_stop` by claude.rs after both `thinking_delta` and
+    /// `signature_delta` have streamed in for a given block. The runner
+    /// accumulates these into `MessageContent::AssistantWithToolCalls.
+    /// thinking_blocks` so the next request can echo them back verbatim
+    /// (Anthropic 400s otherwise: `The content[].thinking in the thinking
+    /// mode must be passed back to the API`). Atomic per-block (vs
+    /// streaming text + signature separately) keeps the runner from
+    /// having to pair up out-of-order deltas across content blocks.
+    ThinkingBlock {
+        text: String,
+        signature: String,
+    },
     ToolCallStart {
         id: String,
         name: String,

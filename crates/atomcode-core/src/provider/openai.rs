@@ -185,6 +185,10 @@ impl OpenAiProvider {
                         text,
                         tool_calls,
                         reasoning_content,
+                        // Anthropic-only field; OpenAI-style endpoints don't
+                        // accept `thinking` content blocks. We persist them
+                        // for cross-provider switches but don't emit here.
+                        thinking_blocks: _,
                     } => {
                         if tool_calls.is_empty() {
                             // No tool calls — send as plain assistant text
@@ -1470,6 +1474,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 reasoning_content: reasoning.map(|s| s.to_string()),
+                thinking_blocks: Vec::new(),
             },
         }
     }

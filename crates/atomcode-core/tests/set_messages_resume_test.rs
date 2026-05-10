@@ -43,6 +43,7 @@ fn build_multi_turn_conversation(n: usize) -> Conversation {
                     arguments: format!(r#"{{"command":"echo {}"}}"#, t),
                 }],
                 reasoning_content: None,
+                thinking_blocks: Vec::new(),
             },
         });
         conv.turn_tracker.on_message_added(msg_idx);
@@ -344,6 +345,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                     },
                 ],
                 reasoning_content: None,
+                thinking_blocks: Vec::new(),
             },
         },
         Message {
@@ -374,6 +376,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                     arguments: r#"{"file_path":"/tmp/x.rs","old_string":"foo","new_string":"bar"}"#.into(),
                 }],
                 reasoning_content: None,
+                thinking_blocks: Vec::new(),
             },
         },
         Message {

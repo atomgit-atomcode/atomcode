@@ -159,6 +159,24 @@ impl Conversation {
         tool_calls: Vec<ToolCall>,
         reasoning: Option<&str>,
     ) {
+        self.add_assistant_tool_calls_with_thinking(text, tool_calls, reasoning, Vec::new());
+    }
+
+    /// Like `add_assistant_tool_calls` but additionally stores Anthropic
+    /// extended-thinking content blocks (text + signature pairs). The
+    /// blocks must be echoed verbatim on subsequent requests when the
+    /// upstream is Anthropic-style and thinking is enabled — otherwise
+    /// the next request gets `400 The content[].thinking in the thinking
+    /// mode must be passed back to the API`. Other provider paths
+    /// (OpenAI / Ollama) ignore this field via `..` destructuring, so
+    /// leaving it populated is harmless across cross-provider switches.
+    pub fn add_assistant_tool_calls_with_thinking(
+        &mut self,
+        text: Option<&str>,
+        tool_calls: Vec<ToolCall>,
+        reasoning: Option<&str>,
+        thinking_blocks: Vec<crate::conversation::message::ThinkingBlock>,
+    ) {
         let idx = self.messages.len();
         self.messages.push(Message {
             role: Role::Assistant,
@@ -166,6 +184,7 @@ impl Conversation {
                 text: text.map(|s| s.to_string()),
                 tool_calls,
                 reasoning_content: reasoning.map(|s| s.to_string()),
+                thinking_blocks,
             },
         });
         self.turn_tracker.on_message_added(idx);
@@ -197,11 +216,27 @@ impl Conversation {
         tool_calls: &[ToolCall],
         reasoning: Option<&str>,
     ) {
+        self.finalize_stream_with_tool_calls_and_thinking(tool_calls, reasoning, Vec::new());
+    }
+
+    /// Variant that additionally records Anthropic extended-thinking
+    /// blocks for echo-back. See `add_assistant_tool_calls_with_thinking`.
+    pub fn finalize_stream_with_tool_calls_and_thinking(
+        &mut self,
+        tool_calls: &[ToolCall],
+        reasoning: Option<&str>,
+        thinking_blocks: Vec<crate::conversation::message::ThinkingBlock>,
+    ) {
         let text = self
             .stream_buffer
             .take()
             .and_then(|s| clean_assistant_text(&s));
-        self.add_assistant_tool_calls(text.as_deref(), tool_calls.to_vec(), reasoning);
+        self.add_assistant_tool_calls_with_thinking(
+            text.as_deref(),
+            tool_calls.to_vec(),
+            reasoning,
+            thinking_blocks,
+        );
     }
 
     pub fn to_provider_messages(&self, system_prompt: &str) -> Vec<Message> {

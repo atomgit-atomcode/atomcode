@@ -159,6 +159,7 @@ pub async fn maybe_preprocess(
             // for tools. Drop them.
             crate::stream::StreamEvent::Warning(_)
             | crate::stream::StreamEvent::Usage(_)
+            | crate::stream::StreamEvent::ThinkingBlock { .. }
             | crate::stream::StreamEvent::ToolCallStart { .. }
             | crate::stream::StreamEvent::ToolCallDelta(_)
             | crate::stream::StreamEvent::ToolCallDone(_) => {}
