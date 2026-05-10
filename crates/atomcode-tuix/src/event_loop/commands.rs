@@ -103,6 +103,23 @@ pub fn perform_session_rename(
     Ok((old_name, new_name))
 }
 
+/// Render the "Instruction files:" status block — the same one shown
+/// by `/status`, factored out so `/init` can also display it after
+/// writing `.atomcode.md` (so users see the new file appear under
+/// PROJECT immediately, rather than trusting the success message).
+fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
+    use atomcode_core::config::instructions::LayeredInstructions;
+    let instructions = LayeredInstructions::load(working_dir);
+    let mut out = String::from("  Instruction files:\n");
+    for (level, path) in instructions.status_lines() {
+        match path {
+            Some(p) => out.push_str(&format!("    ✓ {} ({})\n", p.display(), level.label())),
+            None => out.push_str(&format!("    ✗ {} — not found\n", level.label())),
+        }
+    }
+    out
+}
+
 pub(super) fn execute_slash_command(
     cmd: &str,
     arg: &str,
@@ -366,18 +383,8 @@ pub(super) fn execute_slash_command(
             );
             txt.push_str(&render_codingplan_status_for_status_cmd());
 
-            // Instruction files status
-            let instructions =
-                atomcode_core::config::instructions::LayeredInstructions::load(&ctx.working_dir);
-            txt.push_str("\n  Instruction files:\n");
-            for (level, path) in instructions.status_lines() {
-                match path {
-                    Some(p) => {
-                        txt.push_str(&format!("    ✓ {} ({})\n", p.display(), level.label()))
-                    }
-                    None => txt.push_str(&format!("    ✗ {} — not found\n", level.label())),
-                }
-            }
+            txt.push('\n');
+            txt.push_str(&render_instruction_status_block(&ctx.working_dir));
 
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
@@ -693,10 +700,19 @@ pub(super) fn execute_slash_command(
             match std::fs::write(&target, &content) {
                 Ok(()) => {
                     renderer.render(UiLine::CommandOutput(format!(
-                        "  Wrote {} ({} bytes). Edit to customise; takes effect on next session.\n",
+                        "  Wrote {} ({} bytes). Edit to customise; picked up on your next message.\n",
                         target.display(),
                         content.len()
                     )));
+                    // Confirm the file is reachable for the prompt-builder by
+                    // re-running the same load that `/status` uses. If the
+                    // freshly written file does NOT appear under PROJECT here,
+                    // the user knows immediately — instead of asking the AI
+                    // a question and trying to infer load state from its
+                    // answer.
+                    renderer.render(UiLine::CommandOutput(
+                        render_instruction_status_block(&ctx.working_dir),
+                    ));
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(format!("  /init failed: {}\n", e)));
