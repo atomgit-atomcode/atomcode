@@ -159,6 +159,12 @@ fn cc_event_name_to_event(name: &str) -> Option<HookEvent> {
     })
 }
 
+fn parse_hook_event(name: &str) -> Option<HookEvent> {
+    serde_json::from_value::<HookEvent>(serde_json::Value::String(name.to_string()))
+        .ok()
+        .or_else(|| cc_event_name_to_event(name))
+}
+
 /// Parse a single hooks JSON file and return named hook configs.
 ///
 /// Disabled hooks are filtered out. Missing files return an empty vec
@@ -177,9 +183,9 @@ fn load_hooks_file(path: &Path) -> Result<Vec<(String, HookConfig)>> {
         if entry.disabled {
             continue;
         }
-        let event: HookEvent =
-            serde_json::from_value(serde_json::Value::String(entry.event.clone()))
-                .unwrap_or(HookEvent::PreToolUse);
+        let Some(event) = parse_hook_event(&entry.event) else {
+            continue;
+        };
         configs.push((
             name,
             HookConfig {
@@ -452,6 +458,40 @@ mod tests {
         assert_eq!(map["h2"].event, HookEvent::PostToolUse);
         assert_eq!(map["h3"].event, HookEvent::SessionStart);
         assert_eq!(map["h4"].event, HookEvent::SessionEnd);
+    }
+
+    #[test]
+    fn pascal_case_event_names_are_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let json = r#"{
+            "hooks": {
+                "h1": { "event": "PreToolUse", "command": "a" },
+                "h2": { "event": "UserPromptSubmit", "command": "b" }
+            }
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        let hooks = load_hooks_file(&path).unwrap();
+        let map: BTreeMap<String, HookConfig> = hooks.into_iter().collect();
+        assert_eq!(map["h1"].event, HookEvent::PreToolUse);
+        assert_eq!(map["h2"].event, HookEvent::UserPromptSubmit);
+    }
+
+    #[test]
+    fn invalid_event_name_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let json = r#"{
+            "hooks": {
+                "typo": { "event": "pre_tool", "command": "should-not-run" },
+                "valid": { "event": "post_tool_use", "command": "echo ok" }
+            }
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        let hooks = load_hooks_file(&path).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].0, "valid");
+        assert_eq!(hooks[0].1.event, HookEvent::PostToolUse);
     }
 
     /// Malformed JSON returns an error, not a panic.
