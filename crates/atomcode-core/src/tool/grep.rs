@@ -71,12 +71,7 @@ impl Tool for GrepTool {
             Err(_) => return self.approval(args),
         };
         let raw_path = parsed.path.as_deref().unwrap_or(".");
-        // Use Enumerate (not Read): grep is a search, not a targeted read.
-        // Read action prompts on every non-sensitive out-of-workspace path,
-        // which fires on routine searches like `~/Documents/other-project`.
-        // Enumerate keeps the safety net for sensitive paths (~/.ssh, /etc,
-        // id_rsa, .env, …) but auto-approves ordinary cross-project searches.
-        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Enumerate)
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read)
         {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
@@ -418,12 +413,8 @@ mod tests {
     use crate::tool::{ApprovalRequirement, Tool, ToolContext};
     use tempfile::TempDir;
 
-    // Regression: a routine grep over a path outside the workspace
-    // (e.g. `~/Documents/other-project`) used to prompt every time. Now
-    // we only escalate for sensitive paths — non-sensitive cross-project
-    // searches auto-approve.
     #[test]
-    fn grep_outside_workspace_non_sensitive_auto_approves() {
+    fn grep_outside_workspace_non_sensitive_requires_approval() {
         let workspace = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         let ctx = ToolContext::new(workspace.path().to_path_buf());
@@ -433,12 +424,10 @@ mod tests {
         );
         assert!(matches!(
             GrepTool.approval_with_context(&args, &ctx),
-            ApprovalRequirement::AutoApprove
+            ApprovalRequirement::RequireApproval(_)
         ));
     }
 
-    // Sensitive paths must still prompt — this is the safety net we
-    // intentionally kept when switching from Read to Enumerate semantics.
     #[test]
     fn grep_sensitive_path_still_requires_always() {
         let workspace = TempDir::new().unwrap();
