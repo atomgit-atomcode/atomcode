@@ -507,14 +507,20 @@ cargo build --release
 cp target/release/atomcode ~/.local/bin/</pre>
         </div>
         <div class="code-block rounded-xl p-5">
-          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.wizard">首次运行 — 欢迎界面</div>
+          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.wizard">首次运行 — 3 步启动向导</div>
           <pre class="font-mono text-sm"><span class="text-slate-400">$</span> <span class="text-emerald-400">atomcode</span>
 
-<span class="text-slate-300" data-i18n="install.welcome">欢迎使用 AtomCode · 开始使用：</span>
+<span class="text-slate-500" data-i18n="install.step1">第 1/3 步 · 欢迎</span>
+<span class="text-slate-300">AtomCode</span>
+<span class="text-slate-500" data-i18n="install.tagline">在终端里运行的 AI 编程代理</span>
 
-  <span class="text-brand-400">&#9656;</span> <span class="text-white font-semibold">Set up CodingPlan</span>    <span class="text-slate-500" data-i18n="install.codingplan">免费额度 · 推荐</span>
-    <span class="text-slate-300">Configure manually</span>   <span class="text-slate-500" data-i18n="install.apikey">API Key</span>
-    <span class="text-slate-300">Skip for now</span>          <span class="text-slate-500" data-i18n="install.skip">先看看再说</span></pre>
+<span class="text-slate-500" data-i18n="install.step2">第 2/3 步 · 语言</span>
+  <span class="text-brand-400">&#9656;</span> <span class="text-white">自动检测 / English / 简体中文</span>
+
+<span class="text-slate-500" data-i18n="install.step3">第 3/3 步 · 配置</span>
+  <span class="text-brand-400">&#9656;</span> <span class="text-white font-semibold">CodingPlan</span>     <span class="text-slate-500" data-i18n="install.codingplan">免费额度 · 推荐</span>
+    <span class="text-slate-300">手动配置</span>       <span class="text-slate-500" data-i18n="install.apikey">API Key</span>
+    <span class="text-slate-300">跳过</span>           <span class="text-slate-500" data-i18n="install.skip">先看看再说</span></pre>
         </div>
         <!-- 下载预编译二进制 -->
         <div class="code-block rounded-xl p-5">
@@ -629,7 +635,9 @@ cp target/release/atomcode ~/.local/bin/</pre>
         'install.title': '30 秒快速开始', 'install.desc': '一条命令完成安装，就是这么简单！',
         'install.oneclick': '一键安装（macOS / Linux / HarmonyOS PC）',
         'install.oneclick.win': '一键安装（Windows · PowerShell）',
-        'install.build': '从源码构建', 'install.wizard': '首次运行 — 欢迎界面', 'install.welcome': '欢迎使用 AtomCode · 开始使用：',
+        'install.build': '从源码构建', 'install.wizard': '首次运行 — 3 步启动向导',
+        'install.step1': '第 1/3 步 · 欢迎', 'install.step2': '第 2/3 步 · 语言', 'install.step3': '第 3/3 步 · 配置',
+        'install.tagline': '在终端里运行的 AI 编程代理',
         'install.codingplan': '免费额度 · 推荐', 'install.apikey': 'API Key', 'install.skip': '先看看再说',
         'install.download': '或下载预编译二进制文件', 'install.apple': 'Apple Silicon',
         'footer.tagline': 'AtomCode · 开源终端 AI 编码助手', 'footer.license': 'MIT 许可证', 'footer.rust': '用 Rust 构建'
@@ -669,7 +677,9 @@ cp target/release/atomcode ~/.local/bin/</pre>
         'install.title': 'Get Started in 30 Seconds', 'install.desc': "One command to install. That's it.",
         'install.oneclick': 'One-click install (macOS / Linux / HarmonyOS PC)',
         'install.oneclick.win': 'One-click install (Windows · PowerShell)',
-        'install.build': 'Build from source', 'install.wizard': 'First run — welcome screen', 'install.welcome': 'Welcome to AtomCode · Get started:',
+        'install.build': 'Build from source', 'install.wizard': 'First run — 3-step onboarding',
+        'install.step1': 'Step 1/3 · Welcome', 'install.step2': 'Step 2/3 · Language', 'install.step3': 'Step 3/3 · Setup',
+        'install.tagline': 'AI coding agent in your terminal',
         'install.codingplan': 'Free tokens · recommended', 'install.apikey': 'API Key', 'install.skip': 'explore first',
         'install.download': 'Or download a pre-built binary', 'install.apple': 'Apple Silicon',
         'footer.tagline': 'AtomCode · Open source terminal AI coding agent', 'footer.license': 'MIT License', 'footer.rust': 'Built with Rust'
