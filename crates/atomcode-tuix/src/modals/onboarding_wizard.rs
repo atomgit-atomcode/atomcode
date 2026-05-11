@@ -96,6 +96,49 @@ fn pad_to_width(s: &str, target: usize) -> String {
     format!("{s}{}", " ".repeat(target - w))
 }
 
+/// Footer rows the renderer reserves at the bottom (spinner +
+/// top_rule + input + bot_rule + status). Used to compute how much
+/// vertical body space is available for centering — the wizard
+/// panel must not push into the footer.
+const FOOTER_ROWS: usize = 5;
+
+/// Wrap `lines` with top-padding blanks and a left-padding indent
+/// so the wizard panel sits roughly in the centre of the visible
+/// body area. `panel_width` is the horizontal extent of the widest
+/// line (typically the bordered panel — 80 cols capped); the
+/// callers pass this in rather than scanning every line for SGR
+/// width because draw_panel-shaped output already commits to a
+/// known width.
+///
+/// Each rendered line keeps its own SGR; we prepend bare spaces,
+/// which contribute no styling, so colour spans on the original
+/// line stay intact.
+fn center_lines(
+    lines: Vec<String>,
+    panel_width: usize,
+    term_cols: u16,
+    term_rows: u16,
+) -> Vec<String> {
+    let term_cols = term_cols as usize;
+    let term_rows = term_rows as usize;
+    let body_rows = term_rows.saturating_sub(FOOTER_ROWS);
+    let top_blanks = body_rows.saturating_sub(lines.len()) / 2;
+    let left_pad = term_cols.saturating_sub(panel_width) / 2;
+    let pad_str = " ".repeat(left_pad);
+    let mut out = Vec::with_capacity(lines.len() + top_blanks);
+    for _ in 0..top_blanks {
+        out.push(String::new());
+    }
+    for line in lines {
+        if line.is_empty() || left_pad == 0 {
+            out.push(line);
+        } else {
+            out.push(format!("{pad_str}{line}"));
+        }
+    }
+    out
+}
+
 /// Mirror of `/clear`'s "fresh idle view" emission: clear has
 /// already been issued by the caller, this pushes the AtomCode
 /// banner + cwd + model + slash-hint tips that the renderer's
@@ -596,14 +639,20 @@ impl crate::modals::Modal for OnboardingWizard {
         renderer: &mut dyn crate::render::Renderer,
     ) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        // The wizard panel is capped at 80 cols by draw_panel; use that
+        // as the centering anchor so the bordered box stays at the
+        // canvas middle in wide terminals. Confirm is deliberately
+        // left uncentred — it's an inline scrollback message that
+        // shares space with the preserved body context.
+        let panel_width = (cols as usize).min(80);
         let lines = match self.step {
             Step::Confirm => {
                 // No box for the y/N prompt — one inline line.
                 vec![crate::i18n::t(crate::i18n::Msg::OnboardingConfirmClear).into_owned()]
             }
-            Step::Intro => self.draw_intro_lines(cols, rows),
-            Step::Language => self.draw_language_lines(cols),
-            Step::Setup => self.draw_setup_lines(cols),
+            Step::Intro => center_lines(self.draw_intro_lines(cols, rows), panel_width, cols, rows),
+            Step::Language => center_lines(self.draw_language_lines(cols), panel_width, cols, rows),
+            Step::Setup => center_lines(self.draw_setup_lines(cols), panel_width, cols, rows),
         };
         for line in lines {
             // No trailing `\n` — the retained renderer's
