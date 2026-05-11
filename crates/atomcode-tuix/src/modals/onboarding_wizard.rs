@@ -96,6 +96,27 @@ fn pad_to_width(s: &str, target: usize) -> String {
     format!("{s}{}", " ".repeat(target - w))
 }
 
+/// Mirror of `/clear`'s "fresh idle view" emission: clear has
+/// already been issued by the caller, this pushes the AtomCode
+/// banner + cwd + model + slash-hint tips that the renderer's
+/// `UiLine::Welcome` handler paints. Used when OnboardingWizard
+/// exits to drop the user onto the standard session view (same
+/// frame the `/clear` slash command produces) instead of a blank
+/// canvas with only the idle prompt. Does NOT emit the
+/// `CmdNewSession` "新会话已开始" toast — onboarding-exit is not
+/// the same intent as `/session` and the toast would be noise.
+fn paint_welcome(
+    ctx: &crate::event_loop::LoopCtx,
+    renderer: &mut dyn crate::render::Renderer,
+) {
+    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    renderer.render(crate::render::UiLine::Welcome {
+        model: ctx.model_name.clone(),
+        working_dir: dir_display,
+    });
+    renderer.flush();
+}
+
 // ───────────────────────────────────────────────────────────────────
 // State machine
 // ───────────────────────────────────────────────────────────────────
@@ -537,23 +558,30 @@ impl crate::modals::Modal for OnboardingWizard {
                 // Setup always runs on a wizard-owned screen
                 // (Confirm→Intro and every subsequent transition is
                 // a clear-and-redraw). Wipe the panel before
-                // returning Close so the event loop's
-                // redraw_idle_plain — or the codingplan / provider
-                // wizard takeover — starts on a clean canvas. Without
-                // this the bordered box stays painted behind the
-                // idle prompt and the user sees the wizard "stuck"
-                // even though it's actually closed.
+                // returning Close so the next view starts on a clean
+                // canvas. For Skip (no follow-up flag) we also
+                // render the welcome banner here so the user lands
+                // on the regular idle session view (AtomCode banner
+                // + cwd + model + tips), not a blank screen with
+                // just an input prompt. CodingPlan and Provider
+                // takeovers paint their own UI, so we only emit
+                // Welcome for the Skip branch.
                 renderer.clear_screen();
+                if self.setup_idx == 2 {
+                    paint_welcome(ctx, renderer);
+                }
                 Ok(ModalAction::Close)
             }
             PureOutcome::Close => {
-                // Same reasoning as ApplySetupThenClose, but gated
-                // on step: Esc/N from the Confirm step deliberately
-                // preserves the body context — clearing there would
-                // wipe the conversation the user just declined to
-                // discard.
+                // Esc/N from Confirm preserves the body context —
+                // clearing there would wipe the conversation the
+                // user just declined to discard. Esc from any other
+                // step bails out of onboarding entirely; render the
+                // welcome banner so the user sees the standard idle
+                // session view instead of a blank canvas.
                 if self.step != Step::Confirm {
                     renderer.clear_screen();
+                    paint_welcome(ctx, renderer);
                 }
                 Ok(ModalAction::Close)
             }
