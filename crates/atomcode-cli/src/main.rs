@@ -477,6 +477,9 @@ enum Commands {
         /// Port to listen on (default: 13456)
         #[arg(long, default_value = "13456")]
         port: u16,
+        /// Client identifier for telemetry (e.g. "vscode", "atomcode-air")
+        #[arg(long)]
+        client: Option<String>,
     },
     /// Telemetry controls
     Telemetry {
@@ -870,7 +873,7 @@ async fn run() -> Result<i32> {
                     }
                 }
             }
-            Commands::Daemon { port } => {
+            Commands::Daemon { port, client } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 eprintln!("Starting AtomCode daemon on port {}...", port);
                 eprintln!("Press Ctrl+C to stop.");
@@ -888,9 +891,12 @@ async fn run() -> Result<i32> {
                 });
                 match daemon_bin {
                     Some(bin) => {
-                        let status = std::process::Command::new(bin)
-                            .arg("--port")
-                            .arg(port.to_string())
+                        let mut cmd = std::process::Command::new(bin);
+                        cmd.arg("--port").arg(port.to_string());
+                        if let Some(ref c) = client {
+                            cmd.arg("--client").arg(c);
+                        }
+                        let status = cmd
                             .status()
                             .context("Failed to start atomcode-daemon")?;
                         return Ok(if status.success() { 0 } else { 1 });

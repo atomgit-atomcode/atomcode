@@ -297,11 +297,11 @@ impl Tool for ParallelEditTool {
         // for build-system markers, not model intent). On miss the table
         // is the final answer.
         if let Some((cmd, build_dir)) = find_build_command(&working_dir) {
-            let output = tokio::process::Command::new("sh")
-                .args(["-c", &cmd])
-                .current_dir(&build_dir)
-                .output()
-                .await;
+            let mut build_cmd = tokio::process::Command::new("sh");
+            build_cmd.args(["-c", &cmd])
+                .current_dir(&build_dir);
+            crate::process_utils::suppress_console_window(&mut build_cmd);
+            let output = build_cmd.output().await;
             if let Ok(out) = output {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);

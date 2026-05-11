@@ -236,7 +236,7 @@ export class DaemonProcess {
    * 5. Workspace build outputs (for developers)
    */
   private findBinary(port: number): DaemonBinary | undefined {
-    const portArgs = ['--port', String(port)];
+    const portArgs = ['--port', String(port), '--client', 'vscode'];
 
     // 1. User-configured path (could be atomcode or atomcode-daemon)
     if (this.configBinaryPath && fs.existsSync(this.configBinaryPath)) {

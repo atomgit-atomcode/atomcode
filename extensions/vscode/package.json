@@ -2,7 +2,7 @@
   "name": "atomcode-vscode",
   "displayName": "AtomCode",
   "description": "AI coding agent powered by AtomCode — terminal-grade AI inside VS Code",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "atomgit",
   "license": "MIT",
   "repository": {

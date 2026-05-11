@@ -159,10 +159,11 @@ pub(crate) async fn auth_login_start(
 /// POST /auth/login/:login_id/poll - Polls one OAuth login session.
 pub(crate) async fn auth_login_poll(
     State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<atomcode_telemetry::SessionMode>,
     Path(login_id): Path<String>,
 ) -> impl IntoResponse {
     let state_inner = state.clone();
-    crate::telemetry_scope::daemon_scope(&state, None, atomcode_telemetry::SessionMode::Ide, || async move {
+    crate::telemetry_scope::daemon_scope(&state, None, client_mode, || async move {
         match poll_login_session(&state_inner, &login_id).await {
             Ok(LoginPollStep::Pending) => Json(LoginPollResponse {
                 status: "pending".to_string(),
@@ -198,9 +199,12 @@ pub(crate) async fn auth_login_cancel(
 }
 
 /// POST /auth/logout - Logs out (removes stored auth).
-pub(crate) async fn auth_logout(State(state): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn auth_logout(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<atomcode_telemetry::SessionMode>,
+) -> impl IntoResponse {
     let state_inner = state.clone();
-    crate::telemetry_scope::daemon_scope(&state, None, atomcode_telemetry::SessionMode::Ide, || async move {
+    crate::telemetry_scope::daemon_scope(&state, None, client_mode, || async move {
         match auth::logout() {
             Ok(()) => {
                 state_inner.telemetry.set_account_id(None);

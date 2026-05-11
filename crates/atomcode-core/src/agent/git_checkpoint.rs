@@ -9,9 +9,11 @@ use std::process::Command;
 /// Create a checkpoint. Returns SHA if there are uncommitted changes, None if clean.
 pub fn create_checkpoint(working_dir: &Path) -> Option<String> {
     // Check if git repo
-    let is_git = Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(working_dir)
+    let mut check_cmd = Command::new("git");
+    check_cmd.args(["rev-parse", "--git-dir"])
+        .current_dir(working_dir);
+    crate::process_utils::suppress_console_window_sync(&mut check_cmd);
+    let is_git = check_cmd
         .output()
         .ok()
         .map(|o| o.status.success())
@@ -21,11 +23,11 @@ pub fn create_checkpoint(working_dir: &Path) -> Option<String> {
     }
 
     // git stash create: creates stash commit, returns SHA. Empty if clean.
-    let output = Command::new("git")
-        .args(["stash", "create"])
-        .current_dir(working_dir)
-        .output()
-        .ok()?;
+    let mut stash_cmd = Command::new("git");
+    stash_cmd.args(["stash", "create"])
+        .current_dir(working_dir);
+    crate::process_utils::suppress_console_window_sync(&mut stash_cmd);
+    let output = stash_cmd.output().ok()?;
 
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if sha.is_empty() {

@@ -1017,10 +1017,11 @@ async fn get_project_state(State(state): State<AppState>) -> impl IntoResponse {
 /// POST /cd - Change working directory (like /cd command)
 async fn change_dir(
     State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
     Json(req): Json<ChangeDirRequest>,
 ) -> impl IntoResponse {
     let state_clone = state.clone();
-    daemon_scope(&state, None, SessionMode::Ide, || async move {
+    daemon_scope(&state, None, client_mode, || async move {
         let state = state_clone;
         let mut project = state.project.write().await;
 
@@ -1324,11 +1325,12 @@ fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<
 /// DELETE /projects/:hash/sessions/:id - Delete a session
 async fn delete_session(
     State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
     Path((hash, id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let session_uuid = uuid::Uuid::parse_str(&id).ok();
     let state_clone = state.clone();
-    daemon_scope(&state, session_uuid, SessionMode::Ide, || async move {
+    daemon_scope(&state, session_uuid, client_mode, || async move {
         match delete_session_file(&hash, &id) {
             Ok(()) => {
                 state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into() });
@@ -1381,12 +1383,13 @@ fn rename_session_file(
 /// PATCH /projects/:hash/sessions/:id/rename - Rename a session
 async fn rename_session(
     State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
     Path((hash, id)): Path<(String, String)>,
     Json(req): Json<RenameRequest>,
 ) -> impl IntoResponse {
     let session_uuid = uuid::Uuid::parse_str(&id).ok();
     let state_clone = state.clone();
-    daemon_scope(&state, session_uuid, SessionMode::Ide, || async move {
+    daemon_scope(&state, session_uuid, client_mode, || async move {
         match rename_session_file(&hash, &id, &req.name) {
             Ok(()) => {
                 state_clone.telemetry.track(Event::UseCommand { type_: "rename".into() });
@@ -2071,8 +2074,8 @@ async fn process_chat_request(
         loop_guard: Default::default(),
     };
 
-    // Build system prompt (minimal for API)
-    let system_prompt = build_api_system_prompt(&working_dir, &skill_registry);
+    // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
+    let system_prompt = build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
@@ -2303,33 +2306,90 @@ async fn process_chat_request(
     Ok(())
 }
 
-/// Build minimal system prompt for API mode
+/// Build system prompt for daemon/API mode.
+///
+/// Aligned with TUI's `AgentLoop::build_system_prompt` to provide the same
+/// capabilities (model identity, layered instructions, memory, git snapshot,
+/// full rules). The only omission is plan mode (not applicable in API mode).
+///
+/// This function is self-contained — it does NOT touch any TUI code path.
 fn build_api_system_prompt(
     working_dir: &PathBuf,
+    _config: &Config,
+    provider_config: &atomcode_core::config::provider::ProviderConfig,
     skill_registry: &Arc<std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
 ) -> String {
-    let cwd = working_dir.to_string_lossy();
+    // Respect user's custom system_prompt override (same as TUI).
+    let rules = if let Some(custom) = provider_config.system_prompt.as_deref() {
+        custom.to_string()
+    } else {
+        atomcode_core::config::prompt_sections::build_rules().to_string()
+    };
+
+    // Environment metadata
+    let shell = if cfg!(target_os = "windows") {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
+    };
+    let env_info = format!("Platform: {} | Shell: {}", std::env::consts::OS, shell);
+
+    // Identity: inject model name so the model correctly identifies itself.
+    let model_display = &provider_config.model;
+
+    // Assemble prompt: identity + env → rules LAST (recency effect).
     let mut prompt = format!(
-        r#"You are AtomCode, an AI coding agent by AtomGit. When asked who you are, say you are AtomCode. Never claim to be Claude, GPT, Copilot, or any other AI product — you are AtomCode and only AtomCode.
-
-## WORKING DIRECTORY
-{cwd}
-
-## PRINCIPLES:
-1. ACT, DON'T INSTRUCT — DO IT, don't tell the user how.
-2. BE CONCISE — State what you did. No unsolicited advice.
-3. ONE SIGNAL IS ENOUGH — Success once → move on.
-
-## WORKFLOW:
-1. INVESTIGATE: Read code and logs. Don't ask the user — find the answer yourself.
-2. LOCATE: Use project context to find the right files.
-3. EDIT: Make targeted changes.
-4. VERIFY: After EACH edit, compile/build. Fix errors before moving on.
-5. SUMMARIZE: Tell the user what you changed.
-"#
+        "You are AtomCode. When asked who you are, say you are AtomCode \
+         (an AI coding agent by AtomGit) running the {} model. \
+         Never claim to be another product.\n\
+         Working directory: {wd}\n\
+         All file paths in tool calls must be absolute, resolved under {wd}. \
+         Verify file existence before editing.\n{env_info}\n",
+        model_display,
+        wd = working_dir.display(),
+        env_info = env_info,
     );
 
-    // Inject available skills into system prompt
+    // Git commit attribution (Co-Authored-By trailer).
+    prompt.push_str(&format!(
+        "\n=== GIT COMMITS ===\n\
+         When you create a git commit on the user's behalf, end the commit \
+         message with this trailer (preceded by a blank line):\n\
+         \n\
+         Co-Authored-By: AtomCode ({}) <noreply@atomgit.com>\n\
+         \n\
+         Use a HEREDOC for `git commit -m` so the trailer's blank line is \
+         preserved verbatim. Skip this trailer for `git commit --amend` \
+         and `git revert` (those operate on existing commits whose \
+         attribution shouldn't change).\n",
+        model_display
+    ));
+
+    // Layered instructions (global → project → user).
+    // Pure file reads, no side effects, < 1ms.
+    let instructions = atomcode_core::config::instructions::LayeredInstructions::load(working_dir);
+    let merged_instructions = instructions.merged();
+    if !merged_instructions.is_empty() {
+        prompt.push_str(&format!("\n{}\n", merged_instructions));
+    }
+
+    // Persistent memory (global + project).
+    // Pure file reads, no side effects.
+    {
+        use atomcode_core::config::memory::MemoryStore;
+        let project_name = working_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
+        let global = MemoryStore::global();
+        let project = MemoryStore::project(working_dir);
+        let memory_block = MemoryStore::merged_for_prompt(&global, &project, &project_name);
+        if !memory_block.is_empty() {
+            prompt.push_str(&format!("\n{}\n", memory_block));
+        }
+    }
+
+    // Available skills
     if let Ok(registry) = skill_registry.read() {
         let skills: Vec<String> = registry
             .invocable_by_llm()
@@ -2343,13 +2403,31 @@ fn build_api_system_prompt(
             })
             .collect();
         if !skills.is_empty() {
-            prompt.push_str("\n## AVAILABLE SKILLS\n");
+            prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
             prompt.push_str(
                 "Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
             );
             prompt.push_str(&skills.join("\n"));
             prompt.push('\n');
         }
+    }
+
+    // Git snapshot (branch / HEAD / status).
+    // Blocking I/O (~30ms) — acceptable per chat request since this runs once
+    // at prompt construction time, not on a hot path.
+    let env_snapshot = atomcode_core::ctx::EnvSnapshot::capture(working_dir);
+    prompt.push_str(&env_snapshot.as_prompt_section());
+
+    // RULES GO LAST — recency effect ensures the model remembers these.
+    prompt.push_str(&format!(
+        "\n=== RULES (follow these strictly) ===\n{rules}\n"
+    ));
+
+    // Platform-specific rules (Windows path conventions, etc.)
+    let platform = atomcode_core::config::platform_rules();
+    if !platform.is_empty() {
+        prompt.push_str(platform);
+        prompt.push('\n');
     }
 
     prompt
@@ -2371,11 +2449,12 @@ struct StopChatResponse {
 /// POST /chat/stop - Stop a running chat session
 async fn stop_chat(
     State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
     Json(req): Json<StopChatRequest>,
 ) -> impl IntoResponse {
     let session_uuid = uuid::Uuid::parse_str(&req.session_id).ok();
     let state_clone = state.clone();
-    daemon_scope(&state, session_uuid, SessionMode::Ide, || async move {
+    daemon_scope(&state, session_uuid, client_mode, || async move {
         // Add to stopped sessions set
         state_clone
             .stopped_sessions
@@ -2583,7 +2662,7 @@ fn spawn_idle_timeout_task(
     });
 }
 
-fn parse_daemon_args() -> (String, u16, CliOverride, u64) {
+fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
     const DEFAULT_HOST: &str = "127.0.0.1";
     const DEFAULT_PORT: u16 = 13456;
 
@@ -2591,6 +2670,7 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64) {
     let mut port: Option<u16> = None;
     let mut no_telemetry = false;
     let mut idle_timeout: Option<u64> = None;
+    let mut client_mode: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -2634,6 +2714,18 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64) {
             idle_timeout = value.parse().ok();
             continue;
         }
+
+        if arg == "--client" {
+            if let Some(value) = args.next() {
+                client_mode = Some(value);
+            }
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--client=") {
+            client_mode = Some(value.to_string());
+            continue;
+        }
     }
 
     let cli_override = if no_telemetry {
@@ -2650,7 +2742,13 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64) {
         .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
     let timeout = if raw_timeout == 0 { 0 } else { raw_timeout.max(60) };
 
-    (host.unwrap_or_else(|| DEFAULT_HOST.to_string()), port.unwrap_or(DEFAULT_PORT), cli_override, timeout)
+    let mode = match client_mode.as_deref() {
+        Some("vscode") => SessionMode::Vscode,
+        Some("atomcode-air") => SessionMode::AtomcodeAir,
+        _ => SessionMode::Ide,
+    };
+
+    (host.unwrap_or_else(|| DEFAULT_HOST.to_string()), port.unwrap_or(DEFAULT_PORT), cli_override, timeout, mode)
 }
 
 #[tokio::main]
@@ -2671,7 +2769,7 @@ async fn main() {
     };
 
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
-    let (host, port, cli_override, idle_timeout_secs) = parse_daemon_args();
+    let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
     let resolved = resolve(&cfg_telemetry, &cli_override, Config::config_dir(), &ProcessEnv);
 
     // Step 3: Print telemetry status line (R2.6)
@@ -2862,7 +2960,7 @@ async fn main() {
             // Step 12: On bind failure, still emit OpenAtomcode (R4.4) then exit
             CurrentContext::scope(
                 CurrentContext {
-                    mode: Some(SessionMode::Ide),
+                    mode: Some(startup_mode),
                     repo_origin: Some(repo_origin.clone()),
                     session_id: None,
                     ..CurrentContext::default()
@@ -2880,7 +2978,7 @@ async fn main() {
     // Steps 10-11: Enter CurrentContext scope and emit OpenAtomcode (R4.1, R4.2)
     CurrentContext::scope(
         CurrentContext {
-            mode: Some(SessionMode::Ide),
+            mode: Some(startup_mode),
             repo_origin: Some(repo_origin.clone()),
             session_id: None,
             ..CurrentContext::default()

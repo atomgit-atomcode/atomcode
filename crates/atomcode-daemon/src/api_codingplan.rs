@@ -50,10 +50,11 @@ struct StepInfo {
 /// POST /codingplan/setup - Runs CodingPlan provider setup.
 pub(crate) async fn codingplan_setup(
     State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<atomcode_telemetry::SessionMode>,
     Json(req): Json<CodingPlanSetupRequest>,
 ) -> impl IntoResponse {
     let state_clone = state.clone();
-    daemon_scope(&state, None, atomcode_telemetry::SessionMode::Ide, || async move {
+    daemon_scope(&state, None, client_mode, || async move {
         let state = state_clone;
         // Clean up expired sessions
         cleanup_expired_sessions(&state.login_sessions).await;

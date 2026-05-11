@@ -83,6 +83,8 @@ impl StdioClient {
             cmd.env(key, value);
         }
 
+        crate::process_utils::suppress_console_window(&mut cmd);
+
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn MCP server: {}", self.command))?;

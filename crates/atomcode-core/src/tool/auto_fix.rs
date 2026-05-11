@@ -133,11 +133,10 @@ pub async fn post_edit_syntax_check(file_path: &str) -> String {
     };
 
     if let Some((program, args)) = cmd {
-        match tokio::process::Command::new(program)
-            .args(&args)
-            .output()
-            .await
-        {
+        let mut command = tokio::process::Command::new(program);
+        command.args(&args);
+        crate::process_utils::suppress_console_window(&mut command);
+        match command.output().await {
             Ok(output) if !output.status.success() => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let first_lines: String = stderr.lines().take(3).collect::<Vec<_>>().join("\n");

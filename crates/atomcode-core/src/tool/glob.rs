@@ -180,11 +180,11 @@ impl Tool for GlobTool {
             find_args.push("-path".to_string());
             find_args.push(format!("*/{prefix}*/*"));
         }
-        let output = Command::new("find")
-            .args(&find_args)
-            .current_dir(&wd)
-            .output()
-            .await?;
+        let mut cmd = Command::new("find");
+        cmd.args(&find_args)
+            .current_dir(&wd);
+        crate::process_utils::suppress_console_window(&mut cmd);
+        let output = cmd.output().await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut files: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();

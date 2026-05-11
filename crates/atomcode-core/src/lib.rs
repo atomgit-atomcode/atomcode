@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod atomgit;
 pub mod auth;
+pub mod process_utils;
 pub mod coding_plan;
 pub mod commands;
 pub mod config;

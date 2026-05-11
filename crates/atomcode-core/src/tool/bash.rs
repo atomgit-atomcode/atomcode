@@ -292,15 +292,14 @@ impl Tool for BashTool {
 async fn snapshot_workspace_changes(
     wd: &std::path::Path,
 ) -> Option<std::collections::HashSet<String>> {
-    let out = tokio::process::Command::new("git")
-        .args(["status", "--porcelain", "-uall"])
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["status", "--porcelain", "-uall"])
         .current_dir(wd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    crate::process_utils::suppress_console_window(&mut cmd);
+    let out = cmd.output().await.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -333,13 +332,16 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
 
     // Platform-aware shell: cmd.exe on Windows, bash on Unix
     #[cfg(target_os = "windows")]
-    let mut child = Command::new("cmd.exe")
-        .args(&["/C", &parsed.command])
-        .current_dir(&wd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(&["/C", &parsed.command])
+            .current_dir(&wd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        crate::process_utils::suppress_console_window(&mut cmd);
+        cmd.spawn()?
+    };
 
     #[cfg(not(target_os = "windows"))]
     let mut child = {
