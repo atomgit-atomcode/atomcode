@@ -1100,10 +1100,18 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 let safe_desc = scrub_controls(desc);
                 let body = match menu.kind {
                     crate::render::MenuKind::SlashCommand => {
+                        // Pad by DISPLAY width, not char count: `/设为默认`
+                        // (5 chars, 9 cells) needs the same description
+                        // start column as `/添加` (3 chars, 5 cells). The
+                        // previous `{:<12}` char-count padding left CJK
+                        // rows two cells to the right of ASCII rows.
+                        let name_width = unicode_width::UnicodeWidthStr::width(safe_name.as_str());
+                        let pad = 12usize.saturating_sub(name_width);
+                        let padded = format!("{}{}", safe_name, " ".repeat(pad));
                         if selected {
-                            format!("▸ /{:<12}  {}", safe_name, safe_desc)
+                            format!("▸ /{}  {}", padded, safe_desc)
                         } else {
-                            format!("  /{:<12}  {}", safe_name, safe_desc)
+                            format!("  /{}  {}", padded, safe_desc)
                         }
                     }
                     crate::render::MenuKind::AtMention => {

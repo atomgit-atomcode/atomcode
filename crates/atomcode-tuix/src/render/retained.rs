@@ -613,10 +613,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // read as a wonky margin against the flush-left rule.
         let content = match kind {
             super::MenuKind::SlashCommand => {
+                // Pad by DISPLAY width, not char count: `/设为默认`
+                // (5 chars, 9 cells) needs the same description
+                // start column as `/添加` (3 chars, 5 cells), so
+                // `{:<12}`'s char-count padding leaves CJK rows
+                // pushed two cells to the right of their ASCII
+                // neighbours. UnicodeWidthStr knows CJK glyphs are
+                // 2 cells; compute and append spaces explicitly.
+                let name_width = unicode_width::UnicodeWidthStr::width(name);
+                let pad = 12usize.saturating_sub(name_width);
+                let padded = format!("{}{}", name, " ".repeat(pad));
                 if selected {
-                    format!("▸ /{:<12}  {}", name, desc)
+                    format!("▸ /{}  {}", padded, desc)
                 } else {
-                    format!("  /{:<12}  {}", name, desc)
+                    format!("  /{}  {}", padded, desc)
                 }
             }
             super::MenuKind::AtMention => {
