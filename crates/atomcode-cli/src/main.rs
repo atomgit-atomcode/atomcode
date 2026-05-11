@@ -382,6 +382,10 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
+    /// Set interface language (e.g. en, zh-CN, zh)
+    #[arg(long)]
+    lang: Option<String>,
+
     /// Path to config file
     #[arg(long)]
     config: Option<PathBuf>,
@@ -897,6 +901,7 @@ async fn run() -> Result<i32> {
                 telemetry: Default::default(),
                 lsp: Default::default(),
                 auto_commit: false,
+                language: None,
             }
         })
     } else {
@@ -912,8 +917,16 @@ async fn run() -> Result<i32> {
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            language: None,
         }
     };
+
+    // ── i18n locale ──
+    let locale = atomcode_tuix::i18n::resolve_initial_locale(
+        cli.lang.as_deref(),
+        config.language,
+    );
+    atomcode_tuix::i18n::set_locale(locale);
 
     let unavailable_reason = if config.providers.is_empty() {
         Some("未配置 provider。请使用 /provider 添加 provider 后再试。".to_string())
@@ -1821,6 +1834,7 @@ fn run_codingplan_core(
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            language: None,
         },
     };
 
