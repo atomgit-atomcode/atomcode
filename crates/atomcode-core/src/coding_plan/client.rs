@@ -15,10 +15,11 @@ use anyhow::{anyhow, Context, Result};
 use super::types::{ClaimResponse, ModelEntry, PlanType, StatusResponse};
 use crate::auth;
 
-/// Pre-prod API base. Per the v2 rollout we point at `pre-api.gitcode.com`
-/// while the new tier-based claim/models endpoints stabilise; flip back
-/// to `api.gitcode.com` here in a single edit when we cut over to prod.
-pub const API_BASE: &str = "https://pre-api.gitcode.com/api/v5";
+/// Prod API base. v2 rollout (tier-based claim/models/status) has
+/// landed on `api.gitcode.com`; the previous `pre-api.gitcode.com`
+/// staging endpoint is no longer needed. Single edit here flips
+/// every claim-v2 / models-v2 / status-v2 call.
+pub const API_BASE: &str = "https://api.gitcode.com/api/v5";
 
 /// Token-authenticated blocking REST client for CodingPlan endpoints.
 pub struct Client {
