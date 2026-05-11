@@ -1194,9 +1194,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         // Kept compact (5 lines) so on small terminals the menu still
         // fits without scrolling the welcome banner off-screen.
         renderer.render(UiLine::CommandOutput(
-            "\n  Welcome to AtomCode. Pick an option to get started:\n  \
-            (↑↓ to navigate, Enter to confirm, Esc to skip)\n\n"
-                .into(),
+            format!(
+                "\n  {}\n  {}\n\n",
+                crate::i18n::t(crate::i18n::Msg::WelcomeBannerLine1),
+                crate::i18n::t(crate::i18n::Msg::WelcomeBannerLine2),
+            )
+            .into(),
         ));
         app.active_modal = Some(Box::new(crate::modals::WelcomeWizard::new()));
         if let Some(m) = app.active_modal.as_mut() {

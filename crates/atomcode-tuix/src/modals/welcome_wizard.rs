@@ -47,11 +47,15 @@ impl WelcomeWizard {
     }
 
     /// Stable option list.
-    fn options() -> [(&'static str, &'static str); 3] {
+    fn options() -> [(String, String); 3] {
+        use crate::i18n::{t, Msg};
         [
-            ("Set up CodingPlan", "Free tokens · recommended"),
-            ("Configure manually", "API key"),
-            ("Skip for now", "explore first"),
+            (t(Msg::WelcomeOptionCodingPlan).into_owned(),
+             t(Msg::WelcomeOptionCodingPlanHint).into_owned()),
+            (t(Msg::WelcomeOptionConfigureManually).into_owned(),
+             t(Msg::WelcomeOptionConfigureManuallyHint).into_owned()),
+            (t(Msg::WelcomeOptionSkip).into_owned(),
+             t(Msg::WelcomeOptionSkipHint).into_owned()),
         ]
     }
 
@@ -126,8 +130,7 @@ impl Modal for WelcomeWizard {
 
 fn build_menu_payload(w: &WelcomeWizard) -> MenuPayload {
     let items: Vec<(String, String)> = WelcomeWizard::options()
-        .iter()
-        .map(|(label, hint)| (label.to_string(), hint.to_string()))
+        .into_iter()
         .collect();
     MenuPayload {
         items,
@@ -152,6 +155,7 @@ mod tests {
     /// has to go through a test update.
     #[test]
     fn options_put_codingplan_first() {
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let opts = WelcomeWizard::options();
         assert_eq!(opts[0].0, "Set up CodingPlan");
         assert_eq!(opts[0].1, "Free tokens · recommended");
@@ -187,6 +191,7 @@ mod tests {
 
     #[test]
     fn menu_payload_reflects_selection() {
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let mut w = WelcomeWizard::new();
         w.selected = 1;
         let p = build_menu_payload(&w);
