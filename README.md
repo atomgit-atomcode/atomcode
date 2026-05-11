@@ -27,7 +27,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
-  <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
   <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">
@@ -150,7 +150,7 @@ and the binary will be generated at `target/release/atomcode`.
 
 ### Requirements
 
-- Rust 1.75+ (for building)
+- Rust 1.88+ (for building; older Cargo versions cannot parse the current lockfile)
 - An API key from any supported provider (or an AtomGit account for `/login`)
 
 ### Uninstall
@@ -369,7 +369,7 @@ AtomCode reads this file automatically and includes it in the system prompt.
 
 ### Prerequisites
 
-- **Rust 1.75+** — install via [rustup](https://rustup.rs/)
+- **Rust 1.88+** — install via [rustup](https://rustup.rs/)
 - **Git**
 - A supported LLM provider API key (for runtime testing)
 
