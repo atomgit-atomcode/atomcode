@@ -115,7 +115,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
 /// Look up the i18n translation for a built-in command description.
 /// Returns `None` for unknown command names (callers fall back to
 /// the static `desc` field).
-fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
+pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
     use crate::i18n::{t, Msg};
     let msg = match name {
         "codingplan" => Msg::CmdDescCodingplan,

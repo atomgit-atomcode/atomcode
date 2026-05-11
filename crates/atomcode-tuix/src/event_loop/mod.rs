@@ -2142,7 +2142,12 @@ fn build_menu_items(
     let mut matches: Vec<(String, String)> = commands
         .matching_prefix(rest)
         .into_iter()
-        .map(|c| (c.name.to_string(), c.desc.to_string()))
+        .map(|c| {
+            let desc = crate::commands::cmd_desc_i18n(c.name)
+                .map(|cow| cow.into_owned())
+                .unwrap_or_else(|| c.desc.to_string());
+            (c.name.to_string(), desc)
+        })
         .collect();
     for (name, desc) in custom.command_names_and_descriptions() {
         if name.starts_with(&prefix_lower) && !matches.iter().any(|(n, _)| *n == name) {
