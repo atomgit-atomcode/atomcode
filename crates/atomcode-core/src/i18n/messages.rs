@@ -476,4 +476,15 @@ pub enum Msg<'a> {
     /// model can't accept images AND no `vision_preprocessor_provider`
     /// is configured. `model` is the current model identifier.
     ModelNoImageSupport { model: &'a str },
+
+    /// Confirmation hint after the first Ctrl+C on an empty buffer.
+    /// "  (press Ctrl+C again to exit)\n" — leading indent + trailing
+    /// newline are part of the template.
+    CtrlCAgainToExit,
+
+    /// Startup hint shown on terminals where Kitty CSI-u keyboard
+    /// disambiguation isn't available, telling the user the
+    /// guaranteed-works `\<Enter>` multi-line trick. Multi-line
+    /// payload with leading indent + trailing paragraph break.
+    HintMultiLineInput,
 }

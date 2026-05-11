@@ -674,5 +674,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             model
         )
         .into(),
+        Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
+        Msg::HintMultiLineInput =>
+            "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \
+            所有终端均可用。（Shift / Alt / Ctrl + Enter 在部分终端也支持，\n    \
+            取决于该终端的键盘协议 — 可以试试看。）\n\n"
+                .into(),
     }
 }

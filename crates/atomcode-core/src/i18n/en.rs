@@ -680,5 +680,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             model
         )
         .into(),
+        Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
+        Msg::HintMultiLineInput =>
+            "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
+            Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \
+            depending on the terminal's keyboard protocol — try them out.)\n\n"
+                .into(),
     }
 }

@@ -2184,10 +2184,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // sometimes-wrong terminal-specific one.
     if kbd_hint_set && !jediterm_set {
         renderer.render(UiLine::CommandOutput(
-            "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
-            Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \
-            depending on the terminal's keyboard protocol — try them out.)\n\n"
-                .into(),
+            crate::i18n::t(crate::i18n::Msg::HintMultiLineInput).into_owned(),
         ));
     }
 
@@ -4092,7 +4089,7 @@ fn handle_idle_key(
             } else {
                 app.exit_pending = Some(now);
                 renderer.render(UiLine::CommandOutput(
-                    "  (press Ctrl+C again to exit)\n".into(),
+                    crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
                 ));
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -4563,7 +4560,7 @@ fn handle_approval_key(
             ctx.agent.cmd_tx.send(AgentCommand::DenyTool).ok();
             app.state.on_approval_resolved();
             renderer.render(UiLine::CommandOutput(
-                "  (press Ctrl+C again to exit)\n".into(),
+                crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
             ));
             renderer.flush();
         }
