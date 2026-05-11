@@ -220,17 +220,21 @@ impl OnboardingWizard {
                 }
                 PureOutcome::Redraw
             }
+            // Number keys are shortcuts: pick AND commit in one
+            // keystroke. The arrow-key path still requires Enter,
+            // but typing a digit is unambiguous — the user already
+            // expressed intent, no second confirmation needed.
             (Language, KeyCode::Char('1')) => {
                 self.language_idx = 0;
-                PureOutcome::Redraw
+                PureOutcome::ApplyLanguageThenAdvance
             }
             (Language, KeyCode::Char('2')) => {
                 self.language_idx = 1;
-                PureOutcome::Redraw
+                PureOutcome::ApplyLanguageThenAdvance
             }
             (Language, KeyCode::Char('3')) => {
                 self.language_idx = 2;
-                PureOutcome::Redraw
+                PureOutcome::ApplyLanguageThenAdvance
             }
             (Language, KeyCode::Enter) => PureOutcome::ApplyLanguageThenAdvance,
             (Language, KeyCode::Left) => {
@@ -252,15 +256,15 @@ impl OnboardingWizard {
             }
             (Setup, KeyCode::Char('1')) => {
                 self.setup_idx = 0;
-                PureOutcome::Redraw
+                PureOutcome::ApplySetupThenClose
             }
             (Setup, KeyCode::Char('2')) => {
                 self.setup_idx = 1;
-                PureOutcome::Redraw
+                PureOutcome::ApplySetupThenClose
             }
             (Setup, KeyCode::Char('3')) => {
                 self.setup_idx = 2;
-                PureOutcome::Redraw
+                PureOutcome::ApplySetupThenClose
             }
             (Setup, KeyCode::Enter) => PureOutcome::ApplySetupThenClose,
             (Setup, KeyCode::Left) => {
