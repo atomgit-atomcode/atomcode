@@ -453,7 +453,7 @@ impl Tool for EditFileTool {
             };
             let (result, _final_content) = validate_write_check(
                 &new_content,
-                &parsed.file_path,
+                &file_path_str,
                 &new_string,
                 &content,
                 result,
@@ -481,7 +481,7 @@ impl Tool for EditFileTool {
         // If symbol is provided, scope the edit to that symbol's body using tree-sitter.
         // This resolves ambiguity: old_string only needs to be unique within the symbol, not the whole file.
         if let Some(ref symbol_name) = parsed.symbol {
-            let path = std::path::Path::new(&parsed.file_path);
+            let path = file_path.as_path();
             let mut searcher = ctx.semantic.lock().await;
             if let Some(slice) = searcher.extract_symbol(path, symbol_name) {
                 let sym_text = &content[slice.start_byte..slice.end_byte];
@@ -541,7 +541,7 @@ impl Tool for EditFileTool {
                 };
                 let (result, _final_content) = validate_write_check(
                     &new_content,
-                    &parsed.file_path,
+                    &file_path_str,
                     &new_string,
                     &content,
                     result,
@@ -597,7 +597,7 @@ impl Tool for EditFileTool {
                 };
                 let (result, _final_content) = validate_write_check(
                     &fuzzy_result,
-                    &parsed.file_path,
+                    &file_path_str,
                     &new_string,
                     &content,
                     result,
@@ -693,7 +693,7 @@ impl Tool for EditFileTool {
             };
             let (result, _final_content) = validate_write_check(
                 &new_content,
-                &parsed.file_path,
+                &file_path_str,
                 &new_string,
                 &content,
                 result,
@@ -705,7 +705,7 @@ impl Tool for EditFileTool {
             if count > 1 {
                 // Auto-disambiguate using tree-sitter: if only ONE symbol contains the match,
                 // scope to that symbol automatically. The model doesn't need to pass symbol=.
-                let path = std::path::Path::new(&parsed.file_path);
+                let path = file_path.as_path();
                 let mut searcher = ctx.semantic.lock().await;
                 if let Some(symbols) = searcher.list_symbols(path) {
                     // Find which symbols contain the old_string
@@ -741,7 +741,7 @@ impl Tool for EditFileTool {
                         };
                         let (result, _final_content) = validate_write_check(
                             &new_content,
-                            &parsed.file_path,
+                            &file_path_str,
                             &new_string,
                             &content,
                             result,
@@ -778,7 +778,7 @@ impl Tool for EditFileTool {
             };
             let (result, _final_content) = validate_write_check(
                 &new_content,
-                &parsed.file_path,
+                &file_path_str,
                 &new_string,
                 &content,
                 result,
@@ -1531,7 +1531,9 @@ fn find_closest_match_inner(
 #[cfg(test)]
 mod security_tests {
     use super::*;
-    use crate::tool::{ApprovalRequirement, Tool};
+    use crate::tool::{ApprovalRequirement, Tool, ToolContext};
+    use serial_test::serial;
+    use tempfile::TempDir;
 
     #[test]
     fn edit_file_requires_approval_for_sensitive_paths() {
@@ -1569,5 +1571,37 @@ mod security_tests {
             tool.approval("{not valid json"),
             ApprovalRequirement::RequireApproval(_)
         ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn edit_file_writes_relative_path_against_tool_working_dir() {
+        let workspace = TempDir::new().unwrap();
+        let process_cwd = TempDir::new().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::create_dir_all(process_cwd.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/app.rs"), "fn main() {\n    old();\n}\n")
+            .unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(process_cwd.path()).unwrap();
+        let result = EditFileTool
+            .execute(
+                r#"{"file_path":"src/app.rs","old_string":"old();","new_string":"new();"}"#,
+                &ToolContext::new(workspace.path().to_path_buf()),
+            )
+            .await;
+        std::env::set_current_dir(original_cwd).unwrap();
+
+        let result = result.unwrap();
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("src/app.rs")).unwrap(),
+            "fn main() {\n    new();\n}\n"
+        );
+        assert!(
+            !process_cwd.path().join("src/app.rs").exists(),
+            "edit_file must not write relative paths against the process cwd"
+        );
     }
 }
