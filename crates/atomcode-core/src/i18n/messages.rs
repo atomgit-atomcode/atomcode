@@ -448,4 +448,21 @@ pub enum Msg<'a> {
     /// Footer line: "Press ESC to cancel" with surrounding
     /// blank-line padding.
     LoginCancelHint,
+
+    // ── /context report ──
+    CtxUsageHeader,
+    CtxUsageNoTurns,
+    CtxUsageWaiting,
+    CtxProvider,
+    CtxCtxName,
+    CtxLabelSystemPrompt,
+    CtxLabelToolDefs,
+    CtxLabelColdZone,
+    CtxLabelMessages,
+    CtxLabelFree,
+    CtxMessagesInWindow { n: usize },
+    CtxSystemPromptHeader,
+    CtxSystemPromptEmpty,
+    /// Used in the "used/window tokens (pct)" line below the bar.
+    CtxTokensSuffix,
 }

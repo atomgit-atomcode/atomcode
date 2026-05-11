@@ -647,5 +647,19 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LoginUrlOnly =>
             "  Open this URL in any browser to sign in to AtomGit:\n  ".into(),
         Msg::LoginCancelHint => "\n\n  Press ESC to cancel\n".into(),
+        Msg::CtxUsageHeader => "Context Usage".into(),
+        Msg::CtxUsageNoTurns => "(run at least one turn first — stats are captured per turn)".into(),
+        Msg::CtxUsageWaiting => "(waiting for first complete turn — partial stats only)".into(),
+        Msg::CtxProvider => "Provider".into(),
+        Msg::CtxCtxName => "ctx".into(),
+        Msg::CtxLabelSystemPrompt => "System prompt".into(),
+        Msg::CtxLabelToolDefs => "Tool defs".into(),
+        Msg::CtxLabelColdZone => "Cold zone".into(),
+        Msg::CtxLabelMessages => "Messages".into(),
+        Msg::CtxLabelFree => "Free".into(),
+        Msg::CtxMessagesInWindow { n } => format!("Messages in window: {n}").into(),
+        Msg::CtxSystemPromptHeader => "=== SYSTEM PROMPT ===".into(),
+        Msg::CtxSystemPromptEmpty => "(empty — wait for one complete turn to capture)".into(),
+        Msg::CtxTokensSuffix => "tokens".into(),
     }
 }

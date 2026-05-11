@@ -1678,12 +1678,12 @@ fn format_context_report(
     model_name: &str,
     show_prompt: bool,
 ) -> String {
+    let header = t(Msg::CtxUsageHeader);
     let Some(snap) = snapshot else {
-        return "  Context Usage\n  \n  (run at least one turn first — stats are captured per turn)\n".into();
+        return format!("  {}\n  \n  {}\n", header, t(Msg::CtxUsageNoTurns));
     };
     if snap.ctx_window == 0 {
-        return "  Context Usage\n  \n  (waiting for first complete turn — partial stats only)\n"
-            .into();
+        return format!("  {}\n  \n  {}\n", header, t(Msg::CtxUsageWaiting));
     }
 
     let window = snap.ctx_window;
@@ -1743,31 +1743,61 @@ fn format_context_report(
 
     let used_pct = pct(total_used);
 
+    // Localised legend labels. Pad each to the widest display-width
+    // in the current locale so the `:` column aligns regardless of
+    // whether the active translation uses ASCII or CJK glyphs (CJK
+    // chars are 2 cells; char-count padding would mis-align).
+    let l_sys = t(Msg::CtxLabelSystemPrompt).into_owned();
+    let l_tools = t(Msg::CtxLabelToolDefs).into_owned();
+    let l_cold = t(Msg::CtxLabelColdZone).into_owned();
+    let l_msgs = t(Msg::CtxLabelMessages).into_owned();
+    let l_free = t(Msg::CtxLabelFree).into_owned();
+    let max_label = [&l_sys, &l_tools, &l_cold, &l_msgs, &l_free]
+        .iter()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()))
+        .max()
+        .unwrap_or(0);
+    let pad_label = |label: &str| -> String {
+        let w = unicode_width::UnicodeWidthStr::width(label);
+        format!("{}{}", label, " ".repeat(max_label.saturating_sub(w)))
+    };
+
+    let ctx_name = if snap.ctx_name.is_empty() {
+        "default"
+    } else {
+        snap.ctx_name.as_str()
+    };
+
     let mut out = format!(
-        "  Context Usage\n  \
+        "  {header}\n  \
          \n  \
          {bar}\n  \
-         {used}/{window} tokens ({used_pct})\n  \
+         {used}/{window} {tokens} ({used_pct})\n  \
          \n  \
-         Provider: {model}  ·  ctx: {ctx_name}\n  \
+         {provider}: {model}  ·  {ctx_label}: {ctx_name}\n  \
          \n  \
-         ▒ System prompt : {sys_s:>7}  ({sys_p})\n  \
-         ▓ Tool defs     : {tools_s:>7}  ({tools_p})\n  \
-         ░ Cold zone     : {cold_s:>7}  ({cold_p})\n  \
-         █ Messages      : {msgs_s:>7}  ({msgs_p})\n  \
-         · Free          : {free_s:>7}  ({free_p})\n  \
+         ▒ {l_sys} : {sys_s:>7}  ({sys_p})\n  \
+         ▓ {l_tools} : {tools_s:>7}  ({tools_p})\n  \
+         ░ {l_cold} : {cold_s:>7}  ({cold_p})\n  \
+         █ {l_msgs} : {msgs_s:>7}  ({msgs_p})\n  \
+         · {l_free} : {free_s:>7}  ({free_p})\n  \
          \n  \
-         Messages in window: {n_msgs}\n",
+         {msg_count}\n",
+        header = t(Msg::CtxUsageHeader),
         bar = bar,
         used = k(total_used),
         window = k(window),
+        tokens = t(Msg::CtxTokensSuffix),
         used_pct = used_pct,
+        provider = t(Msg::CtxProvider),
+        ctx_label = t(Msg::CtxCtxName),
         model = model_name,
-        ctx_name = if snap.ctx_name.is_empty() {
-            "default"
-        } else {
-            snap.ctx_name.as_str()
-        },
+        ctx_name = ctx_name,
+        l_sys = pad_label(&l_sys),
+        l_tools = pad_label(&l_tools),
+        l_cold = pad_label(&l_cold),
+        l_msgs = pad_label(&l_msgs),
+        l_free = pad_label(&l_free),
         sys_s = k(sys),
         sys_p = pct(sys),
         tools_s = k(tools),
@@ -1778,7 +1808,7 @@ fn format_context_report(
         msgs_p = pct(messages),
         free_s = k(free),
         free_p = pct(free),
-        n_msgs = snap.total_messages,
+        msg_count = t(Msg::CtxMessagesInWindow { n: snap.total_messages }),
     );
 
     // `/context prompt` — append the full system-prompt bytes the last
@@ -1789,9 +1819,9 @@ fn format_context_report(
     // fires once the first complete turn lands).
     if show_prompt {
         out.push('\n');
-        out.push_str("  === SYSTEM PROMPT ===\n");
+        out.push_str(&format!("  {}\n", t(Msg::CtxSystemPromptHeader)));
         if snap.system_prompt.is_empty() {
-            out.push_str("  (empty — wait for one complete turn to capture)\n");
+            out.push_str(&format!("  {}\n", t(Msg::CtxSystemPromptEmpty)));
         } else {
             // Indent each line with two spaces to match the surrounding
             // CommandOutput formatting (every other block uses a 2-space
@@ -2516,6 +2546,8 @@ mod tests {
 
     #[test]
     fn context_report_without_snapshot_prompts_to_run_turn() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let out = format_context_report(None, "claude-opus-4-7", false);
         assert!(out.contains("run at least one turn"));
         // Never leak a window/totals when there's nothing to show
@@ -2524,6 +2556,8 @@ mod tests {
 
     #[test]
     fn context_report_with_zero_window_flags_partial_stats() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let snap = crate::state::ContextSnapshot {
             system_tokens: 100,
             sent_tokens: 200,
@@ -2540,6 +2574,8 @@ mod tests {
 
     #[test]
     fn context_report_renders_full_breakdown() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let snap = crate::state::ContextSnapshot {
             system_tokens: 8_000,
             sent_tokens: 30_000, // includes cold
@@ -2576,6 +2612,8 @@ mod tests {
 
     #[test]
     fn context_report_messages_excludes_cold_zone() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         // sent_tokens = messages + cold_zone (cold is injected as a
         // System message inside `sent`). Renderer must subtract so
         // "Messages" doesn't double-count.
@@ -2604,6 +2642,8 @@ mod tests {
 
     #[test]
     fn context_report_free_is_nonneg_under_rounding() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         // Pathological: sum of components exactly = window. Free must
         // render as 0, never blow up the subtraction.
         let snap = crate::state::ContextSnapshot {
@@ -2630,6 +2670,8 @@ mod tests {
 
     #[test]
     fn context_report_without_show_prompt_omits_system_prompt_section() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         // Default `/context` output must not include the prompt dump
         // even when the snapshot HAS a cached prompt. Otherwise the
         // breakdown dashboard gets buried under 5-15K chars every call.
@@ -2656,6 +2698,8 @@ mod tests {
 
     #[test]
     fn context_report_with_show_prompt_appends_cached_prompt() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let snap = crate::state::ContextSnapshot {
             system_tokens: 1_000,
             sent_tokens: 5_000,

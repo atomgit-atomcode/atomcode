@@ -645,5 +645,19 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LoginUrlOnly =>
             "  在浏览器中打开此链接以登录 AtomGit：\n  ".into(),
         Msg::LoginCancelHint => "\n\n  按 ESC 取消\n".into(),
+        Msg::CtxUsageHeader => "上下文用量".into(),
+        Msg::CtxUsageNoTurns => "（请至少完成一轮对话 — 统计在每轮结束时记录）".into(),
+        Msg::CtxUsageWaiting => "（等待首轮完成 — 当前仅为部分统计）".into(),
+        Msg::CtxProvider => "Provider".into(),
+        Msg::CtxCtxName => "ctx".into(),
+        Msg::CtxLabelSystemPrompt => "系统提示".into(),
+        Msg::CtxLabelToolDefs => "工具定义".into(),
+        Msg::CtxLabelColdZone => "冷区".into(),
+        Msg::CtxLabelMessages => "消息".into(),
+        Msg::CtxLabelFree => "空闲".into(),
+        Msg::CtxMessagesInWindow { n } => format!("窗口内消息数：{n}").into(),
+        Msg::CtxSystemPromptHeader => "=== 系统提示 ===".into(),
+        Msg::CtxSystemPromptEmpty => "（为空 — 完成一轮对话后捕获）".into(),
+        Msg::CtxTokensSuffix => "tokens".into(),
     }
 }
