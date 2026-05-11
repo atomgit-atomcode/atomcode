@@ -791,6 +791,11 @@ pub struct LoopCtx {
     /// stays current without thrashing the system clipboard on every
     /// redraw. Refreshed lazily inside `build_status`.
     pub clipboard_check: std::sync::Arc<std::sync::Mutex<ClipboardCheckState>>,
+    /// `true` when the TUI was launched with `PlainRenderer` (CI / pipe
+    /// / non-TTY). The onboarding wizard checks this — plain mode can't
+    /// run interactive multi-step flows, so first-run falls through to
+    /// the existing "no provider configured" status hint.
+    pub is_plain_renderer: bool,
 }
 
 /// Memoised result of the most recent clipboard probe. The hash is a
@@ -2256,29 +2261,20 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     }
 
     // First-run onboarding: no providers configured AND no OAuth login
-    // on disk means the user has never set this up. Show the legacy-tui
-    // 3-choice wizard (Login / Configure manually / Skip) as a modal —
-    // same mechanism as /resume, /provider, etc. Users with a config or
-    // prior OAuth auth are never shown this and boot straight to idle.
-    let is_first_run =
-        ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none();
-    if is_first_run {
-        // Body-side guide — pushed to scrollback above the footer menu,
-        // gives the user context before they navigate the MenuPayload.
-        // Kept compact (5 lines) so on small terminals the menu still
-        // fits without scrolling the welcome banner off-screen.
-        renderer.render(UiLine::CommandOutput(
-            format!(
-                "\n  {}\n  {}\n\n",
-                crate::i18n::t(crate::i18n::Msg::WelcomeBannerLine1),
-                crate::i18n::t(crate::i18n::Msg::WelcomeBannerLine2),
-            )
-            .into(),
-        ));
-        app.active_modal = Some(Box::new(crate::modals::WelcomeWizard::new()));
-        if let Some(m) = app.active_modal.as_mut() {
-            m.draw(&app.buf, &app.state, &ctx, renderer);
-        }
+    // on disk means the user has never set this up — open the
+    // OnboardingWizard. Users with a config or prior OAuth auth are
+    // never shown this and boot straight to idle. Plain renderer
+    // (CI / pipe / non-TTY) is also gated out — the bordered box
+    // would just garble its output channel with no human to see it.
+    if should_auto_show_onboarding(&ctx) {
+        // Modal trait imported so `wizard.draw(...)` resolves; the
+        // OnboardingWizard's Modal impl owns the per-step box drawing.
+        use crate::modals::Modal;
+        renderer.clear_screen();
+        let wizard = crate::modals::OnboardingWizard::new()
+            .with_initial_language(ctx.config.language);
+        wizard.draw(&app.buf, &app.state, &ctx, renderer);
+        app.active_modal = Some(Box::new(wizard));
     } else {
         renderer.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -4160,6 +4156,19 @@ fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mu
         attachments,
     });
     renderer.flush();
+}
+
+/// True iff startup should auto-open the OnboardingWizard:
+/// no providers configured AND no OAuth login on disk AND we're
+/// running in an interactive renderer. Plain mode (CI / pipe /
+/// non-TTY) falls through to the "no provider configured" status
+/// hint instead — the bordered-panel wizard can't sensibly run
+/// without a human watching keystrokes.
+pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
+    if ctx.is_plain_renderer {
+        return false;
+    }
+    ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none()
 }
 
 /// Redraw after running a slash command. If the command installed a

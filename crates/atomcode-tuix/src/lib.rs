@@ -338,6 +338,14 @@ pub async fn run(
     // TTY → retained-mode Ink-style cell-diff renderer.
     // Non-TTY (pipe, CI, dumb terminal, force_plain) → PlainRenderer,
     // which just writes plain text without ANSI cursor positioning.
+    //
+    // `is_plain_renderer` mirrors the predicate that picks PlainRenderer
+    // below — neither alt-screen wanted nor caps.tty means plain. Threaded
+    // into LoopCtx so non-interactive sessions (CI, pipe, dumb TERM) can
+    // skip the OnboardingWizard auto-trigger; the modal would otherwise
+    // try to draw a Cyan-bordered box into a stdout that no human is
+    // watching.
+    let is_plain_renderer = !want_alt_screen && !caps.tty;
     let inner: Box<dyn Renderer> = if want_alt_screen {
         // Alt-screen renderer: takes over the alternate screen buffer
         // (`\x1b[?1049h`) so it can use absolute cursor positioning
@@ -546,6 +554,7 @@ pub async fn run(
         clipboard_check: std::sync::Arc::new(std::sync::Mutex::new(
             crate::event_loop::ClipboardCheckState::default(),
         )),
+        is_plain_renderer,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
