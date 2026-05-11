@@ -31,6 +31,7 @@ pub use dir_picker::DirPicker;
 pub use issue_wizard::IssueWizard;
 pub use language_picker::LanguagePicker;
 pub use model_picker::ModelPicker;
+pub use onboarding_wizard::OnboardingWizard;
 pub use provider_wizard::ProviderWizard;
 pub use session_picker::SessionPicker;
 pub use welcome_wizard::WelcomeWizard;

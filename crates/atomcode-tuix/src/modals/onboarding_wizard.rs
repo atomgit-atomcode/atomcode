@@ -84,6 +84,18 @@ pub(super) fn draw_panel(
     out
 }
 
+/// Right-pad `s` with spaces until its visible width reaches
+/// `target`. Returns the input unchanged if it's already that wide
+/// or wider. Used to align option-label columns in Setup step so
+/// hints sit at the same x-position across all 3 rows.
+fn pad_to_width(s: &str, target: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= target {
+        return s.to_string();
+    }
+    format!("{s}{}", " ".repeat(target - w))
+}
+
 // ───────────────────────────────────────────────────────────────────
 // State machine
 // ───────────────────────────────────────────────────────────────────
@@ -115,7 +127,10 @@ pub struct OnboardingWizard {
     /// 0=CodingPlan, 1=Manual, 2=Skip
     pub(super) setup_idx: usize,
     /// Set when constructed via `/welcome` mid-session with non-empty
-    /// body. Drives whether step starts at Confirm or Intro.
+    /// body. Read by Task 8's slash command path to decide cleanup
+    /// behaviour after Close (whether to skip the post-modal idle
+    /// redraw to avoid double-painting).
+    #[allow(dead_code)] // consumed in Task 8 (/welcome slash command)
     pub(super) needs_confirm: bool,
 }
 
@@ -402,11 +417,134 @@ impl OnboardingWizard {
         config.save(&atomcode_core::config::Config::default_path())?;
         Ok(new_locale)
     }
+
+    /// Build all output lines for step 3 (Setup). Reuses the existing
+    /// `WelcomeOption*` Msg variants from the old wizard so the
+    /// already-translated CodingPlan / Manual / Skip labels stay
+    /// consistent. Labels are right-padded to 22 visible cols so the
+    /// hint column lines up across rows even when one label is
+    /// English ("Configure manually") and another is Chinese
+    /// ("配置 CodingPlan") that takes fewer chars but more grid cells.
+    pub(super) fn draw_setup_lines(&self, term_cols: u16) -> Vec<String> {
+        use crate::i18n::{t, Msg};
+
+        let mut out = Vec::new();
+        out.push(t(Msg::OnboardingStepHeaderSetup).into_owned());
+        out.push(String::new());
+
+        let options = [
+            (
+                t(Msg::WelcomeOptionCodingPlan).into_owned(),
+                t(Msg::WelcomeOptionCodingPlanHint).into_owned(),
+            ),
+            (
+                t(Msg::WelcomeOptionConfigureManually).into_owned(),
+                t(Msg::WelcomeOptionConfigureManuallyHint).into_owned(),
+            ),
+            (
+                t(Msg::WelcomeOptionSkip).into_owned(),
+                t(Msg::WelcomeOptionSkipHint).into_owned(),
+            ),
+        ];
+
+        let mut content: Vec<String> = Vec::new();
+        content.push(String::new());
+        content.push(t(Msg::OnboardingSetupTitle).into_owned());
+        content.push(String::new());
+        for (i, (label, hint)) in options.iter().enumerate() {
+            let bullet = if i == self.setup_idx { '●' } else { '○' };
+            let label_padded = pad_to_width(label, 22);
+            content.push(format!("{bullet}  [{}] {} {}", i + 1, label_padded, hint));
+        }
+        content.push(String::new());
+        content.push(t(Msg::OnboardingNavHint).into_owned());
+        content.push(String::new());
+
+        out.extend(draw_panel(
+            &t(Msg::OnboardingPanelTitle),
+            &content,
+            "Step 3/3",
+            (term_cols as usize).min(80),
+        ));
+        out
+    }
 }
 
 impl Default for OnboardingWizard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl crate::modals::Modal for OnboardingWizard {
+    fn handle_key(
+        &mut self,
+        code: KeyCode,
+        mods: KeyModifiers,
+        buf: &mut crate::event_loop::Buffer,
+        state: &mut crate::state::UiState,
+        ctx: &mut crate::event_loop::LoopCtx,
+        renderer: &mut dyn crate::render::Renderer,
+    ) -> anyhow::Result<crate::modals::ModalAction> {
+        use crate::modals::ModalAction;
+        let outcome = self.handle_key_pure(code, mods);
+        match outcome {
+            PureOutcome::Noop => Ok(ModalAction::Continue),
+            PureOutcome::Redraw => {
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            PureOutcome::ClearAndRedraw => {
+                renderer.clear_screen();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            PureOutcome::ApplyLanguageThenAdvance => {
+                if let Err(e) = self.apply_language(&mut ctx.config) {
+                    let msg = crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                        error: &e.to_string(),
+                    });
+                    renderer.render(crate::render::UiLine::CommandOutput(
+                        format!("{}\n", msg),
+                    ));
+                }
+                self.step = Step::Setup;
+                renderer.clear_screen();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            PureOutcome::ApplySetupThenClose => {
+                match self.setup_idx {
+                    0 => ctx.pending_run_codingplan = true,
+                    1 => ctx.pending_open_provider_wizard = true,
+                    _ => { /* Skip — no flag */ }
+                }
+                Ok(ModalAction::Close)
+            }
+            PureOutcome::Close => Ok(ModalAction::Close),
+        }
+    }
+
+    fn draw(
+        &self,
+        _buf: &crate::event_loop::Buffer,
+        _state: &crate::state::UiState,
+        _ctx: &crate::event_loop::LoopCtx,
+        renderer: &mut dyn crate::render::Renderer,
+    ) {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let lines = match self.step {
+            Step::Confirm => {
+                // No box for the y/N prompt — one inline line.
+                vec![crate::i18n::t(crate::i18n::Msg::OnboardingConfirmClear).into_owned()]
+            }
+            Step::Intro => self.draw_intro_lines(cols, rows),
+            Step::Language => self.draw_language_lines(cols),
+            Step::Setup => self.draw_setup_lines(cols),
+        };
+        for line in lines {
+            renderer.render(crate::render::UiLine::CommandOutput(format!("{line}\n")));
+        }
     }
 }
 
@@ -864,6 +1002,81 @@ mod tests {
             vision_preprocessor_provider: None,
             language: None,
         }
+    }
+
+    // ── Step 3 (Setup) draw tests ──
+
+    /// Setup panel renders 3 numbered options with localised
+    /// CodingPlan / Manual / Skip labels (reusing WelcomeOption* Msg
+    /// variants), the SetupTitle, and the nav hint.
+    #[test]
+    fn setup_layout_has_three_options() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_setup_lines(80);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Step 3/3 · Setup"));
+        assert!(joined.contains("How would you like to set up?"));
+        assert!(joined.contains("[1] Set up CodingPlan"));
+        assert!(joined.contains("[2] Configure manually"));
+        assert!(joined.contains("[3] Skip for now"));
+        // Hints sit after each option.
+        assert!(joined.contains("Free tokens"));
+        assert!(joined.contains("API key"));
+        // Nav hint.
+        assert!(joined.contains("1-3 select"));
+    }
+
+    /// ZhCn locale flips every label + hint to the Chinese strings
+    /// that the i18n shipped originally for WelcomeOption*.
+    #[test]
+    fn setup_zh_renders_chinese_labels() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let lines = OnboardingWizard::new().draw_setup_lines(80);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("第 3/3 步 · 配置"));
+        assert!(joined.contains("配置 CodingPlan"));
+        assert!(joined.contains("手动配置"));
+        assert!(joined.contains("暂时跳过"));
+    }
+
+    /// Filled marker tracks setup_idx.
+    #[test]
+    fn setup_selected_marker_follows_idx() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let mut w = OnboardingWizard::new();
+        w.setup_idx = 1;
+        let lines = w.draw_setup_lines(80);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Selected: idx 1 → ●  [2]; others get ○.
+        assert!(joined.contains("●  [2]"));
+        assert!(joined.contains("○  [1]"));
+        assert!(joined.contains("○  [3]"));
+    }
+
+    /// pad_to_width: short strings get right-padded to target; long
+    /// strings pass through unchanged.
+    #[test]
+    fn pad_to_width_handles_cjk_and_short_strings() {
+        assert_eq!(pad_to_width("hi", 6), "hi    ");
+        // CJK char = 2 cols, so "中文" is 4 cols + 2 pad = "中文  ".
+        assert_eq!(pad_to_width("中文", 6), "中文  ");
+        // Already wider — returned as-is, no truncation.
+        assert_eq!(pad_to_width("hello world", 5), "hello world");
     }
 
     /// Locale-driven copy lookup — boot in ZhCn, every string in the
