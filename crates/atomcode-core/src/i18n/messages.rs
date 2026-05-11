@@ -208,7 +208,7 @@ pub enum Msg<'a> {
     UpgradeVerifying,
     UpgradeReplacing,
     UpgradeDone { version: &'a str, backup: &'a str },
-    UpgradeAlreadyLatest { detail: &'a str },
+    UpgradeAlreadyLatest { current: &'a str, latest: &'a str },
     UpgradeFailed { error: &'a str },
     UpgradeRolledBack { exe: &'a str, backup: &'a str },
 
@@ -465,4 +465,10 @@ pub enum Msg<'a> {
     CtxSystemPromptEmpty,
     /// Used in the "used/window tokens (pct)" line below the bar.
     CtxTokensSuffix,
+
+    // ── /compact ──
+    CompactNothingShort,
+    CompactStarting,
+    CompactNothingNoSavings { before: &'a str, after: &'a str },
+    CompactDropped { messages: usize, before: &'a str, after: &'a str },
 }

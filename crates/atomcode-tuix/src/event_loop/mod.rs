@@ -4189,6 +4189,33 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
     ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none()
 }
 
+/// Extract current + latest version from the `ALREADY_LATEST` error
+/// body. The shape is fixed by `self_update.rs`:
+///   `already on {current} (latest is {latest}). Pass --force to reinstall.`
+/// Returns None if the format ever drifts — caller falls back to "?"
+/// placeholders so the localized sentence still renders cleanly.
+fn parse_already_latest_versions(s: &str) -> Option<(&str, &str)> {
+    let after_on = s.strip_prefix("already on ")?;
+    let (current, rest) = after_on.split_once(" (latest is ")?;
+    let latest = rest.strip_suffix(". Pass --force to reinstall.")?;
+    let latest = latest.strip_suffix(')')?;
+    Some((current, latest))
+}
+
+#[cfg(test)]
+mod parse_already_latest_versions_tests {
+    use super::parse_already_latest_versions;
+    #[test]
+    fn extracts_both_versions() {
+        let s = "already on v4.22.0 (latest is v4.21.2). Pass --force to reinstall.";
+        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.0", "v4.21.2")));
+    }
+    #[test]
+    fn rejects_unrelated_strings() {
+        assert!(parse_already_latest_versions("something else entirely").is_none());
+    }
+}
+
 /// Redraw after running a slash command. If the command installed a
 /// modal, delegate the draw to it so the modal's menu appears; otherwise
 /// fall through to the plain idle prompt.
@@ -4694,12 +4721,20 @@ pub(super) fn handle_upgrade_event(
         UpgradeEvent::Failed(msg) => {
             if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
                 // Friendly path — not an error, just "nothing to do".
+                // self_update.rs's anyhow!() error is fixed-format
+                // English: "already on {current} (latest is {latest}).
+                // Pass --force to reinstall." Pull the two version
+                // strings out so each locale formats the full sentence
+                // itself instead of pasting English into a translated
+                // wrapper.
                 let friendly = msg.replace(
                     &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
                     "",
                 );
+                let (current, latest) = parse_already_latest_versions(&friendly)
+                    .unwrap_or(("?", "?"));
                 renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::UpgradeAlreadyLatest { detail: &friendly }).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::UpgradeAlreadyLatest { current, latest }).into_owned(),
                 ));
             } else {
                 renderer.render(UiLine::Error(

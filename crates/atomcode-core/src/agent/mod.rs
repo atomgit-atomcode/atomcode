@@ -2464,13 +2464,13 @@ impl AgentLoop {
         let system_prompt = self.build_system_prompt();
         let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
-                "(nothing to compact — conversation is short)\n".to_string(),
+                crate::i18n::t(crate::i18n::Msg::CompactNothingShort).into_owned(),
             ));
             return;
         };
 
         let _ = self.event_tx.send(AgentEvent::TextDelta(
-            "(compacting with LLM summary...)\n".to_string(),
+            crate::i18n::t(crate::i18n::Msg::CompactStarting).into_owned(),
         ));
 
         // Try LLM summarization (with optional custom prompt)
@@ -2495,11 +2495,15 @@ impl AgentLoop {
         let outcome = self.try_apply_compression(&system_prompt, n_msgs, content, true);
 
         if !outcome.applied {
-            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                "(nothing to compact — would not save tokens: {} → {})\n",
-                fmt_k_tokens(outcome.before_tokens),
-                fmt_k_tokens(outcome.after_tokens),
-            )));
+            let before = fmt_k_tokens(outcome.before_tokens);
+            let after = fmt_k_tokens(outcome.after_tokens);
+            let _ = self.event_tx.send(AgentEvent::TextDelta(
+                crate::i18n::t(crate::i18n::Msg::CompactNothingNoSavings {
+                    before: &before,
+                    after: &after,
+                })
+                .into_owned(),
+            ));
             let (msgs, _) =
                 self.ctx
                     .build_messages(&self.conversation, &system_prompt, "");
@@ -2507,13 +2511,16 @@ impl AgentLoop {
             return;
         }
 
-        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-            "(compacted — dropped {} message{}, {} → {} tokens)\n",
-            outcome.removed_messages,
-            if outcome.removed_messages == 1 { "" } else { "s" },
-            fmt_k_tokens(outcome.before_tokens),
-            fmt_k_tokens(outcome.after_tokens),
-        )));
+        let before = fmt_k_tokens(outcome.before_tokens);
+        let after = fmt_k_tokens(outcome.after_tokens);
+        let _ = self.event_tx.send(AgentEvent::TextDelta(
+            crate::i18n::t(crate::i18n::Msg::CompactDropped {
+                messages: outcome.removed_messages,
+                before: &before,
+                after: &after,
+            })
+            .into_owned(),
+        ));
 
         let (msgs, _) = self
             .ctx

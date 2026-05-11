@@ -312,8 +312,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Replacing binary\n".into(),
         Msg::UpgradeDone { version, backup } =>
             format!("\n✓ Upgraded to {} (previous version kept at {})\n  Restarting new version...\n", version, backup).into(),
-        Msg::UpgradeAlreadyLatest { detail } =>
-            format!("  ✓ Already on the latest version. {}\n", detail).into(),
+        Msg::UpgradeAlreadyLatest { current, latest } =>
+            format!(
+                "  ✓ Already on the latest version. already on {} (latest is {}). Pass --force to reinstall.\n",
+                current, latest
+            ).into(),
         Msg::UpgradeFailed { error } =>
             format!("Upgrade failed: {}", error).into(),
         Msg::UpgradeRolledBack { exe, backup } =>
@@ -661,5 +664,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CtxSystemPromptHeader => "=== SYSTEM PROMPT ===".into(),
         Msg::CtxSystemPromptEmpty => "(empty — wait for one complete turn to capture)".into(),
         Msg::CtxTokensSuffix => "tokens".into(),
+        Msg::CompactNothingShort => "(nothing to compact — conversation is short)\n".into(),
+        Msg::CompactStarting => "(compacting with LLM summary...)\n".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("(nothing to compact — would not save tokens: {} → {})\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } => {
+            let plural = if messages == 1 { "" } else { "s" };
+            format!("(compacted — dropped {} message{}, {} → {} tokens)\n", messages, plural, before, after).into()
+        }
     }
 }

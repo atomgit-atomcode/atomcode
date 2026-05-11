@@ -312,8 +312,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  正在替换二进制文件\n".into(),
         Msg::UpgradeDone { version, backup } =>
             format!("\n✓ 已升级到 {}（旧版本保留为 {}）\n  正在重启新版本...\n", version, backup).into(),
-        Msg::UpgradeAlreadyLatest { detail } =>
-            format!("  ✓ 已是最新版本，无需更新。{}\n", detail).into(),
+        Msg::UpgradeAlreadyLatest { current, latest } =>
+            format!(
+                "  ✓ 已是最新版本，无需更新（当前 {}，远端最新 {}）。如需重装请加 --force。\n",
+                current, latest
+            ).into(),
         Msg::UpgradeFailed { error } =>
             format!("升级失败: {}", error).into(),
         Msg::UpgradeRolledBack { exe, backup } =>
@@ -659,5 +662,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CtxSystemPromptHeader => "=== 系统提示 ===".into(),
         Msg::CtxSystemPromptEmpty => "（为空 — 完成一轮对话后捕获）".into(),
         Msg::CtxTokensSuffix => "tokens".into(),
+        Msg::CompactNothingShort => "（无需压缩 — 当前对话较短）\n".into(),
+        Msg::CompactStarting => "（正在使用 LLM 摘要进行压缩...）\n".into(),
+        Msg::CompactNothingNoSavings { before, after } =>
+            format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
+        Msg::CompactDropped { messages, before, after } =>
+            format!("（已压缩 — 丢弃 {} 条消息，{} → {} tokens）\n", messages, before, after).into(),
     }
 }
