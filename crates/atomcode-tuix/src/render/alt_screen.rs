@@ -1132,10 +1132,11 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     fn push_error(&mut self, msg: &str) {
         self.flush_assistant_remainder();
         let safe = scrub_controls(msg);
+        let label = t(Msg::ErrorPrefix { msg: &safe });
         let row = if self.caps.colors {
-            format!("{}[Error: {}]{}", SGR_RED, safe, SGR_RESET)
+            format!("{}{}{}", SGR_RED, label, SGR_RESET)
         } else {
-            format!("[Error: {}]", safe)
+            label.into_owned()
         };
         self.push_body_row(row);
     }
@@ -1143,10 +1144,11 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// `(cancelled)` marker row.
     fn push_cancelled(&mut self) {
         self.flush_assistant_remainder();
+        let label = t(Msg::Cancelled);
         let row = if self.caps.colors {
-            format!("{}(cancelled){}", SGR_DIM, SGR_RESET)
+            format!("{}{}{}", SGR_DIM, label, SGR_RESET)
         } else {
-            "(cancelled)".to_string()
+            label.into_owned()
         };
         self.push_body_row(row);
     }
@@ -1284,10 +1286,10 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             UiLine::ApprovalPrompt { tool, detail } => {
                 let safe_tool = scrub_controls(&tool);
                 let safe_detail = scrub_controls(&detail);
-                let prompt = format!(
-                    "Allow {}({})? [Y]es / [N]o / [A]lways",
-                    safe_tool, safe_detail
-                );
+                let prompt = t(Msg::ApprovalPromptAlt {
+                    tool: &safe_tool,
+                    detail: &safe_detail,
+                }).into_owned();
                 let row = if self.caps.colors {
                     format!("{}{}{}", SGR_CYAN, prompt, SGR_RESET)
                 } else {

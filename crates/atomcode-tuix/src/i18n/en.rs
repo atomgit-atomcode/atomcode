@@ -168,5 +168,258 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Checking for updates...\n".into(),
         Msg::CmdNoActiveProvider =>
             "No active provider configured. Use /provider to add one.".into(),
+
+        // ── Approval prompt ──
+        Msg::ApprovalPromptAlt { tool, detail } =>
+            format!("Allow {}({})? [Y]es / [N]o / [A]lways", tool, detail).into(),
+        Msg::ApprovalWaitingLabel =>
+            "▶ Waiting for approval: ".into(),
+        Msg::ApprovalAllow => " Allow  ".into(),
+        Msg::ApprovalAlways => " Always  ".into(),
+        Msg::ApprovalDeny => " Deny".into(),
+
+        // ── Cancelled / Error prefix ──
+        Msg::Cancelled => "(cancelled)".into(),
+        Msg::ErrorPrefix { msg } =>
+            format!("[Error: {msg}]").into(),
+
+        // ── Upgrade ──
+        Msg::UpgradeSuccess { from, to } =>
+            format!("  ✓ Upgraded {} → {}\n", from, to).into(),
+
+        // ── Terminal keyboard hints ──
+        Msg::KbdHintMacos =>
+            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+        Msg::KbdHintOther =>
+            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+
+        // ── JediTerm / conhost fallback ──
+        Msg::JediTermFallback =>
+            "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
+            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+            Native terminal scrollback is unavailable while atomcode runs;\n    \
+            on exit your host terminal restores its pre-atomcode state.\n    \
+            Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
+            ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n".into(),
+        Msg::LegacyConhostFallback =>
+            "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
+            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
+            Native terminal scrollback is unavailable while atomcode runs.\n    \
+            For full host-terminal scrollback support, install Windows Terminal\n    \
+            (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
+            Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
+            bypass this fallback (may show duplicated content on scroll).\n\n".into(),
+
+        // ── Session replay ──
+        Msg::SessionReplayHint =>
+            "  ⓘ Showing previous session — model context starts fresh.\n    \
+            Use /resume to fully restore the conversation including model memory.\n\n".into(),
+
+        // ── Background task ──
+        Msg::BackgroundComplete { turns } =>
+            format!("  Background task complete ({} turn{}):\n",
+                    turns, if turns == 1 { "" } else { "s" }).into(),
+        Msg::BackgroundFailed { turns } =>
+            format!("  Background task failed after {} turn{}:\n",
+                    turns, if turns == 1 { "" } else { "s" }).into(),
+        Msg::BackgroundFilesEdited =>
+            "  Files edited:\n".into(),
+
+        // ── /config ──
+        Msg::ConfigProviderLabel { provider, path } =>
+            format!("  Provider: {}\n  Config: {}\n\n", provider, path).into(),
+
+        // ── /cost ──
+        Msg::CostReport { prompt, completion, cached, cache_rate, total, cost } =>
+            format!(
+                "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
+                prompt, completion, cached, cache_rate, total, cost
+            ).into(),
+
+        // ── /think ──
+        Msg::ThinkStatus { status, budget, provider } =>
+            format!(
+                "  Extended thinking: {}\n  Budget: {} tokens\n  Provider: {}\n\n  Usage: /think on | off | budget <N>\n",
+                status, budget, provider
+            ).into(),
+        Msg::ThinkEnabled { budget } =>
+            format!("  Extended thinking enabled (budget: {} tokens).\n", budget).into(),
+        Msg::ThinkDisabled =>
+            "  Extended thinking disabled.\n".into(),
+        Msg::ThinkBudgetSet { n } =>
+            format!("  Thinking budget set to {} tokens.\n", n).into(),
+        Msg::ThinkBudgetTooSmall { n } =>
+            format!("Budget must be >= 1024 (got {})", n).into(),
+        Msg::ThinkBudgetUsage =>
+            "Usage: /think budget <number>".into(),
+        Msg::ThinkUsage =>
+            "  Usage: /think [on | off | budget <N>]\n".into(),
+
+        // ── /remember, /forget ──
+        Msg::RememberUsage =>
+            "Usage: /remember <fact to remember>  (--global for global scope)".into(),
+        Msg::ForgetUsage =>
+            "Usage: /forget <keyword>".into(),
+
+        // ── /background ──
+        Msg::BackgroundUsage =>
+            "  Usage: /background <task description>\n".into(),
+
+        // ── /init ──
+        Msg::InitAlreadyExists { path } =>
+            format!("  {} already exists. Use `/init --force` to overwrite.\n", path).into(),
+        Msg::InitWrote { path, bytes } =>
+            format!("  Wrote {} ({} bytes). Edit to customise; takes effect on next session.\n", path, bytes).into(),
+        Msg::InitFailed { error } =>
+            format!("  /init failed: {}\n", error).into(),
+
+        // ── /cd ──
+        Msg::CdWorkingDir { cwd } =>
+            format!("  Working directory: {}\n  No recent projects. Use `/cd <path>` to switch.\n", cwd).into(),
+
+        // ── /diff ──
+        Msg::DiffFailed { error } =>
+            format!("git diff failed: {}", error).into(),
+
+        // ── /upgrade ──
+        Msg::UpgradeUnknownArg { arg } =>
+            format!("unknown /upgrade argument: {}\n  usage: /upgrade [rollback|--force]", arg).into(),
+
+        // ── /skills ──
+        Msg::SkillsNone =>
+            "  No user-invocable skills loaded.\n".into(),
+        Msg::SkillsAvailable =>
+            "  Available skills:\n".into(),
+        Msg::SkillUnknown { name } =>
+            format!("Unknown skill: {} (try /skills to list)", name).into(),
+
+        // ── /mcp ──
+        Msg::McpReloading { count } =>
+            format!("  Reloading MCP servers... ({} configured)\n", count).into(),
+        Msg::McpConnecting =>
+            "  Connecting:\n".into(),
+        Msg::McpConnectingServer { name } =>
+            format!("    - {}  connecting...\n", name).into(),
+        Msg::McpNoServersConfigured =>
+            "  No MCP servers configured.\n".into(),
+        Msg::McpClearedReconnecting { removed } =>
+            format!("  ✓ Cleared {} MCP tools. Reconnecting in background...\n", removed).into(),
+        Msg::McpClearedNoServers { removed } =>
+            format!("  ✓ Cleared {} MCP tools. No servers to connect.\n", removed).into(),
+        Msg::McpToolsUsage =>
+            "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
+        Msg::McpToolsListing { server } =>
+            format!("  Listing MCP tools for '{}'...\n", server).into(),
+        Msg::McpNoRegistry =>
+            "  No MCP registry loaded. Run /mcp reload first.\n".into(),
+        Msg::McpServersHeader =>
+            "  MCP Servers:\n".into(),
+        Msg::McpReloadFailed { error } =>
+            format!("mcp reload failed: failed to load .mcp.json / ~/.atomcode/mcp.json: {:#}", error).into(),
+
+        // ── /worktree ──
+        Msg::WorktreeUsage =>
+            "  Usage:\n    /worktree create <branch> [base]  Create worktree and switch\n    /worktree list                     List all worktrees\n    /worktree done                     Switch back to original directory\n    /worktree cleanup <branch>         Clean up worktree\n".into(),
+        Msg::WorktreeCreateUsage =>
+            "  Usage: /worktree create <branch> [base]\n  Example: /worktree create fix-bug main\n".into(),
+        Msg::WorktreeCreated { branch, base, path } =>
+            format!("  ✓ Worktree created\n    Branch: {} (based on {})\n    Path: {}\n    Working directory switched\n", branch, base, path).into(),
+        Msg::WorktreeCreateFailed { error } =>
+            format!("worktree create failed: {}", error).into(),
+        Msg::WorktreeNoActive =>
+            "  No active worktrees.\n".into(),
+        Msg::WorktreeListFailed { error } =>
+            format!("worktree list failed: {}", error).into(),
+        Msg::WorktreeActiveHeader =>
+            "  Active worktrees:\n".into(),
+        Msg::WorktreeHasChanges => "(has changes)".into(),
+        Msg::WorktreeClean => "(clean)".into(),
+        Msg::WorktreeCurrent => " ← current".into(),
+        Msg::WorktreeDoneBack { path } =>
+            format!("  ✓ Switched back to: {}\n", path).into(),
+        Msg::WorktreeDoneMergeHint { branch } =>
+            format!("  Hint: use 'git merge {}' or create a PR to merge into main branch\n", branch).into(),
+        Msg::WorktreeNoSession =>
+            "  No active worktree session. Use /worktree create first.\n".into(),
+        Msg::WorktreeCleanupUsage =>
+            "  Usage: /worktree cleanup <branch> [--force]\n".into(),
+        Msg::WorktreeCleaned { branch } =>
+            format!("  ✓ Worktree '{}' cleaned up\n", branch).into(),
+        Msg::WorktreeCleanedSwitched { path } =>
+            format!("  Switched back to: {}\n", path).into(),
+        Msg::WorktreeCleanupUncommitted { branch } =>
+            format!("  ⚠ Worktree '{}' has uncommitted changes.\n  Use /worktree cleanup {} --force to force cleanup\n", branch, branch).into(),
+        Msg::WorktreeCleanupFailed { error } =>
+            format!("worktree cleanup failed: {}", error).into(),
+
+        // ── /help commands (custom) ──
+        Msg::HelpCustomCommandsHeader =>
+            "  Custom commands:\n".into(),
+        Msg::HelpCustomNone =>
+            "    (none)\n\n".into(),
+        Msg::HelpCustomCreateHint =>
+            "  Create: ~/.atomcode/commands/<name>.md or .atomcode/commands/<name>.md\n".into(),
+        Msg::HelpSourceGlobal => "global".into(),
+        Msg::HelpSourceProject => "project".into(),
+
+        // ── /plugin ──
+        Msg::PluginUsage =>
+            "usage: /plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),
+        Msg::PluginMarketplaceUsage =>
+            "usage: /plugin marketplace [add|remove|update|list] <args>".into(),
+        Msg::PluginInstallUsage =>
+            "usage: /plugin install <plugin>@<marketplace>".into(),
+        Msg::PluginUninstallUsage =>
+            "usage: /plugin uninstall <plugin>@<marketplace>".into(),
+        Msg::PluginNoMarketplaces =>
+            "no marketplaces registered".into(),
+        Msg::PluginMarketplacesHeader =>
+            "registered marketplaces:".into(),
+        Msg::PluginNoInstalled =>
+            "no installed plugins".into(),
+        Msg::PluginInstalledHeader =>
+            "installed plugins:".into(),
+
+        // ── Command descriptions ──
+        Msg::CmdDescCodingplan =>
+            "Claim CodingPlan + set up models from the plan's model list".into(),
+        Msg::CmdDescResume => "Resume a previous session".into(),
+        Msg::CmdDescLogin => "Sign in with AtomGit OAuth".into(),
+        Msg::CmdDescLogout => "Sign out of AtomGit".into(),
+        Msg::CmdDescWhoami => "Show current logged-in user".into(),
+        Msg::CmdDescModel => "Switch provider / model".into(),
+        Msg::CmdDescProvider => "Manage providers (add / edit / delete)".into(),
+        Msg::CmdDescStatus => "Show session status".into(),
+        Msg::CmdDescConfig => "Show config path".into(),
+        Msg::CmdDescReload => "Reload ~/.atomcode/config.toml from disk".into(),
+        Msg::CmdDescCd => "Change working directory".into(),
+        Msg::CmdDescInit => "Generate .atomcode.md project instructions from the working directory".into(),
+        Msg::CmdDescBackground => "Run a one-shot task in an isolated background context (read-only-ish tool subset)".into(),
+        Msg::CmdDescDiff => "Show git diff".into(),
+        Msg::CmdDescClear => "Clear screen".into(),
+        Msg::CmdDescSession => "Start a new session (clears conversation)".into(),
+        Msg::CmdDescCost => "Show token cost".into(),
+        Msg::CmdDescContext => "Show context budget breakdown".into(),
+        Msg::CmdDescCompact => "Compact conversation history".into(),
+        Msg::CmdDescRemember => "Save a fact to memory (/remember --global for global)".into(),
+        Msg::CmdDescForget => "Remove matching memories".into(),
+        Msg::CmdDescMemory => "Show all saved memories".into(),
+        Msg::CmdDescMcp => "Show MCP server status (subcommand: reload)".into(),
+        Msg::CmdDescUndo => "Undo last change (not yet supported)".into(),
+        Msg::CmdDescWorktree => "Git worktree isolation (create/list/done/cleanup)".into(),
+        Msg::CmdDescUpgrade => "Upgrade atomcode to latest (subcommand: rollback)".into(),
+        Msg::CmdDescIssue => "Report a bug / request a feature for AtomCode itself (interactive wizard)".into(),
+        Msg::CmdDescPlan => "Switch to Plan mode (read-only exploration)".into(),
+        Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
+        Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
+        Msg::CmdDescHelp => "Show this help".into(),
+        Msg::CmdDescLanguage => "Switch display language".into(),
+        Msg::CmdDescQuit => "Exit AtomCode".into(),
+        Msg::CmdDescSkills => "Browse loaded skills".into(),
+        Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, list)".into(),
+
+        // ── config save failed ──
+        Msg::ConfigSaveFailed { error } =>
+            format!("config save failed: {}", error).into(),
     }
 }

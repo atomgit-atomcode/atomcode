@@ -48,18 +48,20 @@ impl CommandRegistry {
     }
 
     pub fn help_text(&self) -> String {
+        use crate::i18n::{t, Msg};
         let max_name = self
             .commands
             .iter()
             .map(|c| c.name.len())
             .max()
             .unwrap_or(6);
-        let mut out = crate::i18n::t(crate::i18n::Msg::HelpAvailableCommands).into_owned();
+        let mut out = t(Msg::HelpAvailableCommands).into_owned();
         for c in self.commands {
+            let desc = cmd_desc_i18n(c.name).unwrap_or_else(|| c.desc.into());
             out.push_str(&format!(
                 "    /{:<width$}  {}\n",
                 c.name,
-                c.desc,
+                desc,
                 width = max_name
             ));
         }
@@ -109,6 +111,52 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
     Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
 ];
+
+/// Look up the i18n translation for a built-in command description.
+/// Returns `None` for unknown command names (callers fall back to
+/// the static `desc` field).
+fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
+    use crate::i18n::{t, Msg};
+    let msg = match name {
+        "codingplan" => Msg::CmdDescCodingplan,
+        "resume" => Msg::CmdDescResume,
+        "login" => Msg::CmdDescLogin,
+        "logout" => Msg::CmdDescLogout,
+        "whoami" => Msg::CmdDescWhoami,
+        "model" => Msg::CmdDescModel,
+        "provider" => Msg::CmdDescProvider,
+        "status" => Msg::CmdDescStatus,
+        "config" => Msg::CmdDescConfig,
+        "reload" => Msg::CmdDescReload,
+        "cd" => Msg::CmdDescCd,
+        "init" => Msg::CmdDescInit,
+        "background" => Msg::CmdDescBackground,
+        "diff" => Msg::CmdDescDiff,
+        "clear" => Msg::CmdDescClear,
+        "session" => Msg::CmdDescSession,
+        "cost" => Msg::CmdDescCost,
+        "context" => Msg::CmdDescContext,
+        "compact" => Msg::CmdDescCompact,
+        "remember" => Msg::CmdDescRemember,
+        "forget" => Msg::CmdDescForget,
+        "memory" => Msg::CmdDescMemory,
+        "mcp" => Msg::CmdDescMcp,
+        "undo" => Msg::CmdDescUndo,
+        "worktree" => Msg::CmdDescWorktree,
+        "upgrade" => Msg::CmdDescUpgrade,
+        "issue" => Msg::CmdDescIssue,
+        "plan" => Msg::CmdDescPlan,
+        "build" => Msg::CmdDescBuild,
+        "think" => Msg::CmdDescThink,
+        "help" => Msg::CmdDescHelp,
+        "language" => Msg::CmdDescLanguage,
+        "quit" => Msg::CmdDescQuit,
+        "skills" => Msg::CmdDescSkills,
+        "plugin" => Msg::CmdDescPlugin,
+        _ => return None,
+    };
+    Some(t(msg))
+}
 
 /// A completion candidate for slash-command Tab completion, merging built-in
 /// and user-defined custom commands.

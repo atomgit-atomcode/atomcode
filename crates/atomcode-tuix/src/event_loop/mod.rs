@@ -1085,10 +1085,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     if let Ok(prev) = std::env::var("ATOMCODE_UPGRADED_FROM") {
         std::env::remove_var("ATOMCODE_UPGRADED_FROM");
         let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-        renderer.render(UiLine::CommandOutput(format!(
-            "  ✓ Upgraded {} → {}\n",
-            prev, current
-        )));
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::UpgradeSuccess { from: &prev, to: &current }).into_owned(),
+        ));
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
@@ -1111,11 +1110,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         // in all terminals, so we recommend Ctrl+Enter as the primary fallback.
         #[cfg(target_os = "macos")]
         renderer.render(UiLine::CommandOutput(
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+            crate::i18n::t(crate::i18n::Msg::KbdHintMacos).into_owned(),
         ));
         #[cfg(not(target_os = "macos"))]
         renderer.render(UiLine::CommandOutput(
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+            crate::i18n::t(crate::i18n::Msg::KbdHintOther).into_owned(),
         ));
     }
 
@@ -1132,13 +1131,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     if std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok() {
         std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
         renderer.render(UiLine::CommandOutput(
-            "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs;\n    \
-            on exit your host terminal restores its pre-atomcode state.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
-            ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
-                .into(),
+            crate::i18n::t(crate::i18n::Msg::JediTermFallback).into_owned(),
         ));
     }
 
@@ -1152,14 +1145,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     if std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok() {
         std::env::remove_var("ATOMCODE_LEGACY_CONHOST_FALLBACK");
         renderer.render(UiLine::CommandOutput(
-            "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs.\n    \
-            For full host-terminal scrollback support, install Windows Terminal\n    \
-            (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
-            bypass this fallback (may show duplicated content on scroll).\n\n"
-                .into(),
+            crate::i18n::t(crate::i18n::Msg::LegacyConhostFallback).into_owned(),
         ));
     }
 
@@ -1173,9 +1159,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         if !session.messages.is_empty() {
             crate::modals::session_picker::replay_session(renderer, &session, false);
             renderer.render(UiLine::CommandOutput(
-                "  ⓘ Showing previous session — model context starts fresh.\n    \
-                Use /resume to fully restore the conversation including model memory.\n\n"
-                    .into(),
+                crate::i18n::t(crate::i18n::Msg::SessionReplayHint).into_owned(),
             ));
             renderer.flush();
         }
@@ -2593,7 +2577,7 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 .send(AgentCommand::ReloadConfig(ctx.config.clone()));
         }
         Err(e) => {
-            renderer.render(UiLine::Error(format!("config save failed: {}", e)));
+            renderer.render(UiLine::Error(crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed { error: &format!("{}", e) }).into_owned()));
             renderer.flush();
         }
     }
@@ -3423,17 +3407,9 @@ fn handle_agent_event(
             success,
         } => {
             let header = if success {
-                format!(
-                    "  Background task complete ({} turn{}):\n",
-                    turns,
-                    if turns == 1 { "" } else { "s" }
-                )
+                crate::i18n::t(crate::i18n::Msg::BackgroundComplete { turns }).into_owned()
             } else {
-                format!(
-                    "  Background task failed after {} turn{}:\n",
-                    turns,
-                    if turns == 1 { "" } else { "s" }
-                )
+                crate::i18n::t(crate::i18n::Msg::BackgroundFailed { turns }).into_owned()
             };
             let mut body = String::from(&header);
             body.push_str("  ");
@@ -3442,7 +3418,7 @@ fn handle_agent_event(
                 body.push('\n');
             }
             if !files_edited.is_empty() {
-                body.push_str("  Files edited:\n");
+                body.push_str(&crate::i18n::t(crate::i18n::Msg::BackgroundFilesEdited));
                 for f in &files_edited {
                     body.push_str(&format!("    - {}\n", f));
                 }

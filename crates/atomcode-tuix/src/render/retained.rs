@@ -1696,8 +1696,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.commit_inflight_tool();
                 // (cancelled) is a state-change marker — must remain
                 // visible. Default fg, not Muted.
-                let label = self.style_for(Role::Secondary);
-                self.push_body_text("(cancelled)", &label);
+                let style = self.style_for(Role::Secondary);
+                let label = t(Msg::Cancelled);
+                self.push_body_text(&label, &style);
             }
 
             // ── body: tools & diffs ──
@@ -1893,18 +1894,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let chip_n = chip(Color::Red);
 
                 let mut row = Vec::new();
-                push_str_cells(&mut row, "▶ Waiting for approval: ", &warn);
+                let waiting = t(Msg::ApprovalWaitingLabel);
+                let allow = t(Msg::ApprovalAllow);
+                let always = t(Msg::ApprovalAlways);
+                let deny = t(Msg::ApprovalDeny);
+                push_str_cells(&mut row, &waiting, &warn);
                 push_str_cells(&mut row, " Y ", &chip_y);
-                push_str_cells(&mut row, " Allow  ", &plain);
+                push_str_cells(&mut row, &allow, &plain);
                 push_str_cells(&mut row, " A ", &chip_a);
-                push_str_cells(&mut row, " Always  ", &plain);
+                push_str_cells(&mut row, &always, &plain);
                 push_str_cells(&mut row, " N ", &chip_n);
-                push_str_cells(&mut row, " Deny", &plain);
+                push_str_cells(&mut row, &deny, &plain);
                 self.push_body_row(row);
             }
             UiLine::Error(msg) => {
                 let err_style = self.style_for(Role::Error);
-                let body = format!("[Error: {}]", scrub_controls(&msg));
+                let safe = scrub_controls(&msg);
+                let body = t(Msg::ErrorPrefix { msg: &safe });
                 self.push_body_text(&body, &err_style);
             }
             UiLine::CommandOutput(text) => {
