@@ -327,6 +327,81 @@ impl OnboardingWizard {
         ));
         out
     }
+
+    /// Build all output lines for step 2 (Language). Bilingual title
+    /// is locale-independent (it IS the moment the user picks
+    /// locale); the prompt + option labels + nav hint follow the
+    /// current global locale.
+    pub(super) fn draw_language_lines(&self, term_cols: u16) -> Vec<String> {
+        use crate::i18n::{t, Msg};
+
+        let mut out = Vec::new();
+        out.push(t(Msg::OnboardingStepHeaderLanguage).into_owned());
+        out.push(String::new());
+
+        let options = [
+            t(Msg::OnboardingLanguageOptionAuto).into_owned(),
+            t(Msg::OnboardingLanguageOptionEn).into_owned(),
+            t(Msg::OnboardingLanguageOptionZhCn).into_owned(),
+        ];
+
+        let mut content: Vec<String> = Vec::new();
+        content.push(String::new());
+        content.push(t(Msg::OnboardingLanguageTitleBilingual).into_owned());
+        content.push(String::new());
+        content.push(t(Msg::OnboardingLanguagePrompt).into_owned());
+        content.push(String::new());
+        for (i, label) in options.iter().enumerate() {
+            let bullet = if i == self.language_idx { '●' } else { '○' };
+            content.push(format!("{bullet}  [{}] {}", i + 1, label));
+        }
+        content.push(String::new());
+        content.push(t(Msg::OnboardingNavHint).into_owned());
+        content.push(String::new());
+
+        out.extend(draw_panel(
+            &t(Msg::OnboardingPanelTitle),
+            &content,
+            "Step 2/3",
+            (term_cols as usize).min(80),
+        ));
+        out
+    }
+
+    /// Apply the user's language choice — called when Enter pressed
+    /// in step 2. Mutates `config.language`, flips the global locale,
+    /// and persists the config to disk. Returns the locale that was
+    /// applied so the caller can also surface a confirmation message.
+    ///
+    /// Auto-detect (`language_idx == 0`) clears `config.language` so
+    /// the resolver re-derives from env on next launch; the running
+    /// session also re-resolves immediately so the next redraw uses
+    /// the env-detected locale.
+    pub(super) fn apply_language(
+        &self,
+        config: &mut atomcode_core::config::Config,
+    ) -> anyhow::Result<atomcode_core::locale::Locale> {
+        use atomcode_core::locale::Locale;
+        let new_locale = match self.language_idx {
+            0 => {
+                // Auto-detect: clear config field, re-resolve from env.
+                config.language = None;
+                crate::i18n::resolve_initial_locale(None, None)
+            }
+            1 => {
+                config.language = Some(Locale::En);
+                Locale::En
+            }
+            2 => {
+                config.language = Some(Locale::ZhCn);
+                Locale::ZhCn
+            }
+            _ => unreachable!("language_idx is bounded 0..=2"),
+        };
+        crate::i18n::set_locale(new_locale);
+        config.save(&atomcode_core::config::Config::default_path())?;
+        Ok(new_locale)
+    }
 }
 
 impl Default for OnboardingWizard {
@@ -662,6 +737,133 @@ mod tests {
         assert!(joined.contains("AI coding agent that lives in your terminal"));
         assert!(joined.contains("Free tokens"));
         assert!(joined.contains("Press Enter to continue"));
+    }
+
+    // ── Step 2 (Language) draw + apply tests ──
+
+    /// Bilingual title + 3 numbered options + nav hint all present in
+    /// the rendered output.
+    #[test]
+    fn language_layout_has_three_options_with_numbers() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_language_lines(80);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Bilingual title (locale-independent).
+        assert!(joined.contains("Choose your language / 选择语言"));
+        // Three numbered options.
+        assert!(joined.contains("[1] Auto-detect"));
+        assert!(joined.contains("[2] English"));
+        assert!(joined.contains("[3] 简体中文"));
+        // Step header + indicator.
+        assert!(joined.contains("Step 2/3 · Language"));
+        // Nav hint.
+        assert!(joined.contains("1-3 select"));
+    }
+
+    /// Selected marker `●` sits on the row matching language_idx;
+    /// the other rows get the hollow `○` marker.
+    #[test]
+    fn language_selected_marker_follows_idx() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let mut w = OnboardingWizard::new();
+        w.step = Step::Language;
+        w.language_idx = 2;
+        let lines = w.draw_language_lines(80);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // `●  [3] 简体中文` selected; `○  [2] English` unselected.
+        let pos_filled = joined.find("●  [3]").expect("filled marker missing");
+        let pos_hollow = joined.find("○  [2]").expect("hollow marker missing");
+        assert!(
+            pos_hollow < pos_filled,
+            "expected hollow before filled marker"
+        );
+    }
+
+    /// apply_language writes the picked locale into config + flips
+    /// the global locale + persists to disk under an ATOMCODE_HOME
+    /// override so tests don't touch real `~/.atomcode`.
+    #[test]
+    fn apply_language_writes_config_and_sets_locale() {
+        use atomcode_core::locale::Locale;
+        let _g = crate::i18n::test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // ATOMCODE_HOME drives Config::config_dir() ahead of $HOME, so
+        // the test's config.save lands in `<tmp>/config.toml` and not
+        // the real home dir. Saved+restored around the test to keep
+        // parallel tests from racing on the global env.
+        let prev_atomcode_home = std::env::var("ATOMCODE_HOME").ok();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+
+        let mut cfg = blank_config_for_test();
+        let mut w = OnboardingWizard::new();
+        w.language_idx = 2;
+        let applied = w.apply_language(&mut cfg).unwrap();
+        assert_eq!(applied, Locale::ZhCn);
+        assert_eq!(cfg.language, Some(Locale::ZhCn));
+        assert_eq!(crate::i18n::current_locale(), Locale::ZhCn);
+        // File must actually exist on disk.
+        assert!(tmp.path().join("config.toml").exists());
+
+        // Restore env.
+        match prev_atomcode_home {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+    }
+
+    /// Auto-detect (idx 0) blanks `config.language` so the next-launch
+    /// resolver re-derives from env. Even when the prior config carried
+    /// an explicit choice.
+    #[test]
+    fn apply_language_auto_clears_config_field() {
+        use atomcode_core::locale::Locale;
+        let _g = crate::i18n::test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("ATOMCODE_HOME").ok();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+
+        let mut cfg = blank_config_for_test();
+        cfg.language = Some(Locale::En); // start with non-None
+        let mut w = OnboardingWizard::new();
+        w.language_idx = 0;
+        w.apply_language(&mut cfg).unwrap();
+        assert_eq!(cfg.language, None);
+
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_HOME", v),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+    }
+
+    /// Minimal Config used by the apply_language tests. Config has no
+    /// Default impl (every field is intentionally required so adding
+    /// a new field forces every test to update), so we mirror the
+    /// blank_config_with_lsp helper from `core::config::tests` here.
+    fn blank_config_for_test() -> atomcode_core::config::Config {
+        atomcode_core::config::Config {
+            default_provider: String::new(),
+            default_workdir: None,
+            providers: Default::default(),
+            datalog: Default::default(),
+            auto_update: true,
+            notifications: Default::default(),
+            telemetry: Default::default(),
+            lsp: Default::default(),
+            auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: None,
+            language: None,
+        }
     }
 
     /// Locale-driven copy lookup — boot in ZhCn, every string in the
