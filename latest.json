@@ -6,6 +6,7 @@
     "darwin-x64": { "sha256": "c0a8bc316c8499d87024bfafbd9838304b183d2799d9acb1088b29ef36048809", "size": 20732304 },
     "linux-x64": { "sha256": "d8bb1a262602b074ab0b83ed63f6d51524379eae0e870af5dd42df12b13a3f12", "size": 21905920 },
     "linux-arm64": { "sha256": "947c98a53f0d56672398d87230d9257f76f76c12bcad07555d611a967d5c9ee5", "size": 20410120 },
-    "windows-x64": { "sha256": "ccc039862b9f461907845e7bc4ccbd5a6f44bc7c613c7a69d1597c04f2bef8ef", "size": 21186704 }
+    "windows-x64": { "sha256": "ccc039862b9f461907845e7bc4ccbd5a6f44bc7c613c7a69d1597c04f2bef8ef", "size": 21186704 },
+    "ohos-arm64": {"sha256": "d9d0857455e164b966d5181e89a89e30446839f8375acc88bc360d27f25fd188", "size": 20408064}
   }
 }
