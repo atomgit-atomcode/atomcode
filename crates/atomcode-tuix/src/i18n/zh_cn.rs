@@ -171,7 +171,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── 审批提示 ──
         Msg::ApprovalPromptAlt { tool, detail } =>
-            format!("允许 {}({})？[Y]是 / [N]否 / [A]总是", tool, detail).into(),
+            format!("允许 {}（{}）？[Y]是 / [N]否 / [A]总是", tool, detail).into(),
         Msg::ApprovalWaitingLabel =>
             "▶ 等待审批：".into(),
         Msg::ApprovalAllow => " 允许  ".into(),
@@ -331,7 +331,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WorktreeActiveHeader =>
             "  活跃工作树：\n".into(),
         Msg::WorktreeHasChanges => "（有变更）".into(),
-        Msg::WorktreeClean => "（clean）".into(),
+        Msg::WorktreeClean => "（无变更）".into(),
         Msg::WorktreeCurrent => " ← 当前".into(),
         Msg::WorktreeDoneBack { path } =>
             format!("  ✓ 工作目录已切回：{}\n", path).into(),
