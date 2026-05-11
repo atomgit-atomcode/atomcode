@@ -46,11 +46,15 @@ pub fn collapse_home(path: &str) -> String {
                 if rest.is_empty() {
                     return "~".to_string();
                 }
-                // Keep the separator after `~` — on Unix that's `/`,
-                // on Windows it's `\`. Either way `rest` starts with
-                // it (unless home_str had a trailing slash, in which
-                // case tack one on).
-                return format!("~{}", rest);
+                // Always emit forward slashes after `~` — the `~`
+                // shortcut is a Unix shell convention and `~\foo`
+                // (the Windows-native form) matches no actual shell:
+                // PowerShell / cmd don't expand `~`, Git Bash / WSL
+                // use `~/`. Mixed `~\…` reads as a typo. Normalising
+                // here keeps every status-row path consistent with
+                // the rest of the TUI (skill paths, command help,
+                // docs) which all reference `~/.atomcode/...`.
+                return format!("~{}", rest.replace('\\', "/"));
             }
         }
     }
@@ -80,12 +84,24 @@ mod tests {
             let home_str = home.to_string_lossy().to_string();
             let nested = format!("{}/project/foo", home_str);
             let got = collapse_home(&nested);
-            // Accept both POSIX and Windows separators.
-            assert!(
-                got == "~/project/foo" || got == "~\\project\\foo",
-                "unexpected collapse: {}",
-                got
-            );
+            assert_eq!(got, "~/project/foo");
+        }
+    }
+
+    /// Windows `home_str` uses `\`, and the input path strip_prefix
+    /// leaves a backslash-prefixed remainder. The collapse output must
+    /// still normalise to `~/foo`, not the hybrid `~\foo` form.
+    #[test]
+    fn collapse_home_emits_forward_slash_on_windows_separators() {
+        if let Some(home) = home_dir() {
+            let home_str = home.to_string_lossy().to_string();
+            // Build the path with the same separator home_str uses, so
+            // strip_prefix succeeds on both Unix and Windows test runs.
+            let sep = if home_str.contains('\\') { '\\' } else { '/' };
+            let nested = format!("{home_str}{sep}atomcode{sep}src");
+            let got = collapse_home(&nested);
+            assert_eq!(got, "~/atomcode/src");
+            assert!(!got.contains('\\'), "must not retain backslashes: {got}");
         }
     }
 
