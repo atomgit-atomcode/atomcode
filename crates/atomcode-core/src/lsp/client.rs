@@ -31,6 +31,13 @@ fn uri_to_path(uri: &str) -> PathBuf {
     }
 }
 
+/// Convert a local path to a standards-compliant file:// URI.
+fn path_to_uri(path: &Path) -> String {
+    url::Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| format!("file://{}", path.display()))
+}
+
 /// Tracks the state of an open document for didOpen/didChange versioning.
 #[derive(Debug, Clone)]
 pub struct OpenDocumentState {
@@ -99,7 +106,7 @@ impl LspClient {
         let opened_documents: Arc<RwLock<HashMap<PathBuf, OpenDocumentState>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        let root_uri = format!("file://{}", project_root.display());
+        let root_uri = path_to_uri(project_root);
 
         let client = Self {
             next_id: AtomicU64::new(1),
@@ -185,7 +192,7 @@ impl LspClient {
 
     /// Notify the server that a file was opened.
     pub async fn did_open(&self, path: &Path, content: &str, language_id: &str) -> Result<()> {
-        let uri = format!("file://{}", path.display());
+        let uri = path_to_uri(path);
         self.send_notification(
             "textDocument/didOpen",
             Some(json!({
@@ -202,7 +209,7 @@ impl LspClient {
 
     /// Notify the server that a file changed.
     pub async fn did_change(&self, path: &Path, content: &str, version: i32) -> Result<()> {
-        let uri = format!("file://{}", path.display());
+        let uri = path_to_uri(path);
         self.send_notification(
             "textDocument/didChange",
             Some(json!({
@@ -218,7 +225,7 @@ impl LspClient {
 
     /// Notify the server that a file was closed.
     pub async fn did_close(&self, path: &Path) -> Result<()> {
-        let uri = format!("file://{}", path.display());
+        let uri = path_to_uri(path);
         self.send_notification(
             "textDocument/didClose",
             Some(json!({
@@ -299,7 +306,7 @@ impl LspClient {
         opened.insert(
             path.to_path_buf(),
             OpenDocumentState {
-                uri: format!("file://{}", path.display()),
+                uri: path_to_uri(path),
                 language_id: language_id.to_string(),
                 version: 1,
             },
@@ -626,6 +633,17 @@ mod tests {
         assert_eq!(path, PathBuf::from("/tmp/my file.rs"));
     }
 
+    #[test]
+    fn path_to_uri_encodes_spaces_and_fragments() {
+        let path = PathBuf::from("/tmp/my file#1.rs");
+        let uri = path_to_uri(&path);
+        assert!(
+            uri.contains("my%20file%231.rs"),
+            "path_to_uri must percent-encode reserved characters: {uri}"
+        );
+        assert_eq!(uri_to_path(&uri), path);
+    }
+
     #[cfg(windows)]
     #[test]
     fn uri_to_path_handles_windows_path() {
@@ -661,5 +679,6 @@ mod tests {
         let state = opened.read().await.get(&path).cloned().unwrap();
         assert_eq!(state.version, 3);
         assert_eq!(state.language_id, "rust");
+        assert_eq!(state.uri, path_to_uri(&path));
     }
 }
