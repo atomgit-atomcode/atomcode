@@ -17,12 +17,64 @@
 
 use unicode_width::UnicodeWidthStr;
 
+/// ASCII fallback set for the box-drawing glyphs and decorative
+/// content chars. Switched on when `caps.unicode_symbols == false`
+/// (Windows legacy conhost, `LANG=C`, `TERM=dumb`, etc.) so users on
+/// fonts that miss the Unicode glyphs see a tidy ASCII box instead
+/// of tofu + drifting borders. The drift is the real bug — `●`, `·`,
+/// `←` all return width 1 from `unicode-width` but conhost allocates
+/// them slightly wider in practice, so the right `│` lands at a
+/// different column on every row that contains one.
+fn box_chars(unicode_symbols: bool) -> (&'static str, &'static str, &'static str, &'static str, &'static str, &'static str) {
+    if unicode_symbols {
+        ("┌", "┐", "└", "┘", "─", "│")
+    } else {
+        ("+", "+", "+", "+", "-", "|")
+    }
+}
+
+/// Strip decorative Unicode glyphs out of `s` when running on a
+/// terminal that lacks reliable Unicode rendering / cell-width
+/// accounting (Windows legacy conhost et al). Each substitution
+/// returns an ASCII string of EQUAL display width to what
+/// `unicode-width` thought the original was — keeps the right border
+/// pinned to the same column on every row.
+fn ascii_fallback(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '●' | '•' => out.push('*'),
+            '○' => out.push('o'),
+            '·' => out.push('-'),
+            '←' => out.push('<'),
+            '→' => out.push('>'),
+            '↑' => out.push('^'),
+            '↓' => out.push('v'),
+            '█' => out.push('#'),
+            // Box-drawing glyphs in content (e.g. tables emitted by
+            // markdown into the panel) get the same swap as the
+            // outer panel border.
+            '┌' | '┐' | '└' | '┘' | '┬' | '┴' | '├' | '┤' | '┼' => out.push('+'),
+            '─' => out.push('-'),
+            '│' => out.push('|'),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Build the lines of a Cyan-bordered panel.
 ///
 /// Returns one string per terminal row: top border with title, content
 /// lines with side borders + padding, bottom border with step indicator.
 /// `width` is the total external width including both border columns;
 /// inner content area is `width - 4` (2 padding cells on each side).
+///
+/// `unicode_symbols=false` swaps the box-drawing glyphs for `+ - |`
+/// and substitutes the decorative chars (`●`, `○`, `·`, `←`, `•`,
+/// `█`) inside each content line. Wired from `state.unicode_symbols`
+/// so Windows legacy conhost / `LANG=C` / `TERM=dumb` users see a
+/// clean ASCII box with the right border still column-aligned.
 ///
 /// The returned strings include SGR colour codes so the renderer paints
 /// the borders cyan and the title brand-magenta. Pass these strings to
@@ -32,36 +84,67 @@ pub(super) fn draw_panel(
     content: &[String],
     step_indicator: &str,
     width: usize,
+    unicode_symbols: bool,
 ) -> Vec<String> {
     use crossterm::style::{Color, ResetColor, SetForegroundColor};
     let border = Color::Cyan; // Palette::BORDER
     let brand = Color::Magenta; // Palette::BRAND
+    let (tl, tr, bl, br_c, h, v) = box_chars(unicode_symbols);
+
+    // Sanitise content lines and the title/indicator strings when
+    // ASCII fallback is active. Done once here rather than at every
+    // call site so call sites stay readable.
+    let title_owned: String;
+    let title_seg_src: &str = if unicode_symbols {
+        title
+    } else {
+        title_owned = ascii_fallback(title);
+        &title_owned
+    };
+    let step_owned: String;
+    let step_src: &str = if unicode_symbols {
+        step_indicator
+    } else {
+        step_owned = ascii_fallback(step_indicator);
+        &step_owned
+    };
 
     let mut out = Vec::with_capacity(content.len() + 2);
     let inner_width = width.saturating_sub(4);
 
     // Top border: ┌─ <title> ─...─┐
-    let title_seg = format!(" {title} ");
+    let title_seg = format!(" {title_seg_src} ");
     let title_width = UnicodeWidthStr::width(title_seg.as_str());
     let dashes_after = inner_width.saturating_sub(title_width);
     let top = format!(
-        "{b}┌─{r}{br}{tt}{r}{b}{dash}─┐{r}",
+        "{b}{tl}{h}{r}{br}{tt}{r}{b}{dash}{h}{tr}{r}",
         b = SetForegroundColor(border),
         br = SetForegroundColor(brand),
+        tl = tl,
+        tr = tr,
+        h = h,
         tt = title_seg,
-        dash = "─".repeat(dashes_after),
+        dash = h.repeat(dashes_after),
         r = ResetColor,
     );
     out.push(top);
 
     // Content rows: │ <2 sp pad> <line padded to inner_width-2> <2 sp pad> │
-    for line in content {
-        let line_width = UnicodeWidthStr::width(line.as_str());
+    for raw in content {
+        let owned;
+        let line: &str = if unicode_symbols {
+            raw.as_str()
+        } else {
+            owned = ascii_fallback(raw);
+            &owned
+        };
+        let line_width = UnicodeWidthStr::width(line);
         let pad = (inner_width.saturating_sub(2)).saturating_sub(line_width);
         let row = format!(
-            "{b}│{r}  {line}{pad}  {b}│{r}",
+            "{b}{v}{r}  {line}{pad}  {b}{v}{r}",
             b = SetForegroundColor(border),
             r = ResetColor,
+            v = v,
             line = line,
             pad = " ".repeat(pad),
         );
@@ -69,14 +152,17 @@ pub(super) fn draw_panel(
     }
 
     // Bottom border: └─ <step_indicator> ─...─┘
-    let step_seg = format!(" {step_indicator} ");
+    let step_seg = format!(" {step_src} ");
     let step_w = UnicodeWidthStr::width(step_seg.as_str());
     let dashes_after_step = inner_width.saturating_sub(step_w);
     let bot = format!(
-        "{b}└─{step_seg}{dash}─┘{r}",
+        "{b}{bl}{h}{step_seg}{dash}{h}{br_c}{r}",
         b = SetForegroundColor(border),
+        bl = bl,
+        br_c = br_c,
+        h = h,
         step_seg = step_seg,
-        dash = "─".repeat(dashes_after_step),
+        dash = h.repeat(dashes_after_step),
         r = ResetColor,
     );
     out.push(bot);
@@ -366,7 +452,12 @@ impl OnboardingWizard {
     /// 5-line ASCII logo + Ctrl+C hint so the box fits 18-row
     /// terminals. Spec threshold: full layout needs 18 rows (16 box +
     /// 2 header); compact needs 13 (11 box + 2 header).
-    pub(super) fn draw_intro_lines(&self, term_cols: u16, term_rows: u16) -> Vec<String> {
+    pub(super) fn draw_intro_lines(
+        &self,
+        term_cols: u16,
+        term_rows: u16,
+        unicode_symbols: bool,
+    ) -> Vec<String> {
         use crate::i18n::{t, Msg};
         let compact = term_rows < 22;
 
@@ -427,15 +518,16 @@ impl OnboardingWizard {
             &content,
             "Step 1/3",
             (term_cols as usize).min(80),
+            unicode_symbols,
         ));
-        out
+        ascii_fallback_step(out, unicode_symbols)
     }
 
     /// Build all output lines for step 2 (Language). Bilingual title
     /// is locale-independent (it IS the moment the user picks
     /// locale); the prompt + option labels + nav hint follow the
     /// current global locale.
-    pub(super) fn draw_language_lines(&self, term_cols: u16) -> Vec<String> {
+    pub(super) fn draw_language_lines(&self, term_cols: u16, unicode_symbols: bool) -> Vec<String> {
         use crate::i18n::{t, Msg};
 
         let mut out = Vec::new();
@@ -467,8 +559,9 @@ impl OnboardingWizard {
             &content,
             "Step 2/3",
             (term_cols as usize).min(80),
+            unicode_symbols,
         ));
-        out
+        ascii_fallback_step(out, unicode_symbols)
     }
 
     /// Apply the user's language choice — called when Enter pressed
@@ -513,7 +606,7 @@ impl OnboardingWizard {
     /// hint column lines up across rows even when one label is
     /// English ("Configure manually") and another is Chinese
     /// ("配置 CodingPlan") that takes fewer chars but more grid cells.
-    pub(super) fn draw_setup_lines(&self, term_cols: u16) -> Vec<String> {
+    pub(super) fn draw_setup_lines(&self, term_cols: u16, unicode_symbols: bool) -> Vec<String> {
         use crate::i18n::{t, Msg};
 
         let mut out = Vec::new();
@@ -553,9 +646,25 @@ impl OnboardingWizard {
             &content,
             "Step 3/3",
             (term_cols as usize).min(80),
+            unicode_symbols,
         ));
-        out
+        ascii_fallback_step(out, unicode_symbols)
     }
+}
+
+/// Trailing pass over a step's full output (header + box + footer
+/// blanks). `draw_panel` already substitutes Unicode inside its
+/// boxed rows, but the step header rows pushed BEFORE the box don't
+/// go through it — so e.g. "Step 3/3 · Setup" would still carry the
+/// middle dot on a Windows-legacy-console session. Running the
+/// fallback over the whole vec catches those; it's a no-op on rows
+/// the panel already sanitised (none of `+ - | * o < > ^ v #` are in
+/// the substitution set, so they pass through unchanged).
+fn ascii_fallback_step(lines: Vec<String>, unicode_symbols: bool) -> Vec<String> {
+    if unicode_symbols {
+        return lines;
+    }
+    lines.into_iter().map(|l| ascii_fallback(&l)).collect()
 }
 
 impl Default for OnboardingWizard {
@@ -659,14 +768,21 @@ impl crate::modals::Modal for OnboardingWizard {
         // left uncentred — it's an inline scrollback message that
         // shares space with the preserved body context.
         let panel_width = (cols as usize).min(80);
+        // Mirror of TerminalCaps::unicode_symbols — false on Windows
+        // legacy conhost / LANG=C / TERM=dumb. Threaded into the
+        // panel + content rendering so those terminals get an ASCII
+        // box (`+ - |`) with `●·←` substituted out, which keeps the
+        // right border column-aligned (the chief visible Win10 bug).
+        let unicode = state.unicode_symbols;
         let lines = match self.step {
             Step::Confirm => {
                 // No box for the y/N prompt — one inline line.
-                vec![crate::i18n::t(crate::i18n::Msg::OnboardingConfirmClear).into_owned()]
+                let msg = crate::i18n::t(crate::i18n::Msg::OnboardingConfirmClear).into_owned();
+                vec![if unicode { msg } else { ascii_fallback(&msg) }]
             }
-            Step::Intro => center_lines(self.draw_intro_lines(cols, rows), panel_width, cols, rows),
-            Step::Language => center_lines(self.draw_language_lines(cols), panel_width, cols, rows),
-            Step::Setup => center_lines(self.draw_setup_lines(cols), panel_width, cols, rows),
+            Step::Intro => center_lines(self.draw_intro_lines(cols, rows, unicode), panel_width, cols, rows),
+            Step::Language => center_lines(self.draw_language_lines(cols, unicode), panel_width, cols, rows),
+            Step::Setup => center_lines(self.draw_setup_lines(cols, unicode), panel_width, cols, rows),
         };
         for line in lines {
             // No trailing `\n` — the retained renderer's
@@ -749,7 +865,7 @@ mod tests {
 
     #[test]
     fn top_border_has_title() {
-        let lines = draw_panel("AtomCode", &[], "Step 1/3", 60);
+        let lines = draw_panel("AtomCode", &[], "Step 1/3", 60, true);
         let plain = strip_sgr(&lines[0]);
         assert!(plain.starts_with("┌─ AtomCode "));
         assert!(plain.ends_with("─┐"));
@@ -757,7 +873,7 @@ mod tests {
 
     #[test]
     fn bottom_border_has_step_indicator() {
-        let lines = draw_panel("AtomCode", &[], "Step 1/3", 60);
+        let lines = draw_panel("AtomCode", &[], "Step 1/3", 60, true);
         let plain = strip_sgr(lines.last().unwrap());
         assert!(plain.starts_with("└─ Step 1/3 "));
         assert!(plain.ends_with("─┘"));
@@ -766,7 +882,7 @@ mod tests {
     #[test]
     fn content_lines_are_padded_to_width() {
         let content = vec!["hello".to_string(), "".to_string()];
-        let lines = draw_panel("X", &content, "Y", 30);
+        let lines = draw_panel("X", &content, "Y", 30, true);
         // Lines 1 & 2 are content. Each must be exactly `width` wide
         // when measured by visible-grid columns.
         for line in &lines[1..=2] {
@@ -783,7 +899,7 @@ mod tests {
     fn cjk_content_pads_correctly() {
         // Each CJK char is 2 cols. "中文" = 4 cols.
         let content = vec!["中文".to_string()];
-        let lines = draw_panel("X", &content, "Y", 30);
+        let lines = draw_panel("X", &content, "Y", 30, true);
         let plain = strip_sgr(&lines[1]);
         assert_eq!(UnicodeWidthStr::width(plain.as_str()), 30);
     }
@@ -793,7 +909,7 @@ mod tests {
         // width=10 has inner_width=6 which won't fit "AtomCode" title;
         // saturating_sub guards against underflow. We just assert it
         // doesn't panic and produces *some* output.
-        let lines = draw_panel("AtomCode", &["x".into()], "S", 10);
+        let lines = draw_panel("AtomCode", &["x".into()], "S", 10, true);
         assert_eq!(lines.len(), 3); // top + 1 content + bottom
     }
 
@@ -982,7 +1098,7 @@ mod tests {
     fn intro_full_layout_has_all_pieces() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
-        let lines = OnboardingWizard::new().draw_intro_lines(80, 24);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 24, true);
         let joined: String = lines
             .iter()
             .map(|s| strip_sgr(s))
@@ -1012,7 +1128,7 @@ mod tests {
     fn intro_compact_drops_logo() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
-        let lines = OnboardingWizard::new().draw_intro_lines(80, 18);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 18, true);
         let joined: String = lines
             .iter()
             .map(|s| strip_sgr(s))
@@ -1038,7 +1154,7 @@ mod tests {
     fn language_layout_has_three_options_with_numbers() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
-        let lines = OnboardingWizard::new().draw_language_lines(80);
+        let lines = OnboardingWizard::new().draw_language_lines(80, true);
         let joined: String = lines
             .iter()
             .map(|s| strip_sgr(s))
@@ -1065,7 +1181,7 @@ mod tests {
         let mut w = OnboardingWizard::new();
         w.step = Step::Language;
         w.language_idx = 2;
-        let lines = w.draw_language_lines(80);
+        let lines = w.draw_language_lines(80, true);
         let joined: String = lines
             .iter()
             .map(|s| strip_sgr(s))
@@ -1166,7 +1282,7 @@ mod tests {
     fn setup_layout_has_three_options() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
-        let lines = OnboardingWizard::new().draw_setup_lines(80);
+        let lines = OnboardingWizard::new().draw_setup_lines(80, true);
         let joined: String = lines
             .iter()
             .map(|s| strip_sgr(s))
@@ -1190,7 +1306,7 @@ mod tests {
     fn setup_zh_renders_chinese_labels() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
-        let lines = OnboardingWizard::new().draw_setup_lines(80);
+        let lines = OnboardingWizard::new().draw_setup_lines(80, true);
         let joined: String = lines
             .iter()
             .map(|s| strip_sgr(s))
@@ -1210,7 +1326,7 @@ mod tests {
     fn setup_options_put_codingplan_first() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
-        let lines = OnboardingWizard::new().draw_setup_lines(80);
+        let lines = OnboardingWizard::new().draw_setup_lines(80, true);
         let joined: String = lines
             .iter()
             .map(|s| strip_sgr(s))
@@ -1234,7 +1350,7 @@ mod tests {
         crate::i18n::set_locale(crate::i18n::Locale::En);
         let mut w = OnboardingWizard::new();
         w.setup_idx = 1;
-        let lines = w.draw_setup_lines(80);
+        let lines = w.draw_setup_lines(80, true);
         let joined: String = lines
             .iter()
             .map(|s| strip_sgr(s))
@@ -1278,7 +1394,7 @@ mod tests {
     fn vterm_step1_shows_box_borders_in_en() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
-        let lines = OnboardingWizard::new().draw_intro_lines(80, 24);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 24, true);
         let screen = paint_to_vterm(lines, 80, 24);
         // Top + bottom corner glyphs visible in the painted grid.
         assert!(screen.contains("┌─"), "top border missing: {screen}");
@@ -1295,7 +1411,7 @@ mod tests {
         crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
         let mut w = OnboardingWizard::new();
         w.step = Step::Language;
-        let lines = w.draw_language_lines(80);
+        let lines = w.draw_language_lines(80, true);
         let screen = paint_to_vterm(lines, 80, 24);
         // vt100 places a CJK double-width char in one cell and leaves
         // the next cell blank, so `选择语言` reads back as
@@ -1321,7 +1437,7 @@ mod tests {
     fn vterm_step1_compact_below_22_rows_drops_logo() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
-        let lines = OnboardingWizard::new().draw_intro_lines(80, 18);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 18, true);
         let screen = paint_to_vterm(lines, 80, 18);
         assert!(
             !screen.contains("█ █ █ █"),
@@ -1340,7 +1456,7 @@ mod tests {
     fn vterm_step3_setup_options_align_vertically() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
-        let lines = OnboardingWizard::new().draw_setup_lines(80);
+        let lines = OnboardingWizard::new().draw_setup_lines(80, true);
 
         let mut vt = crate::test_term::VirtualTerminal::new(80, 24);
         let mut bytes = Vec::new();
@@ -1386,7 +1502,7 @@ mod tests {
     fn intro_renders_in_zh_cn() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
-        let lines = OnboardingWizard::new().draw_intro_lines(80, 24);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 24, true);
         let joined: String = lines
             .iter()
             .map(|s| strip_sgr(s))
@@ -1398,5 +1514,109 @@ mod tests {
         assert!(joined.contains("Ctrl+C 可随时退出"));
         // Brand title stays English on purpose.
         assert!(joined.contains("AtomCode"));
+    }
+
+    // ── ASCII fallback (Windows legacy conhost / LANG=C / TERM=dumb) ──
+
+    /// `unicode_symbols=false` swaps the box-drawing glyphs and the
+    /// decorative content chars for ASCII equivalents. Regression
+    /// guard for the Windows 10 cmd report where the right `│`
+    /// landed at a different column on every row that contained
+    /// `●` / `·` / `←`, because `unicode-width` reports them as 1
+    /// cell while conhost allocates a slightly wider glyph.
+    #[test]
+    fn draw_panel_ascii_fallback_uses_plus_dash_pipe() {
+        let lines = draw_panel(
+            "AtomCode",
+            &["row one".into(), "row two".into()],
+            "Step 3/3",
+            30,
+            false,
+        );
+        let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+        // Box-drawing glyphs gone, ASCII fallbacks in their place.
+        assert!(!joined.contains('┌'), "U+250C leaked: {:?}", joined);
+        assert!(!joined.contains('┐'), "U+2510 leaked: {:?}", joined);
+        assert!(!joined.contains('└'), "U+2514 leaked: {:?}", joined);
+        assert!(!joined.contains('┘'), "U+2518 leaked: {:?}", joined);
+        assert!(!joined.contains('─'), "U+2500 leaked: {:?}", joined);
+        assert!(!joined.contains('│'), "U+2502 leaked: {:?}", joined);
+        assert!(joined.contains('+'), "no + corner: {:?}", joined);
+        assert!(joined.contains('-'), "no - horizontal: {:?}", joined);
+        assert!(joined.contains('|'), "no | vertical: {:?}", joined);
+    }
+
+    /// `●`, `○`, `·`, `←`, `•` inside content rows must be substituted
+    /// with width-equivalent ASCII so the right border stays
+    /// column-aligned. We can't easily verify column alignment in a
+    /// unit test (no real terminal), but we CAN assert the
+    /// substitution happened.
+    #[test]
+    fn draw_panel_ascii_fallback_substitutes_decorative_chars_in_content() {
+        let content = vec!["● filled".into(), "○ open · mid · ← back • bullet".into()];
+        let lines = draw_panel("X", &content, "Y", 60, false);
+        let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+        for bad in ['●', '○', '·', '←', '•'] {
+            assert!(
+                !joined.contains(bad),
+                "Unicode {:?} leaked through ASCII fallback: {:?}",
+                bad,
+                joined
+            );
+        }
+        assert!(joined.contains('*'), "● not replaced with *: {:?}", joined);
+        assert!(joined.contains('o'), "○ not replaced with o: {:?}", joined);
+        assert!(joined.contains('<'), "← not replaced with <: {:?}", joined);
+    }
+
+    /// On Windows-legacy-console paths, `state.unicode_symbols == false`
+    /// flows through `draw_setup_lines` → `draw_panel`, so the full
+    /// step 3 render must come out ASCII-only.
+    #[test]
+    fn draw_setup_lines_ascii_fallback_produces_pure_ascii_box() {
+        let _g = atomcode_core::i18n::test_lock();
+        atomcode_core::i18n::set_locale(atomcode_core::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_setup_lines(80, false);
+        let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+        for bad in ['┌', '┐', '└', '┘', '─', '│', '●', '○', '·', '←', '•'] {
+            assert!(
+                !joined.contains(bad),
+                "Unicode {:?} leaked through Setup ASCII fallback: {:?}",
+                bad,
+                joined
+            );
+        }
+        // Visible content is still readable in ASCII.
+        assert!(joined.contains("Set up CodingPlan"));
+        assert!(joined.contains("[1]") && joined.contains("[2]") && joined.contains("[3]"));
+    }
+
+    /// Belt + braces: each row of an ASCII-fallback rendered Setup
+    /// panel must end with `|` at the SAME column. This is the
+    /// property that was visibly broken on Windows 10 cmd (right
+    /// border zig-zagging).
+    #[test]
+    fn draw_panel_ascii_fallback_right_border_column_aligned() {
+        let _g = atomcode_core::i18n::test_lock();
+        atomcode_core::i18n::set_locale(atomcode_core::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_setup_lines(80, false);
+        // Drop the step header row that sits ABOVE the panel — it's
+        // not bordered.
+        let bordered: Vec<String> = lines
+            .iter()
+            .map(|l| strip_sgr(l))
+            .filter(|l| l.contains('|') || l.contains('+'))
+            .collect();
+        assert!(bordered.len() >= 3, "expected top + content + bottom: {:?}", bordered);
+        let widths: std::collections::HashSet<usize> = bordered
+            .iter()
+            .map(|l| UnicodeWidthStr::width(l.as_str()))
+            .collect();
+        assert_eq!(
+            widths.len(),
+            1,
+            "panel rows have different visible widths — right border would zig-zag: {:?}",
+            bordered
+        );
     }
 }
