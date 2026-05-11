@@ -1254,6 +1254,52 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         }
         self.paint_body();
         self.paint_footer();
+        // paint_body always leaves the cursor at the last body-row
+        // it touched (CUP+EL+content per row); paint_footer's tail
+        // only re-anchors the cursor when footer_dirty is true, so
+        // a body-only render (e.g. async MCP "已连接" CommandOutput
+        // after startup) leaves the visible cursor stranded mid-body
+        // far from the input row. Re-anchor on every frame when an
+        // input prompt is showing — the CUP is one cheap escape and
+        // matches what fast terminals (macOS Terminal.app etc.)
+        // expect: cursor visible AT the input column.
+        self.anchor_cursor_to_input();
+    }
+
+    /// Move the terminal cursor back to the input row's character
+    /// position. Called at the end of every paint_frame so async
+    /// body updates (which only set body_dirty and skip the footer
+    /// repaint) don't leave the cursor stranded above the input
+    /// box. No-op when no input prompt is active.
+    fn anchor_cursor_to_input(&mut self) {
+        let Some((buf_str, cursor_byte)) = self.pending_input.clone() else {
+            return;
+        };
+        let total_footer = self.footer_rows();
+        let footer_top = self.height.saturating_sub(total_footer) + 1;
+        let input_row = footer_top + 2;
+        let chev = self.caps.prompt_chevron();
+        let chev_width = chev.chars().count();
+        let max_cols = (self.width as usize).saturating_sub(chev_width);
+        let cursor_byte = cursor_byte.min(buf_str.len());
+        let nl_marker = if self.caps.unicode_symbols { "↵" } else { "\\n" };
+        let prefix_safe = scrub_controls(&buf_str[..cursor_byte]).replace('\n', nl_marker);
+        let cursor_col_in_buf = display_width(&prefix_safe);
+        let visible_cursor_col = if cursor_col_in_buf < max_cols {
+            cursor_col_in_buf
+        } else {
+            max_cols.saturating_sub(1)
+        };
+        let cursor_col = chev_width + visible_cursor_col;
+        if self.cursor_shown {
+            let cup = format!("\x1b[{};{}H", input_row, cursor_col + 1);
+            let _ = self.out.write_all(cup.as_bytes());
+        } else {
+            let cup = format!("\x1b[{};{}H\x1b[?25h", input_row, cursor_col + 1);
+            let _ = self.out.write_all(cup.as_bytes());
+            self.cursor_shown = true;
+        }
+        let _ = self.out.flush();
     }
 
     /// Pipe one completed line through the markdown renderer and push
