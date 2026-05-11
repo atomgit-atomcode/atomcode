@@ -280,14 +280,13 @@ impl OnboardingWizard {
     /// caller; passed in so tests don't need a real terminal.
     /// Returns SGR-laced strings ready for `UiLine::CommandOutput`.
     ///
-    /// `term_rows < 23` triggers the compact fallback — drops the
-    /// 6-line ASCII logo + Ctrl+C hint so the box fits 18-row
-    /// terminals. Full layout is now ~21 rows (19 box + 2 header)
-    /// after the ANSI Shadow logo grew by one row; compact still
-    /// needs 13 (11 box + 2 header).
+    /// `term_rows < 22` triggers the compact fallback — drops the
+    /// 5-line ASCII logo + Ctrl+C hint so the box fits 18-row
+    /// terminals. Spec threshold: full layout needs 18 rows (16 box +
+    /// 2 header); compact needs 13 (11 box + 2 header).
     pub(super) fn draw_intro_lines(&self, term_cols: u16, term_rows: u16) -> Vec<String> {
         use crate::i18n::{t, Msg};
-        let compact = term_rows < 23;
+        let compact = term_rows < 22;
 
         // Step header (above box)
         let mut out = Vec::new();
@@ -299,20 +298,20 @@ impl OnboardingWizard {
         content.push(String::new()); // top padding
 
         if !compact {
-            // 6-line ANSI Shadow block logo. Solid `█` strokes plus
-            // box-drawing shadow corners (`╔╗╚╝║═`) read more
-            // cleanly than thin figlet fonts in monospaced
-            // terminals. Each row is 70 visible cells; the 2-space
-            // leading lines up under draw_panel's own 2-space
-            // padding, and row 1 carries one extra leading space
-            // because "A"'s slanted top is naturally blank in the
-            // upper-left.
-            content.push("   █████╗ ████████╗ ██████╗ ███╗   ███╗ ██████╗ ██████╗ ██████╗ ███████╗".to_string());
-            content.push("  ██╔══██╗╚══██╔══╝██╔═══██╗████╗ ████║██╔════╝██╔═══██╗██╔══██╗██╔════╝".to_string());
-            content.push("  ███████║   ██║   ██║   ██║██╔████╔██║██║     ██║   ██║██║  ██║█████╗  ".to_string());
-            content.push("  ██╔══██╗   ██║   ██║   ██║██║╚██╔╝██║██║     ██║   ██║██║  ██║██╔══╝  ".to_string());
-            content.push("  ██║  ██║   ██║   ╚██████╔╝██║ ╚═╝ ██║╚██████╗╚██████╔╝██████╔╝███████╗".to_string());
-            content.push("  ╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝".to_string());
+            // 5-line pure block-glyph logo. Uses only `█` and spaces
+            // so it renders uniformly in every monospaced font —
+            // mixing solid blocks with thin box-drawing chars (the
+            // ANSI Shadow style) broke in fonts that draw `█` at
+            // 100% cell coverage while keeping `╔═` at line weight,
+            // leaving the shadow outline floating disjointly from
+            // the letter bodies. Each row is 49 cells; 12-col
+            // leading pad centres the 49-wide logo inside
+            // draw_panel's 74-col content area (12 + 49 + 13 = 74).
+            content.push("             ███  █████  ███  █     █  ████  ███  ████  █████".to_string());
+            content.push("            █   █   █   █   █ ██   ██ █     █   █ █   █ █    ".to_string());
+            content.push("            █████   █   █   █ █ █ █ █ █     █   █ █   █ ████ ".to_string());
+            content.push("            █   █   █   █   █ █  █  █ █     █   █ █   █ █    ".to_string());
+            content.push("            █   █   █    ███  █     █  ████  ███  ████  █████".to_string());
             content.push(String::new());
             content.push(
                 t(Msg::OnboardingIntroVersionLine {
@@ -866,11 +865,10 @@ mod tests {
             .map(|s| strip_sgr(s))
             .collect::<Vec<_>>()
             .join("\n");
-        // ASCII logo signature: the bottom row of the ANSI Shadow
-        // block ends with `╚══════╝` (the wide bottom of "E"),
-        // unique to the new logo.
+        // ASCII logo signature: M's row 3 collapses to alternating
+        // `█ █ █ █`, unique to the new pure-block design.
         assert!(
-            joined.contains("╚══════╝"),
+            joined.contains("█ █ █ █"),
             "logo missing: {joined}"
         );
         assert!(joined.contains("Version "));
@@ -885,7 +883,7 @@ mod tests {
         assert!(joined.contains("Step 1/3"));
     }
 
-    /// `term_rows < 23` drops the logo + Ctrl+C lines. Bullets,
+    /// `term_rows < 22` drops the logo + Ctrl+C lines. Bullets,
     /// version, and Press-Enter still render so the user can advance.
     #[test]
     fn intro_compact_drops_logo() {
@@ -898,7 +896,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            !joined.contains("╚══════╝"),
+            !joined.contains("█ █ █ █"),
             "logo should be hidden in compact mode: {joined}"
         );
         // Compact replaces the version block with a compact product
@@ -1197,13 +1195,13 @@ mod tests {
     }
 
     #[test]
-    fn vterm_step1_compact_below_23_rows_drops_logo() {
+    fn vterm_step1_compact_below_22_rows_drops_logo() {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
         let lines = OnboardingWizard::new().draw_intro_lines(80, 18);
         let screen = paint_to_vterm(lines, 80, 18);
         assert!(
-            !screen.contains("╚══════╝"),
+            !screen.contains("█ █ █ █"),
             "ASCII logo present in compact mode: {screen}"
         );
         // Compact substitutes `AtomCode vX.Y.Z`.
