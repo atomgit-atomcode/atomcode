@@ -564,6 +564,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescCodingplan =>
             "Claim CodingPlan + set up models from the plan's model list".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),
+        Msg::CmdDescRename => "Rename current session".into(),
         Msg::CmdDescLogin => "Sign in with AtomGit OAuth".into(),
         Msg::CmdDescLogout => "Sign out of AtomGit".into(),
         Msg::CmdDescWhoami => "Show current logged-in user".into(),

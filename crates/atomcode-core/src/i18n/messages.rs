@@ -354,6 +354,7 @@ pub enum Msg<'a> {
     // ── Command descriptions (for help_text dynamic lookup) ──
     CmdDescCodingplan,
     CmdDescResume,
+    CmdDescRename,
     CmdDescLogin,
     CmdDescLogout,
     CmdDescWhoami,

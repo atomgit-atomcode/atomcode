@@ -562,6 +562,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescCodingplan =>
             "领取 CodingPlan 并从计划的模型列表中配置模型".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),
+        Msg::CmdDescRename => "重命名当前会话".into(),
         Msg::CmdDescLogin => "使用 AtomGit OAuth 登录".into(),
         Msg::CmdDescLogout => "退出 AtomGit 登录".into(),
         Msg::CmdDescWhoami => "显示当前登录用户".into(),

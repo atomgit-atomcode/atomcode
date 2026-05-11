@@ -122,6 +122,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
     let msg = match name {
         "codingplan" => Msg::CmdDescCodingplan,
         "resume" => Msg::CmdDescResume,
+        "rename" => Msg::CmdDescRename,
         "login" => Msg::CmdDescLogin,
         "logout" => Msg::CmdDescLogout,
         "whoami" => Msg::CmdDescWhoami,
