@@ -5237,7 +5237,8 @@ fn handle_agent_event(
             // without bumping the AgentEvent contract. Char count helps
             // users notice degenerate near-zero VL outputs that would
             // mislead the main model into "image failed" responses.
-            let msg = format!("✓ VL 识别图片成功，返回 {} chars", char_count);
+            let msg = crate::i18n::t(crate::i18n::Msg::VisionPreprocessSuccess { char_count })
+                .into_owned();
             renderer.render(UiLine::VisionPreprocessSuccess {
                 msg,
                 model: vl_key,

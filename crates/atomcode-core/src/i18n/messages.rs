@@ -415,6 +415,16 @@ pub enum Msg<'a> {
     OnboardingConfirmClear,
     CmdWelcomeDescription,
 
+    /// Vision preprocessor success banner. Shown as a body line right
+    /// after a VL turn finishes, in the form
+    ///   `✓ VL recognised image, returned N chars`
+    /// (English) /
+    ///   `✓ VL 识别图片成功，返回 N chars`
+    /// (zh-CN). The model key trails as a dim suffix in the renderer
+    /// — kept out of this message so the wrapper styling stays
+    /// renderer-side.
+    VisionPreprocessSuccess { char_count: usize },
+
     /// TurnComplete separator summary, e.g.
     ///   `✓ Shipped · 3 rounds · 2 tools · 6.8s · 285 tokens`
     /// `done` is a playful English verb from `DONE_LABELS` — kept
