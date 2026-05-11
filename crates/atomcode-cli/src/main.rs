@@ -929,7 +929,7 @@ async fn run() -> Result<i32> {
     atomcode_tuix::i18n::set_locale(locale);
 
     let unavailable_reason = if config.providers.is_empty() {
-        Some("未配置 provider。请使用 /provider 添加 provider 后再试。".to_string())
+        Some(atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::CmdNoActiveProvider).into_owned())
     } else {
         None
     };

@@ -68,11 +68,12 @@ impl Modal for LanguagePicker {
                 ctx.config.language = Some(locale);
                 let config_path = atomcode_core::config::Config::default_path();
                 if let Err(e) = ctx.config.save(&config_path) {
+                    // TODO: surface via renderer once a non-modal error display is available
                     eprintln!("[language] failed to save config: {e}");
                 }
-                renderer.render(UiLine::CommandOutput(
-                    format!("  Language set to: {label} ({locale})\n"),
-                ));
+                let display = format!("{label} ({locale})");
+                let msg = crate::i18n::t(crate::i18n::Msg::LanguageSetTo { locale: &display });
+                renderer.render(UiLine::CommandOutput(format!("  {msg}\n")));
                 renderer.flush();
                 Ok(ModalAction::Close)
             }
@@ -98,5 +99,26 @@ impl Modal for LanguagePicker {
             status: build_status(state, ctx),
         });
         renderer.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_selects_current_locale() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(Locale::ZhCn);
+        let picker = LanguagePicker::open();
+        assert_eq!(picker.selected, 1); // ZhCn is second option
+    }
+
+    #[test]
+    fn open_defaults_to_en() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(Locale::En);
+        let picker = LanguagePicker::open();
+        assert_eq!(picker.selected, 0); // En is first option
     }
 }

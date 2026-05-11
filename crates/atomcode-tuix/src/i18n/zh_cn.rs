@@ -34,13 +34,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  Provider 管理 — 添加 / 编辑 / 删除 / 设为默认。按 Esc 取消。\n".into(),
         Msg::ProviderWizardCancelled =>
             "（已取消）".into(),
-        Msg::ProviderMenuAdd => "add".into(),
+        Msg::ProviderMenuAdd => "添加".into(),
         Msg::ProviderMenuAddDesc => "添加新 Provider".into(),
-        Msg::ProviderMenuEdit => "edit".into(),
+        Msg::ProviderMenuEdit => "编辑".into(),
         Msg::ProviderMenuEditDesc => "编辑已有 Provider".into(),
-        Msg::ProviderMenuDelete => "delete".into(),
+        Msg::ProviderMenuDelete => "删除".into(),
         Msg::ProviderMenuDeleteDesc => "移除 Provider".into(),
-        Msg::ProviderMenuSetDefault => "set-default".into(),
+        Msg::ProviderMenuSetDefault => "设为默认".into(),
         Msg::ProviderMenuSetDefaultDesc => "切换默认 Provider".into(),
         Msg::ProviderNoProviders =>
             "尚未配置任何 Provider。".into(),
@@ -56,15 +56,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderUpdated { name } =>
             format!("已更新 \"{name}\"。").into(),
         Msg::ProviderStepName => "Provider 名称？".into(),
-        Msg::ProviderStepType => "类型？(openai / claude / ollama)".into(),
+        Msg::ProviderStepType => "类型？（openai / claude / ollama）".into(),
         Msg::ProviderStepTypeWithHint { current } =>
             format!("类型？[{current}]（openai / claude / ollama，留空保持不变）").into(),
         Msg::ProviderStepBaseUrl =>
             "Base URL？（留空使用默认值）".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL？[{current}]（留空保持不变）").into(),
+        Msg::ProviderDefaultHint => "Provider 默认值".into(),
         Msg::ProviderStepApiKey =>
             "API 密钥？（留空不设置）".into(),
+        Msg::ProviderStepApiKeyWithHint { hint } =>
+            format!("API 密钥？[{hint}]").into(),
         Msg::ProviderStepApiKeySet => "已设置 — 留空保持不变".into(),
         Msg::ProviderStepApiKeyUnset => "未设置".into(),
         Msg::ProviderStepModel => "模型？".into(),
@@ -112,7 +115,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueTitleConfirmed { title } =>
             format!("✓ 标题：{title}").into(),
         Msg::IssueRequiredField { field } =>
-            format!("（必填 — 请输入{field}，或按 Esc 取消）").into(),
+            format!("（必填 — 请输入 {field}，或按 Esc 取消）").into(),
+
+        // ── 语言 ──
+        Msg::LanguageSetTo { locale } =>
+            format!("语言已切换为：{locale}").into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>

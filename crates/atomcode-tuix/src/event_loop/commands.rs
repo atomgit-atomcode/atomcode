@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 use super::{save_and_reload, LoopCtx};
+use crate::i18n::{t, Msg};
 use crate::modals::{DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
@@ -121,7 +122,7 @@ pub(super) fn execute_slash_command(
             state.agent_mode = AgentMode::Plan;
             ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();
             renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdSwitchedPlanMode).into_owned(),
+                t(Msg::CmdSwitchedPlanMode).into_owned(),
             ));
             renderer.flush();
         }
@@ -129,7 +130,7 @@ pub(super) fn execute_slash_command(
             state.agent_mode = AgentMode::Build;
             ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(false)).ok();
             renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdSwitchedBuildMode).into_owned(),
+                t(Msg::CmdSwitchedBuildMode).into_owned(),
             ));
             renderer.flush();
         }
@@ -186,7 +187,7 @@ pub(super) fn execute_slash_command(
                         .send(AgentCommand::ReloadConfig(new_cfg))
                         .ok();
                     renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::CmdReloadDone {
+                        t(Msg::CmdReloadDone {
                             provider: &new_default, model: &new_model,
                         }).into_owned(),
                     ));
@@ -194,7 +195,7 @@ pub(super) fn execute_slash_command(
                 Err(e) => {
                     let msg = format!("{}", e);
                     renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::CmdReloadFailed { error: &msg }).into_owned(),
+                        t(Msg::CmdReloadFailed { error: &msg }).into_owned(),
                     ));
                 }
             }
@@ -247,14 +248,14 @@ pub(super) fn execute_slash_command(
                 working_dir: dir_display,
             });
             renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdNewSession).into_owned(),
+                t(Msg::CmdNewSession).into_owned(),
             ));
             renderer.flush();
         }
         "model" => {
             if ctx.config.providers.is_empty() {
                 renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::CmdNoProviders).into_owned(),
+                    t(Msg::CmdNoProviders).into_owned(),
                 ));
                 renderer.flush();
             } else {
@@ -271,14 +272,15 @@ pub(super) fn execute_slash_command(
                         ctx.config.language = Some(locale);
                         let config_path = atomcode_core::config::Config::default_path();
                         if let Err(e) = ctx.config.save(&config_path) {
+                            // TODO: surface via renderer once a non-modal error display is available
                             eprintln!("[language] failed to save config: {e}");
                         }
-                        let msg = format!("  Language set to: {locale}\n");
-                        renderer.render(UiLine::CommandOutput(msg));
+                        let msg = t(Msg::LanguageSetTo { locale: &locale.to_string() });
+                        renderer.render(UiLine::CommandOutput(format!("  {msg}\n")));
                         renderer.flush();
                     }
                     Err(_) => {
-                        let msg = crate::i18n::t(crate::i18n::Msg::ErrUnsupportedLocale { input: arg });
+                        let msg = t(Msg::ErrUnsupportedLocale { input: arg });
                         renderer.render(UiLine::CommandOutput(format!("  {msg}\n")));
                         renderer.flush();
                     }
@@ -290,7 +292,7 @@ pub(super) fn execute_slash_command(
                 let sessions: Vec<_> = all.into_iter().filter(|s| s.message_count > 0).collect();
                 if sessions.is_empty() {
                     renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::CmdNoSessions).into_owned(),
+                        t(Msg::CmdNoSessions).into_owned(),
                     ));
                     renderer.flush();
                 } else {
@@ -305,7 +307,7 @@ pub(super) fn execute_slash_command(
         "provider" => {
             *active_modal = Some(Box::new(ProviderWizard::MainMenu { selected: 0 }));
             renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::ProviderWizardHeader).into_owned(),
+                t(Msg::ProviderWizardHeader).into_owned(),
             ));
             renderer.flush();
         }
@@ -344,7 +346,7 @@ pub(super) fn execute_slash_command(
                 Ok(o) => {
                     let s = String::from_utf8_lossy(&o.stdout).to_string();
                     renderer.render(UiLine::CommandOutput(if s.is_empty() {
-                        crate::i18n::t(crate::i18n::Msg::CmdNoChanges).into_owned()
+                        t(Msg::CmdNoChanges).into_owned()
                     } else {
                         s
                     }));
@@ -357,7 +359,7 @@ pub(super) fn execute_slash_command(
         }
         "undo" => {
             renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::CmdUndoNotSupported).into_owned(),
+                t(Msg::CmdUndoNotSupported).into_owned(),
             ));
             renderer.flush();
         }
@@ -467,13 +469,13 @@ pub(super) fn execute_slash_command(
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(ctx.config.clone()));
                     renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::CmdLogoutDone).into_owned(),
+                        t(Msg::CmdLogoutDone).into_owned(),
                     ));
                 }
                 Err(e) => {
                     let msg = format!("{}", e);
                     renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::CmdLogoutFailed { error: &msg }).into_owned(),
+                        t(Msg::CmdLogoutFailed { error: &msg }).into_owned(),
                     ));
                 }
             }
@@ -491,7 +493,7 @@ pub(super) fn execute_slash_command(
                     atomcode_core::auth::auth_file_path().display(),
                 )
             } else {
-                crate::i18n::t(crate::i18n::Msg::CmdWhoamiNotSignedIn).into_owned()
+                t(Msg::CmdWhoamiNotSignedIn).into_owned()
             };
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
@@ -537,7 +539,7 @@ pub(super) fn execute_slash_command(
                     return Ok(());
                 }
                 renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::CmdCheckingUpdate).into_owned(),
+                    t(Msg::CmdCheckingUpdate).into_owned(),
                 ));
                 renderer.flush();
                 let current = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -604,7 +606,7 @@ pub(super) fn execute_slash_command(
                     apply_cd(ctx, path.clone());
                     let p = path.display().to_string();
                     renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::DirChanged { path: &p }).into_owned(),
+                        t(Msg::DirChanged { path: &p }).into_owned(),
                     ));
                 }
                 Err(e) => {
@@ -839,7 +841,7 @@ pub(super) fn execute_slash_command(
             match provider {
                 None => {
                     renderer.render(UiLine::Error(
-                        crate::i18n::t(crate::i18n::Msg::CmdNoActiveProvider).into_owned(),
+                        t(Msg::CmdNoActiveProvider).into_owned(),
                     ));
                     renderer.flush();
                 }
@@ -992,7 +994,7 @@ pub(super) fn execute_slash_command(
                 state.on_submit();
             } else {
                 renderer.render(UiLine::Error(
-                    crate::i18n::t(crate::i18n::Msg::CmdUnknownCommand { name: other }).into_owned(),
+                    t(Msg::CmdUnknownCommand { name: other }).into_owned(),
                 ));
                 renderer.flush();
             }

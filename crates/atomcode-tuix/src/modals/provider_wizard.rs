@@ -549,17 +549,18 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
         }
         (WizardStep::BaseUrl, None) => t(Msg::ProviderStepBaseUrl).into_owned(),
         (WizardStep::BaseUrl, Some(p)) => {
-            let hint = p.base_url.as_deref().unwrap_or("provider default");
+            let default_hint = t(Msg::ProviderDefaultHint);
+            let hint = p.base_url.as_deref().unwrap_or(&default_hint);
             t(Msg::ProviderStepBaseUrlWithHint { current: hint }).into_owned()
         }
         (WizardStep::ApiKey, None) => t(Msg::ProviderStepApiKey).into_owned(),
         (WizardStep::ApiKey, Some(p)) => {
             let hint = if p.api_key.is_some() {
-                t(Msg::ProviderStepApiKeySet).into_owned()
+                t(Msg::ProviderStepApiKeySet)
             } else {
-                t(Msg::ProviderStepApiKeyUnset).into_owned()
+                t(Msg::ProviderStepApiKeyUnset)
             };
-            format!("API key? [{}]", hint)
+            t(Msg::ProviderStepApiKeyWithHint { hint: &hint }).into_owned()
         }
         (WizardStep::Model, None) => t(Msg::ProviderStepModel).into_owned(),
         (WizardStep::Model, Some(p)) =>

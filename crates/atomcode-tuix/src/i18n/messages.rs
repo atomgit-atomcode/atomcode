@@ -43,7 +43,9 @@ pub enum Msg<'a> {
     ProviderStepTypeWithHint { current: &'a str },
     ProviderStepBaseUrl,
     ProviderStepBaseUrlWithHint { current: &'a str },
+    ProviderDefaultHint,
     ProviderStepApiKey,
+    ProviderStepApiKeyWithHint { hint: &'a str },
     ProviderStepApiKeySet,
     ProviderStepApiKeyUnset,
     ProviderStepModel,
@@ -78,6 +80,9 @@ pub enum Msg<'a> {
     IssueStep2,
     IssueTitleConfirmed { title: &'a str },
     IssueRequiredField { field: &'a str },
+
+    // ── Language ──
+    LanguageSetTo { locale: &'a str },
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,

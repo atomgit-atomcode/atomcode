@@ -63,8 +63,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Base URL? (blank to use provider default)".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL? [{current}] (blank to keep)").into(),
+        Msg::ProviderDefaultHint => "provider default".into(),
         Msg::ProviderStepApiKey =>
             "API key? (blank to leave unset)".into(),
+        Msg::ProviderStepApiKeyWithHint { hint } =>
+            format!("API key? [{hint}]").into(),
         Msg::ProviderStepApiKeySet => "set — blank to keep".into(),
         Msg::ProviderStepApiKeyUnset => "unset".into(),
         Msg::ProviderStepModel => "Model?".into(),
@@ -113,6 +116,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("✓ title: {title}").into(),
         Msg::IssueRequiredField { field } =>
             format!("(required — type a {field} or Esc to cancel)").into(),
+
+        // ── Language ──
+        Msg::LanguageSetTo { locale } =>
+            format!("Language set to: {locale}").into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>

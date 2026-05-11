@@ -155,6 +155,7 @@ mod tests {
     /// has to go through a test update.
     #[test]
     fn options_put_codingplan_first() {
+        let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
         let opts = WelcomeWizard::options();
         assert_eq!(opts[0].0, "Set up CodingPlan");
@@ -191,6 +192,7 @@ mod tests {
 
     #[test]
     fn menu_payload_reflects_selection() {
+        let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
         let mut w = WelcomeWizard::new();
         w.selected = 1;

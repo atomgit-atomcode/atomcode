@@ -10,7 +10,10 @@ use std::sync::RwLock;
 
 static LOCALE: RwLock<Locale> = RwLock::new(Locale::En);
 
-/// Look up using the global current locale.
+/// Translate a message using the current global locale.
+///
+/// Returns a `Cow<'static, str>` — static for literal translations,
+/// owned for interpolated ones.
 pub fn t(msg: Msg<'_>) -> Cow<'static, str> {
     t_with(current_locale(), msg)
 }
@@ -23,14 +26,23 @@ pub fn t_with(locale: Locale, msg: Msg<'_>) -> Cow<'static, str> {
     }
 }
 
+/// Return the current global locale. Falls back to `Locale::En` if
+/// the RwLock is poisoned.
 pub fn current_locale() -> Locale {
-    *LOCALE.read().expect("LOCALE poisoned")
+    LOCALE.read().map(|g| *g).unwrap_or(Locale::En)
 }
 
+/// Switch the global locale used by [`t`]. Silently no-ops if the
+/// RwLock is poisoned.
 pub fn set_locale(locale: Locale) {
-    *LOCALE.write().expect("LOCALE poisoned") = locale;
+    if let Ok(mut g) = LOCALE.write() {
+        *g = locale;
+    }
 }
 
+/// Determine the initial locale from (in priority order):
+/// CLI `--lang` flag, config file `language` field, environment
+/// variables `LC_ALL` / `LC_MESSAGES` / `LANG`.
 pub fn resolve_initial_locale(
     cli_lang: Option<&str>,
     config_lang: Option<Locale>,
@@ -64,6 +76,8 @@ pub fn resolve_initial_locale_with_env(
 
 fn classify_env_locale(value: &str) -> Locale {
     let lower = value.to_ascii_lowercase();
+    // All Chinese variants (zh_CN, zh_TW, zh_HK, …) map to ZhCn.
+    // zh_TW / zh_HK intentionally fall back — no separate Traditional variant yet.
     if lower == "zh"
         || lower.starts_with("zh_")
         || lower.starts_with("zh-")
@@ -75,15 +89,18 @@ fn classify_env_locale(value: &str) -> Locale {
     }
 }
 
+/// Serialization lock for tests that mutate the global locale.
+/// Prevents test races when multiple tests call `set_locale`.
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
 
     #[test]
     fn t_with_returns_english_for_en() {
@@ -99,7 +116,7 @@ mod tests {
 
     #[test]
     fn set_locale_flips_global() {
-        let _g = lock();
+        let _g = test_lock();
         set_locale(Locale::ZhCn);
         assert_eq!(current_locale(), Locale::ZhCn);
         let s = t(Msg::WelcomeBannerLine1);

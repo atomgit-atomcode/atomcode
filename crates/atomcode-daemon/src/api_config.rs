@@ -37,6 +37,7 @@ fn empty_config() -> Config {
         telemetry: Default::default(),
         lsp: Default::default(),
         auto_commit: false,
+        language: None,
     }
 }
 

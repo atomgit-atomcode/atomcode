@@ -11,6 +11,12 @@ pub enum Locale {
     ZhCn,
 }
 
+impl Default for Locale {
+    fn default() -> Self {
+        Locale::En
+    }
+}
+
 impl fmt::Display for Locale {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -26,7 +32,8 @@ impl FromStr for Locale {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "en" | "english" => Ok(Locale::En),
-            "zh" | "zh_cn" | "zh-cn" | "chinese" | "简体中文" => Ok(Locale::ZhCn),
+            "zh" | "zh_cn" | "zh-cn" | "chinese" | "简体中文"
+            | "zh_tw" | "zh-tw" | "zh_hk" | "zh-hk" | "繁體中文" => Ok(Locale::ZhCn),
             other => Err(format!("unsupported locale: {other}")),
         }
     }
@@ -50,6 +57,12 @@ mod tests {
         assert_eq!("zh_CN".parse::<Locale>().unwrap(), Locale::ZhCn);
         assert_eq!("zh-cn".parse::<Locale>().unwrap(), Locale::ZhCn);
         assert_eq!("简体中文".parse::<Locale>().unwrap(), Locale::ZhCn);
+        // zh_TW / zh_HK fall back to ZhCn (no separate Traditional variant yet)
+        assert_eq!("zh_TW".parse::<Locale>().unwrap(), Locale::ZhCn);
+        assert_eq!("zh-tw".parse::<Locale>().unwrap(), Locale::ZhCn);
+        assert_eq!("zh_HK".parse::<Locale>().unwrap(), Locale::ZhCn);
+        assert_eq!("zh-hk".parse::<Locale>().unwrap(), Locale::ZhCn);
+        assert_eq!("繁體中文".parse::<Locale>().unwrap(), Locale::ZhCn);
     }
 
     #[test]
