@@ -3239,6 +3239,23 @@ fn handle_input(
             // Modal trumps phase handlers when it's installed — /model,
             // /provider, /resume all install a modal and the event loop
             // funnels every keystroke through it until it reports Close.
+            //
+            // Exception: Ctrl+C is a global exit shortcut and must NOT
+            // be trappable by any modal. The OnboardingWizard's Intro
+            // screen explicitly promises "Ctrl+C exits anytime" — and
+            // more broadly, the universal keyboard escape hatch should
+            // never depend on whichever modal happens to be open
+            // forwarding it. Dismiss the modal and send Shutdown so
+            // the run-loop tears down cleanly.
+            if matches!(app.state.phase, UiPhase::Idle)
+                && code == KeyCode::Char('c')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && app.active_modal.is_some()
+            {
+                app.active_modal = None;
+                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                return Ok(());
+            }
             if matches!(app.state.phase, UiPhase::Idle) {
                 if let Some(modal) = app.active_modal.as_mut() {
                     let action = modal.handle_key(
