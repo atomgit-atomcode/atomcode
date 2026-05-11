@@ -2,14 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::{mpsc, RwLock};
 
 use super::client::{McpClient, McpToolInfo};
 use super::config::{load_mcp_config, McpServerConfig};
-use super::transport_stdio::StdioClient;
 use super::transport_http::HttpClient;
+use super::transport_stdio::StdioClient;
 use super::types::ServerStatus;
 
 /// Connection status event sent to listeners when servers connect or fail.
@@ -26,8 +27,11 @@ pub enum McpConnectEvent {
 /// Registry of connected MCP servers.
 pub struct McpRegistry {
     servers: Arc<RwLock<BTreeMap<String, Arc<dyn McpClient>>>>,
+    server_timeouts_ms: Arc<RwLock<BTreeMap<String, u64>>>,
     /// Channel for connection status events (used by TUI to display in scrollback).
     connect_events: Option<mpsc::UnboundedSender<McpConnectEvent>>,
+    /// Signals when all initial background connections have completed (or failed).
+    initial_ready: Arc<tokio::sync::Notify>,
 }
 
 impl McpRegistry {
@@ -35,7 +39,9 @@ impl McpRegistry {
     pub fn new() -> Self {
         Self {
             servers: Arc::new(RwLock::new(BTreeMap::new())),
+            server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
             connect_events: None,
+            initial_ready: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -45,7 +51,9 @@ impl McpRegistry {
         (
             Self {
                 servers: Arc::new(RwLock::new(BTreeMap::new())),
+                server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
                 connect_events: Some(tx),
+                initial_ready: Arc::new(tokio::sync::Notify::new()),
             },
             rx,
         )
@@ -89,15 +97,19 @@ impl McpRegistry {
 
         if !configs.is_empty() {
             let servers = registry.servers.clone();
+            let server_timeouts_ms = registry.server_timeouts_ms.clone();
+            let initial_ready = registry.initial_ready.clone();
             tokio::spawn(async move {
                 // Connect servers in parallel
                 let tasks: Vec<_> = configs
                     .into_iter()
                     .map(|config| {
                         let servers = servers.clone();
+                        let server_timeouts_ms = server_timeouts_ms.clone();
                         let tx = combined_tx.clone();
                         async move {
                             let name = config.name.clone();
+                            let timeout_ms = config.timeout_ms();
                             let mut client: Box<dyn McpClient> = match &config.config {
                                 super::config::McpTransportConfig::Stdio {
                                     command,
@@ -114,11 +126,13 @@ impl McpRegistry {
                                 super::config::McpTransportConfig::Http {
                                     url,
                                     headers,
+                                    auth,
                                     timeout_ms,
                                 } => Box::new(HttpClient::new(
                                     name.clone(),
                                     url.clone(),
                                     headers.clone(),
+                                    auth.clone(),
                                     *timeout_ms,
                                 )),
                             };
@@ -127,6 +141,9 @@ impl McpRegistry {
                                 Ok(_result) => {
                                     let mut servers = servers.write().await;
                                     servers.insert(name.clone(), Arc::from(client));
+                                    drop(servers);
+                                    let mut timeouts = server_timeouts_ms.write().await;
+                                    timeouts.insert(name.clone(), timeout_ms);
                                     if let Some(tx) = tx {
                                         let _ = tx.send(McpConnectEvent::Connected {
                                             name: name.clone(),
@@ -148,7 +165,12 @@ impl McpRegistry {
 
                 // Wait for all connections to complete (each has its own timeout)
                 futures::future::join_all(tasks).await;
+                // Signal that initial connections are done
+                initial_ready.notify_waiters();
             });
+        } else {
+            // No servers configured — signal immediately
+            registry.initial_ready.notify_waiters();
         }
 
         registry
@@ -194,11 +216,13 @@ impl McpRegistry {
             super::config::McpTransportConfig::Http {
                 url,
                 headers,
+                auth,
                 timeout_ms,
             } => Box::new(HttpClient::new(
                 config.name.clone(),
                 url.clone(),
                 headers.clone(),
+                auth.clone(),
                 *timeout_ms,
             )),
         };
@@ -207,8 +231,24 @@ impl McpRegistry {
 
         let mut servers = self.servers.write().await;
         servers.insert(config.name.clone(), Arc::from(client));
+        drop(servers);
+        let mut timeouts = self.server_timeouts_ms.write().await;
+        timeouts.insert(config.name.clone(), config.timeout_ms());
 
         Ok(())
+    }
+
+    /// Timeout budget for a slow tools/list operation on a connected server.
+    ///
+    /// The transport already has its own request timeout. This outer budget adds
+    /// a small grace period so TUI background tasks do not cancel a request right
+    /// before the transport timeout/error can surface.
+    pub async fn list_tools_timeout(&self, server_name: &str) -> Duration {
+        let configured_ms = {
+            let timeouts = self.server_timeouts_ms.read().await;
+            timeouts.get(server_name).copied().unwrap_or(30_000)
+        };
+        Duration::from_millis(configured_ms.saturating_add(5_000))
     }
 
     /// Get all available tools from all connected servers.
@@ -334,12 +374,31 @@ impl McpRegistry {
             .collect()
     }
 
+    /// Wait for initial background connections to complete (or timeout).
+    /// Returns immediately if no background connections are pending.
+    pub async fn wait_for_initial_connections(&self, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, self.initial_ready.notified()).await;
+    }
+
     /// Get an Arc clone for sharing across threads.
     pub fn share(&self) -> Arc<Self> {
         Arc::new(Self {
             servers: self.servers.clone(),
+            server_timeouts_ms: self.server_timeouts_ms.clone(),
             connect_events: self.connect_events.clone(),
+            initial_ready: self.initial_ready.clone(),
         })
+    }
+}
+
+impl McpServerConfig {
+    fn timeout_ms(&self) -> u64 {
+        match &self.config {
+            super::config::McpTransportConfig::Stdio { timeout_ms, .. }
+            | super::config::McpTransportConfig::Http { timeout_ms, .. } => {
+                timeout_ms.unwrap_or(30_000)
+            }
+        }
     }
 }
 

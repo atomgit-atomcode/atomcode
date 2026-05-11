@@ -18,6 +18,24 @@ impl AgentLoop {
                     .event_tx
                     .send(AgentEvent::ToolCallStreaming { name, hint });
             }
+            TurnEvent::ToolBatchStarted { batch_id, calls } => {
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolBatchStarted { batch_id, calls });
+            }
+            TurnEvent::ToolBatchCompleted {
+                batch_id,
+                ok,
+                total,
+                elapsed_ms,
+            } => {
+                let _ = self.event_tx.send(AgentEvent::ToolBatchCompleted {
+                    batch_id,
+                    ok,
+                    total,
+                    elapsed_ms,
+                });
+            }
             TurnEvent::ToolOutputChunk { call_id, chunk } => {
                 let _ = self
                     .event_tx
@@ -28,6 +46,14 @@ impl AgentLoop {
                 ref name,
                 ref arguments,
             } => {
+                // Dedupe across retries — see the matching guard in
+                // `agent/mod.rs` inline forward path. Same id arriving
+                // twice means the previous attempt's stream got cut off
+                // (429 / timeout) and was retried; we've already painted
+                // a row for it.
+                if !self.emitted_tool_ids.insert(id.clone()) {
+                    return;
+                }
                 self.datalog.log_tool_call(name, arguments);
 
                 self.current_tool_name = name.clone();
@@ -209,6 +235,10 @@ impl AgentLoop {
             }
             TurnEvent::Error(e) => {
                 let _ = self.event_tx.send(AgentEvent::Error(e));
+            }
+            TurnEvent::Warning(w) => {
+                self.datalog.log_warning(&w);
+                let _ = self.event_tx.send(AgentEvent::Warning(w));
             }
             TurnEvent::WorkingDirChanged(new_dir) => {
                 // The tool itself (change_dir / bash cd) already mutated

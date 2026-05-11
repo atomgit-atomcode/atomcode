@@ -28,6 +28,7 @@ pub struct CurrentContext {
     pub model: Option<String>,
     pub repo_origin: Option<RepoOrigin>,
     pub mode: Option<crate::event::SessionMode>,
+    pub session_id: Option<Uuid>,
 }
 
 tokio::task_local! {
@@ -252,7 +253,9 @@ impl Telemetry {
             device_id: self.device_id,
             launch_id: self.launch_id,
             account_id: self.account_id.read().ok().and_then(|g| g.clone()),
-            session_id: self.session_id.read().map(|g| *g).unwrap_or(self.launch_id),
+            session_id: ctx.session_id
+                .or_else(|| self.session_id.read().ok().map(|g| *g))
+                .unwrap_or(self.launch_id),
             turn_id: ctx.turn_id,
             ts: now_ms(),
             schema_version: crate::SCHEMA_VERSION,
@@ -476,10 +479,34 @@ fn arch_str() -> &'static str {
 mod sys_locale {
     /// Minimal locale getter without pulling a new crate: read env, fallback.
     pub fn get_locale() -> Option<String> {
-        std::env::var("LANG")
+        let raw = std::env::var("LANG")
             .ok()
-            .or_else(|| std::env::var("LC_ALL").ok())
-            .map(|s| s.split('.').next().unwrap_or(&s).replace('_', "-"))
+            .or_else(|| std::env::var("LC_ALL").ok());
+        match raw.as_deref() {
+            // "C" and "POSIX" are not real locales — common when daemon is
+            // spawned by VS Code (launchd environment on macOS).
+            Some("C") | Some("POSIX") | None => {
+                // On macOS, try AppleLocale from user defaults
+                #[cfg(target_os = "macos")]
+                {
+                    if let Ok(output) = std::process::Command::new("defaults")
+                        .args(["read", "-g", "AppleLocale"])
+                        .output()
+                    {
+                        if output.status.success() {
+                            let locale = String::from_utf8_lossy(&output.stdout)
+                                .trim()
+                                .replace('_', "-");
+                            if !locale.is_empty() {
+                                return Some(locale);
+                            }
+                        }
+                    }
+                }
+                Some("en-US".to_string())
+            }
+            Some(val) => Some(val.split('.').next().unwrap_or(val).replace('_', "-")),
+        }
     }
 }
 
@@ -529,6 +556,44 @@ mod resolve_host_tests {
         assert_eq!(
             resolve_provider_host("unknown_vendor", Some("https://api.example.com")),
             Some("api.example.com".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::*;
+    use crate::event::Event;
+
+    #[tokio::test]
+    async fn current_context_session_id_override_wins_over_telemetry_field() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+
+        // Simulate CLI-style: set session_id on the Telemetry struct itself
+        let launch = tel.launch_id();
+        tel.set_session_id(launch);
+
+        // Now use a per-scope override via CurrentContext
+        let override_uuid = Uuid::new_v4();
+        CurrentContext::scope(
+            CurrentContext {
+                session_id: Some(override_uuid),
+                ..Default::default()
+            },
+            || async {
+                tel.track(Event::OpenAtomcode);
+            },
+        )
+        .await;
+
+        // Allow the mpsc receiver task to process
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let records = captured.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].envelope.session_id, override_uuid,
+            "CurrentContext.session_id should override the Telemetry-level session_id"
         );
     }
 }

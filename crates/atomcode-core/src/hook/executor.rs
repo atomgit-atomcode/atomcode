@@ -214,6 +214,7 @@ impl HookExecutor {
             cmd.env("CLAUDE_PLUGIN_ROOT", s);
             cmd.env("ATOMCODE_PLUGIN_ROOT", s);
         }
+        crate::process_utils::suppress_console_window(&mut cmd);
 
         let timeout = Duration::from_millis(hook.timeout_ms);
 
@@ -279,6 +280,8 @@ impl HookExecutor {
             cmd.env("CLAUDE_PLUGIN_ROOT", s);
             cmd.env("ATOMCODE_PLUGIN_ROOT", s);
         }
+
+        crate::process_utils::suppress_console_window(&mut cmd);
 
         let timeout = Duration::from_millis(hook.timeout_ms);
 

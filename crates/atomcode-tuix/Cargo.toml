@@ -10,12 +10,46 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 crossterm = "0.29"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 libc = "0.2"
 dirs = "6"
 qrcode = { version = "0.14", default-features = false }
+ignore = "0.4"
+arboard = "3"
+png = "0.17"
+base64 = "0.22"
+urlencoding = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# NSPasteboard access for the Ctrl+V → file-URL fallback path. arboard's
+# `get_image()` only returns Some when the system clipboard carries
+# raw image bytes (PNG / TIFF / NSImage), but the iTerm2 image-clipboard
+# workflow and Finder `Cmd+C` on an image file leave only
+# `public.file-url` on the pasteboard — no bytes. Cmd+V handles it
+# through bracketed paste (iTerm2 dumps the temp path as text), but
+# Ctrl+V is intercepted at the key layer before iTerm2's paste handler
+# runs, so we read `public.file-url` directly through AppKit, decode
+# the percent-encoded path with `urlencoding`, and feed it into the
+# same `try_attach_image_from_path` we already use for bracketed paste.
+# Already present transitively via arboard, so no fresh registry fetch.
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSPasteboard"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString"] }
+
+[target.'cfg(windows)'.dependencies]
+# Direct Win32 console-mode access for the conhost mouse-capture path.
+# crossterm's EnableMouseCapture uses `set_mode(ENABLE_MOUSE_MODE)` which
+# OVERWRITES the entire input mode mask — that drops bits raw_mode set
+# up and silently eats SetConsoleMode failures (we `let _ =` the result
+# at the call site). The conhost regression report shows that path
+# isn't reliably enabling wheel events on legacy Win10 console even
+# though crossterm thinks it succeeded. Read-modify-write through
+# windows-sys preserves the existing mode, ORs in the mouse bits,
+# explicitly clears ENABLE_QUICK_EDIT_MODE (which can intercept mouse
+# selection on conhost), and surfaces errors via the trace log.
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 tempfile = "3"

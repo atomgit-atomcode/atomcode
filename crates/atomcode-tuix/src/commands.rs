@@ -48,18 +48,20 @@ impl CommandRegistry {
     }
 
     pub fn help_text(&self) -> String {
+        use crate::i18n::{t, Msg};
         let max_name = self
             .commands
             .iter()
             .map(|c| c.name.len())
             .max()
             .unwrap_or(6);
-        let mut out = String::from("  Available commands:\n");
+        let mut out = t(Msg::HelpAvailableCommands).into_owned();
         for c in self.commands {
+            let desc = cmd_desc_i18n(c.name).unwrap_or_else(|| c.desc.into());
             out.push_str(&format!(
                 "    /{:<width$}  {}\n",
                 c.name,
-                c.desc,
+                desc,
                 width = max_name
             ));
         }
@@ -70,6 +72,7 @@ impl CommandRegistry {
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
+    Command { name: "rename",  desc: "Rename current session", needs_args: true },
     Command { name: "login",   desc: "Sign in with AtomGit OAuth", needs_args: false },
     Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false },
     Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false },
@@ -90,7 +93,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true },
     Command { name: "forget", desc: "Remove matching memories", needs_args: true },
     Command { name: "memory", desc: "Show all saved memories", needs_args: false },
-    Command { name: "mcp",     desc: "Show MCP server status (subcommand: reload)", needs_args: false },
+    Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout)", needs_args: false },
     Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
     Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
@@ -99,6 +102,8 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
+    Command { name: "language", desc: "Switch display language", needs_args: false },
+    Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
     // Gateway entry that opens a second-level palette listing all
     // user-invocable skills. needs_args=true so Enter rewrites the
@@ -108,6 +113,54 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
     Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
 ];
+
+/// Look up the i18n translation for a built-in command description.
+/// Returns `None` for unknown command names (callers fall back to
+/// the static `desc` field).
+pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
+    use crate::i18n::{t, Msg};
+    let msg = match name {
+        "codingplan" => Msg::CmdDescCodingplan,
+        "resume" => Msg::CmdDescResume,
+        "rename" => Msg::CmdDescRename,
+        "login" => Msg::CmdDescLogin,
+        "logout" => Msg::CmdDescLogout,
+        "whoami" => Msg::CmdDescWhoami,
+        "model" => Msg::CmdDescModel,
+        "provider" => Msg::CmdDescProvider,
+        "status" => Msg::CmdDescStatus,
+        "config" => Msg::CmdDescConfig,
+        "reload" => Msg::CmdDescReload,
+        "cd" => Msg::CmdDescCd,
+        "init" => Msg::CmdDescInit,
+        "background" => Msg::CmdDescBackground,
+        "diff" => Msg::CmdDescDiff,
+        "clear" => Msg::CmdDescClear,
+        "session" => Msg::CmdDescSession,
+        "cost" => Msg::CmdDescCost,
+        "context" => Msg::CmdDescContext,
+        "compact" => Msg::CmdDescCompact,
+        "remember" => Msg::CmdDescRemember,
+        "forget" => Msg::CmdDescForget,
+        "memory" => Msg::CmdDescMemory,
+        "mcp" => Msg::CmdDescMcp,
+        "undo" => Msg::CmdDescUndo,
+        "worktree" => Msg::CmdDescWorktree,
+        "upgrade" => Msg::CmdDescUpgrade,
+        "issue" => Msg::CmdDescIssue,
+        "plan" => Msg::CmdDescPlan,
+        "build" => Msg::CmdDescBuild,
+        "think" => Msg::CmdDescThink,
+        "help" => Msg::CmdDescHelp,
+        "language" => Msg::CmdDescLanguage,
+        "welcome" => Msg::CmdWelcomeDescription,
+        "quit" => Msg::CmdDescQuit,
+        "skills" => Msg::CmdDescSkills,
+        "plugin" => Msg::CmdDescPlugin,
+        _ => return None,
+    };
+    Some(t(msg))
+}
 
 /// A completion candidate for slash-command Tab completion, merging built-in
 /// and user-defined custom commands.
@@ -132,7 +185,9 @@ pub fn complete_commands(
         if cmd.name.starts_with(prefix) {
             candidates.push(CompletionCandidate {
                 name: cmd.name.to_string(),
-                description: cmd.desc.to_string(),
+                description: cmd_desc_i18n(cmd.name)
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|| cmd.desc.to_string()),
                 is_custom: false,
             });
         }

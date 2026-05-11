@@ -19,10 +19,11 @@ impl WorktreeManager {
     }
 
     pub fn from_dir(dir: PathBuf) -> Result<Self> {
-        let output = Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(&dir)
-            .output()
+        let mut cmd = Command::new("git");
+        cmd.args(["rev-parse", "--show-toplevel"])
+            .current_dir(&dir);
+        crate::process_utils::suppress_console_window_sync(&mut cmd);
+        let output = cmd.output()
             .context("Failed to resolve git repository root")?;
         if !output.status.success() {
             anyhow::bail!(
@@ -48,13 +49,16 @@ impl WorktreeManager {
                 worktree_path.display()
             );
         }
-        let output = Command::new("git")
-            .args(["worktree", "add", "-b", branch])
-            .arg(&worktree_path)
-            .arg(base)
-            .current_dir(&self.repo_root)
-            .output()
-            .context("Failed to run git worktree add")?;
+        let output = {
+            let mut cmd = Command::new("git");
+            cmd.args(["worktree", "add", "-b", branch])
+                .arg(&worktree_path)
+                .arg(base)
+                .current_dir(&self.repo_root);
+            crate::process_utils::suppress_console_window_sync(&mut cmd);
+            cmd.output()
+                .context("Failed to run git worktree add")?
+        };
         if !output.status.success() {
             anyhow::bail!(
                 "git worktree add failed: {}",
@@ -70,10 +74,11 @@ impl WorktreeManager {
 
     /// List all worktrees with branch name, path, and change status.
     pub fn list(&self) -> Result<Vec<(String, PathBuf, bool)>> {
-        let output = Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
-            .current_dir(&self.repo_root)
-            .output()
+        let mut cmd = Command::new("git");
+        cmd.args(["worktree", "list", "--porcelain"])
+            .current_dir(&self.repo_root);
+        crate::process_utils::suppress_console_window_sync(&mut cmd);
+        let output = cmd.output()
             .context("Failed to run git worktree list")?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut result = Vec::new();
@@ -109,12 +114,15 @@ impl WorktreeManager {
         if force {
             args.push("--force");
         }
-        let output = Command::new("git")
-            .args(&args)
-            .arg(&worktree_path)
-            .current_dir(&self.repo_root)
-            .output()
-            .context("Failed to run git worktree remove")?;
+        let output = {
+            let mut cmd = Command::new("git");
+            cmd.args(&args)
+                .arg(&worktree_path)
+                .current_dir(&self.repo_root);
+            crate::process_utils::suppress_console_window_sync(&mut cmd);
+            cmd.output()
+                .context("Failed to run git worktree remove")?
+        };
         if !output.status.success() {
             anyhow::bail!(
                 "git worktree remove failed: {}",
@@ -125,10 +133,11 @@ impl WorktreeManager {
     }
 
     fn has_uncommitted_changes(&self, worktree_path: &Path) -> bool {
-        Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(worktree_path)
-            .output()
+        let mut cmd = Command::new("git");
+        cmd.args(["status", "--porcelain"])
+            .current_dir(worktree_path);
+        crate::process_utils::suppress_console_window_sync(&mut cmd);
+        cmd.output()
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false)
     }

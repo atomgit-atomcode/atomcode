@@ -2,12 +2,12 @@
   "name": "atomcode-vscode",
   "displayName": "AtomCode",
   "description": "AI coding agent powered by AtomCode — terminal-grade AI inside VS Code",
-  "version": "0.1.0",
+  "version": "0.0.3",
   "publisher": "atomgit",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://gitcode.com/atomgit_atomcode/atomcode.git",
+    "url": "https://atomgit.com/atomgit_atomcode/atomcode.git",
     "directory": "extensions/vscode"
   },
   "engines": {
@@ -28,7 +28,10 @@
   "icon": "resources/icon.png",
   "main": "./out/extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCommand:atomcode.explain",
+    "onCommand:atomcode.fix",
+    "onCommand:atomcode.optimize"
   ],
   "contributes": {
     "commands": [
@@ -40,6 +43,10 @@
       {
         "command": "atomcode.openTab",
         "title": "AtomCode: Open in New Tab"
+      },
+      {
+        "command": "atomcode.openPreferredLocation",
+        "title": "AtomCode: Open Preferred Location"
       },
       {
         "command": "atomcode.focusInput",
@@ -80,7 +87,7 @@
         {
           "type": "webview",
           "id": "atomcode.chatView",
-          "name": "Chat"
+          "name": "Sessions"
         }
       ]
     },
@@ -180,11 +187,14 @@
   "scripts": {
     "build:webview": "node webview-ui/esbuild.js",
     "watch:webview": "node webview-ui/esbuild.js --watch",
+    "bundle:daemon": "node scripts/bundle-daemon.js",
+    "bundle:daemon:required": "node scripts/bundle-daemon.js --require",
     "compile": "tsc -p ./ && npm run build:webview",
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && npm run bundle:daemon",
     "watch": "npx concurrently \"tsc -watch -p ./\" \"npm run watch:webview\"",
     "lint": "eslint src --ext ts",
-    "package": "vsce package --no-dependencies"
+    "package:local": "vsce package --no-dependencies",
+    "package": "npm run bundle:daemon:required && vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/dompurify": "^3.0.5",

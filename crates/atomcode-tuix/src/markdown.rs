@@ -54,6 +54,24 @@ pub fn render_line_with_width(
         return None;
     }
 
+    // Pre-drawn Unicode box-drawing table row (`┌─┬─┐ │ ├─┼─┤ └─┴─┘`).
+    // Some models — usually weaker ones mimicking earlier-turn output that
+    // we ourselves rendered — emit tables fully drawn in box characters
+    // instead of `|`-form markdown. Without detection, those rows fall
+    // through to the inline-only branch and `push_markdown_body`'s
+    // wrap-at-cell-level chops them at terminal width, shattering the
+    // borders (the macOS overflow case in the screenshot). Convert each
+    // row to the equivalent pipe form (│ → |, ─ → -, junctions → |) and
+    // route through the same buffer + flush path the `|`-form takes;
+    // `flush_aligned_table_with_width` then enforces flat-mode fallback
+    // for narrow terminals exactly like a real markdown table would get.
+    if !state.in_code_block {
+        if let Some(converted) = box_drawing_table_row(trimmed) {
+            state.table_buf.push(converted);
+            return None;
+        }
+    }
+
     // Non-table line arriving after buffered rows: flush as aligned block.
     let prefix = if !state.table_buf.is_empty() {
         let t = flush_aligned_table_with_width(&state.table_buf, caps, max_width);
@@ -76,20 +94,23 @@ pub fn render_line_with_width(
         return prefix_only();
     }
 
-    // Inside code block: render in bright cyan + bold (SGR 96 + 1) with
-    // no inline
-    // parsing. Bright cyan is the conventional "code" tone across themes
-    // and reads vividly on both light and dark backgrounds.
+    // Inside code block: CC-style — plain code, no gutter glyph,
+    // default foreground. Two-space leading indent provides the
+    // visual offset that makes the block readable against
+    // surrounding prose; that's all CC does and it's what the user
+    // expects. We previously emitted `│` (U+2502 BOX DRAWINGS LIGHT
+    // VERTICAL) as a faint left bar, which renders cleanly on
+    // modern terminals but turns into garbage on Windows cmd.exe
+    // under non-UTF-8 codepages — the simplest fix is to not emit
+    // any non-ASCII chrome around code at all.
+    //
+    // Earlier iterations tried bright white (`\x1b[1;97m`) and
+    // truecolor blue-500 to dodge palette remap; both painted every
+    // code line in a competing colour, drowning the surrounding
+    // markdown. Plain default-colour text wins on every theme and
+    // every terminal, including bare cmd.exe.
     if state.in_code_block {
-        let body = if caps.colors {
-            // Bold + bright cyan: bold compensates for the low contrast
-            // bright cyan can have on pastel light themes (e.g. iTerm2's
-            // default light preset where SGR 96 is a washed-out teal).
-            format!("\x1b[1;96m{}\x1b[22;39m", line)
-        } else {
-            line.to_string()
-        };
-        return Some(prepend(body));
+        return Some(prepend(format!("  {}", line)));
     }
 
     // Horizontal rule — render as a blank separator line, not a visible
@@ -99,18 +120,23 @@ pub fn render_line_with_width(
         return Some(prepend(String::new()));
     }
 
-    // Heading — express hierarchy with SGR weight (bold) and italic
-    // rather than coloured greys. SGR 90 (bright-black) renders at near-
-    // invisible contrast on several iTerm2 dark presets; italic keeps
-    // H4+ visually distinct from H1-3 without relying on a colour that
-    // can disappear into the background.
+    // Heading — H1-H3 get bold + bright cyan (Palette::ACCENT, SGR 96)
+    // so headings sit on their own colour layer above the default-colour
+    // body. Bright cyan was chosen over bright magenta (BRAND, 95)
+    // because terminals that remap bright white (97, used by inline code
+    // and code blocks) to lavender — Catppuccin / Tokyo Night / similar
+    // — typically remap bright magenta to the same lavender, which
+    // would collapse heading colour into the inline-code colour.
+    // Cyan stays hue-distinct on those palettes and on plain ANSI.
+    // H4+ keeps italic-only so the deep-hierarchy levels still read as
+    // "weaker than a real heading" without adding a third colour tier.
     if let Some((level, rest)) = parse_heading(line) {
         let inner = render_inline(rest, caps);
         let body = if !caps.colors {
             format!("{} {}", "#".repeat(level as usize), inner)
         } else {
             match level {
-                1 | 2 | 3 => format!("\x1b[1m{}\x1b[22m", inner),
+                1 | 2 | 3 => format!("\x1b[1;96m{}\x1b[22;39m", inner),
                 _ => format!("\x1b[3m{}\x1b[23m", inner),
             }
         };
@@ -147,6 +173,52 @@ pub fn finalize_with_width(
     Some(t)
 }
 
+/// Recognise a pre-drawn Unicode box-drawing table line and return the
+/// equivalent `|`-pipe form so it can join the same buffering path as
+/// real markdown tables. Returns None for lines that aren't part of a box
+/// table.
+///
+/// Two row shapes accepted:
+///   1. **Data row** — starts with `│`. Each `│` becomes `|`; cell content
+///      passes through unchanged. Caller buffers the result and the
+///      existing flush logic splits on `|` and trims as usual.
+///   2. **Border row** — starts with `┌`/`├`/`└` AND every char is in the
+///      box-drawing set (`─┌┬┐├┼┤└┴┘`) plus spaces. Junctions become `|`
+///      and `─` becomes `-`, producing a `|---|---|`-style separator that
+///      `flush_aligned_table_with_width`'s `is_sep` matcher already
+///      recognises (its predicate is `[-: ]+` per cell).
+///
+/// The "every char is box-drawing" guard on border rows defends against
+/// false positives: a stray paragraph that happens to begin with `├` for
+/// some unrelated reason would NOT match (it has letters too).
+fn box_drawing_table_row(trimmed: &str) -> Option<String> {
+    let first = trimmed.chars().next()?;
+    match first {
+        '│' => Some(trimmed.replace('│', "|")),
+        '┌' | '├' | '└' => {
+            if trimmed.chars().all(|c| {
+                matches!(
+                    c,
+                    '─' | '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' | ' '
+                )
+            }) {
+                let converted: String = trimmed
+                    .chars()
+                    .map(|c| match c {
+                        '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' => '|',
+                        '─' => '-',
+                        other => other,
+                    })
+                    .collect();
+                Some(converted)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Flush a buffered markdown table as a column-aligned block. Computes the
 /// max display width per column, pads every cell accordingly, renders with
 /// `│`/`┼`/`─` box chars in muted gray. Inline markdown inside cells is
@@ -155,9 +227,11 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
     flush_aligned_table_with_width(rows, caps, 0)
 }
 
-/// Width-aware variant. When `max_width > 0`, column widths are capped so
-/// each rendered row fits within the budget (line = `1 + ncols·(w+3)`); cells
-/// that exceed the cap are truncated with `…`. `max_width = 0` = no cap.
+/// Width-aware variant. When `max_width > 0` and the table can't fit at its
+/// natural column widths, fall back to a flat key/value record format
+/// (`header: cell` per line, blank line between rows) so no information is
+/// lost to per-cell truncation. `max_width = 0` keeps box-table rendering
+/// at natural widths regardless of size.
 pub fn flush_aligned_table_with_width(
     rows: &[String],
     caps: TerminalCaps,
@@ -183,8 +257,11 @@ pub fn flush_aligned_table_with_width(
         return String::new();
     }
 
-    // Compute col widths from non-separator rows, using display width of
-    // the plaintext (markdown markers stripped for width only).
+    // Compute natural column widths from non-separator rows. We do NOT cap
+    // these — the cap-and-truncate-with-… approach the previous code took
+    // chopped real content out of cells and made wide tables in narrow
+    // terminals unreadable. Instead, if the natural table doesn't fit, the
+    // flat-mode fallback below renders every cell in full.
     let mut col_widths = vec![0usize; ncols];
     for row in &parsed {
         if is_sep(row) {
@@ -200,16 +277,13 @@ pub fn flush_aligned_table_with_width(
         }
     }
 
-    // Cap per-column width so the full row fits: line = 1 (left `│`) +
-    // ncols · (w + 3). Lower bound 6 keeps cells legible; upper bound 40
-    // matches atomcode-tui so short tables don't waste horizontal space.
-    if max_width > 0 {
-        let overhead = 1 + 3 * ncols;
-        let budget = max_width.saturating_sub(overhead);
-        let cap = (budget / ncols.max(1)).clamp(6, 40);
-        for w in col_widths.iter_mut() {
-            *w = (*w).min(cap);
-        }
+    // Total width of one rendered row at natural widths:
+    //   `│` + per-col ` cell ` + `│` between/after each col
+    //   = 1 + sum(w + 3 for w in col_widths)
+    // If this exceeds the terminal budget, switch to flat mode.
+    let natural_row_width: usize = 1 + col_widths.iter().map(|w| w + 3).sum::<usize>();
+    if max_width > 0 && natural_row_width > max_width {
+        return render_flat_table(&parsed, caps);
     }
 
     // Bright-black / DarkGrey (SGR 90) — table borders are chrome,
@@ -252,22 +326,11 @@ pub fn flush_aligned_table_with_width(
         out.push_str(border_off);
         for (j, w) in col_widths.iter().enumerate() {
             let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            let plain = strip_md_for_width(cell);
-            let plain_w = crate::width::display_width(&plain);
-            // Truncate overlong cells to fit the column cap. Inline markdown
-            // (`**bold**`, backticks) is dropped on the truncated form — the
-            // alternative (truncating the raw string) risks unterminated
-            // `**` markers that poison the rest of the line.
-            let (body, body_w) = if plain_w > *w {
-                let t = crate::width::truncate_with_ellipsis(&plain, *w);
-                let tw = crate::width::display_width(&t);
-                (t, tw)
-            } else {
-                (render_inline(cell, caps), plain_w)
-            };
+            let plain_w = crate::width::display_width(&strip_md_for_width(cell));
+            let body = render_inline(cell, caps);
             out.push(' ');
             out.push_str(&body);
-            let pad = w.saturating_sub(body_w);
+            let pad = w.saturating_sub(plain_w);
             for _ in 0..pad {
                 out.push(' ');
             }
@@ -287,6 +350,61 @@ pub fn flush_aligned_table_with_width(
 
     // Bottom border: └─┴─┘
     out.push_str(&rule('└', '┴', '┘'));
+    out
+}
+
+/// Narrow-terminal fallback for tables that can't fit at natural column
+/// widths. Each data row is expanded into N lines of `header：cell` (one
+/// per column), with a blank line between successive rows. Soft-wrapping
+/// of long lines is left to the caller's downstream wrap stage so the
+/// terminal width budget is honoured without losing any cell content.
+fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
+    let is_sep = |row: &[String]| -> bool {
+        row.iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
+    };
+    let has_sep = parsed.iter().any(|r| is_sep(r));
+    let mut data_iter = parsed.iter().filter(|r| !is_sep(r));
+
+    // First non-sep row is treated as headers when a separator exists.
+    // Without a separator the source isn't a real markdown table (it's
+    // just `|` lines); fall back to printing every cell with no label.
+    let headers: Vec<String> = if has_sep {
+        match data_iter.next() {
+            Some(h) => h.clone(),
+            None => return String::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    let mut first = true;
+    for row in data_iter {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        for j in 0..ncols {
+            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+            let cell_rendered = render_inline(cell, caps);
+            if let Some(header) = headers.get(j) {
+                let h_rendered = render_inline(header, caps);
+                out.push_str(&h_rendered);
+                out.push('：');
+                out.push_str(&cell_rendered);
+            } else {
+                out.push_str(&cell_rendered);
+            }
+            out.push('\n');
+        }
+    }
+    // Drop the trailing newline so the caller's `format!("{}\n{}", t, body)`
+    // doesn't sprinkle an extra blank line after the block.
+    if out.ends_with('\n') {
+        out.pop();
+    }
     out
 }
 
@@ -373,12 +491,20 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    // Bold + bright cyan — bold helps the inline code
-                    // span stay visible on light themes where SGR 96
-                    // can render as a low-contrast pastel.
-                    out.push_str("\x1b[1;96m");
+                    // Bold only (no fg colour). Earlier iterations used
+                    // `\x1b[1;97m` (bright white) and then truecolor
+                    // blue-500 (`\x1b[1;38;2;59;130;246m`) to dodge
+                    // terminal palette remap. In long mixed output
+                    // (markdown headings + code fences + many backtick
+                    // spans) the cumulative colour load competed with
+                    // code blocks for the eye's anchor — every
+                    // `path/to/foo.rs` shouted as loud as a 30-line
+                    // code fence. Bold alone keeps inline code
+                    // distinguishable from prose without painting half
+                    // the screen.
+                    out.push_str("\x1b[1m");
                     out.push_str(&inner);
-                    out.push_str("\x1b[22;39m");
+                    out.push_str("\x1b[22m");
                 } else {
                     out.push('`');
                     out.push_str(&inner);
@@ -487,10 +613,60 @@ mod tests {
 
     #[test]
     fn inline_code() {
-        // Inline code uses SGR 1+96 (bold + bright cyan) — bold helps
-        // it stay readable on light themes where SGR 96 alone can render
-        // as a low-contrast pastel teal.
-        assert!(render_inline_line("`x`", caps()).contains("\x1b[1;96mx"));
+        // Inline code uses bold ONLY (no fg colour). Earlier
+        // iterations tried bright-white and truecolor blue-500;
+        // both painted too many backtick spans on screen. Bold alone
+        // keeps inline code distinguishable from prose without
+        // competing with code-block emphasis.
+        let rendered = render_inline_line("`x`", caps());
+        assert!(
+            rendered.contains("\x1b[1mx"),
+            "inline code must open bold (SGR 1) without fg colour: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("\x1b[1;97m"),
+            "inline code must NOT include bright-white SGR 97: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("\x1b[1;38;2;"),
+            "inline code must NOT include truecolor RGB anymore: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_renders_as_plain_indented_code() {
+        // CC-style: code blocks are plain text with a 2-space
+        // left margin and default foreground colour. No `│` gutter
+        // (turns to mojibake on Windows cmd.exe under non-UTF-8
+        // codepage), no bold+bright white, no truecolor blue. Pin
+        // the shape so a future "let's add a fancy bar" refactor
+        // catches itself in CI.
+        let mut state = MdState::new();
+        let _ = render_line("```", &mut state, caps()); // open fence
+        let inside = render_line("let x = 1;", &mut state, caps()).unwrap_or_default();
+        assert!(
+            inside.contains("  let x = 1;"),
+            "fenced code body should appear with 2-space indent: {:?}",
+            inside
+        );
+        assert!(
+            !inside.contains('│'),
+            "fenced code block must NOT emit `│` left bar (Windows cmd compat): {:?}",
+            inside
+        );
+        assert!(
+            !inside.contains("\x1b[1;97m"),
+            "fenced code block must NOT bold+bright-white the content: {:?}",
+            inside
+        );
+        assert!(
+            !inside.contains("\x1b[1;38;2;"),
+            "fenced code block must NOT truecolor-blue the content: {:?}",
+            inside
+        );
     }
 
     #[test]
@@ -503,9 +679,20 @@ mod tests {
         let mut st = MdState::new();
         let out = render_line("## Hello", &mut st, caps()).unwrap();
         assert!(out.contains("Hello"));
-        // Headings now use SGR bold (\x1b[1m) with default foreground —
-        // readable on both light and dark terminal themes.
-        assert!(out.contains("\x1b[1m"));
+        // H1-H3 use bold + bright cyan (`\x1b[1;96m`) so headings sit
+        // on a separate colour layer from default-colour body text.
+        assert!(out.contains("\x1b[1;96m"), "H2 should be bold + bright cyan, got: {:?}", out);
+    }
+
+    #[test]
+    fn heading_h4_uses_italic_not_color() {
+        let mut st = MdState::new();
+        let out = render_line("#### Sub-deep", &mut st, caps()).unwrap();
+        assert!(out.contains("Sub-deep"));
+        // H4+ keeps italic-only — distinct from coloured H1-H3 without
+        // adding a third colour tier.
+        assert!(out.contains("\x1b[3m"), "H4 should be italic, got: {:?}", out);
+        assert!(!out.contains("\x1b[1;96m"), "H4 must not pick up the H1-H3 cyan");
     }
 
     #[test]
@@ -561,51 +748,161 @@ mod tests {
         );
     }
 
-    /// Regression: `flush_aligned_table` computed col widths from raw cell
-    /// text with no upper bound. Long CJK rows produced lines far wider than
-    /// the terminal, which `wrap_cells_to_width` downstream chopped mid-border
-    /// — same structural-corruption class as the atomcode-tui table bug.
-    ///
-    /// Also prints a visual demo of a very long table so the developer can
-    /// eyeball the box-drawing alignment in a narrow panel.
+    /// Wide-enough terminal: render as a normal box-drawing table at the
+    /// table's natural column widths. No truncation, no ellipsis.
     #[test]
-    fn table_fits_within_narrow_panel_width() {
-        // ---- visual demo ----
-        let demo_rows = vec![
-            "| 功能模块 | 核心描述 | 技术栈 | 状态 | 优先级 | 负责人 |".to_string(),
-            "|------|------|------|------|------|------|".to_string(),
-            "| 用户认证系统 | 支持手机号验证码登录、邮箱密码登录、第三方 OAuth2 集成（微信、钉钉、Google）、JWT Token 自动续期、多端设备管理与会话锁定、密码策略配置与强制改密功能 | Rust + Actix-web + Redis + PostgreSQL | 开发中 | P0 | 张三 |".to_string(),
-            "| 权限管理系统 | RBAC 模型实现、细粒度资源级权限控制、数据行级访问控制、动态角色分配与审批流程、权限变更实时审计与日志追踪、组织架构同步与部门级权限继承 | Rust + PostgreSQL + Redis | 已上线 | P0 | 李四 |".to_string(),
-            "| 消息推送中心 | WebSocket 实时消息通道、FCM/APNs 推送、邮件模板引擎、短信网关集成、消息重试与死信队列、阅读状态回执与未读计数、批量推送任务调度与进度监控 | Rust + RabbitMQ + Redis + FCM | 规划中 | P1 | 王五 |".to_string(),
-            "| 文件存储服务 | 分片上传与断点续传、图片自动缩放与水印、PDF 在线预览、病毒扫描集成、CDN 加速与缓存策略、存储配额与用量统计、版本控制与回溯、大文件秒传（MD5 校验） | Rust + MinIO + Cloudflare R2 | 开发中 | P1 | 赵六 |".to_string(),
-            "| 数据分析面板 | 多维度数据聚合查询、自定义仪表盘与 Widget 布局、时间序列数据可视化、数据导出为 Excel/PDF、定时报表生成与邮件分发、实时数据大屏模式 | Rust + ClickHouse + Chart.js | 规划中 | P2 | 孙七 |".to_string(),
-            "| 工作流引擎 | 可视化流程编排与拖拽设计器、条件分支与并行网关、人工任务审批流、定时触发与延迟节点、流程版本管理与灰度发布、执行日志追踪与失败重试 | Rust + PostgreSQL + Redis | 规划中 | P2 | 周八 |".to_string(),
-            "| API 网关 | 限流与熔断、请求路由与负载均衡、身份认证与签名验证、请求响应转换、CORS 预检处理、API 文档自动生成、灰度发布与 A/B 测试、流量镜像与影子测试 | Rust + OpenResty + Lua | 已上线 | P0 | 吴九 |".to_string(),
-            "| 国际化支持 | 多语言资源文件管理与翻译工作流、RTL 右向左语言适配、时区与日期格式本地化、多货币与税务规则、区域性功能开关与特性路由、A/B 测试地域定向 | Rust + i18n-next | 开发中 | P2 | 郑十 |".to_string(),
-        ];
-        let max_w = 80;
-        println!("\n=== Rendered table demo (max_width={}) ===", max_w);
-        let rendered = flush_aligned_table_with_width(&demo_rows, plain_caps(), max_w);
-        print!("{}", rendered);
-        println!("=== End ===\n");
-
-        // ---- regression check ----
+    fn wide_table_renders_as_box_at_natural_widths() {
         let rows = vec![
-            "| 功能 | 描述 | 状态 |".to_string(),
-            "|------|------|------|".to_string(),
-            "| 用户认证系统 | 支持手机号验证码登录、邮箱密码登录、第三方 OAuth2 集成（微信、钉钉、Google）、JWT Token 自动续期 | 开发中 |".to_string(),
-            "| 权限管理系统 | RBAC 模型实现、细粒度资源级权限控制、数据行级访问控制、动态角色分配与审批流程 | 已上线 |".to_string(),
+            "| Feature | Status |".to_string(),
+            "|---------|--------|".to_string(),
+            "| login   | done   |".to_string(),
+            "| signup  | wip    |".to_string(),
         ];
-        let out = flush_aligned_table_with_width(&rows, plain_caps(), max_w);
-        for (i, line) in out.lines().enumerate() {
-            let w = crate::width::display_width(line);
-            assert!(
-                w <= max_w,
-                "line {} rendered at {} cols — exceeds max_width {}",
-                i,
-                w,
-                max_w
-            );
+        // Plenty of room — natural width is well under 80.
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        assert!(out.contains('┌'));
+        assert!(out.contains('│'));
+        assert!(out.contains('└'));
+        // Cell contents survive in full.
+        assert!(out.contains("login"));
+        assert!(out.contains("signup"));
+        // No ellipsis introduced.
+        assert!(!out.contains('…'));
+    }
+
+    /// Narrow terminal: table can't fit at natural widths → fall back to
+    /// flat `header：cell` records so no cell content is lost. Mirrors the
+    /// CC narrow-mode rendering the user requested.
+    #[test]
+    fn narrow_terminal_falls_back_to_flat_records() {
+        let rows = vec![
+            "| 能力 | AtomCode Air | Cursor | Copilot |".to_string(),
+            "|------|--------------|--------|---------|".to_string(),
+            "| 开源 | ✅ | ❌ | ❌ |".to_string(),
+            "| 多语言运行 | ✅ Python+ | 🟡 | ❌ |".to_string(),
+        ];
+        // Tight budget — the natural box layout needs > 40 cols.
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 40);
+
+        // Flat mode: no box-drawing characters anywhere.
+        assert!(!out.contains('│'), "narrow output must not contain border │");
+        assert!(!out.contains('┌'), "narrow output must not contain top corner");
+
+        // Every cell value survives in full — no truncation.
+        assert!(out.contains("AtomCode Air"));
+        assert!(out.contains("Python+"));
+
+        // Each header label appears once per data row.
+        let count_neng_li = out.matches("能力").count();
+        assert_eq!(count_neng_li, 2, "header `能力` should label both data rows");
+        let count_cursor = out.matches("Cursor").count();
+        assert_eq!(count_cursor, 2, "header `Cursor` should label both data rows");
+
+        // Records are separated by a blank line.
+        assert!(
+            out.contains("\n\n"),
+            "expected blank line between flat records"
+        );
+    }
+
+    /// Threshold transition: the same table in a slightly different
+    /// terminal width should switch modes cleanly.
+    #[test]
+    fn flat_mode_kicks_in_when_natural_width_exceeds_budget() {
+        let rows = vec![
+            "| A | B | C |".to_string(),
+            "|---|---|---|".to_string(),
+            "| short | also short | x |".to_string(),
+        ];
+        // Natural width ~ 1 + (5+3) + (10+3) + (1+3) = 26.
+        let wide = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        assert!(wide.contains('│'), "80 cols should render as box");
+
+        let narrow = flush_aligned_table_with_width(&rows, plain_caps(), 20);
+        assert!(!narrow.contains('│'), "20 cols should fall back to flat");
+    }
+
+    /// Pre-drawn Unicode box-drawing tables (the `┌─┬─┐ │ ├─┼─┤ └─┴─┘`
+    /// shape some weak models emit instead of `|`-form markdown) must
+    /// route through the same flat-mode-aware flush path: at narrow widths
+    /// they collapse to `header：cell` records — no box characters survive.
+    /// This is the macOS-overflow regression captured in the screenshot.
+    #[test]
+    fn box_drawing_table_collapses_to_flat_when_narrow() {
+        let mut st = MdState::new();
+        let lines = [
+            "┌──────────────┬──────────────────────────────────────────┐",
+            "│ 场景         │ 作用                                     │",
+            "├──────────────┼──────────────────────────────────────────┤",
+            "│ 多文件并行编辑 │ parallel_edit_files 工具触发时分发给子智能体 │",
+            "├──────────────┼──────────────────────────────────────────┤",
+            "│ 弹性预算控制 │ 每个 SubAgent 有初始 4 轮对话预算          │",
+            "└──────────────┴──────────────────────────────────────────┘",
+            "", // boundary line triggers flush
+        ];
+        let mut out = String::new();
+        for line in &lines {
+            if let Some(r) = render_line_with_width(line, &mut st, plain_caps(), 30) {
+                out.push_str(&r);
+                out.push('\n');
+            }
         }
+        // Narrow → flat-mode kicks in. No box corners survive.
+        assert!(
+            !out.contains('┌') && !out.contains('└'),
+            "narrow box-drawing table must collapse to flat:\n{out}"
+        );
+        // Each header label appears once per data row (2 data rows here).
+        assert_eq!(
+            out.matches("场景").count(),
+            2,
+            "header `场景` should label each data record:\n{out}"
+        );
+        assert_eq!(out.matches("作用").count(), 2);
+        // Cell content survives in full — no truncation.
+        assert!(out.contains("parallel_edit_files"));
+        assert!(out.contains("初始 4 轮"));
+    }
+
+    /// Wide terminal: a box-drawing table re-renders as a clean box at
+    /// natural widths (the input is converted to pipe form, then
+    /// `flush_aligned_table_with_width` re-emits its own box drawing).
+    #[test]
+    fn box_drawing_table_re_renders_as_box_when_fits() {
+        let mut st = MdState::new();
+        let lines = [
+            "┌─────┬─────┐",
+            "│ a   │ b   │",
+            "├─────┼─────┤",
+            "│ 1   │ 2   │",
+            "└─────┴─────┘",
+            "",
+        ];
+        let mut out = String::new();
+        for line in &lines {
+            if let Some(r) = render_line_with_width(line, &mut st, plain_caps(), 80) {
+                out.push_str(&r);
+                out.push('\n');
+            }
+        }
+        assert!(out.contains('┌'), "wide terminal should keep box rendering:\n{out}");
+        assert!(out.contains('└'));
+        assert!(out.contains("a") && out.contains("2"));
+    }
+
+    /// False-positive guard: a paragraph whose first character happens to
+    /// be `├` (or any junction) but has surrounding prose must NOT be
+    /// pulled into the box-table buffer. The border-row matcher requires
+    /// the entire trimmed line to consist of box-drawing chars + spaces.
+    #[test]
+    fn box_drawing_detection_does_not_swallow_prose_with_stray_box_char() {
+        let mut st = MdState::new();
+        // Prose that starts with `├` followed by regular words. Real-world
+        // probability is near-zero but the guard matters.
+        let line = "├ hello, this is not a table line";
+        let out = render_line_with_width(line, &mut st, plain_caps(), 80);
+        // Must render inline (Some), not buffer (None).
+        assert!(out.is_some(), "prose with stray junction must not buffer");
+        assert!(st.table_buf.is_empty(), "table_buf must stay empty");
     }
 }

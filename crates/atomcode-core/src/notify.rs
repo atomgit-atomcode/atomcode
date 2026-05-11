@@ -420,6 +420,12 @@ fn macos_terminal_bundle_id(app: Option<TerminalApp>) -> Option<&'static str> {
     }
 }
 
+// Only the macOS branch of `spawn_system_notification` calls this (to
+// find `terminal-notifier`). Linux uses notify-send unconditionally and
+// Windows shells out to powershell.exe — neither needs PATH lookup.
+// Kept callable on every platform because `missing_executable_lookup_
+// returns_none` is a portable unit test of PATH-iteration semantics.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn find_executable_on_path(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {

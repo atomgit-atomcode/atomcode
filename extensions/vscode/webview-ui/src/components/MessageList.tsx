@@ -10,10 +10,11 @@ export function MessageList() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [state.messages, state.isGenerating]);
+  }, [state.messages, state.queuedMessages, state.isGenerating]);
 
   const query = state.searchQuery.toLowerCase();
   const hasSearch = query.length > 0;
+  const lastMessageId = state.messages[state.messages.length - 1]?.id;
 
   return (
     <>
@@ -21,7 +22,7 @@ export function MessageList() {
       <div className={`messages-container${hasSearch ? ' dimmed' : ''}`}>
         {state.messages.map((msg) => {
           const matches = hasSearch && msg.text.toLowerCase().includes(query);
-          const highlightClass = matches ? ' highlighted' : '';
+          const highlightClass = `${matches ? ' highlighted' : ''}${msg.id === lastMessageId ? ' is-last' : ''}`;
 
           if (msg.role === 'user') return <UserMessage key={msg.id} message={msg} className={highlightClass} />;
           if (msg.role === 'assistant') return <AssistantMessage key={msg.id} message={msg} className={highlightClass} />;
@@ -33,6 +34,11 @@ export function MessageList() {
             );
           }
           return null;
+        })}
+        {state.queuedMessages.map((msg) => {
+          const matches = hasSearch && msg.text.toLowerCase().includes(query);
+          const highlightClass = matches ? ' highlighted' : '';
+          return <UserMessage key={msg.id} message={msg} className={highlightClass} />;
         })}
         <div ref={bottomRef} />
       </div>

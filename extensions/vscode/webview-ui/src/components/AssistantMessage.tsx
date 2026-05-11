@@ -13,15 +13,18 @@ export function AssistantMessage({ message, className = '' }: AssistantMessagePr
   const hasError = message.toolCalls?.some((t) => t.status === 'error');
   const isStreaming = message.streaming;
   const dotClass = isStreaming ? 'dot-brand dot-blink' : hasError ? 'dot-error' : 'dot-success';
+  const toolCalls = message.toolCalls ?? [];
 
   return (
     <div className={`timeline-message ${dotClass}${className}`}>
       <div className="assistant-message-content">
+        {toolCalls.length > 0 && (
+          <div className="tool-list">
+            {toolCalls.map((tool) => <ToolCall key={tool.id} tool={tool} />)}
+          </div>
+        )}
         {message.text && <Markdown content={message.text} />}
         {isStreaming && !message.text && <span className="streaming-cursor" />}
-        {message.toolCalls && message.toolCalls.length > 0 &&
-          message.toolCalls.map((tool) => <ToolCall key={tool.id} tool={tool} />)
-        }
         {message.permissionRequest && message.permissionRequest.status === 'pending' && (
           <PermissionRequest request={message.permissionRequest} />
         )}

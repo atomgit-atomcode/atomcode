@@ -78,16 +78,17 @@ impl AgentLoop {
                 .map(|mtime| mtime.elapsed().unwrap_or_default().as_secs() > 300)
                 .unwrap_or(false);
 
-            if let Ok(output) = tokio::process::Command::new("grep")
-                .args(&[
+            if let Ok(output) = {
+                let mut cmd = tokio::process::Command::new("grep");
+                cmd.args(&[
                     "-i",
                     "-E",
                     "error|exception|fail|caused by",
                     &log_path.to_string_lossy(),
-                ])
-                .output()
-                .await
-            {
+                ]);
+                crate::process_utils::suppress_console_window(&mut cmd);
+                cmd.output().await
+            } {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if !stdout.trim().is_empty() {
                     let lines: Vec<&str> = stdout.lines().collect();
@@ -111,11 +112,12 @@ impl AgentLoop {
             // Try Spring Boot default log location
             let spring_log = wd.join("backend/logs/spring.log");
             if spring_log.exists() {
-                if let Ok(output) = tokio::process::Command::new("tail")
-                    .args(&["-50", &spring_log.to_string_lossy()])
-                    .output()
-                    .await
-                {
+                if let Ok(output) = {
+                    let mut cmd = tokio::process::Command::new("tail");
+                    cmd.args(&["-50", &spring_log.to_string_lossy()]);
+                    crate::process_utils::suppress_console_window(&mut cmd);
+                    cmd.output().await
+                } {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let error_lines: Vec<&str> = stdout
                         .lines()

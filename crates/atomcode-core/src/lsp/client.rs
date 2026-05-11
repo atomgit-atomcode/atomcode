@@ -73,12 +73,14 @@ impl LspClient {
         project_root: &Path,
         language_id: &str,
     ) -> Result<Self> {
-        let mut child = Command::new(&config.command)
-            .args(&config.args)
+        let mut cmd = Command::new(&config.command);
+        cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        crate::process_utils::suppress_console_window(&mut cmd);
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn LSP server: {}", config.command))?;
 

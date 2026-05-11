@@ -5,9 +5,51 @@
 // `#[serde(default)]` where the backend has historically returned `null`
 // or omitted fields, so the client doesn't blow up on minor schema drift.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
-/// `POST /api/v5/coding-plan/claim` response.
+/// Treat both missing and explicit-null JSON values as the type's
+/// `Default::default()`. Plain `#[serde(default)]` only fires for
+/// missing fields — explicit `null` would still try to deserialize
+/// against the target type and fail (e.g. "invalid type: null,
+/// expected a string"). The CodingPlan status endpoint sends `null`
+/// for `claimed_at` / `expires_at` when a freshly-claimed plan has
+/// not yet been activated on the backend.
+fn null_to_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// CodingPlan tier the user is attempting to claim or has claimed.
+/// Wire form is the literal `Max` / `Pro` / `Lite` strings the v2
+/// endpoints accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanType {
+    Max,
+    Pro,
+    Lite,
+}
+
+impl PlanType {
+    /// Wire-form string the API expects on `?plan_type=` and in
+    /// `{"plan_type": "..."}` bodies.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PlanType::Max => "Max",
+            PlanType::Pro => "Pro",
+            PlanType::Lite => "Lite",
+        }
+    }
+
+    /// Cascade order: highest tier first. Used by `step_claim` to walk
+    /// `Max → Pro → Lite` and stop at the first successful claim.
+    pub const CASCADE_ORDER: &'static [PlanType] =
+        &[PlanType::Max, PlanType::Pro, PlanType::Lite];
+}
+
+/// `POST /api/v5/coding-plan/claim-v2` response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaimResponse {
     pub success: bool,
@@ -16,19 +58,27 @@ pub struct ClaimResponse {
     pub message: String,
 }
 
-/// `GET /api/v5/coding-plan/models` element.
+/// `GET /api/v5/coding-plan/models-v2` element. Wire shape per the v2
+/// spec: `is_infinity` (which gated availability in v1) is gone — the
+/// server now computes the eligibility check itself and exposes the
+/// result via `plan_available`. `id` and `is_atomcode_exclusive` map
+/// straight from `ami_chat_model.id` / `ami_chat_model.is_atomcode_exclusive`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
     #[serde(default)]
     pub id: i64,
-    #[serde(default)]
-    pub is_infinity: u8,
     #[serde(default)]
     pub is_atomcode_exclusive: u8,
     /// Human-readable model name, often of the form `org/model`.
     /// Used verbatim in the provider's `model` field.
     #[serde(default)]
     pub display_model_name: String,
+    /// `true` iff the user's current plan tier (the one their `claim-v2`
+    /// succeeded on) covers this model. `false` means it's a higher-tier
+    /// model — show with strikethrough but DON'T register as a provider
+    /// since switching to it would 403 on every request.
+    #[serde(default)]
+    pub plan_available: bool,
 }
 
 /// `GET /api/v5/coding-plan/status` response envelope.
@@ -57,9 +107,12 @@ pub struct PlanInfo {
     pub plan_name: String,
     #[serde(default)]
     pub status: i32,
-    #[serde(default)]
+    /// Backend sends JSON `null` for unactivated claims — must absorb
+    /// it as empty string, not error out parsing.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub claimed_at: String,
-    #[serde(default)]
+    /// Same null-when-unactivated pattern as `claimed_at`.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub expires_at: String,
     #[serde(default)]
     pub remaining_days: i32,
@@ -127,23 +180,58 @@ impl UsageInfo {
 mod tests {
     use super::*;
 
-    /// Regression for the exact response shape in the API docs. Keeps
-    /// future schema tweaks from silently breaking field mapping.
+    /// Regression for the exact v2 response shape from the API docs.
+    /// Pins the field renaming (`is_infinity` dropped, `plan_available`
+    /// added) so a future schema tweak that drops `plan_available`
+    /// would fail loudly here rather than silently treating every
+    /// model as locked.
     #[test]
     fn model_entry_parses_docs_example() {
         let body = r#"[
             {
               "id": 1980884839691821059,
-              "is_infinity": 1,
               "is_atomcode_exclusive": 0,
-              "display_model_name": "moonshotai/Kimi-K2-Instruct"
+              "display_model_name": "moonshotai/Kimi-K2-Instruct",
+              "plan_available": true
             }
         ]"#;
         let v: Vec<ModelEntry> = serde_json::from_str(body).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].id, 1980884839691821059);
         assert_eq!(v[0].display_model_name, "moonshotai/Kimi-K2-Instruct");
-        assert_eq!(v[0].is_infinity, 1);
+        assert!(v[0].plan_available);
+    }
+
+    /// `plan_available=false` (model exists but locked behind a higher
+    /// plan tier) must round-trip cleanly. The renderer relies on this
+    /// field to apply the strikethrough; if missing it defaults to
+    /// `false` (conservative — locked rather than incorrectly unlocked).
+    #[test]
+    fn model_entry_locked_round_trips() {
+        let body = r#"{
+            "id": 42,
+            "is_atomcode_exclusive": 1,
+            "display_model_name": "premium/very-good",
+            "plan_available": false
+        }"#;
+        let m: ModelEntry = serde_json::from_str(body).unwrap();
+        assert!(!m.plan_available);
+        assert_eq!(m.is_atomcode_exclusive, 1);
+    }
+
+    /// PlanType wire form must match the literal strings the v2
+    /// endpoints accept — case-sensitive, no internal aliasing.
+    /// Cascade order is the contract `step_claim` walks Max-first.
+    #[test]
+    fn plan_type_wire_form_and_cascade() {
+        assert_eq!(PlanType::Max.as_str(), "Max");
+        assert_eq!(PlanType::Pro.as_str(), "Pro");
+        assert_eq!(PlanType::Lite.as_str(), "Lite");
+        assert_eq!(
+            PlanType::CASCADE_ORDER,
+            &[PlanType::Max, PlanType::Pro, PlanType::Lite],
+            "cascade must walk highest tier first"
+        );
     }
 
     #[test]
@@ -262,6 +350,38 @@ mod tests {
         let c: ClaimResponse = serde_json::from_str(body).unwrap();
         assert!(!c.success);
         assert!(c.duplicate);
+    }
+
+    /// Regression: when a fresh claim hasn't propagated to the status
+    /// endpoint yet, the backend returns `status: 0` with `claimed_at`
+    /// and `expires_at` as JSON `null`. Plain `#[serde(default)]` only
+    /// fires for *missing* fields, not explicit nulls — so the parser
+    /// would blow up with "invalid type: null, expected a string" and
+    /// the user saw `⚠ Status fetch failed (non-fatal)` immediately
+    /// after a successful `/codingplan` claim. Body taken verbatim from
+    /// the user's screenshot.
+    #[test]
+    fn plan_info_tolerates_null_claimed_at_and_expires_at() {
+        let body = r#"{
+            "codingplan_free": {
+                "plan_name": "CodingPlan Free",
+                "status": 0,
+                "claimed_at": null,
+                "expires_at": null,
+                "remaining_days": 0,
+                "total_days": 0,
+                "apply_id": 0
+            }
+        }"#;
+        let s: StatusResponse =
+            serde_json::from_str(body).expect("null claimed_at/expires_at must not crash parsing");
+        let plan = s.codingplan_free.expect("plan should be present");
+        assert_eq!(plan.plan_name, "CodingPlan Free");
+        assert_eq!(plan.status, 0);
+        // null collapses to empty string — render layer can decide
+        // whether to display a placeholder or skip the segment.
+        assert_eq!(plan.claimed_at, "");
+        assert_eq!(plan.expires_at, "");
     }
 
     /// Backend has historically returned nulls for optional fields;
