@@ -341,9 +341,9 @@
           <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.graph.desc">符号索引、调用链追踪、引用查找、影响面分析 —— 8 个内置工具让模型真正读懂大型代码库。</p>
         </div>
         <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-emerald-600/15 flex items-center justify-center text-emerald-400 text-lg mb-4 group-hover:bg-emerald-600/25 transition">&#9888;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.safety.title">安全与一键回滚</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.safety.desc">危险命令需显式确认，工具错误不崩溃而是成为模型的观察信息；<code class="text-brand-400">/undo</code> 一键回滚上一轮所有文件编辑。</p>
+          <div class="w-10 h-10 rounded-xl bg-emerald-600/15 flex items-center justify-center text-emerald-400 text-lg mb-4 group-hover:bg-emerald-600/25 transition">&#128444;</div>
+          <h3 class="text-base font-semibold mb-2" data-i18n="features.images.title">图片附件与 VL 预处理</h3>
+          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.images.desc"><code class="text-brand-400">Ctrl+V</code> 粘贴截图、Finder 拖拽、iTerm2 自动识别路径 —— 主模型不支持图片时，自动调用 VL preprocessor 做 OCR + 描述 splice 给主模型。</p>
         </div>
         <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
           <div class="w-10 h-10 rounded-xl bg-teal-600/15 flex items-center justify-center text-teal-400 text-lg mb-4 group-hover:bg-teal-600/25 transition">&#128274;</div>
@@ -351,9 +351,9 @@
           <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.atomgit.desc">AtomGit OAuth 一键登录、终端内 <code class="text-brand-400">/issue</code> 创建 Issue、企业微信扫码登录 —— 与 AtomGit 开源生态无缝对接。</p>
         </div>
         <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-sky-600/15 flex items-center justify-center text-sky-400 text-lg mb-4 group-hover:bg-sky-600/25 transition">&#128221;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.session.title">会话与 Skills</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.session.desc">持久化会话 <code class="text-brand-400">/resume</code> 随时恢复，自定义 Skill 扩展斜杠命令；支持 Headless 模式与 Daemon HTTP API。</p>
+          <div class="w-10 h-10 rounded-xl bg-sky-600/15 flex items-center justify-center text-sky-400 text-lg mb-4 group-hover:bg-sky-600/25 transition">&#129513;</div>
+          <h3 class="text-base font-semibold mb-2" data-i18n="features.ecosystem.title">Skills 与 Plugin 生态</h3>
+          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.ecosystem.desc">用 Skills 写自己的斜杠命令；<code class="text-brand-400">/plugin install &lt;git-repo&gt;</code> 一键拿别人写好的命令、hook、skill 套件 —— 与 Claude Code 生态兼容。</p>
         </div>
       </div>
     </div>
@@ -608,9 +608,9 @@ cp target/release/atomcode ~/.local/bin/</pre>
         'features.agent.title': '智能 Agent 循环', 'features.agent.desc': '自主多步执行：读取、编辑、运行、网络检索、自我验证 —— 循环执行直至任务完成。',
         'features.provider.title': '多模型支持', 'features.provider.desc': 'Claude、OpenAI、DeepSeek、GLM、Qwen、Ollama —— 任意 OpenAI 兼容 API 皆可接入，国产大模型一视同仁。',
         'features.graph.title': '代码图谱', 'features.graph.desc': '符号索引、调用链追踪、引用查找、影响面分析 —— 8 个内置工具让模型真正读懂大型代码库。',
-        'features.safety.title': '安全与一键回滚', 'features.safety.desc': '危险命令需显式确认，工具错误不崩溃而是成为模型的观察信息；/undo 一键回滚上一轮所有文件编辑。',
+        'features.images.title': '图片附件与 VL 预处理', 'features.images.desc': 'Ctrl+V 粘贴截图、Finder 拖拽、iTerm2 自动识别路径 —— 主模型不支持图片时，自动调用 VL preprocessor 做 OCR + 描述 splice 给主模型。',
         'features.atomgit.title': 'AtomGit 原生集成', 'features.atomgit.desc': 'AtomGit OAuth 一键登录、终端内 /issue 创建 Issue、企业微信扫码登录 —— 与 AtomGit 开源生态无缝对接。',
-        'features.session.title': '会话与 Skills', 'features.session.desc': '持久化会话 /resume 随时恢复，自定义 Skill 扩展斜杠命令；支持 Headless 模式与 Daemon HTTP API。',
+        'features.ecosystem.title': 'Skills 与 Plugin 生态', 'features.ecosystem.desc': '用 Skills 写自己的斜杠命令；/plugin install <git-repo> 一键拿别人写好的命令、hook、skill 套件 —— 与 Claude Code 生态兼容。',
         'comparison.title': 'AtomCode 与 Claude Code 对比', 'comparison.desc': '相同模型基准测试。基于真实编程任务测量。',
         'comparison.performance': '任务性能（相同模型）', 'comparison.task': '任务类型', 'comparison.status': '状态', 'comparison.features': '功能对比', 'comparison.feature': '功能',
         'comparison.task1': '简单编辑（样式修改）', 'comparison.task2': '模块重构', 'comparison.task3': '启动开发服务器',
@@ -648,9 +648,9 @@ cp target/release/atomcode ~/.local/bin/</pre>
         'features.agent.title': 'Agent Loop', 'features.agent.desc': 'Autonomous multi-step execution: read, edit, run, web-search, self-verify — looping until the task is done.',
         'features.provider.title': 'Multi-Provider', 'features.provider.desc': 'Claude, OpenAI, DeepSeek, GLM, Qwen, Ollama — connect any OpenAI-compatible API, with first-class support for Chinese models.',
         'features.graph.title': 'Code Graph', 'features.graph.desc': 'Symbol index, call-chain tracing, reference lookup, blast-radius analysis — 8 built-in tools so the model truly understands large codebases.',
-        'features.safety.title': 'Safety & One-Click Undo', 'features.safety.desc': 'Destructive commands require approval; tool errors become observations instead of crashes; /undo rolls back every edit from the last turn.',
+        'features.images.title': 'Image Attach & VL Preprocessor', 'features.images.desc': 'Ctrl+V paste screenshots, Finder drag-and-drop, iTerm2 path-paste — when the active model can\'t see images, the VL preprocessor OCRs them and splices the result back into the prompt.',
         'features.atomgit.title': 'Native AtomGit Integration', 'features.atomgit.desc': 'AtomGit OAuth login, create issues via /issue from the terminal, WeCom QR login — seamlessly integrated with the AtomGit ecosystem.',
-        'features.session.title': 'Sessions & Skills', 'features.session.desc': 'Persistent sessions via /resume, custom Skills extending slash commands, plus headless mode and a daemon HTTP API.',
+        'features.ecosystem.title': 'Skills & Plugin Ecosystem', 'features.ecosystem.desc': 'Write your own slash commands as Skills; install whole packs of commands, hooks and skills from any git repo with /plugin install <git-repo> — Claude Code ecosystem compatible.',
         'comparison.title': 'AtomCode vs Claude Code', 'comparison.desc': 'Same-model benchmarks. Measured on real-world coding tasks.',
         'comparison.performance': 'Task Performance (Same Model)', 'comparison.task': 'Task Type', 'comparison.status': 'Status', 'comparison.features': 'Feature Comparison', 'comparison.feature': 'Feature',
         'comparison.task1': 'Simple edit (style change)', 'comparison.task2': 'Module refactor', 'comparison.task3': 'Dev server launch',
