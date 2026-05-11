@@ -429,4 +429,23 @@ pub enum Msg<'a> {
         duration: &'a str,
         total_tokens: usize,
     },
+
+    // ── OAuth login chrome (/login + /codingplan share these) ──
+    /// Header above the QR block when scanning with WeChat is the
+    /// expected flow. Includes the leading "  " indent and trailing
+    /// "\n\n" paragraph break that the caller used to inline.
+    LoginQrHeader,
+    /// Separator + URL prelude shown below the QR block when both
+    /// QR and URL fallback are available. Leading "\n\n  " and
+    /// trailing "\n  " are part of the template.
+    LoginUrlAfterQr,
+    /// QR + URL both unavailable (Unicode-incapable terminal AND a
+    /// platform where URL-based login doesn't work, e.g. OHOS).
+    LoginNoQrNoUrl,
+    /// URL-only header when QR can't render but URL login works.
+    /// Leading "  " indent and trailing "\n  " before the URL.
+    LoginUrlOnly,
+    /// Footer line: "Press ESC to cancel" with surrounding
+    /// blank-line padding.
+    LoginCancelHint,
 }

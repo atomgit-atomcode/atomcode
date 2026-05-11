@@ -636,5 +636,16 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
             format!("✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
+        Msg::LoginQrHeader =>
+            "  Sign in to AtomGit — scan the QR code with your WeChat:\n\n".into(),
+        Msg::LoginUrlAfterQr =>
+            "\n\n  OR open the URL below in a browser:\n  ".into(),
+        Msg::LoginNoQrNoUrl =>
+            "  Cannot render a QR code in this terminal,\n  \
+             and URL-based login is unavailable on this platform.\n  \
+             Try a Unicode-capable terminal to display the QR.".into(),
+        Msg::LoginUrlOnly =>
+            "  Open this URL in any browser to sign in to AtomGit:\n  ".into(),
+        Msg::LoginCancelHint => "\n\n  Press ESC to cancel\n".into(),
     }
 }

@@ -2013,26 +2013,22 @@ fn compose_login_chrome_inner(url: &str, unicode: bool, omit_url: bool) -> Strin
 
     let mut out = String::new();
     if let Some(block) = qr_block {
-        out.push_str("  Sign in to AtomGit — scan the QR code with your WeChat:\n\n");
+        out.push_str(&t(Msg::LoginQrHeader));
         out.push_str(&block);
         if !omit_url {
-            out.push_str("\n\n  OR open the URL below in a browser:\n  ");
+            out.push_str(&t(Msg::LoginUrlAfterQr));
             out.push_str(url);
         }
     } else if omit_url {
         // No QR + URL doesn't work on this platform → there's nothing
         // actionable to offer. Tell the user explicitly rather than
         // dropping them into a screen with just "Press ESC to cancel".
-        out.push_str(
-            "  Cannot render a QR code in this terminal,\n  \
-             and URL-based login is unavailable on this platform.\n  \
-             Try a Unicode-capable terminal to display the QR.",
-        );
+        out.push_str(&t(Msg::LoginNoQrNoUrl));
     } else {
-        out.push_str("  Open this URL in any browser to sign in to AtomGit:\n  ");
+        out.push_str(&t(Msg::LoginUrlOnly));
         out.push_str(url);
     }
-    out.push_str("\n\n  Press ESC to cancel\n");
+    out.push_str(&t(Msg::LoginCancelHint));
     out
 }
 
@@ -2155,6 +2151,8 @@ mod compose_login_chrome_tests {
     /// Non-OH default: QR + URL fallback line both present.
     #[test]
     fn omit_url_false_keeps_url_block_alongside_qr() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let s = compose_login_chrome_inner(URL, true, false);
         assert!(s.contains("scan the QR code"), "QR header missing:\n{s}");
         assert!(
@@ -2169,6 +2167,8 @@ mod compose_login_chrome_tests {
     /// lead the user into a dead path.
     #[test]
     fn omit_url_true_drops_url_block_when_qr_present() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let s = compose_login_chrome_inner(URL, true, true);
         assert!(s.contains("scan the QR code"), "QR header missing:\n{s}");
         assert!(
@@ -2187,6 +2187,8 @@ mod compose_login_chrome_tests {
     /// only "Press ESC to cancel" with no actionable hint.
     #[test]
     fn omit_url_true_without_qr_explains_dead_end() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let s = compose_login_chrome_inner(URL, false, true);
         assert!(
             !s.contains(URL),
@@ -2202,6 +2204,8 @@ mod compose_login_chrome_tests {
     /// present. Regression guard for the existing pre-OH behaviour.
     #[test]
     fn omit_url_false_without_qr_shows_url_fallback() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let s = compose_login_chrome_inner(URL, false, false);
         assert!(
             s.contains("Open this URL in any browser"),

@@ -634,5 +634,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdWelcomeDescription => "重新运行 onboarding 向导".into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
             format!("✓ {done} · {turn_count} 轮 · {tool_call_count} 工具 · {duration} · {total_tokens} tokens").into(),
+        Msg::LoginQrHeader =>
+            "  登录 AtomGit — 使用微信扫描下方二维码：\n\n".into(),
+        Msg::LoginUrlAfterQr =>
+            "\n\n  或在浏览器打开下方链接：\n  ".into(),
+        Msg::LoginNoQrNoUrl =>
+            "  当前终端无法渲染二维码，\n  \
+             且该平台不支持基于 URL 的登录。\n  \
+             请改用支持 Unicode 的终端以显示二维码。".into(),
+        Msg::LoginUrlOnly =>
+            "  在浏览器中打开此链接以登录 AtomGit：\n  ".into(),
+        Msg::LoginCancelHint => "\n\n  按 ESC 取消\n".into(),
     }
 }
