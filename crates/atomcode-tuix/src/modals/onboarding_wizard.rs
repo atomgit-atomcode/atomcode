@@ -102,13 +102,22 @@ fn pad_to_width(s: &str, target: usize) -> String {
 /// panel must not push into the footer.
 const FOOTER_ROWS: usize = 5;
 
-/// Wrap `lines` with top-padding blanks and a left-padding indent
-/// so the wizard panel sits roughly in the centre of the visible
-/// body area. `panel_width` is the horizontal extent of the widest
-/// line (typically the bordered panel — 80 cols capped); the
-/// callers pass this in rather than scanning every line for SGR
-/// width because draw_panel-shaped output already commits to a
-/// known width.
+/// Wrap `lines` with top + bottom padding blanks and a left
+/// indent so the wizard panel sits at the visual centre of the
+/// visible body area. `panel_width` is the horizontal extent of
+/// the widest line (typically the bordered panel — 80 cols
+/// capped); callers pass this in rather than scanning every line
+/// for SGR width because draw_panel-shaped output already commits
+/// to a known width.
+///
+/// Both renderers (retained's DECSTBM region + alt_screen with
+/// sticky_bottom) anchor body content to the body region's BOTTOM:
+/// when total pushed rows < body_height, the auto-empty rows
+/// appear ABOVE the content, not below. So top-padding alone just
+/// stacks redundant blanks against the existing auto-empty strip
+/// while the panel stays glued to the footer. Filling the region
+/// to exactly body_height with top_blanks + content + bottom_blanks
+/// pushes the panel into the actual middle row in both renderers.
 ///
 /// Each rendered line keeps its own SGR; we prepend bare spaces,
 /// which contribute no styling, so colour spans on the original
@@ -122,10 +131,12 @@ fn center_lines(
     let term_cols = term_cols as usize;
     let term_rows = term_rows as usize;
     let body_rows = term_rows.saturating_sub(FOOTER_ROWS);
-    let top_blanks = body_rows.saturating_sub(lines.len()) / 2;
+    let free = body_rows.saturating_sub(lines.len());
+    let top_blanks = free / 2;
+    let bottom_blanks = free - top_blanks;
     let left_pad = term_cols.saturating_sub(panel_width) / 2;
     let pad_str = " ".repeat(left_pad);
-    let mut out = Vec::with_capacity(lines.len() + top_blanks);
+    let mut out = Vec::with_capacity(lines.len() + free);
     for _ in 0..top_blanks {
         out.push(String::new());
     }
@@ -135,6 +146,9 @@ fn center_lines(
         } else {
             out.push(format!("{pad_str}{line}"));
         }
+    }
+    for _ in 0..bottom_blanks {
+        out.push(String::new());
     }
     out
 }
