@@ -2155,6 +2155,11 @@ mod tests {
     /// all push body rows. Verify each surfaces in the painted output.
     #[test]
     fn body_uilines_render_into_viewport() {
+        // UiLine::Error localizes via i18n — pin the locale so a
+        // concurrent test that flipped to ZhCn doesn't make this
+        // assertion see `[错误：boom]`.
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let mut buf = Vec::new();
         let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
         r.render(UiLine::User("hi".into()));

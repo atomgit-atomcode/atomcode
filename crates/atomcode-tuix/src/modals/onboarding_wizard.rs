@@ -528,8 +528,8 @@ impl crate::modals::Modal for OnboardingWizard {
     fn draw(
         &self,
         _buf: &crate::event_loop::Buffer,
-        _state: &crate::state::UiState,
-        _ctx: &crate::event_loop::LoopCtx,
+        state: &crate::state::UiState,
+        ctx: &crate::event_loop::LoopCtx,
         renderer: &mut dyn crate::render::Renderer,
     ) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -545,6 +545,25 @@ impl crate::modals::Modal for OnboardingWizard {
         for line in lines {
             renderer.render(crate::render::UiLine::CommandOutput(format!("{line}\n")));
         }
+        // Reset the footer's cached input/menu state. The retained
+        // renderer stores `input_buf`/`menu` separately from
+        // scrollback; without an explicit InputPrompt re-render here,
+        // a user who triggered `/welcome` from the slash menu (typed
+        // `/w`, hit Enter on the highlighted `/welcome`) would still
+        // see `❯ /w` plus the slash-menu dropdown lingering under the
+        // wizard — and Backspace wouldn't budge it because the
+        // in-memory buffer was already cleared by the dispatch path.
+        // Empty buf + no menu wipes both visuals; the modal owns key
+        // input until it closes, so the bare `❯ ` underneath is
+        // purely cosmetic.
+        renderer.render(crate::render::UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::event_loop::build_status(state, ctx),
+            attachments: Vec::new(),
+        });
+        renderer.flush();
     }
 }
 
