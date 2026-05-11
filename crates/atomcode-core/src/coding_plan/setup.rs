@@ -572,6 +572,7 @@ mod tests {
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            language: None,
         }
     }
 

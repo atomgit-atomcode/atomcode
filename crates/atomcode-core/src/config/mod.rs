@@ -94,6 +94,11 @@ pub struct Config {
     /// Only applies when working inside a git repository.
     #[serde(default)]
     pub auto_commit: bool,
+    /// UI / prompt language override. `None` means auto-detect from the
+    /// environment (LC_ALL / LANG / system default). Persisted as the
+    /// short key defined by `Locale`'s serde rename (e.g. `"zh_CN"`).
+    #[serde(default)]
+    pub language: Option<crate::locale::Locale>,
 }
 
 /// Controls the per-turn markdown datalog writer.
@@ -544,6 +549,7 @@ mod tests {
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            language: None,
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -657,6 +663,66 @@ mod tests {
             err.to_string().contains("No providers configured"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn saved_config_roundtrips_language() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut cfg = Config {
+            default_provider: "p".to_string(),
+            default_workdir: None,
+            providers: HashMap::new(),
+            datalog: DatalogConfig::default(),
+            notifications: NotificationConfig::default(),
+            auto_update: true,
+            reflection_cadence: 7,
+            telemetry: Default::default(),
+            lsp: Default::default(),
+            auto_commit: false,
+            language: Some(crate::locale::Locale::ZhCn),
+        };
+        cfg.providers.insert(
+            "p".to_string(),
+            ProviderConfig {
+                provider_type: "openai".to_string(),
+                api_key: Some("k".to_string()),
+                model: "m".to_string(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 16000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral: false,
+            },
+        );
+        cfg.save(tmp.path()).unwrap();
+
+        let loaded = Config::load(tmp.path()).unwrap();
+        assert_eq!(loaded.language, Some(crate::locale::Locale::ZhCn));
+    }
+
+    #[test]
+    fn config_default_has_no_language() {
+        let toml_str = r#"
+            default_provider = "test"
+            [providers]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.language, None);
+    }
+
+    #[test]
+    fn config_missing_language_field_loads_as_none() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "default_provider = \"foo\"\n[providers]\n").unwrap();
+        let loaded = Config::load(tmp.path()).unwrap();
+        assert_eq!(loaded.language, None);
     }
 
 }
