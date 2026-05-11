@@ -2960,7 +2960,22 @@ fn extract_provider_ctx_limit(e: &str) -> Option<usize> {
 }
 
 fn is_rate_limited_error(e: &str) -> bool {
-    e.contains("429") || e.contains("rate") || e.contains("Too Many")
+    // English / HTTP standard patterns.
+    if e.contains("429") || e.contains("rate") || e.contains("Too Many") {
+        return true;
+    }
+    // Chinese / gateway-side patterns. GitCode's litellm proxy on
+    // glm-5.1 returns the user-facing 「模型「X」的请求负载过高，
+    // 请稍后再试」 message via in-stream SSE (then closes the
+    // connection without [DONE], surfaced as StreamEvent::Error by
+    // openai.rs's abrupt-close discriminator). Without these
+    // patterns the error fell through to the generic 3-shot retry
+    // branch — proper rate-limit handling (5 retries, 3-30s
+    // exponential backoff) only fires when this matches.
+    e.contains("请求负载过高")
+        || e.contains("请求过于频繁")
+        || e.contains("服务繁忙")
+        || e.contains("限流")
 }
 
 fn is_auth_error(e: &str) -> bool {
@@ -3452,6 +3467,26 @@ mod classifier_tests {
     #[test]
     fn rate_limit_error_is_detected() {
         assert!(is_rate_limited_error("API error (429 Too Many Requests)"));
+    }
+
+    /// Chinese gateway-side rate-limit blobs streamed in-band by
+    /// GitCode litellm (and similar proxies) must route to the
+    /// proper rate-limit retry path (5 attempts × 3-30s backoff),
+    /// not the generic 3-shot fallback. Without this the
+    /// abrupt-close discriminator in openai.rs converts the SSE
+    /// blob to StreamEvent::Error but the agent then mis-retries
+    /// it.
+    #[test]
+    fn rate_limit_error_detects_chinese_gateway_patterns() {
+        assert!(is_rate_limited_error("模型「GLM-5.1」的请求负载过高，请稍后再试。"));
+        assert!(is_rate_limited_error("请求过于频繁，请稍后再试"));
+        assert!(is_rate_limited_error("服务繁忙"));
+        assert!(is_rate_limited_error("当前已被限流"));
+        // Negative: a vanilla error must NOT be classified as rate
+        // limit just because it mentions "请稍后再试" alone
+        // (which is generic Chinese "try again later").
+        assert!(!is_rate_limited_error("请稍后再试"));
+        assert!(!is_rate_limited_error("API error (500 Internal Server Error)"));
     }
 
     #[test]

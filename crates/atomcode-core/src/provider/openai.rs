@@ -552,6 +552,21 @@ impl LlmProvider for OpenAiProvider {
                 let mut saw_data_line = false;
                 let mut saw_valid_chunk = false;
                 let mut invalid_chunk_samples: Vec<String> = Vec::new();
+                // Track how much real content the stream actually
+                // produced. Used by the abrupt-close branch below to
+                // distinguish:
+                //   * many chunks + much content → real mid-output
+                //     truncation (table cut, list mid-row, …) → keep
+                //     emitting Done(truncated=true) so the agent's
+                //     "resume where you left off" retry can fire.
+                //   * 0-2 chunks, short text, no tool calls → gateway
+                //     streamed a single error blob like 「请求负载
+                //     过高，请稍后再试」 and hung up. NOT a real
+                //     truncation; emit StreamEvent::Error so the
+                //     agent's rate-limit / failure path takes over
+                //     instead of looping the resume retry.
+                let mut content_chunks: usize = 0;
+                let mut accumulated_content = String::new();
                 // One-shot guard: if the provider's prompt_tokens looks
                 // implausibly low for our content size, log a warning once
                 // per request stream so we don't spam.
@@ -700,6 +715,8 @@ impl LlmProvider for OpenAiProvider {
                             for choice in chunk.choices {
                                 if let Some(content) = choice.delta.content {
                                     if !content.is_empty() {
+                                        content_chunks += 1;
+                                        accumulated_content.push_str(&content);
                                         let _ = tx.send(Ok(StreamEvent::Delta(content)));
                                     }
                                 }
@@ -883,6 +900,40 @@ impl LlmProvider for OpenAiProvider {
                     let _ = tx.send(Ok(done));
                     return;
                 }
+
+                // Abrupt close discriminator: if the model never made
+                // tool-call progress AND the accumulated text is
+                // tiny (≤ 2 content chunks AND ≤ 200 chars), this
+                // wasn't a real truncation — gateways like GitCode's
+                // litellm proxy stream a single error blob
+                // (「请求负载过高，请稍后再试」 / "rate limit
+                // exceeded") and slam the connection closed without
+                // a [DONE] marker. Promoting that to `truncated=true`
+                // makes the agent inject "resume where you left off"
+                // and retry, which renders the SAME error a second
+                // time (see issue: GLM-5.1 网关限流双重渲染).
+                // Diverting to `StreamEvent::Error` instead lets the
+                // agent's `is_rate_limited` retry path (with 3-30s
+                // backoff) handle it correctly — or, if it's an
+                // unfamiliar error string, surface it once and stop.
+                //
+                // Cap thresholds tuned for real-world gateway error
+                // payloads (typically 10-80 chars) vs legitimate
+                // short answers ("Yes.", "Done."). The real risk —
+                // misclassifying a 1-chunk legit reply — is mitigated
+                // by the fact that successful completions virtually
+                // always emit `[DONE]`; reaching this branch already
+                // means the stream ended anomalously.
+                let trimmed = accumulated_content.trim();
+                let looks_like_gateway_error = tool_calls.is_empty()
+                    && content_chunks <= 2
+                    && trimmed.chars().count() <= 200
+                    && !trimmed.is_empty();
+                if looks_like_gateway_error {
+                    let _ = tx.send(Ok(StreamEvent::Error(trimmed.to_string())));
+                    return;
+                }
+
                 for (id, name, args) in &tool_calls {
                     let _ = tx.send(Ok(StreamEvent::ToolCallDone(
                         crate::tool::ToolCall {
@@ -1744,5 +1795,158 @@ mod tests {
     fn sum_message_content_chars_safe_on_missing_messages() {
         let body = serde_json::json!({"model": "x"});
         assert_eq!(sum_message_content_chars(&body), 0);
+    }
+
+    // ── abrupt-close gateway-error discriminator ───────────────────
+    //
+    // GLM-5.1 / litellm-style gateways respond to a 429 by streaming
+    // a single SSE chunk carrying a Chinese error message and then
+    // hanging up without `data: [DONE]`. Before this code path
+    // existed, the provider mapped both that case AND "real
+    // mid-output truncation" to `Done { truncated: true }`, causing
+    // the agent's resume-from-truncation retry to re-fire the same
+    // request and render the same error message twice. Tests below
+    // pin the new behavior:
+    //
+    //   * 1 short content chunk, no `[DONE]`           → Error
+    //   * many content chunks + abrupt close           → Done(truncated=true)
+    //   * 1 short chunk + tool_call + abrupt close     → Done(truncated=true)
+    //     (model was making tool progress; let resume retry try again)
+
+    use crate::config::provider::ProviderConfig;
+    use crate::provider::LlmProvider;
+    use futures::StreamExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn provider_pointing_at(url: &str) -> OpenAiProvider {
+        OpenAiProvider::new(&ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-test".into()),
+            model: "test-model".into(),
+            base_url: Some(format!("{}/v1", url)),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 8000,
+            max_tokens: Some(1024),
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        })
+        .expect("provider construction")
+    }
+
+    async fn collect_stream(p: &OpenAiProvider) -> Vec<StreamEvent> {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::Text("hi".into()),
+        };
+        let mut stream = p.chat_stream(&[msg], None).expect("stream");
+        let mut out = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                Ok(e) => out.push(e),
+                Err(e) => panic!("transport error: {:#}", e),
+            }
+        }
+        out
+    }
+
+    /// Gateway streams ONE chunk with an error blob, no DONE, then
+    /// closes. Provider must surface that as `Error(blob)`, NOT as
+    /// `Done { truncated: true }` (which would trigger the agent's
+    /// resume-retry and render the same blob twice).
+    #[tokio::test]
+    async fn abrupt_close_with_single_error_chunk_becomes_stream_error() {
+        let server = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\
+                   \"模型「GLM-5.1」的请求负载过高，请稍后再试。\"}}]}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        let events = collect_stream(&p).await;
+        let has_error = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error(s) if s.contains("请求负载过高")));
+        let has_truncated_done = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Done { truncated: true }));
+        let has_marker_delta = events.iter().any(|e| {
+            matches!(e, StreamEvent::Delta(s) if s.contains("stream ended without close marker"))
+        });
+        assert!(
+            has_error,
+            "expected StreamEvent::Error(gateway blob), got: {:?}",
+            events
+        );
+        assert!(
+            !has_truncated_done,
+            "abrupt close on tiny error blob must NOT emit Done(truncated=true): {:?}",
+            events
+        );
+        assert!(
+            !has_marker_delta,
+            "abrupt close on tiny error blob must NOT emit the [stream ended …] marker delta: {:?}",
+            events
+        );
+    }
+
+    /// Real-truncation case: many chunks of substantive content,
+    /// then abrupt close (no DONE / no finish_reason). Stays on the
+    /// existing `Done { truncated: true }` path so the agent's
+    /// "resume where you left off" retry can salvage the partial
+    /// output (table-cut, list-cut, etc.).
+    #[tokio::test]
+    async fn abrupt_close_with_substantive_content_still_emits_truncated_done() {
+        let server = MockServer::start().await;
+        // 5 chunks × ~50 chars each = ~250 chars of real content.
+        // Above the 200-char and 2-chunk thresholds → not a
+        // gateway error.
+        let mut sse = String::new();
+        for i in 0..5 {
+            sse.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\
+                 \"line {} with enough content to clear the heuristic thresholds. \"}}}}]}}\n\n",
+                i
+            ));
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        let events = collect_stream(&p).await;
+        let has_truncated_done = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Done { truncated: true }));
+        let has_error = events.iter().any(|e| matches!(e, StreamEvent::Error(_)));
+        assert!(
+            has_truncated_done,
+            "substantive content + abrupt close must keep Done(truncated=true): {:?}",
+            events
+        );
+        assert!(
+            !has_error,
+            "real truncation must NOT be misclassified as Error: {:?}",
+            events
+        );
     }
 }
