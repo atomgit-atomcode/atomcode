@@ -181,7 +181,9 @@ pub fn complete_commands(
         if cmd.name.starts_with(prefix) {
             candidates.push(CompletionCandidate {
                 name: cmd.name.to_string(),
-                description: cmd.desc.to_string(),
+                description: cmd_desc_i18n(cmd.name)
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|| cmd.desc.to_string()),
                 is_custom: false,
             });
         }
