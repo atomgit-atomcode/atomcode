@@ -9,6 +9,9 @@ pub enum Msg<'a> {
     WelcomeOptionSkip,
     WelcomeOptionSkipHint,
 
+    // ── /codingplan ──
+    CodingPlanSetupFailed { error: &'a str },
+
     // i18n self-errors
     ErrUnsupportedLocale { input: &'a str },
 
@@ -16,6 +19,7 @@ pub enum Msg<'a> {
     StatusNoProvider,
     StatusUpgradeHint { version: &'a str },
     StatusModelNotConfigured,
+    StatusClipboardImageHint,
 
     // ── Help / commands ──
     HelpAvailableCommands,
@@ -67,11 +71,19 @@ pub enum Msg<'a> {
     SessionTimeHourAgo { n: u64 },
     SessionTimeDayAgo { n: u64 },
     SessionMsgCount { count: usize },
+    SessionNameEmpty,
+    SessionNameTooLong { max: usize },
+    SessionNameControlChars,
+    SessionListFailed { error: &'a str },
+    SessionRenamed { old: &'a str, new: &'a str },
+    SessionNoneSelected,
+    SessionRenameEditing { buffer: &'a str },
 
     // ── Dir picker ──
     DirCurrent,
     DirNotExists { path: &'a str },
     DirChanged { path: &'a str },
+    DirNotADirectory { path: &'a str },
 
     // ── Issue wizard ──
     IssueCancelled,
@@ -80,6 +92,8 @@ pub enum Msg<'a> {
     IssueStep2,
     IssueTitleConfirmed { title: &'a str },
     IssueRequiredField { field: &'a str },
+    IssueCreated { number: u64, title: &'a str, url: &'a str },
+    IssueCreateFailed { error: &'a str },
 
     // ── Language ──
     LanguageSetTo { locale: &'a str },
@@ -131,6 +145,14 @@ pub enum Msg<'a> {
 
     // ── Upgrade messages ──
     UpgradeSuccess { from: &'a str, to: &'a str },
+    UpgradeManifestFetched { version: &'a str },
+    UpgradeDownloading { pct: i32, bytes: u64, total: u64 },
+    UpgradeVerifying,
+    UpgradeReplacing,
+    UpgradeDone { version: &'a str, backup: &'a str },
+    UpgradeAlreadyLatest { detail: &'a str },
+    UpgradeFailed { error: &'a str },
+    UpgradeRolledBack { exe: &'a str, backup: &'a str },
 
     // ── Terminal keyboard hints ──
     KbdHintMacos,
@@ -208,6 +230,22 @@ pub enum Msg<'a> {
     McpNoRegistry,
     McpServersHeader,
     McpReloadFailed { error: &'a str },
+    // /mcp login / logout
+    McpOAuthLoginUsage,
+    McpOAuthLogoutUsage,
+    McpOAuthLoadConfigFailed { error: &'a str },
+    McpOAuthServerNotFound { server: &'a str },
+    McpOAuthStarting { server: &'a str },
+    McpOAuthSaved { provider: &'a str, server: &'a str },
+    McpOAuthFailed { error: &'a str },
+    McpOAuthTokenRemoved { server: &'a str },
+    McpOAuthNoToken { server: &'a str },
+    McpOAuthLogoutFailed { error: &'a str },
+    // MCP / LSP server connect feedback (event handler output)
+    McpServerConnected { name: &'a str },
+    McpServerFailed { name: &'a str, error: &'a str },
+    LspServerStarted { name: &'a str, ext: &'a str },
+    LspServerFailed { name: &'a str, ext: &'a str, error: &'a str },
 
     // ── /worktree ──
     WorktreeUsage,
@@ -245,6 +283,15 @@ pub enum Msg<'a> {
     PluginMarketplacesHeader,
     PluginNoInstalled,
     PluginInstalledHeader,
+    PluginMarketplaceCloning { url: &'a str },
+    PluginMarketplaceRemoved { name: &'a str },
+    PluginMarketplaceRemoveFailed { error: &'a str },
+    PluginMarketplaceUpdating { name: &'a str },
+    PluginMarketplaceListFailed { error: &'a str },
+    PluginInstalling { plugin: &'a str, marketplace: &'a str },
+    PluginUninstalled { plugin: &'a str, marketplace: &'a str },
+    PluginUninstallFailed { error: &'a str },
+    PluginListFailed { error: &'a str },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
     CmdDescCodingplan,

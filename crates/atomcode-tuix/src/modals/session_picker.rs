@@ -129,10 +129,12 @@ impl Modal for SessionPicker {
                                         .position(|&fi| self.sessions[fi].id == prev_id)
                                         .unwrap_or(0);
                                     // Show success feedback
-                                    renderer.render(UiLine::CommandOutput(format!(
-                                        "  Renamed: '{}' -> '{}'",
-                                        old_name, new_name
-                                    )));
+                                    renderer.render(UiLine::CommandOutput(
+                                        crate::i18n::t(crate::i18n::Msg::SessionRenamed {
+                                            old: &old_name,
+                                            new: &new_name,
+                                        }).into_owned(),
+                                    ));
                                     renderer.flush();
                                 }
                                 Err(err) => {
@@ -197,7 +199,9 @@ impl Modal for SessionPicker {
                         self.draw(buf, state, ctx, renderer);
                     }
                 } else {
-                    renderer.render(UiLine::Error("No session selected".into()));
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionNoneSelected).into_owned(),
+                    ));
                     renderer.flush();
                 }
                 Ok(ModalAction::Continue)
@@ -287,7 +291,12 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
             let desc = format!("{} · {}", msgs, humanize_age(s.updated_at));
             // If in rename editing mode and this is the selected item, show the editing buffer
             if p.rename_editing && filter_idx == p.selected {
-                (format!("> {}_  [Enter: confirm, Esc: cancel]", p.rename_buffer), desc)
+                (
+                    crate::i18n::t(crate::i18n::Msg::SessionRenameEditing {
+                        buffer: &p.rename_buffer,
+                    }).into_owned(),
+                    desc,
+                )
             } else {
                 (s.name.clone(), desc)
             }

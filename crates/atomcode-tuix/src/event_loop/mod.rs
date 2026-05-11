@@ -2467,7 +2467,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
                 match &ev {
                     McpConnectEvent::Connected { name } => {
-                        renderer.render(UiLine::CommandOutput(format!("✓ MCP server '{}' connected", name)));
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::McpServerConnected { name }).into_owned(),
+                        ));
                         // Register tools from this newly connected server.
                         // Important: do this in a background task so a slow `tools/list`
                         // can't block the TUI event loop and freeze input.
@@ -2505,7 +2507,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         }
                     }
                     McpConnectEvent::Failed { name, error } => {
-                        renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::McpServerFailed { name, error }).into_owned(),
+                        ));
                     }
                     McpConnectEvent::Warning { name, message } => {
                         // Default: keep MCP startup/runtime noise out of scrollback.
@@ -2572,16 +2576,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 use atomcode_core::lsp::LspConnectEvent;
                 match &ev {
                     LspConnectEvent::Started { command, ext } => {
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "✓ LSP server '{}' started for .{}",
-                            command, ext
-                        )));
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LspServerStarted { name: command, ext }).into_owned(),
+                        ));
                     }
                     LspConnectEvent::Failed { command, ext, error } => {
-                        renderer.render(UiLine::Error(format!(
-                            "✗ LSP server '{}' for .{} failed: {}",
-                            command, ext, error
-                        )));
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::LspServerFailed { name: command, ext, error }).into_owned(),
+                        ));
                     }
                     LspConnectEvent::Warning { ext, message } => {
                         crate::tuix_trace!("LSP", "ext='{}' warning: {}", ext, message);
@@ -2740,7 +2742,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
                 match &ev {
                     McpConnectEvent::Connected { name } => {
-                        renderer.render(UiLine::CommandOutput(format!("✓ MCP server '{}' connected", name)));
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::McpServerConnected { name }).into_owned(),
+                        ));
                         // Register tools from this newly connected server (backgrounded).
                         if let Some(registry) = &ctx.mcp_registry {
                             let registry = registry.clone();
@@ -2776,7 +2780,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         }
                     }
                     McpConnectEvent::Failed { name, error } => {
-                        renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::McpServerFailed { name, error }).into_owned(),
+                        ));
                     }
                     McpConnectEvent::Warning { name, message } => {
                         // Default: keep MCP startup/runtime noise out of scrollback.
@@ -2843,16 +2849,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 use atomcode_core::lsp::LspConnectEvent;
                 match &ev {
                     LspConnectEvent::Started { command, ext } => {
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "✓ LSP server '{}' started for .{}",
-                            command, ext
-                        )));
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LspServerStarted { name: command, ext }).into_owned(),
+                        ));
                     }
                     LspConnectEvent::Failed { command, ext, error } => {
-                        renderer.render(UiLine::Error(format!(
-                            "✗ LSP server '{}' for .{} failed: {}",
-                            command, ext, error
-                        )));
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::LspServerFailed { name: command, ext, error }).into_owned(),
+                        ));
                     }
                     LspConnectEvent::Warning { ext, message } => {
                         crate::tuix_trace!("LSP", "ext='{}' warning: {}", ext, message);
@@ -3267,16 +3271,20 @@ fn handle_input(
                                             draft.owner, draft.repo, created.number
                                         )
                                     });
-                                    renderer.render(UiLine::CommandOutput(format!(
-                                        "  [issue] ✔ created #{}: {}\n  {}\n",
-                                        created.number, created.title, shown_url,
-                                    )));
+                                    renderer.render(UiLine::CommandOutput(
+                                        crate::i18n::t(crate::i18n::Msg::IssueCreated {
+                                            number: created.number,
+                                            title: &created.title,
+                                            url: &shown_url,
+                                        }).into_owned(),
+                                    ));
                                 }
                                 Err(e) => {
-                                    renderer.render(UiLine::CommandOutput(format!(
-                                        "  [issue] ✗ create failed: {:#}\n",
-                                        e
-                                    )));
+                                    renderer.render(UiLine::CommandOutput(
+                                        crate::i18n::t(crate::i18n::Msg::IssueCreateFailed {
+                                            error: &format!("{:#}", e),
+                                        }).into_owned(),
+                                    ));
                                 }
                             }
                             renderer.flush();
@@ -4605,7 +4613,9 @@ pub(super) fn handle_upgrade_event(
     match ev {
         UpgradeEvent::ManifestFetched { version } => {
             *last_pct = -1;
-            renderer.render(UiLine::CommandOutput(format!("  最新版本: {}\n", version)));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeManifestFetched { version: &version }).into_owned(),
+            ));
         }
         UpgradeEvent::Downloading { bytes, total } => {
             let pct = if total == 0 {
@@ -4619,25 +4629,29 @@ pub(super) fn handle_upgrade_event(
                 // progress would flood the append-only renderer with lines
                 // since there's no in-place update here.
                 if pct == 25 || pct == 50 || pct == 75 || pct == 100 {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  下载中 {}% ({} / {} bytes)\n",
-                        pct, bytes, total
-                    )));
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::UpgradeDownloading { pct, bytes, total }).into_owned(),
+                    ));
                 }
             }
         }
         UpgradeEvent::Verifying => {
-            renderer.render(UiLine::CommandOutput("  正在校验 SHA256\n".into()));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeVerifying).into_owned(),
+            ));
         }
         UpgradeEvent::Replacing => {
-            renderer.render(UiLine::CommandOutput("  正在替换二进制文件\n".into()));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeReplacing).into_owned(),
+            ));
         }
         UpgradeEvent::Done { version, backup, exe } => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "\n✓ 已升级到 {}（旧版本保留为 {}）\n  正在重启新版本...\n",
-                version,
-                backup.display()
-            )));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeDone {
+                    version: &version,
+                    backup: &backup.display().to_string(),
+                }).into_owned(),
+            ));
             // Push the hint in the status bar to match the new reality —
             // the little "↑ vX" arrow goes away for this session.
             if let Ok(mut g) = ctx.update_hint.lock() {
@@ -4657,20 +4671,22 @@ pub(super) fn handle_upgrade_event(
                     &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
                     "",
                 );
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  ✓ 已是最新版本，无需更新。{}\n",
-                    friendly
-                )));
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::UpgradeAlreadyLatest { detail: &friendly }).into_owned(),
+                ));
             } else {
-                renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::UpgradeFailed { error: &msg }).into_owned(),
+                ));
             }
         }
         UpgradeEvent::RolledBack { exe, backup } => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "\n✓ 已回滚。当前二进制: {}；另一版本保存在 {}\n  正在重启回滚版本...\n",
-                exe.display(),
-                backup.display()
-            )));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeRolledBack {
+                    exe: &exe.display().to_string(),
+                    backup: &backup.display().to_string(),
+                }).into_owned(),
+            ));
             *done = Some(exe);
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
@@ -5634,7 +5650,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         // here as a fresh hint so the user can attach it too.
         let _ = h;
         Some((
-            "Image in clipboard · ctrl+v to paste".into(),
+            crate::i18n::t(crate::i18n::Msg::StatusClipboardImageHint).into_owned(),
             crate::render::HintSeverity::Info,
         ))
     } else {

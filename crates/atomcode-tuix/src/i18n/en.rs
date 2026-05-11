@@ -14,6 +14,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeOptionSkip => "Skip for now".into(),
         Msg::WelcomeOptionSkipHint => "explore first".into(),
 
+        // ── /codingplan ──
+        Msg::CodingPlanSetupFailed { error } =>
+            format!("codingplan setup failed: {error}").into(),
+
         Msg::ErrUnsupportedLocale { input } =>
             format!("unsupported locale: {input}").into(),
 
@@ -24,6 +28,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("↑ {version} available · /upgrade").into(),
         Msg::StatusModelNotConfigured =>
             "(not configured)".into(),
+        Msg::StatusClipboardImageHint =>
+            "Image in clipboard · ctrl+v to paste".into(),
 
         // ── Help ──
         Msg::HelpAvailableCommands =>
@@ -96,6 +102,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionTimeDayAgo { n } => format!("{n}d ago").into(),
         Msg::SessionMsgCount { count } =>
             format!("{count} msgs").into(),
+        Msg::SessionNameEmpty =>
+            "Session name cannot be empty".into(),
+        Msg::SessionNameTooLong { max } =>
+            format!("Session name too long (max {max} characters)").into(),
+        Msg::SessionNameControlChars =>
+            "Session name cannot contain control characters".into(),
+        Msg::SessionListFailed { error } =>
+            format!("list sessions failed: {error}").into(),
+        Msg::SessionRenamed { old, new } =>
+            format!("  Renamed: '{old}' -> '{new}'").into(),
+        Msg::SessionNoneSelected =>
+            "No session selected".into(),
+        Msg::SessionRenameEditing { buffer } =>
+            format!("> {buffer}_  [Enter: confirm, Esc: cancel]").into(),
 
         // ── Dir picker ──
         Msg::DirCurrent => "current".into(),
@@ -103,6 +123,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("directory no longer exists: {path}").into(),
         Msg::DirChanged { path } =>
             format!("  Changed to: {path}\n").into(),
+        Msg::DirNotADirectory { path } =>
+            format!("Not a directory: {path}").into(),
 
         // ── Issue wizard ──
         Msg::IssueCancelled => "(cancelled)".into(),
@@ -114,6 +136,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Step 2/2 — enter description (Shift+Enter = newline, Enter to submit, Esc to cancel):".into(),
         Msg::IssueTitleConfirmed { title } =>
             format!("✓ title: {title}").into(),
+        Msg::IssueCreated { number, title, url } =>
+            format!("  [issue] ✔ created #{number}: {title}\n  {url}\n").into(),
+        Msg::IssueCreateFailed { error } =>
+            format!("  [issue] ✗ create failed: {error}\n").into(),
         Msg::IssueRequiredField { field } =>
             format!("(required — type a {field} or Esc to cancel)").into(),
 
@@ -186,6 +212,22 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── Upgrade ──
         Msg::UpgradeSuccess { from, to } =>
             format!("  ✓ Upgraded {} → {}\n", from, to).into(),
+        Msg::UpgradeManifestFetched { version } =>
+            format!("  Latest version: {}\n", version).into(),
+        Msg::UpgradeDownloading { pct, bytes, total } =>
+            format!("  Downloading {}% ({} / {} bytes)\n", pct, bytes, total).into(),
+        Msg::UpgradeVerifying =>
+            "  Verifying SHA256\n".into(),
+        Msg::UpgradeReplacing =>
+            "  Replacing binary\n".into(),
+        Msg::UpgradeDone { version, backup } =>
+            format!("\n✓ Upgraded to {} (previous version kept at {})\n  Restarting new version...\n", version, backup).into(),
+        Msg::UpgradeAlreadyLatest { detail } =>
+            format!("  ✓ Already on the latest version. {}\n", detail).into(),
+        Msg::UpgradeFailed { error } =>
+            format!("Upgrade failed: {}", error).into(),
+        Msg::UpgradeRolledBack { exe, backup } =>
+            format!("\n✓ Rolled back. Current binary: {}; other version saved at {}\n  Restarting rolled-back version...\n", exe, backup).into(),
 
         // ── Terminal keyboard hints ──
         Msg::KbdHintMacos =>
@@ -316,6 +358,36 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  MCP Servers:\n".into(),
         Msg::McpReloadFailed { error } =>
             format!("mcp reload failed: failed to load .mcp.json / ~/.atomcode/mcp.json: {:#}", error).into(),
+        // /mcp login / logout
+        Msg::McpOAuthLoginUsage =>
+            "  Usage: /mcp login <server>\n  Example: /mcp login github\n".into(),
+        Msg::McpOAuthLogoutUsage =>
+            "  Usage: /mcp logout <server>\n  Example: /mcp logout github\n".into(),
+        Msg::McpOAuthLoadConfigFailed { error } =>
+            format!("  MCP OAuth login failed to load config: {error}\n").into(),
+        Msg::McpOAuthServerNotFound { server } =>
+            format!("  MCP OAuth login failed: server '{server}' not found in config.\n").into(),
+        Msg::McpOAuthStarting { server } =>
+            format!("  Starting MCP OAuth for '{server}' in your browser...\n").into(),
+        Msg::McpOAuthSaved { provider, server } =>
+            format!("  Saved {provider} OAuth token for MCP server '{server}'. Run /mcp reload to connect.\n").into(),
+        Msg::McpOAuthFailed { error } =>
+            format!("  MCP OAuth failed: {error}\n").into(),
+        Msg::McpOAuthTokenRemoved { server } =>
+            format!("  Removed saved OAuth token for MCP server '{server}'.\n").into(),
+        Msg::McpOAuthNoToken { server } =>
+            format!("  No saved OAuth token found for MCP server '{server}'.\n").into(),
+        Msg::McpOAuthLogoutFailed { error } =>
+            format!("  MCP OAuth logout failed: {error}\n").into(),
+        // MCP / LSP server connect feedback
+        Msg::McpServerConnected { name } =>
+            format!("✓ MCP server '{name}' connected").into(),
+        Msg::McpServerFailed { name, error } =>
+            format!("✗ MCP server '{name}' failed: {error}").into(),
+        Msg::LspServerStarted { name, ext } =>
+            format!("✓ LSP server '{name}' started for .{ext}").into(),
+        Msg::LspServerFailed { name, ext, error } =>
+            format!("✗ LSP server '{name}' for .{ext} failed: {error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>
@@ -379,6 +451,24 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "no installed plugins".into(),
         Msg::PluginInstalledHeader =>
             "installed plugins:".into(),
+        Msg::PluginMarketplaceCloning { url } =>
+            format!("cloning marketplace from {url}…").into(),
+        Msg::PluginMarketplaceRemoved { name } =>
+            format!("marketplace `{name}` removed").into(),
+        Msg::PluginMarketplaceRemoveFailed { error } =>
+            format!("remove marketplace: {error}").into(),
+        Msg::PluginMarketplaceUpdating { name } =>
+            format!("updating marketplace `{name}`…").into(),
+        Msg::PluginMarketplaceListFailed { error } =>
+            format!("list marketplaces: {error}").into(),
+        Msg::PluginInstalling { plugin, marketplace } =>
+            format!("installing `{plugin}@{marketplace}`…").into(),
+        Msg::PluginUninstalled { plugin, marketplace } =>
+            format!("uninstalled `{plugin}@{marketplace}`").into(),
+        Msg::PluginUninstallFailed { error } =>
+            format!("uninstall: {error}").into(),
+        Msg::PluginListFailed { error } =>
+            format!("list plugins: {error}").into(),
 
         // ── Command descriptions ──
         Msg::CmdDescCodingplan =>

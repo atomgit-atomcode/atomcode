@@ -14,6 +14,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeOptionSkip => "暂时跳过".into(),
         Msg::WelcomeOptionSkipHint => "稍后再说".into(),
 
+        // ── /codingplan ──
+        Msg::CodingPlanSetupFailed { error } =>
+            format!("CodingPlan 设置失败：{error}").into(),
+
         Msg::ErrUnsupportedLocale { input } =>
             format!("不支持的语言：{input}").into(),
 
@@ -24,6 +28,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("↑ {version} 可用 · 使用 /upgrade 升级").into(),
         Msg::StatusModelNotConfigured =>
             "（未配置）".into(),
+        Msg::StatusClipboardImageHint =>
+            "剪贴板有图片 · ctrl+v 粘贴".into(),
 
         // ── 帮助 ──
         Msg::HelpAvailableCommands =>
@@ -96,6 +102,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionTimeDayAgo { n } => format!("{n}天前").into(),
         Msg::SessionMsgCount { count } =>
             format!("{count} 条消息").into(),
+        Msg::SessionNameEmpty =>
+            "会话名不能为空".into(),
+        Msg::SessionNameTooLong { max } =>
+            format!("会话名过长（最多 {max} 个字符）").into(),
+        Msg::SessionNameControlChars =>
+            "会话名不能包含控制字符".into(),
+        Msg::SessionListFailed { error } =>
+            format!("列出会话失败：{error}").into(),
+        Msg::SessionRenamed { old, new } =>
+            format!("  已重命名：'{old}' -> '{new}'").into(),
+        Msg::SessionNoneSelected =>
+            "未选中会话".into(),
+        Msg::SessionRenameEditing { buffer } =>
+            format!("> {buffer}_  [Enter: 确认, Esc: 取消]").into(),
 
         // ── 目录选择器 ──
         Msg::DirCurrent => "当前".into(),
@@ -103,6 +123,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("目录已不存在：{path}").into(),
         Msg::DirChanged { path } =>
             format!("  已切换到：{path}\n").into(),
+        Msg::DirNotADirectory { path } =>
+            format!("不是目录：{path}").into(),
 
         // ── Issue 向导 ──
         Msg::IssueCancelled => "（已取消）".into(),
@@ -114,6 +136,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "步骤 2/2 — 输入描述（Shift+Enter 换行，Enter 提交，Esc 取消）：".into(),
         Msg::IssueTitleConfirmed { title } =>
             format!("✓ 标题：{title}").into(),
+        Msg::IssueCreated { number, title, url } =>
+            format!("  [issue] ✔ 已创建 #{number}：{title}\n  {url}\n").into(),
+        Msg::IssueCreateFailed { error } =>
+            format!("  [issue] ✗ 创建失败：{error}\n").into(),
         Msg::IssueRequiredField { field } =>
             format!("（必填 — 请输入 {field}，或按 Esc 取消）").into(),
 
@@ -186,6 +212,22 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 升级 ──
         Msg::UpgradeSuccess { from, to } =>
             format!("  ✓ 已升级 {} → {}\n", from, to).into(),
+        Msg::UpgradeManifestFetched { version } =>
+            format!("  最新版本: {}\n", version).into(),
+        Msg::UpgradeDownloading { pct, bytes, total } =>
+            format!("  下载中 {}% ({} / {} bytes)\n", pct, bytes, total).into(),
+        Msg::UpgradeVerifying =>
+            "  正在校验 SHA256\n".into(),
+        Msg::UpgradeReplacing =>
+            "  正在替换二进制文件\n".into(),
+        Msg::UpgradeDone { version, backup } =>
+            format!("\n✓ 已升级到 {}（旧版本保留为 {}）\n  正在重启新版本...\n", version, backup).into(),
+        Msg::UpgradeAlreadyLatest { detail } =>
+            format!("  ✓ 已是最新版本，无需更新。{}\n", detail).into(),
+        Msg::UpgradeFailed { error } =>
+            format!("升级失败: {}", error).into(),
+        Msg::UpgradeRolledBack { exe, backup } =>
+            format!("\n✓ 已回滚。当前二进制: {}；另一版本保存在 {}\n  正在重启回滚版本...\n", exe, backup).into(),
 
         // ── 终端键盘提示 ──
         Msg::KbdHintMacos =>
@@ -314,6 +356,36 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  MCP 服务器：\n".into(),
         Msg::McpReloadFailed { error } =>
             format!("MCP 重载失败：无法加载 .mcp.json / ~/.atomcode/mcp.json：{:#}", error).into(),
+        // /mcp login / logout
+        Msg::McpOAuthLoginUsage =>
+            "  用法：/mcp login <服务名>\n  示例：/mcp login github\n".into(),
+        Msg::McpOAuthLogoutUsage =>
+            "  用法：/mcp logout <服务名>\n  示例：/mcp logout github\n".into(),
+        Msg::McpOAuthLoadConfigFailed { error } =>
+            format!("  MCP OAuth 登录失败：无法加载配置：{error}\n").into(),
+        Msg::McpOAuthServerNotFound { server } =>
+            format!("  MCP OAuth 登录失败：配置中未找到服务 '{server}'。\n").into(),
+        Msg::McpOAuthStarting { server } =>
+            format!("  正在浏览器中启动 '{server}' 的 MCP OAuth 流程...\n").into(),
+        Msg::McpOAuthSaved { provider, server } =>
+            format!("  已保存 MCP 服务 '{server}' 的 {provider} OAuth Token。运行 /mcp reload 完成连接。\n").into(),
+        Msg::McpOAuthFailed { error } =>
+            format!("  MCP OAuth 失败：{error}\n").into(),
+        Msg::McpOAuthTokenRemoved { server } =>
+            format!("  已移除 MCP 服务 '{server}' 保存的 OAuth Token。\n").into(),
+        Msg::McpOAuthNoToken { server } =>
+            format!("  未找到 MCP 服务 '{server}' 保存的 OAuth Token。\n").into(),
+        Msg::McpOAuthLogoutFailed { error } =>
+            format!("  MCP OAuth 登出失败：{error}\n").into(),
+        // MCP / LSP 服务连接反馈
+        Msg::McpServerConnected { name } =>
+            format!("✓ MCP 服务 '{name}' 已连接").into(),
+        Msg::McpServerFailed { name, error } =>
+            format!("✗ MCP 服务 '{name}' 失败：{error}").into(),
+        Msg::LspServerStarted { name, ext } =>
+            format!("✓ LSP 服务 '{name}' 已为 .{ext} 启动").into(),
+        Msg::LspServerFailed { name, ext, error } =>
+            format!("✗ LSP 服务 '{name}'（.{ext}）失败：{error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>
@@ -377,6 +449,24 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "未安装任何插件".into(),
         Msg::PluginInstalledHeader =>
             "已安装的插件：".into(),
+        Msg::PluginMarketplaceCloning { url } =>
+            format!("正在从 {url} 克隆 marketplace…").into(),
+        Msg::PluginMarketplaceRemoved { name } =>
+            format!("已移除 marketplace `{name}`").into(),
+        Msg::PluginMarketplaceRemoveFailed { error } =>
+            format!("移除 marketplace 失败：{error}").into(),
+        Msg::PluginMarketplaceUpdating { name } =>
+            format!("正在更新 marketplace `{name}`…").into(),
+        Msg::PluginMarketplaceListFailed { error } =>
+            format!("列出 marketplace 失败：{error}").into(),
+        Msg::PluginInstalling { plugin, marketplace } =>
+            format!("正在安装 `{plugin}@{marketplace}`…").into(),
+        Msg::PluginUninstalled { plugin, marketplace } =>
+            format!("已卸载 `{plugin}@{marketplace}`").into(),
+        Msg::PluginUninstallFailed { error } =>
+            format!("卸载失败：{error}").into(),
+        Msg::PluginListFailed { error } =>
+            format!("列出插件失败：{error}").into(),
 
         // ── 命令描述 ──
         Msg::CmdDescCodingplan =>

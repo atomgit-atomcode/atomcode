@@ -62,16 +62,13 @@ pub const MAX_SESSION_NAME_LEN: usize = 100;
 pub fn validate_session_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Some("Session name cannot be empty".into());
+        return Some(t(Msg::SessionNameEmpty).into_owned());
     }
     if trimmed.chars().count() > MAX_SESSION_NAME_LEN {
-        return Some(format!(
-            "Session name too long (max {} characters)",
-            MAX_SESSION_NAME_LEN
-        ));
+        return Some(t(Msg::SessionNameTooLong { max: MAX_SESSION_NAME_LEN }).into_owned());
     }
     if trimmed.chars().any(char::is_control) {
-        return Some("Session name cannot contain control characters".into());
+        return Some(t(Msg::SessionNameControlChars).into_owned());
     }
     None
 }
@@ -368,7 +365,9 @@ pub(super) fn execute_slash_command(
                 }
             }
             Err(e) => {
-                renderer.render(UiLine::Error(format!("list sessions failed: {}", e)));
+                renderer.render(UiLine::Error(
+                    t(Msg::SessionListFailed { error: &e.to_string() }).into_owned(),
+                ));
                 renderer.flush();
             }
         },
@@ -760,7 +759,7 @@ pub(super) fn execute_slash_command(
                 let server = rest.trim();
                 if server.is_empty() {
                     renderer.render(UiLine::CommandOutput(
-                        "  Usage: /mcp login <server>\n  Example: /mcp login github\n".into(),
+                        t(Msg::McpOAuthLoginUsage).into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -768,26 +767,23 @@ pub(super) fn execute_slash_command(
                 let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
                     Ok(configs) => configs,
                     Err(e) => {
-                        renderer.render(UiLine::Error(format!(
-                            "  MCP OAuth login failed to load config: {:#}\n",
-                            e
-                        )));
+                        renderer.render(UiLine::Error(
+                            t(Msg::McpOAuthLoadConfigFailed { error: &format!("{:#}", e) }).into_owned(),
+                        ));
                         renderer.flush();
                         return Ok(());
                     }
                 };
                 let Some(config) = configs.into_iter().find(|config| config.name == server) else {
-                    renderer.render(UiLine::Error(format!(
-                        "  MCP OAuth login failed: server '{}' not found in config.\n",
-                        server
-                    )));
+                    renderer.render(UiLine::Error(
+                        t(Msg::McpOAuthServerNotFound { server }).into_owned(),
+                    ));
                     renderer.flush();
                     return Ok(());
                 };
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  Starting MCP OAuth for '{}' in your browser...\n",
-                    server
-                )));
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::McpOAuthStarting { server }).into_owned(),
+                ));
                 renderer.flush();
                 let is_github_server = matches!(
                     &config.config,
@@ -811,14 +807,12 @@ pub(super) fn execute_slash_command(
                     )
                 });
                 match result {
-                    Ok(token) => renderer.render(UiLine::CommandOutput(format!(
-                        "  Saved {} OAuth token for MCP server '{}'. Run /mcp reload to connect.\n",
-                        token.provider, server
-                    ))),
-                    Err(e) => renderer.render(UiLine::Error(format!(
-                        "  MCP OAuth failed: {:#}\n",
-                        e
-                    ))),
+                    Ok(token) => renderer.render(UiLine::CommandOutput(
+                        t(Msg::McpOAuthSaved { provider: &token.provider, server }).into_owned(),
+                    )),
+                    Err(e) => renderer.render(UiLine::Error(
+                        t(Msg::McpOAuthFailed { error: &format!("{:#}", e) }).into_owned(),
+                    )),
                 }
                 renderer.flush();
                 return Ok(());
@@ -828,24 +822,21 @@ pub(super) fn execute_slash_command(
                 let server = rest.trim();
                 if server.is_empty() {
                     renderer.render(UiLine::CommandOutput(
-                        "  Usage: /mcp logout <server>\n  Example: /mcp logout github\n".into(),
+                        t(Msg::McpOAuthLogoutUsage).into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
                 }
                 match atomcode_core::mcp::McpTokenStore::default().delete_token(server) {
-                    Ok(true) => renderer.render(UiLine::CommandOutput(format!(
-                        "  Removed saved OAuth token for MCP server '{}'.\n",
-                        server
-                    ))),
-                    Ok(false) => renderer.render(UiLine::CommandOutput(format!(
-                        "  No saved OAuth token found for MCP server '{}'.\n",
-                        server
-                    ))),
-                    Err(e) => renderer.render(UiLine::Error(format!(
-                        "  MCP OAuth logout failed: {:#}\n",
-                        e
-                    ))),
+                    Ok(true) => renderer.render(UiLine::CommandOutput(
+                        t(Msg::McpOAuthTokenRemoved { server }).into_owned(),
+                    )),
+                    Ok(false) => renderer.render(UiLine::CommandOutput(
+                        t(Msg::McpOAuthNoToken { server }).into_owned(),
+                    )),
+                    Err(e) => renderer.render(UiLine::Error(
+                        t(Msg::McpOAuthLogoutFailed { error: &format!("{:#}", e) }).into_owned(),
+                    )),
                 }
                 renderer.flush();
                 return Ok(());
@@ -1223,7 +1214,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                     // consumed by handle_plugin_job_event and rendered there.
                     let url = arg.to_string();
                     let tx = ctx.plugin_job_tx.clone();
-                    ok(renderer, format!("cloning marketplace from {}…", url));
+                    ok(renderer, t(Msg::PluginMarketplaceCloning { url: &url }).into_owned());
                     tokio::task::spawn_blocking(move || {
                         let ev = match atomcode_core::plugin::marketplace::add_marketplace(&url) {
                             Ok(info) => atomcode_core::plugin::PluginJobEvent::MarketplaceAdded(info),
@@ -1238,14 +1229,14 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 "remove" => match atomcode_core::plugin::marketplace::remove_marketplace(arg) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
-                        ok(renderer, format!("marketplace `{}` removed", arg));
+                        ok(renderer, t(Msg::PluginMarketplaceRemoved { name: arg }).into_owned());
                     }
-                    Err(e) => err(renderer, format!("remove marketplace: {}", e)),
+                    Err(e) => err(renderer, t(Msg::PluginMarketplaceRemoveFailed { error: &e.to_string() }).into_owned()),
                 },
                 "update" => {
                     let name = arg.to_string();
                     let tx = ctx.plugin_job_tx.clone();
-                    ok(renderer, format!("updating marketplace `{}`…", name));
+                    ok(renderer, t(Msg::PluginMarketplaceUpdating { name: &name }).into_owned());
                     tokio::task::spawn_blocking(move || {
                         let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name) {
                             Ok(info) => atomcode_core::plugin::PluginJobEvent::MarketplaceUpdated(info),
@@ -1278,7 +1269,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                         )));
                         renderer.flush();
                     }
-                    Err(e) => err(renderer, format!("list marketplaces: {}", e)),
+                    Err(e) => err(renderer, t(Msg::PluginMarketplaceListFailed { error: &e.to_string() }).into_owned()),
                 },
                 _ => err(
                     renderer,
@@ -1293,7 +1284,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 // (state-file edit only) but still go through the same
                 // codepath for consistency.
                 let tx = ctx.plugin_job_tx.clone();
-                ok(renderer, format!("installing `{}@{}`…", plugin, mp));
+                ok(renderer, t(Msg::PluginInstalling { plugin: &plugin, marketplace: &mp }).into_owned());
                 tokio::task::spawn_blocking(move || {
                     let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
                         Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
@@ -1311,9 +1302,9 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             Some((plugin, mp)) => match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
                 Ok(()) => {
                     super::reload_plugins(ctx);
-                    ok(renderer, format!("uninstalled `{}@{}`", plugin, mp));
+                    ok(renderer, t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned());
                 }
-                Err(e) => err(renderer, format!("uninstall: {}", e)),
+                Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
             },
             None => err(
                 renderer,
@@ -1335,7 +1326,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 )));
                 renderer.flush();
             }
-            Err(e) => err(renderer, format!("list plugins: {}", e)),
+            Err(e) => err(renderer, t(Msg::PluginListFailed { error: &e.to_string() }).into_owned()),
         },
         _ => err(
             renderer,
@@ -1379,7 +1370,9 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             let mgr = match WorktreeManager::from_dir(ctx.working_dir.clone()) {
                 Ok(mgr) => mgr,
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!("worktree create failed: {:#}", e)));
+                    renderer.render(UiLine::Error(
+                        t(Msg::WorktreeCreateFailed { error: &format!("{:#}", e) }).into_owned(),
+                    ));
                     renderer.flush();
                     return Ok(());
                 }
@@ -1497,7 +1490,9 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             let mgr = match WorktreeManager::from_dir(manager_dir) {
                 Ok(mgr) => mgr,
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!("worktree cleanup failed: {:#}", e)));
+                    renderer.render(UiLine::Error(
+                        t(Msg::WorktreeCleanupFailed { error: &format!("{:#}", e) }).into_owned(),
+                    ));
                     renderer.flush();
                     return Ok(());
                 }
@@ -1924,7 +1919,7 @@ fn resolve_cd(
         .canonicalize()
         .map_err(|e| format!("{}: {}", target.display(), e))?;
     if !canon.is_dir() {
-        return Err(format!("Not a directory: {}", canon.display()));
+        return Err(t(Msg::DirNotADirectory { path: &canon.display().to_string() }).into_owned());
     }
     Ok(canon)
 }
@@ -2310,7 +2305,9 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
             renderer.flush();
         }
         Err(e) => {
-            renderer.render(UiLine::Error(format!("login failed: {}", e)));
+            renderer.render(UiLine::Error(
+                t(Msg::CmdLoginFailed { error: &e.to_string() }).into_owned(),
+            ));
             renderer.flush();
         }
     }
@@ -2335,7 +2332,9 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
             // Login failed/cancelled. Surface as a top-level error;
             // skip the rest of setup since claim/models/status all
             // need a token.
-            renderer.render(UiLine::Error(format!("codingplan setup failed: {}", e)));
+            renderer.render(UiLine::Error(
+                t(Msg::CodingPlanSetupFailed { error: &e.to_string() }).into_owned(),
+            ));
             renderer.flush();
             return Ok(());
         }
@@ -2386,7 +2385,9 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
             renderer.flush();
         }
         Err(e) => {
-            renderer.render(UiLine::Error(format!("codingplan setup failed: {:#}", e)));
+            renderer.render(UiLine::Error(
+                t(Msg::CodingPlanSetupFailed { error: &format!("{:#}", e) }).into_owned(),
+            ));
             renderer.flush();
         }
     }
