@@ -497,11 +497,16 @@ impl crate::modals::Modal for OnboardingWizard {
         let outcome = self.handle_key_pure(code, mods);
         match outcome {
             PureOutcome::Noop => Ok(ModalAction::Continue),
-            PureOutcome::Redraw => {
-                self.draw(buf, state, ctx, renderer);
-                Ok(ModalAction::Continue)
-            }
-            PureOutcome::ClearAndRedraw => {
+            PureOutcome::Redraw | PureOutcome::ClearAndRedraw => {
+                // Both within-step navigation (1/2/3, ↑/↓) and step
+                // transitions need to wipe the previous panel before
+                // repainting. The wizard's draw() pushes CommandOutput
+                // rows that the retained renderer appends to
+                // scrollback — without clear_screen, every keystroke
+                // would stack another full panel below the last one.
+                // The body context above is already gone by the time
+                // any non-Confirm step runs (Confirm→Intro is itself
+                // a clear-and-redraw), so reclearing here is free.
                 renderer.clear_screen();
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
