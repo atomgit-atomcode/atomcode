@@ -61,7 +61,7 @@ impl Modal for IssueWizard {
     ) -> Result<ModalAction> {
         match code {
             KeyCode::Esc => {
-                push(renderer, "(cancelled)");
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::IssueCancelled));
                 buf.text.clear();
                 buf.cursor = 0;
                 Ok(ModalAction::Close)
@@ -88,7 +88,7 @@ impl Modal for IssueWizard {
                     };
                     push(
                         renderer,
-                        &format!("(required — type a {} or Esc to cancel)", what),
+                        &crate::i18n::t(crate::i18n::Msg::IssueRequiredField { field: what }),
                     );
                     return Ok(ModalAction::Continue);
                 }
@@ -164,11 +164,11 @@ impl IssueWizard {
         self.prompt_shown = true;
         push(
             renderer,
-            &format!("New issue on atomgit.com/{}/{}", self.owner, self.repo),
+            &crate::i18n::t(crate::i18n::Msg::IssueNewOn { owner: &self.owner, repo: &self.repo }),
         );
         push(
             renderer,
-            "Step 1/2 — enter title (required, Esc to cancel):",
+            &crate::i18n::t(crate::i18n::Msg::IssueStep1),
         );
     }
 
@@ -180,11 +180,11 @@ impl IssueWizard {
         push(renderer, "");
         push(
             renderer,
-            &format!("✓ title: {}", abbreviate(&self.title, 80)),
+            &crate::i18n::t(crate::i18n::Msg::IssueTitleConfirmed { title: &abbreviate(&self.title, 80) }),
         );
         push(
             renderer,
-            "Step 2/2 — enter description (Shift+Enter = newline, Enter to submit, Esc to cancel):",
+            &crate::i18n::t(crate::i18n::Msg::IssueStep2),
         );
     }
 }

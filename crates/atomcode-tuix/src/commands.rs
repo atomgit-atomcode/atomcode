@@ -54,7 +54,7 @@ impl CommandRegistry {
             .map(|c| c.name.len())
             .max()
             .unwrap_or(6);
-        let mut out = String::from("  Available commands:\n");
+        let mut out = crate::i18n::t(crate::i18n::Msg::HelpAvailableCommands).into_owned();
         for c in self.commands {
             out.push_str(&format!(
                 "    /{:<width$}  {}\n",

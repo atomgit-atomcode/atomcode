@@ -3565,7 +3565,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // Only one hint can render at a time (right-aligned on the status row).
     let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
         Some((
-            "no provider · /provider to configure".into(),
+            crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
     } else if let Some(warning) = ctx.monitor_warning.lock().ok().and_then(|g| g.clone()) {
@@ -3577,7 +3577,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .and_then(|g| g.clone())
             .map(|v| {
                 (
-                    format!("↑ {} 使用/upgrade升级", v),
+                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned(),
                     crate::render::HintSeverity::Info,
                 )
             })
@@ -3587,7 +3587,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // line reads as a glitch. Replace with an explicit placeholder so the
     // user sees the state, not a rendering artifact.
     let model = if no_provider {
-        "(not configured)".to_string()
+        crate::i18n::t(crate::i18n::Msg::StatusModelNotConfigured).into_owned()
     } else {
         ctx.model_name.clone()
     };
