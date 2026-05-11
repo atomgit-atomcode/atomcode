@@ -207,6 +207,7 @@ export class DaemonProcess {
     this.process = child_process.spawn(binary.path, binary.args, {
       detached: true,
       stdio: 'ignore',
+      windowsHide: true,
       ...(cwd ? { cwd } : {}),
     });
     this.process.unref();

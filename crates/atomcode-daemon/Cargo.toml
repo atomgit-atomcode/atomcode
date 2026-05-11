@@ -29,3 +29,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

@@ -2,6 +2,12 @@
 //!
 //! Provides HTTP API for querying conversation history and streaming chat.
 
+// On Windows, mark this binary as a GUI-subsystem application so that
+// launching it from a GUI parent (e.g. VSCode extension host) does NOT
+// allocate a visible console window. When launched from a terminal the
+// daemon will attempt to re-attach to the parent console for stderr output.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod api_auth;
 mod api_codingplan;
 mod api_config;
@@ -2754,6 +2760,15 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
 #[tokio::main]
 async fn main() {
     use axum::routing::patch;
+
+    // On Windows, when built as a GUI-subsystem binary (windows_subsystem = "windows"),
+    // there is no default console. If launched from a terminal (cmd.exe / PowerShell),
+    // re-attach to the parent's console so eprintln!/tracing output is visible.
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
+    }
 
     // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
     // are migrated to the canonical location (~/.atomcode/sessions) before any handler reads it.
