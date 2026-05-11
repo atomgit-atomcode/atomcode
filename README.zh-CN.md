@@ -22,7 +22,8 @@
   <a href="#功能特性">功能</a> ·
   <a href="#架构">架构</a> ·
   <a href="#开发">开发</a> ·
-  <a href="#贡献指南">贡献</a>
+  <a href="#贡献指南">贡献</a> ·
+  <a href="#社区交流">社区</a>
 </p>
 
 <p align="center">
@@ -484,6 +485,14 @@ cargo install --path crates/atomcode-cli
 - **新增模型提供方** —— 在 `crates/atomcode-core/src/provider/` 下实现 `LlmProvider`
 - **改进 UI** —— 渲染相关代码在 `crates/atomcode-tuix/src/render/`
 - **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
+
+## 社区交流
+
+用微信扫描下方二维码加入 AtomCode 用户群，反馈问题、分享使用心得，和其他用户、维护者一起交流：
+
+<p align="center">
+  <img src="https://cdn-news.gitcode.com/news/AtomCode_qun.png" alt="AtomCode 微信用户群二维码" width="220">
+</p>
 
 ## 许可证
 

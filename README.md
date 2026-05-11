@@ -22,7 +22,8 @@
   <a href="#features">Features</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#development">Development</a> ·
-  <a href="#contributing">Contributing</a>
+  <a href="#contributing">Contributing</a> ·
+  <a href="#community">Community</a>
 </p>
 
 <p align="center">
@@ -487,6 +488,14 @@ Contributions are welcome! AtomCode is in active development.
 - **Add a new provider** — implement `LlmProvider` in `crates/atomcode-core/src/provider/`
 - **Improve the UI** — rendering lives in `crates/atomcode-tuix/src/render/`
 - **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) for open bugs
+
+## Community
+
+Scan the QR code below with WeChat to join the AtomCode community group — share feedback, report issues, and talk to other users and maintainers:
+
+<p align="center">
+  <img src="https://cdn-news.gitcode.com/news/AtomCode_qun.png" alt="AtomCode WeChat community QR code" width="220">
+</p>
 
 ## License
 
