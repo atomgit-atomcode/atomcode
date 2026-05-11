@@ -90,17 +90,51 @@ fn classify_env_locale(value: &str) -> Locale {
 }
 
 /// Serialization lock for tests that mutate the global locale.
-/// Prevents test races when multiple tests call `set_locale`.
+/// Prevents test races when multiple tests call `set_locale`, AND
+/// restores the original locale on guard drop so a test that flips
+/// to `ZhCn` doesn't leak into the next test that assumes the
+/// default `En`.
 ///
 /// Exposed unconditionally (not `#[cfg(test)]`-gated) because tests in
 /// downstream crates (atomcode-tuix, etc.) need to take this lock too,
 /// and `cfg(test)` only applies to the crate currently being tested.
 /// The lock is a `OnceLock` so it costs nothing at runtime until first
 /// use.
-pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+///
+/// Return value is a custom guard that:
+///   1. Owns the underlying `MutexGuard<'static, ()>` so the lock is
+///      released when it drops.
+///   2. Captures `current_locale()` at construction.
+///   3. Restores that captured locale in its own `Drop` (runs BEFORE
+///      the inner MutexGuard's Drop, since fields drop in declaration
+///      order — so the next test sees the restored locale AND the
+///      lock is still held while restoration happens).
+pub fn test_lock() -> LocaleTestGuard {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let original = current_locale();
+    LocaleTestGuard {
+        original,
+        _guard: guard,
+    }
+}
+
+/// RAII guard returned by `test_lock()`. Holds the serialisation
+/// mutex AND restores the locale that was current at lock-acquire
+/// time. Field declaration order matters: `original` (with its
+/// `Drop` impl below) drops before `_guard`, so the locale is
+/// restored while the lock is still held — the next waiter never
+/// sees a transient mixed state.
+pub struct LocaleTestGuard {
+    original: Locale,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for LocaleTestGuard {
+    fn drop(&mut self) {
+        set_locale(self.original);
+    }
 }
 
 #[cfg(test)]

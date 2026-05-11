@@ -1049,6 +1049,31 @@ mod tests {
         assert!(joined.contains("暂时跳过"));
     }
 
+    /// CodingPlan must come first in the rendered step-3 list, then
+    /// Manual, then Skip. Migrated from the deleted welcome_wizard.rs's
+    /// `options_put_codingplan_first` test; pins option order so a
+    /// reorder needs a deliberate test update.
+    #[test]
+    fn setup_options_put_codingplan_first() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_setup_lines(80);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pos_codingplan = joined
+            .find("Set up CodingPlan")
+            .expect("CodingPlan label missing");
+        let pos_manual = joined
+            .find("Configure manually")
+            .expect("manual label missing");
+        let pos_skip = joined.find("Skip for now").expect("skip label missing");
+        assert!(pos_codingplan < pos_manual);
+        assert!(pos_manual < pos_skip);
+    }
+
     /// Filled marker tracks setup_idx.
     #[test]
     fn setup_selected_marker_follows_idx() {

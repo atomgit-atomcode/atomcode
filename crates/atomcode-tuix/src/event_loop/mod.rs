@@ -726,17 +726,18 @@ pub struct LoopCtx {
     /// branch POSTs the issue to AtomGit and echoes the URL of the
     /// newly-created issue back into the conversation.
     pub pending_new_issue: Option<NewIssueDraft>,
-    /// Set by `WelcomeWizard` when the user picks option 0 (Set up
-    /// CodingPlan). The event loop drains this on modal close and
-    /// runs the full CodingPlan setup flow (login if needed → claim →
-    /// fetch models → register providers). Needs raw-mode
-    /// suspend/resume, something modals can't drive themselves. Same
-    /// pattern as `pending_new_issue`.
+    /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
+    /// option 0 (Set up CodingPlan). The event loop drains this on
+    /// modal close and runs the full CodingPlan setup flow (login if
+    /// needed → claim → fetch models → register providers). Needs
+    /// raw-mode suspend/resume, something modals can't drive
+    /// themselves. Same pattern as `pending_new_issue`.
     pub pending_run_codingplan: bool,
-    /// Set by `WelcomeWizard` when the user picks option 1 (Configure
-    /// manually). The event loop drains this on modal close and swaps in
-    /// `ProviderWizard::MainMenu` — a Modal-to-Modal transition that
-    /// needs mutable `active_modal` access only the event loop has.
+    /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
+    /// option 1 (Configure manually). The event loop drains this on
+    /// modal close and swaps in `ProviderWizard::MainMenu` — a
+    /// Modal-to-Modal transition that needs mutable `active_modal`
+    /// access only the event loop has.
     pub pending_open_provider_wizard: bool,
     /// MCP server registry for `/mcp` status display. `None` when no MCP
     /// servers are configured or all failed to connect.
@@ -3285,7 +3286,7 @@ fn handle_input(
                             }
                             renderer.flush();
                         }
-                        // WelcomeWizard signals its follow-up via two bool
+                        // OnboardingWizard signals its follow-up via two bool
                         // flags. Drain one, execute it here — the
                         // CodingPlan flow (which internally handles
                         // OAuth login when needed) needs suspend/resume
