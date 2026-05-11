@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use super::{save_and_reload, LoopCtx};
-use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
+use crate::modals::{DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
@@ -254,6 +254,30 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
             } else {
                 *active_modal = Some(Box::new(ModelPicker::open(&ctx.config)));
+            }
+        }
+        "language" => {
+            if arg.is_empty() {
+                *active_modal = Some(Box::new(LanguagePicker::open()));
+            } else {
+                match arg.parse::<atomcode_core::locale::Locale>() {
+                    Ok(locale) => {
+                        crate::i18n::set_locale(locale);
+                        ctx.config.language = Some(locale);
+                        let config_path = atomcode_core::config::Config::default_path();
+                        if let Err(e) = ctx.config.save(&config_path) {
+                            eprintln!("[language] failed to save config: {e}");
+                        }
+                        let msg = format!("  Language set to: {locale}\n");
+                        renderer.render(UiLine::CommandOutput(msg));
+                        renderer.flush();
+                    }
+                    Err(_) => {
+                        let msg = crate::i18n::t(crate::i18n::Msg::ErrUnsupportedLocale { input: arg });
+                        renderer.render(UiLine::CommandOutput(format!("  {msg}\n")));
+                        renderer.flush();
+                    }
+                }
             }
         }
         "resume" => match ctx.session_manager.list() {

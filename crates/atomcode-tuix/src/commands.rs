@@ -99,6 +99,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
+    Command { name: "language", desc: "Switch display language", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
     // Gateway entry that opens a second-level palette listing all
     // user-invocable skills. needs_args=true so Enter rewrites the
