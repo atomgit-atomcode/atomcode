@@ -27,7 +27,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
-  <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
     <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">
@@ -150,7 +150,7 @@ cargo build --release
 
 ### 依赖
 
-- Rust 1.75+（用于构建）
+- Rust 1.88+（用于构建；更旧的 Cargo 无法解析当前 lock 文件）
 - 任一支持的模型提供方的 API Key（或使用 `/login` 的 AtomGit 账号）
 
 ## 快速开始
@@ -338,7 +338,7 @@ AtomCode 会自动读取这个文件并注入到系统提示中。
 
 ### 前置条件
 
-- **Rust 1.75+** —— 通过 [rustup](https://rustup.rs/) 安装
+- **Rust 1.88+** —— 通过 [rustup](https://rustup.rs/) 安装
 - **Git**
 - 任一支持的模型 API Key（用于运行时测试）
 
