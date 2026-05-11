@@ -501,7 +501,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMCODE_HOME", tmp.path());
 
-        let plugin_dir = tmp.path().join(".atomcode/plugins/marketplaces/p");
+        let plugin_dir = tmp.path().join("plugins/marketplaces/p");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(
             plugin_dir.join("hooks.json"),
@@ -509,7 +509,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            tmp.path().join(".atomcode/plugins/installed_plugins.json"),
+            tmp.path().join("plugins/installed_plugins.json"),
             r#"{"version":1,"plugins":{"p@p":{"marketplace":"p","plugin":"p","plugin_dir":"marketplaces/p","installed_at":"x"}}}"#,
         )
         .unwrap();

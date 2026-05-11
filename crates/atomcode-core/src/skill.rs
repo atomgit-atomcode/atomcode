@@ -800,7 +800,7 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", tmp.path());
 
         // Fake a registered + installed plugin on disk.
-        let plugins_root = tmp.path().join(".atomcode/plugins");
+        let plugins_root = tmp.path().join("plugins");
         let plugin_dir = plugins_root.join("marketplaces/p");
         let skill_dir = plugin_dir.join("skills/hello");
         std::fs::create_dir_all(&skill_dir).unwrap();
