@@ -634,5 +634,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OnboardingConfirmClear =>
             "/welcome will clear the screen. Continue? [y/N]".into(),
         Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),
+        Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens } =>
+            format!("✓ {done} · {turn_count} rounds · {tool_call_count} tools · {duration} · {total_tokens} tokens").into(),
     }
 }

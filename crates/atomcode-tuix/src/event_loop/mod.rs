@@ -5063,10 +5063,14 @@ fn handle_agent_event(
             pending_tools.clear();
             let done = state.next_done_label();
             let dur = crate::render::fmt_dur(duration);
-            let label = format!(
-                "✓ {} · {} rounds · {} tools · {} · {} tokens",
-                done, turn_count, tool_call_count, dur, total_tokens
-            );
+            let label = crate::i18n::t(crate::i18n::Msg::TurnSummary {
+                done,
+                turn_count,
+                tool_call_count,
+                duration: &dur,
+                total_tokens,
+            })
+            .into_owned();
             renderer.render(UiLine::TurnSeparator { label });
             renderer.flush();
             state.on_turn_complete();

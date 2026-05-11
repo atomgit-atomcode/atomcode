@@ -414,4 +414,19 @@ pub enum Msg<'a> {
     OnboardingNavHint,
     OnboardingConfirmClear,
     CmdWelcomeDescription,
+
+    /// TurnComplete separator summary, e.g.
+    ///   `✓ Shipped · 3 rounds · 2 tools · 6.8s · 285 tokens`
+    /// `done` is a playful English verb from `DONE_LABELS` — kept
+    /// English in every locale because translated cute verbs read
+    /// awkward; the structural words (`rounds`/`tools`/`tokens`)
+    /// localise. `duration` is a pre-formatted human string (e.g.
+    /// "6.8s").
+    TurnSummary {
+        done: &'a str,
+        turn_count: usize,
+        tool_call_count: usize,
+        duration: &'a str,
+        total_tokens: usize,
+    },
 }
