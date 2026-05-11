@@ -2119,10 +2119,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     if let Ok(prev) = std::env::var("ATOMCODE_UPGRADED_FROM") {
         std::env::remove_var("ATOMCODE_UPGRADED_FROM");
         let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-        renderer.render(UiLine::CommandOutput(format!(
-            "  ✓ Upgraded {} → {}\n",
-            prev, current
-        )));
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::UpgradeSuccess { from: &prev, to: &current }).into_owned(),
+        ));
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
@@ -2157,11 +2156,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     if kbd_hint_set {
         std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
     }
-    // Suppress the standalone keyboard hint when either the legacy-
-    // conhost or JediTerm banner is firing — both of those banners
-    // include their own newline guidance, so dual-firing produced
-    // wall-of-text noise. Otherwise emit a single universal hint
-    // pointing at `\<Enter>`.
+    // Suppress the standalone keyboard hint when the JediTerm banner
+    // is firing — that banner already carries its own newline
+    // guidance, so dual-firing produced wall-of-text noise. Otherwise
+    // emit a single universal hint pointing at `\<Enter>`.
     //
     // Why the universal-fallback message instead of per-terminal
     // chord recommendations: the previous helper detected MSYSTEM /
@@ -2251,8 +2249,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             ctx.current_session = session;
             app.state.on_turn_complete();
             renderer.render(UiLine::CommandOutput(
-                "  ⓘ Previous session restored — conversation context is available.\n\n"
-                    .into(),
+                crate::i18n::t(crate::i18n::Msg::SessionReplayHint).into_owned(),
             ));
             renderer.flush();
         }
@@ -2271,9 +2268,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         // Kept compact (5 lines) so on small terminals the menu still
         // fits without scrolling the welcome banner off-screen.
         renderer.render(UiLine::CommandOutput(
-            "\n  Welcome to AtomCode. Pick an option to get started:\n  \
-            (↑↓ to navigate, Enter to confirm, Esc to skip)\n\n"
-                .into(),
+            format!(
+                "\n  {}\n  {}\n\n",
+                crate::i18n::t(crate::i18n::Msg::WelcomeBannerLine1),
+                crate::i18n::t(crate::i18n::Msg::WelcomeBannerLine2),
+            )
+            .into(),
         ));
         app.active_modal = Some(Box::new(crate::modals::WelcomeWizard::new()));
         if let Some(m) = app.active_modal.as_mut() {
@@ -3564,7 +3564,12 @@ fn build_menu_items(
     let mut matches: Vec<(String, String)> = commands
         .matching_prefix(rest)
         .into_iter()
-        .map(|c| (c.name.to_string(), c.desc.to_string()))
+        .map(|c| {
+            let desc = crate::commands::cmd_desc_i18n(c.name)
+                .map(|cow| cow.into_owned())
+                .unwrap_or_else(|| c.desc.to_string());
+            (c.name.to_string(), desc)
+        })
         .collect();
     for (name, desc) in custom.command_names_and_descriptions() {
         if name.starts_with(&prefix_lower) && !matches.iter().any(|(n, _)| *n == name) {
@@ -4213,7 +4218,7 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 .send(AgentCommand::ReloadConfig(ctx.config.clone()));
         }
         Err(e) => {
-            renderer.render(UiLine::Error(format!("config save failed: {}", e)));
+            renderer.render(UiLine::Error(crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed { error: &format!("{}", e) }).into_owned()));
             renderer.flush();
         }
     }
@@ -5451,17 +5456,9 @@ fn handle_agent_event(
         }
         AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
             let header = if success {
-                format!(
-                    "  Background task complete ({} turn{}):\n",
-                    turns,
-                    if turns == 1 { "" } else { "s" }
-                )
+                crate::i18n::t(crate::i18n::Msg::BackgroundComplete { turns }).into_owned()
             } else {
-                format!(
-                    "  Background task failed after {} turn{}:\n",
-                    turns,
-                    if turns == 1 { "" } else { "s" }
-                )
+                crate::i18n::t(crate::i18n::Msg::BackgroundFailed { turns }).into_owned()
             };
             let mut body = String::from(&header);
             body.push_str("  ");
@@ -5470,7 +5467,7 @@ fn handle_agent_event(
                 body.push('\n');
             }
             if !files_edited.is_empty() {
-                body.push_str("  Files edited:\n");
+                body.push_str(&crate::i18n::t(crate::i18n::Msg::BackgroundFilesEdited));
                 for f in &files_edited {
                     body.push_str(&format!("    - {}\n", f));
                 }
@@ -5616,7 +5613,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // on the status row).
     let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
         Some((
-            "no provider · /provider to configure".into(),
+            crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
     } else if let Some(warning) = ctx.monitor_warning.lock().ok().and_then(|g| g.clone()) {
@@ -5647,7 +5644,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .and_then(|g| g.clone())
             .map(|v| {
                 (
-                    format!("↑ {} 使用/upgrade升级", v),
+                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned(),
                     crate::render::HintSeverity::Info,
                 )
             })
@@ -5657,7 +5654,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // line reads as a glitch. Replace with an explicit placeholder so the
     // user sees the state, not a rendering artifact.
     let model = if no_provider {
-        "(not configured)".to_string()
+        crate::i18n::t(crate::i18n::Msg::StatusModelNotConfigured).into_owned()
     } else {
         ctx.model_name.clone()
     };

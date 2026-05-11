@@ -11,6 +11,7 @@ pub mod graph;
 pub mod hook;
 pub mod init;
 pub mod input_history;
+pub mod locale;
 pub mod lsp;
 pub mod mcp;
 pub mod notify;

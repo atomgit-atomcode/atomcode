@@ -109,10 +109,9 @@ impl Modal for ModelPicker {
                         ctx.wake_tx.clone(),
                     );
                 }
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  Switched to {} · {}\n",
-                    chosen, display
-                )));
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::ModelSwitched { provider: &chosen, model: &display }).into_owned(),
+                ));
                 renderer.flush();
                 Ok(ModalAction::Close)
             }

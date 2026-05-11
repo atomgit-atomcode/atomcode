@@ -928,7 +928,7 @@ impl AgentLoop {
                     } else {
                         self.turn_runner.provider =
                             std::sync::Arc::from(crate::provider::unavailable_provider(
-                                "未配置 provider。请使用 /provider 添加 provider 后再试。",
+                                "No active provider configured. Use /provider to add one.",
                             ));
                         self.turn_runner.config = self.config.clone();
                     }

@@ -300,6 +300,7 @@ fn test_config() -> Config {
         auto_commit: false,
         subagent: Default::default(),
         vision_preprocessor_provider: None,
+        language: None,
     }
 }
 

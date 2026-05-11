@@ -275,9 +275,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let _ = writeln!(
                     self.out,
-                    "Allow {}({})? [Y]es / [N]o / [A]lways",
-                    scrub_controls(&tool),
-                    scrub_controls(&detail)
+                    "{}",
+                    crate::i18n::t(crate::i18n::Msg::ApprovalPromptAlt {
+                        tool: &scrub_controls(&tool),
+                        detail: &scrub_controls(&detail),
+                    })
                 );
             }
             UiLine::Error(msg) => {

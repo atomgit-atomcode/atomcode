@@ -387,6 +387,10 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
+    /// Set interface language (e.g. en, zh-CN, zh)
+    #[arg(long)]
+    lang: Option<String>,
+
     /// Path to config file
     #[arg(long)]
     config: Option<PathBuf>,
@@ -948,6 +952,7 @@ async fn run() -> Result<i32> {
                 auto_commit: false,
                 subagent: Default::default(),
                 vision_preprocessor_provider: None,
+                language: None,
             }
         })
     } else {
@@ -964,11 +969,19 @@ async fn run() -> Result<i32> {
             auto_commit: false,
             subagent: Default::default(),
             vision_preprocessor_provider: None,
+            language: None,
         }
     };
 
+    // ── i18n locale ──
+    let locale = atomcode_tuix::i18n::resolve_initial_locale(
+        cli.lang.as_deref(),
+        config.language,
+    );
+    atomcode_tuix::i18n::set_locale(locale);
+
     let unavailable_reason = if config.providers.is_empty() {
-        Some("未配置 provider。请使用 /provider 添加 provider 后再试。".to_string())
+        Some(atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::CmdNoActiveProvider).into_owned())
     } else {
         None
     };
@@ -2050,6 +2063,7 @@ fn run_codingplan_core(
             auto_commit: false,
             subagent: Default::default(),
             vision_preprocessor_provider: None,
+            language: None,
         },
     };
 

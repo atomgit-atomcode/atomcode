@@ -89,18 +89,18 @@ impl Modal for DirPicker {
                     return Ok(ModalAction::Close);
                 }
                 if !path.is_dir() {
-                    renderer.render(UiLine::Error(format!(
-                        "directory no longer exists: {}",
-                        path.display()
-                    )));
+                    let p = path.display().to_string();
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::DirNotExists { path: &p }).into_owned(),
+                    ));
                     renderer.flush();
                     return Ok(ModalAction::Close);
                 }
                 apply_cd(ctx, path.clone());
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  Changed to: {}\n",
-                    path.display()
-                )));
+                let p = path.display().to_string();
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::DirChanged { path: &p }).into_owned(),
+                ));
                 renderer.flush();
                 Ok(ModalAction::Close)
             }
@@ -129,7 +129,7 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
         .map(|d| {
             let name = crate::platform::collapse_home(&d.to_string_lossy());
             let desc = if d == &p.current {
-                "current".to_string()
+                crate::i18n::t(crate::i18n::Msg::DirCurrent).into_owned()
             } else {
                 String::new()
             };

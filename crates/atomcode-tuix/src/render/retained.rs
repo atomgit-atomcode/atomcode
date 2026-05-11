@@ -28,6 +28,7 @@ use super::cell::{push_str_cells, serialize_row, Cell, CellStyle};
 use super::screen::Screen;
 use super::theme::{role, Role};
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
+use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use crossterm::style::Color;
@@ -1759,19 +1760,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Slash shortcuts stay accent_bold (cyan) for visual emphasis.
         let hint_text = self.style_faint(Role::Secondary);
         let accent_bold = self.style_bold(Role::Accent);
+        let idle_prefix = t(Msg::IdleHintPrefix);
+        let idle_slash = t(Msg::IdleHintSlash);
+        let idle_suffix = t(Msg::IdleHintSuffix);
         rows.extend(self.build_wrapped_text_rows(
             &[
-                ("type something, or press  ", hint_text.clone()),
-                ("/", accent_bold.clone()),
-                ("  to browse commands", hint_text.clone()),
+                (&idle_prefix, hint_text.clone()),
+                (&idle_slash, accent_bold.clone()),
+                (&idle_suffix, hint_text.clone()),
             ],
             content_w,
         ));
 
+        let provider_cmd = t(Msg::IdleHintProvider);
+        let provider_suffix = t(Msg::IdleHintProviderSuffix);
         rows.extend(self.build_wrapped_text_rows(
             &[
-                ("/provider", accent_bold),
-                ("  to add a custom model", hint_text),
+                (&provider_cmd, accent_bold),
+                ("  ", hint_text.clone()),
+                (&provider_suffix, hint_text),
             ],
             content_w,
         ));
@@ -1956,8 +1963,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.commit_inflight_tool();
                 // (cancelled) is a state-change marker — must remain
                 // visible. Default fg, not Muted.
-                let label = self.style_for(Role::Secondary);
-                self.push_body_text("(cancelled)", &label);
+                let style = self.style_for(Role::Secondary);
+                let label = t(Msg::Cancelled);
+                self.push_body_text(&label, &style);
             }
 
             // ── body: tools & diffs ──
@@ -2304,18 +2312,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let chip_n = chip(Color::Red);
 
                 let mut row = Vec::new();
-                push_str_cells(&mut row, "▶ Waiting for approval: ", &warn);
+                let waiting = t(Msg::ApprovalWaitingLabel);
+                let allow = t(Msg::ApprovalAllow);
+                let always = t(Msg::ApprovalAlways);
+                let deny = t(Msg::ApprovalDeny);
+                push_str_cells(&mut row, &waiting, &warn);
                 push_str_cells(&mut row, " Y ", &chip_y);
-                push_str_cells(&mut row, " Allow  ", &plain);
+                push_str_cells(&mut row, &allow, &plain);
                 push_str_cells(&mut row, " A ", &chip_a);
-                push_str_cells(&mut row, " Always  ", &plain);
+                push_str_cells(&mut row, &always, &plain);
                 push_str_cells(&mut row, " N ", &chip_n);
-                push_str_cells(&mut row, " Deny", &plain);
+                push_str_cells(&mut row, &deny, &plain);
                 self.push_body_row(row);
             }
             UiLine::Error(msg) => {
                 let err_style = self.style_for(Role::Error);
-                let body = format!("[Error: {}]", scrub_controls(&msg));
+                let safe = scrub_controls(&msg);
+                let body = t(Msg::ErrorPrefix { msg: &safe });
                 self.push_body_text(&body, &err_style);
             }
             UiLine::Warning(msg) => {

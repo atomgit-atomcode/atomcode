@@ -232,7 +232,10 @@ impl Modal for SessionPicker {
                         state.total_tokens = 0;
                         state.thinking_idx = 0;
                         state.on_turn_complete();
-                        renderer.render(UiLine::Error(format!("load session failed: {}", e)));
+                        let msg = format!("{}", e);
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &msg }).into_owned(),
+                        ));
                         renderer.flush();
                         Ok(ModalAction::Close)
                     }
@@ -280,7 +283,8 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
         .enumerate()
         .map(|(filter_idx, &session_idx)| {
             let s = &p.sessions[session_idx];
-            let desc = format!("{} msgs · {}", s.message_count, humanize_age(s.updated_at));
+            let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount { count: s.message_count });
+            let desc = format!("{} · {}", msgs, humanize_age(s.updated_at));
             // If in rename editing mode and this is the selected item, show the editing buffer
             if p.rename_editing && filter_idx == p.selected {
                 (format!("> {}_  [Enter: confirm, Esc: cancel]", p.rename_buffer), desc)
@@ -297,6 +301,7 @@ fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
 }
 
 fn humanize_age(ts: u64) -> String {
+    use crate::i18n::{t, Msg};
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -304,13 +309,13 @@ fn humanize_age(ts: u64) -> String {
         .unwrap_or(ts);
     let d = now.saturating_sub(ts);
     if d < 60 {
-        "just now".into()
+        t(Msg::SessionTimeJustNow).into_owned()
     } else if d < 3600 {
-        format!("{}m ago", d / 60)
+        t(Msg::SessionTimeMinAgo { n: d / 60 }).into_owned()
     } else if d < 86400 {
-        format!("{}h ago", d / 3600)
+        t(Msg::SessionTimeHourAgo { n: d / 3600 }).into_owned()
     } else {
-        format!("{}d ago", d / 86400)
+        t(Msg::SessionTimeDayAgo { n: d / 86400 }).into_owned()
     }
 }
 
@@ -329,7 +334,7 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
         renderer.reset();
     }
     renderer.render(UiLine::TurnSeparator {
-        label: format!("resumed: {}", session.name),
+        label: crate::i18n::t(crate::i18n::Msg::SessionResumedLabel { name: &session.name }).into_owned(),
     });
     for m in &session.messages {
         match (&m.role, &m.content) {

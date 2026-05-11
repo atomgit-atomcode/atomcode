@@ -15,7 +15,8 @@
 use std::path::PathBuf;
 
 use super::{save_and_reload, LoopCtx};
-use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
+use crate::i18n::{t, Msg};
+use crate::modals::{DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
@@ -162,12 +163,12 @@ pub(super) fn execute_slash_command(
             if arg.trim() == "commands" {
                 let config_dir = Config::config_dir();
                 let cmds = ctx.custom_commands.list();
-                let mut out = String::from("  Custom commands:\n");
+                let mut out = t(Msg::HelpCustomCommandsHeader).into_owned();
                 for cmd in &cmds {
                     let source_label = if cmd.source.starts_with(&config_dir) {
-                        "global"
+                        t(Msg::HelpSourceGlobal)
                     } else {
-                        "project"
+                        t(Msg::HelpSourceProject)
                     };
                     out.push_str(&format!(
                         "    /{}  — {} ({})\n",
@@ -175,10 +176,8 @@ pub(super) fn execute_slash_command(
                     ));
                 }
                 if cmds.is_empty() {
-                    out.push_str("    (none)\n\n");
-                    out.push_str(
-                        "  Create: ~/.atomcode/commands/<name>.md or .atomcode/commands/<name>.md\n",
-                    );
+                    out.push_str(&t(Msg::HelpCustomNone));
+                    out.push_str(&t(Msg::HelpCustomCreateHint));
                 }
                 renderer.render(UiLine::CommandOutput(out));
             } else {
@@ -190,7 +189,7 @@ pub(super) fn execute_slash_command(
             state.agent_mode = AgentMode::Plan;
             ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();
             renderer.render(UiLine::CommandOutput(
-                "  Switched to Plan mode (read-only exploration).\n".into(),
+                t(Msg::CmdSwitchedPlanMode).into_owned(),
             ));
             renderer.flush();
         }
@@ -198,18 +197,18 @@ pub(super) fn execute_slash_command(
             state.agent_mode = AgentMode::Build;
             ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(false)).ok();
             renderer.render(UiLine::CommandOutput(
-                "  Switched to Build mode (full execution).\n".into(),
+                t(Msg::CmdSwitchedBuildMode).into_owned(),
             ));
             renderer.flush();
         }
         "config" => {
             // Head: current active provider + config path so users know
             // which provider is talking and where to edit.
-            let mut txt = format!(
-                "  Provider: {}\n  Config: {}\n\n",
-                ctx.config.default_provider,
-                Config::default_path().display(),
-            );
+            let config_path = Config::default_path().display().to_string();
+            let mut txt = t(Msg::ConfigProviderLabel {
+                provider: &ctx.config.default_provider,
+                path: &config_path,
+            }).into_owned();
             // Body: one minimal runnable example + pointer to the full
             // reference so users know where to get Claude / OpenAI /
             // Ollama variants without flooding the terminal here.
@@ -254,16 +253,17 @@ pub(super) fn execute_slash_command(
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(new_cfg))
                         .ok();
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  Config reloaded. Active: {} · {}\n",
-                        new_default, new_model,
-                    )));
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::CmdReloadDone {
+                            provider: &new_default, model: &new_model,
+                        }).into_owned(),
+                    ));
                 }
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!(
-                        "reload failed: {} (kept previous config)",
-                        e
-                    )));
+                    let msg = format!("{}", e);
+                    renderer.render(UiLine::Error(
+                        t(Msg::CmdReloadFailed { error: &msg }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -315,15 +315,44 @@ pub(super) fn execute_slash_command(
                 model: ctx.model_name.clone(),
                 working_dir: dir_display,
             });
-            renderer.render(UiLine::CommandOutput("  New session started.\n".into()));
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::CmdNewSession).into_owned(),
+            ));
             renderer.flush();
         }
         "model" => {
             if ctx.config.providers.is_empty() {
-                renderer.render(UiLine::CommandOutput("  No providers configured.\n".into()));
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::CmdNoProviders).into_owned(),
+                ));
                 renderer.flush();
             } else {
                 *active_modal = Some(Box::new(ModelPicker::open(&ctx.config)));
+            }
+        }
+        "language" => {
+            if arg.is_empty() {
+                *active_modal = Some(Box::new(LanguagePicker::open()));
+            } else {
+                match arg.parse::<atomcode_core::locale::Locale>() {
+                    Ok(locale) => {
+                        crate::i18n::set_locale(locale);
+                        ctx.config.language = Some(locale);
+                        let config_path = atomcode_core::config::Config::default_path();
+                        if let Err(e) = ctx.config.save(&config_path) {
+                            // TODO: surface via renderer once a non-modal error display is available
+                            eprintln!("[language] failed to save config: {e}");
+                        }
+                        let msg = t(Msg::LanguageSetTo { locale: &locale.to_string() });
+                        renderer.render(UiLine::CommandOutput(format!("  {msg}\n")));
+                        renderer.flush();
+                    }
+                    Err(_) => {
+                        let msg = t(Msg::ErrUnsupportedLocale { input: arg });
+                        renderer.render(UiLine::CommandOutput(format!("  {msg}\n")));
+                        renderer.flush();
+                    }
+                }
             }
         }
         "resume" => match ctx.session_manager.list() {
@@ -331,7 +360,7 @@ pub(super) fn execute_slash_command(
                 let sessions: Vec<_> = all.into_iter().filter(|s| s.message_count > 0).collect();
                 if sessions.is_empty() {
                     renderer.render(UiLine::CommandOutput(
-                        "  No previous sessions found. Start a conversation first.\n".into(),
+                        t(Msg::CmdNoSessions).into_owned(),
                     ));
                     renderer.flush();
                 } else {
@@ -368,8 +397,7 @@ pub(super) fn execute_slash_command(
         "provider" => {
             *active_modal = Some(Box::new(ProviderWizard::MainMenu { selected: 0 }));
             renderer.render(UiLine::CommandOutput(
-                "  Provider management — Add / Edit / Delete / Set default. Esc to cancel.\n"
-                    .into(),
+                t(Msg::ProviderWizardHeader).into_owned(),
             ));
             renderer.flush();
         }
@@ -398,20 +426,20 @@ pub(super) fn execute_slash_command(
                 Ok(o) => {
                     let s = String::from_utf8_lossy(&o.stdout).to_string();
                     renderer.render(UiLine::CommandOutput(if s.is_empty() {
-                        "  (no changes)\n".into()
+                        t(Msg::CmdNoChanges).into_owned()
                     } else {
                         s
                     }));
                 }
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!("git diff failed: {}", e)));
+                    renderer.render(UiLine::Error(t(Msg::DiffFailed { error: &format!("{}", e) }).into_owned()));
                 }
             }
             renderer.flush();
         }
         "undo" => {
             renderer.render(UiLine::CommandOutput(
-                "  Undo is not yet supported.\n".into(),
+                t(Msg::CmdUndoNotSupported).into_owned(),
             ));
             renderer.flush();
         }
@@ -426,15 +454,16 @@ pub(super) fn execute_slash_command(
                 &ctx.model_name, state.prompt_tokens, state.completion_tokens, state.cached_tokens,
             );
             let cost_str = atomcode_core::pricing::format_cost(cost);
-            renderer.render(UiLine::CommandOutput(format!(
-                "  Prompt tokens:     {}\n  Completion tokens: {}\n  Cached tokens:     {} ({}% hit rate)\n  Total tokens:      {}\n  Estimated cost:    {}\n",
-                state.prompt_tokens,
-                state.completion_tokens,
-                state.cached_tokens,
-                cache_rate,
-                total,
-                cost_str,
-            )));
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::CostReport {
+                    prompt: state.prompt_tokens,
+                    completion: state.completion_tokens,
+                    cached: state.cached_tokens,
+                    cache_rate,
+                    total,
+                    cost: &cost_str,
+                }).into_owned(),
+            ));
             renderer.flush();
         }
         "context" => {
@@ -472,7 +501,7 @@ pub(super) fn execute_slash_command(
         "remember" => {
             let text = arg.trim();
             if text.is_empty() {
-                renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
                 renderer.flush();
             } else {
                 let (content, global) = if text.starts_with("--global ") {
@@ -481,7 +510,7 @@ pub(super) fn execute_slash_command(
                     (text.to_string(), false)
                 };
                 if content.is_empty() {
-                    renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                    renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
                     renderer.flush();
                 } else {
                     ctx.agent.cmd_tx.send(AgentCommand::Remember { content, global }).ok();
@@ -491,7 +520,7 @@ pub(super) fn execute_slash_command(
         "forget" => {
             let keyword = arg.trim();
             if keyword.is_empty() {
-                renderer.render(UiLine::Error("Usage: /forget <keyword>".to_string()));
+                renderer.render(UiLine::Error(t(Msg::ForgetUsage).into_owned()));
                 renderer.flush();
             } else {
                 ctx.agent.cmd_tx.send(AgentCommand::Forget { keyword: keyword.to_string() }).ok();
@@ -521,11 +550,14 @@ pub(super) fn execute_slash_command(
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(ctx.config.clone()));
                     renderer.render(UiLine::CommandOutput(
-                        "  Signed out of AtomGit. Permissions refreshed.\n".into(),
+                        t(Msg::CmdLogoutDone).into_owned(),
                     ));
                 }
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!("logout failed: {}", e)));
+                    let msg = format!("{}", e);
+                    renderer.render(UiLine::Error(
+                        t(Msg::CmdLogoutFailed { error: &msg }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -542,7 +574,7 @@ pub(super) fn execute_slash_command(
                     atomcode_core::auth::auth_file_path().display(),
                 )
             } else {
-                "  Not signed in. Use /login to authenticate.\n".into()
+                t(Msg::CmdWhoamiNotSignedIn).into_owned()
             };
             renderer.render(UiLine::CommandOutput(txt));
             renderer.flush();
@@ -580,14 +612,15 @@ pub(super) fn execute_slash_command(
             } else {
                 let force = arg_norm == "--force" || arg_norm == "-f";
                 if !force && !arg_norm.is_empty() {
-                    renderer.render(UiLine::Error(format!(
-                        "unknown /upgrade argument: {}\n  usage: /upgrade [rollback|--force]",
-                        arg
-                    )));
+                    renderer.render(UiLine::Error(
+                        t(Msg::UpgradeUnknownArg { arg }).into_owned(),
+                    ));
                     renderer.flush();
                     return Ok(());
                 }
-                renderer.render(UiLine::CommandOutput("  正在检查更新...\n".into()));
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::CmdCheckingUpdate).into_owned(),
+                ));
                 renderer.flush();
                 let current = format!("v{}", env!("CARGO_PKG_VERSION"));
                 let tx = ctx.upgrade_tx.clone();
@@ -634,10 +667,10 @@ pub(super) fn execute_slash_command(
             // itself, so there's nothing else to do here.
             if arg.is_empty() {
                 if ctx.recent_dirs.is_empty() {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  Working directory: {}\n  No recent projects. Use `/cd <path>` to switch.\n",
-                        ctx.working_dir.display()
-                    )));
+                    let cwd = ctx.working_dir.display().to_string();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::CdWorkingDir { cwd: &cwd }).into_owned(),
+                    ));
                     renderer.flush();
                 } else {
                     *active_modal = Some(Box::new(DirPicker::open(
@@ -651,10 +684,10 @@ pub(super) fn execute_slash_command(
             match new_dir {
                 Ok(path) => {
                     apply_cd(ctx, path.clone());
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  Changed to: {}\n",
-                        path.display()
-                    )));
+                    let p = path.display().to_string();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::DirChanged { path: &p }).into_owned(),
+                    ));
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(e));
@@ -671,7 +704,7 @@ pub(super) fn execute_slash_command(
             let task = arg.trim();
             if task.is_empty() {
                 renderer.render(UiLine::CommandOutput(
-                    "  Usage: /background <task description>\n".to_string(),
+                    t(Msg::BackgroundUsage).into_owned(),
                 ));
                 renderer.flush();
                 return Ok(());
@@ -689,21 +722,20 @@ pub(super) fn execute_slash_command(
             let target = ctx.working_dir.join(".atomcode.md");
             let force = matches!(arg.trim(), "--force" | "force");
             if target.exists() && !force {
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  {} already exists. Use `/init --force` to overwrite.\n",
-                    target.display()
-                )));
+                let path_str = target.display().to_string();
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::InitAlreadyExists { path: &path_str }).into_owned(),
+                ));
                 renderer.flush();
                 return Ok(());
             }
             let content = atomcode_core::init::generate_project_instructions(&ctx.working_dir);
             match std::fs::write(&target, &content) {
                 Ok(()) => {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  Wrote {} ({} bytes). Edit to customise; picked up on your next message.\n",
-                        target.display(),
-                        content.len()
-                    )));
+                    let path_str = target.display().to_string();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::InitWrote { path: &path_str, bytes: content.len() }).into_owned(),
+                    ));
                     // Confirm the file is reachable for the prompt-builder by
                     // re-running the same load that `/status` uses. If the
                     // freshly written file does NOT appear under PROJECT here,
@@ -715,7 +747,9 @@ pub(super) fn execute_slash_command(
                     ));
                 }
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!("  /init failed: {}\n", e)));
+                    renderer.render(UiLine::Error(
+                        t(Msg::InitFailed { error: &format!("{}", e) }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -823,23 +857,22 @@ pub(super) fn execute_slash_command(
                 let configs = match atomcode_core::mcp::load_mcp_config(&ctx.working_dir) {
                     Ok(c) => c,
                     Err(e) => {
-                        renderer.render(UiLine::Error(format!(
-                            "mcp reload failed: failed to load .mcp.json / ~/.atomcode/mcp.json: {:#}",
-                            e
-                        )));
+                        renderer.render(UiLine::Error(
+                            t(Msg::McpReloadFailed { error: &format!("{:#}", e) }).into_owned(),
+                        ));
                         renderer.flush();
                         return Ok(());
                     }
                 };
 
-                let mut header = format!("  Reloading MCP servers... ({} configured)\n", configs.len());
+                let mut header = t(Msg::McpReloading { count: configs.len() }).into_owned();
                 if !configs.is_empty() {
-                    header.push_str("  Connecting:\n");
+                    header.push_str(&t(Msg::McpConnecting));
                     for c in &configs {
-                        header.push_str(&format!("    - {}  connecting...\n", c.name));
+                        header.push_str(&t(Msg::McpConnectingServer { name: &c.name }));
                     }
                 } else {
-                    header.push_str("  (no MCP servers configured)\n");
+                    header.push_str(&t(Msg::McpNoServersConfigured));
                 }
                 renderer.render(UiLine::CommandOutput(header));
                 renderer.flush();
@@ -859,10 +892,9 @@ pub(super) fn execute_slash_command(
 
                 // If no servers are configured, we're done after cleanup.
                 if configs.is_empty() {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  ✓ Cleared {} MCP tools. No servers to connect.\n",
-                        removed
-                    )));
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::McpClearedNoServers { removed }).into_owned(),
+                    ));
                     renderer.flush();
                     return Ok(());
                 }
@@ -887,10 +919,9 @@ pub(super) fn execute_slash_command(
                 ctx.mcp_registry = Some(std::sync::Arc::new(registry));
                 ctx.mcp_connect_rx = Some(rx);
 
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  ✓ Cleared {} MCP tools. Reconnecting in background...\n",
-                    removed
-                )));
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::McpClearedReconnecting { removed }).into_owned(),
+                ));
                 renderer.flush();
                 return Ok(());
             }
@@ -901,7 +932,7 @@ pub(super) fn execute_slash_command(
                 let server = rest.trim();
                 if server.is_empty() {
                     renderer.render(UiLine::CommandOutput(
-                        "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
+                        t(Msg::McpToolsUsage).into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -948,13 +979,12 @@ pub(super) fn execute_slash_command(
                             });
                         }
                     });
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  Listing MCP tools for '{}'...\n",
-                        server_for_msg
-                    )));
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::McpToolsListing { server: &server_for_msg }).into_owned(),
+                    ));
                 } else {
                     renderer.render(UiLine::CommandOutput(
-                        "  No MCP registry loaded. Run /mcp reload first.\n".into(),
+                        t(Msg::McpNoRegistry).into_owned(),
                     ));
                 }
                 renderer.flush();
@@ -968,10 +998,10 @@ pub(super) fn execute_slash_command(
                 });
                 if statuses.is_empty() {
                     renderer.render(UiLine::CommandOutput(
-                        "  No MCP servers configured.\n".into(),
+                        t(Msg::McpNoServersConfigured).into_owned(),
                     ));
                 } else {
-                    let mut txt = String::from("  MCP Servers:\n");
+                    let mut txt = t(Msg::McpServersHeader).into_owned();
                     for (name, status) in statuses {
                         txt.push_str(&format!("    {}  {}\n", name, status));
                     }
@@ -979,7 +1009,7 @@ pub(super) fn execute_slash_command(
                 }
             } else {
                 renderer.render(UiLine::CommandOutput(
-                    "  No MCP servers configured.\n".into(),
+                    t(Msg::McpNoServersConfigured).into_owned(),
                 ));
             }
             renderer.flush();
@@ -994,7 +1024,7 @@ pub(super) fn execute_slash_command(
             match provider {
                 None => {
                     renderer.render(UiLine::Error(
-                        "No active provider configured. Use /provider to add one.".into(),
+                        t(Msg::CmdNoActiveProvider).into_owned(),
                     ));
                     renderer.flush();
                 }
@@ -1004,25 +1034,23 @@ pub(super) fn execute_slash_command(
                         let enabled = p.thinking_enabled.unwrap_or(false);
                         let budget = p.thinking_budget.unwrap_or(10_000);
                         let status = if enabled { "enabled" } else { "disabled" };
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  Extended thinking: {}\n  Budget: {} tokens\n  Provider: {}\n\n  Usage: /think on | off | budget <N>\n",
-                            status, budget, provider_name,
-                        )));
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::ThinkStatus { status, budget, provider: &provider_name }).into_owned(),
+                        ));
                         renderer.flush();
                     } else if sub == "on" {
                         p.thinking_enabled = Some(true);
                         let budget = p.thinking_budget.unwrap_or(10_000);
                         save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  Extended thinking enabled (budget: {} tokens).\n",
-                            budget,
-                        )));
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::ThinkEnabled { budget }).into_owned(),
+                        ));
                         renderer.flush();
                     } else if sub == "off" {
                         p.thinking_enabled = Some(false);
                         save_and_reload(ctx, renderer);
                         renderer.render(UiLine::CommandOutput(
-                            "  Extended thinking disabled.\n".into(),
+                            t(Msg::ThinkDisabled).into_owned(),
                         ));
                         renderer.flush();
                     } else if let Some(rest) = sub.strip_prefix("budget") {
@@ -1031,29 +1059,27 @@ pub(super) fn execute_slash_command(
                             Ok(n) if n >= 1024 => {
                                 p.thinking_budget = Some(n);
                                 save_and_reload(ctx, renderer);
-                                renderer.render(UiLine::CommandOutput(format!(
-                                    "  Thinking budget set to {} tokens.\n",
-                                    n,
-                                )));
+                                renderer.render(UiLine::CommandOutput(
+                                    t(Msg::ThinkBudgetSet { n }).into_owned(),
+                                ));
                                 renderer.flush();
                             }
                             Ok(n) => {
-                                renderer.render(UiLine::Error(format!(
-                                    "Budget must be >= 1024 (got {})",
-                                    n
-                                )));
+                                renderer.render(UiLine::Error(
+                                    t(Msg::ThinkBudgetTooSmall { n }).into_owned(),
+                                ));
                                 renderer.flush();
                             }
                             Err(_) => {
                                 renderer.render(UiLine::Error(
-                                    "Usage: /think budget <number>".into(),
+                                    t(Msg::ThinkBudgetUsage).into_owned(),
                                 ));
                                 renderer.flush();
                             }
                         }
                     } else {
                         renderer.render(UiLine::CommandOutput(
-                            "  Usage: /think [on | off | budget <N>]\n".into(),
+                            t(Msg::ThinkUsage).into_owned(),
                         ));
                         renderer.flush();
                     }
@@ -1094,11 +1120,12 @@ pub(super) fn execute_slash_command(
                     .unwrap_or_default();
                 if lines.is_empty() {
                     renderer.render(UiLine::CommandOutput(
-                        "  No user-invocable skills loaded.\n".into(),
+                        t(Msg::SkillsNone).into_owned(),
                     ));
                 } else {
                     renderer.render(UiLine::CommandOutput(format!(
-                        "  Available skills:\n{}\n",
+                        "{}{}\n",
+                        t(Msg::SkillsAvailable),
                         lines.join("\n")
                     )));
                 }
@@ -1120,10 +1147,9 @@ pub(super) fn execute_slash_command(
                         .ok();
                     state.on_submit();
                 } else {
-                    renderer.render(UiLine::Error(format!(
-                        "Unknown skill: {} (try /skills to list)",
-                        skill_name
-                    )));
+                    renderer.render(UiLine::Error(
+                        t(Msg::SkillUnknown { name: skill_name }).into_owned(),
+                    ));
                     renderer.flush();
                 }
             }
@@ -1146,7 +1172,9 @@ pub(super) fn execute_slash_command(
                     .ok();
                 state.on_submit();
             } else {
-                renderer.render(UiLine::Error(format!("Unknown command: /{}", other)));
+                renderer.render(UiLine::Error(
+                    t(Msg::CmdUnknownCommand { name: other }).into_owned(),
+                ));
                 renderer.flush();
             }
         }
@@ -1231,10 +1259,10 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 }
                 "list" => match atomcode_core::plugin::marketplace::list_marketplaces() {
                     Ok(items) if items.is_empty() => {
-                        ok(renderer, "no marketplaces registered".into());
+                        ok(renderer, t(Msg::PluginNoMarketplaces).into_owned());
                     }
                     Ok(items) => {
-                        let mut lines = vec!["registered marketplaces:".to_string()];
+                        let mut lines = vec![t(Msg::PluginMarketplacesHeader).into_owned()];
                         for m in items {
                             lines.push(format!(
                                 "  {}  {}  {}  ({} plugins)",
@@ -1254,7 +1282,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 },
                 _ => err(
                     renderer,
-                    "usage: /plugin marketplace [add|remove|update|list] <args>".into(),
+                    t(Msg::PluginMarketplaceUsage).into_owned(),
                 ),
             }
         }
@@ -1277,7 +1305,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                     let _ = tx.send(ev);
                 });
             }
-            None => err(renderer, "usage: /plugin install <plugin>@<marketplace>".into()),
+            None => err(renderer, t(Msg::PluginInstallUsage).into_owned()),
         },
         "uninstall" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {
             Some((plugin, mp)) => match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
@@ -1289,15 +1317,15 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             },
             None => err(
                 renderer,
-                "usage: /plugin uninstall <plugin>@<marketplace>".into(),
+                t(Msg::PluginUninstallUsage).into_owned(),
             ),
         },
         "list" => match atomcode_core::plugin::installer::list_installed() {
             Ok(items) if items.is_empty() => {
-                ok(renderer, "no installed plugins".into());
+                ok(renderer, t(Msg::PluginNoInstalled).into_owned());
             }
             Ok(items) => {
-                let mut lines = vec!["installed plugins:".to_string()];
+                let mut lines = vec![t(Msg::PluginInstalledHeader).into_owned()];
                 for p in items {
                     lines.push(format!("  {}@{}  {}", p.plugin, p.marketplace, p.plugin_dir));
                 }
@@ -1311,8 +1339,7 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
         },
         _ => err(
             renderer,
-            "usage: /plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]"
-                .into(),
+            t(Msg::PluginUsage).into_owned(),
         ),
     }
 }
@@ -1338,7 +1365,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 Some(b) => *b,
                 None => {
                     renderer.render(UiLine::CommandOutput(
-                        "  用法: /worktree create <branch> [base]\n  示例: /worktree create fix-bug main\n".into(),
+                        t(Msg::WorktreeCreateUsage).into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -1362,13 +1389,15 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                     // Save original dir before switching
                     ctx.worktree_original_dir = Some(ctx.working_dir.clone());
                     apply_cd(ctx, wt.path.clone());
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  \u{2713} 工作树已创建\n    分支: {} (基于 {})\n    路径: {}\n    工作目录已切换\n",
-                        wt.branch, wt.base_branch, wt.path.display(),
-                    )));
+                    let path_str = wt.path.display().to_string();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::WorktreeCreated { branch: &wt.branch, base: &wt.base_branch, path: &path_str }).into_owned(),
+                    ));
                 }
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!("worktree create failed: {:#}", e)));
+                    renderer.render(UiLine::Error(
+                        t(Msg::WorktreeCreateFailed { error: &format!("{:#}", e) }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -1377,7 +1406,9 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             let mgr = match WorktreeManager::from_dir(ctx.working_dir.clone()) {
                 Ok(mgr) => mgr,
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!("worktree list failed: {:#}", e)));
+                    renderer.render(UiLine::Error(
+                        t(Msg::WorktreeListFailed { error: &format!("{:#}", e) }).into_owned(),
+                    ));
                     renderer.flush();
                     return Ok(());
                 }
@@ -1386,15 +1417,23 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 Ok(worktrees) => {
                     if worktrees.is_empty() {
                         renderer.render(UiLine::CommandOutput(
-                            "  没有活跃的工作树。\n".into(),
+                            t(Msg::WorktreeNoActive).into_owned(),
                         ));
                     } else {
-                        let mut txt = String::from("  活跃工作树:\n");
+                        let mut txt = t(Msg::WorktreeActiveHeader).into_owned();
                         for (branch, path, has_changes) in &worktrees {
                             let is_current = path == &ctx.working_dir;
                             let marker = if is_current { "\u{25cf}" } else { "\u{25cb}" };
-                            let change_label = if *has_changes { "(有变更)" } else { "(clean)" };
-                            let current_hint = if is_current { " \u{2190} 当前" } else { "" };
+                            let change_label = if *has_changes {
+                                t(Msg::WorktreeHasChanges)
+                            } else {
+                                t(Msg::WorktreeClean)
+                            };
+                            let current_hint = if is_current {
+                                t(Msg::WorktreeCurrent)
+                            } else {
+                                "".into()
+                            };
                             txt.push_str(&format!(
                                 "    {} {:<16} {}  {}{}\n",
                                 marker,
@@ -1408,7 +1447,9 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                     }
                 }
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!("worktree list failed: {:#}", e)));
+                    renderer.render(UiLine::Error(
+                        t(Msg::WorktreeListFailed { error: &format!("{:#}", e) }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -1417,19 +1458,18 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             if let Some(original) = ctx.worktree_original_dir.take() {
                 let current_branch = detect_current_branch(&ctx.working_dir);
                 apply_cd(ctx, original.clone());
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  \u{2713} 工作目录已切回: {}\n",
-                    original.display(),
-                )));
+                let path_str = original.display().to_string();
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::WorktreeDoneBack { path: &path_str }).into_owned(),
+                ));
                 if let Some(branch) = current_branch {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  提示: 使用 'git merge {}' 或创建 PR 合入主分支\n",
-                        branch,
-                    )));
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::WorktreeDoneMergeHint { branch: &branch }).into_owned(),
+                    ));
                 }
             } else {
                 renderer.render(UiLine::CommandOutput(
-                    "  没有活跃的工作树会话。先使用 /worktree create 创建一个。\n".into(),
+                    t(Msg::WorktreeNoSession).into_owned(),
                 ));
             }
             renderer.flush();
@@ -1439,7 +1479,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 Some(b) => *b,
                 None => {
                     renderer.render(UiLine::CommandOutput(
-                        "  用法: /worktree cleanup <branch> [--force]\n".into(),
+                        t(Msg::WorktreeCleanupUsage).into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -1479,15 +1519,14 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                     } else {
                         None
                     };
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  \u{2713} 工作树 '{}' 已清理\n",
-                        branch,
-                    )));
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::WorktreeCleaned { branch }).into_owned(),
+                    ));
                     if let Some(target) = switched_to {
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  工作目录已切回: {}\n",
-                            target.display(),
-                        )));
+                        let path_str = target.display().to_string();
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::WorktreeCleanedSwitched { path: &path_str }).into_owned(),
+                        ));
                     }
                 }
                 Err(e) => {
@@ -1497,15 +1536,13 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                             || err_msg.contains("modified")
                             || err_msg.contains("changes"))
                     {
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  \u{26a0} 工作树 '{}' 有未提交的变更。\n  使用 /worktree cleanup {} --force 强制清理\n",
-                            branch, branch,
-                        )));
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::WorktreeCleanupUncommitted { branch }).into_owned(),
+                        ));
                     } else {
-                        renderer.render(UiLine::Error(format!(
-                            "worktree cleanup failed: {}",
-                            err_msg
-                        )));
+                        renderer.render(UiLine::Error(
+                            t(Msg::WorktreeCleanupFailed { error: &err_msg }).into_owned(),
+                        ));
                     }
                 }
             }
@@ -1513,7 +1550,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
         }
         _ => {
             renderer.render(UiLine::CommandOutput(
-                "  用法:\n    /worktree create <branch> [base]  创建工作树并切换\n    /worktree list                     列出所有工作树\n    /worktree done                     切回原始目录\n    /worktree cleanup <branch>         清理工作树\n".into(),
+                t(Msg::WorktreeUsage).into_owned(),
             ));
             renderer.flush();
         }
