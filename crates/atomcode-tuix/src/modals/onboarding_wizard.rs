@@ -259,6 +259,76 @@ impl OnboardingWizard {
     }
 }
 
+impl OnboardingWizard {
+    /// Build all output lines for step 1 (Intro). `term_cols` /
+    /// `term_rows` are taken from `crossterm::terminal::size()` at the
+    /// caller; passed in so tests don't need a real terminal.
+    /// Returns SGR-laced strings ready for `UiLine::CommandOutput`.
+    ///
+    /// `term_rows < 22` triggers the compact fallback — drops the
+    /// 5-line ASCII logo + Ctrl+C hint so the box fits 18-row
+    /// terminals. Spec threshold: full layout needs 18 rows (16 box +
+    /// 2 header); compact needs 13 (11 box + 2 header).
+    pub(super) fn draw_intro_lines(&self, term_cols: u16, term_rows: u16) -> Vec<String> {
+        use crate::i18n::{t, Msg};
+        let compact = term_rows < 22;
+
+        // Step header (above box)
+        let mut out = Vec::new();
+        out.push(t(Msg::OnboardingStepHeaderWelcome).into_owned());
+        out.push(String::new()); // blank line between header and box
+
+        // Build content lines
+        let mut content: Vec<String> = Vec::new();
+        content.push(String::new()); // top padding
+
+        if !compact {
+            // 5-line ASCII logo. Leading 3-space pad keeps it
+            // visually grouped inside the panel; draw_panel handles
+            // right-side width padding.
+            content.push(r#"      _   _                  ____          _"#.to_string());
+            content.push(r#"     / \ | |_ ___  _ __ ___ / ___|___   __| | ___"#.to_string());
+            content.push(r#"    / _ \| __/ _ \| '_ ` _ \ |   / _ \ / _` |/ _ \"#.to_string());
+            content.push(r#"   / ___ \ || (_) | | | | | | |__| (_) | (_| |  __/"#.to_string());
+            content.push(r#"  /_/   \_\__\___/|_| |_| |_|\____\___/ \__,_|\___|"#.to_string());
+            content.push(String::new());
+            content.push(
+                t(Msg::OnboardingIntroVersionLine {
+                    v: env!("CARGO_PKG_VERSION"),
+                })
+                .into_owned(),
+            );
+            content.push(String::new());
+            content.push(t(Msg::OnboardingIntroBullet1).into_owned());
+            content.push(t(Msg::OnboardingIntroBullet2).into_owned());
+            content.push(t(Msg::OnboardingIntroBullet3).into_owned());
+            content.push(String::new());
+            content.push(t(Msg::OnboardingIntroPressEnter).into_owned());
+            content.push(t(Msg::OnboardingIntroCtrlC).into_owned());
+        } else {
+            // Compact: no logo + no Ctrl+C hint. Just product line +
+            // tagline + bullets + press-enter.
+            content.push(format!("AtomCode v{}", env!("CARGO_PKG_VERSION")));
+            content.push(t(Msg::OnboardingIntroCompactTagline).into_owned());
+            content.push(String::new());
+            content.push(t(Msg::OnboardingIntroBullet1).into_owned());
+            content.push(t(Msg::OnboardingIntroBullet2).into_owned());
+            content.push(t(Msg::OnboardingIntroBullet3).into_owned());
+            content.push(String::new());
+            content.push(t(Msg::OnboardingIntroPressEnter).into_owned());
+        }
+        content.push(String::new()); // bottom padding
+
+        out.extend(draw_panel(
+            &t(Msg::OnboardingPanelTitle),
+            &content,
+            "Step 1/3",
+            (term_cols as usize).min(80),
+        ));
+        out
+    }
+}
+
 impl Default for OnboardingWizard {
     fn default() -> Self {
         Self::new()
@@ -536,5 +606,81 @@ mod tests {
             let outcome = w.handle_key_pure(KeyCode::Esc, KeyModifiers::NONE);
             assert_eq!(outcome, PureOutcome::Close, "Esc at {start:?} must Close");
         }
+    }
+
+    // ── Step 1 (Intro) draw tests ──
+
+    /// Full-height layout assertions: ASCII logo + version + all
+    /// three bullets + press-enter + ctrl-c lines all present.
+    #[test]
+    fn intro_full_layout_has_all_pieces() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 24);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // ASCII logo signature (the last row of the 5-line glyph
+        // block is unique enough to pin).
+        assert!(
+            joined.contains("/_/   \\_\\__\\___/"),
+            "logo missing: {joined}"
+        );
+        assert!(joined.contains("Version "));
+        assert!(joined.contains("Multi-step agent loop"));
+        assert!(joined.contains("Connects to any OpenAI"));
+        assert!(joined.contains("Free tokens via CodingPlan"));
+        assert!(joined.contains("Press Enter to continue"));
+        assert!(joined.contains("Ctrl+C exits"));
+        // Header above the box.
+        assert!(joined.contains("Step 1/3 · Welcome"));
+        // Box step indicator at bottom.
+        assert!(joined.contains("Step 1/3"));
+    }
+
+    /// `term_rows < 22` drops the logo + Ctrl+C lines. Bullets,
+    /// version, and Press-Enter still render so the user can advance.
+    #[test]
+    fn intro_compact_drops_logo() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 18);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined.contains("/_/   \\_\\__\\___/"),
+            "logo should be hidden in compact mode: {joined}"
+        );
+        // Compact replaces the version block with a compact product
+        // line `AtomCode vX.Y.Z` + tagline.
+        assert!(joined.contains("AtomCode v"));
+        assert!(joined.contains("AI coding agent that lives in your terminal"));
+        assert!(joined.contains("Free tokens"));
+        assert!(joined.contains("Press Enter to continue"));
+    }
+
+    /// Locale-driven copy lookup — boot in ZhCn, every string in the
+    /// intro panel should be the Chinese translation.
+    #[test]
+    fn intro_renders_in_zh_cn() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 24);
+        let joined: String = lines
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("第 1/3 步 · 欢迎"));
+        assert!(joined.contains("版本 "));
+        assert!(joined.contains("按 Enter 继续"));
+        assert!(joined.contains("Ctrl+C 可随时退出"));
+        // Brand title stays English on purpose.
+        assert!(joined.contains("AtomCode"));
     }
 }
