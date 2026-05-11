@@ -31,6 +31,11 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
     match (code, ctrl) {
         (KeyCode::Enter, ctrl) if ctrl || shift || alt => Action::InsertNewline,
         (KeyCode::Enter, _) => Action::Submit,
+        // Ctrl+J = ASCII LF. On Kitty-aware terminals it arrives disambiguated
+        // from Enter and gives users another newline chord when their primary
+        // one is intercepted by the host terminal (e.g. Windows Terminal binds
+        // Alt+Enter to toggleFullscreen by default).
+        (KeyCode::Char('j'), true) => Action::InsertNewline,
         (KeyCode::Char('c'), true) => Action::Cancel,
         (KeyCode::Char('u'), true) => Action::ClearLine,
         (KeyCode::Char('w'), true) => Action::DeleteWordBackward,
@@ -98,6 +103,21 @@ mod tests {
     fn alt_shift_enter_inserts_newline() {
         assert_eq!(
             k(KeyCode::Enter, KeyModifiers::ALT | KeyModifiers::SHIFT),
+            Action::InsertNewline
+        );
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline() {
+        // Ctrl+J = ASCII 0x0A (LF). On terminals that negotiate the Kitty
+        // keyboard protocol, crossterm reports it as `Char('j'), CONTROL`
+        // — give it the same role as Shift/Ctrl/Alt+Enter so users on
+        // Kitty-aware terminals (kitty, wezterm, alacritty, WT ≥1.21) have
+        // an extra fallback when their main chord is intercepted by the
+        // host terminal (e.g. Windows Terminal eats Alt+Enter for full-
+        // screen toggle by default).
+        assert_eq!(
+            k(KeyCode::Char('j'), KeyModifiers::CONTROL),
             Action::InsertNewline
         );
     }

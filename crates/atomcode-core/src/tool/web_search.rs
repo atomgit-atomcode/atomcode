@@ -84,17 +84,20 @@ impl Tool for WebSearchTool {
         } else {
             "curl"
         };
-        let output = Command::new(curl_bin)
-            .args(&[
-                "-s", "-X", "POST",
-                "https://html.duckduckgo.com/html/",
-                "-d", &format!("q={}", query_encoded),
-                "-A", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)",
-                "--max-time", "15",
-                "-L", // follow redirects
-            ])
-            .output()
-            .await;
+        let mut cmd = Command::new(curl_bin);
+        cmd.args(&[
+            "-s", "-X", "POST",
+            "https://html.duckduckgo.com/html/",
+            "-d", &format!("q={}", query_encoded),
+            "-A", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)",
+            "--max-time", "15",
+            "-L", // follow redirects
+        ]);
+
+        // On Windows, prevent the spawned curl.exe from creating a visible console window.
+        crate::process_utils::suppress_console_window(&mut cmd);
+
+        let output = cmd.output().await;
 
         let html = match output {
             Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),

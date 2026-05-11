@@ -5,6 +5,10 @@
 # Env overrides:
 #   $env:ATOMCODE_VERSION   release tag to install (default: v4.21.2)
 #   $env:ATOMCODE_PREFIX    install dir (default: %LOCALAPPDATA%\AtomCode)
+# IMPORTANT: when changing install paths, registry edits, or filenames here,
+# also update scripts/uninstall.ps1 AND
+# crates/atomcode-core/src/uninstall/paths.rs. The CI parity test guards
+# the manifest, but binary path / PATH edit are not checked.
 
 $ErrorActionPreference = "Stop"
 

@@ -35,8 +35,20 @@ use crate::turn::runner::TurnRunner;
 /// Commands sent FROM the UI TO the agent loop.
 #[derive(Debug)]
 pub enum AgentCommand {
-    /// User sent a message (may include attached file content).
-    SendMessage(String),
+    /// User sent a message (may include attached file content and/or images).
+    /// `image_markers[i]` is the `[Image #N]` number printed for `images[i]`
+    /// at paste time. Round-tripped through `AgentEvent::RestorePendingImages`
+    /// so that on VL preprocess failure the TUI can re-attach images with
+    /// their ORIGINAL markers — otherwise an UP-recalled `[Image #5]` text
+    /// wouldn't match a freshly-renumbered restored image. Empty when the
+    /// caller has no images (slash commands, queued text from streaming,
+    /// CLI single-shot).
+    SendMessage {
+        text: String,
+        images: Vec<crate::conversation::message::ImagePart>,
+        #[allow(dead_code)] // used in 2026-05-09 vision-preprocessor retry; agent reflects on Failed
+        image_markers: Vec<usize>,
+    },
     /// Cancel current operation.
     Cancel,
     /// Approve a pending tool call.
@@ -121,6 +133,22 @@ impl TurnStopReason {
     }
 }
 
+/// One descriptor per sub-agent in a `SubAgentDispatchStart` batch.
+/// Mirrored 1:1 with the `tasks` vector built in `parallel_edit::execute`
+/// so callers can reuse the index across the lifecycle events.
+#[derive(Debug, Clone)]
+pub struct SubAgentTaskInfo {
+    /// Workspace-relative file path the sub-agent will edit. Renderer
+    /// shows this in full (not basename-only) so multi-component paths
+    /// like `src/server/tunnel.rs` vs `src/client/tunnel.rs` stay
+    /// visibly distinct.
+    pub path: String,
+    /// User-facing duplicate-instance qualifier. Empty when the path
+    /// is unique within this dispatch; `" (#2)"`, `" (#3)"` when the
+    /// dispatcher is forking >1 sub-agent against the same path.
+    pub dedup_suffix: String,
+}
+
 /// Events sent FROM the agent loop TO the UI.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -141,6 +169,24 @@ pub enum AgentEvent {
         id: String,
         name: String,
         arguments: String,
+    },
+    /// Multiple tool calls fan out from one assistant message. Fires BEFORE
+    /// the per-call `ToolCallStarted` events, only when ≥ 2 non-duplicate
+    /// calls are about to dispatch. UI uses this to render a single
+    /// grouped block (`▸ Reading 4 files (parallel)` + child rows) rather
+    /// than N independent `▸` rows. Per-call events still fire for
+    /// backward compat — UI dedupes via `batch_id` membership.
+    ToolBatchStarted {
+        batch_id: String,
+        calls: Vec<crate::turn::event::ToolBatchCall>,
+    },
+    /// Closes the batch opened by `ToolBatchStarted`. UI finalizes the
+    /// group header with `· N/M ok · Xs wall` summary.
+    ToolBatchCompleted {
+        batch_id: String,
+        ok: usize,
+        total: usize,
+        elapsed_ms: u64,
     },
     /// Real-time output chunk from a running tool (e.g., bash command).
     /// Sent during tool execution before ToolCallResult.
@@ -190,8 +236,73 @@ pub enum AgentEvent {
     },
     /// An error occurred.
     Error(String),
-    /// Sub-agent progress (real-time parallel task display).
-    SubAgentProgress { file: String, status: String },
+    /// Non-fatal advisory from a provider or other subsystem. UI renders
+    /// this as a one-line yellow banner; does not abort the turn.
+    /// Currently sourced from the OpenAI provider's truncation detector
+    /// when the proxy reports implausibly few prompt_tokens.
+    Warning(String),
+    /// VL preprocessing failed; the agent is returning the user's pending
+    /// images so the TUI can re-attach them to the input state. Lets the
+    /// user retry the same image without re-pasting from clipboard. Hashes
+    /// are TUI-side state, so the renderer recomputes them from the
+    /// returned base64 bytes (best-effort; clipboard-equality dedup may
+    /// fire on a fresh paste of the same image — minor UX, not breaking).
+    RestorePendingImages {
+        images: Vec<crate::conversation::message::ImagePart>,
+        /// Original `[Image #N]` numbers, parallel to `images`. Round-tripped
+        /// from `AgentCommand::SendMessage::image_markers` so the TUI can
+        /// re-attach with the SAME marker numbers — keeps UP-recalled
+        /// caption text matching after retry.
+        markers: Vec<usize>,
+    },
+    /// VL preprocessing succeeded — surface a one-line success notice
+    /// without dumping the (possibly long, sometimes uninformative) VL
+    /// description into the UI. The description still rides into
+    /// conversation history for the main model. `vl_key` is the provider
+    /// key from config; `char_count` is `text.chars().count()` so users
+    /// can spot zero/near-zero outputs that would mislead the main model.
+    VisionPreprocessSuccess {
+        vl_key: String,
+        char_count: usize,
+    },
+    /// Sub-agent batch began. `tasks` is the ordered list of children
+    /// the dispatcher is about to fork — same order as the resulting
+    /// `SubAgentTaskDone`/`SubAgentTaskFailed` events will arrive in,
+    /// so the UI can pre-allocate one display slot per child and
+    /// disambiguate same-basename tasks via the index.
+    SubAgentDispatchStart {
+        /// Per-task descriptors. `path` is the workspace-relative file
+        /// path (preserved as the model wrote it — no basename-only
+        /// truncation). `dedup_suffix` is the user-facing `(#2)`,
+        /// `(#3)` qualifier when the same path appears N times in one
+        /// dispatch; empty for unique entries.
+        tasks: Vec<SubAgentTaskInfo>,
+    },
+    /// Sub-agent batch ended (all tasks settled or pool returned). UI
+    /// clears the override so subsequent thinks/tools resume normal
+    /// label behaviour.
+    SubAgentDispatchEnd,
+    /// One sub-agent has been claimed from the pool and is now running.
+    /// `index` indexes into the `tasks` vector emitted with the
+    /// matching DispatchStart so the UI can locate its slot.
+    SubAgentTaskStarted { index: usize },
+    /// Sub-agent finished successfully. `summary` is a one-sentence
+    /// human-readable result, already truncated to a reasonable length
+    /// by the agent loop.
+    SubAgentTaskDone {
+        index: usize,
+        elapsed_ms: u64,
+        turns: usize,
+        summary: String,
+    },
+    /// Sub-agent failed (error, timeout, no-edit). `reason` is one
+    /// short phrase, not a stack trace.
+    SubAgentTaskFailed {
+        index: usize,
+        elapsed_ms: u64,
+        turns: usize,
+        reason: String,
+    },
     /// `/background` task finished. `summary` is the final assistant text
     /// (truncated if long). `success` is false on error / timeout / cancel.
     BackgroundComplete {
@@ -256,17 +367,7 @@ pub(crate) struct DisciplineState {
     pub model_produced_text: bool,
     pub silent_tool_rounds: usize,
     pub is_negative_feedback: bool,
-    pub recent_calls: Vec<(String, u64)>,
     pub build_fail_count: usize,
-    /// Per-region read counter; key shape matches `TurnRunner.file_read_counts`
-    /// so the post-turn "stuck" warning in `discipline::apply_post_turn_discipline`
-    /// reads what the agent loop writes. See `turn::runner::read_region_key`.
-    pub file_read_counts: std::collections::HashMap<(String, u64), usize>,
-    /// Snapshot of `AgentLoop.tool_call_count` at the last cadence reflection
-    /// injection. The delta `tool_call_count - last_reflection_at_tool_count`
-    /// feeds `should_inject_reflection` in `discipline`. Resets together with
-    /// `tool_call_count` when a new user task chain starts.
-    pub last_reflection_at_tool_count: usize,
     pub scouting_count: usize,
     pub api_confirmed_working: bool,
     pub consecutive_edits_file: Option<String>,
@@ -324,6 +425,16 @@ pub struct AgentLoop {
     /// LLM returns no tool calls, or when the step budget is hit).
     max_turns: Option<usize>,
     retry_count: usize,
+    /// Tool-call IDs already forwarded to the renderer in the current
+    /// user turn. Cleared at the start of each new user message (in
+    /// `process_user_input` per-turn reset block).
+    ///
+    /// Dedupes the case where 429 / stream-ended retries cause the
+    /// runner to re-emit `TurnEvent::ToolCallStarted` with the same
+    /// provider-assigned tool_call_id. Without this, every retry adds
+    /// a duplicate `▸ Bash(...)` row in scrollback — at extreme rate-
+    /// limit scenarios users see the same command 30+ times.
+    emitted_tool_ids: std::collections::HashSet<String>,
 
     // Approval channel endpoints for InteractivePermissionDecider
     /// Receives approval requests from InteractivePermissionDecider
@@ -524,6 +635,11 @@ impl AgentLoop {
         // Share tool registry between AgentLoop and TurnRunner via Arc.
         let shared_tools = std::sync::Arc::new(tool_registry);
 
+        // Hand the registry handle to ToolContext so active-dispatch tools
+        // (parallel_edit_files) can read it at execute time without
+        // creating a Tool ↔ Registry Arc cycle.
+        tool_context.tool_registry = Some(shared_tools.clone());
+
         // Convert Box → Arc so provider can be shared with sub-agents.
         let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
 
@@ -556,7 +672,8 @@ impl AgentLoop {
                     thinking_budget: None,
                     skip_tls_verify: false,
                     ephemeral: true,
-                }),
+
+}),
             };
 
         let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
@@ -572,9 +689,8 @@ impl AgentLoop {
             ctx: ctx.clone(),
             permission: interactive_permission,
             recently_edited_files: Vec::new(),
-            recent_calls: Vec::new(),
-            file_read_counts: std::collections::HashMap::new(),
             hook_executor: hook_executor.clone(),
+            loop_guard: Default::default(),
         };
 
         // Capture session-start env snapshot (git status, branch, HEAD).
@@ -599,6 +715,7 @@ impl AgentLoop {
             turn_count: 0,
             max_turns: None,
             retry_count: 0,
+            emitted_tool_ids: std::collections::HashSet::new(),
             approval_req_rx,
             approval_resp_tx,
             last_approval_request: None,
@@ -650,6 +767,25 @@ impl AgentLoop {
     /// Run the agent loop. This is the main entry point — call from a tokio task.
     /// The loop processes commands from the UI and emits events back.
     pub async fn run(mut self) {
+        // Active-dispatch tool registration. The model invokes
+        // `parallel_edit_files` explicitly when it judges parallel edit
+        // is the right move; the framework no longer infers from text.
+        // Gated on `subagent.enabled` so users can disable fork
+        // dispatch via `/config subagent.enabled false` without code
+        // changes — the tool simply isn't advertised to the model.
+        // Registered here (not in `new()`) because `register_arc` is
+        // async and `new()` is sync.
+        if self.config.subagent.enabled {
+            let tool = crate::tool::parallel_edit::ParallelEditTool {
+                provider: self.turn_runner.provider.clone(),
+                config: self.config.clone(),
+                event_tx: self.event_tx.clone(),
+            };
+            self.tool_registry
+                .register_arc("parallel_edit_files".to_string(), std::sync::Arc::new(tool))
+                .await;
+        }
+
         // Spawn background code graph indexer
         {
             let working_dir = self.turn_runner.context.working_dir.read().await.clone();
@@ -692,8 +828,8 @@ impl AgentLoop {
 
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
-                AgentCommand::SendMessage(content) => {
-                    self.handle_send_message(content).await;
+                AgentCommand::SendMessage { text, images, image_markers } => {
+                    self.handle_send_message(text, images, image_markers).await;
                 }
                 AgentCommand::Cancel => {
                     self.cancel_token.cancel();
@@ -792,7 +928,7 @@ impl AgentLoop {
                     } else {
                         self.turn_runner.provider =
                             std::sync::Arc::from(crate::provider::unavailable_provider(
-                                "未配置 provider。请使用 /provider 添加 provider 后再试。",
+                                "No active provider configured. Use /provider to add one.",
                             ));
                         self.turn_runner.config = self.config.clone();
                     }
@@ -816,7 +952,12 @@ impl AgentLoop {
                 }
                 AgentCommand::SetMessages(messages) => {
                     // Set messages from a resumed session.
+                    // Rebuild turn_tracker so the context builder can use
+                    // proper turn-based windowing instead of the fallback path.
+                    let turn_tracker =
+                        crate::conversation::turn::TurnTracker::rebuild(&messages);
                     self.conversation.messages = messages;
+                    self.conversation.turn_tracker = turn_tracker;
                 }
                 AgentCommand::SetPlanMode(enabled) => {
                     self.plan_mode = enabled;
@@ -1016,7 +1157,12 @@ impl AgentLoop {
     // Core agent logic
     // -------------------------------------------------------------------------
 
-    async fn handle_send_message(&mut self, mut content: String) {
+    async fn handle_send_message(
+        &mut self,
+        mut content: String,
+        images: Vec<crate::conversation::message::ImagePart>,
+        image_markers: Vec<usize>,
+    ) {
         self.current_task = content.clone();
 
         if let Some(reason) = self.turn_runner.provider.availability_error() {
@@ -1151,26 +1297,96 @@ impl AgentLoop {
             }
         }
 
-        self.conversation.add_user_message(&clean);
+        // Vision preprocessing: when the active provider can't accept images
+        // and the user pasted some, run them through the configured VL model
+        // first and turn the result into plain text. See
+        // `vision_preprocessor` module doc for the data-flow contract.
+        let mut vision_warning: Option<String> = None;
+        let (clean, images) = if !images.is_empty() {
+            use crate::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
+            match maybe_preprocess(&self.config, &*self.turn_runner.provider, &clean, &images).await {
+                PreprocessOutcome::Skipped => (clean, images),
+                PreprocessOutcome::Replaced { text, vl_key } => {
+                    // Surface a one-line success notice (provider key in
+                    // muted gray, char count for sanity-check). The full
+                    // description is intentionally NOT shown in the UI —
+                    // it would either be redundant with what the main
+                    // model proceeds to discuss or, on bad VL output,
+                    // mislead the user that "success" means useful
+                    // content. Description still rides into conversation
+                    // history below.
+                    let _ = self.event_tx.send(AgentEvent::VisionPreprocessSuccess {
+                        vl_key: vl_key.clone(),
+                        char_count: text.chars().count(),
+                    });
+                    let merged = if clean.is_empty() {
+                        format!("[图片内容（由 {vl_key} 识别）]\n{text}")
+                    } else {
+                        format!("{clean}\n\n[图片内容（由 {vl_key} 识别）]\n{text}")
+                    };
+                    (merged, Vec::new())
+                }
+                PreprocessOutcome::Failed { reason } => {
+                    vision_warning = Some(format!(
+                        "VL 预处理失败：{reason} · 图片已自动保留，可直接重试",
+                    ));
+                    // Layer-1 retry support: hand the image bytes back to
+                    // TUIX so the user doesn't have to re-paste from
+                    // clipboard. Without this the bytes are gone after
+                    // submit and Ctrl+V is the only way to re-attach.
+                    let _ = self.event_tx.send(AgentEvent::RestorePendingImages {
+                        images: images.clone(),
+                        markers: image_markers.clone(),
+                    });
+                    let merged = if clean.is_empty() {
+                        "[图片识别失败]".to_string()
+                    } else {
+                        format!("{clean}\n\n[图片识别失败]")
+                    };
+                    (merged, Vec::new())
+                }
+            }
+        } else {
+            (clean, images)
+        };
+        if let Some(w) = vision_warning {
+            let _ = self.event_tx.send(AgentEvent::Warning(w));
+        }
+
+        if images.is_empty() {
+            self.conversation.add_user_message(&clean);
+        } else {
+            use crate::conversation::message::{Message, MessageContent, Role};
+            let msg = Message {
+                role: Role::User,
+                content: MessageContent::MultiPart {
+                    text: if clean.is_empty() { None } else { Some(clean.clone()) },
+                    images,
+                },
+            };
+            let idx = self.conversation.messages.len();
+            self.conversation.messages.push(msg);
+            self.conversation.turn_tracker.on_user_message(idx);
+        }
         self.turn_tokens = 0;
         self.tool_call_count = 0;
-        // Reset the reflection marker so the next cadence checkpoint is
-        // measured from the start of this new task chain, not from the
-        // tool count accumulated in the previous task.
-        self.discipline_state.last_reflection_at_tool_count = 0;
         self.turn_count = 0;
         self.retry_count = 0;
-        self.discipline_state.recent_calls.clear();
+        self.emitted_tool_ids.clear();
         self.files_read_this_turn.clear();
         self.files_edited_this_turn.clear();
         self.turn_runner.recently_edited_files.clear();
+        // Cross-batch loop guard is scoped to a single user-message
+        // turn — every new user message = fresh slate. See
+        // `turn::loop_guard` for why this clear() is the entire
+        // per-turn-only contract on the caller side.
+        self.turn_runner.loop_guard.clear();
         self.discipline_state.consecutive_reads = 0;
         self.discipline_state.verify_injected = false;
         self.discipline_state.model_produced_text = false;
         self.discipline_state.silent_tool_rounds = 0;
         // Note: is_negative_feedback is set above, do not reset here.
         self.discipline_state.build_fail_count = 0;
-        self.discipline_state.file_read_counts.clear();
         self.discipline_state.scouting_count = 0;
         self.discipline_state.api_confirmed_working = false;
         self.discipline_state.consecutive_edits_file = None;
@@ -1360,13 +1576,12 @@ impl AgentLoop {
                 let files_edited_this_turn = &mut self.files_edited_this_turn;
                 let active_file = &mut self.active_file;
                 let files_read_this_turn = &mut self.files_read_this_turn;
-                let file_read_counts = &mut self.discipline_state.file_read_counts;
                 let consecutive_reads = &mut self.discipline_state.consecutive_reads;
                 let targeted_read_count = &mut self.discipline_state.targeted_read_count;
                 let last_bash_cmd = &mut self.discipline_state.last_bash_cmd;
                 let session_files = &mut self.session_files;
                 let reindex_tx = &self.reindex_tx;
-                let working_dir_for_read_counts = runner.context.working_dir.clone();
+                let emitted_tool_ids = &mut self.emitted_tool_ids;
 
                 // Tool filtering: diagnosis phase uses read-only tools.
                 // All other turns have full tool access (including edit_file).
@@ -1422,7 +1637,30 @@ impl AgentLoop {
                                 TurnEvent::ReasoningDelta(text) => {
                                     let _ = event_tx.send(AgentEvent::ReasoningDelta(text));
                                 }
+                                TurnEvent::ToolBatchStarted { ref batch_id, ref calls } => {
+                                    let _ = event_tx.send(AgentEvent::ToolBatchStarted {
+                                        batch_id: batch_id.clone(),
+                                        calls: calls.clone(),
+                                    });
+                                }
+                                TurnEvent::ToolBatchCompleted { ref batch_id, ok, total, elapsed_ms } => {
+                                    let _ = event_tx.send(AgentEvent::ToolBatchCompleted {
+                                        batch_id: batch_id.clone(),
+                                        ok,
+                                        total,
+                                        elapsed_ms,
+                                    });
+                                }
                                 TurnEvent::ToolCallStarted { ref id, ref name, ref arguments } => {
+                                    // Dedupe across retries: the same provider-assigned tool_call_id
+                                    // arrives again whenever a 429 / stream-ended attempt is retried.
+                                    // Without this guard, every retry paints another `▸ Bash(...)` row.
+                                    // Skip ALL downstream side effects (datalog, phase, file tracking,
+                                    // event emission) for the duplicate — the first emission has
+                                    // already accounted for them.
+                                    if !emitted_tool_ids.insert(id.clone()) {
+                                        continue;
+                                    }
                                     // Forward tool name immediately for UI spinner
                                     let _ = event_tx.send(AgentEvent::ToolCallStreaming { name: name.clone(), hint: String::new() });
                                     // Flush accumulated model text to datalog before logging tool call accumulated model text to datalog before logging tool call
@@ -1458,14 +1696,7 @@ impl AgentLoop {
                                                     .map(|n| n.to_string_lossy().to_string())
                                                     .unwrap_or_else(|| fp.to_string());
                                                 session_files.insert(short.clone(), std::path::PathBuf::from(fp));
-                                                // Track per-region read count for re-read guard.
-                                                // Key matches `TurnRunner.file_read_counts` shape so the
-                                                // post-turn warning in `discipline::apply_post_turn_discipline`
-                                                // agrees with the guard on what counts as "same region".
                                                 if name == "read_file" {
-                                                    let working_dir = working_dir_for_read_counts.try_read().ok().map(|g| g.clone());
-                                                    let key = crate::turn::runner::read_region_key(arguments, working_dir.as_deref());
-                                                    *file_read_counts.entry(key).or_insert(0) += 1;
                                                     if !files_read_this_turn.contains(&short) {
                                                         files_read_this_turn.push(short);
                                                     }
@@ -1592,6 +1823,10 @@ impl AgentLoop {
                                 }
                                 TurnEvent::Error(e) => {
                                     let _ = event_tx.send(AgentEvent::Error(e));
+                                }
+                                TurnEvent::Warning(w) => {
+                                    datalog.log_warning(&w);
+                                    let _ = event_tx.send(AgentEvent::Warning(w));
                                 }
                                 TurnEvent::WorkingDirChanged(new_dir) => {
                                     // A tool (change_dir / bash cd) mutated the shared
@@ -1843,46 +2078,11 @@ impl AgentLoop {
                         self.discipline_state.silent_tool_rounds += 1;
                     }
 
-                    // Sub-agent extraction from UsedTools: model may output plan text
-                    // alongside tool calls (e.g. "Plan: 1. IdeaCenter.vue 2. ProductCenter.vue"
-                    // + read_file in the same turn). Only dispatch on the FIRST tool-use turn
-                    // (planning phase). If model has already been editing files, don't
-                    // re-dispatch — the text may just mention files it already changed.
-                    if let Some(ref plan_text) = text {
-                        if self.tool_call_count <= tool_count  // only first tool-use response
-                            && !self.subtask_driver.active
-                            && !plan_text.trim().is_empty()
-                        {
-                            self.subtask_driver.extract_from_plan(plan_text);
-                            if self.subtask_driver.active && self.subtask_driver.subtasks.len() >= 2
-                            {
-                                self.plan_text = Some(plan_text.clone());
-                                if let Some(sub_result) =
-                                    self.try_sub_agent_dispatch(plan_text).await
-                                {
-                                    let _ = self
-                                        .event_tx
-                                        .send(AgentEvent::TextDelta(sub_result.clone()));
-                                    self.subtask_driver = subtask_driver::SubtaskDriver::new();
-
-                                    if sub_result.contains("BUILD ERRORS") {
-                                        // Build failed — inject error, continue turn loop
-                                        self.conversation.add_user_message(&format!(
-                                            "[Sub-agent merge build FAILED. Fix the errors below, then summarize.]\n{}",
-                                            sub_result
-                                        ));
-                                    } else {
-                                        // Sub-agent results streamed via TextDelta above;
-                                        // no extra "Summarize" user-turn — it just triggers
-                                        // another round of re-narration. Let the turn stop naturally.
-                                        self.finish_turn(TurnStopReason::Natural);
-                                        return;
-                                    }
-                                }
-                                // Failed — fall through to serial execution
-                            }
-                        }
-                    }
+                    // Fork sub-agent dispatch is no longer driven by parsing this
+                    // turn's text. The model invokes `parallel_edit_files`
+                    // explicitly when it judges parallel edit is the right move.
+                    // See `crate::tool::parallel_edit` for the active-dispatch
+                    // tool and `agent/mod.rs::run` for its registration.
 
                     // Post-process: truncate large outputs + externalize to disk
                     self.post_process_tool_results(tool_count);
@@ -1891,8 +2091,6 @@ impl AgentLoop {
                     // Model runs build/lint itself when needed.
                     // See docs/archive/guardian-auto-compile.md if re-introducing.
 
-                    // Apply discipline: inject status reminders (no STOP commands).
-                    self.apply_post_turn_discipline();
                     // Safety cap at 200 tool calls — only for runaway cost protection.
                     if self.check_step_limit() {
                         self.finish_turn(TurnStopReason::StepLimit);
@@ -1919,34 +2117,32 @@ impl AgentLoop {
 
                     if (is_messages_illegal || is_context_overflow) && self.retry_count < 2 {
                         self.retry_count += 1;
-                        // Try compression first (preserve semantics), fall back to truncation.
                         let sys_prompt = self.build_system_prompt();
-                        self.maybe_compress_history(&sys_prompt).await;
-                        // If compression didn't help enough, truncate as last resort.
-                        // Two shots: one 700K-token mess rarely sheds enough in
-                        // a single compression + 4-msg truncate.
-                        let len = self.conversation.messages.len();
-                        if len > 10 {
-                            self.conversation.messages.truncate(len - 4);
-                            // Bypassing `add_*` mutates `messages` directly, so
-                            // `turn_tracker` now points past the end of the
-                            // message list (last turn's start_idx + msg_count
-                            // can exceed messages.len()). Downstream
-                            // `build_messages` clamps via .min() so we don't
-                            // panic, but the drop-oldest loop uses wrong
-                            // boundaries. Rebuild the tracker from the
-                            // surviving messages — other truncation sites
-                            // (cancel_current_turn, ReloadConfig clear) do
-                            // the equivalent sync inline.
-                            self.conversation.turn_tracker =
-                                crate::conversation::turn::TurnTracker::rebuild(
-                                    &self.conversation.messages,
-                                );
-                        }
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            "\n[Context overflow — compressed history and retrying...]\n"
-                                .to_string(),
-                        ));
+                        // Auto-discover the proxy's actually-enforced limit
+                        // from the error body. Self-built proxies for
+                        // open-weight models often enforce far less than
+                        // the configured ctx_window — without parsing the
+                        // rejection we'd compact toward the wrong target.
+                        let limit = extract_provider_ctx_limit(&e)
+                            .unwrap_or_else(|| self.ctx.ctx_window());
+                        // 5K safety buffer — leaves room for the streaming
+                        // response and one round of tool results before the
+                        // next compact would be needed.
+                        let target = limit.saturating_sub(5_000);
+                        let recovered = self
+                            .emergency_compact_to_target(target, &sys_prompt)
+                            .await;
+                        let msg = if recovered {
+                            "\n[Context overflow — recovered via layered compact, retrying...]\n"
+                                .to_string()
+                        } else {
+                            format!(
+                                "\n[Context overflow — compacted toward {}T but still over, \
+                                 retrying anyway...]\n",
+                                target
+                            )
+                        };
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
                         continue;
                     } else if is_rate_limited && self.retry_count < 5 {
                         self.retry_count += 1;
@@ -2018,14 +2214,51 @@ impl AgentLoop {
     // forward_turn_event → tool_dispatch.rs
     // post_process_tool_results → tool_dispatch.rs
 
-    /// Compress old turns when context > threshold.
-    /// Uses LLM to summarize, falls back to mechanical compression.
+    /// Pro-active context compaction. Two-stage:
+    ///
+    /// 1. **Tier 1 (cheap, mechanical):** collapse old `ToolResult`
+    ///    bodies into stubs (`compact_old_tool_results_in_place`, the
+    ///    same generic stub format `microcompact` uses at render time;
+    ///    keeps the last 3 turns full). Zero LLM calls. Cheap to fire,
+    ///    easy to revert if model needs the bytes back via re-read.
+    ///
+    /// 2. **Tier 2 (expensive, LLM-driven):** if Tier 1 didn't bring
+    ///    the context under threshold, fall through to LLM-summarize
+    ///    older turns into the cold zone (existing path).
+    ///
+    /// Buffer was retuned 2026-05-06: small windows (≤100K, e.g.
+    /// self-hosted GLM 65K) now trigger at 60K instead of 52K, so
+    /// the 5K runway above the trigger lets Tier 1 absorb hits
+    /// before the proxy 65K wall. Datalog 2026-05-06_19-06-50: 4
+    /// reactive emergency compactions, each dropping 18-30K
+    /// catastrophically. With proactive Tier 1 firing 5K below the
+    /// wall, expected pattern is 3-4 mild Tier 1 events dropping
+    /// 5-10K each, model retains skeleton + recent turns.
     async fn maybe_compress_history(&mut self, system_prompt: &str) {
         let sys_tokens = system_prompt.len() / 4 + 4;
         if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
             return;
         }
 
+        // ── Tier 1: collapse old tool_results (no LLM call) ──
+        // Keep the most recent 3 turns at full fidelity; older
+        // turns get their tool_result bodies replaced with the same
+        // generic stub microcompact uses at render time. One stub
+        // format, one place to maintain.
+        crate::ctx::render::compact_old_tool_results_in_place(
+            &mut self.conversation,
+            /* keep_recent_turns */ 3,
+        );
+
+        // Re-check: if Tier 1 was enough, stop here and skip the
+        // LLM summarization round-trip. This is the common case for
+        // sessions where the bulk of context is heavy bash/cargo
+        // outputs.
+        if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
+            return;
+        }
+
+        // ── Tier 2: LLM-summarize oldest turns into cold zone ──
         let (content, n_turns) = match self.ctx.compression_plan(&self.conversation) {
             Some(plan) => plan,
             None => return,
@@ -2159,6 +2392,59 @@ impl AgentLoop {
         }
     }
 
+    /// D2 emergency compact — layered, measured, never combines destructive
+    /// ops. Replaces the previous "LLM-compress + blind truncate(len-4)"
+    /// path that destroyed last-turn context (datalog atomgr-2d99b47d/
+    /// 2026-05-06_08-43-12: 65K → 8516 tokens because compression THEN a
+    /// 4-message truncate ran back-to-back, and the truncate dropped
+    /// exactly the recent file reads the user needed for "继续").
+    ///
+    /// Each tier checks budget against `target` and breaks at the first
+    /// sufficient tier. Returns true if any tier reached the target.
+    ///
+    /// Tiers (least → most destructive):
+    /// 1. Collapse old tool_results (keep last 3 turns full).
+    /// 2. LLM-summarize older turns into cold zone.
+    /// 3. Hard token-driven truncate (drops oldest until under target,
+    ///    snapping to safe boundaries; the last user message is sacred).
+    async fn emergency_compact_to_target(
+        &mut self,
+        target_tokens: usize,
+        system_prompt: &str,
+    ) -> bool {
+        let sys_tokens = system_prompt.len() / 4 + 4;
+        let estimate = |conv: &Conversation| -> usize {
+            sys_tokens + conv.messages.iter().map(|m| m.estimate_tokens()).sum::<usize>()
+        };
+
+        if estimate(&self.conversation) <= target_tokens {
+            return true;
+        }
+
+        // Tier 1: collapse heavy tool results in older turns.
+        crate::ctx::render::compact_old_tool_results_in_place(
+            &mut self.conversation,
+            /* keep_recent_turns */ 3,
+        );
+        if estimate(&self.conversation) <= target_tokens {
+            return true;
+        }
+
+        // Tier 2: LLM-summarize older turns into the cold zone. This is
+        // the most expensive tier (it makes a network round trip), so
+        // we only reach it after Tier 1 already failed.
+        self.maybe_compress_history(system_prompt).await;
+        if estimate(&self.conversation) <= target_tokens {
+            return true;
+        }
+
+        // Tier 3: hard truncate to fit. Token-driven, not message-count
+        // driven. The previous code did `truncate(len - 4)` blindly
+        // which is what produced the 8516-token catastrophe.
+        hard_truncate_to_target(&mut self.conversation, target_tokens, sys_tokens);
+        estimate(&self.conversation) <= target_tokens
+    }
+
     /// Manual `/compact` entry point. Mechanical only — reuses the active
     /// ctx strategy's `compression_plan` (same path as the task-boundary
     /// cleanup in `handle_send_message`) so behavior stays consistent with
@@ -2178,13 +2464,13 @@ impl AgentLoop {
         let system_prompt = self.build_system_prompt();
         let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
-                "(nothing to compact — conversation is short)\n".to_string(),
+                crate::i18n::t(crate::i18n::Msg::CompactNothingShort).into_owned(),
             ));
             return;
         };
 
         let _ = self.event_tx.send(AgentEvent::TextDelta(
-            "(compacting with LLM summary...)\n".to_string(),
+            crate::i18n::t(crate::i18n::Msg::CompactStarting).into_owned(),
         ));
 
         // Try LLM summarization (with optional custom prompt)
@@ -2209,11 +2495,15 @@ impl AgentLoop {
         let outcome = self.try_apply_compression(&system_prompt, n_msgs, content, true);
 
         if !outcome.applied {
-            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                "(nothing to compact — would not save tokens: {} → {})\n",
-                fmt_k_tokens(outcome.before_tokens),
-                fmt_k_tokens(outcome.after_tokens),
-            )));
+            let before = fmt_k_tokens(outcome.before_tokens);
+            let after = fmt_k_tokens(outcome.after_tokens);
+            let _ = self.event_tx.send(AgentEvent::TextDelta(
+                crate::i18n::t(crate::i18n::Msg::CompactNothingNoSavings {
+                    before: &before,
+                    after: &after,
+                })
+                .into_owned(),
+            ));
             let (msgs, _) =
                 self.ctx
                     .build_messages(&self.conversation, &system_prompt, "");
@@ -2221,13 +2511,16 @@ impl AgentLoop {
             return;
         }
 
-        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-            "(compacted — dropped {} message{}, {} → {} tokens)\n",
-            outcome.removed_messages,
-            if outcome.removed_messages == 1 { "" } else { "s" },
-            fmt_k_tokens(outcome.before_tokens),
-            fmt_k_tokens(outcome.after_tokens),
-        )));
+        let before = fmt_k_tokens(outcome.before_tokens);
+        let after = fmt_k_tokens(outcome.after_tokens);
+        let _ = self.event_tx.send(AgentEvent::TextDelta(
+            crate::i18n::t(crate::i18n::Msg::CompactDropped {
+                messages: outcome.removed_messages,
+                before: &before,
+                after: &after,
+            })
+            .into_owned(),
+        ));
 
         let (msgs, _) = self
             .ctx
@@ -2353,302 +2646,16 @@ impl AgentLoop {
 
     // change_dir → services.rs
 
-    /// Try to dispatch sub-agents for parallel multi-file editing.
-    /// Returns Some(summary_text) if dispatch succeeded, None if it should
-    /// fall back to serial subtask execution.
-    async fn try_sub_agent_dispatch(&mut self, _plan_text: &str) -> Option<String> {
-        // Sub-agent disabled: 8 次实测全败，等 Phase 4 用 fork 模式重建。
-        // 当前 fallback 到 serial subtask execution（主 agent 串行编辑）。
-        return None;
-
-        #[allow(unreachable_code)]
-        let wd = self
-            .turn_runner
-            .context
-            .working_dir
-            .try_read()
-            .map(|g| g.clone())
-            .ok()?;
-
-        let subtasks = &self.subtask_driver.subtasks;
-        if subtasks.len() < 2 {
-            return None;
-        }
-
-        // Bug fix tasks should NOT use sub-agents — need serial diagnosis.
-        // Only feature development (create/implement/add/beautify) benefits from parallel.
-        let task_lower = self.current_task.to_lowercase();
-        let is_bugfix = task_lower.contains("报错")
-            || task_lower.contains("错误")
-            || task_lower.contains("修复")
-            || task_lower.contains("修一下")
-            || task_lower.contains("不行")
-            || task_lower.contains("fix")
-            || task_lower.contains("error")
-            || task_lower.contains("broken")
-            || task_lower.contains("bug")
-            || task_lower.contains("还是");
-        if is_bugfix {
-            return None;
-        }
-
-        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-            "\n\n**Dispatching {} sub-agents in parallel...**\n",
-            subtasks.len()
-        )));
-
-        // Read all target files. If any file can't be found, fall back to serial.
-        let mut tasks = Vec::new();
-        let mut all_file_contents: Vec<(String, String)> = Vec::new();
-
-        for subtask in subtasks {
-            // Try to find the file: first check direct path, then walk the tree.
-            let file_path = {
-                let direct = wd.join(&subtask.file);
-                if direct.exists() {
-                    direct
-                } else {
-                    // Walk directory tree to find the file by name
-                    match find_file_recursive(&wd, &subtask.file) {
-                        Some(p) => p,
-                        None => {
-                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                                "  Cannot find {}. Falling back to serial mode.\n",
-                                subtask.file
-                            )));
-                            return None;
-                        }
-                    }
-                }
-            };
-
-            let content = match std::fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(_) => {
-                    let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
-                        "  Cannot read {}. Falling back to serial mode.\n",
-                        subtask.file
-                    )));
-                    return None;
-                }
-            };
-
-            all_file_contents.push((file_path.to_string_lossy().to_string(), content));
-        }
-
-        // Generate sibling skeletons: compact view of other files
-        for i in 0..all_file_contents.len() {
-            let (ref file_path, ref _content) = all_file_contents[i];
-            let mut siblings = String::new();
-            for (j, (ref sib_path, ref sib_content)) in all_file_contents.iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                let short = std::path::Path::new(sib_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| sib_path.clone());
-                // Take first 30 lines as skeleton
-                let skeleton: String = sib_content.lines().take(30).collect::<Vec<_>>().join("\n");
-                siblings.push_str(&format!("### {}\n```\n{}\n```\n\n", short, skeleton));
-            }
-
-            // Extract the task instruction for this file from the plan
-            let file_name = &subtasks[i].file;
-            let task_instr = extract_file_instruction(_plan_text, file_name);
-
-            tasks.push(sub_agent::SubAgentTask {
-                file_path: file_path.clone(),
-                file_content: all_file_contents[i].1.clone(),
-                task_instruction: task_instr,
-                contract: extract_contract(_plan_text),
-                sibling_skeletons: siblings,
-            });
-        }
-
-        // Dispatch
-        let pool = sub_agent::SubAgentPool::new(tasks);
-        let provider = self.turn_runner.provider.clone();
-        let tools = self.tool_registry.clone();
-        let config = self.config.clone();
-
-        let results = pool
-            .execute_all(provider, tools, &config, &wd, &self.event_tx)
-            .await;
-
-        // Build summary
-        let mut summary = String::from("\n**Sub-agent results:**\n");
-        let mut all_success = true;
-        for r in &results {
-            let status = if r.success { "OK" } else { "FAILED" };
-            let short = std::path::Path::new(&r.file_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| r.file_path.clone());
-            summary.push_str(&format!(
-                "| {} | {} | {} turns | {} |\n",
-                short, status, r.turns_used, r.summary,
-            ));
-            if !r.success {
-                all_success = false;
-                for err in &r.errors {
-                    summary.push_str(&format!("  Error: {}\n", err));
-                }
-            }
-            // Track edited files
-            if r.success {
-                if !self.files_edited_this_turn.contains(&r.file_path) {
-                    self.files_edited_this_turn.push(r.file_path.clone());
-                }
-            }
-        }
-
-        if all_success {
-            summary.push_str(&format!(
-                "\nAll {} sub-agents completed successfully.\n",
-                results.len()
-            ));
-        } else {
-            let failed: Vec<_> = results.iter().filter(|r| !r.success).collect();
-            summary.push_str(&format!(
-                "\n{}/{} sub-agents failed.\n",
-                failed.len(),
-                results.len()
-            ));
-        }
-
-        // Merge verification: compile/build to catch cross-file errors.
-        // Search up to 2 levels deep for build markers (handles nested project dirs).
-        let build_cmd_and_dir = find_build_command(&wd);
-
-        if let Some((cmd, build_dir)) = build_cmd_and_dir {
-            let output = tokio::process::Command::new("sh")
-                .args(["-c", &cmd])
-                .current_dir(&build_dir)
-                .output()
-                .await;
-            if let Ok(out) = output {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let combined = format!("{}{}", stdout, stderr);
-                if !out.status.success() || combined.to_lowercase().contains("error") {
-                    let err_lines: String =
-                        combined.lines().take(10).collect::<Vec<_>>().join("\n");
-                    summary.push_str(&format!(
-                        "\n⚠ BUILD ERRORS after sub-agent merge:\n{}\nFix these errors before proceeding.\n",
-                        err_lines
-                    ));
-                } else {
-                    summary.push_str("\n✓ Build verification passed.\n");
-                }
-            }
-        }
-
-        Some(summary)
-    }
+    // try_sub_agent_dispatch → REMOVED. Fork sub-agent dispatch is now
+    // ACTIVE: the model invokes `parallel_edit_files` (see
+    // `crate::tool::parallel_edit`) when it judges parallel edit is the
+    // right move. The framework no longer parses plan text or guesses
+    // intent — eliminating ~250 lines of heuristics, ~70 hardcoded
+    // intent-keywords across two iterations of failed gate logic, and
+    // an entire class of mis-fire failures (read-only turns dispatching
+    // 6 fork sub-agents that fake edits or no-op).
 }
 
-/// Recursively search for a file by name under the given directory.
-/// Returns the first match. Skips hidden dirs, node_modules, target, etc.
-fn find_file_recursive(dir: &std::path::Path, file_name: &str) -> Option<std::path::PathBuf> {
-    let walker = ignore::WalkBuilder::new(dir)
-        .hidden(true) // skip hidden
-        .git_ignore(true) // respect .gitignore
-        .max_depth(Some(10))
-        .build();
-
-    for entry in walker {
-        if let Ok(e) = entry {
-            if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                if let Some(name) = e.path().file_name() {
-                    if name.to_string_lossy() == file_name {
-                        return Some(e.into_path());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract the instruction for a specific file from the plan text.
-/// Looks for lines mentioning the file name and returns them as context.
-fn extract_file_instruction(plan_text: &str, file_name: &str) -> String {
-    let mut relevant_lines = Vec::new();
-    for line in plan_text.lines() {
-        if line.contains(file_name) {
-            relevant_lines.push(line.trim().to_string());
-        }
-    }
-    if relevant_lines.is_empty() {
-        format!("Edit {} according to the plan.", file_name)
-    } else {
-        relevant_lines.join("\n")
-    }
-}
-
-/// Extract contract/interface information from the plan text.
-/// Looks for "Contract", "Interface", "API" sections.
-fn extract_contract(plan_text: &str) -> String {
-    let mut in_contract = false;
-    let mut contract_lines = Vec::new();
-    for line in plan_text.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("contract") || lower.contains("interface") || lower.contains("api") {
-            in_contract = true;
-        }
-        if in_contract {
-            contract_lines.push(line.to_string());
-            // Stop after a blank line following contract section
-            if line.trim().is_empty() && contract_lines.len() > 1 {
-                break;
-            }
-        }
-    }
-    if contract_lines.is_empty() {
-        "No explicit contract defined. Follow the plan.".to_string()
-    } else {
-        contract_lines.join("\n")
-    }
-}
-
-/// LEGACY: Hardcoded build marker detection. Used only by sub-agent merge verification.
-fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBuf)> {
-    let markers: &[(&str, &str)] = &[
-        ("package.json", "npm run build 2>&1 | head -30"),
-        ("Cargo.toml", "cargo check 2>&1 | tail -20"),
-        ("pom.xml", "mvn compile -q 2>&1 | tail -20"),
-        ("go.mod", "go build ./... 2>&1 | tail -20"),
-    ];
-
-    // Check wd itself first
-    for &(marker, cmd) in markers {
-        if wd.join(marker).exists() {
-            return Some((cmd.to_string(), wd.to_path_buf()));
-        }
-    }
-
-    // Check immediate subdirectories (depth 1)
-    if let Ok(entries) = std::fs::read_dir(wd) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let sub = entry.path();
-                // Skip hidden dirs, node_modules, target, etc.
-                let name = sub.file_name().unwrap_or_default().to_string_lossy();
-                if name.starts_with('.') || name == "node_modules" || name == "target" {
-                    continue;
-                }
-                for &(marker, cmd) in markers {
-                    if sub.join(marker).exists() {
-                        return Some((cmd.to_string(), sub));
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
 
 fn track_tool_modified_files(
     tool_name: &str,
@@ -2821,6 +2828,80 @@ fn reload_should_clear_conversation(
     }
 }
 
+/// D2 Tier 1: replace the `output` of every ToolResult in turns older
+/// than the last `keep_recent_turns` with a one-line stub. Cheapest
+/// destructive tier — preserves the conversation skeleton (assistant
+/// text, tool-call shapes, paired result IDs) so the model can still
+/// reason about *what was attempted*, just not the heavy outputs.
+///
+/// The previous emergency path (`truncate(len - 4)`) destroyed the
+/// skeleton too. Keeping it intact is what lets the model resume
+/// after compaction without re-exploring.
+/// D2 Tier 3: drop oldest messages until total tokens (incl. system) <=
+/// `target_tokens`. Token-driven — never drops a fixed number of
+/// messages, since that's how `truncate(len - 4)` corrupted state.
+///
+/// Sacred invariants (won't violate even if it means staying over budget):
+/// 1. The last `User` message is kept (current task anchor).
+/// 2. The drop boundary snaps to a turn boundary so we never split a
+///    `tool_call` from its paired `tool_result`.
+fn hard_truncate_to_target(
+    conv: &mut crate::conversation::Conversation,
+    target_tokens: usize,
+    sys_tokens: usize,
+) {
+    use crate::conversation::message::{MessageContent, Role};
+    if conv.messages.is_empty() {
+        return;
+    }
+    let total_budget = target_tokens.saturating_sub(sys_tokens);
+
+    // Find the last User message — it must survive.
+    let last_user_idx = conv
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| m.role == Role::User)
+        .map(|(i, _)| i);
+
+    let mut kept_tokens = 0usize;
+    let mut keep_from = conv.messages.len();
+    for i in (0..conv.messages.len()).rev() {
+        let mt = conv.messages[i].estimate_tokens();
+        // Always keep the last user message regardless of budget.
+        let is_sacred = Some(i) == last_user_idx;
+        if !is_sacred && kept_tokens + mt > total_budget && keep_from < conv.messages.len() {
+            break;
+        }
+        kept_tokens += mt;
+        keep_from = i;
+    }
+
+    // Snap forward: don't start at a ToolResult orphan (its paired
+    // assistant tool_call would be in the dropped section). Keep
+    // walking forward until we land on a User or AssistantText message.
+    while keep_from < conv.messages.len() {
+        match &conv.messages[keep_from].content {
+            MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
+                keep_from += 1;
+            }
+            _ => break,
+        }
+    }
+    // Don't skip past the sacred last-user index even if the boundary
+    // walker would have taken us there — better to ship one stub
+    // tool_result than to drop the user msg.
+    if let Some(lu) = last_user_idx {
+        keep_from = keep_from.min(lu);
+    }
+
+    if keep_from > 0 {
+        conv.messages.drain(0..keep_from);
+        conv.turn_tracker = crate::conversation::turn::TurnTracker::rebuild(&conv.messages);
+    }
+}
+
 /// True when an upstream API error string indicates the request exceeded
 /// the model's context-length budget. Covers OpenRouter's verbose 400
 /// message, OpenAI's `context_length_exceeded` code, and Anthropic's
@@ -2835,8 +2916,66 @@ fn is_context_overflow_error(e: &str) -> bool {
         || e.contains("reduce the length")
 }
 
+/// Extract the provider's actually-enforced context limit from a 400/
+/// overflow error message, if it's discoverable. Used by D2 emergency
+/// compaction so we compact toward the *real* limit (proxy-enforced)
+/// rather than the configured ctx_window — which can be much larger
+/// than what the upstream actually accepts.
+///
+/// Self-built proxies for open-weight models are the worst offender:
+/// the model is nominally 128K but the proxy enforces 64K, and the
+/// framework can't know that without parsing the rejection.
+///
+/// Recognised shapes (case-sensitive, all observed in real datalogs):
+/// - OpenAI / GLM proxy: `maximum context length is 65536 tokens`
+/// - OpenRouter: `This endpoint's maximum context length is 200000 tokens`
+/// - Generic: `context length of 32768`
+/// - Anthropic-ish: `prompt is too long: 200000 tokens > 200000 maximum`
+fn extract_provider_ctx_limit(e: &str) -> Option<usize> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // Three anchors, any of them satisfies. Number captured is the
+        // smallest plausible limit token count (≥ 1024 — drop very small
+        // numbers that appear in unrelated parts of error bodies).
+        regex::Regex::new(
+            r"(?:maximum context length (?:is|of)|context length of|context length limit (?:is|of)|tokens? > (?P<rhs>\d+))\s*(?P<lhs>\d+)?",
+        )
+        .expect("valid regex")
+    });
+    for caps in re.captures_iter(e) {
+        let n = caps
+            .name("lhs")
+            .or_else(|| caps.name("rhs"))
+            .and_then(|m| m.as_str().parse::<usize>().ok());
+        // Filter out tiny numbers that aren't real ctx limits — every
+        // realistic context window is at least a few thousand tokens.
+        if let Some(n) = n {
+            if n >= 1024 {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 fn is_rate_limited_error(e: &str) -> bool {
-    e.contains("429") || e.contains("rate") || e.contains("Too Many")
+    // English / HTTP standard patterns.
+    if e.contains("429") || e.contains("rate") || e.contains("Too Many") {
+        return true;
+    }
+    // Chinese / gateway-side patterns. GitCode's litellm proxy on
+    // glm-5.1 returns the user-facing 「模型「X」的请求负载过高，
+    // 请稍后再试」 message via in-stream SSE (then closes the
+    // connection without [DONE], surfaced as StreamEvent::Error by
+    // openai.rs's abrupt-close discriminator). Without these
+    // patterns the error fell through to the generic 3-shot retry
+    // branch — proper rate-limit handling (5 retries, 3-30s
+    // exponential backoff) only fires when this matches.
+    e.contains("请求负载过高")
+        || e.contains("请求过于频繁")
+        || e.contains("服务繁忙")
+        || e.contains("限流")
 }
 
 fn is_auth_error(e: &str) -> bool {
@@ -2966,8 +3105,9 @@ fn fmt_k_tokens(t: usize) -> String {
 #[cfg(test)]
 mod classifier_tests {
     use super::{
-        is_auth_error, is_context_overflow_error, is_rate_limited_error, public_error_message,
-        public_error_reason, reload_should_clear_conversation,
+        extract_provider_ctx_limit, is_auth_error, is_context_overflow_error,
+        is_rate_limited_error, public_error_message, public_error_reason,
+        reload_should_clear_conversation,
     };
 
     // ── reload_should_clear_conversation ──
@@ -3062,6 +3202,240 @@ mod classifier_tests {
     }
 
     #[test]
+    fn extract_glm_proxy_ctx_limit() {
+        // From the actual datalog that motivated D2.
+        let msg = "API error (400 Bad Request) at `http://115.120.18.212:18005/v1/chat/completions`: \
+                   {\"error\":{\"message\":\"This model's maximum context length is 65536 tokens. \
+                   However, you requested 15210 output tokens and your prompt contains at least \
+                   50327 input tokens, for a total of at least 65537 tokens.\"}}";
+        assert_eq!(extract_provider_ctx_limit(msg), Some(65536));
+    }
+
+    #[test]
+    fn extract_openrouter_ctx_limit() {
+        let msg = "API error (400): This endpoint's maximum context length is 204800 tokens. \
+                   However, you requested about 745279 tokens";
+        assert_eq!(extract_provider_ctx_limit(msg), Some(204800));
+    }
+
+    #[test]
+    fn extract_anthropic_prompt_too_long() {
+        let msg = "prompt is too long: 200000 tokens > 200000 maximum";
+        assert_eq!(extract_provider_ctx_limit(msg), Some(200000));
+    }
+
+    #[test]
+    fn extract_no_limit_returns_none_for_non_overflow_errors() {
+        assert_eq!(extract_provider_ctx_limit("429 Too Many Requests"), None);
+        assert_eq!(extract_provider_ctx_limit("401 Unauthorized"), None);
+        assert_eq!(extract_provider_ctx_limit(""), None);
+    }
+
+    #[test]
+    fn extract_filters_out_implausibly_small_numbers() {
+        // Status codes and small ints in error bodies must not be
+        // mistaken for context limits.
+        let msg = "Error 400: maximum context length is 200 tokens";
+        assert_eq!(extract_provider_ctx_limit(msg), None);
+    }
+
+    // ── D2 emergency compact tier helpers ──
+
+    use crate::conversation::{Conversation, message::MessageContent};
+    use crate::tool::{ToolCall, ToolResult};
+
+    /// Build a synthetic conversation with `n_turns` turns, each carrying
+    /// one user message + one assistant tool_call + one tool_result of
+    /// `result_size` chars.
+    fn build_conv(n_turns: usize, result_size: usize) -> Conversation {
+        let mut conv = Conversation::new();
+        for t in 0..n_turns {
+            conv.add_user_message(&format!("turn {} request", t));
+            conv.add_assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: format!("call_{}", t),
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"/x"}"#.into(),
+                }],
+                None,
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", t),
+                output: "x".repeat(result_size),
+                success: true,
+            });
+        }
+        conv
+    }
+
+    fn count_collapsed_results(conv: &Conversation) -> usize {
+        // New unified stub format: `[<tool> <ok|FAILED>: N lines, first: …]`.
+        // The substring " lines, first:" is unique to the stub shape and
+        // robust whether the tool name is "bash", "grep", or "tool".
+        conv.messages
+            .iter()
+            .filter(|m| match &m.content {
+                MessageContent::ToolResult(tr) => tr.output.contains(" lines, first:"),
+                _ => false,
+            })
+            .count()
+    }
+
+    /// Phase 1 proactive compact: Tier 1 (collapse) is enough for the
+    /// common case — heavy old tool_result bodies become stubs and
+    /// the conversation token total drops below threshold without
+    /// invoking the LLM-summary round trip. Tier 2 only fires when
+    /// Tier 1 wasn't enough. This test pins the contract that Tier 1
+    /// is invoked first; Tier 2 path is covered separately by the
+    /// existing emergency-compact tests.
+    #[test]
+    fn proactive_tier1_collapses_old_tool_results_only() {
+        // Build a conversation heavy with old, large tool_results
+        // (typical bash/cargo session shape). After Tier 1 with
+        // keep_recent_turns=3, the 3 OLDEST turns' tool_results
+        // should be stubs while the 3 RECENT turns retain full
+        // payload. Pins the "older=collapsed, newer=intact" split.
+        let mut conv = build_conv(/* n_turns */ 6, /* result_size */ 4_000);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3);
+
+        // Walk the messages: each turn pushes (User, AssistantToolCall,
+        // ToolResult). 6 turns × 3 msgs = 18 msgs. The first 3 turns
+        // are "old"; turns 4-6 are "recent".
+        let mut tr_sizes: Vec<usize> = Vec::new();
+        for m in &conv.messages {
+            if let MessageContent::ToolResult(tr) = &m.content {
+                tr_sizes.push(tr.output.len());
+            }
+        }
+        assert_eq!(tr_sizes.len(), 6, "expected 6 tool_results");
+        // Old: index 0, 1, 2 — must be stubs (small).
+        for &s in &tr_sizes[..3] {
+            assert!(
+                s < 200,
+                "old tool_result must collapse to stub; got len={}",
+                s
+            );
+        }
+        // Recent: index 3, 4, 5 — must remain full (4_000 chars + the
+        // 'x' chars).
+        for &s in &tr_sizes[3..] {
+            assert!(
+                s >= 4_000,
+                "recent tool_result must remain full; got len={}",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn collapse_keeps_last_n_turns_full() {
+        let mut conv = build_conv(5, 1024);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2);
+        // 5 turns, keep last 2 → first 3 should have stubbed tool_results.
+        assert_eq!(count_collapsed_results(&conv), 3);
+    }
+
+    #[test]
+    fn collapse_skips_already_tiny_results() {
+        // Tool results under 200 chars aren't worth collapsing — the stub
+        // would weigh more than the original.
+        let mut conv = build_conv(5, 50);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 2);
+        assert_eq!(count_collapsed_results(&conv), 0);
+    }
+
+    #[test]
+    fn collapse_no_op_when_under_keep_threshold() {
+        let mut conv = build_conv(2, 1024);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 3);
+        // Only 2 turns total, keep 3 — nothing to collapse.
+        assert_eq!(count_collapsed_results(&conv), 0);
+    }
+
+    #[test]
+    fn collapse_preserves_call_id_and_success_flag() {
+        let mut conv = build_conv(3, 1024);
+        crate::ctx::render::compact_old_tool_results_in_place(&mut conv, 1);
+        // Verify call_0's tool_result still has the right call_id even
+        // though its body was stubbed — preserves tool_call/tool_result
+        // pairing for OpenAI-style providers.
+        let tr = conv
+            .messages
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::ToolResult(tr) if tr.call_id == "call_0" => Some(tr),
+                _ => None,
+            })
+            .expect("call_0 result must still exist");
+        // New unified stub format: `[<tool> <ok|FAILED>: N lines, first: …]`.
+        assert!(tr.output.contains(" lines, first:"));
+        assert!(tr.output.starts_with("["));
+        assert!(tr.success);
+    }
+
+    #[test]
+    fn hard_truncate_keeps_last_user_message_even_under_budget() {
+        // Tight budget that forces aggressive drops; sacred invariant
+        // says the last user msg must survive regardless. This is the
+        // structural guarantee the previous `truncate(len-4)` code
+        // *violated*, producing the 8516-token catastrophe.
+        let mut conv = build_conv(10, 2048);
+        super::hard_truncate_to_target(&mut conv, /* target */ 100, /* sys */ 50);
+        let has_user = conv
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, crate::conversation::message::Role::User));
+        assert!(has_user, "last user message must survive even at tight budget");
+    }
+
+    #[test]
+    fn hard_truncate_does_not_start_with_orphan_tool_result() {
+        // After truncate the first surviving message must NOT be a
+        // ToolResult — that would orphan it from its paired assistant
+        // tool_call, which OpenAI-style APIs reject with 400.
+        let mut conv = build_conv(8, 1024);
+        super::hard_truncate_to_target(&mut conv, /* target */ 2000, /* sys */ 100);
+        if let Some(first) = conv.messages.first() {
+            assert!(
+                !matches!(
+                    first.content,
+                    MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_)
+                ),
+                "first surviving message must not be an orphan tool_result"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_truncate_no_op_when_already_under_target() {
+        let mut conv = build_conv(3, 100);
+        let before = conv.messages.len();
+        super::hard_truncate_to_target(&mut conv, /* target */ 100_000, /* sys */ 100);
+        assert_eq!(conv.messages.len(), before);
+    }
+
+    #[test]
+    fn hard_truncate_rebuilds_turn_tracker() {
+        // After draining messages from the front, the turn_tracker must
+        // be rebuilt so its Turn entries point at valid indices. Without
+        // this, the next build_messages crashes or silently emits wrong
+        // boundaries (the bug the old `truncate(len-4)` path also
+        // patched, but inconsistently — see the rebuild call there).
+        let mut conv = build_conv(10, 2048);
+        super::hard_truncate_to_target(&mut conv, /* target */ 1000, /* sys */ 100);
+        // Every turn's start_idx must be a valid index into messages.
+        for t in &conv.turn_tracker.turns {
+            assert!(
+                t.start_idx <= conv.messages.len(),
+                "turn start_idx {} out of bounds (messages.len()={})",
+                t.start_idx,
+                conv.messages.len()
+            );
+        }
+    }
+
+    #[test]
     fn stream_timeout_is_summarized() {
         // public_error_message defers to ATOMCODE_SHOW_RAW_API_ERROR (raw by
         // default), so the user-facing string can't be tested deterministically
@@ -3093,6 +3467,26 @@ mod classifier_tests {
     #[test]
     fn rate_limit_error_is_detected() {
         assert!(is_rate_limited_error("API error (429 Too Many Requests)"));
+    }
+
+    /// Chinese gateway-side rate-limit blobs streamed in-band by
+    /// GitCode litellm (and similar proxies) must route to the
+    /// proper rate-limit retry path (5 attempts × 3-30s backoff),
+    /// not the generic 3-shot fallback. Without this the
+    /// abrupt-close discriminator in openai.rs converts the SSE
+    /// blob to StreamEvent::Error but the agent then mis-retries
+    /// it.
+    #[test]
+    fn rate_limit_error_detects_chinese_gateway_patterns() {
+        assert!(is_rate_limited_error("模型「GLM-5.1」的请求负载过高，请稍后再试。"));
+        assert!(is_rate_limited_error("请求过于频繁，请稍后再试"));
+        assert!(is_rate_limited_error("服务繁忙"));
+        assert!(is_rate_limited_error("当前已被限流"));
+        // Negative: a vanilla error must NOT be classified as rate
+        // limit just because it mentions "请稍后再试" alone
+        // (which is generic Chinese "try again later").
+        assert!(!is_rate_limited_error("请稍后再试"));
+        assert!(!is_rate_limited_error("API error (500 Internal Server Error)"));
     }
 
     #[test]
@@ -3284,3 +3678,4 @@ mod bash_deleted_file_tracking_tests {
         );
     }
 }
+

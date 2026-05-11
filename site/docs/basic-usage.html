@@ -124,8 +124,8 @@ atomcode --config ./custom.toml</code></pre>
       <p>在 TUI 中:</p>
       <ul>
         <li><code>Enter</code> 发送消息</li>
-        <li><code>Shift+Enter</code> 换行(不发送)</li>
-        <li><code>Alt+Enter</code> / <code>Ctrl+Enter</code> 也换行(不发送)</li>
+        <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> / <code>Ctrl+J</code> 换行(需要 Kitty 键盘协议: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21)</li>
+        <li><code>Alt+Enter</code> 换行(多数终端可用,但 Windows Terminal 默认绑给"切换全屏",需在设置里解绑)</li>
         <li>输入框高度会随内容自动增长</li>
       </ul>
 
@@ -134,6 +134,27 @@ atomcode --config ./custom.toml</code></pre>
 
       <h2>粘贴长文本</h2>
       <p>AtomCode 支持 bracketed paste。当你粘贴一段很长的内容(比如一堆日志)时,TUI 会把它折叠成一个紧凑的 <em>[paste #N · 132 lines]</em> 指示器,避免输入框被撑爆。发送时会完整带入。</p>
+
+      <h2 id="image-attach">图片附件 / 截图</h2>
+      <p>除了文本,你还能把<strong>图片</strong>带进对话 — 报错截图、UI mock、白板照片等。AtomCode 提供三条入口,任选其一:</p>
+      <ul>
+        <li><strong>Ctrl+V</strong> — 系统剪贴板里有图片时(刚 <code>Cmd+Shift+4</code> 截图、从浏览器复制图等),按 Ctrl+V 直接 attach。这是 macOS + iTerm2 等终端默认 Cmd+V 不传图给 PTY 时的兜底方案,任何终端都通用。</li>
+        <li><strong>Cmd+V(macOS / iTerm2,需简单配置)</strong> — iTerm2 → Settings → Profiles → Keys → Key Mappings,把 <code>⌘V</code> 映射为 <code>Send Hex Codes: 0x16</code>,之后 Cmd+V 就跟 Ctrl+V 等价。</li>
+        <li><strong>Finder 拖拽 / iTerm2 自动转路径</strong> — 把一张图直接拖进终端窗口,iTerm2 / Wezterm 等会把文件路径以 plaintext 方式粘进来;AtomCode 识别到绝对路径 + <code>.png</code> / <code>.jpg</code> / <code>.jpeg</code> / <code>.gif</code> / <code>.webp</code> 扩展名 + 文件存在 + 大小 ≤ 20MB 时,会自动读取文件并 attach。原始路径字符串不会留在输入框里。</li>
+      </ul>
+      <p>每次成功 attach 时,输入框会就地插入一个 <code>[Image #N]</code> 标记,提交时图片字节随消息一起发。状态栏右侧也会出现 <em>Image in clipboard · ctrl+v to paste</em> 的提示(剪贴板还有未粘的图时)。</p>
+
+      <h3>非视觉模型怎么处理图片?</h3>
+      <p>当前 active provider 不支持图片输入(比如 DeepSeek-V3 / Kimi 等纯文本模型)时,AtomCode 不会直接拒绝,而是会自动调用一个独立的 <strong>VL preprocessor</strong>(视觉模型,比如 Qwen3-VL / GLM-4V)对图片做 OCR + 描述,把结果作为文本 splice 到用户消息里再发给主模型。这样无论主模型支不支持图片,你都能"贴张截图问问题"。</p>
+      <ul>
+        <li>preprocessor 用哪个模型?由配置文件里的 <code>vision_preprocessor_provider</code> 决定 — 详见 <a href="./configuration.html#vision-preprocessor">配置文件 · 视觉预处理器</a>。</li>
+        <li><code>/codingplan</code> 流程会自动从模型列表里挑一个 VL/OCR 模型自动设置进去。</li>
+        <li>VL 调用使用<strong>无进展超时</strong>(idle timeout):只要 stream 持续吐 chunk,不限总时长;30 秒没动静才算超时。失败时会以 <em>VL 预处理失败</em> 的警告呈现,图片识别失败但消息照常发。</li>
+      </ul>
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>如果当前模型本身就支持视觉输入(Claude 3+ / GPT-4o / Gemini / Qwen-VL 等),会直接发原始图片字节,不走 preprocessor。</p>
+      </div>
 
       <h2>切换会话和目录</h2>
       <ul>
@@ -154,7 +175,7 @@ atomcode --config ./custom.toml</code></pre>
 
       <h2>下一步</h2>
       <ul>
-        <li><a href="./slash-commands.html">斜杠命令</a> —— 17 个命令的完整参考</li>
+        <li><a href="./slash-commands.html">斜杠命令</a> —— 30+ 个命令的完整参考</li>
         <li><a href="./keybindings.html">快捷键</a> —— 熟练使用键盘将大幅提升效率</li>
       </ul>
     </main>

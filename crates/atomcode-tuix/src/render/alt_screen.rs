@@ -31,6 +31,7 @@
 use std::io::{self, BufWriter, Stdout, Write};
 
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
+use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use crate::width::{display_width, truncate_to_width};
@@ -304,11 +305,29 @@ fn base64_encode(input: &[u8]) -> String {
 // alt_screen will diverge from plain on more dimensions in later phases
 // and shared constants would create a noisy upstream-change footprint.
 const SGR_RESET: &str = "\x1b[0m";
-const SGR_RED: &str = "\x1b[31m";
-const SGR_GREEN: &str = "\x1b[32m";
-const SGR_MAGENTA: &str = "\x1b[35m"; // Role::Brand — see render/theme.rs
-const SGR_CYAN: &str = "\x1b[36m";
+const SGR_RED: &str = "\x1b[91m";
+const SGR_GREEN: &str = "\x1b[92m";
+const SGR_MAGENTA: &str = "\x1b[95m"; // Role::Brand — see render/theme.rs
+const SGR_CYAN: &str = "\x1b[96m"; // Role::Border / Accent — bright variant; the
+                                   // dim 36m form rendered the input-box rule
+                                   // as visibly "dashed" on Windows Terminal
+                                   // because the muted cyan let font-glyph
+                                   // gaps in `─` show through. Bright cyan
+                                   // matches retained's `Palette::BORDER`
+                                   // (Color::Cyan ≡ SGR 96 in crossterm) and
+                                   // closes the cross-renderer drift.
 const SGR_DIM: &str = "\x1b[2m";
+const SGR_GREY: &str = "\x1b[90m"; // Role::Muted — bright black / mid-gray.
+                                   // Prefer over SGR 2m on Windows conhost
+                                   // (< 1809 historically swallowed dim);
+                                   // matches retained's `Palette::MUTED`
+                                   // which crossterm emits as SGR 90.
+const SGR_BOLD: &str = "\x1b[1m";
+const SGR_YELLOW: &str = "\x1b[93m";
+/// Reverse video — swap fg/bg. Combined with a coloured fg this paints
+/// a coloured "chip" with the underlying default-bg as the chip's text
+/// colour. Used by the approval-prompt Y/A/N badges.
+const SGR_REVERSE: &str = "\x1b[7m";
 
 /// Default cap on `body_lines` length. ~5000 rows × ~200 bytes/row
 /// (rough average for SGR-decorated text) is ~1 MB per session — fine
@@ -331,6 +350,15 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// Drop pops only when this is true so a failed enter doesn't try
     /// to pop a buffer we never owned.
     alt_screen_active: bool,
+    /// Saved Win32 console-input mode captured when we flipped the
+    /// mouse-capture bits. `Drop` / `leave_alt_screen` write this back
+    /// so the parent shell gets its quick-edit / line-input state
+    /// returned exactly as it was, not approximated. `None` means we
+    /// never successfully read the original (e.g. stdin not a console)
+    /// — in that case we don't try to restore. Windows-only because
+    /// other platforms route mouse capture through VT escape codes.
+    #[cfg(windows)]
+    prior_console_in_mode: Option<u32>,
     /// Cached width / height. Updated by resize in Phase 4.
     width: u16,
     height: u16,
@@ -389,6 +417,12 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// field. None → no menu paint. Up to 4 items shown at once;
     /// pagination around `selected` when there are more.
     pending_menu: Option<MenuPayload>,
+    /// Image-attachment marker numbers currently visible inside the
+    /// input buffer (intersection of typed `[Image #N]` literals with
+    /// real pending bytes — see `event_loop::compute_input_attachments`).
+    /// Each gets a `└ [Image #N]` preview row rendered between the
+    /// bot_rule and the menu, mirroring the retained renderer.
+    pending_attachments: Vec<usize>,
     /// True when footer state changed since the last paint. Same role
     /// as `body_dirty` but for the footer strip.
     footer_dirty: bool,
@@ -410,6 +444,25 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// shift `head` to wherever the cursor was when the buffered
     /// frame arrived.
     selection_active: bool,
+    /// Tracks whether the terminal cursor is currently shown (`?25h`
+    /// last emitted) or hidden (`?25l`). Used to dedupe visibility
+    /// toggles per frame: re-emitting `?25h` at streaming framerate
+    /// restarts the host terminal's hardware cursor blink animation,
+    /// which on macOS Terminal.app reads as constant flicker even
+    /// after `?12l` disabled hardware blink (the show pulse itself is
+    /// the visible flash). Initialised to `true` because terminals
+    /// default to a visible cursor.
+    cursor_shown: bool,
+    /// True on terminals that process CUP sequences synchronously
+    /// (JediTerm, legacy conhost) — paint_body's per-row CUPs would
+    /// otherwise visibly trail the cursor through every body row.
+    /// On those we hide cursor before paint_body and re-show in
+    /// paint_footer's tail. False on fast terminals (macOS Terminal.app,
+    /// iTerm2, modern xterm, WezTerm, Kitty), where paint completes in
+    /// well under a frame and the per-frame hide/show toggle reads
+    /// instead as flicker — we leave cursor visible the whole time
+    /// and only reposition it via a CUP at frame end.
+    slow_paint_terminal: bool,
 }
 
 /// Mouse-drag selection range. See `AltScreenRenderer::selection` for
@@ -438,9 +491,79 @@ impl Selection {
 }
 
 impl AltScreenRenderer<BufWriter<Stdout>> {
-    pub fn new(caps: TerminalCaps) -> Self {
+    pub fn new(caps: TerminalCaps, slow_paint_terminal: bool) -> Self {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-        Self::with_writer(BufWriter::new(io::stdout()), caps, w, h)
+        let mut r = Self::with_writer(BufWriter::new(io::stdout()), caps, w, h);
+        r.slow_paint_terminal = slow_paint_terminal;
+        r
+    }
+}
+
+/// Read STD_INPUT_HANDLE's current console mode, OR-in the bits required
+/// for mouse-event delivery on conhost, AND-out `ENABLE_QUICK_EDIT_MODE`,
+/// and write the result back. Returns the original mode on success so
+/// `leave_alt_screen` can restore it byte-for-byte; returns `None` if
+/// either GetConsoleMode or SetConsoleMode fails (typically: stdin was
+/// redirected and isn't a console handle, e.g. running under a pipe).
+///
+/// All results are mirrored to `tuix_trace!` (gated on
+/// `ATOMCODE_TUIX_LOG`) so a "wheel still doesn't work" report shows
+/// exactly which syscall returned what mask.
+#[cfg(windows)]
+fn enable_conhost_mouse_capture() -> Option<u32> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS,
+        ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT, STD_INPUT_HANDLE,
+    };
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        // GetStdHandle returns INVALID_HANDLE_VALUE (`!0 as HANDLE`) on
+        // failure; on Windows that's `-1isize as *mut c_void`. Treat
+        // null and "all bits set" as failure shapes.
+        if h.is_null() || h as isize == -1 {
+            crate::tuix_trace!("REN", "conhost-mouse: GetStdHandle returned invalid");
+            return None;
+        }
+        let mut original: u32 = 0;
+        if GetConsoleMode(h, &mut original) == 0 {
+            let err = std::io::Error::last_os_error();
+            crate::tuix_trace!("REN", "conhost-mouse: GetConsoleMode failed: {}", err);
+            return None;
+        }
+        let new_mode = (original | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
+            & !ENABLE_QUICK_EDIT_MODE;
+        if SetConsoleMode(h, new_mode) == 0 {
+            let err = std::io::Error::last_os_error();
+            crate::tuix_trace!(
+                "REN",
+                "conhost-mouse: SetConsoleMode(0x{:08x}) failed: {}",
+                new_mode,
+                err
+            );
+            return None;
+        }
+        crate::tuix_trace!(
+            "REN",
+            "conhost-mouse: ok prev=0x{:08x} new=0x{:08x}",
+            original,
+            new_mode
+        );
+        Some(original)
+    }
+}
+
+/// Restore STD_INPUT_HANDLE's console mode to the value `enable_conhost_
+/// mouse_capture` returned. Best-effort — failure here just means the
+/// shell mode bits drift slightly on exit; better than aborting.
+#[cfg(windows)]
+fn restore_conhost_console_in_mode(prior: u32) {
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE};
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        if h.is_null() || h as isize == -1 {
+            return;
+        }
+        let _ = SetConsoleMode(h, prior);
     }
 }
 
@@ -450,6 +573,8 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             out,
             caps,
             alt_screen_active: false,
+            #[cfg(windows)]
+            prior_console_in_mode: None,
             width: w,
             height: h,
             body_lines: Vec::new(),
@@ -463,9 +588,12 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             pending_status: StatusLine::default(),
             pending_spinner: None,
             pending_menu: None,
+            pending_attachments: Vec::new(),
             footer_dirty: true,
             selection: None,
             selection_active: false,
+            cursor_shown: true,
+            slow_paint_terminal: false,
         };
         r.enter_alt_screen();
         r
@@ -482,12 +610,13 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     }
 
     /// Total rows reserved for the footer. Variable because the
-    /// slash-menu palette grows / shrinks the footer dynamically:
+    /// slash-menu palette + attachment preview rows grow / shrink the
+    /// footer dynamically:
     ///   spinner (1) + top_rule (1) + input (1) + bot_rule (1)
-    ///   + menu (0..4) + status (1) = 5..9
+    ///   + attachments (0..N) + menu (0..4) + status (1) = 5..N+9
     fn footer_rows(&self) -> u16 {
         // spinner + top_rule + input + bot_rule + status = 5 base
-        5 + self.menu_paint_rows()
+        5 + self.menu_paint_rows() + self.pending_attachments.len() as u16
     }
 
     /// Body region height = total rows − footer rows. Always at least 1
@@ -512,13 +641,54 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     ///     unaffected by the upgrade.
     ///   * `\x1b[?1006h` — SGR-extended coordinates (replaces the
     ///     legacy fixed-byte format that breaks past col 223)
+    ///   * `\x1b[?12l` — disable cursor blinking. macOS Terminal.app's
+    ///     hardware blink restarts on every show-cursor (`\x1b[?25h`),
+    ///     so paint_frame's hide→repaint→show cycle (one per keystroke)
+    ///     looked like a non-stop flicker. Restored to `?12h` on leave.
     ///
     /// Best-effort: if the writer fails, `alt_screen_active` stays
     /// false and Drop won't try to pop.
     fn enter_alt_screen(&mut self) {
-        let seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1002h\x1b[?1006h";
+        let seq = "\x1b[?1049h\x1b[H\x1b[2J\x1b[?1002h\x1b[?1006h\x1b[?12l";
         if self.out.write_all(seq.as_bytes()).is_ok() && self.out.flush().is_ok() {
             self.alt_screen_active = true;
+            // Legacy Windows conhost (Win10 PowerShell 5/7, cmd.exe)
+            // does NOT implement the VT mouse-mode toggles above —
+            // `?1002h` / `?1006h` parse as no-ops. Mouse events only
+            // flow when `ENABLE_MOUSE_INPUT` is set on the console
+            // input handle via `SetConsoleMode`, AND when
+            // `ENABLE_QUICK_EDIT_MODE` is cleared (otherwise conhost
+            // intercepts mouse for text-selection and never delivers
+            // events to the program — wheel ticks included on some
+            // versions).
+            //
+            // We previously routed this through crossterm's
+            // `EnableMouseCapture`. Field reports (Win10 PS7) showed
+            // wheel still didn't work even after that fix shipped.
+            // crossterm's Windows path calls `set_mode(ENABLE_MOUSE_
+            // INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)` —
+            // an OVERWRITE of the entire mode. That:
+            //   1. drops `ENABLE_VIRTUAL_TERMINAL_INPUT` and any
+            //      other bits raw_mode set up,
+            //   2. doesn't surface SetConsoleMode failures (we
+            //      `let _ =` the result),
+            //   3. relies on `ENABLE_QUICK_EDIT_MODE` being clearable
+            //      via implicit-absent semantics in the new mask,
+            //      which works on most conhost builds but isn't the
+            //      shape Microsoft's own samples use.
+            //
+            // Switch to read-modify-write through windows-sys: read
+            // the current mode, OR in the mouse bits, AND-out
+            // `ENABLE_QUICK_EDIT_MODE` explicitly, write back. Save
+            // the original for `leave_alt_screen` so the parent shell
+            // gets its mode restored exactly. Surface the
+            // GetConsoleMode/SetConsoleMode return codes via the
+            // trace log so a "still doesn't work" report tells us
+            // immediately whether the syscalls even succeeded.
+            #[cfg(windows)]
+            {
+                self.prior_console_in_mode = enable_conhost_mouse_capture();
+            }
         }
     }
 
@@ -532,7 +702,18 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             // Disable mouse capture FIRST — if alt-screen pops while
             // mouse mode is still on, some terminals leak `\x1b[<...M`
             // events into the main screen until something resets them.
-            let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1049l");
+            // On Windows we additionally restore the exact pre-enter
+            // SetConsoleMode bitmask we saved in `enter_alt_screen`,
+            // so the parent shell gets its quick-edit / line-input
+            // flags back as they were (not "approximated" by
+            // crossterm's saved-original snapshot).
+            #[cfg(windows)]
+            {
+                if let Some(prior) = self.prior_console_in_mode.take() {
+                    restore_conhost_console_in_mode(prior);
+                }
+            }
+            let _ = self.out.write_all(b"\x1b[?25h\x1b[?12h\x1b[?1006l\x1b[?1002l\x1b[?1049l");
             let _ = self.out.flush();
             self.alt_screen_active = false;
         }
@@ -626,7 +807,16 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 let _ = self.out.write_all(b"\x1b[0m");
             }
         }
-        let _ = self.out.flush();
+        // No flush here: paint_frame batches body + footer +
+        // anchor_cursor_to_input into a single flush at the very
+        // end so the terminal renders only the final cursor
+        // position. Flushing mid-frame (after the per-row CUPs
+        // walked the cursor through every body row) gave macOS
+        // Terminal.app a vsync window to draw the cursor at
+        // intermediate body positions before anchor moved it
+        // back, which read as a cursor "blinking" mid-screen
+        // during streaming. Tests call `r.flush()` explicitly
+        // after `r.paint_body()`.
         self.body_dirty = false;
     }
 
@@ -740,39 +930,65 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let total_footer = self.footer_rows();
         let footer_top = h.saturating_sub(total_footer) + 1; // 1-indexed
         let menu_rows = self.menu_paint_rows();
+        let attachment_rows = self.pending_attachments.len() as u16;
         let spinner_row = footer_top;
         let top_rule_row = footer_top + 1;
         let input_row = footer_top + 2;
         let bot_rule_row = footer_top + 3;
-        let menu_first_row = footer_top + 4;
-        let status_row = footer_top + 4 + menu_rows;
+        // Attachment preview rows (`└ [Image #N]`) sit between the
+        // bot_rule and the menu — same slot the retained renderer uses
+        // (see `RetainedRenderer::paint_footer`). Count is variable so
+        // menu_first_row / status_row shift accordingly.
+        let attach_first_row = footer_top + 4;
+        let menu_first_row = footer_top + 4 + attachment_rows;
+        let status_row = footer_top + 4 + attachment_rows + menu_rows;
 
         // Row 1 of footer: spinner during streaming, blank otherwise.
-        // Frame glyph in brand magenta (Role::Brand), label dim — gives
-        // the user a visual anchor as the frame rotates against the
-        // dim label.
+        // Frame glyph in brand magenta (Role::Brand) supplies the
+        // visual anchor; label is bold + default-fg, mirroring
+        // retained's `style_bold(Role::Secondary)` in
+        // `build_spinner_body_row`. SGR_DIM was the prior choice but
+        // rendered as hard-to-read mid-gray on Windows cmd (legacy
+        // conhost <1809 swallowed the dim attribute, leaving the
+        // label barely visible against the background).
         let cup = format!("\x1b[{};1H\x1b[K", spinner_row);
         let _ = self.out.write_all(cup.as_bytes());
         if let Some((frame, label)) = &self.pending_spinner {
             let cleaned = scrub_controls(label);
             let line = if self.caps.colors {
                 format!(
-                    "  {}{}{} {}{}{}",
-                    SGR_MAGENTA, frame, SGR_RESET, SGR_DIM, cleaned, SGR_RESET
+                    "{}{}{} {}{}{}",
+                    SGR_MAGENTA, frame, SGR_RESET, SGR_BOLD, cleaned, SGR_RESET
                 )
             } else {
-                format!("  {} {}", frame, cleaned)
+                format!("{} {}", frame, cleaned)
             };
             let _ = self.out.write_all(line.as_bytes());
         }
 
-        // Top rule: full-width cyan ─ above the input box. Mirrors
-        // retained's `build_rule_row`. ASCII fallback to `-` when the
-        // terminal can't render unicode glyphs (rare in alt-screen
-        // since the auto-fallback target — JediTerm / conhost — both
-        // support unicode, but cheap to handle).
-        let rule_char = if self.caps.unicode_symbols { "─" } else { "-" };
-        let rule = rule_char.repeat(self.width as usize);
+        // Top rule: full-width cyan ━ above the input box. Mirrors
+        // retained's `build_rule_row`.
+        //
+        // U+2501 (━ HEAVY HORIZONTAL) instead of U+2500 (─ LIGHT
+        // HORIZONTAL): on legacy Windows conhost with the default
+        // Consolas / Lucida Console fonts the light variant renders
+        // with visible vertical gaps between cells (the glyph stroke
+        // doesn't span the full cell width), so the rule reads as a
+        // dashed line even at full brightness. The heavy variant has
+        // a thicker stroke that fills the cell, eliminating the
+        // dashed look while still living in the same Box Drawing
+        // block (every modern terminal + conhost-with-unicode-font
+        // supports it). Bright cyan alone was insufficient — the
+        // gap between glyphs persisted regardless of colour. See
+        // commit fcf6a7e for the prior dim→bright attempt.
+        //
+        // No ASCII fallback: U+2501 is in WGL4, present on every
+        // Windows monospace font (Consolas, NSimSun, Cascadia,
+        // Microsoft YaHei). Falling back to `-` here on legacy conhost
+        // produced a literal hyphen-dotted line that users read as
+        // "broken/dashed border" — exactly what the heavy variant was
+        // chosen to avoid.
+        let rule = "\u{2501}".repeat(self.width as usize);
         let cup = format!("\x1b[{};1H\x1b[K", top_rule_row);
         let _ = self.out.write_all(cup.as_bytes());
         if self.caps.colors {
@@ -787,9 +1003,59 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let _ = self.out.write_all(cup.as_bytes());
         let chev = self.caps.prompt_chevron();
         let buf_str = self.pending_input.as_ref().map(|(b, _)| b.as_str()).unwrap_or("");
-        let safe_buf = scrub_controls(buf_str).replace('\n', " ");
+        let cursor_byte = self
+            .pending_input
+            .as_ref()
+            .map(|(_, c)| (*c).min(buf_str.len()))
+            .unwrap_or(0);
+        // Show `\n` as a visible marker so users typing `\<Enter>` (the
+        // line-continuation escape, used when Shift/Alt+Enter are
+        // swallowed by the host terminal — typical on Windows
+        // cmd.exe / legacy conhost without Kitty keyboard protocol)
+        // get visual feedback that the newline was inserted.
+        // Replacing with a plain space made the input box render
+        // `abc def` regardless of whether the user typed a space or
+        // `\<Enter>`, so users on Windows cmd reported "shift+enter
+        // / alt+enter / \<Enter> 都无法换行" — they had no UI signal
+        // that `\<Enter>` actually worked. `↵` (U+21B5) is one
+        // display cell in modern fonts; ASCII fallback uses two
+        // chars `\n` so the marker stays readable on legacy conhost
+        // with NSimSun.
+        let nl_marker = if self.caps.unicode_symbols {
+            "↵"
+        } else {
+            "\\n"
+        };
+        let safe_buf = scrub_controls(buf_str).replace('\n', nl_marker);
         let max_cols = (self.width as usize).saturating_sub(chev.chars().count());
-        let trimmed = truncate_to_width(&safe_buf, max_cols);
+        // Display column of the cursor *within* `safe_buf`, computed
+        // with the SAME `\n → nl_marker` substitution as the rendered
+        // line. The previous implementation replaced `\n` with a single
+        // space here while the rendered line used `\\n` (two cols on
+        // legacy conhost without unicode-capable fonts), so every
+        // newline in the buffer slid the cursor one column to the left
+        // of where the user could see they were typing.
+        let prefix_safe = scrub_controls(&buf_str[..cursor_byte]).replace('\n', nl_marker);
+        let cursor_col_in_buf = display_width(&prefix_safe);
+        // Horizontal scroll: when the user types past `max_cols` (or
+        // moves the cursor past it), slide the visible window so the
+        // cursor stays at the right edge instead of falling off.
+        // Without this, `truncate_to_width(&safe_buf, max_cols)` kept
+        // only the leading window and the user's recent typing simply
+        // disappeared — they reported "input box gets too long, can't
+        // see what I'm typing anymore". The window ends at the cursor
+        // (cursor visible at the rightmost col); if the cursor is in
+        // the early portion of the buffer, no scrolling kicks in and
+        // we render the head as before.
+        let (trimmed, visible_cursor_col) = if cursor_col_in_buf < max_cols {
+            (truncate_to_width(&safe_buf, max_cols), cursor_col_in_buf)
+        } else {
+            let start_col = cursor_col_in_buf + 1 - max_cols;
+            (
+                crate::width::slice_cols(&safe_buf, start_col, max_cols),
+                max_cols.saturating_sub(1),
+            )
+        };
         let input_line = if self.caps.colors {
             format!("{}{}{}{}", SGR_CYAN, chev, SGR_RESET, trimmed)
         } else {
@@ -804,6 +1070,25 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let _ = write!(self.out, "{}{}{}", SGR_CYAN, rule, SGR_RESET);
         } else {
             let _ = self.out.write_all(rule.as_bytes());
+        }
+
+        // Attachment preview rows — `└ [Image #N]` in dim/muted style.
+        // Pre-filtered upstream (see `event_loop::compute_input_attachments`)
+        // to only include marker numbers whose bytes are actually pending,
+        // so showing a row is a real visual confirmation that an image is
+        // attached (not just literal `[Image #N]` text the user typed).
+        // Mirrors the post-submit muted echo of the same string in the
+        // body, so users see a consistent look pre- and post-submit.
+        for (i, n) in self.pending_attachments.iter().enumerate() {
+            let row_n = attach_first_row + i as u16;
+            let cup = format!("\x1b[{};1H\x1b[K", row_n);
+            let _ = self.out.write_all(cup.as_bytes());
+            let line = format!("  \u{2514} [Image #{}]", n);
+            if self.caps.colors {
+                let _ = write!(self.out, "{}{}{}", SGR_DIM, line, SGR_RESET);
+            } else {
+                let _ = self.out.write_all(line.as_bytes());
+            }
         }
 
         // Menu rows: 0..4 of `/{name}  {desc}`. Selected gets `▸` prefix
@@ -827,11 +1112,40 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 let selected = (offset + i) == menu.selected;
                 let safe_name = scrub_controls(name);
                 let safe_desc = scrub_controls(desc);
-                let body = if selected {
-                    format!("  ▸ /{:<12}  {}", safe_name, safe_desc)
-                } else {
-                    format!("    /{:<12}  {}", safe_name, safe_desc)
+                let body = match menu.kind {
+                    crate::render::MenuKind::SlashCommand => {
+                        // Pad by DISPLAY width, not char count: `/设为默认`
+                        // (5 chars, 9 cells) needs the same description
+                        // start column as `/添加` (3 chars, 5 cells). The
+                        // previous `{:<12}` char-count padding left CJK
+                        // rows two cells to the right of ASCII rows.
+                        let name_width = unicode_width::UnicodeWidthStr::width(safe_name.as_str());
+                        let pad = 12usize.saturating_sub(name_width);
+                        let padded = format!("{}{}", safe_name, " ".repeat(pad));
+                        if selected {
+                            format!("▸ /{}  {}", padded, safe_desc)
+                        } else {
+                            format!("  /{}  {}", padded, safe_desc)
+                        }
+                    }
+                    crate::render::MenuKind::AtMention => {
+                        // No leading whitespace — `+` flush left.
+                        if safe_desc.is_empty() {
+                            format!("+ {}", safe_name)
+                        } else {
+                            format!("+ {}  {}", safe_name, safe_desc)
+                        }
+                    }
                 };
+                // Clamp to terminal width before write. Without this,
+                // long descriptions (CJK glyphs are 2 display cells)
+                // overflow and the terminal auto-wraps onto subsequent
+                // rows. Single-row wrap is wiped by the next iteration's
+                // CUP+EL, but a 2+ row wrap leaks past that recovery
+                // and leaves stale glyphs in column 1+ of later menu
+                // items — observed on plugin skill listings with very
+                // long Chinese descriptions.
+                let body = truncate_to_width(&body, self.width as usize);
                 if self.caps.colors {
                     if selected {
                         // Reverse video on the selected row to make
@@ -846,9 +1160,17 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             }
         }
 
-        // Status row at the bottom: dim `model · cwd`.
+        // Status row at the bottom: dim `model · cwd`, optionally
+        // prefixed by a brand-colored `PLAN` mode badge so non-default
+        // agent modes are visible at a glance (mirrors retained's
+        // build_status_row treatment).
         let cup = format!("\x1b[{};1H\x1b[K", status_row);
         let _ = self.out.write_all(cup.as_bytes());
+        let mode_badge = self
+            .pending_status
+            .mode_indicator
+            .as_ref()
+            .map(|s| scrub_controls(s));
         let status_text = if !self.pending_status.model.is_empty()
             || !self.pending_status.cwd.is_empty()
         {
@@ -864,58 +1186,156 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         } else {
             String::new()
         };
-        if !status_text.is_empty() {
-            let line = if self.caps.colors {
-                format!("{}{}{}", SGR_DIM, status_text, SGR_RESET)
-            } else {
-                status_text
-            };
-            let _ = self.out.write_all(line.as_bytes());
+        if mode_badge.is_some() || !status_text.is_empty() {
+            // Badge gets brand-colored magenta (Role::Brand). Status
+            // body keeps its faint/dim style. Color codes only emit
+            // when the terminal advertises color support.
+            if let Some(badge) = &mode_badge {
+                if self.caps.colors {
+                    let _ = write!(self.out, "  {}{}{} ", SGR_MAGENTA, badge, SGR_RESET);
+                } else {
+                    let _ = write!(self.out, "  {} ", badge);
+                }
+            }
+            if !status_text.is_empty() {
+                // status_text already includes its own leading 2-space pad
+                // when no badge precedes it. With a badge we already
+                // emitted the leading spaces + badge + space, so trim
+                // the duplicate leading pad to keep alignment.
+                let body = if mode_badge.is_some() {
+                    status_text.trim_start_matches(' ').to_string()
+                } else {
+                    status_text
+                };
+                let line = if self.caps.colors {
+                    format!("{}{}{}", SGR_DIM, body, SGR_RESET)
+                } else {
+                    body
+                };
+                let _ = self.out.write_all(line.as_bytes());
+            }
         }
 
         // Position the terminal cursor inside the input row so the
-        // user sees where their typing will land.
-        if let Some((buf, cursor_byte)) = &self.pending_input {
-            let prefix = if *cursor_byte <= buf.len() {
-                &buf[..*cursor_byte]
+        // user sees where their typing will land. `visible_cursor_col`
+        // is the cursor's column *within the visible window* — already
+        // accounts for both the `\n → nl_marker` rendering and any
+        // horizontal scroll (when the buffer overflowed `max_cols` and
+        // we slid the window so the cursor stays at the right edge).
+        // Adding `chev.chars().count()` skips past the prompt glyph;
+        // the `+ 1` converts to the 1-indexed CSI CUP coordinate.
+        if self.pending_input.is_some() {
+            let cursor_col = chev.chars().count() + visible_cursor_col;
+            if self.cursor_shown {
+                // Cursor already visible from a prior frame — just
+                // reposition it. Skipping the `?25h` re-emit avoids
+                // restarting the host terminal's hardware cursor blink
+                // animation, which on macOS Terminal.app at streaming
+                // framerate reads as constant flicker.
+                let cup = format!("\x1b[{};{}H", input_row, cursor_col + 1);
+                let _ = self.out.write_all(cup.as_bytes());
             } else {
-                buf.as_str()
-            };
-            let prefix_safe = scrub_controls(prefix).replace('\n', " ");
-            let cursor_col = chev.chars().count() + display_width(&prefix_safe);
-            let cup = format!("\x1b[{};{}H\x1b[?25h", input_row, cursor_col + 1);
-            let _ = self.out.write_all(cup.as_bytes());
-        } else {
+                let cup = format!("\x1b[{};{}H\x1b[?25h", input_row, cursor_col + 1);
+                let _ = self.out.write_all(cup.as_bytes());
+                self.cursor_shown = true;
+            }
+        } else if self.cursor_shown {
             let _ = self.out.write_all(b"\x1b[?25l");
+            self.cursor_shown = false;
         }
 
-        let _ = self.out.flush();
+        // No flush here: paint_frame's tail (anchor_cursor_to_input)
+        // is the single flush point for the whole frame. Flushing
+        // here gave the terminal a vsync window between footer
+        // writes and anchor's final CUP, briefly showing the cursor
+        // at the end of the status row before it jumped to input.
+        // Tests call `r.flush()` explicitly when invoking
+        // `paint_footer` directly.
         self.footer_dirty = false;
     }
 
     /// Combined frame paint: body first, footer second so the cursor
     /// final-position belongs to the footer (typically the input row).
     ///
-    /// Hides the cursor for the duration of the paint so the user
-    /// doesn't see it dart through every intermediate CUP. body + footer
-    /// emit roughly `body_rows + 5..9` CUP sequences per frame; on
-    /// slow terminals (JediTerm in JetBrains IDEs in particular) each
-    /// CUP is processed synchronously, and the cursor is briefly
-    /// visible at every row 1, 2, 3, …, 7, then through every footer
-    /// row before settling. paint_footer's tail emits show-cursor +
-    /// the final input-row CUP atomically, so re-revealing it there
-    /// gives a single visible position per frame instead of a moving
-    /// trail. Reported in Android Studio's terminal as "cursor jumps
-    /// around when scrolling history".
+    /// Cursor visibility handling depends on `slow_paint_terminal`:
+    ///
+    /// **Slow terminals (JediTerm, legacy conhost, `slow_paint_terminal=true`):**
+    /// hide cursor before paint_body so its journey through every
+    /// intermediate CUP isn't visible. paint_footer's tail re-emits
+    /// show-cursor (`?25h`) at the final input-row position when
+    /// `pending_input` is set. Without this, JediTerm rendered the
+    /// cursor's trail as visible "jumping" — Android Studio bug.
+    ///
+    /// **Fast terminals (macOS Terminal.app / iTerm2 / xterm /
+    /// WezTerm / Kitty, `slow_paint_terminal=false`):** leave cursor
+    /// visible the whole time; just reposition via final CUP. The
+    /// per-row CUPs DO still flash the cursor through body cells but
+    /// they execute in well under a refresh interval so the trail is
+    /// imperceptible. Avoiding the per-frame `?25l`/`?25h` toggle is
+    /// what matters here — at streaming framerate (~30 Hz) that
+    /// toggle reads as constant flicker on macOS Terminal.app even
+    /// after `?12l` disabled the hardware cursor blink.
     fn paint_frame(&mut self) {
-        // Hide cursor up-front so paint_body's per-row CUPs aren't
-        // visible to the user. paint_footer's tail re-emits show-
-        // cursor (`\x1b[?25h`) at the final input-row position when
-        // `pending_input` is set, or leaves it hidden otherwise
-        // (e.g. during streaming with no input prompt to anchor on).
-        let _ = self.out.write_all(b"\x1b[?25l");
+        if self.slow_paint_terminal && self.cursor_shown {
+            let _ = self.out.write_all(b"\x1b[?25l");
+            self.cursor_shown = false;
+        }
         self.paint_body();
         self.paint_footer();
+        // paint_body always leaves the cursor at the last body-row
+        // it touched (CUP+EL+content per row); paint_footer's tail
+        // only re-anchors the cursor when footer_dirty is true, so
+        // a body-only render (e.g. async MCP "已连接" CommandOutput
+        // after startup) leaves the visible cursor stranded mid-body
+        // far from the input row. Re-anchor on every frame when an
+        // input prompt is showing — the CUP is one cheap escape and
+        // matches what fast terminals (macOS Terminal.app etc.)
+        // expect: cursor visible AT the input column.
+        self.anchor_cursor_to_input();
+        // Single flush point for the whole frame. paint_body and
+        // paint_footer intentionally skip their own flushes so the
+        // terminal renders only the final cursor position, not the
+        // intermediate body-row / status-row landings that produced
+        // a visible cursor "blink" mid-screen during streaming on
+        // macOS Terminal.app. anchor_cursor_to_input early-returns
+        // (no flush) when pending_input is None — handle that here.
+        let _ = self.out.flush();
+    }
+
+    /// Move the terminal cursor back to the input row's character
+    /// position. Called at the end of every paint_frame so async
+    /// body updates (which only set body_dirty and skip the footer
+    /// repaint) don't leave the cursor stranded above the input
+    /// box. No-op when no input prompt is active.
+    fn anchor_cursor_to_input(&mut self) {
+        let Some((buf_str, cursor_byte)) = self.pending_input.clone() else {
+            return;
+        };
+        let total_footer = self.footer_rows();
+        let footer_top = self.height.saturating_sub(total_footer) + 1;
+        let input_row = footer_top + 2;
+        let chev = self.caps.prompt_chevron();
+        let chev_width = chev.chars().count();
+        let max_cols = (self.width as usize).saturating_sub(chev_width);
+        let cursor_byte = cursor_byte.min(buf_str.len());
+        let nl_marker = if self.caps.unicode_symbols { "↵" } else { "\\n" };
+        let prefix_safe = scrub_controls(&buf_str[..cursor_byte]).replace('\n', nl_marker);
+        let cursor_col_in_buf = display_width(&prefix_safe);
+        let visible_cursor_col = if cursor_col_in_buf < max_cols {
+            cursor_col_in_buf
+        } else {
+            max_cols.saturating_sub(1)
+        };
+        let cursor_col = chev_width + visible_cursor_col;
+        if self.cursor_shown {
+            let cup = format!("\x1b[{};{}H", input_row, cursor_col + 1);
+            let _ = self.out.write_all(cup.as_bytes());
+        } else {
+            let cup = format!("\x1b[{};{}H\x1b[?25h", input_row, cursor_col + 1);
+            let _ = self.out.write_all(cup.as_bytes());
+            self.cursor_shown = true;
+        }
+        let _ = self.out.flush();
     }
 
     /// Pipe one completed line through the markdown renderer and push
@@ -924,8 +1344,13 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// next non-buffered line. Always-some output (the common case)
     /// becomes one body_lines entry.
     fn render_md_and_push(&mut self, line: &str) {
+        // Pass terminal width through so markdown tables render in flat
+        // mode when they don't fit at natural column widths (mirrors the
+        // `RetainedRenderer` path). Alt-screen body has no left padding,
+        // so the full screen width is the budget.
+        let md_width = self.width as usize;
         if let Some(rendered) =
-            crate::markdown::render_line(line, &mut self.md_state, self.caps)
+            crate::markdown::render_line_with_width(line, &mut self.md_state, self.caps, md_width)
         {
             // `rendered` may itself contain `\n` when it includes a
             // table flush prefix from a prior buffered block. Split
@@ -950,8 +1375,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // Also flush any pending markdown state (e.g. a buffered
         // table block) so end-of-turn doesn't strand it. Mirrors
         // RetainedRenderer's TurnComplete handling.
+        let md_width = self.width as usize;
         if let Some(tail) =
-            crate::markdown::finalize(&mut self.md_state, self.caps)
+            crate::markdown::finalize_with_width(&mut self.md_state, self.caps, md_width)
         {
             for sub in tail.split('\n') {
                 self.push_body_row(sub.to_string());
@@ -1044,39 +1470,70 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // it reads as subordinate to primary content.
         let hint_a = if self.caps.colors {
             format!(
-                "{}type something, or press {}{}/{}{}  to browse commands{}",
-                SGR_DIM, SGR_RESET, SGR_CYAN, SGR_RESET, SGR_DIM, SGR_RESET
-            )
+                "{}{}{}{}{}{}{}{}",
+                SGR_DIM,
+                t(Msg::IdleHintPrefix),
+                SGR_RESET,
+                SGR_CYAN,
+                t(Msg::IdleHintSlash),
+                SGR_RESET,
+                SGR_DIM,
+                t(Msg::IdleHintSuffix),
+            ) + SGR_RESET
         } else {
-            "type something, or press / to browse commands".into()
+            t(Msg::IdleHintFull).into_owned()
         };
         self.push_body_row(hint_a);
         let hint_b = if self.caps.colors {
             format!(
-                "{}/provider{}  {}to add a custom model{}",
-                SGR_CYAN, SGR_RESET, SGR_DIM, SGR_RESET
+                "{}{}{}  {}{}{}",
+                SGR_CYAN,
+                t(Msg::IdleHintProvider),
+                SGR_RESET,
+                SGR_DIM,
+                t(Msg::IdleHintProviderSuffix),
+                SGR_RESET
             )
         } else {
-            "/provider  to add a custom model".into()
+            t(Msg::IdleHintProviderFull).into_owned()
         };
         self.push_body_row(hint_b);
         self.push_body_row(String::new());
     }
 
     /// User echo row: `❯ {text}` (or `> {text}` on dumb caps) + blank
-    /// spacer. Resets markdown state so a previous turn's stuck-open
-    /// fence / buffered table can't bleed into this turn's prose.
+    /// spacer. Multi-line input (`\<Enter>` line-continuation,
+    /// Shift/Alt+Enter on terminals that disambiguate, paste with
+    /// embedded newlines) splits each physical line into its own
+    /// body row — `paint_body` CUPs every body line to a distinct
+    /// terminal row, so a single body string with embedded `\n`
+    /// would corrupt the alt-screen layout: the literal LF in raw
+    /// mode advances row but not column, then the next paint_body
+    /// iteration CUP+EL-erases whatever landed below. Windows cmd
+    /// users reported "abc<\><Enter>def" submitted as echo only
+    /// showed `❯ abc`, the `def` flashed and disappeared.
+    /// Continuation lines indent under the chevron-and-space prefix
+    /// so multi-line user messages read as one paragraph rather than
+    /// orphaned rows.
     fn push_user(&mut self, text: &str) {
         self.flush_assistant_remainder();
         self.md_state.reset();
         let chev = self.caps.prompt_chevron();
         let safe = scrub_controls(text);
-        let row = if self.caps.colors {
-            format!("{}{}{}{}", SGR_CYAN, chev, SGR_RESET, safe)
-        } else {
-            format!("{}{}", chev, safe)
-        };
-        self.push_body_row(row);
+        let chev_w = crate::width::display_width(chev);
+        let cont_pad: String = " ".repeat(chev_w);
+        for (i, line) in safe.split('\n').enumerate() {
+            let row = if i == 0 {
+                if self.caps.colors {
+                    format!("{}{}{}{}", SGR_CYAN, chev, SGR_RESET, line)
+                } else {
+                    format!("{}{}", chev, line)
+                }
+            } else {
+                format!("{}{}", cont_pad, line)
+            };
+            self.push_body_row(row);
+        }
         self.push_body_row(String::new());
     }
 
@@ -1086,7 +1543,12 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// until commit). Spinner animation for in-flight ships in Phase 3.
     fn push_tool_call(&mut self, name: &str, detail: &str) {
         self.flush_assistant_remainder();
-        let arrow = "\u{25b8}"; // ▸
+        // ● (U+25CF) — Geometric Shapes block, broadly available
+        // across Windows monospace fonts. Was ▸ (U+25B8) but rendered
+        // as `□` tofu on Windows VSCode/cmd.exe defaults; see the
+        // matching comment in retained.rs ToolCall arm for the
+        // Windows-font rationale.
+        let arrow = "\u{25cf}";
         let name_safe = scrub_controls(name);
         let detail_safe = scrub_controls(detail);
         let row = match (self.caps.colors, detail_safe.is_empty()) {
@@ -1119,21 +1581,61 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     fn push_error(&mut self, msg: &str) {
         self.flush_assistant_remainder();
         let safe = scrub_controls(msg);
+        let label = t(Msg::ErrorPrefix { msg: &safe });
         let row = if self.caps.colors {
-            format!("{}[Error: {}]{}", SGR_RED, safe, SGR_RESET)
+            format!("{}{}{}", SGR_RED, label, SGR_RESET)
         } else {
-            format!("[Error: {}]", safe)
+            label.into_owned()
         };
         self.push_body_row(row);
+    }
+
+    fn push_warning(&mut self, msg: &str) {
+        self.flush_assistant_remainder();
+        let safe = scrub_controls(msg);
+        // Bold yellow `! …` advisory. Visually softer than the red
+        // [Error: …] but still high-contrast — meant to be impossible
+        // to scroll past without noticing.
+        let row = if self.caps.colors {
+            format!("\x1b[1;33m! {}{}", safe, SGR_RESET)
+        } else {
+            format!("! {}", safe)
+        };
+        self.push_body_row(row);
+    }
+
+    /// Push `text` as command-output rows wrapped in `sgr_open` (e.g.
+    /// `SGR_GREY` or `SGR_BOLD`). Scrubs first, soft-wraps each line,
+    /// THEN paints SGR around every wrapped chunk — this ordering is
+    /// load-bearing: `push_command_output` runs `scrub_controls` which
+    /// would otherwise strip caller-supplied SGR if the styling were
+    /// applied first. Used for ToolGroup header (bold) and child
+    /// rows (muted gray), mirroring retained's role-based styling.
+    fn push_styled_command_output(&mut self, text: &str, sgr_open: &str) {
+        self.flush_assistant_remainder();
+        let safe = scrub_controls(text);
+        let max_w = (self.width as usize).max(1);
+        let style_on = self.caps.colors && !sgr_open.is_empty();
+        for line in safe.split('\n') {
+            for chunk in wrap_to_width_sgr_aware(line, max_w) {
+                let row = if style_on {
+                    format!("{}{}{}", sgr_open, chunk, SGR_RESET)
+                } else {
+                    chunk
+                };
+                self.push_body_row(row);
+            }
+        }
     }
 
     /// `(cancelled)` marker row.
     fn push_cancelled(&mut self) {
         self.flush_assistant_remainder();
+        let label = t(Msg::Cancelled);
         let row = if self.caps.colors {
-            format!("{}(cancelled){}", SGR_DIM, SGR_RESET)
+            format!("{}{}{}", SGR_DIM, label, SGR_RESET)
         } else {
-            "(cancelled)".to_string()
+            label.into_owned()
         };
         self.push_body_row(row);
     }
@@ -1257,6 +1759,39 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // pushes ToolCallInFlight as a static row already, so
                 // there's nothing to freeze yet.
             }
+            UiLine::ToolGroupRender { batch_id: _, header, children } => {
+                // alt-screen mirrors retained's append-style without
+                // the in-place ✓ rewrite (alt-screen layout is
+                // virtual-buffer based; live-group rewrite would need
+                // its own row tracking). Header + children print
+                // statically; ChildUpdate appends a new row.
+                //
+                // Style parity with retained (`UiLine::ToolGroupRender`
+                // arm in retained.rs):
+                //   - header: bold, default fg — emphasises the
+                //     `● Running N tools in parallel` anchor row
+                //   - children: muted gray (SGR 90) — high-frequency
+                //     per-call rows (`▸ bash(cmd…)`) that should read
+                //     as subordinate detail, not compete with the
+                //     header. User reported children rendered in
+                //     default fg here, so the visual hierarchy was
+                //     flattened relative to retained.
+                self.push_styled_command_output(&header, SGR_BOLD);
+                for c in children {
+                    self.push_styled_command_output(&c.text, SGR_GREY);
+                }
+            }
+            UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
+                // Update inherits the muted child styling so the row
+                // stays visually subordinate after the result lands.
+                self.push_styled_command_output(&new_text, SGR_GREY);
+            }
+            UiLine::ToolGroupSummary { text } => {
+                // Summary mirrors header: bold default-fg anchor row
+                // closing the group. Matches retained's
+                // `style_bold(Role::Secondary)` choice.
+                self.push_styled_command_output(&text, SGR_BOLD);
+            }
             UiLine::ToolResult { success, summary } => {
                 self.push_tool_result(success, &summary);
             }
@@ -1269,16 +1804,37 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 }
             }
             UiLine::ApprovalPrompt { tool, detail } => {
-                let safe_tool = scrub_controls(&tool);
-                let safe_detail = scrub_controls(&detail);
-                let prompt = format!(
-                    "Allow {}({})? [Y]es / [N]o / [A]lways",
-                    safe_tool, safe_detail
-                );
+                // Mirror retained's chip-based prompt: bold-yellow
+                // "▶ Waiting for approval:" label + Y/A/N reverse-video
+                // chips (green / cyan / red) + their textual labels.
+                // The previous alt-screen path emitted the flat
+                // `ApprovalPromptAlt` sentence — visually indistinct from
+                // a regular command-output row, so users couldn't tell at
+                // a glance that an approval was pending. tool/detail are
+                // already visible in the ToolCall row above, so we don't
+                // re-echo them here (same omission as retained).
+                let _ = (tool, detail);
+                let waiting = t(Msg::ApprovalWaitingLabel);
+                let allow = t(Msg::ApprovalAllow);
+                let always = t(Msg::ApprovalAlways);
+                let deny = t(Msg::ApprovalDeny);
                 let row = if self.caps.colors {
-                    format!("{}{}{}", SGR_CYAN, prompt, SGR_RESET)
+                    format!(
+                        "{bold}{yellow}{waiting}{reset}{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
+                        bold = SGR_BOLD,
+                        yellow = SGR_YELLOW,
+                        rev = SGR_REVERSE,
+                        green = SGR_GREEN,
+                        cyan = SGR_CYAN,
+                        red = SGR_RED,
+                        reset = SGR_RESET,
+                        waiting = waiting,
+                        allow = allow,
+                        always = always,
+                        deny = deny,
+                    )
                 } else {
-                    prompt
+                    format!("{waiting} Y {allow} A {always} N {deny}")
                 };
                 self.push_body_row(row);
             }
@@ -1287,8 +1843,45 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             UiLine::CommandOutput(text) => {
                 self.push_command_output(&text);
             }
+            UiLine::ImageAttachment(n) => {
+                // `└` at col 2, aligned under the `[` of `[Image #N]`
+                // in the user-message echo above (push_user prefixes
+                // `❯ ` so user content starts at col 2). alt-screen's
+                // push_command_output passes through verbatim — no
+                // PAD_COL auto-prefix — so we emit the leading 2
+                // spaces explicitly here. Mirrors retained's render
+                // visually: same `└` column, same indent under the
+                // parent user message.
+                //
+                // Tight grouping: `push_user` always emits a trailing
+                // blank spacer row. Pop it if present so the attachment
+                // sits flush under the user message (no orphan blank
+                // between `❯ msg` and `└ [Image #N]`), then re-emit a
+                // fresh trailing blank so the next turn's content still
+                // has paragraph separation.
+                if self.body_lines.last().map_or(false, |r| r.is_empty()) {
+                    self.body_lines.pop();
+                }
+                self.push_command_output(&format!("  └ [Image #{}]", n));
+                self.push_body_row(String::new());
+            }
+            UiLine::VisionPreprocessSuccess { msg, model } => {
+                // alt-screen has no two-style row primitive; degrade to
+                // a plain command-output line concatenating message and
+                // model. Loses the gray styling but preserves the
+                // information. Acceptable for the alt-screen path
+                // (used in non-retained terminals).
+                //
+                // Trailing blank: paragraph separation before the next
+                // event (spinner / assistant text). Mirrors retained.
+                self.push_command_output(&format!("{}  {}", msg, model));
+                self.push_body_row(String::new());
+            }
             UiLine::Error(msg) => {
                 self.push_error(&msg);
+            }
+            UiLine::Warning(msg) => {
+                self.push_warning(&msg);
             }
 
             // ── footer: input box ──
@@ -1297,14 +1890,17 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 cursor_byte,
                 menu,
                 status,
+                attachments,
             } => {
                 self.pending_input = Some((buf, cursor_byte));
                 self.pending_status = status;
                 self.pending_menu = menu; // slash-palette payload
+                self.pending_attachments = attachments;
                 self.pending_spinner = None; // input takes over from spinner
                 self.footer_dirty = true;
-                // Menu state changes the footer height (variable rows).
-                // Repaint body too so it shrinks/grows correspondingly.
+                // Menu / attachment state changes the footer height
+                // (variable rows). Repaint body too so it shrinks/grows
+                // correspondingly.
                 self.body_dirty = true;
             }
             UiLine::StreamingBox {
@@ -1314,10 +1910,12 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 label,
                 status,
                 menu,
+                attachments,
             } => {
                 self.pending_input = Some((buf, cursor_byte));
                 self.pending_status = status;
                 self.pending_menu = menu;
+                self.pending_attachments = attachments;
                 self.pending_spinner = Some((frame, label));
                 self.footer_dirty = true;
                 self.body_dirty = true;
@@ -1451,6 +2049,14 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
+        // No-op if size unchanged. Pairs with the burst coalescing in
+        // `event_loop::handle_input`; same-size events still arrive
+        // (focus changes, tab cycles, multiplexer pane shuffles) and
+        // the `\x1b[2J\x1b[H` wipe below is visible flicker even when
+        // the result is byte-identical.
+        if cols == self.width && rows == self.height {
+            return;
+        }
         // Resize is the simplest of all renderers in alt-screen mode:
         // no DECSTBM region to renegotiate, no scroll-region edge
         // cases, no auto-wrap-into-footer issues. We just:
@@ -1616,10 +2222,47 @@ mod tests {
         );
     }
 
+    /// Multiline user input (`\<Enter>` on terminals that swallow
+    /// Shift/Alt+Enter — typical Windows cmd.exe / legacy conhost,
+    /// where the modifier bits never reach the application — plus
+    /// pasted content with embedded newlines) MUST split into one
+    /// body row per physical line. Was a single body string with
+    /// embedded `\n`, which `paint_body` writes verbatim — the
+    /// terminal interprets LF as row-advance, and the next CUP+EL
+    /// for the following body row erases whatever landed there.
+    /// User-reported on Windows cmd: "abc<\><Enter>def" submitted as
+    /// echo only showed `❯ abc`, the `def` flashed and disappeared.
+    #[test]
+    fn push_user_splits_on_newline_into_separate_body_rows() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::User("first\nsecond\nthird".into()));
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("first"), "first line missing. got: {:?}", s);
+        assert!(s.contains("second"), "second line missing. got: {:?}", s);
+        assert!(s.contains("third"), "third line missing. got: {:?}", s);
+        // No raw `\n` survives into a single painted body row —
+        // `paint_body` CUPs each row independently, so multi-line
+        // echo must emit each line through `push_body_row` separately.
+        assert!(
+            !s.contains("first\nsecond"),
+            "multiline echo must not embed raw \\n in a single body row \
+             (would corrupt alt-screen layout). got: {:?}",
+            s
+        );
+    }
+
     /// Phase 2: User / AssistantText / ToolCall / ToolResult / Error
     /// all push body rows. Verify each surfaces in the painted output.
     #[test]
     fn body_uilines_render_into_viewport() {
+        // UiLine::Error localizes via i18n — pin the locale so a
+        // concurrent test that flipped to ZhCn doesn't make this
+        // assertion see `[错误：boom]`.
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
         let mut buf = Vec::new();
         let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
         r.render(UiLine::User("hi".into()));
@@ -1892,6 +2535,7 @@ mod tests {
             cursor_byte: 5,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
@@ -1921,6 +2565,7 @@ mod tests {
                 cwd: "/tmp/proj".into(),
                 ..Default::default()
             },
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
@@ -1934,7 +2579,9 @@ mod tests {
         assert!(s.contains("\x1b[2m"), "status should be dim. got: {:?}", s);
     }
 
-    /// Phase 4.5: top + bottom rules render as cyan ─ across full width.
+    /// Phase 4.5: top + bottom rules render as cyan ━ across full width.
+    /// (Heavy variant ━ U+2501 instead of light ─ U+2500 — see
+    /// `paint_footer` for the legacy-conhost dashed-look rationale.)
     #[test]
     fn input_box_has_top_and_bottom_rules() {
         let mut buf = Vec::new();
@@ -1944,21 +2591,22 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
         let s = String::from_utf8_lossy(&buf);
-        // top_rule at row 7, bot_rule at row 9. Each row has 20 ─.
-        let twenty_dashes = "─".repeat(20);
+        // top_rule at row 7, bot_rule at row 9. Each row has 20 ━.
+        let twenty_heavy = "━".repeat(20);
         assert!(s.contains("\x1b[7;1H"), "top rule row CUP missing. got: {:?}", s);
         assert!(s.contains("\x1b[9;1H"), "bot rule row CUP missing. got: {:?}", s);
         assert!(
-            s.contains(&twenty_dashes),
-            "20 ─ chars missing. got: {:?}",
+            s.contains(&twenty_heavy),
+            "20 ━ chars missing. got: {:?}",
             s
         );
-        // Cyan colour applied to the rule.
-        assert!(s.contains("\x1b[36m"), "rule should be cyan. got: {:?}", s);
+        // Bright cyan (96) — matches retained's `Palette::BORDER`.
+        assert!(s.contains("\x1b[96m"), "rule should be bright cyan. got: {:?}", s);
     }
 
     /// `wrap_to_width_sgr_aware` is the soft-wrap helper that keeps long
@@ -2066,8 +2714,10 @@ mod tests {
                     ("exit".into(), "leave".into()),
                 ],
                 selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         // 3 menu items → footer = 5 + 3 = 8 → body = 24 - 8 = 16.
         assert_eq!(r.body_height(), 24 - 8);
@@ -2089,8 +2739,10 @@ mod tests {
                     ("exit".into(), "leave".into()),
                 ],
                 selected: 1,
+                    kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         drop(r);
@@ -2103,6 +2755,66 @@ mod tests {
         // Both items present.
         assert!(s.contains("login"));
         assert!(s.contains("exit"));
+    }
+
+    /// Long CJK descriptions (plugin skill listings can have 100+
+    /// display columns of Chinese) used to overflow past terminal
+    /// width and auto-wrap onto subsequent rows. The next iteration's
+    /// CUP+EL only wiped the immediately-next row, so 2+ row wraps
+    /// leaked stale glyphs into column 1+ of later menu items.
+    /// Truncating each menu body to terminal width keeps everything
+    /// confined to a single row per item.
+    #[test]
+    fn slash_menu_truncates_overlong_body_to_terminal_width() {
+        let mut buf = Vec::new();
+        // Narrow window to make overflow easy to construct without huge
+        // descriptions: 30 cols total.
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 30, 24);
+        // First item's description is 60+ display cols of CJK, ~2× wider
+        // than the window. Pre-fix this would wrap onto the second
+        // item's row. Post-fix: clamped at 30 cols, no wrap.
+        let very_long_cjk = "中文描述非常非常长".repeat(5); // 9 chars * 5 = 45 chars * 2 cols = 90 cols
+        r.render(UiLine::InputPrompt {
+            buf: "/".into(),
+            cursor_byte: 1,
+            menu: Some(crate::render::MenuPayload {
+                items: vec![
+                    ("first".into(), very_long_cjk.clone()),
+                    ("second".into(), "short".into()),
+                ],
+                selected: 0,
+                    kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        r.flush();
+        // Assert each menu row's writeable payload between CUPs fits
+        // inside the 30-col window. We can't easily measure visible
+        // columns from raw bytes here, but we can assert truncation
+        // happened by checking the second item's name is still emitted
+        // (it would be drowned by an unbounded first-row wrap).
+        let body_lines = r.body_lines.clone();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("first"),
+            "first item must be present in output. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("second"),
+            "second item must remain visible despite first row's overlong CJK. got: {:?}",
+            s
+        );
+        // The full 90-col CJK description must NOT all be present
+        // verbatim — it would only fit if the truncation was bypassed.
+        assert!(
+            !s.contains(very_long_cjk.as_str()),
+            "full overlong CJK description must be truncated, but emit kept the entire run. got: {:?}",
+            s
+        );
+        let _ = body_lines;
     }
 
     /// Phase 4.5: welcome banner now includes the version (right-aligned)
@@ -2143,10 +2855,11 @@ mod tests {
     }
 
     /// The spinner FRAME (the rotating glyph) must be coloured brand
-    /// magenta (`\x1b[35m`) when caps.colors is on — visual anchor so
-    /// the rotation reads as motion against the dim label. Mirrors
-    /// `RetainedRenderer::build_spinner_body_row` (Role::Brand frame +
-    /// Role::Secondary label).
+    /// magenta (`\x1b[95m`) when caps.colors is on — visual anchor for
+    /// the rotation. Label is bold default-fg (mirrors retained's
+    /// `style_bold(Role::Secondary)` in build_spinner_body_row); the
+    /// previous SGR_DIM choice rendered as hard-to-read mid-gray on
+    /// Windows legacy conhost.
     #[test]
     fn spinner_frame_uses_brand_magenta() {
         let mut buf = Vec::new();
@@ -2159,12 +2872,23 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(
-            s.contains("\x1b[35m\u{280b}\x1b[0m"),
+            s.contains("\x1b[95m\u{280b}\x1b[0m"),
             "spinner frame must be wrapped in magenta SGR. got: {:?}",
             s
         );
-        // Label still dim — the two SGRs co-exist on the same row.
-        assert!(s.contains("\x1b[2m"), "label should still be dim. got: {:?}", s);
+        // Label is bold + default-fg — bold SGR (\x1b[1m) wraps the
+        // label, no foreground colour change. Co-exists with the
+        // magenta frame SGR on the same row.
+        assert!(
+            s.contains("\x1b[1m"),
+            "label should be wrapped in bold SGR. got: {:?}",
+            s
+        );
+        assert!(
+            !s.contains("\x1b[2m"),
+            "label must not use dim SGR (broken on Windows conhost). got: {:?}",
+            s
+        );
     }
 
     /// `ClearTransient` flips `pending_spinner` back to None so the
@@ -2184,6 +2908,143 @@ mod tests {
         r.render(UiLine::ClearTransient);
         assert!(r.pending_spinner.is_none(), "ClearTransient must drop spinner");
         drop(r);
+    }
+
+    /// Plan-mode badge gets brand-color SGR (magenta, mirrors retained
+    /// renderer's `Role::Brand`) and is emitted BEFORE the dim
+    /// `model · cwd` body so the user sees the mode at a glance. Same
+    /// layout as the retained `build_status_row` test, just at the
+    /// alt-screen byte-stream level since alt-screen writes raw to
+    /// stdout instead of going through the cell-diff renderer.
+    #[test]
+    fn paint_footer_renders_plan_badge_in_brand_color() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                ctx_used: 0,
+                ctx_window: 0,
+                hint: None,
+                mode_indicator: Some("PLAN".into()),
+            },
+            attachments: Vec::new(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("\x1b[95m"),
+            "PLAN badge must use SGR_MAGENTA (Role::Brand). got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("PLAN"),
+            "PLAN literal must appear in the rendered status. got: {:?}",
+            s
+        );
+        // Badge precedes the dim model/cwd run — confirm the magenta SGR
+        // appears earlier in the byte stream than the dim SGR (\x1b[2m).
+        let badge_pos = s
+            .find("\x1b[95m")
+            .expect("magenta SGR must be present");
+        let dim_pos = s
+            .find("\x1b[2m")
+            .expect("dim SGR (status body) must be present");
+        assert!(
+            badge_pos < dim_pos,
+            "PLAN badge SGR ({}) must precede status-body dim SGR ({}). buf: {:?}",
+            badge_pos,
+            dim_pos,
+            s
+        );
+    }
+
+    /// Default Build mode (`mode_indicator = None`) emits no PLAN
+    /// literal — protects against accidental "PLAN" leak when the
+    /// status line is rendered for a non-plan session. Mirrors the
+    /// retained-renderer guard test.
+    #[test]
+    fn paint_footer_default_mode_emits_no_plan_badge() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                ctx_used: 0,
+                ctx_window: 0,
+                hint: None,
+                mode_indicator: None,
+            },
+            attachments: Vec::new(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            !s.contains("PLAN"),
+            "no mode_indicator must produce no PLAN literal. got: {:?}",
+            s
+        );
+        // Sanity: model/cwd still present so we know the status row
+        // actually rendered (not skipped via some empty-status path).
+        assert!(s.contains("glm-5"));
+        assert!(s.contains("~/proj"));
+    }
+
+    /// `on_resize` is a no-op when the size hasn't actually changed.
+    /// Some terminals fire spurious Resize events on focus / tab /
+    /// pane-shuffle (no grid change), and the `\x1b[2J\x1b[H` wipe
+    /// inside the resize handler is visible flicker even when the
+    /// outcome would be byte-identical. Pairs with the burst-coalesce
+    /// in `event_loop::handle_input`. Linux Mint / gnome-terminal
+    /// users reported "拉伸窗口刷屏" for exactly this reason.
+    #[test]
+    fn on_resize_same_size_emits_nothing() {
+        // Drive two AltScreenRenderer instances against separate
+        // capture buffers — one runs a same-size on_resize, the other
+        // runs a real resize. Compare their output. (Single-renderer
+        // pattern doesn't work because `with_writer` keeps the &mut
+        // Vec borrow alive for the renderer's lifetime.)
+        let mut baseline = Vec::new();
+        {
+            let mut r = AltScreenRenderer::with_writer(&mut baseline, caps_default(), 80, 24);
+            r.render(UiLine::User("hi".into()));
+            r.flush();
+            r.on_resize(80, 24); // same size — should be a no-op
+            drop(r);
+        }
+
+        let mut real_resize = Vec::new();
+        {
+            let mut r = AltScreenRenderer::with_writer(&mut real_resize, caps_default(), 80, 24);
+            r.render(UiLine::User("hi".into()));
+            r.flush();
+            r.on_resize(60, 16); // different size — should emit wipe + repaint
+            drop(r);
+        }
+
+        let baseline_str = String::from_utf8_lossy(&baseline);
+        let real_str = String::from_utf8_lossy(&real_resize);
+        assert!(
+            !baseline_str.contains("\x1b[2J\x1b[H"),
+            "same-size on_resize must not emit \\x1b[2J\\x1b[H wipe (flicker source). \
+             baseline: {:?}",
+            baseline_str
+        );
+        assert!(
+            real_str.contains("\x1b[2J\x1b[H"),
+            "real resize MUST still emit \\x1b[2J\\x1b[H wipe; got: {:?}",
+            real_str
+        );
     }
 
     /// Phase 4: `on_resize` updates cached dimensions, wipes the
@@ -2442,6 +3303,7 @@ mod tests {
             cursor_byte: 5,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         // Push enough body to give scrollback room.
         for i in 0..20 {
@@ -2468,18 +3330,19 @@ mod tests {
         );
     }
 
-    /// Regression: every paint_frame must start by hiding the cursor
-    /// so its journey through ~10+ intermediate CUP positions (one
-    /// per body row, one per footer row) isn't visible to the user.
-    /// Synchronous-CUP terminals like JediTerm rendered the cursor's
-    /// trail as visible "jumping" — Android Studio bug report.
-    /// paint_footer re-emits show-cursor at its tail when
-    /// pending_input is set, so the cursor only appears once at its
-    /// final position.
+    /// Regression: on slow-paint terminals (JediTerm, legacy conhost),
+    /// every paint_frame must start by hiding the cursor so its
+    /// journey through ~10+ intermediate CUP positions (one per body
+    /// row, one per footer row) isn't visible to the user. paint_footer
+    /// re-emits show-cursor at its tail when pending_input is set, so
+    /// the cursor only appears once at its final position. Reported in
+    /// Android Studio's terminal as "cursor jumps around when scrolling
+    /// history".
     #[test]
-    fn paint_frame_hides_cursor_before_painting() {
+    fn paint_frame_hides_cursor_before_painting_on_slow_terminal() {
         let mut buf = Vec::new();
         let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.slow_paint_terminal = true;
         // Force a paint via any body push.
         r.render(UiLine::User("hello".into()));
         drop(r);
@@ -2494,6 +3357,81 @@ mod tests {
             "hide-cursor must come before the first body CUP. hide@{}, body@{}, output: {:?}",
             hide_pos,
             first_body_cup,
+            s
+        );
+    }
+
+    /// Regression: on fast terminals (default), paint_frame must NOT
+    /// emit `?25l` before paint_body — at streaming framerate the
+    /// per-frame `?25l` / `?25h` toggle reads as constant cursor
+    /// flicker on macOS Terminal.app even with hardware blink
+    /// disabled (`?12l`). Painting body without hiding is safe on
+    /// fast terminals because the per-row CUPs flash the cursor
+    /// through cells in well under one refresh interval.
+    #[test]
+    fn paint_frame_does_not_hide_cursor_on_fast_terminal() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // slow_paint_terminal stays false (default).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        // Trigger a streaming-style repaint by pushing more body.
+        r.render(UiLine::User("hello".into()));
+        r.render(UiLine::User("world".into()));
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // No `?25l` before the first body CUP. Drop's leave_alt_screen
+        // emits `?25h\x1b[?12h…?1049l` at the end, which contains
+        // `?25h` but no `?25l`, so the only way `?25l` could be in the
+        // output is from paint_frame — which we don't want.
+        if let Some(first_body_cup) = s.find("\x1b[1;1H\x1b[K") {
+            let pre = &s[..first_body_cup];
+            assert!(
+                !pre.contains("\x1b[?25l"),
+                "fast terminal must not hide cursor before body paint. output: {:?}",
+                s
+            );
+        }
+    }
+
+    /// Regression: on fast terminals, the `?25h` show-cursor sequence
+    /// must be emitted at most once for repeated input-prompt frames
+    /// — re-emitting it every frame restarts the host terminal's
+    /// hardware cursor blink animation, producing visible flicker on
+    /// macOS Terminal.app. Subsequent frames must reposition via a
+    /// bare CUP only.
+    #[test]
+    fn fast_terminal_dedupes_show_cursor_across_frames() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // slow_paint_terminal stays false (default).
+        for i in 0..5 {
+            r.render(UiLine::InputPrompt {
+                buf: format!("typed{}", i),
+                cursor_byte: 6,
+                menu: None,
+                status: crate::render::StatusLine::default(),
+                attachments: Vec::new(),
+            });
+        }
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        // Drop's leave_alt_screen emits one `?25h`. paint_footer
+        // emits at most one more (on the first frame, transitioning
+        // from initial cursor_shown=true → still true via no-op,
+        // actually never re-emits because cursor_shown starts true).
+        // So the count should be exactly 1 (from leave). If paint_footer
+        // were re-emitting per frame we'd see 6+.
+        let show_count = s.matches("\x1b[?25h").count();
+        assert!(
+            show_count <= 1,
+            "fast terminal must dedupe show-cursor; got {} occurrences. output: {:?}",
+            show_count,
             s
         );
     }
@@ -2823,5 +3761,52 @@ mod tests {
         // Line 1: from col 0 to col 4 (head+1) of "second row" = "seco"
         assert_eq!(text, "rst row\nseco", "multi-line extract mismatch: {:?}", text);
         drop(r);
+    }
+
+    /// Regression guard for `/language` modal feedback. The picker's
+    /// Enter handler emits CommandOutput THEN returns Close; the event
+    /// loop then re-renders the input prompt without the menu. The
+    /// CommandOutput must survive that second render — otherwise the
+    /// user sees no confirmation that the locale switch took effect.
+    #[test]
+    fn command_output_survives_subsequent_input_prompt_redraw() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+
+        // Simulate the exact flow language_picker.rs uses on Enter:
+        // first push a confirmation line, then redraw the input prompt
+        // without a menu (the event loop's `redraw_idle_plain` after
+        // `ModalAction::Close`).
+        r.render(UiLine::CommandOutput(
+            "  ✓ Language switched to 简体中文 (zh_CN).\n".into(),
+        ));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        r.flush();
+
+        // The body line must still be present in body_lines AND
+        // visible in the painted output stream — both layers matter
+        // because painting clips out-of-viewport rows.
+        let in_body = r
+            .body_lines
+            .iter()
+            .any(|row| row.contains("Language switched to") && row.contains("简体中文"));
+        assert!(
+            in_body,
+            "confirmation line missing from body_lines: {:?}",
+            r.body_lines
+        );
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("Language switched to") && s.contains("简体中文"),
+            "confirmation line missing from painted output: {:?}",
+            s
+        );
     }
 }

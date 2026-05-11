@@ -29,6 +29,7 @@
 
 pub mod default;
 pub mod env;
+pub mod file_store;
 pub mod ollama;
 pub mod render;
 pub mod resolver;

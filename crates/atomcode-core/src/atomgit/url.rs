@@ -139,10 +139,11 @@ fn split_owner_repo(path: &str) -> Option<RepoRef> {
 ///     Callers treat this as "can't validate, proceed with a warning".
 ///   * `Err(...)` — the git command itself failed unexpectedly.
 pub fn detect_cwd_atomgit_repo(cwd: &std::path::Path) -> std::io::Result<Option<RepoRef>> {
-    let output = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .output()?;
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["remote", "get-url", "origin"])
+        .current_dir(cwd);
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    let output = cmd.output()?;
     if !output.status.success() {
         // `git` returned non-zero — either not a repo, or no `origin`.
         // Both are "can't validate"; don't bubble the raw stderr up.

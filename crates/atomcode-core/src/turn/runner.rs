@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use futures::StreamExt;
@@ -16,6 +15,7 @@ use crate::tool::{
 };
 
 use super::event::{TurnEvent, TurnResult};
+use super::loop_guard::{LoopGuardDecision, LoopGuardState};
 use super::permission::PermissionDecider;
 
 /// Core LLM streaming + tool execution primitive.
@@ -43,104 +43,13 @@ pub struct TurnRunner {
     pub permission: Box<dyn PermissionDecider>,
     /// Files edited during the current session (tracked for context awareness).
     pub recently_edited_files: Vec<String>,
-    /// Rolling history of `(tool_name, args_hash)` pairs — used to detect tool
-    /// call loops (same tool + same args repeated without any edit in between).
-    /// Bounded to 20 entries to keep memory flat. For `read_file` the hash
-    /// covers `(file_path, offset, limit)` so paginating through distinct
-    /// regions is not treated as a repeat; see `loop_args_hash`.
-    pub recent_calls: Vec<(String, u64)>,
-    /// Per-region read counter, keyed by `(basename, offset / READ_REGION_BUCKET)`.
-    /// The region bucket means "scanning different parts of a large file" counts
-    /// as separate keys — only reading the *same* region 3+ times in a turn is
-    /// treated as a panic loop (typical of Office binaries, encoding mismatches,
-    /// or the model cycling offset/limit on an unreadable file).
-    pub file_read_counts: std::collections::HashMap<(String, u64), u32>,
     /// Hook executor — runs user-configured lifecycle hooks at tool execution boundaries.
     pub hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
-}
-
-/// Line-granularity of the read-region bucket used in `file_read_counts`.
-/// A single function body typically fits in one bucket (most are < 50 lines),
-/// so reading different functions of a large file produces different keys
-/// and doesn't cap. Shared so `DisciplineState` and the agent loop write
-/// counts under the same key the guard will read back.
-pub(crate) const READ_REGION_BUCKET: u64 = 50;
-
-/// Extract the region-bucket key for a `read_file` call so that writers
-/// (agent loop, discipline) and readers (loop guard) agree on the key shape.
-/// Prefer a canonical workspace-resolved path to avoid nested workspace and
-/// basename collisions. Missing / malformed offset → bucket 0 (which is also
-/// the bucket for "whole-file" reads).
-pub(crate) fn read_region_key(args: &str, working_dir: Option<&Path>) -> (String, u64) {
-    let file_key = read_file_key(args, working_dir).unwrap_or_else(|| "<malformed>".to_string());
-    let offset = serde_json::from_str::<serde_json::Value>(args)
-        .ok()
-        .and_then(|v| v.get("offset").and_then(|x| x.as_u64()))
-        .unwrap_or(0);
-    (file_key, offset / READ_REGION_BUCKET)
-}
-
-fn read_file_key(args: &str, working_dir: Option<&Path>) -> Option<String> {
-    let v = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    let fp = v.get("file_path").and_then(|v| v.as_str())?;
-    Some(canonical_or_lexical_path_key(fp, working_dir))
-}
-
-fn canonical_or_lexical_path_key(raw_path: &str, working_dir: Option<&Path>) -> String {
-    if let Some(working_dir) = working_dir {
-        if let Ok(access) = crate::tool::inspect_path_access(raw_path, working_dir) {
-            return access.path.display().to_string();
-        }
-    }
-
-    let expanded = expand_home_for_loop_key(raw_path);
-    let candidate = if expanded.is_absolute() {
-        expanded
-    } else if let Some(working_dir) = working_dir {
-        working_dir.join(expanded)
-    } else {
-        expanded
-    };
-    lexical_normalize_for_loop_key(&candidate)
-        .display()
-        .to_string()
-}
-
-fn expand_home_for_loop_key(path: &str) -> PathBuf {
-    if path == "~" {
-        return crate::tool::real_home_dir().unwrap_or_else(|| PathBuf::from(path));
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return crate::tool::real_home_dir()
-            .map(|home| home.join(rest))
-            .unwrap_or_else(|| PathBuf::from(path));
-    }
-    PathBuf::from(path)
-}
-
-fn lexical_normalize_for_loop_key(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                let can_pop = normalized
-                    .components()
-                    .next_back()
-                    .is_some_and(|last| matches!(last, std::path::Component::Normal(_)));
-                if can_pop {
-                    normalized.pop();
-                } else if normalized.as_os_str().is_empty() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-            std::path::Component::RootDir
-            | std::path::Component::Prefix(_)
-            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
-        }
-    }
-
-    normalized
+    /// Cross-batch tool-call loop guard. Cleared per user-message by the
+    /// agent (see `handle_send_message`); records every executed tool's
+    /// `(name, args, output_hash)` triple and short-circuits the third
+    /// identical attempt. See `loop_guard.rs` for the full rationale.
+    pub loop_guard: LoopGuardState,
 }
 
 impl TurnRunner {
@@ -201,6 +110,7 @@ impl TurnRunner {
             ..parent
         };
         let turn_started = std::time::Instant::now();
+
         // 1. Build messages within token budget.
         // Goes through `self.ctx.build_messages` (trait dispatch), NOT
         // `ctx::render::build_messages` (free fn) — otherwise per-model
@@ -330,7 +240,21 @@ impl TurnRunner {
 
         // 4. Process stream events
         let mut tool_calls_buf: Vec<ToolCall> = Vec::new();
+        // RAW accumulator — keeps `<tool_call>...</tool_call>` blocks intact
+        // so the rescue path at Done can parse them when the model emitted
+        // its tool calls as XML in text instead of using the structured
+        // tool_calls API (Qwen / GLM / DeepSeek occasional misbehavior).
         let mut text_buf = String::new();
+        // VISIBLE accumulator — mirror of what `stream_filter` actually
+        // emitted to UI / conversation history. Used for `TurnResult::
+        // Responded.text` so downstream consumers (datalog `log_text`,
+        // ATLAS plan extraction, telemetry) see the same clean text the
+        // user saw, not the raw text_buf with leaked XML. Earlier bug
+        // (5-7 datalog 20-14-23 Turn 5): Responded.text was raw text_buf
+        // → datalog `**Response:**` block carried `<tool_call>grep<arg_key>
+        // pattern</arg_key>...</tool_call>` mid-prose, polluting A/B
+        // analysis.
+        let mut visible_text_buf = String::new();
         // Reasoning-model thinking content collected separately — not emitted
         // to scrollback by default (users don't want to read the thinking).
         // If `text_buf` ends up empty at `Done` but this is non-empty, we
@@ -338,6 +262,13 @@ impl TurnRunner {
         // responses through `reasoning_content` for MiniMax-M2.7 / DeepSeek-R1,
         // and without the fallback we'd return a silent 0-token "Nailed it".
         let mut reasoning_buf = String::new();
+        // Anthropic extended-thinking blocks (text + signature) accumulated
+        // from `StreamEvent::ThinkingBlock`. Carried into the message via
+        // `finalize_stream_with_tool_calls_and_thinking` so the next
+        // request can echo them back — Anthropic 400s otherwise (`The
+        // content[].thinking in the thinking mode must be passed back`).
+        let mut thinking_blocks: Vec<crate::conversation::message::ThinkingBlock> =
+            Vec::new();
         let mut total_tokens: usize = 0;
         // Telemetry: per-turn token counters populated from StreamEvent::Usage.
         let mut tel_input_tokens: u32 = 0;
@@ -420,6 +351,9 @@ impl TurnRunner {
         };
         let mut got_any_event = false;
         let mut was_truncated = false;
+        // Hides `<tool_call>...</tool_call>` blocks from UI/conversation while
+        // keeping `text_buf` raw so rescue can still parse them at Done.
+        let mut stream_filter = ToolCallStreamFilter::default();
 
         // Stream timeouts. Defaults are 300s for both first-token and
         // subsequent-token waits, since slow domestic model providers
@@ -466,9 +400,17 @@ impl TurnRunner {
                                         // Strip model-internal tags (DeepSeek </think>`, QwQ, etc.)
                                         let text = strip_model_tags(&text);
                                         if !text.is_empty() {
-                                            conversation.push_delta(&text);
+                                            // Raw goes into rescue source so XML tool_call blocks
+                                            // can be parsed at Done.
                                             text_buf.push_str(&text);
-                                            let _ = event_tx.send(TurnEvent::TextDelta(text));
+                                            // Visible stream excludes <tool_call>...</tool_call>
+                                            // blocks (Qwen/GLM XML leak suppression).
+                                            let visible = stream_filter.feed(&text);
+                                            if !visible.is_empty() {
+                                                conversation.push_delta(&visible);
+                                                visible_text_buf.push_str(&visible);
+                                                let _ = event_tx.send(TurnEvent::TextDelta(visible));
+                                            }
                                         }
                                     }
                                     Some(Ok(StreamEvent::Reasoning(text))) => {
@@ -478,6 +420,19 @@ impl TurnRunner {
                                         // content ends up empty.
                                         let _ = event_tx.send(TurnEvent::ReasoningDelta(text.clone()));
                                         reasoning_buf.push_str(&text);
+                                    }
+                                    Some(Ok(StreamEvent::ThinkingBlock { text, signature })) => {
+                                        got_any_event = true;
+                                        // Anthropic-only path: store the block (with
+                                        // its signature) for echo-back. Don't emit a
+                                        // UI event — the text was already streamed
+                                        // through ReasoningDelta during the deltas.
+                                        thinking_blocks.push(
+                                            crate::conversation::message::ThinkingBlock {
+                                                text,
+                                                signature,
+                                            },
+                                        );
                                     }
                                     Some(Ok(StreamEvent::ToolCallStart { id, name })) => {
                                         got_any_event = true;
@@ -566,6 +521,17 @@ impl TurnRunner {
                                     }
 
                                     Some(Ok(StreamEvent::Done { truncated: is_truncated })) => {
+                                        // Flush any holdback from the tool_call filter. If the
+                                        // stream ended mid-`<tool_call>` block, the filter
+                                        // discards the partial — preferring a missing close to
+                                        // a leaked tag.
+                                        let trailing = stream_filter.flush();
+                                        if !trailing.is_empty() {
+                                            conversation.push_delta(&trailing);
+                                            visible_text_buf.push_str(&trailing);
+                                            let _ = event_tx.send(TurnEvent::TextDelta(trailing));
+                                        }
+
                                         // Reasoning-only fallback: some gateways route the
                                         // entire response through `reasoning_content` for
                                         // reasoning models (MiniMax-M2.7, DeepSeek-R1). If
@@ -587,6 +553,18 @@ impl TurnRunner {
                                                 false
                                             }
                                         } else {
+                                            // Repair path: model split intent across two channels
+                                            // — function-calling JSON arrived with truncated args
+                                            // (e.g. only `new_string`, missing `old_string`),
+                                            // while the text stream carried the complete args as
+                                            // `<tool_call>` XML. Fill missing keys from the XML
+                                            // pool so the call doesn't fail at execute() with a
+                                            // misleading "old_string is required". JSON wins on
+                                            // conflicts; XML only fills gaps.
+                                            let xml_pool = rescue_text_tool_calls(&text_buf);
+                                            if !xml_pool.is_empty() {
+                                                repair_tool_call_args(&mut tool_calls_buf, &xml_pool);
+                                            }
                                             false
                                         };
 
@@ -594,10 +572,47 @@ impl TurnRunner {
                                             && tool_calls_buf.is_empty()
                                             && !rescued_tools
                                             && !reasoning_buf.trim().is_empty()
+                                            && reasoning_buf.trim()
+                                                != crate::provider::REASONING_PLACEHOLDER
                                         {
+                                            // Skip-promotion guard: when the reasoning
+                                            // channel carries ONLY our own outbound
+                                            // placeholder (`(no reasoning recorded)`),
+                                            // don't promote it to the assistant text
+                                            // channel. Some gateways echo back the
+                                            // placeholder as the response's
+                                            // reasoning_content (or the model mimics
+                                            // the pattern from a context full of
+                                            // historical placeholder copies — DeepSeek
+                                            // V4 thinking-mode requires non-empty
+                                            // reasoning_content on every historical
+                                            // assistant tool_call message, so a
+                                            // 17-round session has 17 copies of the
+                                            // placeholder in context). Promoting it
+                                            // would commit a meaningless string to
+                                            // history AND present `Responded { text:
+                                            // "(no reasoning recorded)" }` to the
+                                            // agent loop, which then calls
+                                            // finish_turn(Natural) and the user sees
+                                            // a silent "Nailed it" mid-task stop
+                                            // (user-reported on DeepSeek V4 Flash,
+                                            // 17 rounds 20 tools, screenshot showed
+                                            // the placeholder as the only assistant
+                                            // text before TurnComplete fired). With
+                                            // the guard: text_buf stays empty, falls
+                                            // through to the empty-response Failed
+                                            // branch below, the agent loop's existing
+                                            // 3-retry-with-backoff path takes over
+                                            // and surfaces the issue to the user
+                                            // instead of burying it as success.
                                             let promoted = std::mem::take(&mut reasoning_buf);
                                             conversation.push_delta(&promoted);
                                             text_buf.push_str(&promoted);
+                                            // Reasoning channel doesn't carry tool_call XML
+                                            // (it's a separate stream from delta text), so
+                                            // promoting it directly to visible_text_buf is
+                                            // safe — no need to re-feed through stream_filter.
+                                            visible_text_buf.push_str(&promoted);
                                             let _ = event_tx.send(TurnEvent::TextDelta(promoted));
                                         }
 
@@ -643,10 +658,12 @@ impl TurnRunner {
                                             } else {
                                                 Some(reasoning_buf.as_str())
                                             };
-                                            conversation.finalize_stream_with_tool_calls(
-                                                &tool_calls_buf,
-                                                reasoning,
-                                            );
+                                            conversation
+                                                .finalize_stream_with_tool_calls_and_thinking(
+                                                    &tool_calls_buf,
+                                                    reasoning,
+                                                    std::mem::take(&mut thinking_blocks),
+                                                );
                                         } else {
                                             conversation.finalize_stream();
                                         }
@@ -657,6 +674,15 @@ impl TurnRunner {
                                     Some(Ok(StreamEvent::Error(e))) => {
                                         conversation.finalize_stream();
                                         tel_return!(TurnResult::Failed(e), 0u32);
+                                    }
+
+                                    Some(Ok(StreamEvent::Warning(w))) => {
+                                        // Advisory only — keep streaming. The
+                                        // TUI surfaces this to the user so a
+                                        // truncating proxy is visible at the
+                                        // moment of the bad request, not three
+                                        // hours later in the datalog.
+                                        let _ = event_tx.send(TurnEvent::Warning(w));
                                     }
 
                                     Some(Err(e)) => {
@@ -709,11 +735,17 @@ impl TurnRunner {
             );
         }
 
-        // 5. If no tool calls, we're done — LLM produced text only
+        // 5. If no tool calls, we're done — LLM produced text only.
+        //    Use the FILTERED accumulator so downstream consumers
+        //    (datalog `log_text`, ATLAS plan extraction, telemetry)
+        //    see clean prose, not raw text_buf with leaked XML
+        //    tool_call blocks. Earlier bug: 5-7 atomgr datalog
+        //    20-14-23 Turn 5 logged `### 3. 传输层安全<tool_call>grep
+        //    <arg_key>...` because Responded.text was raw.
         if tool_calls_buf.is_empty() {
             tel_return!(
                 TurnResult::Responded {
-                    text: text_buf,
+                    text: visible_text_buf,
                     tokens: total_tokens,
                     truncated: was_truncated,
                 },
@@ -756,19 +788,109 @@ impl TurnRunner {
             std::collections::HashMap::new();
         let mut is_dup: Vec<bool> = vec![false; tool_calls_buf.len()];
         for (i, call) in tool_calls_buf.iter().enumerate() {
-            let key = (call.name.clone(), call.arguments.clone());
+            // Key on the *canonicalised* argument JSON so that semantically
+            // identical calls with cosmetically different formatting collapse.
+            // Weak/streaming models routinely re-emit the same call with
+            // different whitespace, key order, or escape style:
+            //   {"pattern":"foo"}   vs   {"pattern": "foo"}
+            //   {"a":1,"b":2}       vs   {"b":2,"a":1}
+            // The byte-identical comparison below would treat those as
+            // distinct and let N ghost in-flight rows leak into the UI.
+            // serde_json::to_string with a BTreeMap-backed Value sorts keys
+            // and strips whitespace, so two formattings of the same object
+            // yield the same canonical string. Non-JSON args fall back to
+            // the raw string (no regression for free-form tools).
+            let key = (call.name.clone(), normalize_tool_args(&call.arguments));
             if seen_calls.contains_key(&key) {
                 is_dup[i] = true;
             } else {
                 seen_calls.insert(key, i);
             }
         }
+
+        // ── ToolBatchStarted: fires when ≥ 2 non-duplicate calls fan
+        // out from one assistant message. Lets the UI render a single
+        // grouped block instead of N independent ▸ rows.
+        // Per-call ToolCallStarted events still fire below for backward
+        // compat (UI dedupes via batch_id membership).
+        let non_dup_count = is_dup.iter().filter(|d| !**d).count();
+        let active_batch_id = if non_dup_count >= 2 {
+            let batch_id = format!("batch_{}", uuid::Uuid::new_v4());
+            let calls: Vec<crate::turn::event::ToolBatchCall> = tool_calls_buf
+                .iter()
+                .zip(is_dup.iter())
+                .filter(|(_, dup)| !**dup)
+                .map(|(c, _)| crate::turn::event::ToolBatchCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    arguments: c.arguments.clone(),
+                })
+                .collect();
+            let _ = event_tx.send(TurnEvent::ToolBatchStarted {
+                batch_id: batch_id.clone(),
+                calls,
+            });
+            Some((batch_id, std::time::Instant::now(), non_dup_count))
+        } else {
+            None
+        };
+        let mut batch_ok_count: usize = 0;
+
         let mut files_edited_this_batch: Vec<String> = Vec::new();
         for (i, call) in tool_calls_buf.iter().enumerate() {
             if cancel.is_cancelled() {
                 tel_return!(TurnResult::Cancelled, tool_count);
             }
-            
+
+            // ── Dup-in-batch: silent skip BEFORE any UI event ──
+            // Some thinking-mode models emit the same tool_call N times in
+            // one assistant message. Dispatching them all wastes execute
+            // cycles, so we replay the first call's result for #2..N. The
+            // model still sees one ToolResult per tool_call (parity
+            // preserved via add_tool_result), but the UI must not render
+            // ghost inflight rows for the duplicates — which it would if
+            // ToolCallStarted fired before the is_dup gate.
+            //
+            // Symptom users saw before this gate moved up: a wall of
+            // identical `Bash(...)` rows for each batch where the model
+            // emitted N copies of the same call (e.g. dead_code grep
+            // session with N variants pasted in by mistake).
+            if is_dup[i] {
+                let result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: "[Duplicate call — same tool and arguments as an earlier call in this batch. \
+                             Result already returned above.]".to_string(),
+                    success: true,
+                };
+                conversation.add_tool_result(result);
+                continue;
+            }
+
+            // ── Cross-batch loop guard ──
+            // The in-batch `is_dup` above only catches a model emitting
+            // the same call N times *within one assistant message*. The
+            // 22-identical-`Bash(cargo check)` symptom from weak models
+            // is the orthogonal case: identical (name, args) repeating
+            // across many sequential turns with no progress between.
+            // See `loop_guard.rs` for the false-positive avoidance rules
+            // (output-hash + state-change reset) that make this safe to
+            // gate before execution. Same ghost-row reasoning as is_dup:
+            // blocked attempts must not emit ToolCallStarted, otherwise
+            // the UI renders a spinner row that never receives a result.
+            if let LoopGuardDecision::Block(msg) =
+                self.loop_guard.check(&call.name, &call.arguments)
+            {
+                let result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: msg,
+                    // success=false so the model treats this as a soft
+                    // error and is more likely to change strategy.
+                    success: false,
+                };
+                conversation.add_tool_result(result);
+                continue;
+            }
+
             // Send ToolCallStarted event when the tool actually starts executing.
             // This ensures tool call and result are paired correctly in the UI.
             let _ = event_tx.send(TurnEvent::ToolCallStarted {
@@ -776,7 +898,7 @@ impl TurnRunner {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             });
-            
+
             // Enforce tool filter at execution time — LLM may call tools
             // not in the provided tool_defs (e.g., during diagnosis read-only phase).
             if let Some(filter) = allowed_tools {
@@ -800,43 +922,52 @@ impl TurnRunner {
                     continue;
                 }
             }
-            if is_dup[i] {
-                let result = ToolResult {
-                    call_id: call.id.clone(),
-                    output: "[Duplicate call — same tool and arguments as an earlier call in this batch. \
-                             Result already returned above.]".to_string(),
-                    success: true,
-                };
-                let _ = event_tx.send(TurnEvent::ToolCallResult {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    output: result.output.clone(),
-                    success: true,
-                    duration: std::time::Duration::ZERO,
-                });
-                conversation.add_tool_result(result);
-            } else {
-                let result = self.execute_single_tool(call, event_tx, &cancel).await;
+            // Dup-in-batch was already short-circuited above (before the
+            // ToolCallStarted emit), so by the time we reach here this is
+            // a real, non-duplicate call to execute.
+            let result = self.execute_single_tool(call, event_tx, &cancel).await;
+            if active_batch_id.is_some() && result.success {
+                batch_ok_count += 1;
+            }
 
-                // Track files edited for read interception (batch + cross-turn)
-                // Use full file path as key to avoid basename collisions
-                // (e.g., api/__init__.py vs schemas/__init__.py).
-                if matches!(call.name.as_str(), "edit_file" | "create_file") && result.success {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                        if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                            let file_key = fp.to_string();
-                            if !files_edited_this_batch.contains(&file_key) {
-                                files_edited_this_batch.push(file_key.clone());
-                            }
-                            if !self.recently_edited_files.contains(&file_key) {
-                                self.recently_edited_files.push(file_key);
-                            }
+            // Track files edited for read interception (batch + cross-turn)
+            // Use full file path as key to avoid basename collisions
+            // (e.g., api/__init__.py vs schemas/__init__.py).
+            if matches!(call.name.as_str(), "edit_file" | "create_file") && result.success {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                    if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
+                        let file_key = fp.to_string();
+                        if !files_edited_this_batch.contains(&file_key) {
+                            files_edited_this_batch.push(file_key.clone());
+                        }
+                        if !self.recently_edited_files.contains(&file_key) {
+                            self.recently_edited_files.push(file_key);
                         }
                     }
                 }
-
-                conversation.add_tool_result(result);
             }
+
+            // Record into the cross-batch loop guard. Must run on every
+            // real execution (success OR failure) so the next turn's
+            // check() sees the full history. The guard's own state-
+            // change reset rule lives inside record() — runner doesn't
+            // need to know the tool taxonomy.
+            self.loop_guard
+                .record(&call.name, &call.arguments, &result.output, result.success);
+
+            conversation.add_tool_result(result);
+        }
+
+        // ── ToolBatchCompleted: closes the group started above. UI
+        // uses this to swap the spinner header to a static `· N/M ok ·
+        // Xs wall` summary. Only fires when a batch was actually opened.
+        if let Some((batch_id, started_at, total)) = active_batch_id {
+            let _ = event_tx.send(TurnEvent::ToolBatchCompleted {
+                batch_id,
+                ok: batch_ok_count,
+                total,
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
+            });
         }
 
         // Truncate oversized tool outputs before returning. Without this,
@@ -856,10 +987,13 @@ impl TurnRunner {
 
         tel_return!(
             TurnResult::UsedTools {
-                text: if text_buf.is_empty() {
+                // Same filtered-vs-raw split as the Responded arm above.
+                // text_buf keeps raw for the rescue path; visible_text_buf
+                // is what should reach downstream consumers.
+                text: if visible_text_buf.is_empty() {
                     None
                 } else {
-                    Some(text_buf)
+                    Some(visible_text_buf)
                 },
                 tool_count,
                 tokens: total_tokens,
@@ -1012,11 +1146,21 @@ impl TurnRunner {
             call
         };
 
-        // Loop detection: block before we even ask for approval. Without this,
-        // models that get stuck (e.g. re-reading a binary Office file with
-        // different offset/limit values) can burn 30+ turns on the same call.
-        // Returns a user-facing message when blocked; the tool never runs.
-        if let Some(msg) = self.detect_call_loop(&call.name, &call.arguments) {
+        // Schema gate: bounce malformed args back to the model BEFORE
+        // approval / execute. Provider stream truncation occasionally
+        // ships `{]` or `{"file_path":"..."]` (closing bracket wrong,
+        // required field missing); without this guard, write_file's
+        // fail-closed approval branch would prompt the user, the user
+        // would Allow, and execute would then fail with the same parse
+        // error — a wasted approval round-trip on a known-broken call.
+        // Runs AFTER `repair_tool_args` (so wrapper-shape / fence / nested
+        // payloads recover first) but BEFORE approval — the unrecoverable
+        // remainder is what gets bounced.
+        if let Err(reason) = tool.validate_args(&call.arguments) {
+            let msg = format!(
+                "Error: {}. Re-issue {} with a complete JSON object containing all required fields.",
+                reason, call.name
+            );
             let _ = event_tx.send(TurnEvent::ToolCallResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -1030,6 +1174,11 @@ impl TurnRunner {
                 success: false,
             };
         }
+
+        // Loop detection moved upstream to `dispatch_tools` (gates BEFORE
+        // ToolCallStarted is emitted, so blocked attempts don't render
+        // ghost inflight rows in scrollback). When we reach here the
+        // call has already cleared that guard exactly once.
 
         // Check permission via the injected PermissionDecider.
         // AutoApprove tools execute immediately; RequireApproval tools go through
@@ -1205,147 +1354,29 @@ impl TurnRunner {
             working_dir: wd,
         }
     }
-
-    /// Detect tool-call loops and return a recovery message when one should be
-    /// blocked. Also updates the rolling call history as a side effect.
-    ///
-    /// Two patterns are caught:
-    ///
-    /// 1. **Per-region read saturation** (`read_file` specific):
-    ///    3 unbroken `read_file` calls against the *same region* of a file
-    ///    (basename + offset bucket). Paginating through distinct regions of
-    ///    a large file produces different keys and does NOT trip — this
-    ///    specifically targets the panic loop where the model re-reads the
-    ///    same slice hoping for different content (Office binary, encoding
-    ///    mismatch, etc.). Reset by a successful `edit_file` / `write_file`
-    ///    targeting the same file (clears ALL regions for that file).
-    ///
-    /// 2. **Exact repeats** (any tool): 3 calls with identical `(tool_name,
-    ///    args_hash)` and no intervening `edit_file` / `write_file`. Means
-    ///    the model re-issued the same command without reacting to the
-    ///    previous failure.
-    ///
-    /// For `read_file`, the hash covers `(file_path, offset, limit)` so that
-    /// paginating through distinct regions of a large file does NOT count as
-    /// a loop — only literal re-reads do.
-    pub(super) fn detect_call_loop(&mut self, tool_name: &str, args: &str) -> Option<String> {
-        // --- Pattern 1: per-region read saturation ----------------------------
-        let working_dir = self.context.working_dir.try_read().ok().map(|g| g.clone());
-        if tool_name == "read_file" {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                    let display_name = std::path::Path::new(fp)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| fp.to_string());
-                    let key = read_region_key(args, working_dir.as_deref());
-                    let count = self.file_read_counts.entry(key).or_insert(0);
-                    *count += 1;
-                    if *count >= 3 {
-                        return Some(format!(
-                            "BLOCKED: read_file '{}' hit its {}-call cap for the SAME region of this file. \
-                             You keep requesting the same slice and getting the same output. \
-                             First, check that the path itself is right — if you're using a relative \
-                             or basename-only path, the user may have mentioned a specific absolute \
-                             path (e.g. ~/some/dir/file) that you should be using instead. \
-                             If you need more of this file, pass a different offset to jump elsewhere. \
-                             If you're stuck because the file is unreadable (Office binary, PDF, \
-                             encoding mismatch), switch to a bash converter \
-                             (pandoc / pdftotext / antiword / unzip for .docx) or tell the user \
-                             the format isn't supported. \
-                             Do not re-read this region again in this turn.",
-                            display_name, count
-                        ));
-                    }
-                }
-            }
-        }
-
-        // A successful edit on a file clears ALL of that file's region counts,
-        // so post-edit verification reads (potentially covering different parts)
-        // aren't blocked. `edit_file` / `write_file` also clear the global
-        // recent-repeat list further down.
-        if matches!(tool_name, "edit_file" | "write_file" | "create_file") {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                    let file_key = canonical_or_lexical_path_key(fp, working_dir.as_deref());
-                    self.file_read_counts
-                        .retain(|(file, _), _| file != &file_key);
-                }
-            }
-        }
-
-        // --- Pattern 2: exact-repeat across any tool --------------------------
-        let args_hash = loop_args_hash(tool_name, args, working_dir.as_deref());
-        let sig = (tool_name.to_string(), args_hash);
-
-        // Count repeats of this exact signature *since the last edit*. An edit
-        // breaks the streak — re-issuing the same read/grep after fixing the
-        // file is legitimate and must not be blocked.
-        let mut repeats = 1usize; // including the current call
-        for prev in self.recent_calls.iter().rev() {
-            if matches!(prev.0.as_str(), "edit_file" | "write_file" | "create_file") {
-                break;
-            }
-            if *prev == sig {
-                repeats += 1;
-            }
-        }
-
-        self.recent_calls.push(sig);
-        if self.recent_calls.len() > 20 {
-            self.recent_calls.remove(0);
-        }
-
-        if repeats >= 3 {
-            return Some(format!(
-                "BLOCKED: {} was called with identical arguments {} times in a row \
-                 without any intervening edit. This is a loop. Read the previous error \
-                 message — it explains why the call is failing. Fix the underlying \
-                 problem (wrong path, wrong format, missing dependency) before retrying, \
-                 or tell the user the step can't proceed.",
-                tool_name, repeats
-            ));
-        }
-        None
-    }
 }
 
-/// Hash a tool call for exact-repeat loop detection.
+/// Canonicalise a tool-call `arguments` string for in-batch dedup keying.
 ///
-/// For `read_file` we hash `(file_path, offset, limit)` — paginating through
-/// different regions of the same large file must NOT collapse to one hash
-/// (that was the historical behavior and it tripped the 3-repeat guard on
-/// legitimate scans). Missing `offset` / `limit` normalize to 0 so the hash
-/// is stable whether the model omits the field or sends it as `null`.
+/// Weak/streaming models routinely re-emit the same call with cosmetically
+/// different formatting — `{"pattern":"foo"}` vs `{"pattern": "foo"}` vs
+/// `{"a":1,"b":2}` vs `{"b":2,"a":1}`. Byte-comparison treats them as
+/// distinct, the in-batch `is_dup` misses, and N ghost ToolCallInFlight
+/// rows leak into the UI (the symptom from the deepseek-v4-flash
+/// screenshot: 2 empty `Glob(**/*.rs)` rows + 1 with body).
 ///
-/// For every other tool we hash the whole `args` string.
-fn loop_args_hash(tool_name: &str, args: &str, working_dir: Option<&Path>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    if tool_name == "read_file" {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-            if v.get("file_path").and_then(|v| v.as_str()).is_some() {
-                let file_key = read_file_key(args, working_dir).unwrap_or_default();
-                file_key.hash(&mut h);
-                v.get("offset")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0)
-                    .hash(&mut h);
-                v.get("limit")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0)
-                    .hash(&mut h);
-                return h.finish();
-            }
-        }
-        // Malformed args or missing file_path — hash raw so identical bad
-        // calls still collapse and trip the loop detector.
-        args.hash(&mut h);
-    } else {
-        args.hash(&mut h);
+/// We re-parse and serialise compact. `serde_json::Map` is BTreeMap-backed
+/// when the `preserve_order` feature is off (it is — see workspace
+/// Cargo.toml), so object keys come out alphabetically — two re-orderings
+/// of the same object hash to the same canonical string. Non-JSON args
+/// (free-form text, garbage from broken streams) round-trip through the
+/// fallback unchanged so we don't regress free-form tools or accidentally
+/// merge two genuinely different malformed payloads.
+fn normalize_tool_args(args: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| args.to_string()),
+        Err(_) => args.to_string(),
     }
-    h.finish()
 }
 
 /// Strip model-internal reasoning tags from streaming output.
@@ -1417,10 +1448,11 @@ fn strip_model_tags(text: &str) -> String {
     result
 }
 
-/// Rescue tool calls embedded as text in the model's response.
-/// Some models (GLM-5 via OpenRouter) sometimes output tool calls as
-/// `<tool_call>name(arg=value)</tool_call>` or `<tool_call>name(json)</tool_call>`
-/// instead of using the standard function calling format.
+/// Rescue tool calls embedded as text in the model's response. Three variants:
+///   1. `<tool_call>name(json)</tool_call>` — paren+JSON
+///   2. `<tool_call>name(k=v, k=v)</tool_call>` — paren+kv (legacy single-line)
+///   3. `<tool_call><tool_name>name</tool_name><arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`
+///      — Qwen/GLM XML format (multi-line, args may span newlines)
 /// Returns rescued ToolCalls, empty vec if nothing found.
 fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut calls = Vec::new();
@@ -1428,30 +1460,40 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
 
     while let Some(start) = remaining.find("<tool_call>") {
         let after_tag = &remaining[start + "<tool_call>".len()..];
-        let end = after_tag
-            .find("</tool_call>")
-            .or_else(|| after_tag.find('\n'))
-            .unwrap_or(after_tag.len());
-        let body = after_tag[..end].trim();
 
-        // Parse: "name(key=value, ...)" or "name({json})"
-        if let Some(paren) = body.find('(') {
+        // Prefer </tool_call> close (XML format spans newlines).
+        // Fall back to first newline only when no close tag is present
+        // (legacy single-line format).
+        let (body, advance) = match after_tag.find("</tool_call>") {
+            Some(pos) => (&after_tag[..pos], pos + "</tool_call>".len()),
+            None => {
+                let pos = after_tag.find('\n').unwrap_or(after_tag.len());
+                (&after_tag[..pos], pos)
+            }
+        };
+        let body = body.trim();
+
+        if let Some((name, args_json)) = parse_xml_tool_call(body) {
+            let call_id = format!("rescued_{}", calls.len());
+            calls.push(ToolCall {
+                id: call_id,
+                name,
+                arguments: args_json,
+            });
+        } else if let Some(paren) = body.find('(') {
             let name = body[..paren].trim();
             let args_raw = body[paren + 1..].trim_end_matches(')').trim();
 
             if !name.is_empty() {
-                // Try parsing as JSON first
                 let args_json = if args_raw.starts_with('{') {
                     args_raw.to_string()
                 } else {
-                    // Convert key=value pairs to JSON
                     let mut json_parts = Vec::new();
                     for part in args_raw.split(',') {
                         let part = part.trim();
                         if let Some(eq) = part.find('=') {
                             let k = part[..eq].trim();
                             let v = part[eq + 1..].trim();
-                            // Quote the value if not already quoted
                             let v_quoted = if v.starts_with('"')
                                 || v.starts_with('{')
                                 || v.starts_with('[')
@@ -1478,10 +1520,213 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
             }
         }
 
-        remaining = &after_tag[end..];
+        remaining = &after_tag[advance..];
     }
 
     calls
+}
+
+/// Parse Qwen/GLM XML-style tool call body:
+///   `<tool_name>NAME</tool_name><arg_key>K1</arg_key><arg_value>V1</arg_value>...`
+/// Returns `(name, args_as_json_object)` or None when the format doesn't match.
+fn parse_xml_tool_call(body: &str) -> Option<(String, String)> {
+    let name = extract_between(body, "<tool_name>", "</tool_name>")?
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut map = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(k_start) = rest.find("<arg_key>") {
+        let k_after = &rest[k_start + "<arg_key>".len()..];
+        let k_end = k_after.find("</arg_key>")?;
+        let key = k_after[..k_end].trim().to_string();
+        if key.is_empty() {
+            return None;
+        }
+        let after_key = &k_after[k_end + "</arg_key>".len()..];
+        let v_start = after_key.find("<arg_value>")?;
+        let v_after = &after_key[v_start + "<arg_value>".len()..];
+        let v_end = v_after.find("</arg_value>")?;
+        let raw_value = &v_after[..v_end];
+        map.insert(key, coerce_xml_value(raw_value));
+        rest = &v_after[v_end + "</arg_value>".len()..];
+    }
+
+    if map.is_empty() {
+        return None;
+    }
+    Some((name, serde_json::Value::Object(map).to_string()))
+}
+
+fn extract_between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let s = haystack.find(open)? + open.len();
+    let e = haystack[s..].find(close)? + s;
+    Some(&haystack[s..e])
+}
+
+/// Best-effort type inference for `<arg_value>` payloads. Bool/int/float/JSON
+/// literals get unquoted; everything else stays a string (preserves whitespace).
+fn coerce_xml_value(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed == "true" {
+        return serde_json::Value::Bool(true);
+    }
+    if trimmed == "false" {
+        return serde_json::Value::Bool(false);
+    }
+    if trimmed == "null" {
+        return serde_json::Value::Null;
+    }
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return serde_json::Value::from(n);
+    }
+    if let Ok(f) = trimmed.parse::<f64>() {
+        return serde_json::Value::from(f);
+    }
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return v;
+        }
+    }
+    // Preserve raw (including leading/trailing whitespace) — the model may have
+    // intended exact-match strings (e.g. old_string for edit_file).
+    serde_json::Value::String(raw.to_string())
+}
+
+/// Patch `tool_calls_buf` entries with missing keys borrowed from `xml_pool`
+/// (parsed by `rescue_text_tool_calls` on the same turn's raw text). Used when
+/// the model split intent across the function-calling JSON channel and the
+/// `<tool_call>` XML in the text — the JSON path may arrive with only a subset
+/// of the arguments, while the XML carries the full set. JSON wins on
+/// conflicts; XML only fills gaps. Multiple calls of the same name are matched
+/// to XML blocks of the same name in order of appearance.
+fn repair_tool_call_args(calls: &mut [ToolCall], xml_pool: &[ToolCall]) {
+    use std::collections::HashMap;
+
+    let mut by_name: HashMap<&str, Vec<&ToolCall>> = HashMap::new();
+    for x in xml_pool {
+        by_name.entry(x.name.as_str()).or_default().push(x);
+    }
+    let mut consumed: HashMap<&str, usize> = HashMap::new();
+
+    for call in calls.iter_mut() {
+        let Some(group) = by_name.get(call.name.as_str()) else {
+            continue;
+        };
+        let idx = consumed.entry(call.name.as_str()).or_insert(0);
+        let Some(xml_call) = group.get(*idx) else {
+            continue;
+        };
+        *idx += 1;
+
+        let xml_obj = match serde_json::from_str::<serde_json::Value>(&xml_call.arguments) {
+            Ok(serde_json::Value::Object(o)) => o,
+            _ => continue,
+        };
+
+        let merged = match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+            Ok(serde_json::Value::Object(mut j_obj)) => {
+                let mut patched = false;
+                for (k, v) in xml_obj {
+                    if !j_obj.contains_key(&k) {
+                        j_obj.insert(k, v);
+                        patched = true;
+                    }
+                }
+                if patched {
+                    Some(serde_json::Value::Object(j_obj))
+                } else {
+                    None
+                }
+            }
+            // JSON args unparseable / non-object → take XML wholesale.
+            _ => Some(serde_json::Value::Object(xml_obj)),
+        };
+        if let Some(v) = merged {
+            call.arguments = v.to_string();
+        }
+    }
+}
+
+/// Streaming filter that hides `<tool_call>...</tool_call>` blocks from the
+/// visible UI/conversation stream while letting the rescue path see the full
+/// raw text via a separate buffer. Tags can split across delta chunks, so the
+/// filter holds back trailing bytes that might be a partial tag.
+#[derive(Default)]
+struct ToolCallStreamFilter {
+    inside: bool,
+    holdback: String,
+}
+
+impl ToolCallStreamFilter {
+    const OPEN: &'static str = "<tool_call>";
+    const CLOSE: &'static str = "</tool_call>";
+
+    /// Feed a delta chunk; return what's safe to display now.
+    fn feed(&mut self, chunk: &str) -> String {
+        let mut work = std::mem::take(&mut self.holdback);
+        work.push_str(chunk);
+        let mut out = String::new();
+
+        loop {
+            if self.inside {
+                match work.find(Self::CLOSE) {
+                    Some(pos) => {
+                        work = work[pos + Self::CLOSE.len()..].to_string();
+                        self.inside = false;
+                    }
+                    None => {
+                        self.holdback = trail_holdback(&work, Self::CLOSE.len() - 1);
+                        return out;
+                    }
+                }
+            } else {
+                match work.find(Self::OPEN) {
+                    Some(pos) => {
+                        out.push_str(&work[..pos]);
+                        work = work[pos + Self::OPEN.len()..].to_string();
+                        self.inside = true;
+                    }
+                    None => {
+                        let hold = trail_holdback(&work, Self::OPEN.len() - 1);
+                        let visible_len = work.len() - hold.len();
+                        out.push_str(&work[..visible_len]);
+                        self.holdback = hold;
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+
+    /// End-of-stream flush. If we're still inside an unclosed `<tool_call>`,
+    /// the holdback is dropped (prevents leak); otherwise emit any held tail.
+    fn flush(&mut self) -> String {
+        if self.inside {
+            self.holdback.clear();
+            String::new()
+        } else {
+            std::mem::take(&mut self.holdback)
+        }
+    }
+}
+
+/// Take up to `max` trailing bytes from `s`, snapped down to a UTF-8 char
+/// boundary so the holdback is always a valid `String`.
+fn trail_holdback(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut split = s.len() - max;
+    while split < s.len() && !s.is_char_boundary(split) {
+        split += 1;
+    }
+    s[split..].to_string()
 }
 
 /// Merge multiple edit_file calls on the same file into one multi-edit call.
@@ -1579,201 +1824,437 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     removed_ids
 }
 
+
 #[cfg(test)]
-mod loop_hash_tests {
-    use super::{loop_args_hash, read_region_key, READ_REGION_BUCKET};
-
-    // Using a separate module name to avoid conflicting with the sibling
-    // `turn::tests` integration-style test module.
+mod normalize_tool_args_tests {
+    use super::normalize_tool_args;
 
     #[test]
-    fn read_file_hash_distinguishes_different_windows() {
-        // The core fix: hashing must make paginated reads appear as distinct
-        // calls, otherwise the 3-repeat guard fires on legitimate scans of a
-        // single large file. If this test fails, the model is about to be
-        // blocked after 3 offsets.
-        let a = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
-            None,
-        );
-        let b = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/a.rs","offset":100,"limit":60}"#,
-            None,
-        );
-        assert_ne!(a, b, "offsets 1 vs 100 must hash differently");
-
-        let c = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
-            None,
-        );
-        let d = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/a.rs","offset":1,"limit":120}"#,
-            None,
-        );
-        assert_ne!(c, d, "limit 60 vs 120 must hash differently");
-
-        let e = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
-            None,
-        );
-        let f = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
-            None,
-        );
-        assert_eq!(e, f, "identical args must hash identically");
-
-        let g = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/a.rs","offset":1,"limit":60}"#,
-            None,
-        );
-        let h = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/b.rs","offset":1,"limit":60}"#,
-            None,
-        );
-        assert_ne!(g, h, "different files must hash differently");
+    fn whitespace_variants_collapse() {
+        // The deepseek-v4-flash screenshot symptom: same call, different
+        // whitespace → must dedup.
+        let a = r#"{"pattern":"**/*.rs"}"#;
+        let b = r#"{"pattern": "**/*.rs"}"#;
+        let c = r#"{ "pattern":"**/*.rs" }"#;
+        let d = r#"{
+  "pattern": "**/*.rs"
+}"#;
+        let na = normalize_tool_args(a);
+        assert_eq!(normalize_tool_args(b), na);
+        assert_eq!(normalize_tool_args(c), na);
+        assert_eq!(normalize_tool_args(d), na);
     }
 
     #[test]
-    fn missing_offset_and_limit_normalize_to_zero() {
-        // `{path}` and `{path, offset:0, limit:0}` must hash the same — otherwise
-        // the model can evade the loop guard just by toggling the field's presence.
-        let bare = loop_args_hash("read_file", r#"{"file_path":"/a.rs"}"#, None);
-        let zeros = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"/a.rs","offset":0,"limit":0}"#,
-            None,
-        );
-        assert_eq!(bare, zeros);
+    fn key_order_collapses() {
+        // serde_json::Map is BTreeMap-backed (no preserve_order feature),
+        // so re-serialising sorts keys alphabetically.
+        let a = r#"{"a":1,"b":2}"#;
+        let b = r#"{"b":2,"a":1}"#;
+        assert_eq!(normalize_tool_args(a), normalize_tool_args(b));
     }
 
     #[test]
-    fn other_tools_hash_full_args() {
-        // Non-read tools keep full-args hashing so changing any field (path,
-        // pattern, command) is correctly treated as a different call.
-        let a = loop_args_hash("grep", r#"{"pattern":"foo","path":"/x"}"#, None);
-        let b = loop_args_hash("grep", r#"{"pattern":"foo","path":"/y"}"#, None);
-        assert_ne!(a, b);
-
-        let s1 = loop_args_hash("bash", r#"{"command":"ls"}"#, None);
-        let s2 = loop_args_hash("bash", r#"{"command":"ls"}"#, None);
-        assert_eq!(s1, s2);
+    fn nested_objects_normalize_recursively() {
+        let a = r#"{"outer":{"x":1,"y":2}}"#;
+        let b = r#"{"outer":{"y":2,"x":1}}"#;
+        assert_eq!(normalize_tool_args(a), normalize_tool_args(b));
     }
 
     #[test]
-    fn region_key_buckets_are_per_file() {
-        // Same file, same bucket regardless of how offset rounds down.
-        let a = read_region_key(
-            r#"{"file_path":"/x/render.rs","offset":100,"limit":50}"#,
-            None,
+    fn semantically_different_args_stay_different() {
+        // Don't over-collapse — different values must remain distinct so a
+        // legitimate batch of `Glob(**/*.rs)` + `Glob(**/*.toml)` doesn't
+        // dedup.
+        let a = r#"{"pattern":"**/*.rs"}"#;
+        let b = r#"{"pattern":"**/*.toml"}"#;
+        assert_ne!(normalize_tool_args(a), normalize_tool_args(b));
+    }
+
+    #[test]
+    fn non_json_args_pass_through_unchanged() {
+        // Free-form / malformed payloads must not panic or merge.
+        // (Two genuinely different garbage strings must stay distinct so
+        // we don't accidentally dedup unrelated calls.)
+        let raw = "not even json {{{";
+        assert_eq!(normalize_tool_args(raw), raw);
+        assert_ne!(normalize_tool_args("garbage A"), normalize_tool_args("garbage B"));
+    }
+}
+
+#[cfg(test)]
+mod tool_call_text_rescue_tests {
+    use super::{repair_tool_call_args, rescue_text_tool_calls, ToolCall, ToolCallStreamFilter};
+
+    #[test]
+    fn rescues_qwen_xml_format() {
+        // Qwen/GLM-5.1 sometimes emits args as <arg_key>/<arg_value> XML pairs
+        // instead of a JSON blob. Without parsing this format the call gets
+        // dispatched with empty args and edit_file fails with "old_string is
+        // required" while the raw XML leaks into the user-visible stream.
+        let text = r#"Let me make the edit:
+<tool_call>
+  <tool_name>edit_file</tool_name>
+  <arg_key>file_path</arg_key><arg_value>src/main.rs</arg_value>
+  <arg_key>old_string</arg_key><arg_value>        attrs
+      }
+  }</arg_value>
+  <arg_key>new_string</arg_key><arg_value>        attrs.push(x);
+        attrs
+      }
+  }</arg_value>
+  <arg_key>replace_all</arg_key><arg_value>false</arg_value>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 1, "single XML block should rescue one call");
+        assert_eq!(calls[0].name, "edit_file");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["file_path"], "src/main.rs");
+        assert_eq!(v["replace_all"], false);
+        // Whitespace-sensitive — old_string must round-trip exactly so edit_file
+        // can find the match in the file.
+        assert_eq!(v["old_string"], "        attrs\n      }\n  }");
+    }
+
+    #[test]
+    fn xml_without_tool_name_is_skipped() {
+        // No <tool_name> means we have no idea what to dispatch — better to
+        // skip than guess. An XML block with only <arg_key> tags is treated as
+        // a malformed legacy emit (no `(` either, so the paren branch also
+        // skips), yielding zero calls.
+        let text = r#"<tool_call>
+  <arg_key>file_path</arg_key><arg_value>x.rs</arg_value>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn legacy_paren_json_format_still_works() {
+        // Don't regress the existing rescue path used by GLM-5 via OpenRouter.
+        let text = r#"<tool_call>read_file({"file_path":"a.rs"})</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["file_path"], "a.rs");
+    }
+
+    #[test]
+    fn legacy_paren_kv_format_still_works() {
+        let text = r#"<tool_call>read_file(file_path=a.rs, offset=10)</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["file_path"], "a.rs");
+        assert_eq!(v["offset"], 10);
+    }
+
+    #[test]
+    fn xml_coerces_bool_int_float() {
+        let text = r#"<tool_call>
+  <tool_name>cfg</tool_name>
+  <arg_key>flag</arg_key><arg_value>true</arg_value>
+  <arg_key>n</arg_key><arg_value>42</arg_value>
+  <arg_key>f</arg_key><arg_value>3.14</arg_value>
+  <arg_key>s</arg_key><arg_value>hello</arg_value>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["flag"], true);
+        assert_eq!(v["n"], 42);
+        assert!((v["f"].as_f64().unwrap() - 3.14).abs() < 1e-9);
+        assert_eq!(v["s"], "hello");
+    }
+
+    #[test]
+    fn stream_filter_passes_plain_text() {
+        let mut f = ToolCallStreamFilter::default();
+        let out = f.feed("hello world");
+        // Holdback may keep up to 10 bytes in case "<tool_call" is starting,
+        // so flush to get the full output.
+        let tail = f.flush();
+        assert_eq!(format!("{}{}", out, tail), "hello world");
+    }
+
+    /// Regression for 5-7 atomgr datalog (build dd425fd, 20-14-23 Turn 5):
+    /// GLM-5.1 emitted prose then mid-sentence switched to XML tool_call:
+    /// `### 3. 传输层安全<tool_call>grep<arg_key>pattern</arg_key>...
+    /// </tool_call>`. The stream_filter caught it for streamed deltas /
+    /// conversation history, but `TurnResult::Responded.text` used raw
+    /// `text_buf` → `datalog::log_text` printed the XML in `**Response:**`.
+    ///
+    /// Fix: parallel `visible_text_buf` mirrors what the filter actually
+    /// emitted; `Responded.text` and `UsedTools.text` use it instead of
+    /// raw text_buf. This test pins the visible-side behavior for the
+    /// exact Turn 5 input shape.
+    #[test]
+    fn glm_xml_leak_mid_prose_strips_to_clean_visible_text() {
+        let mut f = ToolCallStreamFilter::default();
+        let mut visible = String::new();
+
+        // Replay the actual Turn 5 chunking shape: prose, then XML
+        // tool_call split across multiple deltas (provider chunks at
+        // arbitrary boundaries — the filter must hold back across them).
+        for chunk in [
+            "### 3. 传输层安全",
+            "<tool_call>grep",
+            "<arg_key>pattern</arg_key>",
+            "<arg_value>http://</arg_value>",
+            "<arg_key>path</arg_key>",
+            "<arg_value>/Users/y/project</arg_value>",
+            "</tool_call>",
+        ] {
+            visible.push_str(&f.feed(chunk));
+        }
+        visible.push_str(&f.flush());
+
+        assert!(
+            !visible.contains("<tool_call>"),
+            "visible accumulator must strip <tool_call> open tag: {:?}",
+            visible
         );
-        let b = read_region_key(
-            r#"{"file_path":"/x/render.rs","offset":130,"limit":50}"#,
-            None,
+        assert!(
+            !visible.contains("</tool_call>"),
+            "visible accumulator must strip </tool_call> close tag: {:?}",
+            visible
+        );
+        assert!(
+            !visible.contains("<arg_key>") && !visible.contains("<arg_value>"),
+            "visible accumulator must strip XML inner tags: {:?}",
+            visible
         );
         assert_eq!(
-            a,
-            b,
-            "offsets 100 and 130 both land in bucket {}",
-            100 / READ_REGION_BUCKET
+            visible, "### 3. 传输层安全",
+            "only the pre-tool prose should reach Responded.text"
         );
+    }
 
-        // Jump by one full bucket → different key.
-        let far = read_region_key(
-            &format!(
-                r#"{{"file_path":"/x/render.rs","offset":{},"limit":50}}"#,
-                READ_REGION_BUCKET + 200
+    #[test]
+    fn stream_filter_strips_complete_block_in_one_chunk() {
+        let mut f = ToolCallStreamFilter::default();
+        let out = f.feed("before <tool_call>edit_file({})</tool_call> after");
+        let tail = f.flush();
+        let combined = format!("{}{}", out, tail);
+        assert!(combined.contains("before "));
+        assert!(combined.contains(" after"));
+        assert!(!combined.contains("<tool_call>"));
+        assert!(!combined.contains("</tool_call>"));
+        assert!(!combined.contains("edit_file"));
+    }
+
+    #[test]
+    fn stream_filter_strips_block_split_across_chunks() {
+        // Realistic case: provider streams bytes that split the open tag
+        // arbitrarily. The filter must hold back partial-tag bytes, not emit
+        // them, and resume cleanly when the close arrives.
+        let mut f = ToolCallStreamFilter::default();
+        let mut visible = String::new();
+        for chunk in [
+            "before <tool_",
+            "call><tool_name>edit_file</tool_name>",
+            "<arg_key>k</arg_key><arg_value>v</arg_value>",
+            "</tool_call> after",
+        ] {
+            visible.push_str(&f.feed(chunk));
+        }
+        visible.push_str(&f.flush());
+        assert_eq!(visible, "before  after");
+    }
+
+    #[test]
+    fn stream_filter_drops_unclosed_block() {
+        // If the stream ends mid-`<tool_call>` (truncation, error), discard
+        // the holdback rather than leaking the open fragment to the user.
+        let mut f = ToolCallStreamFilter::default();
+        let out = f.feed("text <tool_call>edit_file({});");
+        let tail = f.flush();
+        let combined = format!("{}{}", out, tail);
+        assert_eq!(combined, "text ");
+    }
+
+    #[test]
+    fn stream_filter_handles_partial_open_at_chunk_end() {
+        // The filter must not emit `<` or `<t` etc. as visible text just
+        // because the chunk happened to end mid-tag.
+        let mut f = ToolCallStreamFilter::default();
+        let v1 = f.feed("hello <");
+        // Could be holdback; not guaranteed any specific output yet.
+        let v2 = f.feed("tool_call>x</tool_call>!");
+        let tail = f.flush();
+        let combined = format!("{}{}{}", v1, v2, tail);
+        assert_eq!(combined, "hello !");
+    }
+
+    #[test]
+    fn stream_filter_passes_through_lt_that_isnt_tool_call() {
+        // A bare `<` followed by non-tool_call content should eventually flush.
+        let mut f = ToolCallStreamFilter::default();
+        let mut visible = String::new();
+        visible.push_str(&f.feed("a < b "));
+        visible.push_str(&f.feed("and c <"));
+        visible.push_str(&f.feed("d>e"));
+        visible.push_str(&f.flush());
+        assert_eq!(visible, "a < b and c <d>e");
+    }
+
+    fn tc(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.into(),
+        }
+    }
+
+    #[test]
+    fn repair_fills_missing_old_string_from_xml() {
+        // Reproduces the user-reported bug: the function-calling JSON channel
+        // delivered `{file_path, new_string, replace_all}` (passes
+        // validate_args because new_string is present) but missing
+        // `old_string` — execute() then fails with "old_string is required".
+        // The full args were carried as XML in the text stream. After repair,
+        // the call has all four keys.
+        let mut calls = vec![tc(
+            "c1",
+            "edit_file",
+            r#"{"file_path":"x.rs","new_string":"new","replace_all":false}"#,
+        )];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"old","new_string":"new","replace_all":false}"#,
+        )];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let merged: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(merged["file_path"], "x.rs");
+        assert_eq!(merged["old_string"], "old");
+        assert_eq!(merged["new_string"], "new");
+        assert_eq!(merged["replace_all"], false);
+    }
+
+    #[test]
+    fn repair_does_not_overwrite_keys_present_in_json() {
+        // Conflict policy: function-calling JSON is the source of truth; XML
+        // only fills gaps. If the JSON channel and XML disagree on a key
+        // (e.g. different new_string), keep JSON.
+        let mut calls = vec![tc(
+            "c1",
+            "edit_file",
+            r#"{"file_path":"x.rs","new_string":"json_wins"}"#,
+        )];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","new_string":"xml_loses","old_string":"old"}"#,
+        )];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let merged: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(merged["new_string"], "json_wins");
+        assert_eq!(merged["old_string"], "old");
+    }
+
+    #[test]
+    fn repair_skips_when_names_dont_match() {
+        // Repair must never cross tool boundaries — patching read_file with
+        // edit_file's args would dispatch a malformed call.
+        let original = r#"{"file_path":"x.rs"}"#;
+        let mut calls = vec![tc("c1", "read_file", original)];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"a","new_string":"b"}"#,
+        )];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        assert_eq!(calls[0].arguments, original);
+    }
+
+    #[test]
+    fn repair_takes_xml_wholesale_when_json_unparseable() {
+        // Truncated/garbled args from the JSON channel would otherwise
+        // fail to parse later anyway. Replace with the XML object.
+        let mut calls = vec![tc("c1", "edit_file", r#"{"file_path": "trunc"#)];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"a","new_string":"b"}"#,
+        )];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let merged: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(merged["file_path"], "x.rs");
+        assert_eq!(merged["old_string"], "a");
+    }
+
+    #[test]
+    fn repair_matches_multiple_same_name_calls_in_order() {
+        // Two edit_file calls in the same turn, two XML blocks — match by
+        // order so the second JSON call gets the second XML's args, not the
+        // first one's reused.
+        let mut calls = vec![
+            tc("c1", "edit_file", r#"{"file_path":"a.rs","new_string":"a_new"}"#),
+            tc("c2", "edit_file", r#"{"file_path":"b.rs","new_string":"b_new"}"#),
+        ];
+        let xml_pool = vec![
+            tc(
+                "rescued_0",
+                "edit_file",
+                r#"{"file_path":"a.rs","old_string":"a_old","new_string":"a_new"}"#,
             ),
-            None,
-        );
-        assert_ne!(a, far, "offsets across bucket boundaries must differ");
-
-        // Whole-file read and `offset=0` both normalize to bucket 0.
-        let full = read_region_key(r#"{"file_path":"/x/render.rs"}"#, None);
-        let zero = read_region_key(r#"{"file_path":"/x/render.rs","offset":0}"#, None);
-        assert_eq!(full, zero);
-        assert_eq!(full.1, 0);
-
-        // Different files are different keys even at the same offset bucket.
-        let other = read_region_key(r#"{"file_path":"/x/mod.rs","offset":100}"#, None);
-        assert_ne!(a, other);
-    }
-
-    #[test]
-    fn read_file_hash_canonicalizes_relative_paths_with_working_dir() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("src/lib.rs");
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, "fn lib() {}\n").unwrap();
-
-        let rel = loop_args_hash(
-            "read_file",
-            r#"{"file_path":"src/lib.rs","offset":0,"limit":20}"#,
-            Some(dir.path()),
-        );
-        let abs = loop_args_hash(
-            "read_file",
-            &format!(
-                r#"{{"file_path":"{}","offset":0,"limit":20}}"#,
-                file.display()
+            tc(
+                "rescued_1",
+                "edit_file",
+                r#"{"file_path":"b.rs","old_string":"b_old","new_string":"b_new"}"#,
             ),
-            Some(dir.path()),
-        );
-
-        assert_eq!(rel, abs, "relative and absolute path to same file must collapse");
+        ];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let m1: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        let m2: serde_json::Value = serde_json::from_str(&calls[1].arguments).unwrap();
+        assert_eq!(m1["old_string"], "a_old");
+        assert_eq!(m2["old_string"], "b_old");
     }
 
     #[test]
-    fn region_key_distinguishes_same_basename_in_different_dirs() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let a = dir.path().join("a/mod.rs");
-        let b = dir.path().join("b/mod.rs");
-        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
-        std::fs::write(&a, "mod a;\n").unwrap();
-        std::fs::write(&b, "mod b;\n").unwrap();
-
-        let key_a = read_region_key(
-            r#"{"file_path":"a/mod.rs","offset":100,"limit":50}"#,
-            Some(dir.path()),
-        );
-        let key_b = read_region_key(
-            r#"{"file_path":"b/mod.rs","offset":100,"limit":50}"#,
-            Some(dir.path()),
-        );
-
-        assert_ne!(key_a, key_b, "same basename in different dirs must not share a read bucket");
+    fn repair_no_op_when_json_already_complete() {
+        // If the JSON channel got everything right, repair is silent —
+        // serialization-level identity isn't guaranteed (key order may
+        // change), but semantic equality holds.
+        let mut calls = vec![tc(
+            "c1",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"a","new_string":"b","replace_all":false}"#,
+        )];
+        let xml_pool = vec![tc(
+            "rescued_0",
+            "edit_file",
+            r#"{"file_path":"x.rs","old_string":"a"}"#,
+        )];
+        let before: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        repair_tool_call_args(&mut calls, &xml_pool);
+        let after: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]
-    fn region_key_handles_malformed_args() {
-        // Garbage in → bucket 0 (same as no-offset), so at worst we over-count
-        // a single bucket and the model gets a helpful block message instead
-        // of a mis-routed one.
-        let bad = read_region_key("not json", None);
-        assert_eq!(bad, ("<malformed>".to_string(), 0));
+    fn repair_skips_unparseable_xml() {
+        // If the XML pool has a bogus entry (e.g. arguments that aren't a
+        // JSON object), repair must skip it without crashing or polluting
+        // the JSON call.
+        let original = r#"{"file_path":"x.rs"}"#;
+        let mut calls = vec![tc("c1", "edit_file", original)];
+        let xml_pool = vec![tc("rescued_0", "edit_file", "not even json")];
+        repair_tool_call_args(&mut calls, &xml_pool);
+        assert_eq!(calls[0].arguments, original);
     }
 
     #[test]
-    fn malformed_read_args_fall_back_to_raw_hash() {
-        // If args aren't valid JSON or lack file_path, still produce a stable
-        // hash from the raw string so the loop detector at least collapses
-        // exact duplicate bad calls.
-        let a = loop_args_hash("read_file", "not json at all", None);
-        let b = loop_args_hash("read_file", "not json at all", None);
-        assert_eq!(a, b);
-
-        let c = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#, None);
-        let d = loop_args_hash("read_file", r#"{"no_file_path":"oops"}"#, None);
-        assert_eq!(c, d);
-
-        assert_ne!(a, c, "different malformed inputs still differ");
+    fn stream_filter_handles_utf8_at_holdback_boundary() {
+        // UTF-8 multi-byte chars must not get split across the holdback
+        // boundary — the trail snap rounds up to a char boundary.
+        let mut f = ToolCallStreamFilter::default();
+        let mut visible = String::new();
+        visible.push_str(&f.feed("中文 hello "));
+        visible.push_str(&f.feed("世界"));
+        visible.push_str(&f.flush());
+        assert_eq!(visible, "中文 hello 世界");
     }
 }

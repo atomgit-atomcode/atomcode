@@ -74,18 +74,18 @@ impl Tool for FindReferencesTool {
 
         // Use ripgrep to find all occurrences (word boundary match)
         let pattern = format!(r"\b{}\b", regex::escape(&parsed.symbol));
-        let output = Command::new("rg")
-            .args(&[
-                "--json",
-                "--line-number",
-                "--color=never",
-                "--max-count=30",
-                "-w", // word boundary
-                &pattern,
-                &search_dir,
-            ])
-            .output()
-            .await;
+        let mut cmd = Command::new("rg");
+        cmd.args(&[
+            "--json",
+            "--line-number",
+            "--color=never",
+            "--max-count=30",
+            "-w", // word boundary
+            &pattern,
+            &search_dir,
+        ]);
+        crate::process_utils::suppress_console_window(&mut cmd);
+        let output = cmd.output().await;
 
         let rg_output = match output {
             Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),

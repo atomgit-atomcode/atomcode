@@ -122,6 +122,14 @@ struct PlatformTokenResponse {
 // degrades to `thread::sleep`.
 
 /// Outcome of waiting for stdin activity during the OAuth poll loop.
+//
+// On Windows `wait_for_esc_or_timeout` always returns `Timeout` (no
+// poll(2) over stdin), so `Cancelled` and `OtherInput` are constructed
+// only on Unix. The variants must still exist on Windows because
+// `classify_input` and its tests reference them — `cargo test` runs on
+// every platform. Suppress the dead-code warning rather than gate the
+// type, so the test surface stays portable.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscOutcome {
     /// Bare ESC keypress — user cancelled.
@@ -143,6 +151,13 @@ enum EscOutcome {
 /// single write to the master pty, so a 32-byte non-blocking read sees
 /// the whole sequence at once and we never mistake its prefix for bare
 /// ESC. See spec `2026-04-28-show-oauth-url-design.md` §5.
+//
+// Only called from the Unix `wait_for_esc_or_timeout`. Kept callable on
+// Windows because the unit-test module exercises it on every platform —
+// the logic is byte-pattern matching, no platform deps. `dead_code`
+// suppression scoped to Windows so Unix still gets the warning if a
+// future change makes it genuinely unused there.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn classify_input(bytes: &[u8]) -> EscOutcome {
     match bytes {
         [] => EscOutcome::Timeout,

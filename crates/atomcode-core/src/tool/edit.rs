@@ -116,9 +116,33 @@ async fn validate_write_check(
 
     atomic_write(file_path, &validated.fixed_content).await?;
 
+    // Canonicalize once for downstream tools that key by absolute path
+    // (FileStore, LSP). `file_path` here may be the model's
+    // raw-as-supplied string — e.g. on macOS that's `/var/folders/...`
+    // while FileStore stored the symlink-resolved `/private/var/...`.
+    // Without this normalization, FileStore's `invalidate(raw_path)`
+    // is a silent no-op and a stale `store_id` keeps serving pre-edit
+    // bytes to the next peek_file call.
+    let raw_path = std::path::Path::new(file_path);
+    let canon_path = std::fs::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
+
     // Notify LSP that file changed (if LSP is enabled).
-    let path = std::path::Path::new(file_path);
-    ctx.notify_lsp_file_changed(path, &validated.fixed_content).await;
+    ctx.notify_lsp_file_changed(&canon_path, &validated.fixed_content)
+        .await;
+    // D3: drop any FileStore entry for this path. peek_file against the
+    // pre-edit store_id will return a "stale" hint pointing at re-read,
+    // ensuring the model never operates on a snapshot that no longer
+    // matches disk after its own edit.
+    ctx.file_store.write().await.invalidate(&canon_path);
+    // Defense-in-depth: also purge read_cache entries for this path. The
+    // mtime gate at read.rs catches most cases, but on FS with coarse
+    // mtime granularity (ext4 sec, NFS) an edit within the same tick as
+    // the prior read leaves mtime unchanged and the gate fails open.
+    // Explicit purge closes that corner case.
+    ctx.read_cache
+        .write()
+        .await
+        .retain(|(p, _, _), _| p != &canon_path);
 
     // 4. Post-write syntax check (needs file on disk)
     let syntax_warn = auto_fix::post_edit_syntax_check(file_path).await;
@@ -237,15 +261,68 @@ impl Tool for EditFileTool {
                         "description": "Replace ALL occurrences (default: first only). Only for text mode."
                     }
                 },
-                "required": ["file_path", "new_string"]
+                // Only file_path is universally required. Mode-specific
+                // requirements (text/line/edits/symbol) are enforced in
+                // validate_args() below — encoding them in `required` is
+                // a lie because edits-mode doesn't need top-level
+                // new_string, and that lie used to bounce legitimate
+                // edits-mode calls.
+                "required": ["file_path"]
             }),
         }
     }
 
+    fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
+        // Stage 1: structural diagnostic — list provided keys, name what's
+        // missing, give a copy-pasteable example. Replaces the raw serde
+        // "line 1 column N" error that weak models read as a positional-
+        // arg complaint.
+        super::diagnose_args(
+            "edit_file",
+            args,
+            &[&["file_path"]],
+            "edit_file({\"file_path\": \"<abs>\", \"old_string\": \"<old>\", \"new_string\": \"<new>\"}) \
+             — text mode; or use start_line+end_line+new_string for line mode",
+        )?;
+        let parsed: EditFileArgs = serde_json::from_str(args).map_err(|e| {
+            format!(
+                "edit_file: {e}. Check that file_path is a string, line numbers are integers, \
+                 and old_string/new_string are strings."
+            )
+        })?;
+        // Stage 2: semantic gate — edit_file is a multi-mode tool. Accepts
+        // (old_string + new_string) OR (start_line + end_line +
+        // new_string) OR (edits array) OR (symbol + new_string). A call
+        // with only `file_path` is a truncated/half-formed payload that
+        // would deterministically fail in execute(); reject it here so
+        // the model gets a structured retry hint without an approval
+        // round-trip.
+        let has_string_mode = parsed.old_string.is_some() || parsed.new_string.is_some();
+        let has_line_mode = parsed.start_line.is_some() || parsed.end_line.is_some();
+        let has_edits = parsed.edits.is_some();
+        let has_symbol = parsed.symbol.is_some();
+        if !has_string_mode && !has_line_mode && !has_edits && !has_symbol {
+            return Err(
+                "edit_file arguments missing edit content. Provide `old_string`+`new_string`, \
+                 `start_line`+`end_line`+`new_string`, an `edits` array, or `symbol`+`new_string`."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     fn approval(&self, args: &str) -> ApprovalRequirement {
+        // The runner's `validate_args` gate already rejects unparseable
+        // payloads upstream — when we get here, args are valid JSON
+        // matching the schema. Sensitive-path detection still runs as
+        // a separate concern: even valid args can target a path that
+        // requires explicit user approval.
         let parsed = match serde_json::from_str::<EditFileArgs>(args) {
             Ok(p) => p,
             Err(_) => {
+                // Defense in depth: if validate_args was somehow bypassed
+                // (e.g. tool invoked from a path that doesn't run the
+                // gate), fall back to the original fail-closed behaviour.
                 return ApprovalRequirement::RequireApproval(
                     "Could not parse edit_file arguments for safety check.".to_string(),
                 );
@@ -281,7 +358,34 @@ impl Tool for EditFileTool {
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        let parsed: EditFileArgs = serde_json::from_str(args)?;
+        // Defense-in-depth: validate_args runs at the runner gate, but if
+        // it's bypassed we surface the same model-friendly diagnostic
+        // instead of bubbling a raw serde error up the call stack.
+        if let Err(msg) = super::diagnose_args(
+            "edit_file",
+            args,
+            &[&["file_path"]],
+            "edit_file({\"file_path\": \"<abs>\", \"old_string\": \"<old>\", \"new_string\": \"<new>\"})",
+        ) {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: msg,
+                success: false,
+            });
+        }
+        let parsed: EditFileArgs = match serde_json::from_str(args) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!(
+                        "edit_file: {e}. Check that file_path is a string, line numbers are \
+                         integers, and old_string/new_string are strings."
+                    ),
+                    success: false,
+                });
+            }
+        };
         let working_dir = ctx.working_dir.read().await.clone();
         let file_path = match super::inspect_path_access(&parsed.file_path, &working_dir) {
             Ok(access) => access.path,
@@ -1080,13 +1184,27 @@ fn try_fuzzy_replace(
         return None; // caller will handle the "multiple matches" error
     }
 
-    // Compute the base indent of new_string (to preserve relative indentation)
+    // Compute the base indent of new_string used as the re-anchor point.
+    //
+    // 2026-04-23 (P1 #14c+11): changed from `.min()` to "first non-empty
+    // line's indent".
+    //
+    // BUG the old `.min()` version caused (hermes session 2026-04-22_21-06):
+    //   Model's new_string had 4 lines — `.run(...)` at 9 spaces,
+    //   `.expect(...)` at 9 spaces, `}` at 0 spaces, `marker()` at 0 spaces.
+    //   `.min()` picked 0 (from the outdented `}`). Then `.run(...)` got
+    //   `relative = 9 - 0 = 9`, added to the file's 8-space prefix → output
+    //   at 17 spaces. Next fuzzy edit on that corrupted file repeated the
+    //   shift → 17 → 26 → accumulating indent drift.
+    //
+    // NEW ANCHOR semantics: the model's first non-empty line in new_string
+    // represents the OUTER indent the model intended to match in old_string.
+    // Relative differences (lines indented more OR less than the anchor)
+    // are preserved as signed offsets from the file's actual indent.
     let new_lines: Vec<&str> = new_string.lines().collect();
-    let new_base_indent = new_lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
+    let new_base_indent = new_lines.iter()
+        .find(|l| !l.trim().is_empty())
         .map(|l| l.len() - l.trim_start().len())
-        .min()
         .unwrap_or(0);
 
     let mut result_lines: Vec<String> = content_lines.iter().map(|l| l.to_string()).collect();
@@ -1103,20 +1221,30 @@ fn try_fuzzy_replace(
         let file_indent = original_line.len() - original_line.trim_start().len();
         let file_indent_str: String = original_line.chars().take(file_indent).collect();
 
-        // Build replacement preserving RELATIVE indentation from new_string
-        let replacement: Vec<String> = new_lines
-            .iter()
-            .map(|l| {
-                if l.trim().is_empty() {
-                    String::new()
+        // Build replacement preserving RELATIVE indentation from new_string,
+        // supporting both deeper-than-anchor (add spaces) and outdented-from-
+        // anchor (trim the file's indent prefix) cases.
+        let replacement: Vec<String> = new_lines.iter().map(|l| {
+            if l.trim().is_empty() {
+                String::new()
+            } else {
+                let line_indent = l.len() - l.trim_start().len();
+                let signed_relative = line_indent as isize - new_base_indent as isize;
+                let total_indent = if signed_relative >= 0 {
+                    // Same or deeper than anchor — keep file's indent prefix
+                    // (preserves tabs/spaces mix) and extend with plain spaces.
+                    format!("{}{}", file_indent_str, " ".repeat(signed_relative as usize))
                 } else {
-                    let line_indent = l.len() - l.trim_start().len();
-                    let relative = line_indent.saturating_sub(new_base_indent);
-                    let total_indent = format!("{}{}", file_indent_str, " ".repeat(relative));
-                    format!("{}{}", total_indent, l.trim())
-                }
-            })
-            .collect();
+                    // Outdented from anchor — drop `abs(signed_relative)`
+                    // chars from the tail of file_indent_str. Preserves the
+                    // leading whitespace semantics up to the needed depth.
+                    let drop = (-signed_relative) as usize;
+                    let keep = file_indent.saturating_sub(drop);
+                    file_indent_str.chars().take(keep).collect()
+                };
+                format!("{}{}", total_indent, l.trim())
+            }
+        }).collect();
 
         result_lines.splice(start..end, replacement);
     }

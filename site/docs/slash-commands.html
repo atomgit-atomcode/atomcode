@@ -51,7 +51,7 @@
 
     <main class="prose-docs min-w-0">
       <h1>斜杠命令</h1>
-      <p class="lede">在 TUI 输入框中以 <code>/</code> 开头即可触发命令,并获得自动补全菜单。按功能分类的 23 个内置命令如下。</p>
+      <p class="lede">在 TUI 输入框中以 <code>/</code> 开头即可触发命令,并获得自动补全菜单。按功能分类的 30+ 个内置命令如下;Skills 和 Plugin 加载的命令也会自动出现在补全菜单里。</p>
 
       <h2>核心功能</h2>
       <table>
@@ -63,6 +63,7 @@
           <tr><td><code>/login</code></td><td>仅完成 AtomGit OAuth 身份认证,<strong>不动 provider 配置</strong>(给已有 API Key 但想用 <code>/issue</code> 等 AtomGit 集成的用户)</td></tr>
           <tr><td><code>/resume</code></td><td>打开会话选择器,恢复任意一个之前的持久化会话(含消息、目录和模型状态)</td></tr>
           <tr><td><code>/session</code></td><td>创建一个全新的、干净的会话</td></tr>
+          <tr><td><code>/rename &lt;新名字&gt;</code></td><td>重命名当前会话(影响 <code>/resume</code> 选择器里的显示名)</td></tr>
           <tr><td><code>/provider</code></td><td>打开 provider 管理界面,增删改切换</td></tr>
           <tr><td><code>/model</code></td><td>在当前 provider 下切换模型,或跨 provider 切换</td></tr>
           <tr><td><code>/cd</code></td><td>切换工作目录,并写回 <code>default_workdir</code>。也可以直接输入 <code>cd /path</code>(无需斜杠前缀)</td></tr>
@@ -81,8 +82,23 @@
           <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
           <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
           <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
+          <tr><td><code>/init</code></td><td>扫描当前工作目录,生成 / 刷新 <code>.atomcode.md</code> 项目指令文件 — 内含 build / test 命令、技术栈摘要、目录结构等,后续每次启动都会作为系统提示注入</td></tr>
+          <tr><td><code>/background &lt;任务&gt;</code></td><td>把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于"顺手让它去查一下 X"这类轻探索</td></tr>
+          <tr><td><code>/worktree &lt;子命令&gt;</code></td><td>Git worktree 隔离:<code>create</code> 在新分支上拉一份独立 worktree、<code>list</code> 查看现有 worktree、<code>done</code> 把 worktree 改动 squash 回主分支、<code>cleanup</code> 清理已完成的 worktree</td></tr>
           <tr><td><code>/issue</code></td><td>交互式向导:在当前 git 仓库对应的 AtomGit 仓库创建一个新 issue(需先 OAuth 登录,cwd 必须是 atomgit.com 仓库的 clone)</td></tr>
-          <tr><td><code>/fixissue &lt;url&gt;</code></td><td>拉取一条指派给你的 AtomGit issue,让 agent 自动修复。完成后会把答复作为评论回写到 issue,并打上 <code>fixed</code> 标签</td></tr>
+        </tbody>
+      </table>
+
+      <h2>对话模式与思考</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/plan</code></td><td>切到 <strong>Plan 模式</strong>:只读探索,模型可以调用 <code>read_file</code> / <code>grep</code> / <code>list_directory</code> 等不写盘的工具,但 <code>edit_file</code> / <code>bash</code> 等会被屏蔽。适合在动手之前让模型先理清方案</td></tr>
+          <tr><td><code>/build</code></td><td>切回 <strong>Build 模式</strong>(默认):全部工具可用,可以读、写、执行。<code>/plan</code> 和 <code>/build</code> 之间可随时来回切</td></tr>
+          <tr><td><code>/think on</code> / <code>off</code></td><td>开关 extended thinking(对支持的模型 — Claude / DeepSeek-R1 / GLM-4.5 等)。开启后模型会输出推理过程,代价是更慢更费 token</td></tr>
+          <tr><td><code>/think budget &lt;N&gt;</code></td><td>给 thinking 设个 token 预算上限(对 Claude 系列生效),控制推理长度</td></tr>
         </tbody>
       </table>
 
@@ -99,6 +115,21 @@
         </tbody>
       </table>
       <p>详细使用与最佳实践见 <a href="./memory.html">永久记忆</a>。</p>
+
+      <h2>扩展生态</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/skills</code></td><td>浏览当前已加载的 skills(项目级 + 用户级)。每个 skill 也会以独立的斜杠命令形式出现在补全菜单里,可以直接 <code>/&lt;skill-name&gt;</code> 触发</td></tr>
+          <tr><td><code>/plugin marketplace</code></td><td>打开插件市场浏览器,从已注册的 marketplace 中挑选并安装</td></tr>
+          <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>从指定 marketplace 安装插件</td></tr>
+          <tr><td><code>/plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>卸载已安装的插件(保留 marketplace 注册)</td></tr>
+          <tr><td><code>/plugin list</code></td><td>列出本地已安装的插件</td></tr>
+        </tbody>
+      </table>
+      <p>详细配置与使用见 <a href="./skills.html">Skills 扩展</a> 和 <a href="./plugins.html">Plugin 系统</a>。</p>
 
       <h2>MCP 集成</h2>
       <table>
@@ -123,6 +154,8 @@
           <tr><td><code>/whoami</code></td><td>显示当前 AtomGit 登录用户的用户名 / 邮箱</td></tr>
           <tr><td><code>/config</code></td><td>显示 <code>~/.atomcode/config.toml</code> 的路径</td></tr>
           <tr><td><code>/reload</code></td><td>从磁盘热加载 <code>~/.atomcode/config.toml</code>,不需要重启 atomcode 就能让外部修改(或另一个终端的 <code>/codingplan</code> 带来的变更)生效</td></tr>
+          <tr><td><code>/language</code></td><td>切换界面语言:自动检测(<code>LC_ALL</code> / <code>LANG</code>)、English、或 简体中文。立即生效并写回 <code>~/.atomcode/config.toml</code></td></tr>
+          <tr><td><code>/welcome</code></td><td>重新打开 3 步首次启动向导(欢迎页 → 语言 → 接入方式)。会话非空时会先弹 <code>y/N</code> 二次确认,确认后清屏。语言和默认接入方式都可以从这里再调一次</td></tr>
           <tr><td><code>/logout</code></td><td>清除 AtomGit OAuth token</td></tr>
           <tr><td><code>/upgrade</code></td><td>自动升级到最新版本;子命令 <code>/upgrade rollback</code> 回滚到上一个版本</td></tr>
           <tr><td><code>/help</code></td><td>展示命令和快捷键参考</td></tr>

@@ -8,12 +8,35 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 use super::client::LspClient;
 use super::registry::LspServerRegistry;
 use super::types::Diagnostic;
 use crate::config::LspConfig;
+
+/// Status events emitted by `LspManager` when servers start, fail, or
+/// hit non-fatal trouble. Mirrors `mcp::McpConnectEvent` so the TUI
+/// event loop can render them as scrollback lines instead of having
+/// the manager write directly to stderr (which leaks into the input
+/// box while the renderer owns the screen — see `lsp/mod.rs` for the
+/// full plumbing rationale).
+#[derive(Debug, Clone)]
+pub enum LspConnectEvent {
+    /// A language server was successfully started for the given extension.
+    Started { command: String, ext: String },
+    /// Starting the server failed; LSP is best-effort, so the agent loop
+    /// continues without diagnostics for that file type.
+    Failed {
+        command: String,
+        ext: String,
+        error: String,
+    },
+    /// Non-fatal trouble (e.g. shutdown error during teardown). Routed
+    /// to the trace log by the TUI rather than scrollback so it doesn't
+    /// churn the UI for things the user can't act on.
+    Warning { ext: String, message: String },
+}
 
 /// Extension-to-language_id mapping for LSP `textDocument/didOpen`.
 fn extension_to_language_id(ext: &str) -> &str {
@@ -55,10 +78,18 @@ pub struct LspManager {
     enabled: bool,
     /// Time in milliseconds to wait after file sync before reading diagnostics.
     diagnostics_settle_delay_ms: u64,
+    /// Optional channel for connection status events. Some(tx) when a
+    /// listener (TUI event loop) is consuming them; None in headless
+    /// mode where eprintln-to-stderr would be visible to CI logs anyway
+    /// — but we still don't print, since send-on-None is just a no-op
+    /// and the headless path doesn't need the diagnostics.
+    connect_events: Option<mpsc::UnboundedSender<LspConnectEvent>>,
 }
 
 impl LspManager {
-    /// Create a new LSP manager.
+    /// Create a new LSP manager without an event channel. Status changes
+    /// are silently dropped — appropriate for tests and headless mode
+    /// where no UI consumes them.
     pub fn new(
         project_root: PathBuf,
         registry: LspServerRegistry,
@@ -71,6 +102,38 @@ impl LspManager {
             project_root,
             enabled,
             diagnostics_settle_delay_ms,
+            connect_events: None,
+        }
+    }
+
+    /// Create a new LSP manager paired with a receiver for connection
+    /// status events. The TUI event loop consumes the receiver and
+    /// renders `Started` / `Failed` events as scrollback lines next to
+    /// the existing MCP rendering.
+    pub fn with_event_channel(
+        project_root: PathBuf,
+        registry: LspServerRegistry,
+        enabled: bool,
+        diagnostics_settle_delay_ms: u64,
+    ) -> (Self, mpsc::UnboundedReceiver<LspConnectEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mgr = Self {
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            registry,
+            project_root,
+            enabled,
+            diagnostics_settle_delay_ms,
+            connect_events: Some(tx),
+        };
+        (mgr, rx)
+    }
+
+    /// Send a status event to the listener, if any. No-op when no
+    /// channel is wired (`new()` constructor or after the receiver was
+    /// dropped — `send` returns Err which we ignore intentionally).
+    fn emit(&self, event: LspConnectEvent) {
+        if let Some(tx) = &self.connect_events {
+            let _ = tx.send(event);
         }
     }
 
@@ -123,15 +186,24 @@ impl LspManager {
         match LspClient::start(&config, &self.project_root, language_id).await {
             Ok(client) => {
                 let arc = Arc::new(client);
-                clients.insert(ext, arc);
+                clients.insert(ext.clone(), arc);
+                self.emit(LspConnectEvent::Started {
+                    command: config.command.clone(),
+                    ext,
+                });
                 Ok(true)
             }
             Err(e) => {
-                // Log but don't propagate — LSP is best-effort.
-                eprintln!(
-                    "[lsp] Failed to start {} for .{}: {}",
-                    config.command, ext, e
-                );
+                // LSP is best-effort: a missing or broken language server
+                // must not propagate as a tool error. Surface the failure
+                // through the event channel so the TUI can render it in
+                // scrollback (or, in headless mode with no listener, drop
+                // it silently — `emit` is a no-op when no channel).
+                self.emit(LspConnectEvent::Failed {
+                    command: config.command.clone(),
+                    ext,
+                    error: e.to_string(),
+                });
                 Ok(false)
             }
         }
@@ -203,7 +275,13 @@ impl LspManager {
         let mut clients = self.clients.write().await;
         for (ext, client) in clients.drain() {
             if let Err(e) = client.shutdown().await {
-                eprintln!("[lsp] Error shutting down server for .{}: {}", ext, e);
+                // Shutdown errors are not actionable for the user — the
+                // process is exiting anyway. Route to Warning so the TUI
+                // can decide to log/swallow rather than scrollback-spam.
+                self.emit(LspConnectEvent::Warning {
+                    ext,
+                    message: format!("shutdown error: {}", e),
+                });
             }
         }
     }
@@ -215,24 +293,48 @@ pub fn build_lsp_manager(config: &LspConfig, project_root: &Path) -> Option<Arc<
     if !config.enabled {
         return None;
     }
-
-    let mut registry = if config.auto_detect {
-        LspServerRegistry::with_defaults()
-    } else {
-        LspServerRegistry::empty()
-    };
-
-    // Merge user-configured servers (overrides defaults for same extension).
-    registry.merge_user_config(config.servers.clone());
-
+    let registry = build_registry(config);
     let manager = LspManager::new(
         project_root.to_path_buf(),
         registry,
         true,
         config.diagnostics_settle_delay_ms,
     );
-
     Some(Arc::new(manager))
+}
+
+/// Build an LspManager paired with a receiver for connection-status
+/// events. TUI mode wires the receiver into the event loop so server
+/// start/failure surfaces as `✓ LSP server …` / `✗ LSP server …`
+/// scrollback lines, matching the MCP server flow. Returns `None` when
+/// LSP is disabled in config.
+pub fn build_lsp_manager_with_events(
+    config: &LspConfig,
+    project_root: &Path,
+) -> Option<(Arc<LspManager>, mpsc::UnboundedReceiver<LspConnectEvent>)> {
+    if !config.enabled {
+        return None;
+    }
+    let registry = build_registry(config);
+    let (manager, rx) = LspManager::with_event_channel(
+        project_root.to_path_buf(),
+        registry,
+        true,
+        config.diagnostics_settle_delay_ms,
+    );
+    Some((Arc::new(manager), rx))
+}
+
+/// Shared registry construction used by both `build_lsp_manager`
+/// constructors. Defaults + user overrides merged into one registry.
+fn build_registry(config: &LspConfig) -> LspServerRegistry {
+    let mut registry = if config.auto_detect {
+        LspServerRegistry::with_defaults()
+    } else {
+        LspServerRegistry::empty()
+    };
+    registry.merge_user_config(config.servers.clone());
+    registry
 }
 
 #[cfg(test)]
@@ -365,5 +467,69 @@ mod tests {
         };
         let result = build_lsp_manager(&config, Path::new("/tmp"));
         assert!(result.is_some());
+    }
+
+    /// `with_event_channel` returns a paired `(manager, receiver)` and
+    /// the receiver starts empty. Behaves identically to `new()` when
+    /// no events have fired yet.
+    #[tokio::test]
+    async fn with_event_channel_yields_empty_receiver_initially() {
+        let registry = LspServerRegistry::with_defaults();
+        let (mgr, mut rx) =
+            LspManager::with_event_channel(PathBuf::from("/tmp"), registry, true, 150);
+        assert!(mgr.active_servers().await.is_empty());
+        assert!(rx.try_recv().is_err(), "no events expected before any ensure_server call");
+    }
+
+    /// A failed `ensure_server` (server command not on PATH won't even
+    /// reach the start path; a registered server pointing at a
+    /// guaranteed-nonexistent binary will). We use a custom registry
+    /// with a known-bad command + which::which check disabled by
+    /// passing the .xyz extension so registry lookup hits but `which`
+    /// will fail — that triggers `return Ok(false)` BEFORE the start
+    /// attempt though, so we won't emit `Failed` (which is the right
+    /// behavior: not installed ≠ failed). Verify with active_servers
+    /// that nothing got registered AND no event fired.
+    #[tokio::test]
+    async fn ensure_server_silent_when_command_missing() {
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "xyz".to_string(),
+            super::super::registry::LspServerConfig {
+                command: "atomcode-lsp-does-not-exist".to_string(),
+                args: vec![],
+                root_markers: vec![],
+            },
+        );
+        let mut registry = LspServerRegistry::empty();
+        registry.merge_user_config(servers);
+        let (mgr, mut rx) =
+            LspManager::with_event_channel(PathBuf::from("/tmp"), registry, true, 150);
+        let result = mgr.ensure_server(Path::new("test.xyz")).await.unwrap();
+        assert!(!result, "missing command must return Ok(false)");
+        // `which` failed BEFORE start_client — no event fires, agent
+        // continues silently. This matches MCP's "command not found"
+        // behavior and avoids spamming scrollback for projects that
+        // don't have the language tooling installed.
+        assert!(rx.try_recv().is_err(), "no event expected for missing command");
+    }
+
+    /// Sender drops cleanly: dropping the receiver before any send
+    /// happens must not panic. Confirms `emit` handles the closed-
+    /// receiver case (Result ignored).
+    #[tokio::test]
+    async fn emit_no_op_when_receiver_dropped() {
+        let registry = LspServerRegistry::with_defaults();
+        let (mgr, rx) =
+            LspManager::with_event_channel(PathBuf::from("/tmp"), registry, true, 150);
+        drop(rx);
+        // Trigger the path that calls `emit` — non-existent file ext
+        // takes the early-return; we explicitly call the emit helper
+        // via a synthetic Warning to exercise the post-drop send.
+        mgr.emit(LspConnectEvent::Warning {
+            ext: "rs".to_string(),
+            message: "synthetic post-drop emit".to_string(),
+        });
+        // No panic = pass.
     }
 }

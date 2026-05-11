@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Map, Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Map, Value};
 
 /// MCP server transport configuration.
 #[derive(Debug, Clone)]
@@ -18,8 +18,32 @@ pub enum McpTransportConfig {
     Http {
         url: String,
         headers: BTreeMap<String, String>,
+        auth: Option<McpHttpAuthConfig>,
         timeout_ms: Option<u64>,
     },
+}
+
+/// Authentication configuration for HTTP MCP servers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpHttpAuthConfig {
+    OAuth(McpOAuthConfig),
+}
+
+/// OAuth configuration for HTTP MCP servers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpOAuthConfig {
+    /// Human-readable/provider compatibility name. Older configs only set this.
+    pub provider: Option<String>,
+    /// Optional authorization server issuer URL.
+    pub issuer: Option<String>,
+    /// Optional protected resource metadata URL or fixed resource identifier.
+    pub resource: Option<String>,
+    /// Optional pre-registered OAuth client id.
+    pub client_id: Option<String>,
+    /// Optional environment variable containing a confidential client secret.
+    pub client_secret_env: Option<String>,
+    /// Optional requested scopes.
+    pub scopes: Vec<String>,
 }
 
 /// MCP server configuration.
@@ -64,10 +88,40 @@ struct McpServerEntry {
     #[serde(default)]
     headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
+    auth: Option<McpAuthEntry>,
+    #[serde(default)]
     timeout_ms: Option<u64>,
 }
 
 use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct McpAuthEntry {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
+    resource: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret_env: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    bearer: Option<String>,
+    #[serde(default)]
+    header: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedHttpAuth {
+    oauth: Option<McpHttpAuthConfig>,
+    headers: BTreeMap<String, String>,
+}
 
 /// Load and merge MCP configurations from project and user levels.
 ///
@@ -80,11 +134,8 @@ pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
     )
     .unwrap_or_default();
 
-    let project_config = load_config_file(
-        &project_dir.join(".mcp.json"),
-        McpConfigSource::Project,
-    )
-    .unwrap_or_default();
+    let project_config = load_config_file(&project_dir.join(".mcp.json"), McpConfigSource::Project)
+        .unwrap_or_default();
 
     // Merge: project overrides user
     let mut merged: BTreeMap<String, McpServerConfig> = BTreeMap::new();
@@ -140,14 +191,20 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
             timeout_ms: entry.timeout_ms,
         }
     } else if let Some(url) = entry.url {
+        let parsed_auth = parse_http_auth(name, entry.auth)?;
+        let mut headers: BTreeMap<String, String> = entry
+            .headers
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k, expand_env_vars(&v)))
+            .collect();
+        for (k, v) in parsed_auth.headers {
+            headers.entry(k).or_insert(v);
+        }
         McpTransportConfig::Http {
             url: expand_tilde(&expand_env_vars(&url)),
-            headers: entry
-                .headers
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, v)| (k, expand_env_vars(&v)))
-                .collect(),
+            headers,
+            auth: parsed_auth.oauth,
             timeout_ms: entry.timeout_ms,
         }
     } else {
@@ -162,6 +219,44 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         disabled: entry.disabled,
         config: transport,
     })
+}
+
+fn parse_http_auth(name: &str, auth: Option<McpAuthEntry>) -> Result<ParsedHttpAuth> {
+    let mut parsed = ParsedHttpAuth {
+        oauth: None,
+        headers: BTreeMap::new(),
+    };
+    let Some(auth) = auth else {
+        return Ok(parsed);
+    };
+
+    if let (Some(header), Some(bearer)) = (auth.header, auth.bearer) {
+        parsed.headers.insert(header, expand_env_vars(&bearer));
+    }
+
+    match auth.kind.as_deref() {
+        Some("oauth") => {
+            parsed.oauth = Some(McpHttpAuthConfig::OAuth(McpOAuthConfig {
+                provider: Some(auth.provider.unwrap_or_else(|| name.to_string())),
+                issuer: auth.issuer.map(|v| expand_env_vars(&v)),
+                resource: auth.resource.map(|v| expand_env_vars(&v)),
+                client_id: auth.client_id.map(|v| expand_env_vars(&v)),
+                client_secret_env: auth.client_secret_env,
+                scopes: auth
+                    .scopes
+                    .into_iter()
+                    .map(|s| expand_env_vars(&s))
+                    .collect(),
+            }));
+            Ok(parsed)
+        }
+        Some(other) => bail!(
+            "MCP server '{}' has unsupported auth.type '{}'",
+            name,
+            other
+        ),
+        None => Ok(parsed),
+    }
 }
 
 fn collect_merged_mcp_server_maps(root: &Map<String, Value>) -> Map<String, Value> {
@@ -221,10 +316,7 @@ pub fn merge_stdio_mcp_server_into_json_file(
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create parent directory for {}",
-                    path.display()
-                )
+                format!("Failed to create parent directory for {}", path.display())
             })?;
         }
     }
@@ -233,6 +325,62 @@ pub fn merge_stdio_mcp_server_into_json_file(
     std::fs::write(path, format!("{text}\n"))
         .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
 
+    Ok(())
+}
+
+/// Add or replace an **HTTP OAuth** MCP server entry in a JSON config file.
+pub fn merge_http_oauth_mcp_server_into_json_file(
+    path: &Path,
+    server_key: &str,
+    url: &str,
+    provider: &str,
+) -> Result<()> {
+    if server_key.is_empty() {
+        bail!("MCP server name must not be empty");
+    }
+    if url.is_empty() {
+        bail!("url must not be empty");
+    }
+    if provider.is_empty() {
+        bail!("provider must not be empty");
+    }
+
+    let mut root: Value = if path.exists() {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read MCP config from {}", path.display()))?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse MCP config JSON from {}", path.display()))?
+    } else {
+        json!({})
+    };
+
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("MCP config root must be a JSON object"))?;
+
+    let mut servers = collect_merged_mcp_server_maps(root_obj);
+    let entry = json!({
+        "url": url,
+        "auth": {
+            "type": "oauth",
+            "provider": provider,
+        },
+    });
+    servers.insert(server_key.to_string(), entry);
+    root_obj.insert("mcpServers".to_string(), Value::Object(servers));
+    root_obj.remove("servers");
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create parent directory for {}", path.display())
+            })?;
+        }
+    }
+
+    let pretty = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
+    std::fs::write(path, format!("{}\n", pretty))
+        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
     Ok(())
 }
 
@@ -374,10 +522,8 @@ mod tests {
 
     #[test]
     fn mcp_config_file_accepts_mcp_servers_key() {
-        let raw: McpConfigFile = serde_json::from_str(
-            r#"{"mcpServers":{"a":{"command":"echo","args":[]}}}"#,
-        )
-        .unwrap();
+        let raw: McpConfigFile =
+            serde_json::from_str(r#"{"mcpServers":{"a":{"command":"echo","args":[]}}}"#).unwrap();
         assert!(raw.mcp_servers.contains_key("a"));
     }
 
@@ -392,15 +538,11 @@ mod tests {
     fn merge_stdio_creates_mcp_servers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-        merge_stdio_mcp_server_into_json_file(&path, "p", "npx", &["@x/y".to_string()])
-            .unwrap();
+        merge_stdio_mcp_server_into_json_file(&path, "p", "npx", &["@x/y".to_string()]).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let p = v["mcpServers"]["p"].as_object().unwrap();
         assert_eq!(p["command"].as_str(), Some("npx"));
-        assert_eq!(
-            p["args"].as_array().unwrap()[0].as_str(),
-            Some("@x/y")
-        );
+        assert_eq!(p["args"].as_array().unwrap()[0].as_str(), Some("@x/y"));
     }
 
     #[test]
@@ -418,5 +560,116 @@ mod tests {
         let m = v.get("mcpServers").unwrap().as_object().unwrap();
         assert!(m.contains_key("old"));
         assert!(m.contains_key("new"));
+    }
+
+    #[test]
+    fn http_config_accepts_oauth_auth() {
+        let cfg = server_entry_to_config(
+            "github",
+            serde_json::from_str(
+                r#"{
+                    "url":"https://api.githubcopilot.com/mcp/",
+                    "auth":{"type":"oauth","provider":"github"}
+                }"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        match cfg.config {
+            McpTransportConfig::Http { auth, .. } => {
+                assert_eq!(
+                    auth,
+                    Some(McpHttpAuthConfig::OAuth(McpOAuthConfig {
+                        provider: Some("github".to_string()),
+                        ..McpOAuthConfig::default()
+                    }))
+                );
+            }
+            _ => panic!("expected http config"),
+        }
+    }
+
+    #[test]
+    fn http_config_accepts_generic_oauth_auth() {
+        let cfg = server_entry_to_config(
+            "notion",
+            serde_json::from_str(
+                r#"{
+                    "url":"https://mcp.notion.com/mcp",
+                    "auth":{
+                        "type":"oauth",
+                        "issuer":"https://mcp.notion.com",
+                        "resource":"https://mcp.notion.com/mcp",
+                        "client_id":"client",
+                        "client_secret_env":"NOTION_SECRET",
+                        "scopes":["read","write"]
+                    }
+                }"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        match cfg.config {
+            McpTransportConfig::Http { auth, .. } => {
+                assert_eq!(
+                    auth,
+                    Some(McpHttpAuthConfig::OAuth(McpOAuthConfig {
+                        provider: Some("notion".to_string()),
+                        issuer: Some("https://mcp.notion.com".to_string()),
+                        resource: Some("https://mcp.notion.com/mcp".to_string()),
+                        client_id: Some("client".to_string()),
+                        client_secret_env: Some("NOTION_SECRET".to_string()),
+                        scopes: vec!["read".to_string(), "write".to_string()],
+                    }))
+                );
+            }
+            _ => panic!("expected http config"),
+        }
+    }
+
+    #[test]
+    fn http_config_accepts_bearer_header_auth_without_type() {
+        let cfg = server_entry_to_config(
+            "figma",
+            serde_json::from_str(
+                r#"{
+                    "url":"https://mcp.figma.com/mcp",
+                    "auth":{"bearer":"figd_token","header":"X-Figma-Token"}
+                }"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        match cfg.config {
+            McpTransportConfig::Http { headers, auth, .. } => {
+                assert_eq!(
+                    headers.get("X-Figma-Token").map(String::as_str),
+                    Some("figd_token")
+                );
+                assert_eq!(auth, None);
+            }
+            _ => panic!("expected http config"),
+        }
+    }
+
+    #[test]
+    fn merge_http_oauth_creates_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        merge_http_oauth_mcp_server_into_json_file(
+            &path,
+            "github",
+            "https://api.githubcopilot.com/mcp/",
+            "github",
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let p = v["mcpServers"]["github"].as_object().unwrap();
+        assert_eq!(
+            p["url"].as_str(),
+            Some("https://api.githubcopilot.com/mcp/")
+        );
+        assert_eq!(p["auth"]["type"].as_str(), Some("oauth"));
+        assert_eq!(p["auth"]["provider"].as_str(), Some("github"));
     }
 }
