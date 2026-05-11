@@ -471,4 +471,9 @@ pub enum Msg<'a> {
     CompactStarting,
     CompactNothingNoSavings { before: &'a str, after: &'a str },
     CompactDropped { messages: usize, before: &'a str, after: &'a str },
+
+    /// Surfaced when the user pastes/attaches an image but the active
+    /// model can't accept images AND no `vision_preprocessor_provider`
+    /// is configured. `model` is the current model identifier.
+    ModelNoImageSupport { model: &'a str },
 }

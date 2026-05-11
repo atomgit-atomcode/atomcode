@@ -672,5 +672,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             let plural = if messages == 1 { "" } else { "s" };
             format!("(compacted — dropped {} message{}, {} → {} tokens)\n", messages, plural, before, after).into()
         }
+        Msg::ModelNoImageSupport { model } => format!(
+            "Current model \"{}\" does not support image input and no \
+             vision_preprocessor_provider is configured. Use /model to \
+             switch to a vision-capable model, or set \
+             vision_preprocessor_provider in config.",
+            model
+        )
+        .into(),
     }
 }

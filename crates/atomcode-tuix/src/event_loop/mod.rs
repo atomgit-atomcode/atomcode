@@ -3025,13 +3025,12 @@ fn attach_image_to_input(
         return Ok(false);
     };
     if !ctx.config.can_handle_attached_images() {
-        renderer.render(UiLine::Error(format!(
-            "Current model \"{}\" does not support image input and no \
-             vision_preprocessor_provider is configured. Use /model to \
-             switch to a vision-capable model, or set \
-             vision_preprocessor_provider in config.",
-            ctx.model_name
-        )));
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport {
+                model: &ctx.model_name,
+            })
+            .into_owned(),
+        ));
         renderer.flush();
         if matches!(app.state.phase, UiPhase::Idle) {
             redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -3869,13 +3868,12 @@ fn handle_idle_key(
             // field(s): text, type" for GLM-5.1). Helper in
             // `Config::can_handle_attached_images`.
             if !ctx.config.can_handle_attached_images() {
-                renderer.render(UiLine::Error(format!(
-                    "Current model \"{}\" does not support image input and no \
-                     vision_preprocessor_provider is configured. Use /model to \
-                     switch to a vision-capable model, or set \
-                     vision_preprocessor_provider in config.",
-                    ctx.model_name
-                )));
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport {
+                        model: &ctx.model_name,
+                    })
+                    .into_owned(),
+                ));
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 return Ok(());

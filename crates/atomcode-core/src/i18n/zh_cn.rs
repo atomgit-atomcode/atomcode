@@ -668,5 +668,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("（无需压缩 — 压缩后不会节省 token：{} → {}）\n", before, after).into(),
         Msg::CompactDropped { messages, before, after } =>
             format!("（已压缩 — 丢弃 {} 条消息，{} → {} tokens）\n", messages, before, after).into(),
+        Msg::ModelNoImageSupport { model } => format!(
+            "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
+             请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",
+            model
+        )
+        .into(),
     }
 }
