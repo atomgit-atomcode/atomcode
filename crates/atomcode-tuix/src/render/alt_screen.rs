@@ -807,7 +807,16 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 let _ = self.out.write_all(b"\x1b[0m");
             }
         }
-        let _ = self.out.flush();
+        // No flush here: paint_frame batches body + footer +
+        // anchor_cursor_to_input into a single flush at the very
+        // end so the terminal renders only the final cursor
+        // position. Flushing mid-frame (after the per-row CUPs
+        // walked the cursor through every body row) gave macOS
+        // Terminal.app a vsync window to draw the cursor at
+        // intermediate body positions before anchor moved it
+        // back, which read as a cursor "blinking" mid-screen
+        // during streaming. Tests call `r.flush()` explicitly
+        // after `r.paint_body()`.
         self.body_dirty = false;
     }
 
@@ -1235,7 +1244,13 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             self.cursor_shown = false;
         }
 
-        let _ = self.out.flush();
+        // No flush here: paint_frame's tail (anchor_cursor_to_input)
+        // is the single flush point for the whole frame. Flushing
+        // here gave the terminal a vsync window between footer
+        // writes and anchor's final CUP, briefly showing the cursor
+        // at the end of the status row before it jumped to input.
+        // Tests call `r.flush()` explicitly when invoking
+        // `paint_footer` directly.
         self.footer_dirty = false;
     }
 
@@ -1277,6 +1292,14 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // matches what fast terminals (macOS Terminal.app etc.)
         // expect: cursor visible AT the input column.
         self.anchor_cursor_to_input();
+        // Single flush point for the whole frame. paint_body and
+        // paint_footer intentionally skip their own flushes so the
+        // terminal renders only the final cursor position, not the
+        // intermediate body-row / status-row landings that produced
+        // a visible cursor "blink" mid-screen during streaming on
+        // macOS Terminal.app. anchor_cursor_to_input early-returns
+        // (no flush) when pending_input is None — handle that here.
+        let _ = self.out.flush();
     }
 
     /// Move the terminal cursor back to the input row's character
