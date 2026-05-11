@@ -1019,6 +1019,21 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "welcome" => {
+            // /welcome always opens the OnboardingWizard at the Confirm
+            // step. The spec differentiates "empty body" (no confirm)
+            // from "non-empty body" (confirm), but Renderer doesn't
+            // expose body-emptiness, so we simplify: always show the
+            // y/N gate. A user who explicitly typed /welcome by
+            // definition wants the wizard, so a single keystroke is
+            // acceptable friction; the upside is we never silently
+            // clobber prior conversation.
+            let _ = arg;
+            *active_modal = Some(Box::new(
+                crate::modals::OnboardingWizard::new_with_confirm()
+                    .with_initial_language(ctx.config.language),
+            ));
+        }
         "worktree" => {
             handle_worktree(arg, ctx, renderer)?;
         }
