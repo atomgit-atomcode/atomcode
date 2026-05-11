@@ -599,5 +599,37 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>
             format!("配置保存失败：{}", error).into(),
+
+        // ── OnboardingWizard ──
+        Msg::OnboardingStepHeaderWelcome => "第 1/3 步 · 欢迎".into(),
+        Msg::OnboardingStepHeaderLanguage => "第 2/3 步 · 语言".into(),
+        Msg::OnboardingStepHeaderSetup => "第 3/3 步 · 配置".into(),
+        Msg::OnboardingPanelTitle => "AtomCode".into(),
+        Msg::OnboardingIntroVersionLine { v } =>
+            format!("版本 {v}  ·  在终端里运行的 AI 编程代理").into(),
+        Msg::OnboardingIntroBullet1 =>
+            "• 多步骤 agent loop · 内置代码图工具".into(),
+        Msg::OnboardingIntroBullet2 =>
+            "• 兼容所有 OpenAI 风格 API".into(),
+        Msg::OnboardingIntroBullet3 =>
+            "• 通过 CodingPlan 获取免费额度".into(),
+        Msg::OnboardingIntroPressEnter => "按 Enter 继续。".into(),
+        Msg::OnboardingIntroCtrlC => "Ctrl+C 可随时退出。".into(),
+        Msg::OnboardingIntroCompactTagline =>
+            "在终端里运行的 AI 编程代理。".into(),
+        Msg::OnboardingLanguageTitleBilingual =>
+            "Choose your language / 选择语言".into(),
+        Msg::OnboardingLanguagePrompt =>
+            "选择界面语言。任何时候都可以用 `/language` 修改。".into(),
+        Msg::OnboardingLanguageOptionAuto =>
+            "自动检测 (LC_ALL / LANG)".into(),
+        Msg::OnboardingLanguageOptionEn => "English".into(),
+        Msg::OnboardingLanguageOptionZhCn => "简体中文 (Simplified Chinese)".into(),
+        Msg::OnboardingSetupTitle => "想怎么开始？".into(),
+        Msg::OnboardingNavHint =>
+            "1-3 选择 · Enter 确认 · ← 返回 · Esc 跳过".into(),
+        Msg::OnboardingConfirmClear =>
+            "/welcome 会清屏。是否继续？[y/N]".into(),
+        Msg::CmdWelcomeDescription => "重新运行 onboarding 向导".into(),
     }
 }

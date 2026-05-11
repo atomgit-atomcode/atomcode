@@ -601,5 +601,37 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>
             format!("config save failed: {}", error).into(),
+
+        // ── OnboardingWizard ──
+        Msg::OnboardingStepHeaderWelcome => "Step 1/3 · Welcome".into(),
+        Msg::OnboardingStepHeaderLanguage => "Step 2/3 · Language".into(),
+        Msg::OnboardingStepHeaderSetup => "Step 3/3 · Setup".into(),
+        Msg::OnboardingPanelTitle => "AtomCode".into(),
+        Msg::OnboardingIntroVersionLine { v } =>
+            format!("Version {v}  ·  AI coding agent in your terminal").into(),
+        Msg::OnboardingIntroBullet1 =>
+            "• Multi-step agent loop · built-in code-graph tools".into(),
+        Msg::OnboardingIntroBullet2 =>
+            "• Connects to any OpenAI-compatible API".into(),
+        Msg::OnboardingIntroBullet3 =>
+            "• Free tokens via CodingPlan".into(),
+        Msg::OnboardingIntroPressEnter => "Press Enter to continue.".into(),
+        Msg::OnboardingIntroCtrlC => "Ctrl+C exits at any point.".into(),
+        Msg::OnboardingIntroCompactTagline =>
+            "AI coding agent that lives in your terminal.".into(),
+        Msg::OnboardingLanguageTitleBilingual =>
+            "Choose your language / 选择语言".into(),
+        Msg::OnboardingLanguagePrompt =>
+            "Pick the UI language. You can change it any time with `/language`.".into(),
+        Msg::OnboardingLanguageOptionAuto =>
+            "Auto-detect (LC_ALL / LANG)".into(),
+        Msg::OnboardingLanguageOptionEn => "English".into(),
+        Msg::OnboardingLanguageOptionZhCn => "简体中文 (Simplified Chinese)".into(),
+        Msg::OnboardingSetupTitle => "How would you like to set up?".into(),
+        Msg::OnboardingNavHint =>
+            "1-3 select · Enter confirm · ← back · Esc skip".into(),
+        Msg::OnboardingConfirmClear =>
+            "/welcome will clear the screen. Continue? [y/N]".into(),
+        Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),
     }
 }

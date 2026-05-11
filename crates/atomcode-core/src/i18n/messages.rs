@@ -390,4 +390,27 @@ pub enum Msg<'a> {
 
     // ── config save failed ──
     ConfigSaveFailed { error: &'a str },
+
+    // ── OnboardingWizard (multi-step first-run + `/welcome`). Spec:
+    //    docs/superpowers/specs/2026-05-11-welcome-wizard-redesign-design.md
+    OnboardingStepHeaderWelcome,
+    OnboardingStepHeaderLanguage,
+    OnboardingStepHeaderSetup,
+    OnboardingPanelTitle,
+    OnboardingIntroVersionLine { v: &'a str },
+    OnboardingIntroBullet1,
+    OnboardingIntroBullet2,
+    OnboardingIntroBullet3,
+    OnboardingIntroPressEnter,
+    OnboardingIntroCtrlC,
+    OnboardingIntroCompactTagline,
+    OnboardingLanguageTitleBilingual,
+    OnboardingLanguagePrompt,
+    OnboardingLanguageOptionAuto,
+    OnboardingLanguageOptionEn,
+    OnboardingLanguageOptionZhCn,
+    OnboardingSetupTitle,
+    OnboardingNavHint,
+    OnboardingConfirmClear,
+    CmdWelcomeDescription,
 }
