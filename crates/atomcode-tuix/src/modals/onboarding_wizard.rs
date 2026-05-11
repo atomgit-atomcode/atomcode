@@ -554,7 +554,15 @@ impl crate::modals::Modal for OnboardingWizard {
             Step::Setup => self.draw_setup_lines(cols),
         };
         for line in lines {
-            renderer.render(crate::render::UiLine::CommandOutput(format!("{line}\n")));
+            // No trailing `\n` — the retained renderer's
+            // push_body_text splits on `\n` and treats the empty
+            // chunk after a trailing newline as ANOTHER blank row,
+            // so `"foo\n"` produced two rows (foo + blank) and the
+            // wizard's letterforms ended up with a blank line
+            // between every glyph row. Empty strings already in
+            // `lines` (top/bottom pad, between-section blanks) emit
+            // their own blank rows by themselves.
+            renderer.render(crate::render::UiLine::CommandOutput(line));
         }
         // Reset the footer's cached input/menu state. The retained
         // renderer stores `input_buf`/`menu` separately from
