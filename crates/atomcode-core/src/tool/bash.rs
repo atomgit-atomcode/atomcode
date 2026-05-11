@@ -165,7 +165,7 @@ impl Tool for BashTool {
                     let current = ctx.working_dir.read().await.clone();
                     let resolved = if new_dir.starts_with('/') {
                         std::path::PathBuf::from(&new_dir)
-                    } else if new_dir.starts_with('~') {
+                    } else if new_dir == "~" || new_dir.starts_with("~/") {
                         super::real_home_dir()
                             .map(|h| h.join(new_dir.strip_prefix("~/").unwrap_or(&new_dir[1..])))
                             .unwrap_or_else(|| std::path::PathBuf::from(&new_dir))
@@ -1743,6 +1743,22 @@ mod exit_code_tests {
         );
     }
 
+    #[tokio::test]
+    async fn bash_cd_preserves_tilde_prefixed_relative_dirs() {
+        let (dir, ctx) = ctx();
+        let target = dir.path().join("~cache");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let r = BashTool
+            .execute(r#"{"command":"cd '~cache'"}"#, &ctx)
+            .await
+            .unwrap();
+
+        assert!(r.success, "cd should succeed: {}", r.output);
+        let wd = ctx.working_dir.read().await.clone();
+        assert_eq!(wd, target.canonicalize().unwrap());
+    }
+
     // --- Auto-STOP on resolved error (P0 #5, 2026-04-22) ---
     //
     // Session-scoped signature tracking: first failed bash records a
@@ -2321,6 +2337,21 @@ mod sanitize_tests {
     }
 
     #[test]
+    fn bash_path_guard_preserves_tilde_prefixed_relative_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("~cache");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("notes.txt"), "workspace note").unwrap();
+
+        let approval = approval_for_command_paths("cat ~cache/notes.txt", workspace.path());
+
+        assert!(
+            approval.is_none(),
+            "~cache/notes.txt should be treated as a workspace-relative path"
+        );
+    }
+
+    #[test]
     fn bash_path_guard_requires_always_for_sensitive_reads() {
         let workspace = tempfile::tempdir().unwrap();
 
@@ -2490,7 +2521,7 @@ fn approval_for_command_paths(
         if arg.contains("://") {
             return None;
         }
-        let expanded = if arg.starts_with('~') {
+        let expanded = if arg == "~" || arg.starts_with("~/") {
             // Expand ~/path
             super::real_home_dir().map(|h| {
                 let rest = arg.strip_prefix('~').unwrap_or(arg);
@@ -2544,7 +2575,8 @@ fn approval_for_command_paths(
     }
 
     fn is_path_like(token: &str) -> bool {
-        token.starts_with('~')
+        token == "~"
+            || token.starts_with("~/")
             || token.starts_with('/')
             || token.starts_with("./")
             || token.starts_with("../")
