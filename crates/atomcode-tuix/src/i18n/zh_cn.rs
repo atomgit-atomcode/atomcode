@@ -121,6 +121,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LanguageSetTo { locale } =>
             format!("语言已切换为：{locale}").into(),
 
+        // ── 空闲/引导提示 ──
+        Msg::IdleHintPrefix =>
+            "输入内容，或按 ".into(),
+        Msg::IdleHintSlash => "/".into(),
+        Msg::IdleHintSuffix =>
+            " 浏览命令".into(),
+        Msg::IdleHintFull =>
+            "输入内容，或按 / 浏览命令".into(),
+        Msg::IdleHintProvider => "/provider".into(),
+        Msg::IdleHintProviderSuffix =>
+            "添加自定义模型".into(),
+        Msg::IdleHintProviderFull =>
+            "使用 /provider 添加自定义模型".into(),
+
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>
             "  已切换到 Plan 模式（只读探索）。\n".into(),

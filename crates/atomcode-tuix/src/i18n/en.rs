@@ -121,6 +121,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LanguageSetTo { locale } =>
             format!("Language set to: {locale}").into(),
 
+        // ── Idle / onboarding hints ──
+        Msg::IdleHintPrefix =>
+            "type something, or press ".into(),
+        Msg::IdleHintSlash => "/".into(),
+        Msg::IdleHintSuffix =>
+            " to browse commands".into(),
+        Msg::IdleHintFull =>
+            "type something, or press / to browse commands".into(),
+        Msg::IdleHintProvider => "/provider".into(),
+        Msg::IdleHintProviderSuffix =>
+            "to add a custom model".into(),
+        Msg::IdleHintProviderFull =>
+            "/provider  to add a custom model".into(),
+
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
             "  Switched to Plan mode (read-only exploration).\n".into(),

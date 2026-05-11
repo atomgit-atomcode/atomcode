@@ -84,6 +84,22 @@ pub enum Msg<'a> {
     // ── Language ──
     LanguageSetTo { locale: &'a str },
 
+    // ── Idle / onboarding hints ──
+    /// "type something, or press " (text before the slash)
+    IdleHintPrefix,
+    /// "/" (the slash shortcut itself — kept separate for accent styling)
+    IdleHintSlash,
+    /// " to browse commands" (text after the slash)
+    IdleHintSuffix,
+    /// Complete plain-text version: "type something, or press / to browse commands"
+    IdleHintFull,
+    /// "/provider" command label
+    IdleHintProvider,
+    /// "to add a custom model" (text after /provider)
+    IdleHintProviderSuffix,
+    /// Complete plain-text version: "/provider  to add a custom model"
+    IdleHintProviderFull,
+
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,
     CmdSwitchedBuildMode,

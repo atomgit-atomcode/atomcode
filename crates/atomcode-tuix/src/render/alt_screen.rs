@@ -31,6 +31,7 @@
 use std::io::{self, BufWriter, Stdout, Write};
 
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
+use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use crate::width::{display_width, truncate_to_width};
@@ -1044,20 +1045,32 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // it reads as subordinate to primary content.
         let hint_a = if self.caps.colors {
             format!(
-                "{}type something, or press {}{}/{}{}  to browse commands{}",
-                SGR_DIM, SGR_RESET, SGR_CYAN, SGR_RESET, SGR_DIM, SGR_RESET
-            )
+                "{}{}{}{}{}{}{}{}",
+                SGR_DIM,
+                t(Msg::IdleHintPrefix),
+                SGR_RESET,
+                SGR_CYAN,
+                t(Msg::IdleHintSlash),
+                SGR_RESET,
+                SGR_DIM,
+                t(Msg::IdleHintSuffix),
+            ) + SGR_RESET
         } else {
-            "type something, or press / to browse commands".into()
+            t(Msg::IdleHintFull).into_owned()
         };
         self.push_body_row(hint_a);
         let hint_b = if self.caps.colors {
             format!(
-                "{}/provider{}  {}to add a custom model{}",
-                SGR_CYAN, SGR_RESET, SGR_DIM, SGR_RESET
+                "{}{}{}  {}{}{}",
+                SGR_CYAN,
+                t(Msg::IdleHintProvider),
+                SGR_RESET,
+                SGR_DIM,
+                t(Msg::IdleHintProviderSuffix),
+                SGR_RESET
             )
         } else {
-            "/provider  to add a custom model".into()
+            t(Msg::IdleHintProviderFull).into_owned()
         };
         self.push_body_row(hint_b);
         self.push_body_row(String::new());

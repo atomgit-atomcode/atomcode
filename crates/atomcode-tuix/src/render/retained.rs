@@ -28,6 +28,7 @@ use super::cell::{push_str_cells, serialize_row, Cell, CellStyle};
 use super::screen::Screen;
 use super::theme::{role, Role};
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
+use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use crossterm::style::Color;
@@ -1496,19 +1497,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Slash shortcuts stay accent_bold (cyan) for visual emphasis.
         let hint_text = self.style_faint(Role::Secondary);
         let accent_bold = self.style_bold(Role::Accent);
+        let idle_prefix = t(Msg::IdleHintPrefix);
+        let idle_slash = t(Msg::IdleHintSlash);
+        let idle_suffix = t(Msg::IdleHintSuffix);
         rows.extend(self.build_wrapped_text_rows(
             &[
-                ("type something, or press  ", hint_text.clone()),
-                ("/", accent_bold.clone()),
-                ("  to browse commands", hint_text.clone()),
+                (&idle_prefix, hint_text.clone()),
+                (&idle_slash, accent_bold.clone()),
+                (&idle_suffix, hint_text.clone()),
             ],
             content_w,
         ));
 
+        let provider_cmd = t(Msg::IdleHintProvider);
+        let provider_suffix = t(Msg::IdleHintProviderSuffix);
         rows.extend(self.build_wrapped_text_rows(
             &[
-                ("/provider", accent_bold),
-                ("  to add a custom model", hint_text),
+                (&provider_cmd, accent_bold),
+                ("  ", hint_text.clone()),
+                (&provider_suffix, hint_text),
             ],
             content_w,
         ));
