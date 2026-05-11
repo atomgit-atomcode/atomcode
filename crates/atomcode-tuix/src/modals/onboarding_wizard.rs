@@ -534,9 +534,29 @@ impl crate::modals::Modal for OnboardingWizard {
                     1 => ctx.pending_open_provider_wizard = true,
                     _ => { /* Skip — no flag */ }
                 }
+                // Setup always runs on a wizard-owned screen
+                // (Confirm→Intro and every subsequent transition is
+                // a clear-and-redraw). Wipe the panel before
+                // returning Close so the event loop's
+                // redraw_idle_plain — or the codingplan / provider
+                // wizard takeover — starts on a clean canvas. Without
+                // this the bordered box stays painted behind the
+                // idle prompt and the user sees the wizard "stuck"
+                // even though it's actually closed.
+                renderer.clear_screen();
                 Ok(ModalAction::Close)
             }
-            PureOutcome::Close => Ok(ModalAction::Close),
+            PureOutcome::Close => {
+                // Same reasoning as ApplySetupThenClose, but gated
+                // on step: Esc/N from the Confirm step deliberately
+                // preserves the body context — clearing there would
+                // wipe the conversation the user just declined to
+                // discard.
+                if self.step != Step::Confirm {
+                    renderer.clear_screen();
+                }
+                Ok(ModalAction::Close)
+            }
         }
     }
 
