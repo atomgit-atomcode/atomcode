@@ -323,6 +323,11 @@ const SGR_GREY: &str = "\x1b[90m"; // Role::Muted — bright black / mid-gray.
                                    // matches retained's `Palette::MUTED`
                                    // which crossterm emits as SGR 90.
 const SGR_BOLD: &str = "\x1b[1m";
+const SGR_YELLOW: &str = "\x1b[93m";
+/// Reverse video — swap fg/bg. Combined with a coloured fg this paints
+/// a coloured "chip" with the underlying default-bg as the chip's text
+/// colour. Used by the approval-prompt Y/A/N badges.
+const SGR_REVERSE: &str = "\x1b[7m";
 
 /// Default cap on `body_lines` length. ~5000 rows × ~200 bytes/row
 /// (rough average for SGR-decorated text) is ~1 MB per session — fine
@@ -1776,16 +1781,37 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 }
             }
             UiLine::ApprovalPrompt { tool, detail } => {
-                let safe_tool = scrub_controls(&tool);
-                let safe_detail = scrub_controls(&detail);
-                let prompt = t(Msg::ApprovalPromptAlt {
-                    tool: &safe_tool,
-                    detail: &safe_detail,
-                }).into_owned();
+                // Mirror retained's chip-based prompt: bold-yellow
+                // "▶ Waiting for approval:" label + Y/A/N reverse-video
+                // chips (green / cyan / red) + their textual labels.
+                // The previous alt-screen path emitted the flat
+                // `ApprovalPromptAlt` sentence — visually indistinct from
+                // a regular command-output row, so users couldn't tell at
+                // a glance that an approval was pending. tool/detail are
+                // already visible in the ToolCall row above, so we don't
+                // re-echo them here (same omission as retained).
+                let _ = (tool, detail);
+                let waiting = t(Msg::ApprovalWaitingLabel);
+                let allow = t(Msg::ApprovalAllow);
+                let always = t(Msg::ApprovalAlways);
+                let deny = t(Msg::ApprovalDeny);
                 let row = if self.caps.colors {
-                    format!("{}{}{}", SGR_CYAN, prompt, SGR_RESET)
+                    format!(
+                        "{bold}{yellow}{waiting}{reset}{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
+                        bold = SGR_BOLD,
+                        yellow = SGR_YELLOW,
+                        rev = SGR_REVERSE,
+                        green = SGR_GREEN,
+                        cyan = SGR_CYAN,
+                        red = SGR_RED,
+                        reset = SGR_RESET,
+                        waiting = waiting,
+                        allow = allow,
+                        always = always,
+                        deny = deny,
+                    )
                 } else {
-                    prompt
+                    format!("{waiting} Y {allow} A {always} N {deny}")
                 };
                 self.push_body_row(row);
             }
