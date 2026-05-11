@@ -64,6 +64,10 @@ impl Modal for LanguagePicker {
                 let (locale, label, _) = &self.options[self.selected];
                 let locale = *locale;
                 let label = label.clone();
+                // Flip the global locale FIRST so the confirmation
+                // below renders in the just-picked language. Without
+                // this the "switched to 简体中文" line still comes
+                // back in English on a zh_CN selection.
                 i18n::set_locale(locale);
                 ctx.config.language = Some(locale);
                 let config_path = atomcode_core::config::Config::default_path();
@@ -71,9 +75,13 @@ impl Modal for LanguagePicker {
                     // TODO: surface via renderer once a non-modal error display is available
                     eprintln!("[language] failed to save config: {e}");
                 }
-                let display = format!("{label} ({locale})");
-                let msg = crate::i18n::t(crate::i18n::Msg::LanguageSetTo { locale: &display });
-                renderer.render(UiLine::CommandOutput(format!("  {msg}\n")));
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
+                        label: &label,
+                        locale: &locale.to_string(),
+                    })
+                    .into_owned(),
+                ));
                 renderer.flush();
                 Ok(ModalAction::Close)
             }
@@ -122,5 +130,41 @@ mod tests {
         crate::i18n::set_locale(Locale::En);
         let picker = LanguagePicker::open();
         assert_eq!(picker.selected, 0); // En is first option
+    }
+
+    /// Switching to zh_CN renders a Chinese confirmation line that
+    /// includes the success checkmark + the picked label + the locale
+    /// code. Regression guard for "no feedback after picking
+    /// a language" — the Enter handler is supposed to push a
+    /// CommandOutput line with these three markers visible, in the
+    /// freshly-picked locale.
+    #[test]
+    fn switch_confirmation_zh_cn_has_checkmark_label_and_locale() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(Locale::ZhCn);
+        let msg = crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
+            label: "简体中文",
+            locale: "zh_CN",
+        });
+        assert!(msg.contains("✓"), "missing checkmark: {}", msg);
+        assert!(msg.contains("简体中文"), "missing label: {}", msg);
+        assert!(msg.contains("zh_CN"), "missing locale code: {}", msg);
+        assert!(msg.contains("已切换"), "missing '已切换' verb: {}", msg);
+        assert!(msg.ends_with('\n'), "missing trailing newline: {:?}", msg);
+    }
+
+    #[test]
+    fn switch_confirmation_en_has_checkmark_label_and_locale() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(Locale::En);
+        let msg = crate::i18n::t(crate::i18n::Msg::LanguageSwitched {
+            label: "English",
+            locale: "en",
+        });
+        assert!(msg.contains("✓"), "missing checkmark: {}", msg);
+        assert!(msg.contains("English"), "missing label: {}", msg);
+        assert!(msg.contains("(en)"), "missing locale code: {}", msg);
+        assert!(msg.to_lowercase().contains("switched"), "missing 'switched' verb: {}", msg);
+        assert!(msg.ends_with('\n'), "missing trailing newline: {:?}", msg);
     }
 }

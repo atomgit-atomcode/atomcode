@@ -108,11 +108,14 @@ pub fn perform_session_rename(
 fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
     use atomcode_core::config::instructions::LayeredInstructions;
     let instructions = LayeredInstructions::load(working_dir);
-    let mut out = String::from("  Instruction files:\n");
+    let mut out = t(Msg::StatusInstructionFilesHeader).into_owned();
     for (level, path) in instructions.status_lines() {
         match path {
-            Some(p) => out.push_str(&format!("    ✓ {} ({})\n", p.display(), level.label())),
-            None => out.push_str(&format!("    ✗ {} — not found\n", level.label())),
+            Some(p) => out.push_str(&t(Msg::StatusInstructionPresent {
+                path: &p.display().to_string(),
+                label: level.label(),
+            })),
+            None => out.push_str(&t(Msg::StatusInstructionMissing { label: level.label() })),
         }
     }
     out
@@ -340,8 +343,20 @@ pub(super) fn execute_slash_command(
                             // TODO: surface via renderer once a non-modal error display is available
                             eprintln!("[language] failed to save config: {e}");
                         }
-                        let msg = t(Msg::LanguageSetTo { locale: &locale.to_string() });
-                        renderer.render(UiLine::CommandOutput(format!("  {msg}\n")));
+                        // Display label matches the picker's option list
+                        // so /language en and /language zh both echo a
+                        // human-readable name, not just the locale code.
+                        let label = match locale {
+                            atomcode_core::locale::Locale::En => "English",
+                            atomcode_core::locale::Locale::ZhCn => "简体中文",
+                        };
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::LanguageSwitched {
+                                label,
+                                locale: &locale.to_string(),
+                            })
+                            .into_owned(),
+                        ));
                         renderer.flush();
                     }
                     Err(_) => {
@@ -401,13 +416,12 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "status" => {
-            let mut txt = format!(
-                "  Model:  {}\n  Dir:    {}\n  Config: {}\n  Tokens: {}\n",
-                ctx.model_name,
-                ctx.working_dir.display(),
-                Config::default_path().display(),
-                state.total_tokens,
-            );
+            let mut txt = t(Msg::StatusBody {
+                model: &ctx.model_name,
+                dir: &ctx.working_dir.display().to_string(),
+                config: &Config::default_path().display().to_string(),
+                tokens: state.total_tokens,
+            }).into_owned();
             txt.push_str(&render_codingplan_status_for_status_cmd());
 
             txt.push('\n');
@@ -1603,39 +1617,40 @@ fn render_codingplan_status_for_status_cmd() -> String {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
         Err(_) => {
-            return "  CodingPlan: (not signed in — run /codingplan to set up)\n".into();
+            return t(Msg::StatusCpNotSignedIn).into_owned();
         }
     };
     let status = match client.status_v2() {
         Ok(s) => s,
         Err(e) => {
-            return format!("  CodingPlan: (status fetch failed — {:#})\n", e);
+            return t(Msg::StatusCpFetchFailed { error: &format!("{:#}", e) }).into_owned();
         }
     };
     let plan = match &status.codingplan_free {
         Some(p) => p,
         None => {
-            return "  CodingPlan: (no active plan — run /codingplan)\n".into();
+            return t(Msg::StatusCpNoActive).into_owned();
         }
     };
 
-    let mut out = format!(
-        "  CodingPlan: {}  ·  expires {} ({}d/{}d)\n",
-        plan.plan_name, plan.expires_at, plan.remaining_days, plan.total_days,
-    );
+    let mut out = t(Msg::StatusCpLine {
+        plan: &plan.plan_name,
+        expires_at: &plan.expires_at,
+        remaining_days: plan.remaining_days,
+        total_days: plan.total_days,
+    }).into_owned();
     if let Some(u) = &status.current_usage {
-        out.push_str(&format!(
-            "  Usage: {}  ·  resets {} (in {}s)\n",
-            u.display_desc(),
-            u.reset_at_display,
-            u.seconds_until_reset,
-        ));
+        out.push_str(&t(Msg::StatusCpUsage {
+            usage: &u.display_desc(),
+            reset_at: &u.reset_at_display,
+            seconds: u.seconds_until_reset,
+        }));
     }
     if status.window_quota_exhausted {
         if let Some(hint) = &status.window_quota_hint {
-            out.push_str(&format!("  ⚠ {}\n", hint));
+            out.push_str(&t(Msg::StatusCpWindowHint { hint }));
         } else {
-            out.push_str("  ⚠ Current window quota exhausted\n");
+            out.push_str(&t(Msg::StatusCpWindowExhausted));
         }
     }
     out
@@ -2298,10 +2313,12 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
                     .cmd_tx
                     .send(AgentCommand::ReloadConfig(ctx.config.clone()));
             }
-            renderer.render(UiLine::CommandOutput(format!(
-                "  Signed in as {} ({}). You can chat now; run /codingplan to sync the latest model access.\n",
-                name, auth.user.username
-            )));
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::LoginSignedInWithCpHint {
+                    name: &name,
+                    username: &auth.user.username,
+                }).into_owned(),
+            ));
             renderer.flush();
         }
         Err(e) => {

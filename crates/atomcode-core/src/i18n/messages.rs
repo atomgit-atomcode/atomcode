@@ -11,6 +11,38 @@ pub enum Msg<'a> {
 
     // ── /codingplan ──
     CodingPlanSetupFailed { error: &'a str },
+    // SetupReport renderer (core/coding_plan/setup.rs)
+    CpSetupHeader,
+    CpLoggedIn { who: &'a str, username: &'a str, email: &'a str },
+    CpStepSkipped { reason: &'a str },
+    CpLoginFailed { error: &'a str },
+    CpClaimed { message: &'a str, plan_type: &'a str },
+    CpClaimSuccessFallback,
+    CpAlreadyClaimed { reason: &'a str },
+    CpClaimFailed { error: &'a str },
+    CpAddedProviders { count: usize, plural_s: &'a str },
+    CpLockedJediterm { name: &'a str },
+    CpLockedAnsi { name: &'a str },
+    CpProviderRow { provider: &'a str, model: &'a str, default_suffix: &'a str },
+    CpDefaultSuffix,
+    CpVisionAuto { kind: &'a str },
+    CpVisionUserSupplied { kind: &'a str },
+    CpVisionCleared,
+    CpModelsSkipped { reason: &'a str },
+    CpModelsFailed { error: &'a str },
+    CpStatusHeader,
+    CpPlanPending { plan: &'a str },
+    CpPlanActive {
+        plan: &'a str,
+        expires_at: &'a str,
+        remaining_days: i32,
+        total_days: i32,
+    },
+    CpUsageLine { usage: &'a str, reset_at: &'a str, duration: &'a str },
+    CpWindowQuotaExhausted,
+    CpWindowQuotaHint { hint: &'a str },
+    CpStatusFetchSkipped { reason: &'a str },
+    CpStatusFetchFailed { error: &'a str },
 
     // i18n self-errors
     ErrUnsupportedLocale { input: &'a str },
@@ -20,6 +52,27 @@ pub enum Msg<'a> {
     StatusUpgradeHint { version: &'a str },
     StatusModelNotConfigured,
     StatusClipboardImageHint,
+
+    // ── /status command body ──
+    StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
+    StatusCpNotSignedIn,
+    StatusCpFetchFailed { error: &'a str },
+    StatusCpNoActive,
+    StatusCpLine {
+        plan: &'a str,
+        expires_at: &'a str,
+        remaining_days: i32,
+        total_days: i32,
+    },
+    StatusCpUsage { usage: &'a str, reset_at: &'a str, seconds: i64 },
+    StatusCpWindowExhausted,
+    StatusCpWindowHint { hint: &'a str },
+    StatusInstructionFilesHeader,
+    StatusInstructionPresent { path: &'a str, label: &'a str },
+    StatusInstructionMissing { label: &'a str },
+
+    // ── /login completion ──
+    LoginSignedInWithCpHint { name: &'a str, username: &'a str },
 
     // ── Help / commands ──
     HelpAvailableCommands,
@@ -96,7 +149,12 @@ pub enum Msg<'a> {
     IssueCreateFailed { error: &'a str },
 
     // ── Language ──
-    LanguageSetTo { locale: &'a str },
+    /// Confirmation rendered to scrollback after the user picks a
+    /// locale via `/language` (modal or arg). Already includes the
+    /// leading "  " indent and trailing "\n" so the call site is just
+    /// `renderer.render(UiLine::CommandOutput(t(Msg::LanguageSwitched
+    /// { ... }).into_owned()))`.
+    LanguageSwitched { label: &'a str, locale: &'a str },
 
     // ── Idle / onboarding hints ──
     /// "type something, or press " (text before the slash)

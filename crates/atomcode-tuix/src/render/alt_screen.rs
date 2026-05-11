@@ -3654,4 +3654,51 @@ mod tests {
         assert_eq!(text, "rst row\nseco", "multi-line extract mismatch: {:?}", text);
         drop(r);
     }
+
+    /// Regression guard for `/language` modal feedback. The picker's
+    /// Enter handler emits CommandOutput THEN returns Close; the event
+    /// loop then re-renders the input prompt without the menu. The
+    /// CommandOutput must survive that second render — otherwise the
+    /// user sees no confirmation that the locale switch took effect.
+    #[test]
+    fn command_output_survives_subsequent_input_prompt_redraw() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+
+        // Simulate the exact flow language_picker.rs uses on Enter:
+        // first push a confirmation line, then redraw the input prompt
+        // without a menu (the event loop's `redraw_idle_plain` after
+        // `ModalAction::Close`).
+        r.render(UiLine::CommandOutput(
+            "  ✓ Language switched to 简体中文 (zh_CN).\n".into(),
+        ));
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
+        });
+        r.flush();
+
+        // The body line must still be present in body_lines AND
+        // visible in the painted output stream — both layers matter
+        // because painting clips out-of-viewport rows.
+        let in_body = r
+            .body_lines
+            .iter()
+            .any(|row| row.contains("Language switched to") && row.contains("简体中文"));
+        assert!(
+            in_body,
+            "confirmation line missing from body_lines: {:?}",
+            r.body_lines
+        );
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("Language switched to") && s.contains("简体中文"),
+            "confirmation line missing from painted output: {:?}",
+            s
+        );
+    }
 }

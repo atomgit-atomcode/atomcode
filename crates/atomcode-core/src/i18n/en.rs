@@ -17,6 +17,59 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── /codingplan ──
         Msg::CodingPlanSetupFailed { error } =>
             format!("codingplan setup failed: {error}").into(),
+        Msg::CpSetupHeader =>
+            "  AtomCode CodingPlan setup:\n\n".into(),
+        Msg::CpLoggedIn { who, username, email } =>
+            format!("  ✔ Logged in as {} ({}, {})\n", who, username, email).into(),
+        Msg::CpStepSkipped { reason } =>
+            format!("  ✔ {}\n", reason).into(),
+        Msg::CpLoginFailed { error } =>
+            format!("  ✘ Login failed — {}\n", error).into(),
+        Msg::CpClaimed { message, plan_type } =>
+            format!("  ✔ CodingPlan claimed — {} (CodingPlan {})\n", message, plan_type).into(),
+        Msg::CpClaimSuccessFallback => "success".into(),
+        Msg::CpAlreadyClaimed { reason } =>
+            format!("  ✔ CodingPlan already claimed — {}\n", reason).into(),
+        Msg::CpClaimFailed { error } =>
+            format!("  ✘ CodingPlan claim failed — {}\n", error).into(),
+        Msg::CpAddedProviders { count, plural_s } =>
+            format!("  ✔ Added {} provider{}:\n", count, plural_s).into(),
+        Msg::CpLockedJediterm { name } =>
+            format!("      ✗ {}  (Locked: require plan upgrade)\n", name).into(),
+        Msg::CpLockedAnsi { name } =>
+            format!("      • \x1b[9m{}\x1b[29m  (require plan upgrade)\n", name).into(),
+        Msg::CpProviderRow { provider, model, default_suffix } =>
+            format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
+        Msg::CpDefaultSuffix => "  (default)".into(),
+        Msg::CpVisionAuto { kind } =>
+            format!("  ✔ Vision preprocessor → {}  (auto-detected)\n", kind).into(),
+        Msg::CpVisionUserSupplied { kind } =>
+            format!("  ✔ Vision preprocessor → {}  (user setting kept)\n", kind).into(),
+        Msg::CpVisionCleared =>
+            "  ⚠ Vision preprocessor cleared — no VL/OCR model in current list\n".into(),
+        Msg::CpModelsSkipped { reason } =>
+            format!("  ✔ Models step skipped — {}\n", reason).into(),
+        Msg::CpModelsFailed { error } =>
+            format!("  ✘ Models step failed — {}\n", error).into(),
+        Msg::CpStatusHeader =>
+            "  ✔ CodingPlan status:\n".into(),
+        Msg::CpPlanPending { plan } =>
+            format!("      Plan: {}  ·  pending activation\n", plan).into(),
+        Msg::CpPlanActive { plan, expires_at, remaining_days, total_days } =>
+            format!(
+                "      Plan: {}  ·  expires {} ({}d / {}d remaining)\n",
+                plan, expires_at, remaining_days, total_days,
+            ).into(),
+        Msg::CpUsageLine { usage, reset_at, duration } =>
+            format!("      Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
+        Msg::CpWindowQuotaExhausted =>
+            "      ⚠ Current window quota exhausted\n".into(),
+        Msg::CpWindowQuotaHint { hint } =>
+            format!("      ⚠ {}\n", hint).into(),
+        Msg::CpStatusFetchSkipped { reason } =>
+            format!("  ⚠ Status fetch skipped — {}\n", reason).into(),
+        Msg::CpStatusFetchFailed { error } =>
+            format!("  ⚠ Status fetch failed (non-fatal) — {}\n", error).into(),
 
         Msg::ErrUnsupportedLocale { input } =>
             format!("unsupported locale: {input}").into(),
@@ -30,6 +83,43 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "(not configured)".into(),
         Msg::StatusClipboardImageHint =>
             "Image in clipboard · ctrl+v to paste".into(),
+
+        // ── /status command body ──
+        Msg::StatusBody { model, dir, config, tokens } =>
+            format!(
+                "  Model:  {}\n  Dir:    {}\n  Config: {}\n  Tokens: {}\n",
+                model, dir, config, tokens,
+            ).into(),
+        Msg::StatusCpNotSignedIn =>
+            "  CodingPlan: (not signed in — run /codingplan to set up)\n".into(),
+        Msg::StatusCpFetchFailed { error } =>
+            format!("  CodingPlan: (status fetch failed — {})\n", error).into(),
+        Msg::StatusCpNoActive =>
+            "  CodingPlan: (no active plan — run /codingplan)\n".into(),
+        Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>
+            format!(
+                "  CodingPlan: {}  ·  expires {} ({}d/{}d)\n",
+                plan, expires_at, remaining_days, total_days,
+            ).into(),
+        Msg::StatusCpUsage { usage, reset_at, seconds } =>
+            format!("  Usage: {}  ·  resets {} (in {}s)\n", usage, reset_at, seconds).into(),
+        Msg::StatusCpWindowExhausted =>
+            "  ⚠ Current window quota exhausted\n".into(),
+        Msg::StatusCpWindowHint { hint } =>
+            format!("  ⚠ {}\n", hint).into(),
+        Msg::StatusInstructionFilesHeader =>
+            "  Instruction files:\n".into(),
+        Msg::StatusInstructionPresent { path, label } =>
+            format!("    ✓ {} ({})\n", path, label).into(),
+        Msg::StatusInstructionMissing { label } =>
+            format!("    ✗ {} — not found\n", label).into(),
+
+        // ── /login completion ──
+        Msg::LoginSignedInWithCpHint { name, username } =>
+            format!(
+                "  Signed in as {} ({}). You can chat now; run /codingplan to sync the latest model access.\n",
+                name, username,
+            ).into(),
 
         // ── Help ──
         Msg::HelpAvailableCommands =>
@@ -144,8 +234,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("(required — type a {field} or Esc to cancel)").into(),
 
         // ── Language ──
-        Msg::LanguageSetTo { locale } =>
-            format!("Language set to: {locale}").into(),
+        Msg::LanguageSwitched { label, locale } =>
+            format!("  ✓ Language switched to {label} ({locale}).\n").into(),
 
         // ── Idle / onboarding hints ──
         Msg::IdleHintPrefix =>

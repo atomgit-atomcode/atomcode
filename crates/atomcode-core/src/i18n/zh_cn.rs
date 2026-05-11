@@ -17,6 +17,59 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── /codingplan ──
         Msg::CodingPlanSetupFailed { error } =>
             format!("CodingPlan 设置失败：{error}").into(),
+        Msg::CpSetupHeader =>
+            "  AtomCode CodingPlan 配置：\n\n".into(),
+        Msg::CpLoggedIn { who, username, email } =>
+            format!("  ✔ 已登录：{} ({}，{})\n", who, username, email).into(),
+        Msg::CpStepSkipped { reason } =>
+            format!("  ✔ {}\n", reason).into(),
+        Msg::CpLoginFailed { error } =>
+            format!("  ✘ 登录失败 — {}\n", error).into(),
+        Msg::CpClaimed { message, plan_type } =>
+            format!("  ✔ CodingPlan 已领取 — {}（CodingPlan {}）\n", message, plan_type).into(),
+        Msg::CpClaimSuccessFallback => "成功".into(),
+        Msg::CpAlreadyClaimed { reason } =>
+            format!("  ✔ CodingPlan 已领取 — {}\n", reason).into(),
+        Msg::CpClaimFailed { error } =>
+            format!("  ✘ CodingPlan 领取失败 — {}\n", error).into(),
+        Msg::CpAddedProviders { count, plural_s: _ } =>
+            format!("  ✔ 已添加 {} 个 Provider：\n", count).into(),
+        Msg::CpLockedJediterm { name } =>
+            format!("      ✗ {}  （已锁定：需要升级套餐）\n", name).into(),
+        Msg::CpLockedAnsi { name } =>
+            format!("      • \x1b[9m{}\x1b[29m  （需要升级套餐）\n", name).into(),
+        Msg::CpProviderRow { provider, model, default_suffix } =>
+            format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
+        Msg::CpDefaultSuffix => "  （默认）".into(),
+        Msg::CpVisionAuto { kind } =>
+            format!("  ✔ 视觉预处理器 → {}  （自动检测）\n", kind).into(),
+        Msg::CpVisionUserSupplied { kind } =>
+            format!("  ✔ 视觉预处理器 → {}  （保留用户设置）\n", kind).into(),
+        Msg::CpVisionCleared =>
+            "  ⚠ 视觉预处理器已清除 — 当前模型列表中没有可用的 VL/OCR 模型\n".into(),
+        Msg::CpModelsSkipped { reason } =>
+            format!("  ✔ 模型步骤已跳过 — {}\n", reason).into(),
+        Msg::CpModelsFailed { error } =>
+            format!("  ✘ 模型步骤失败 — {}\n", error).into(),
+        Msg::CpStatusHeader =>
+            "  ✔ CodingPlan 状态：\n".into(),
+        Msg::CpPlanPending { plan } =>
+            format!("      套餐：{}  ·  正在激活\n", plan).into(),
+        Msg::CpPlanActive { plan, expires_at, remaining_days, total_days } =>
+            format!(
+                "      套餐：{}  ·  到期时间 {}（剩余 {}d / 共 {}d）\n",
+                plan, expires_at, remaining_days, total_days,
+            ).into(),
+        Msg::CpUsageLine { usage, reset_at, duration } =>
+            format!("      用量：{}  ·  重置于 {}（{} 后）\n", usage, reset_at, duration).into(),
+        Msg::CpWindowQuotaExhausted =>
+            "      ⚠ 当前窗口配额已耗尽\n".into(),
+        Msg::CpWindowQuotaHint { hint } =>
+            format!("      ⚠ {}\n", hint).into(),
+        Msg::CpStatusFetchSkipped { reason } =>
+            format!("  ⚠ 状态获取已跳过 — {}\n", reason).into(),
+        Msg::CpStatusFetchFailed { error } =>
+            format!("  ⚠ 状态获取失败（非致命） — {}\n", error).into(),
 
         Msg::ErrUnsupportedLocale { input } =>
             format!("不支持的语言：{input}").into(),
@@ -30,6 +83,43 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "（未配置）".into(),
         Msg::StatusClipboardImageHint =>
             "剪贴板有图片 · ctrl+v 粘贴".into(),
+
+        // ── /status 命令主体 ──
+        Msg::StatusBody { model, dir, config, tokens } =>
+            format!(
+                "  模型：    {}\n  目录：    {}\n  配置文件：{}\n  Token：   {}\n",
+                model, dir, config, tokens,
+            ).into(),
+        Msg::StatusCpNotSignedIn =>
+            "  CodingPlan：（未登录 — 运行 /codingplan 进行配置）\n".into(),
+        Msg::StatusCpFetchFailed { error } =>
+            format!("  CodingPlan：（状态获取失败 — {}）\n", error).into(),
+        Msg::StatusCpNoActive =>
+            "  CodingPlan：（无激活套餐 — 运行 /codingplan）\n".into(),
+        Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>
+            format!(
+                "  CodingPlan：{}  ·  到期 {}（{}d / 共 {}d）\n",
+                plan, expires_at, remaining_days, total_days,
+            ).into(),
+        Msg::StatusCpUsage { usage, reset_at, seconds } =>
+            format!("  用量：{}  ·  重置于 {}（{}s 后）\n", usage, reset_at, seconds).into(),
+        Msg::StatusCpWindowExhausted =>
+            "  ⚠ 当前窗口配额已耗尽\n".into(),
+        Msg::StatusCpWindowHint { hint } =>
+            format!("  ⚠ {}\n", hint).into(),
+        Msg::StatusInstructionFilesHeader =>
+            "  指令文件：\n".into(),
+        Msg::StatusInstructionPresent { path, label } =>
+            format!("    ✓ {} ({})\n", path, label).into(),
+        Msg::StatusInstructionMissing { label } =>
+            format!("    ✗ {} — 未找到\n", label).into(),
+
+        // ── /login 完成提示 ──
+        Msg::LoginSignedInWithCpHint { name, username } =>
+            format!(
+                "  已登录：{}（{}）。现在可以开始对话；运行 /codingplan 同步最新的模型权限。\n",
+                name, username,
+            ).into(),
 
         // ── 帮助 ──
         Msg::HelpAvailableCommands =>
@@ -144,8 +234,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("（必填 — 请输入 {field}，或按 Esc 取消）").into(),
 
         // ── 语言 ──
-        Msg::LanguageSetTo { locale } =>
-            format!("语言已切换为：{locale}").into(),
+        Msg::LanguageSwitched { label, locale } =>
+            format!("  ✓ 已切换语言为 {label}（{locale}）。\n").into(),
 
         // ── 空闲/引导提示 ──
         Msg::IdleHintPrefix =>

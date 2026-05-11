@@ -123,24 +123,27 @@ impl SetupReport {
     /// flags as parameters so unit tests don't have to mutate process
     /// env to exercise the JediTerm fallback path.
     pub(crate) fn render_with_terminal_caps(&self, is_jediterm: bool) -> String {
+        use crate::i18n::{t, Msg};
+
         let mut out = String::new();
-        out.push_str("  AtomCode CodingPlan setup:\n\n");
+        out.push_str(&t(Msg::CpSetupHeader));
 
         // Step 1: login
         match &self.login {
             StepResult::Ok(info) => {
                 let who = info.display_name.as_deref().unwrap_or(&info.username);
                 let email = info.email.as_deref().unwrap_or("—");
-                out.push_str(&format!(
-                    "  ✔ Logged in as {} ({}, {})\n",
-                    who, info.username, email,
-                ));
+                out.push_str(&t(Msg::CpLoggedIn {
+                    who,
+                    username: &info.username,
+                    email,
+                }));
             }
             StepResult::Skipped(reason) => {
-                out.push_str(&format!("  ✔ {}\n", reason));
+                out.push_str(&t(Msg::CpStepSkipped { reason }));
             }
             StepResult::Err(msg) => {
-                out.push_str(&format!("  ✘ Login failed — {}\n", msg));
+                out.push_str(&t(Msg::CpLoginFailed { error: msg }));
             }
         }
 
@@ -150,24 +153,25 @@ impl SetupReport {
         // refused).
         match &self.claim {
             StepResult::Ok(info) => {
-                out.push_str(&format!(
-                    "  ✔ CodingPlan claimed — {} (CodingPlan {})\n",
-                    if info.message.is_empty() {
-                        "success".to_string()
-                    } else {
-                        info.message.clone()
-                    },
-                    info.plan_type.as_str(),
-                ));
+                let fallback = t(Msg::CpClaimSuccessFallback);
+                let message = if info.message.is_empty() {
+                    fallback.as_ref()
+                } else {
+                    info.message.as_str()
+                };
+                out.push_str(&t(Msg::CpClaimed {
+                    message,
+                    plan_type: info.plan_type.as_str(),
+                }));
             }
             StepResult::Skipped(reason) if reason == CASCADE_FROM_UPSTREAM_FAIL => {
                 // Cascade from login failure — suppressed.
             }
             StepResult::Skipped(reason) => {
-                out.push_str(&format!("  ✔ CodingPlan already claimed — {}\n", reason));
+                out.push_str(&t(Msg::CpAlreadyClaimed { reason }));
             }
             StepResult::Err(msg) => {
-                out.push_str(&format!("  ✘ CodingPlan claim failed — {}\n", msg));
+                out.push_str(&t(Msg::CpClaimFailed { error: msg }));
             }
         }
 
@@ -177,15 +181,9 @@ impl SetupReport {
         // failure line is just noise. Same for the status row below.
         match &self.models {
             StepResult::Ok(info) => {
-                out.push_str(&format!(
-                    "  ✔ Added {} provider{}:\n",
-                    info.provider_names.len(),
-                    if info.provider_names.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                ));
+                let count = info.provider_names.len();
+                let plural_s = if count == 1 { "" } else { "s" };
+                out.push_str(&t(Msg::CpAddedProviders { count, plural_s }));
                 // Build a quick lookup of which display names made it
                 // into the registered provider list — anything in
                 // `all_models` but NOT in this set is locked behind
@@ -208,43 +206,38 @@ impl SetupReport {
                         // JediTerm fallback: ✗ + "(Locked: ...)" text
                         // marker, no SGR 9 (which JediTerm renders
                         // inconsistently or not at all).
-                        out.push_str(&format!(
-                            "      ✗ {}  (Locked: require plan upgrade)\n",
-                            m.display_model_name,
-                        ));
+                        out.push_str(&t(Msg::CpLockedJediterm {
+                            name: &m.display_model_name,
+                        }));
                     } else {
-                        out.push_str(&format!(
-                            "      • \x1b[9m{}\x1b[29m  (require plan upgrade)\n",
-                            m.display_model_name,
-                        ));
+                        out.push_str(&t(Msg::CpLockedAnsi {
+                            name: &m.display_model_name,
+                        }));
                     }
                 }
+                let default_suffix_cow = t(Msg::CpDefaultSuffix);
                 for (pname, model) in info.provider_names.iter().zip(info.display_names.iter()) {
                     let suffix = if pname == &info.default_provider {
-                        "  (default)"
+                        default_suffix_cow.as_ref()
                     } else {
                         ""
                     };
-                    out.push_str(&format!("      • {}  →  {}{}\n", pname, model, suffix));
+                    out.push_str(&t(Msg::CpProviderRow {
+                        provider: pname,
+                        model,
+                        default_suffix: suffix,
+                    }));
                 }
                 // Vision-preprocessor outcome line.
                 match &info.vision_preprocessor {
                     VisionPreprocessorOutcome::AutoSet(k) => {
-                        out.push_str(&format!(
-                            "  ✔ Vision preprocessor → {}  (auto-detected)\n",
-                            k,
-                        ));
+                        out.push_str(&t(Msg::CpVisionAuto { kind: k }));
                     }
                     VisionPreprocessorOutcome::UserSupplied(k) => {
-                        out.push_str(&format!(
-                            "  ✔ Vision preprocessor → {}  (user setting kept)\n",
-                            k,
-                        ));
+                        out.push_str(&t(Msg::CpVisionUserSupplied { kind: k }));
                     }
                     VisionPreprocessorOutcome::Cleared => {
-                        out.push_str(
-                            "  ⚠ Vision preprocessor cleared — no VL/OCR model in current list\n",
-                        );
+                        out.push_str(&t(Msg::CpVisionCleared));
                     }
                     VisionPreprocessorOutcome::UnchangedNone => {
                         // No-op: nothing to say when both the previous and
@@ -256,47 +249,45 @@ impl SetupReport {
                 // Suppress — claim failure line above is the explanation.
             }
             StepResult::Skipped(reason) => {
-                out.push_str(&format!("  ✔ Models step skipped — {}\n", reason));
+                out.push_str(&t(Msg::CpModelsSkipped { reason }));
             }
             StepResult::Err(msg) => {
-                out.push_str(&format!("  ✘ Models step failed — {}\n", msg));
+                out.push_str(&t(Msg::CpModelsFailed { error: msg }));
             }
         }
 
         // Step 4: status
         match &self.status {
             StepResult::Ok(s) => {
-                out.push_str("  ✔ CodingPlan status:\n");
+                out.push_str(&t(Msg::CpStatusHeader));
                 if let Some(plan) = &s.codingplan_free {
                     if plan.expires_at.is_empty() {
                         // Backend sends null claimed_at/expires_at while a
                         // fresh claim is still propagating. Don't render an
                         // empty date with `(0d / 0d remaining)` zeros — say
                         // "pending activation" so the user knows to wait.
-                        out.push_str(&format!(
-                            "      Plan: {}  ·  pending activation\n",
-                            plan.plan_name,
-                        ));
+                        out.push_str(&t(Msg::CpPlanPending { plan: &plan.plan_name }));
                     } else {
-                        out.push_str(&format!(
-                            "      Plan: {}  ·  expires {} ({}d / {}d remaining)\n",
-                            plan.plan_name, plan.expires_at, plan.remaining_days, plan.total_days,
-                        ));
+                        out.push_str(&t(Msg::CpPlanActive {
+                            plan: &plan.plan_name,
+                            expires_at: &plan.expires_at,
+                            remaining_days: plan.remaining_days,
+                            total_days: plan.total_days,
+                        }));
                     }
                 }
                 if let Some(u) = &s.current_usage {
-                    out.push_str(&format!(
-                        "      Usage: {}  ·  resets {} (in {})\n",
-                        u.display_desc(),
-                        u.reset_at_display,
-                        format_duration_secs(u.seconds_until_reset),
-                    ));
+                    out.push_str(&t(Msg::CpUsageLine {
+                        usage: &u.display_desc(),
+                        reset_at: &u.reset_at_display,
+                        duration: &format_duration_secs(u.seconds_until_reset),
+                    }));
                 }
                 if s.window_quota_exhausted {
                     if let Some(hint) = &s.window_quota_hint {
-                        out.push_str(&format!("      ⚠ {}\n", hint));
+                        out.push_str(&t(Msg::CpWindowQuotaHint { hint }));
                     } else {
-                        out.push_str("      ⚠ Current window quota exhausted\n");
+                        out.push_str(&t(Msg::CpWindowQuotaExhausted));
                     }
                 }
             }
@@ -304,7 +295,7 @@ impl SetupReport {
                 // Suppress — cascade from claim failure.
             }
             StepResult::Skipped(reason) => {
-                out.push_str(&format!("  ⚠ Status fetch skipped — {}\n", reason));
+                out.push_str(&t(Msg::CpStatusFetchSkipped { reason }));
             }
             StepResult::Err(msg) => {
                 // Truncate the error chain so a server-side parse failure
@@ -312,10 +303,9 @@ impl SetupReport {
                 // chain commonly includes the raw JSON via anyhow's
                 // `with_context(format!("(body: {})", body))`, easily
                 // 200+ chars; the diagnostic value beyond ~150 is low.
-                out.push_str(&format!(
-                    "  ⚠ Status fetch failed (non-fatal) — {}\n",
-                    truncate_inline(msg, 150),
-                ));
+                out.push_str(&t(Msg::CpStatusFetchFailed {
+                    error: &truncate_inline(msg, 150),
+                }));
             }
         }
 

@@ -9,6 +9,7 @@ pub mod ctx;
 pub mod git;
 pub mod graph;
 pub mod hook;
+pub mod i18n;
 pub mod init;
 pub mod input_history;
 pub mod locale;
