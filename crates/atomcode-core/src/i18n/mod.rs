@@ -112,7 +112,16 @@ fn classify_env_locale(value: &str) -> Locale {
 pub fn test_lock() -> LocaleTestGuard {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    // Recover from a poisoned mutex (a previous test panicked while
+    // holding the guard). The locale value the panicking test wrote
+    // is irrelevant — we restore from `current_locale()` next, and
+    // each test sets its own desired locale immediately after taking
+    // the lock. Without this, one panicking test would cascade and
+    // fail every subsequent locale-touching test with PoisonError.
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let original = current_locale();
     LocaleTestGuard {
         original,

@@ -1093,6 +1093,129 @@ mod tests {
         assert!(joined.contains("○  [3]"));
     }
 
+    // ── VirtualTerminal snapshot tests ──
+    //
+    // These tests feed the wizard's emitted lines through a real
+    // VirtualTerminal — same vt100 path the prod renderer drives — so
+    // we catch ANSI/SGR mishandling that the strip_sgr unit tests
+    // can't surface. Plan called for a higher-level `new_vterm` /
+    // `ctx_for_modal_tests` helper pair, but those don't exist in
+    // the current tree; the wizard's `draw_*_lines` already returns
+    // standalone strings (it's only the Modal trait wrapper that
+    // needs the renderer / ctx), so we can short-circuit straight
+    // into the vterm by feeding `lines.join("\n")` as bytes.
+
+    /// Feed wizard lines into a fresh VirtualTerminal and return its
+    /// post-paint screen dump. Each line gets a trailing `\r\n` so
+    /// the vterm advances to column 0 of the next row — without the
+    /// `\r`, lines would stack at whatever column the cursor happened
+    /// to be at after the previous line's last SGR.
+    fn paint_to_vterm(lines: Vec<String>, w: u16, h: u16) -> String {
+        let mut vt = crate::test_term::VirtualTerminal::new(w, h);
+        let mut bytes = Vec::new();
+        for line in &lines {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.extend_from_slice(b"\r\n");
+        }
+        vt.feed(&bytes);
+        vt.dump()
+    }
+
+    #[test]
+    fn vterm_step1_shows_box_borders_in_en() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 24);
+        let screen = paint_to_vterm(lines, 80, 24);
+        // Top + bottom corner glyphs visible in the painted grid.
+        assert!(screen.contains("┌─"), "top border missing: {screen}");
+        assert!(screen.contains("└─"), "bottom border missing: {screen}");
+        // Brand title, step header, key copy.
+        assert!(screen.contains("AtomCode"));
+        assert!(screen.contains("Step 1/3 · Welcome"));
+        assert!(screen.contains("Press Enter to continue"));
+    }
+
+    #[test]
+    fn vterm_step2_zh_renders_bilingual_title_and_chinese_options() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let mut w = OnboardingWizard::new();
+        w.step = Step::Language;
+        let lines = w.draw_language_lines(80);
+        let screen = paint_to_vterm(lines, 80, 24);
+        // vt100 places a CJK double-width char in one cell and leaves
+        // the next cell blank, so `选择语言` reads back as
+        // `选 择 语 言` in the grid dump.
+        assert!(
+            screen.contains("Choose your language / 选 择 语 言"),
+            "bilingual title missing: {screen}"
+        );
+        assert!(
+            screen.contains("自 动 检 测"),
+            "Chinese auto-detect label missing: {screen}"
+        );
+        // Step header `第 2/3 步 · 语言` — the trailing-blank cell after
+        // each CJK glyph collides with the source spaces around `2/3`
+        // and `·`, doubling them.
+        assert!(
+            screen.contains("第  2/3 步  · 语 言"),
+            "zh step header missing: {screen}"
+        );
+    }
+
+    #[test]
+    fn vterm_step1_compact_below_22_rows_drops_logo() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_intro_lines(80, 18);
+        let screen = paint_to_vterm(lines, 80, 18);
+        assert!(
+            !screen.contains("/_/   \\_\\__\\___/"),
+            "ASCII logo present in compact mode: {screen}"
+        );
+        // Compact substitutes `AtomCode vX.Y.Z`.
+        assert!(screen.contains("AtomCode v"));
+        assert!(screen.contains("Press Enter to continue"));
+    }
+
+    /// Step 3 setup options align in the grid: bullet column, [N]
+    /// column, label column all stay vertically aligned across the
+    /// three rows. Pin via `any_row` since the wizard emits one row
+    /// per option.
+    #[test]
+    fn vterm_step3_setup_options_align_vertically() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let lines = OnboardingWizard::new().draw_setup_lines(80);
+
+        let mut vt = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut bytes = Vec::new();
+        for line in &lines {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.extend_from_slice(b"\r\n");
+        }
+        vt.feed(&bytes);
+
+        // Each option's row starts with `│  ●  [1]` or `│  ○  [N]`.
+        // The bullet must sit at the same column across all three.
+        let rows_with_bracket: Vec<String> = (0..24)
+            .map(|r| vt.row_text(r))
+            .filter(|r| r.contains("[1]") || r.contains("[2]") || r.contains("[3]"))
+            .collect();
+        assert_eq!(rows_with_bracket.len(), 3, "expected 3 option rows, got {rows_with_bracket:?}");
+        // Bullet position (●/○) — all three rows must place it at
+        // the same column index. Locate via find().
+        let bullet_cols: Vec<Option<usize>> = rows_with_bracket
+            .iter()
+            .map(|r| r.find('●').or_else(|| r.find('○')))
+            .collect();
+        assert!(
+            bullet_cols.iter().all(|c| c.is_some() && *c == bullet_cols[0]),
+            "bullet column drift across rows: {bullet_cols:?}"
+        );
+    }
+
     /// pad_to_width: short strings get right-padded to target; long
     /// strings pass through unchanged.
     #[test]
