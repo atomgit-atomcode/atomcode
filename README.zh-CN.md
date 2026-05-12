@@ -263,7 +263,7 @@ atomcode --prompt-file task.md
 |---------|--------|
 | `/resume` | 恢复或切换会话 |
 | `/session` | 创建新会话 |
-| `/bg` | 将当前会话放到后台；子命令：`/bg /list`、`/bg <N>`、`/bg /drop <N>`、`/bg /help` |
+| `/bg` | 将当前会话放到后台；子命令：`/bg list`、`/bg <N>`、`/bg drop <N>`、`/bg help` |
 | `/background <task>` | 兼容入口：在 `/bg` 槽位中启动一次性后台任务 |
 | `/provider` | 管理 provider |
 | `/model` | 切换模型 / provider |

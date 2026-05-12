@@ -130,7 +130,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     },
     Command {
         name: "bg",
-        desc: "Background sessions: /bg, /bg /list, /bg <N>, /bg /drop <N>",
+        desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>",
         needs_args: false,
     },
     Command {

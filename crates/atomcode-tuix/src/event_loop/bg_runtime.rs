@@ -451,14 +451,14 @@ pub fn parse_bg_command(arg: &str) -> BgCommand {
     if trimmed.is_empty() {
         return BgCommand::BackgroundCurrent;
     }
-    if matches!(trimmed, "/help" | "help" | "-h" | "--help") {
+    if matches!(trimmed, "help" | "-h" | "--help") {
         return BgCommand::Help;
     }
-    if matches!(trimmed, "/list" | "list" | "ls") {
+    if matches!(trimmed, "list" | "ls") {
         return BgCommand::List;
     }
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() == 2 && matches!(parts[0], "/drop" | "drop") {
+    if parts.len() == 2 && parts[0] == "drop" {
         return parts[1]
             .parse::<usize>()
             .map(BgCommand::Drop)
@@ -471,7 +471,7 @@ pub fn parse_bg_command(arg: &str) -> BgCommand {
 }
 
 pub fn render_bg_help() -> String {
-    "  /bg                 Send current session to background and open a new foreground\n  /bg /list           List background sessions\n  /bg <N>             Resume background slot N\n  /bg /drop <N>       Drop background slot N\n  /bg /help           Show this help\n".to_string()
+    "  /bg                 Send current session to background and open a new foreground\n  /bg list            List background sessions\n  /bg <N>             Resume background slot N\n  /bg drop <N>        Drop background slot N\n  /bg help            Show this help\n".to_string()
 }
 
 pub fn render_bg_list(slots: &BackgroundSlots) -> String {
@@ -671,8 +671,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_bg_drop_accepts_slash_form() {
-        assert_eq!(parse_bg_command("/drop 2"), BgCommand::Drop(2));
+    fn parse_bg_subcommands_use_bare_names() {
+        assert_eq!(parse_bg_command("list"), BgCommand::List);
+        assert_eq!(parse_bg_command("drop 2"), BgCommand::Drop(2));
+        assert_eq!(parse_bg_command("help"), BgCommand::Help);
+    }
+
+    #[test]
+    fn parse_bg_rejects_nested_slash_subcommands() {
+        assert_eq!(parse_bg_command("/list"), BgCommand::Help);
+        assert_eq!(parse_bg_command("/drop 2"), BgCommand::Help);
     }
 
     #[test]

@@ -266,7 +266,7 @@ Then just type what you want:
 |---------|--------|
 | `/resume` | Resume or switch session |
 | `/session` | Create a new session |
-| `/bg` | Background current session; subcommands: `/bg /list`, `/bg <N>`, `/bg /drop <N>`, `/bg /help` |
+| `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
 | `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
 | `/provider` | Manage providers |
 | `/model` | Switch model / provider |
