@@ -312,11 +312,26 @@ impl SetupReport {
         out
     }
 
-    /// True iff the critical steps (login + models) succeeded. Callers
-    /// use this to decide whether to persist config changes to disk —
-    /// no point writing config if the model list never arrived.
+    /// True iff every persist-relevant step (login + claim + models)
+    /// either succeeded outright or was skipped non-fatally (server
+    /// reported `duplicate=true`, model list already current, etc.).
+    /// Callers use this to decide whether to persist config changes
+    /// to disk.
+    ///
+    /// `claim` MUST be in the predicate: when claim returns `Err`
+    /// (e.g. backend 500 like the AtomGit `claim-v2` transaction-
+    /// rollback bug), `run()` short-circuits and parks `models` as
+    /// `Skipped(CASCADE_FROM_UPSTREAM_FAIL)` so the report stays
+    /// focused on the actual failure. Without the claim check the
+    /// gate flipped to `true` on every claim-failure path —
+    /// triggering `save_and_reload` to rewrite `config.toml`
+    /// unconditionally. That clobbered any manual edits the user
+    /// made between TUI startup and `/codingplan`, and read as
+    /// "claim failed but it still wrote models to my config".
     pub fn should_persist_config(&self) -> bool {
-        self.login.is_ok_or_skipped() && self.models.is_ok_or_skipped()
+        self.login.is_ok_or_skipped()
+            && self.claim.is_ok_or_skipped()
+            && self.models.is_ok_or_skipped()
     }
 }
 
@@ -1096,6 +1111,54 @@ mod tests {
         assert!(
             !report.should_persist_config(),
             "don't write config on login failure"
+        );
+    }
+
+    /// Regression: claim returned Err (e.g. AtomGit `claim-v2` 500
+    /// with the Spring `UnexpectedRollbackException` payload). `run()`
+    /// short-circuits and stamps the cascade sentinel into `models` /
+    /// `status`. Before this fix, `should_persist_config` only
+    /// checked `login` and `models` — both `is_ok_or_skipped()` =
+    /// `true` here — so the gate flipped open and `save_and_reload`
+    /// rewrote `config.toml`. Surfaced to the user as "claim failed
+    /// but models still got written to my config". Now the predicate
+    /// also requires `claim.is_ok_or_skipped()` so any real claim
+    /// failure blocks the persist.
+    #[test]
+    fn claim_err_blocks_persist() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Err(
+                "claim Pro request: claim-v2 returned 500 Internal Server Error \
+                 — Transaction rolled back because it has been marked as rollback-only"
+                    .into(),
+            ),
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+        };
+        assert!(
+            !report.should_persist_config(),
+            "claim Err must block save_and_reload — config rewrite was overwriting \
+             manual edits between TUI startup and /codingplan",
+        );
+        // Sanity-check: the duplicate-claim Skipped path (server says
+        // "already claimed") must STILL persist so two-runs-in-a-row
+        // /codingplan keeps working as a model-list sync.
+        let dup = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Skipped("already claimed / using Max".into()),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec!["a/b".into()],
+                provider_names: vec!["AtomGit".into()],
+                default_provider: "AtomGit".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![],
+            }),
+            status: StepResult::Err("status fetch timeout".into()),
+        };
+        assert!(
+            dup.should_persist_config(),
+            "duplicate-claim Skipped must still allow persist (it's the model-sync path)",
         );
     }
 
