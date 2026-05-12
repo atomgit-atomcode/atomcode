@@ -34,10 +34,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ✘ CodingPlan claim failed — {}\n", error).into(),
         Msg::CpAddedProviders { count, plural_s } =>
             format!("  ✔ Added {} provider{}:\n", count, plural_s).into(),
-        Msg::CpLockedJediterm { name } =>
-            format!("      ✗ {}  (Locked: require plan upgrade)\n", name).into(),
-        Msg::CpLockedAnsi { name } =>
-            format!("      • \x1b[9m{}\x1b[29m  (require plan upgrade)\n", name).into(),
+        Msg::CpLocked { name } =>
+            format!("      • {}  (require plan upgrade)\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  (default)".into(),

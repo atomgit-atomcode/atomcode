@@ -34,10 +34,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ✘ CodingPlan 领取失败 — {}\n", error).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
             format!("  ✔ 已添加 {} 个 Provider：\n", count).into(),
-        Msg::CpLockedJediterm { name } =>
-            format!("      ✗ {}  （已锁定：需要升级套餐）\n", name).into(),
-        Msg::CpLockedAnsi { name } =>
-            format!("      • \x1b[9m{}\x1b[29m  （需要升级套餐）\n", name).into(),
+        Msg::CpLocked { name } =>
+            format!("      • {}  （需要升级套餐）\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  （默认）".into(),

@@ -21,8 +21,12 @@ pub enum Msg<'a> {
     CpAlreadyClaimed { reason: &'a str },
     CpClaimFailed { error: &'a str },
     CpAddedProviders { count: usize, plural_s: &'a str },
-    CpLockedJediterm { name: &'a str },
-    CpLockedAnsi { name: &'a str },
+    /// Locked-model row. `name` is expected to be pre-decorated with
+    /// U+0336 combining strikethrough by the caller (see
+    /// `coding_plan::setup::strikethrough`), so the template itself
+    /// stays a plain `format!` and survives every renderer's CSI
+    /// scrubber without needing SGR escapes.
+    CpLocked { name: &'a str },
     CpProviderRow { provider: &'a str, model: &'a str, default_suffix: &'a str },
     CpDefaultSuffix,
     CpVisionAuto { kind: &'a str },

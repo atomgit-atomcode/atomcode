@@ -98,17 +98,22 @@ pub enum VisionPreprocessorOutcome {
     Cleared,
 }
 
-/// JetBrains JediTerm doesn't render SGR 9 strikethrough reliably
-/// (older versions silently parse-and-drop it; newer versions render
-/// inconsistently depending on font + theme). Detected via the
-/// `TERMINAL_EMULATOR=JetBrains-JediTerm` env var that JetBrains IDEs
-/// export into their integrated terminal. When true, the locked-model
-/// row falls back to an ASCII `✗` prefix + `(Locked: ...)` text marker
-/// so the meaning carries even with no visual styling.
-pub(crate) fn detect_jediterm() -> bool {
-    std::env::var("TERMINAL_EMULATOR")
-        .map(|v| v == "JetBrains-JediTerm")
-        .unwrap_or(false)
+/// Insert U+0336 (combining long stroke overlay) after each character
+/// so the result renders with a horizontal strikethrough across the
+/// glyph in every modern terminal — iTerm2, Terminal.app, Windows
+/// Terminal, Konsole, JediTerm, even legacy conhost. Replaces an earlier
+/// SGR 9 (`\x1b[9m…\x1b[29m`) approach that was getting deleted by the
+/// renderer's universal CSI scrubber (`tuix::sanitize::scrub_controls`)
+/// before reaching the terminal, leaving locked models indistinguishable
+/// from available ones. Combining marks are zero-width text, not control
+/// codes, so they survive sanitisation and round-trip through copy-paste.
+fn strikethrough(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.chars().count() * 2);
+    for ch in s.chars() {
+        out.push(ch);
+        out.push('\u{0336}');
+    }
+    out
 }
 
 impl SetupReport {
@@ -116,13 +121,6 @@ impl SetupReport {
     /// Shared by the CLI subcommand and the `/codingplan` slash command
     /// so the visual contract stays consistent.
     pub fn render(&self) -> String {
-        self.render_with_terminal_caps(detect_jediterm())
-    }
-
-    /// Test-friendly variant of `render()` that takes terminal capability
-    /// flags as parameters so unit tests don't have to mutate process
-    /// env to exercise the JediTerm fallback path.
-    pub(crate) fn render_with_terminal_caps(&self, is_jediterm: bool) -> String {
         use crate::i18n::{t, Msg};
 
         let mut out = String::new();
@@ -192,28 +190,21 @@ impl SetupReport {
                     info.display_names.iter().map(|s| s.as_str()).collect();
                 // Locked models render FIRST so the upgrade prompt is the
                 // first thing the eye lands on under "Added N providers:".
-                // ANSI SGR 9 for strikethrough (\x1b[9m...\x1b[29m); terminals
-                // that don't honour it (e.g., JediTerm, legacy conhost) still
-                // get the explicit "(require plan upgrade)" suffix so the
-                // meaning never relies on the SGR alone.
+                // The name itself is wrapped in U+0336 combining
+                // strikethrough — plain text, no SGR — so every renderer
+                // path (alt-screen / retained / plain) and every terminal
+                // (iTerm2 / Terminal.app / Windows Terminal / JediTerm /
+                // legacy conhost) shows the same visual cue, and the
+                // explicit "(require plan upgrade)" suffix still carries
+                // the meaning if a font lacks combining-mark support.
                 let locked: Vec<&ModelEntry> = info
                     .all_models
                     .iter()
                     .filter(|m| !m.plan_available && !registered.contains(m.display_model_name.as_str()))
                     .collect();
                 for m in &locked {
-                    if is_jediterm {
-                        // JediTerm fallback: ✗ + "(Locked: ...)" text
-                        // marker, no SGR 9 (which JediTerm renders
-                        // inconsistently or not at all).
-                        out.push_str(&t(Msg::CpLockedJediterm {
-                            name: &m.display_model_name,
-                        }));
-                    } else {
-                        out.push_str(&t(Msg::CpLockedAnsi {
-                            name: &m.display_model_name,
-                        }));
-                    }
+                    let struck = strikethrough(&m.display_model_name);
+                    out.push_str(&t(Msg::CpLocked { name: &struck }));
                 }
                 let default_suffix_cow = t(Msg::CpDefaultSuffix);
                 for (pname, model) in info.provider_names.iter().zip(info.display_names.iter()) {
@@ -1579,7 +1570,10 @@ mod tests {
     /// explicit "(require plan upgrade)" tag, appended to the same
     /// `Added N provider(s)` bullet list as the available models so
     /// users see the full slate at a glance. Pins the v2 spec's "若
-    /// 不可用的模型也展示出来（用横线划掉）" requirement.
+    /// 不可用的模型也展示出来（用横线划掉）" requirement, now backed
+    /// by U+0336 combining strikethrough rather than SGR 9 (the old
+    /// SGR path was being eaten by the TUI's CSI sanitizer before it
+    /// reached the terminal).
     #[test]
     fn render_shows_locked_models_with_strikethrough() {
         let avail = super::super::types::ModelEntry {
@@ -1615,12 +1609,23 @@ mod tests {
         assert!(out.contains("(CodingPlan Lite)"), "claim row must show tier:\n{out}");
         // Available model: standard provider line.
         assert!(out.contains("AtomGit") && out.contains("lite/foo"));
-        // Locked model: strikethrough SGR + explicit suffix. Both
-        // must be present so terminals that ignore SGR 9 still see
-        // "(require plan upgrade)".
+        // Locked model: every char of the name is followed by U+0336
+        // combining strikethrough. We rebuild the expected sequence
+        // here rather than spelling it out so the test stays readable.
+        let struck_name: String = "max/super-secret"
+            .chars()
+            .flat_map(|c| [c, '\u{0336}'])
+            .collect();
         assert!(
-            out.contains("\x1b[9mmax/super-secret\x1b[29m"),
-            "locked model must have SGR 9 strikethrough wrap:\n{out}"
+            out.contains(&struck_name),
+            "locked model must have U+0336 strikethrough per char:\n{out}"
+        );
+        // SGR 9 must NOT appear — the renderer's CSI sanitizer would
+        // delete it on the way to the terminal, and the previous SGR
+        // approach was the bug we're fixing.
+        assert!(
+            !out.contains("\x1b[9m"),
+            "locked-model line must not emit SGR 9:\n{out}"
         );
         assert!(out.contains("(require plan upgrade)"));
         // Locked model appears INSIDE the providers bullet list — its
@@ -1633,7 +1638,7 @@ mod tests {
             "no separate locked-model section expected:\n{out}"
         );
         let added_idx = out.find("Added 1 provider").expect("Added header");
-        let locked_idx = out.find("max/super-secret").expect("locked model line");
+        let locked_idx = out.find(&struck_name).expect("locked model line");
         let avail_idx = out.find("lite/foo").expect("available model line");
         assert!(
             locked_idx > added_idx,
@@ -1645,51 +1650,4 @@ mod tests {
         );
     }
 
-    /// JediTerm fallback: when `TERMINAL_EMULATOR=JetBrains-JediTerm`
-    /// is detected, the locked-model row drops SGR 9 strikethrough and
-    /// switches to `✗ <name>  (Locked: require plan upgrade)`. Pins the
-    /// fallback so terminals that don't honour SGR 9 still convey the
-    /// "this needs an upgrade" semantic.
-    #[test]
-    fn render_jediterm_fallback_uses_ascii_marker_no_strikethrough() {
-        let avail = super::super::types::ModelEntry {
-            id: 1,
-            is_atomcode_exclusive: 0,
-            display_model_name: "lite/foo".into(),
-            plan_available: true,
-        };
-        let locked = super::super::types::ModelEntry {
-            id: 2,
-            is_atomcode_exclusive: 0,
-            display_model_name: "max/super-secret".into(),
-            plan_available: false,
-        };
-        let report = SetupReport {
-            login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Ok(ClaimInfo {
-                message: "claimed".into(),
-                duplicate: false,
-                plan_type: PlanType::Lite,
-            }),
-            models: StepResult::Ok(ModelsInfo {
-                display_names: vec!["lite/foo".into()],
-                provider_names: vec!["AtomGit".into()],
-                default_provider: "AtomGit".into(),
-                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
-                all_models: vec![avail, locked],
-            }),
-            status: StepResult::Skipped("test skip".into()),
-        };
-        let out = report.render_with_terminal_caps(true);
-        // No SGR 9 escapes anywhere in the output.
-        assert!(
-            !out.contains("\x1b[9m"),
-            "JediTerm fallback must not emit SGR 9:\n{out}"
-        );
-        // Explicit ASCII marker + "(Locked: ...)" suffix.
-        assert!(
-            out.contains("✗ max/super-secret  (Locked: require plan upgrade)"),
-            "expected ASCII fallback line:\n{out}"
-        );
-    }
 }
