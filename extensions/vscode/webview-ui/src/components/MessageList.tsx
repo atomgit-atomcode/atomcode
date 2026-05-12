@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useCallback } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
@@ -7,9 +7,23 @@ import { SearchBar } from './SearchBar';
 export function MessageList() {
   const { state } = useChatContext();
   const bottomRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isUserScrolledUp = useRef(false);
 
+  // Detect whether the user has scrolled away from the bottom
+  const handleScroll = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    // Consider "at bottom" if within 80px of the bottom edge
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    isUserScrolledUp.current = !atBottom;
+  }, []);
+
+  // Only auto-scroll if the user hasn't scrolled up
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (!isUserScrolledUp.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
   }, [state.messages, state.queuedMessages, state.isGenerating]);
 
   const query = state.searchQuery.toLowerCase();
@@ -19,7 +33,11 @@ export function MessageList() {
   return (
     <>
       <SearchBar />
-      <div className={`messages-container${hasSearch ? ' dimmed' : ''}`}>
+      <div
+        ref={containerRef}
+        className={`messages-container${hasSearch ? ' dimmed' : ''}`}
+        onScroll={handleScroll}
+      >
         {state.messages.map((msg) => {
           const matches = hasSearch && msg.text.toLowerCase().includes(query);
           const highlightClass = `${matches ? ' highlighted' : ''}${msg.id === lastMessageId ? ' is-last' : ''}`;
