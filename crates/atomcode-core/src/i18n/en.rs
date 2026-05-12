@@ -20,43 +20,52 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan setup:\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
-            format!("  ✔ Logged in as {} ({}, {})\n", who, username, email).into(),
+            format!("  ✓ Logged in as {} ({}, {})\n", who, username, email).into(),
         Msg::CpStepSkipped { reason } =>
-            format!("  ✔ {}\n", reason).into(),
+            format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✘ Login failed — {}\n", error).into(),
+            format!("  ✗ Login failed — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
-            format!("  ✔ CodingPlan claimed — {} (CodingPlan {})\n", message, plan_type).into(),
+            format!("  ✓ CodingPlan claimed — {} (CodingPlan {})\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "success".into(),
         Msg::CpAlreadyClaimed { reason } =>
-            format!("  ✔ CodingPlan already claimed — {}\n", reason).into(),
+            format!("  ✓ CodingPlan already claimed — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✘ CodingPlan claim failed — {}\n", error).into(),
+            format!("  ✗ CodingPlan claim failed — {}\n", error).into(),
         Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✔ CodingPlan {} claimed\n", tier).into(),
+            format!("  ✓ CodingPlan {} claimed\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✔ CodingPlan {} already claimed\n", tier).into(),
+            format!("  ✓ CodingPlan {} already claimed\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  ✘ CodingPlan {} claim failed — {}\n", tier, reason).into(),
+            format!("  ✗ CodingPlan {} claim failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>
-            format!("  ✔ Added {} provider{}:\n", count, plural_s).into(),
+            format!("  ✓ Added {} provider{}:\n", count, plural_s).into(),
         Msg::CpLocked { name } =>
-            format!("      ✘ {}  (require plan upgrade)\n", name).into(),
+            // SGR 31 = standard red foreground, SGR 39 = reset to
+            // default fg. Standard (not bright) so the terminal's
+            // theme palette decides the exact shade — Solarized,
+            // Dracula, light-mode, etc. all map this onto their
+            // own "red" rather than a hard-coded RGB the user can't
+            // tune. The `✗ … (requires Pro plan or higher)` text inside is
+            // a redundant signal so retained-mode terminals (which
+            // strip SGR via the strict sanitizer path) still get
+            // the meaning, just without the colour.
+            format!("      \x1b[31m✗ {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  (default)".into(),
         Msg::CpVisionAuto { kind } =>
-            format!("  ✔ Vision preprocessor → {}  (auto-detected)\n", kind).into(),
+            format!("  ✓ Vision preprocessor → {}  (auto-detected)\n", kind).into(),
         Msg::CpVisionUserSupplied { kind } =>
-            format!("  ✔ Vision preprocessor → {}  (user setting kept)\n", kind).into(),
+            format!("  ✓ Vision preprocessor → {}  (user setting kept)\n", kind).into(),
         Msg::CpVisionCleared =>
             "  ⚠ Vision preprocessor cleared — no VL/OCR model in current list\n".into(),
         Msg::CpModelsSkipped { reason } =>
-            format!("  ✔ Models step skipped — {}\n", reason).into(),
+            format!("  ✓ Models step skipped — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✘ Models step failed — {}\n", error).into(),
+            format!("  ✗ Models step failed — {}\n", error).into(),
         Msg::CpStatusHeader =>
-            "  ✔ CodingPlan status:\n".into(),
+            "  ✓ CodingPlan status:\n".into(),
         Msg::CpPlanPending { plan } =>
             format!("      Plan: {}  ·  pending activation\n", plan).into(),
         Msg::CpPlanActive { plan, expires_at, remaining_days, total_days } =>
@@ -235,7 +244,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueTitleConfirmed { title } =>
             format!("✓ title: {title}").into(),
         Msg::IssueCreated { number, title, url } =>
-            format!("  [issue] ✔ created #{number}: {title}\n  {url}\n").into(),
+            format!("  [issue] ✓ created #{number}: {title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
             format!("  [issue] ✗ create failed: {error}\n").into(),
         Msg::IssueRequiredField { field } =>
