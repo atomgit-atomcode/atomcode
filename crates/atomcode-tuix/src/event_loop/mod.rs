@@ -1240,6 +1240,48 @@ mod buffer_tests {
         assert!(!out.contains("[Pasted"));
     }
 
+    /// Regression: `clear_pastes` then `expand_pastes` is the broken
+    /// ordering that shipped before — the agent received the bare
+    /// `[Pasted #N +M lines]` placeholder instead of the pasted body
+    /// and (correctly) responded "I don't see any pasted content".
+    /// Callers MUST expand FIRST, clear SECOND. This test pins that
+    /// contract: if someone reintroduces an early clear, the
+    /// substitution silently turns into a no-op and the
+    /// `contains("important data")` assertion below catches it.
+    #[test]
+    fn clear_before_expand_loses_paste_body() {
+        let mut b = Buffer::new();
+        let body = "important data\n".repeat(200);
+        b.insert_paste(body.clone());
+        let line = b.text.clone();
+        // Mis-ordered: clear first.
+        b.clear_pastes();
+        let expanded = b.expand_pastes(&line);
+        assert!(
+            expanded.contains("[Pasted #1"),
+            "early-clear must leave the placeholder unsubstituted: {}",
+            expanded
+        );
+        assert!(
+            !expanded.contains("important data"),
+            "early-clear must NOT magically still have the body: {}",
+            expanded
+        );
+
+        // Sanity check the correct order: expand first, then clear.
+        let mut b = Buffer::new();
+        b.insert_paste(body.clone());
+        let line = b.text.clone();
+        let expanded = b.expand_pastes(&line);
+        b.clear_pastes();
+        assert!(
+            expanded.contains("important data"),
+            "expand-before-clear must surface the body: {}",
+            &expanded[..expanded.len().min(120)]
+        );
+        assert!(b.pastes.is_empty(), "clear after expand must still empty the registry");
+    }
+
     #[test]
     fn submit_with_trailing_backslash_inserts_newline() {
         // WSL + Windows Terminal swallows Shift/Ctrl/Alt+Enter, so we
@@ -3952,7 +3994,14 @@ fn handle_idle_key(
             renderer.render(UiLine::ClearTransient);
             app.buf.text.clear();
             app.buf.cursor = 0;
-            app.buf.clear_pastes();
+            // NB: `app.buf.clear_pastes()` is deferred until AFTER the
+            // submit path calls `expand_pastes(&line)` — wiping the
+            // paste Vec here used to leave `expand_pastes` with
+            // nothing to substitute, so the agent received the raw
+            // `[Pasted #N +M lines]` placeholder instead of the
+            // pasted body and answered "I don't see any pasted
+            // content". Mirrors the queue branch below which already
+            // clears AFTER expansion.
             app.menu.selected = 0;
             // Only treat `/name …` as a slash command when `name` is
             // actually registered. Unrecognised `/foo …` (e.g. the user
@@ -3987,6 +4036,11 @@ fn handle_idle_key(
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
+                // Slash commands don't consume pastes (they take a
+                // single short arg, not a pasted body), but the submit
+                // semantically consumes the buffer — drop them so the
+                // next message starts with a clean paste registry.
+                app.buf.clear_pastes();
             } else {
                 // Hydrate recalled attachments BEFORE echoing the user
                 // line, so `[Image #N]` markers in the visible body
@@ -4004,6 +4058,12 @@ fn handle_idle_key(
                 }
                 renderer.render(UiLine::User(line.clone()));
                 let expanded = app.buf.expand_pastes(&line);
+                // Pastes have now been substituted into `expanded`;
+                // safe to drop the registry. Doing it any earlier
+                // (e.g. up at the buf.text.clear() prep) was the
+                // exact bug that made the agent see only the
+                // `[Pasted #N]` placeholder.
+                app.buf.clear_pastes();
                 // Cache the full expanded form before dispatch. If the
                 // user hits Ctrl+C / Esc mid-stream, `handle_streaming_key`
                 // takes this Option and restores it to `app.buf.text`
