@@ -12,7 +12,7 @@ pub(crate) const KEEP_MESSAGES: usize = 20;
 
 use crate::tool::{ToolCall, ToolCallBuffer, ToolResult};
 use message::{Message, MessageContent, Role};
-use turn::TurnTracker;
+use turn::{TurnStatus, TurnTracker};
 
 /// Context budget statistics for logging/debugging.
 #[derive(Debug, Clone, Default)]
@@ -116,12 +116,86 @@ impl Conversation {
         self.turn_tracker.on_user_message(idx);
     }
 
-    /// Cancel the current active turn: remove all its messages from history.
-    /// Used when user cancels before the agent completes — ensures partial
-    /// conversations don't pollute the saved history.
+    /// Cancel the current active turn: save all conversation content up to
+    /// the moment of cancel. The user cancelled because they want to
+    /// redirect the model, not because they want to lose context — the
+    /// LLM needs to see what it already did so it can adjust.
+    ///
+    /// If the model issued tool calls that never got results, we append
+    /// `(cancelled)` ToolResult entries for them so the API doesn't
+    /// reject the message sequence with "messages illegal".
     pub fn cancel_current_turn(&mut self) {
+        // Defensive: if no active turn, nothing to cancel.
+        let start_idx = match self.turn_tracker.active_turn() {
+            Some(turn) => turn.start_idx,
+            None => return,
+        };
+
+        // Finalize any in-flight stream buffer as an assistant message.
+        self.finalize_stream();
+        // Clear any partial tool-call buffer.
+        self.tool_call_buffer = None;
+
+        // Find tool calls that lack results and append (cancelled)
+        // results for them — keeps the API happy.
+        self.backfill_cancelled_tool_results();
+
+        // Update turn tracker
+        let msg_count = self.messages.len() - start_idx;
+        if let Some(current) = self.turn_tracker.turns.last_mut() {
+            current.msg_count = msg_count;
+            current.status = TurnStatus::Completed;
+        }
+    }
+
+    /// For any `AssistantWithToolCalls` in the current turn whose tool
+    /// calls lack a matching `ToolResult`, append a `(cancelled)` result.
+    /// This prevents "messages illegal" API errors from unpaired calls.
+    fn backfill_cancelled_tool_results(&mut self) {
+        // Collect call_ids that already have results (both inline and ref variants).
+        let mut seen_result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for msg in &self.messages {
+            if let Some(call_id) = msg.tool_result_call_id() {
+                seen_result_ids.insert(call_id.to_string());
+            }
+        }
+
+        let mut missing: Vec<(String, String)> = Vec::new();
+        for msg in &self.messages {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                for tc in tool_calls {
+                    if !seen_result_ids.contains(&tc.id) {
+                        missing.push((tc.id.clone(), tc.name.clone()));
+                    }
+                }
+            }
+        }
+
+        for (call_id, _name) in missing {
+            let idx = self.messages.len();
+            self.messages.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id,
+                    output: "(cancelled)".into(),
+                    success: false,
+                }),
+            });
+            self.turn_tracker.on_message_added(idx);
+        }
+    }
+
+    /// Cancel the current active turn AND remove the user message.
+    /// Used on Error exits where leaving an orphan user message (no
+    /// assistant reply) would cause weak models to return 0 tokens on
+    /// the next turn — two consecutive User messages with no intervening
+    /// Assistant confuses OpenAI-compatible APIs.
+    pub fn cancel_current_turn_including_user(&mut self) {
         if let Some(turn) = self.turn_tracker.active_turn() {
             let start_idx = turn.start_idx;
+            // Clear in-flight buffers before truncating messages.
+            self.stream_buffer = None;
+            self.tool_call_buffer = None;
             // Remove all messages from this turn (user message + any assistant/tool messages)
             self.messages.truncate(start_idx);
             // Remove the turn from tracker
@@ -1219,5 +1293,747 @@ mod tests {
             conv.stream_buffer.is_none(),
             "stream buffer must be drained even on drop"
         );
+    }
+
+    // ── cancel_current_turn: preserves completed content (issue #260) ──
+
+    #[test]
+    fn cancel_preserves_completed_assistant_text() {
+        // Cancel after model has responded with text (no tool calls)
+        let mut conv = Conversation::new();
+        conv.add_user_message("创建 index.html");
+        conv.push_delta("好的，我来帮你创建");
+        conv.finalize_stream();
+
+        assert_eq!(conv.messages.len(), 2);
+        conv.cancel_current_turn();
+
+        // User message + assistant text are both preserved
+        assert_eq!(conv.messages.len(), 2);
+        assert!(matches!(conv.messages[0].role, Role::User));
+        assert!(matches!(conv.messages[1].role, Role::Assistant));
+        assert_eq!(conv.messages[0].text().unwrap(), "创建 index.html");
+        assert_eq!(conv.messages[1].text().unwrap(), "好的，我来帮你创建");
+
+        // Turn is completed
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        assert_eq!(conv.turn_tracker.turns[0].status, TurnStatus::Completed);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
+    }
+
+    #[test]
+    fn cancel_backfills_missing_tool_results() {
+        // Cancel while model has issued tool calls but no results yet
+        let mut conv = Conversation::new();
+        conv.add_user_message("创建 index.html");
+        conv.add_assistant_tool_calls(
+            Some("creating file"),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                arguments: "{}".into(),
+            }],
+            None,
+        );
+
+        // user + assistant_with_tool_calls = 2, no result yet
+        assert_eq!(conv.messages.len(), 2);
+
+        conv.cancel_current_turn();
+
+        // All messages preserved + (cancelled) result appended
+        assert_eq!(conv.messages.len(), 3);
+        assert!(matches!(conv.messages[0].role, Role::User));
+        assert!(matches!(conv.messages[1].role, Role::Assistant));
+        assert!(matches!(conv.messages[2].role, Role::Tool));
+        if let MessageContent::ToolResult(r) = &conv.messages[2].content {
+            assert!(!r.success);
+            assert_eq!(r.output, "(cancelled)");
+            assert_eq!(r.call_id, "call_1");
+        } else {
+            panic!("expected ToolResult");
+        }
+    }
+
+    #[test]
+    fn cancel_preserves_completed_tool_pairs_and_backfills_incomplete() {
+        // Model did read_file (complete), then started edit_file (no result)
+        let mut conv = Conversation::new();
+        conv.add_user_message("读取 main.rs 然后修改它");
+
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"file_path":"main.rs"}"#.into(),
+            }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "call_1".into(),
+            output: "fn main() {}".into(),
+            success: true,
+        });
+
+        conv.add_assistant_tool_calls(
+            Some("editing file"),
+            vec![ToolCall {
+                id: "call_2".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"file_path":"main.rs"}"#.into(),
+            }],
+            None,
+        );
+
+        // user + atc1 + result1 + atc2 = 4
+        assert_eq!(conv.messages.len(), 4);
+
+        conv.cancel_current_turn();
+
+        // All 4 preserved + 1 backfilled result for call_2 = 5
+        assert_eq!(conv.messages.len(), 5);
+        assert!(matches!(conv.messages[0].role, Role::User));
+        assert!(matches!(conv.messages[1].role, Role::Assistant)); // atc1
+        assert!(matches!(conv.messages[2].role, Role::Tool)); // result1
+        assert!(matches!(conv.messages[3].role, Role::Assistant)); // atc2
+        assert!(matches!(conv.messages[4].role, Role::Tool)); // backfilled result2
+        if let MessageContent::ToolResult(r) = &conv.messages[4].content {
+            assert_eq!(r.call_id, "call_2");
+            assert!(!r.success);
+        }
+    }
+
+    #[test]
+    fn cancel_preserves_previous_turns() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("你好");
+        conv.push_delta("你好！有什么可以帮你？");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+
+        conv.add_user_message("创建 index.html");
+        conv.push_delta("好的，我来创建...");
+        conv.finalize_stream();
+
+        assert_eq!(conv.messages.len(), 4);
+        conv.cancel_current_turn();
+
+        assert_eq!(conv.messages.len(), 4);
+        assert_eq!(conv.turn_tracker.turns.len(), 2);
+        assert_eq!(conv.turn_tracker.turns[0].status, TurnStatus::Completed);
+        assert_eq!(conv.turn_tracker.turns[1].status, TurnStatus::Completed);
+    }
+
+    #[test]
+    fn cancel_then_follow_up_sees_completed_work() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("创建 index.html");
+        conv.add_assistant_tool_calls(
+            Some("creating file"),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"file_path":"index.html","content":"hello"}"#.into(),
+            }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "call_1".into(),
+            output: "File written successfully".into(),
+            success: true,
+        });
+
+        conv.cancel_current_turn();
+        conv.add_user_message("不要删那行，改成 XXX");
+
+        let msgs = conv.to_provider_messages("You are helpful.");
+        let all_text: String = msgs.iter().map(|m| m.text().unwrap_or("")).collect();
+        assert!(
+            all_text.contains("write_file") || all_text.contains("index.html"),
+            "LLM must see what it already did"
+        );
+        assert!(all_text.contains("不要删那行"), "LLM must see the corrective prompt");
+    }
+
+    #[test]
+    fn cancel_finalizes_stream_buffer() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("你好");
+        conv.push_delta("你好！我是");
+
+        assert!(conv.stream_buffer.is_some());
+        conv.cancel_current_turn();
+
+        assert!(conv.stream_buffer.is_none());
+        assert_eq!(conv.messages.len(), 2);
+        assert!(matches!(conv.messages[1].role, Role::Assistant));
+    }
+
+    #[test]
+    fn cancel_including_user_removes_everything() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+        conv.push_delta("partial response");
+        conv.finalize_stream();
+
+        conv.cancel_current_turn_including_user();
+
+        assert!(conv.messages.is_empty());
+        assert!(conv.turn_tracker.turns.is_empty());
+    }
+
+    #[test]
+    fn cancel_including_user_preserves_previous_turns() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("你好");
+        conv.push_delta("你好！");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+
+        conv.add_user_message("创建文件");
+        conv.push_delta("好的...");
+        conv.finalize_stream();
+
+        conv.cancel_current_turn_including_user();
+
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+    }
+
+    #[test]
+    fn cancel_on_empty_conversation_is_noop() {
+        let mut conv = Conversation::new();
+        conv.cancel_current_turn();
+        assert!(conv.messages.is_empty());
+    }
+
+    #[test]
+    fn cancel_backfills_multi_tool_calls_partial_results() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("读取 a.rs 和 b.rs");
+
+        conv.add_assistant_tool_calls(
+            None,
+            vec![
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"a.rs"}"#.into(),
+                },
+                ToolCall {
+                    id: "call_2".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"b.rs"}"#.into(),
+                },
+            ],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "call_1".into(),
+            output: "a content".into(),
+            success: true,
+        });
+        // call_2 has no result yet
+
+        conv.cancel_current_turn();
+
+        // All preserved + 1 backfilled result for call_2
+        assert_eq!(conv.messages.len(), 4); // user + atc + result1 + result2(cancelled)
+        if let MessageContent::ToolResult(r) = &conv.messages[3].content {
+            assert_eq!(r.call_id, "call_2");
+            assert!(!r.success);
+            assert_eq!(r.output, "(cancelled)");
+        }
+    }
+
+    /// When a tool result is stored as ToolResultRef (disk-cached large
+    /// output), backfill must recognise it as "has result" and NOT append
+    /// a duplicate (cancelled) entry.
+    #[test]
+    fn cancel_backfill_recognises_tool_result_ref() {
+        use crate::tool::result_store::ToolResultRef;
+
+        let mut conv = Conversation::new();
+        conv.add_user_message("读取 big_file.rs");
+
+        conv.add_assistant_tool_calls(
+            Some("reading"),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"file_path":"big_file.rs"}"#.into(),
+            }],
+            None,
+        );
+
+        // Result stored as ToolResultRef (large output on disk)
+        let idx = conv.messages.len();
+        conv.messages.push(Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResultRef(ToolResultRef {
+                call_id: "call_1".into(),
+                hash: "abc123".into(),
+                summary: "500 lines of Rust code".into(),
+                byte_size: 20_000,
+                success: true,
+            }),
+        });
+        conv.turn_tracker.on_message_added(idx);
+
+        // Another tool call with NO result yet
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall {
+                id: "call_2".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"file_path":"big_file.rs"}"#.into(),
+            }],
+            None,
+        );
+
+        conv.cancel_current_turn();
+
+        // call_1 (ToolResultRef) must NOT get a duplicate backfilled result.
+        // Only call_2 (no result) should get a backfilled (cancelled).
+        assert_eq!(conv.messages.len(), 5); // user + atc1 + ref_result1 + atc2 + backfilled_result2
+
+        // Verify the backfilled result is for call_2 only
+        if let MessageContent::ToolResult(r) = &conv.messages[4].content {
+            assert_eq!(r.call_id, "call_2");
+            assert!(!r.success);
+            assert_eq!(r.output, "(cancelled)");
+        } else {
+            panic!("expected ToolResult for call_2");
+        }
+    }
+
+    /// Double-cancel is a no-op: calling cancel_current_turn twice should
+    /// not panic or corrupt state.
+    #[test]
+    fn cancel_double_cancel_is_noop() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+        conv.push_delta("world");
+        conv.finalize_stream();
+
+        conv.cancel_current_turn();
+        assert_eq!(conv.messages.len(), 2);
+
+        // Second cancel — turn already Completed, should be a no-op
+        conv.cancel_current_turn();
+        assert_eq!(conv.messages.len(), 2);
+    }
+
+    // ── Review round 2: additional test coverage ──
+
+    /// After cancel_current_turn_including_user, calling cancel_current_turn
+    /// on the now-absent active turn is a safe no-op (turn was popped).
+    #[test]
+    fn cancel_after_including_user_is_noop() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+        conv.push_delta("partial");
+        conv.finalize_stream();
+
+        conv.cancel_current_turn_including_user();
+        assert!(conv.messages.is_empty());
+
+        // No active turn — cancel should be harmless
+        conv.cancel_current_turn();
+        assert!(conv.messages.is_empty());
+        assert!(conv.turn_tracker.turns.is_empty());
+    }
+
+    /// cancel_current_turn_including_user clears stream_buffer so it
+    /// doesn't leak into the next turn.
+    #[test]
+    fn cancel_including_user_clears_stream_buffer() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+        conv.push_delta("partial response still streaming");
+
+        assert!(conv.stream_buffer.is_some());
+
+        conv.cancel_current_turn_including_user();
+
+        assert!(conv.stream_buffer.is_none(), "stream_buffer must be cleared");
+        assert!(conv.messages.is_empty());
+    }
+
+    /// cancel_current_turn_including_user clears tool_call_buffer so it
+    /// doesn't leak into the next turn.
+    #[test]
+    fn cancel_including_user_clears_tool_call_buffer() {
+        use crate::tool::ToolCallBuffer;
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+
+        // Simulate a partial tool call buffer
+        conv.tool_call_buffer = Some(ToolCallBuffer {
+            id: "call_partial".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+            hint_sent: false,
+        });
+
+        assert!(conv.tool_call_buffer.is_some());
+
+        conv.cancel_current_turn_including_user();
+
+        assert!(conv.tool_call_buffer.is_none(), "tool_call_buffer must be cleared");
+    }
+
+    /// cancel_current_turn_including_user on a completed turn (no active turn)
+    /// is a no-op — messages and turns are untouched.
+    #[test]
+    fn cancel_including_user_on_completed_turn_is_noop() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+        conv.push_delta("world");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+
+        // Turn is Completed, not Active — cancel_including_user does nothing
+        conv.cancel_current_turn_including_user();
+
+        assert_eq!(conv.messages.len(), 2, "completed turn must not be removed");
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+    }
+
+    /// After cancel_including_user, the conversation is clean enough to
+    /// start a new turn and produce valid provider messages.
+    #[test]
+    fn cancel_including_user_then_new_turn_produces_valid_messages() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("bad prompt");
+        conv.push_delta("bad response");
+        conv.finalize_stream();
+
+        conv.cancel_current_turn_including_user();
+
+        // Start a fresh turn
+        conv.add_user_message("good prompt");
+        conv.push_delta("good response");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+
+        let msgs = conv.to_provider_messages("system");
+        // System + User + Assistant = 3
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(msgs[0].role, Role::System));
+        assert!(matches!(msgs[1].role, Role::User));
+        assert!(matches!(msgs[2].role, Role::Assistant));
+    }
+
+    /// backfill: all results are ToolResultRef (no inline ToolResult at all).
+    /// None of them should be mistakenly backfilled as (cancelled).
+    #[test]
+    fn cancel_backfill_all_tool_result_refs() {
+        use crate::tool::result_store::ToolResultRef;
+
+        let mut conv = Conversation::new();
+        conv.add_user_message("读取大文件");
+
+        conv.add_assistant_tool_calls(
+            None,
+            vec![
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"a.rs"}"#.into(),
+                },
+                ToolCall {
+                    id: "call_2".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"b.rs"}"#.into(),
+                },
+            ],
+            None,
+        );
+
+        // Both results as ToolResultRef
+        for (call_id, summary) in [("call_1", "a.rs content"), ("call_2", "b.rs content")] {
+            let idx = conv.messages.len();
+            conv.messages.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResultRef(ToolResultRef {
+                    call_id: call_id.into(),
+                    hash: format!("hash_{}", call_id),
+                    summary: summary.into(),
+                    byte_size: 10_000,
+                    success: true,
+                }),
+            });
+            conv.turn_tracker.on_message_added(idx);
+        }
+
+        conv.cancel_current_turn();
+
+        // No backfill needed: both calls have results (as refs).
+        // user + atc + ref1 + ref2 = 4
+        assert_eq!(conv.messages.len(), 4);
+    }
+
+    /// backfill: mix of ToolResult and ToolResultRef in the same turn.
+    /// Only the truly unpaired call gets backfilled.
+    #[test]
+    fn cancel_backfill_mixed_result_types() {
+        use crate::tool::result_store::ToolResultRef;
+
+        let mut conv = Conversation::new();
+        conv.add_user_message("读取文件并编辑");
+
+        conv.add_assistant_tool_calls(
+            None,
+            vec![
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"x.rs"}"#.into(),
+                },
+                ToolCall {
+                    id: "call_2".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"make"}"#.into(),
+                },
+                ToolCall {
+                    id: "call_3".into(),
+                    name: "edit_file".into(),
+                    arguments: r#"{"file_path":"x.rs"}"#.into(),
+                },
+            ],
+            None,
+        );
+
+        // call_1: inline ToolResult
+        conv.add_tool_result(ToolResult {
+            call_id: "call_1".into(),
+            output: "file content".into(),
+            success: true,
+        });
+
+        // call_2: ToolResultRef
+        let idx = conv.messages.len();
+        conv.messages.push(Message {
+            role: Role::Tool,
+            content: MessageContent::ToolResultRef(ToolResultRef {
+                call_id: "call_2".into(),
+                hash: "hash_call_2".into(),
+                summary: "make output".into(),
+                byte_size: 50_000,
+                success: true,
+            }),
+        });
+        conv.turn_tracker.on_message_added(idx);
+
+        // call_3: no result yet
+
+        conv.cancel_current_turn();
+
+        // user + atc + result1 + ref2 + backfilled_result3 = 5
+        assert_eq!(conv.messages.len(), 5);
+
+        // Only call_3 should be backfilled
+        if let MessageContent::ToolResult(r) = &conv.messages[4].content {
+            assert_eq!(r.call_id, "call_3");
+            assert!(!r.success);
+            assert_eq!(r.output, "(cancelled)");
+        } else {
+            panic!("expected ToolResult for call_3");
+        }
+    }
+
+    /// End-to-end: after cancel with backfilled results, the message
+    /// sequence sent to the provider is API-legal (no orphan tool results,
+    /// every ATC has matching results, sequence starts with System).
+    #[test]
+    fn cancel_then_provider_messages_are_api_legal() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("读取 main.rs 然后修改它");
+
+        conv.add_assistant_tool_calls(
+            Some("reading file"),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"file_path":"main.rs"}"#.into(),
+            }],
+            None,
+        );
+        conv.add_tool_result(ToolResult {
+            call_id: "call_1".into(),
+            output: "fn main() {}".into(),
+            success: true,
+        });
+
+        conv.add_assistant_tool_calls(
+            Some("editing file"),
+            vec![ToolCall {
+                id: "call_2".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"file_path":"main.rs"}"#.into(),
+            }],
+            None,
+        );
+
+        // Cancel before call_2 got a result
+        conv.cancel_current_turn();
+
+        // Verify API legality: System, User, ATC, ToolResult, ATC, ToolResult(cancelled)
+        let msgs = conv.to_provider_messages("You are helpful.");
+        assert!(matches!(msgs[0].role, Role::System));
+        assert!(matches!(msgs[1].role, Role::User));
+        // msgs[2] should be AssistantWithToolCalls (read_file)
+        assert!(matches!(msgs[2].role, Role::Assistant));
+        // msgs[3] should be ToolResult (call_1)
+        assert!(matches!(msgs[3].role, Role::Tool));
+        // msgs[4] should be AssistantWithToolCalls (edit_file)
+        assert!(matches!(msgs[4].role, Role::Assistant));
+        // msgs[5] should be ToolResult (call_2 cancelled)
+        assert!(matches!(msgs[5].role, Role::Tool));
+
+        // Verify every ATC's tool calls have matching results
+        let mut expected_call_ids: Vec<String> = Vec::new();
+        for msg in &msgs {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                for tc in tool_calls {
+                    expected_call_ids.push(tc.id.clone());
+                }
+            }
+        }
+        let mut got_call_ids: Vec<String> = Vec::new();
+        for msg in &msgs {
+            if let Some(id) = msg.tool_result_call_id() {
+                got_call_ids.push(id.to_string());
+            }
+        }
+        assert_eq!(
+            expected_call_ids, got_call_ids,
+            "every tool call must have a matching result"
+        );
+    }
+
+    /// End-to-end: after cancel, user sends a follow-up message, and the
+    /// full provider message sequence is API-legal across both turns.
+    #[test]
+    fn cancel_then_follow_up_full_sequence_api_legal() {
+        let mut conv = Conversation::new();
+
+        // Turn 1 (completed normally)
+        conv.add_user_message("你好");
+        conv.push_delta("你好！");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+
+        // Turn 2 (cancelled mid-tool)
+        conv.add_user_message("读取 main.rs");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            None,
+        );
+        conv.cancel_current_turn();
+
+        // Turn 3 (follow-up after cancel)
+        conv.add_user_message("不要修改那行");
+        conv.push_delta("好的，我只添加新代码");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+
+        let msgs = conv.to_provider_messages("system");
+
+        // Verify no consecutive User messages
+        for i in 1..msgs.len() {
+            if matches!(msgs[i].role, Role::User) {
+                assert!(
+                    !matches!(msgs[i - 1].role, Role::User),
+                    "consecutive User messages at index {}-{} are illegal",
+                    i - 1,
+                    i
+                );
+            }
+        }
+
+        // Verify every ATC has matching results
+        let mut expected: Vec<String> = Vec::new();
+        for msg in &msgs {
+            if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
+                for tc in tool_calls {
+                    expected.push(tc.id.clone());
+                }
+            }
+        }
+        let mut got: Vec<String> = Vec::new();
+        for msg in &msgs {
+            if let Some(id) = msg.tool_result_call_id() {
+                got.push(id.to_string());
+            }
+        }
+        assert_eq!(expected, got, "all tool calls must have matching results");
+    }
+
+    /// cancel_current_turn properly updates turn tracker: turn transitions
+    /// from Active to Completed with correct msg_count after backfill.
+    #[test]
+    fn cancel_updates_turn_tracker_correctly() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("hello");
+        conv.add_assistant_tool_calls(
+            None,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+            None,
+        );
+        // Before cancel: 2 messages, turn is Active
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        assert_eq!(conv.turn_tracker.turns[0].status, TurnStatus::Active);
+        assert_eq!(conv.turn_tracker.turns[0].msg_count, 2);
+
+        conv.cancel_current_turn();
+
+        // After cancel: 3 messages (user + atc + backfilled), turn is Completed
+        assert_eq!(conv.messages.len(), 3);
+        assert_eq!(conv.turn_tracker.turns[0].status, TurnStatus::Completed);
+        assert_eq!(
+            conv.turn_tracker.turns[0].msg_count, 3,
+            "msg_count must include the backfilled result"
+        );
+    }
+
+    /// cancel_current_turn_including_user properly removes the turn from
+    /// the tracker (not just marks it).
+    #[test]
+    fn cancel_including_user_removes_turn_not_just_marks() {
+        let mut conv = Conversation::new();
+
+        // Previous turn
+        conv.add_user_message("hello");
+        conv.push_delta("hi");
+        conv.finalize_stream();
+        conv.turn_tracker.complete_current();
+
+        // Active turn
+        conv.add_user_message("bad");
+        conv.push_delta("oops");
+        conv.finalize_stream();
+
+        assert_eq!(conv.turn_tracker.turns.len(), 2);
+
+        conv.cancel_current_turn_including_user();
+
+        // Only the previous turn survives
+        assert_eq!(conv.turn_tracker.turns.len(), 1);
+        assert_eq!(conv.turn_tracker.turns[0].status, TurnStatus::Completed);
     }
 }
