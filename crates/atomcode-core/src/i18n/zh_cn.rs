@@ -202,6 +202,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出会话失败：{error}").into(),
         Msg::SessionRenamed { old, new } =>
             format!("  已重命名：'{old}' -> '{new}'").into(),
+        Msg::SessionSaveFailed { error } =>
+            format!("保存会话失败：{error}。未持久化新名称。").into(),
         Msg::SessionNoneSelected =>
             "未选中会话".into(),
         Msg::SessionRenameEditing { buffer } =>

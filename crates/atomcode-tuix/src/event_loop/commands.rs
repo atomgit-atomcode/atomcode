@@ -85,7 +85,7 @@ pub fn perform_session_rename(
     let new_name = new_name.trim().to_string();
     let session = session_manager
         .load(session_id)
-        .map_err(|e| format!("Failed to load session: {}", e))?;
+        .map_err(|e| t(Msg::SessionLoadFailed { error: &e.to_string() }).into_owned())?;
     let old_name = session.name.clone();
     let renamed_session = atomcode_core::session::Session {
         name: new_name.clone(),
@@ -97,7 +97,7 @@ pub fn perform_session_rename(
     };
     session_manager
         .save(&renamed_session)
-        .map_err(|e| format!("Failed to save session: {}. The name was not persisted.", e))?;
+        .map_err(|e| t(Msg::SessionSaveFailed { error: &e.to_string() }).into_owned())?;
     Ok((old_name, new_name))
 }
 
@@ -387,25 +387,37 @@ pub(super) fn execute_slash_command(
             }
         },
         "rename" => {
-            if let Some(ref session_id) = ctx.current_session_id {
-                match perform_session_rename(&ctx.session_manager, session_id, arg) {
-                    Ok((old_name, new_name)) => {
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  Session renamed: '{}' -> '{}'",
-                            old_name, new_name
-                        )));
+            // Rename targets `ctx.current_session` (the in-flight conversation),
+            // not whichever id `/resume` last loaded — the user expects /rename
+            // to relabel the conversation they're currently typing into. The
+            // session is always initialised at startup, so we never need a
+            // "load a session first" fallback.
+            if let Some(err) = validate_session_name(arg) {
+                renderer.render(UiLine::Error(err));
+                renderer.flush();
+            } else {
+                let old_name = ctx.current_session.name.clone();
+                let new_name = arg.trim().to_string();
+                ctx.current_session.rename(new_name.clone());
+                match ctx.session_manager.save(&ctx.current_session) {
+                    Ok(()) => {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::SessionRenamed { old: &old_name, new: &new_name })
+                                .into_owned(),
+                        ));
                         renderer.flush();
                     }
-                    Err(err) => {
-                        renderer.render(UiLine::Error(err));
+                    Err(e) => {
+                        // Revert the in-memory rename so a follow-up retry
+                        // still reports the original name.
+                        ctx.current_session.name = old_name;
+                        renderer.render(UiLine::Error(
+                            t(Msg::SessionSaveFailed { error: &e.to_string() })
+                                .into_owned(),
+                        ));
                         renderer.flush();
                     }
                 }
-            } else {
-                renderer.render(UiLine::Error(
-                    "No active session to rename. Use /resume to load a session first.".into()
-                ));
-                renderer.flush();
             }
         }
         "provider" => {

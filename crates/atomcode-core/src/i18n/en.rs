@@ -202,6 +202,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list sessions failed: {error}").into(),
         Msg::SessionRenamed { old, new } =>
             format!("  Renamed: '{old}' -> '{new}'").into(),
+        Msg::SessionSaveFailed { error } =>
+            format!("Failed to save session: {error}. The name was not persisted.").into(),
         Msg::SessionNoneSelected =>
             "No session selected".into(),
         Msg::SessionRenameEditing { buffer } =>
