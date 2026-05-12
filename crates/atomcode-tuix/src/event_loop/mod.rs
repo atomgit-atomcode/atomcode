@@ -13,6 +13,7 @@
 // Over time more subfiles should split out (agent_events, redraw helpers,
 // Buffer); modal overlays already live in `crate::modals`.
 
+pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod monitor;
 use commands::execute_slash_command;
@@ -22,7 +23,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle, AgentPhase};
+use atomcode_core::agent::{
+    AgentClient, AgentCommand, AgentEvent, AgentPhase, AgentRuntimeFactory,
+};
 use atomcode_core::config::Config;
 use atomcode_core::session::SessionManager;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -49,7 +52,12 @@ pub struct McpReloadProgress {
 pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
-    pub agent: AgentHandle,
+    pub agent: AgentClient,
+    pub runtime_factory: AgentRuntimeFactory,
+    pub bg_manager: bg_runtime::BgRuntimeManager,
+    pub foreground_runtime_id: bg_runtime::RuntimeId,
+    pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    pub runtime_event_rx: mpsc::UnboundedReceiver<bg_runtime::RuntimeEvent>,
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
     /// Recently visited project directories, most recent first (max 5).
@@ -993,7 +1001,7 @@ fn next_boundary(s: &str, mut p: usize) -> usize {
 /// and the call sites filled a paragraph. Now the handlers take
 /// `(&mut App, &mut LoopCtx, &mut dyn Renderer, …event)` — the LoopCtx
 /// stays separate because the tokio `select!` in `run_loop` needs to
-/// borrow `ctx.input_rx`, `ctx.agent.event_rx`, `ctx.wake_rx`
+/// borrow `ctx.input_rx`, `ctx.runtime_event_rx`, `ctx.wake_rx`
 /// independently, and bundling them into App would fight the borrow
 /// checker on every arm.
 pub struct App {
@@ -1479,36 +1487,44 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.agent.event_rx.recv() => {
-                let Some(ev) = maybe else { break };
-                let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                if pre_phase != app.state.phase {
-                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
-                }
-                if matches!(app.state.phase, UiPhase::Streaming)
-                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
-                {
-                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    last_spinner_draw = std::time::Instant::now();
-                }
-                if matches!(app.state.phase, UiPhase::Idle) {
-                    // Turn just ended — drain the type-ahead queue.
-                    // Pop the oldest queued message, echo as a User
-                    // line, dispatch to the agent, and transition
-                    // back to Streaming. Remaining queue entries
-                    // fire in order on subsequent completions.
-                    if let Some(queued) = app.message_queue.pop_front() {
-                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.clone()));
-                        renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
-                        app.state.on_submit();
-                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    } else {
-                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
-                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            maybe = ctx.runtime_event_rx.recv() => {
+                let Some(runtime_event) = maybe else { break };
+                if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let pre_phase = app.state.phase;
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                    if pre_phase != app.state.phase {
+                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
+                    if matches!(app.state.phase, UiPhase::Streaming)
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    {
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        last_spinner_draw = std::time::Instant::now();
+                    }
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        // Turn just ended — drain the type-ahead queue.
+                        // Pop the oldest queued message, echo as a User
+                        // line, dispatch to the agent, and transition
+                        // back to Streaming. Remaining queue entries
+                        // fire in order on subsequent completions.
+                        if let Some(queued) = app.message_queue.pop_front() {
+                            crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
+                            renderer.render(UiLine::User(queued.clone()));
+                            renderer.flush();
+                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                            app.state.on_submit();
+                            draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        } else {
+                            crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                } else {
+                    ctx.bg_manager.apply_background_event(
+                        runtime_event.runtime_id,
+                        runtime_event.event,
+                        &ctx.session_manager,
+                    );
                 }
             }
 
@@ -1687,31 +1703,39 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.agent.event_rx.recv() => {
-                let Some(ev) = maybe else { break };
-                let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                if pre_phase != app.state.phase {
-                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
-                }
-                if matches!(app.state.phase, UiPhase::Streaming)
-                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
-                {
-                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    last_spinner_draw = std::time::Instant::now();
-                }
-                if matches!(app.state.phase, UiPhase::Idle) {
-                    if let Some(queued) = app.message_queue.pop_front() {
-                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.clone()));
-                        renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
-                        app.state.on_submit();
-                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    } else {
-                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
-                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            maybe = ctx.runtime_event_rx.recv() => {
+                let Some(runtime_event) = maybe else { break };
+                if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let pre_phase = app.state.phase;
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                    if pre_phase != app.state.phase {
+                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
+                    if matches!(app.state.phase, UiPhase::Streaming)
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    {
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        last_spinner_draw = std::time::Instant::now();
+                    }
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        if let Some(queued) = app.message_queue.pop_front() {
+                            crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
+                            renderer.render(UiLine::User(queued.clone()));
+                            renderer.flush();
+                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                            app.state.on_submit();
+                            draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        } else {
+                            crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                } else {
+                    ctx.bg_manager.apply_background_event(
+                        runtime_event.runtime_id,
+                        runtime_event.event,
+                        &ctx.session_manager,
+                    );
                 }
             }
         }
@@ -1754,6 +1778,7 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
     let path = atomcode_core::config::Config::default_path();
     if let Ok(fresh) = atomcode_core::config::Config::load(&path) {
         ctx.config = fresh;
+        ctx.runtime_factory.set_config(ctx.config.clone());
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
         }
@@ -2114,7 +2139,8 @@ fn build_menu_items(
         let mut items: Vec<(String, String)> = Vec::new();
         if let Some(reg) = skill_registry {
             if let Ok(reg) = reg.read() {
-                for skill in reg.user_invocable() {
+                let skills: Vec<_> = reg.user_invocable().collect();
+                for skill in &skills {
                     // Match against either the bare suffix (`adapter-check…`)
                     // or the full qualified name (`ascend-model-agent-plugin:
                     // adapter-check…`). Bare match keeps the shorthand UX;
@@ -2129,11 +2155,21 @@ fn build_menu_items(
                     if bare_lower.starts_with(&prefix_lower)
                         || full_lower.starts_with(&prefix_lower)
                     {
-                        // Display the qualified name so users see which
-                        // plugin a skill belongs to. Suffix-fallback in
-                        // SkillRegistry::get still resolves the bare form
-                        // when invoked.
-                        items.push((skill.name.clone(), skill.description.clone()));
+                        let bare_is_unique = skills.iter().all(|other| {
+                            other.name == skill.name
+                                || other
+                                    .name
+                                    .split_once(':')
+                                    .map(|(_, s)| s)
+                                    .unwrap_or(other.name.as_str())
+                                    != bare
+                        });
+                        let display = if bare_is_unique {
+                            bare.to_string()
+                        } else {
+                            skill.name.clone()
+                        };
+                        items.push((display, skill.description.clone()));
                     }
                 }
             }
@@ -2584,6 +2620,7 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     let path = Config::default_path();
     match ctx.config.save(&path) {
         Ok(()) => {
+            ctx.runtime_factory.set_config(ctx.config.clone());
             let _ = ctx
                 .agent
                 .cmd_tx
@@ -2766,6 +2803,29 @@ fn handle_streaming_key(
             // leave the buf alone. Gate strictly on *registered*
             // commands; unrecognised `/foo …` falls through to the
             // type-ahead queue as a regular message.
+            let bg_background_current = parse_slash_line(&line)
+                .map(|(cmd, arg)| cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty())
+                .unwrap_or(false);
+            if bg_background_current {
+                commands::execute_slash_command(
+                    "bg",
+                    "",
+                    &mut app.state,
+                    ctx,
+                    renderer,
+                    &mut app.active_modal,
+                    &mut app.fixissue_pending,
+                    &mut app.fixissue_buffer,
+                )?;
+                app.message_queue.clear();
+                app.pending_tools.clear();
+                app.think.reset();
+                app.reasoning_buffer.clear();
+                app.buf.text.clear();
+                app.buf.cursor = 0;
+                app.menu.selected = 0;
+                return Ok(());
+            }
             let is_known_slash = parse_slash_line(&line)
                 .map(|(cmd, _)| ctx.commands.find(cmd).is_some())
                 .unwrap_or(false);
@@ -3369,6 +3429,7 @@ fn handle_agent_event(
             // restarts the session.
             if ctx.working_dir != new_dir {
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
+                ctx.runtime_factory.set_working_dir(new_dir.clone());
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
@@ -3466,8 +3527,21 @@ fn persist_current_session(
     if messages.is_empty() {
         return;
     }
-    ctx.current_session.messages = messages;
-    ctx.current_session.touch();
+    apply_session_messages(&mut ctx.current_session, messages);
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    let _ = ctx.session_manager.save(&ctx.current_session);
+}
+
+pub(crate) fn apply_session_messages(
+    session: &mut atomcode_core::session::Session,
+    messages: Vec<atomcode_core::conversation::message::Message>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    session.messages = messages;
+    session.touch();
     // Triggers for renaming:
     //   * `default` / `session-<ts>` — never renamed yet
     //   * leading `[` — previous rename grabbed a synthetic system-meta
@@ -3476,13 +3550,12 @@ fn persist_current_session(
     //     Role::User message for plumbing reasons. Re-derive from the
     //     next non-synthetic user turn so the /resume picker stops
     //     showing those as session titles.
-    let should_rename = ctx.current_session.name == "default"
-        || ctx.current_session.name.starts_with("session-")
-        || ctx.current_session.name.trim_start().starts_with('[');
+    let should_rename = session.name == "default"
+        || session.name.starts_with("session-")
+        || session.name.trim_start().starts_with('[');
     if should_rename {
         use atomcode_core::conversation::message::Role;
-        let first_real_user = ctx
-            .current_session
+        let first_real_user = session
             .messages
             .iter()
             .filter(|m| matches!(m.role, Role::User))
@@ -3490,14 +3563,13 @@ fn persist_current_session(
         if let Some(text) = first_real_user {
             let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
             if !name.is_empty() {
-                ctx.current_session.name = name;
+                session.name = name;
             }
         }
         // Else: leave the existing default/session-<ts>/[...]-marker
         // name. Better to keep a generic placeholder than to commit to
         // a synthetic injection as the title.
     }
-    let _ = ctx.session_manager.save(&ctx.current_session);
 }
 
 /// True when `text` looks like a synthetic user-channel injection
@@ -3512,7 +3584,37 @@ fn is_synthetic_user_text(text: &str) -> bool {
 
 #[cfg(test)]
 mod session_naming_tests {
-    use super::is_synthetic_user_text;
+    use super::{apply_session_messages, is_synthetic_user_text};
+
+    #[test]
+    fn apply_session_messages_renames_from_first_real_user() {
+        use atomcode_core::conversation::message::{Message, Role};
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        let messages = vec![
+            Message::new(Role::User, "[System meta · not a user message]\nread this"),
+            Message::new(Role::User, "implement background sessions\nwith tests"),
+        ];
+
+        apply_session_messages(&mut session, messages);
+
+        assert_eq!(session.name, "implement background sessions");
+        assert_eq!(session.messages.len(), 2);
+    }
+
+    #[test]
+    fn apply_session_messages_preserves_custom_name() {
+        use atomcode_core::conversation::message::{Message, Role};
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        session.name = "manual name".to_string();
+
+        apply_session_messages(&mut session, vec![Message::new(Role::User, "new task")]);
+
+        assert_eq!(session.name, "manual name");
+    }
 
     #[test]
     fn synthetic_system_meta_is_detected() {

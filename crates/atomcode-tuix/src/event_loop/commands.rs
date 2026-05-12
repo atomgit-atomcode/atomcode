@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use super::{save_and_reload, LoopCtx};
+use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::modals::{DirPicker, IssueWizard, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
@@ -22,6 +22,8 @@ use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
+use atomcode_core::conversation::Conversation;
+use atomcode_core::session::Session;
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
@@ -44,6 +46,59 @@ fn build_oauth_provider() -> ProviderConfig {
         skip_tls_verify: false,
         ephemeral: false,
     }
+}
+
+fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
+    if matches!(state.phase, crate::state::UiPhase::Streaming) {
+        bg_runtime::RuntimeState::Running
+    } else {
+        bg_runtime::RuntimeState::Idle
+    }
+}
+
+fn render_welcome(renderer: &mut dyn Renderer, ctx: &LoopCtx) {
+    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    renderer.render(UiLine::Welcome {
+        model: ctx.model_name.clone(),
+        working_dir: dir_display,
+    });
+}
+
+fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
+    if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
+        ctx.telemetry.set_session_id(uuid);
+    }
+}
+
+fn short_task_name(task: &str) -> String {
+    let first_line = task.lines().next().unwrap_or(task).trim();
+    let mut out: String = first_line.chars().take(80).collect();
+    if out.is_empty() {
+        out = "background task".to_string();
+    }
+    out
+}
+
+fn spawn_runtime(
+    ctx: &mut LoopCtx,
+    session: Session,
+) -> (
+    bg_runtime::RuntimeId,
+    atomcode_core::agent::AgentClient,
+    Session,
+) {
+    let runtime_id = ctx.bg_manager.allocate_runtime_id();
+    let (client, event_rx) = ctx.runtime_factory.spawn_runtime(Conversation::new());
+    bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
+    (runtime_id, client, session)
+}
+
+fn sync_bg_foreground(ctx: &mut LoopCtx) {
+    ctx.bg_manager.set_foreground_runtime(
+        ctx.foreground_runtime_id,
+        ctx.agent.clone(),
+        ctx.current_session.clone(),
+    );
 }
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
@@ -180,6 +235,7 @@ pub(super) fn execute_slash_command(
                         .map(|p| p.model.clone())
                         .unwrap_or_else(|| new_default.clone());
                     ctx.config = new_cfg.clone();
+                    ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
                     ctx.agent
                         .cmd_tx
@@ -231,6 +287,8 @@ pub(super) fn execute_slash_command(
             // it can still be `/resume`d; we just stop writing into it.
             ctx.current_session =
                 atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone());
             // Bind telemetry session_id to the new session's UUID.
             if let Ok(uuid) = uuid::Uuid::parse_str(ctx.current_session.id.as_str()) {
                 ctx.telemetry.set_session_id(uuid);
@@ -341,7 +399,10 @@ pub(super) fn execute_slash_command(
                 0
             };
             let cost = atomcode_core::pricing::calculate_cost(
-                &ctx.model_name, state.prompt_tokens, state.completion_tokens, state.cached_tokens,
+                &ctx.model_name,
+                state.prompt_tokens,
+                state.completion_tokens,
+                state.cached_tokens,
             );
             let cost_str = atomcode_core::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(format!(
@@ -390,7 +451,9 @@ pub(super) fn execute_slash_command(
         "remember" => {
             let text = arg.trim();
             if text.is_empty() {
-                renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                renderer.render(UiLine::Error(
+                    "Usage: /remember <fact to remember>  (--global for global scope)".to_string(),
+                ));
                 renderer.flush();
             } else {
                 let (content, global) = if text.starts_with("--global ") {
@@ -399,10 +462,16 @@ pub(super) fn execute_slash_command(
                     (text.to_string(), false)
                 };
                 if content.is_empty() {
-                    renderer.render(UiLine::Error("Usage: /remember <fact to remember>  (--global for global scope)".to_string()));
+                    renderer.render(UiLine::Error(
+                        "Usage: /remember <fact to remember>  (--global for global scope)"
+                            .to_string(),
+                    ));
                     renderer.flush();
                 } else {
-                    ctx.agent.cmd_tx.send(AgentCommand::Remember { content, global }).ok();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::Remember { content, global })
+                        .ok();
                 }
             }
         }
@@ -412,7 +481,12 @@ pub(super) fn execute_slash_command(
                 renderer.render(UiLine::Error("Usage: /forget <keyword>".to_string()));
                 renderer.flush();
             } else {
-                ctx.agent.cmd_tx.send(AgentCommand::Forget { keyword: keyword.to_string() }).ok();
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::Forget {
+                        keyword: keyword.to_string(),
+                    })
+                    .ok();
             }
         }
         "memory" => {
@@ -580,12 +654,148 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "bg" => {
+            match bg_runtime::parse_bg_command(arg) {
+                bg_runtime::BgCommand::Help => {
+                    renderer.render(UiLine::CommandOutput(bg_runtime::render_bg_help()));
+                }
+                bg_runtime::BgCommand::List => {
+                    renderer.render(UiLine::CommandOutput(bg_runtime::render_bg_list(
+                        ctx.bg_manager.backgrounds(),
+                    )));
+                }
+                bg_runtime::BgCommand::BackgroundCurrent => {
+                    sync_bg_foreground(ctx);
+                    if !ctx.bg_manager.has_capacity() {
+                        renderer.render(UiLine::Error(format!(
+                            "background slot limit reached ({})",
+                            bg_runtime::MAX_BACKGROUND_SLOTS
+                        )));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    let old_short_id = ctx.current_session.short_id().to_string();
+                    let new_session = Session::default_session(ctx.working_dir.clone());
+                    let new_short_id = new_session.short_id().to_string();
+                    let (runtime_id, client, new_session) = spawn_runtime(ctx, new_session);
+                    let old_state = foreground_state_from_ui(state);
+                    let slot = match ctx.bg_manager.background_current(
+                        client.clone(),
+                        new_session.clone(),
+                        runtime_id,
+                        old_state,
+                    ) {
+                        Ok(slot) => slot,
+                        Err(bg_runtime::BgError::SlotLimit { max }) => {
+                            renderer.render(UiLine::Error(format!(
+                                "background slot limit reached ({max})"
+                            )));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+                    };
+
+                    ctx.agent = client;
+                    ctx.foreground_runtime_id = runtime_id;
+                    ctx.current_session = new_session;
+                    bind_telemetry_to_session(ctx, &ctx.current_session);
+                    state.on_turn_complete();
+                    renderer.reset();
+                    render_welcome(renderer, ctx);
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  New foreground session [{}]\n  Background: [#{}] {} (state: {})\n",
+                        new_short_id,
+                        slot,
+                        old_short_id,
+                        old_state.as_str()
+                    )));
+                }
+                bg_runtime::BgCommand::Resume(slot) => {
+                    sync_bg_foreground(ctx);
+                    let outcome = match ctx
+                        .bg_manager
+                        .resume_slot(slot, foreground_state_from_ui(state))
+                    {
+                        Ok(outcome) => outcome,
+                        Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
+                            renderer.render(UiLine::Error(format!(
+                                "invalid background slot {slot} (available: {len})"
+                            )));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::SlotLimit { max }) => {
+                            renderer.render(UiLine::Error(format!(
+                                "background slot limit reached ({max})"
+                            )));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                    };
+                    let Some(client) = outcome.resumed_client else {
+                        renderer.render(UiLine::Error(
+                            "background slot has no runtime client".to_string(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    };
+
+                    ctx.agent = client;
+                    ctx.foreground_runtime_id = outcome.resumed_runtime_id;
+                    ctx.current_session = outcome.resumed_session;
+                    bind_telemetry_to_session(ctx, &ctx.current_session);
+                    state.on_turn_complete();
+                    crate::modals::session_picker::replay_session(
+                        renderer,
+                        &ctx.current_session,
+                        true,
+                    );
+                    let mut msg = format!(
+                        "  Resumed background [#{}] {}\n",
+                        slot,
+                        ctx.current_session.short_id()
+                    );
+                    if let Some(previous_slot) = outcome.previous_foreground_slot {
+                        msg.push_str(&format!(
+                            "  Previous foreground moved to [#{}]\n",
+                            previous_slot
+                        ));
+                    }
+                    renderer.render(UiLine::CommandOutput(msg));
+                }
+                bg_runtime::BgCommand::Drop(slot) => {
+                    let dropped = match ctx.bg_manager.drop_slot(slot) {
+                        Ok(dropped) => dropped,
+                        Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
+                            renderer.render(UiLine::Error(format!(
+                                "invalid background slot {slot} (available: {len})"
+                            )));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::SlotLimit { .. }) => unreachable!(),
+                    };
+                    if matches!(dropped.state, bg_runtime::RuntimeState::Running) {
+                        if let Some(client) = dropped.client.as_ref() {
+                            client.cmd_tx.send(AgentCommand::Cancel).ok();
+                        }
+                    }
+                    if !dropped.session.messages.is_empty() {
+                        let _ = ctx.session_manager.save(&dropped.session);
+                    }
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  Dropped background [#{}] {}\n",
+                        slot,
+                        dropped.session.short_id()
+                    )));
+                }
+            }
+            renderer.flush();
+        }
         "background" => {
-            // Send the task to the agent loop; result comes back as
-            // AgentEvent::BackgroundComplete (rendered in event_loop/mod.rs).
-            // The agent loop guards against concurrent background tasks via
-            // an AtomicBool — second invocation while one is running gets
-            // an Error event back.
+            // Compatibility wrapper around `/bg`: start a one-shot task in a
+            // real background runtime, keep the current foreground active.
             let task = arg.trim();
             if task.is_empty() {
                 renderer.render(UiLine::CommandOutput(
@@ -594,10 +804,43 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
                 return Ok(());
             }
-            ctx.agent
+            if !ctx.bg_manager.has_capacity() {
+                renderer.render(UiLine::Error(format!(
+                    "background slot limit reached ({})",
+                    bg_runtime::MAX_BACKGROUND_SLOTS
+                )));
+                renderer.flush();
+                return Ok(());
+            }
+            let mut session = Session::default_session(ctx.working_dir.clone());
+            session.name = short_task_name(task);
+            let short_id = session.short_id().to_string();
+            let (runtime_id, client, session) = spawn_runtime(ctx, session);
+            let slot = match ctx.bg_manager.push_background_runtime(
+                runtime_id,
+                client.clone(),
+                session,
+                bg_runtime::RuntimeState::Running,
+            ) {
+                Ok(slot) => slot,
+                Err(bg_runtime::BgError::SlotLimit { max }) => {
+                    renderer.render(UiLine::Error(format!(
+                        "background slot limit reached ({max})"
+                    )));
+                    renderer.flush();
+                    return Ok(());
+                }
+                Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+            };
+            client
                 .cmd_tx
-                .send(AgentCommand::Background { task: task.to_string() })
+                .send(AgentCommand::SendMessage(task.to_string()))
                 .ok();
+            renderer.render(UiLine::CommandOutput(format!(
+                "  Background: [#{}] {} (state: running)\n",
+                slot, short_id
+            )));
+            renderer.flush();
         }
         "init" => {
             // Generate .atomcode.md from project structure. Refuses to
@@ -646,7 +889,10 @@ pub(super) fn execute_slash_command(
                     }
                 };
 
-                let mut header = format!("  Reloading MCP servers... ({} configured)\n", configs.len());
+                let mut header = format!(
+                    "  Reloading MCP servers... ({} configured)\n",
+                    configs.len()
+                );
                 if !configs.is_empty() {
                     header.push_str("  Connecting:\n");
                     for c in &configs {
@@ -857,9 +1103,8 @@ pub(super) fn execute_slash_command(
                                 renderer.flush();
                             }
                             Err(_) => {
-                                renderer.render(UiLine::Error(
-                                    "Usage: /think budget <number>".into(),
-                                ));
+                                renderer
+                                    .render(UiLine::Error("Usage: /think budget <number>".into()));
                                 renderer.flush();
                             }
                         }
@@ -1197,15 +1442,17 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             match mgr.list() {
                 Ok(worktrees) => {
                     if worktrees.is_empty() {
-                        renderer.render(UiLine::CommandOutput(
-                            "  没有活跃的工作树。\n".into(),
-                        ));
+                        renderer.render(UiLine::CommandOutput("  没有活跃的工作树。\n".into()));
                     } else {
                         let mut txt = String::from("  活跃工作树:\n");
                         for (branch, path, has_changes) in &worktrees {
                             let is_current = path == &ctx.working_dir;
                             let marker = if is_current { "\u{25cf}" } else { "\u{25cb}" };
-                            let change_label = if *has_changes { "(有变更)" } else { "(clean)" };
+                            let change_label = if *has_changes {
+                                "(有变更)"
+                            } else {
+                                "(clean)"
+                            };
                             let current_hint = if is_current { " \u{2190} 当前" } else { "" };
                             txt.push_str(&format!(
                                 "    {} {:<16} {}  {}{}\n",
@@ -1625,6 +1872,7 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
         .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
         .ok();
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
+    ctx.runtime_factory.set_working_dir(path.clone());
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }
@@ -1769,12 +2017,7 @@ fn compose_login_chrome(url: &str, unicode: bool) -> String {
 /// passed through `decide_qr_style` so the decision logic stays unit
 /// testable.
 fn pick_qr_style(unicode: bool) -> Option<crate::render::qr::QrStyle> {
-    let env_flag = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-    };
+    let env_flag = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).is_some();
     let is_jediterm = std::env::var("TERMINAL_EMULATOR")
         .map(|v| v == "JetBrains-JediTerm")
         .unwrap_or(false);

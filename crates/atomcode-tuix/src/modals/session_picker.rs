@@ -126,6 +126,8 @@ impl Modal for SessionPicker {
                             ctx.telemetry.set_session_id(uuid);
                         }
                         ctx.current_session = session;
+                        ctx.bg_manager
+                            .set_foreground_session(ctx.current_session.clone());
                         state.on_turn_complete();
                         Ok(ModalAction::Close)
                     }

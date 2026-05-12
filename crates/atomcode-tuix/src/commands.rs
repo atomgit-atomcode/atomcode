@@ -68,45 +68,186 @@ impl CommandRegistry {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
-    Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
-    Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
-    Command { name: "login",   desc: "Sign in with AtomGit OAuth", needs_args: false },
-    Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false },
-    Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false },
-    Command { name: "model",   desc: "Switch provider / model", needs_args: false },
-    Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false },
-    Command { name: "status",  desc: "Show session status", needs_args: false },
-    Command { name: "config",  desc: "Show config path", needs_args: false },
-    Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false },
-    Command { name: "cd",      desc: "Change working directory", needs_args: false },
-    Command { name: "init",    desc: "Generate .atomcode.md project instructions from the working directory", needs_args: false },
-    Command { name: "background", desc: "Run a one-shot task in an isolated background context (read-only-ish tool subset)", needs_args: true },
-    Command { name: "diff",    desc: "Show git diff", needs_args: false },
-    Command { name: "clear",   desc: "Clear screen", needs_args: false },
-    Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false },
-    Command { name: "cost",    desc: "Show token cost", needs_args: false },
-    Command { name: "context", desc: "Show context budget breakdown", needs_args: false },
-    Command { name: "compact", desc: "Compact conversation history", needs_args: false },
-    Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true },
-    Command { name: "forget", desc: "Remove matching memories", needs_args: true },
-    Command { name: "memory", desc: "Show all saved memories", needs_args: false },
-    Command { name: "mcp",     desc: "Show MCP server status (subcommand: reload)", needs_args: false },
-    Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
-    Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
-    Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
-    Command { name: "issue",   desc: "Report a bug / request a feature for AtomCode itself (interactive wizard)", needs_args: false },
-    Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false },
-    Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
-    Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
-    Command { name: "help",    desc: "Show this help", needs_args: false },
-    Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
+    Command {
+        name: "codingplan",
+        desc: "Claim CodingPlan + set up models from the plan's model list",
+        needs_args: false,
+    },
+    Command {
+        name: "resume",
+        desc: "Resume a previous session",
+        needs_args: false,
+    },
+    Command {
+        name: "login",
+        desc: "Sign in with AtomGit OAuth",
+        needs_args: false,
+    },
+    Command {
+        name: "logout",
+        desc: "Sign out of AtomGit",
+        needs_args: false,
+    },
+    Command {
+        name: "whoami",
+        desc: "Show current logged-in user",
+        needs_args: false,
+    },
+    Command {
+        name: "model",
+        desc: "Switch provider / model",
+        needs_args: false,
+    },
+    Command {
+        name: "provider",
+        desc: "Manage providers (add / edit / delete)",
+        needs_args: false,
+    },
+    Command {
+        name: "status",
+        desc: "Show session status",
+        needs_args: false,
+    },
+    Command {
+        name: "config",
+        desc: "Show config path",
+        needs_args: false,
+    },
+    Command {
+        name: "reload",
+        desc: "Reload ~/.atomcode/config.toml from disk",
+        needs_args: false,
+    },
+    Command {
+        name: "cd",
+        desc: "Change working directory",
+        needs_args: false,
+    },
+    Command {
+        name: "init",
+        desc: "Generate .atomcode.md project instructions from the working directory",
+        needs_args: false,
+    },
+    Command {
+        name: "bg",
+        desc: "Background sessions: /bg, /bg /list, /bg <N>, /bg /drop <N>",
+        needs_args: false,
+    },
+    Command {
+        name: "background",
+        desc: "Compatibility alias: start a one-shot task in a /bg slot",
+        needs_args: true,
+    },
+    Command {
+        name: "diff",
+        desc: "Show git diff",
+        needs_args: false,
+    },
+    Command {
+        name: "clear",
+        desc: "Clear screen",
+        needs_args: false,
+    },
+    Command {
+        name: "session",
+        desc: "Start a new session (clears conversation)",
+        needs_args: false,
+    },
+    Command {
+        name: "cost",
+        desc: "Show token cost",
+        needs_args: false,
+    },
+    Command {
+        name: "context",
+        desc: "Show context budget breakdown",
+        needs_args: false,
+    },
+    Command {
+        name: "compact",
+        desc: "Compact conversation history",
+        needs_args: false,
+    },
+    Command {
+        name: "remember",
+        desc: "Save a fact to memory (/remember --global for global)",
+        needs_args: true,
+    },
+    Command {
+        name: "forget",
+        desc: "Remove matching memories",
+        needs_args: true,
+    },
+    Command {
+        name: "memory",
+        desc: "Show all saved memories",
+        needs_args: false,
+    },
+    Command {
+        name: "mcp",
+        desc: "Show MCP server status (subcommand: reload)",
+        needs_args: false,
+    },
+    Command {
+        name: "undo",
+        desc: "Undo last change (not yet supported)",
+        needs_args: false,
+    },
+    Command {
+        name: "worktree",
+        desc: "Git worktree isolation (create/list/done/cleanup)",
+        needs_args: true,
+    },
+    Command {
+        name: "upgrade",
+        desc: "Upgrade atomcode to latest (subcommand: rollback)",
+        needs_args: false,
+    },
+    Command {
+        name: "issue",
+        desc: "Report a bug / request a feature for AtomCode itself (interactive wizard)",
+        needs_args: false,
+    },
+    Command {
+        name: "plan",
+        desc: "Switch to Plan mode (read-only exploration)",
+        needs_args: false,
+    },
+    Command {
+        name: "build",
+        desc: "Switch to Build mode (full execution)",
+        needs_args: false,
+    },
+    Command {
+        name: "think",
+        desc: "Extended thinking control (on/off/budget N)",
+        needs_args: false,
+    },
+    Command {
+        name: "help",
+        desc: "Show this help",
+        needs_args: false,
+    },
+    Command {
+        name: "quit",
+        desc: "Exit AtomCode",
+        needs_args: false,
+    },
     // Gateway entry that opens a second-level palette listing all
     // user-invocable skills. needs_args=true so Enter rewrites the
     // buffer to `/skills ` and lets the sub-mode menu render the
     // skill list. Selecting a skill commits as `/skills <name>` →
     // dispatched by the `skills` arm in execute_slash_command.
-    Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
-    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
+    Command {
+        name: "skills",
+        desc: "Browse loaded skills",
+        needs_args: true,
+    },
+    Command {
+        name: "plugin",
+        desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)",
+        needs_args: true,
+    },
 ];
 
 /// A completion candidate for slash-command Tab completion, merging built-in
@@ -192,6 +333,14 @@ mod tests {
         let reg = CommandRegistry::builtin();
         assert!(reg.find("quit").is_some());
         assert!(reg.find("nonexistent").is_none());
+    }
+
+    #[test]
+    fn builtin_contains_bg_command() {
+        let registry = CommandRegistry::builtin();
+        let cmd = registry.find("bg").unwrap();
+        assert_eq!(cmd.name, "bg");
+        assert!(!cmd.needs_args);
     }
 
     #[test]

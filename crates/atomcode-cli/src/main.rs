@@ -15,15 +15,17 @@ use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
 
-use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
+use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop, AgentRuntimeFactory};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
+use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpRegistry};
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::bash::BashTool;
 use atomcode_core::tool::cd::CdTool;
+use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::glob::GlobTool;
 use atomcode_core::tool::grep::GrepTool;
@@ -33,9 +35,7 @@ use atomcode_core::tool::search_replace::SearchReplaceTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
 use atomcode_core::tool::web_search::WebSearchTool;
 use atomcode_core::tool::write::WriteFileTool;
-use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
-use atomcode_core::lsp::manager::build_lsp_manager;
 
 use atomcode_core::auth;
 use atomcode_telemetry::{
@@ -759,9 +759,7 @@ async fn run() -> Result<i32> {
                 let repo = atomcode_core::telemetry_bootstrap::detect_repo_origin(
                     &std::env::current_dir().unwrap_or_default(),
                 );
-                telemetry.set_account_id(
-                    auth::get_stored_auth().map(|a| a.user.id.to_string()),
-                );
+                telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id.to_string()));
                 let scope_ctx = CurrentContext {
                     repo_origin: Some(repo),
                     mode: Some(SessionMode::Headless),
@@ -873,7 +871,9 @@ async fn run() -> Result<i32> {
                 // Flush any events emitted by the subcommand (e.g. login_success)
                 // before the process exits. Bounded by the same 500ms budget as
                 // other exit paths.
-                telemetry.shutdown(std::time::Duration::from_millis(500)).await;
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
                 return result;
             }
         }
@@ -1156,6 +1156,7 @@ async fn run() -> Result<i32> {
     if let Some(n) = cli.reflection_cadence {
         agent_loop.config.reflection_cadence = n;
     }
+    let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
     // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
@@ -1284,7 +1285,7 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, telemetry.clone()).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, telemetry.clone()).await?;
             Ok(0)
         };
 
@@ -1323,7 +1324,7 @@ async fn run_headless(
     let notifications = agent_loop.config.notifications.clone();
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
-        (handle.cmd_tx, handle.event_rx)
+        (handle.client.cmd_tx, handle.event_rx)
     };
 
     let ctx = atomcode_telemetry::CurrentContext::current();
