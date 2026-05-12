@@ -32,10 +32,16 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ✔ CodingPlan already claimed — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
             format!("  ✘ CodingPlan claim failed — {}\n", error).into(),
+        Msg::CpClaimTierSucceeded { tier } =>
+            format!("  ✔ CodingPlan {} claimed\n", tier).into(),
+        Msg::CpClaimTierAlreadyHeld { tier } =>
+            format!("  ✔ CodingPlan {} already claimed\n", tier).into(),
+        Msg::CpClaimTierFailed { tier, reason } =>
+            format!("  ✘ CodingPlan {} claim failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>
             format!("  ✔ Added {} provider{}:\n", count, plural_s).into(),
         Msg::CpLocked { name } =>
-            format!("      • {}  (require plan upgrade)\n", name).into(),
+            format!("      ✘ {}  (require plan upgrade)\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  (default)".into(),
@@ -81,6 +87,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "(not configured)".into(),
         Msg::StatusClipboardImageHint =>
             "Image in clipboard · ctrl+v to paste".into(),
+        Msg::StatusClipboardImageHintSlash =>
+            "Image in clipboard · /paste".into(),
 
         // ── /status command body ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -601,6 +609,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescQuit => "Exit AtomCode".into(),
         Msg::CmdDescSkills => "Browse loaded skills".into(),
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, list)".into(),
+        Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
+        Msg::CmdPasteNoImage => "No image in clipboard.".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>

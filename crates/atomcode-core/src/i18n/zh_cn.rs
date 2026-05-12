@@ -32,10 +32,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ✔ CodingPlan 已领取 — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
             format!("  ✘ CodingPlan 领取失败 — {}\n", error).into(),
+        Msg::CpClaimTierSucceeded { tier } =>
+            format!("  ✔ CodingPlan {} 领取成功\n", tier).into(),
+        Msg::CpClaimTierAlreadyHeld { tier } =>
+            format!("  ✔ CodingPlan {} 已领取\n", tier).into(),
+        Msg::CpClaimTierFailed { tier, reason } =>
+            format!("  ✘ CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
             format!("  ✔ 已添加 {} 个 Provider：\n", count).into(),
         Msg::CpLocked { name } =>
-            format!("      • {}  （需要升级套餐）\n", name).into(),
+            format!("      ✘ {}  （需要升级套餐）\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  （默认）".into(),
@@ -81,6 +87,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "（未配置）".into(),
         Msg::StatusClipboardImageHint =>
             "剪贴板有图片 · ctrl+v 粘贴".into(),
+        Msg::StatusClipboardImageHintSlash =>
+            "剪贴板有图片 · /paste 粘贴".into(),
 
         // ── /status 命令主体 ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -599,6 +607,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescQuit => "退出 AtomCode".into(),
         Msg::CmdDescSkills => "浏览已加载的技能".into(),
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, list）".into(),
+        Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
+        Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>

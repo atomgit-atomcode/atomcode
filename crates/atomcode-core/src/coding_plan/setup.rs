@@ -98,24 +98,6 @@ pub enum VisionPreprocessorOutcome {
     Cleared,
 }
 
-/// Insert U+0336 (combining long stroke overlay) after each character
-/// so the result renders with a horizontal strikethrough across the
-/// glyph in every modern terminal — iTerm2, Terminal.app, Windows
-/// Terminal, Konsole, JediTerm, even legacy conhost. Replaces an earlier
-/// SGR 9 (`\x1b[9m…\x1b[29m`) approach that was getting deleted by the
-/// renderer's universal CSI scrubber (`tuix::sanitize::scrub_controls`)
-/// before reaching the terminal, leaving locked models indistinguishable
-/// from available ones. Combining marks are zero-width text, not control
-/// codes, so they survive sanitisation and round-trip through copy-paste.
-fn strikethrough(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + s.chars().count() * 2);
-    for ch in s.chars() {
-        out.push(ch);
-        out.push('\u{0336}');
-    }
-    out
-}
-
 impl SetupReport {
     /// Render as a multi-line plain-text block for stdout / TUI body.
     /// Shared by the CLI subcommand and the `/codingplan` slash command
@@ -145,31 +127,71 @@ impl SetupReport {
             }
         }
 
-        // Step 2: claim. Show the tier the cascade landed on so users
-        // can see whether Max / Pro / Lite was actually granted (the
-        // cascade walks highest-first; landing on Pro means Max
-        // refused).
-        match &self.claim {
-            StepResult::Ok(info) => {
-                let fallback = t(Msg::CpClaimSuccessFallback);
-                let message = if info.message.is_empty() {
-                    fallback.as_ref()
-                } else {
-                    info.message.as_str()
-                };
-                out.push_str(&t(Msg::CpClaimed {
-                    message,
-                    plan_type: info.plan_type.as_str(),
-                }));
+        // Step 2: claim. When `claim_attempts` is populated (production
+        // path), emit one row per tier so refused / errored
+        // intermediates are visible alongside the winner. When empty
+        // (login-cascade suppression OR legacy test fixtures), fall
+        // back to a single summary row from `self.claim` — preserves
+        // pre-refactor test semantics without churning every fixture.
+        if !self.claim_attempts.is_empty() {
+            for attempt in &self.claim_attempts {
+                let tier = attempt.tier.as_str();
+                match &attempt.outcome {
+                    TierOutcome::Claimed { .. } => {
+                        out.push_str(&t(Msg::CpClaimTierSucceeded { tier }));
+                    }
+                    TierOutcome::AlreadyHeld { .. } => {
+                        out.push_str(&t(Msg::CpClaimTierAlreadyHeld { tier }));
+                    }
+                    TierOutcome::Refused { message } => {
+                        let reason = if message.is_empty() {
+                            // Server returned success=false +
+                            // duplicate=false with no message — surface
+                            // a placeholder so the row isn't a
+                            // confusing "claim failed — " with nothing
+                            // after the em-dash.
+                            "(no reason given)"
+                        } else {
+                            message.as_str()
+                        };
+                        out.push_str(&t(Msg::CpClaimTierFailed { tier, reason }));
+                    }
+                    TierOutcome::Errored { error } => {
+                        // 5xx / transport / parse — same "claim
+                        // failed" glyph as Refused; the message is
+                        // the error text (truncated so a stack
+                        // trace doesn't blow up the row).
+                        let reason = truncate_inline(error, 150);
+                        out.push_str(&t(Msg::CpClaimTierFailed {
+                            tier,
+                            reason: &reason,
+                        }));
+                    }
+                }
             }
-            StepResult::Skipped(reason) if reason == CASCADE_FROM_UPSTREAM_FAIL => {
-                // Cascade from login failure — suppressed.
-            }
-            StepResult::Skipped(reason) => {
-                out.push_str(&t(Msg::CpAlreadyClaimed { reason }));
-            }
-            StepResult::Err(msg) => {
-                out.push_str(&t(Msg::CpClaimFailed { error: msg }));
+        } else {
+            match &self.claim {
+                StepResult::Ok(info) => {
+                    let fallback = t(Msg::CpClaimSuccessFallback);
+                    let message = if info.message.is_empty() {
+                        fallback.as_ref()
+                    } else {
+                        info.message.as_str()
+                    };
+                    out.push_str(&t(Msg::CpClaimed {
+                        message,
+                        plan_type: info.plan_type.as_str(),
+                    }));
+                }
+                StepResult::Skipped(reason) if reason == CASCADE_FROM_UPSTREAM_FAIL => {
+                    // Cascade from login failure — suppressed.
+                }
+                StepResult::Skipped(reason) => {
+                    out.push_str(&t(Msg::CpAlreadyClaimed { reason }));
+                }
+                StepResult::Err(msg) => {
+                    out.push_str(&t(Msg::CpClaimFailed { error: msg }));
+                }
             }
         }
 
@@ -185,26 +207,31 @@ impl SetupReport {
                 // Build a quick lookup of which display names made it
                 // into the registered provider list — anything in
                 // `all_models` but NOT in this set is locked behind
-                // the user's plan tier and renders with strikethrough.
+                // the user's plan tier.
                 let registered: std::collections::HashSet<&str> =
                     info.display_names.iter().map(|s| s.as_str()).collect();
                 // Locked models render FIRST so the upgrade prompt is the
                 // first thing the eye lands on under "Added N providers:".
-                // The name itself is wrapped in U+0336 combining
-                // strikethrough — plain text, no SGR — so every renderer
-                // path (alt-screen / retained / plain) and every terminal
-                // (iTerm2 / Terminal.app / Windows Terminal / JediTerm /
-                // legacy conhost) shows the same visual cue, and the
-                // explicit "(require plan upgrade)" suffix still carries
-                // the meaning if a font lacks combining-mark support.
+                // Visual cue is an `✘` prefix matching the existing
+                // failure rows (`✘ CodingPlan Max claim failed — …`)
+                // plus the explicit `(require plan upgrade)` suffix —
+                // both plain text, so every renderer (alt-screen /
+                // retained / plain) and every terminal font carries
+                // the meaning. An earlier U+0336 combining strikethrough
+                // pass was dropped after a user report that fonts in
+                // the wild silently skip the overlay glyph; the SGR 9
+                // approach before that was eaten by the TUI's CSI
+                // sanitizer (`tuix::sanitize::scrub_controls`). The
+                // prefix-plus-suffix combo doesn't depend on either.
                 let locked: Vec<&ModelEntry> = info
                     .all_models
                     .iter()
                     .filter(|m| !m.plan_available && !registered.contains(m.display_model_name.as_str()))
                     .collect();
                 for m in &locked {
-                    let struck = strikethrough(&m.display_model_name);
-                    out.push_str(&t(Msg::CpLocked { name: &struck }));
+                    out.push_str(&t(Msg::CpLocked {
+                        name: &m.display_model_name,
+                    }));
                 }
                 let default_suffix_cow = t(Msg::CpDefaultSuffix);
                 for (pname, model) in info.provider_names.iter().zip(info.display_names.iter()) {
@@ -333,6 +360,15 @@ impl SetupReport {
 pub struct SetupReport {
     pub login: StepResult<LoginInfo>,
     pub claim: StepResult<ClaimInfo>,
+    /// Per-tier cascade history. Populated by `step_claim` with one
+    /// entry per tier actually attempted (in cascade order Max → Pro
+    /// → Lite). Empty when the cascade never ran (e.g. login failed
+    /// upstream — claim is `Skipped(CASCADE_FROM_UPSTREAM_FAIL)`) or
+    /// when a legacy test fixture wants the old single-row claim
+    /// summary. `render` walks this to emit one row per tier so
+    /// refused / errored intermediate tiers are visible, not hidden
+    /// behind a single "claim failed" summary.
+    pub claim_attempts: Vec<TierAttempt>,
     pub models: StepResult<ModelsInfo>,
     pub status: StepResult<StatusResponse>,
 }
@@ -356,6 +392,31 @@ pub struct ClaimInfo {
     /// argument so the model list comes back with availability gated
     /// to the user's actual entitlement.
     pub plan_type: PlanType,
+}
+
+/// Per-tier outcome captured while `step_claim` walks the cascade.
+/// Surfaces in `SetupReport::render` as one row per attempted tier so
+/// the user can see exactly why the cascade stopped where it did — a
+/// single "claim failed: Lite: 暂无开放" line hid the Max / Pro tier
+/// rejections users wanted to see.
+#[derive(Debug, Clone)]
+pub enum TierOutcome {
+    /// `success=true` on this tier — cascade winner.
+    Claimed { message: String },
+    /// `duplicate=true` — user already held this (or a higher) tier;
+    /// cascade treats this as winner and stops.
+    AlreadyHeld { message: String },
+    /// `2xx success=false duplicate=false` — per-tier refusal (e.g.
+    /// `额度已满` / `暂无开放`). Cascade walks past to the next tier.
+    Refused { message: String },
+    /// Transport / 5xx / parse failure. Cascade aborts.
+    Errored { error: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct TierAttempt {
+    pub tier: PlanType,
+    pub outcome: TierOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -404,22 +465,24 @@ pub fn run(
         return Ok(SetupReport {
             login,
             claim: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            claim_attempts: Vec::new(),
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         });
     }
 
     // Step 2: claim — cascade Max → Pro → Lite, first success wins.
-    let claim = step_claim();
+    let (claim, claim_attempts) = step_claim();
     if claim.is_err() {
-        // Claim failed — adding providers / fetching status both make
-        // no sense without an active plan. Bail with cascade markers
-        // (rendered as no-op in format() so the report stays focused
-        // on the actual problem instead of three identical "skipped:
-        // claim failed" lines).
+        // Claim failed at every tier — adding providers / fetching
+        // status both make no sense without an active plan. Bail
+        // with cascade markers for models/status; `claim_attempts`
+        // still carries every tier's outcome so the renderer shows
+        // the per-tier rows that explain WHY the cascade gave up.
         return Ok(SetupReport {
             login,
             claim,
+            claim_attempts,
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         });
@@ -454,6 +517,7 @@ pub fn run(
         return Ok(SetupReport {
             login,
             claim,
+            claim_attempts,
             models,
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         });
@@ -472,6 +536,7 @@ pub fn run(
     Ok(SetupReport {
         login,
         claim,
+        claim_attempts,
         models,
         status,
     })
@@ -534,18 +599,39 @@ fn step_login(tel: Option<&Arc<atomcode_telemetry::Telemetry>>) -> StepResult<Lo
 /// Transport / 5xx errors abort the whole cascade — those mean the
 /// server is in a bad state, not "this tier is unavailable", so
 /// retrying lower tiers would just stack identical failures.
-fn step_claim() -> StepResult<ClaimInfo> {
+/// Walk the cascade and capture every tier's outcome.
+///
+/// Returns `(overall, attempts)`:
+/// * `overall` — the legacy single-summary view of what happened
+///   (`Ok` / `Skipped` / `Err`). Drives `should_persist_config` and
+///   the downstream `step_models_and_register` plan-type selection.
+/// * `attempts` — every tier actually attempted, in cascade order.
+///   Renderer walks this to emit one row per tier (refused /
+///   errored / claimed) so users can see the full picture instead
+///   of just the winner.
+fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>) {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
-        Err(e) => return StepResult::Err(format!("build client: {:#}", e)),
+        Err(e) => {
+            return (
+                StepResult::Err(format!("build client: {:#}", e)),
+                Vec::new(),
+            );
+        }
     };
+    let mut attempts: Vec<TierAttempt> = Vec::with_capacity(PlanType::CASCADE_ORDER.len());
     let mut last_msg = String::new();
     for &tier in PlanType::CASCADE_ORDER {
         match client.claim_v2(tier) {
             Ok(resp) => {
                 if resp.duplicate {
-                    // Already holds this (or a higher) tier.
-                    return StepResult::Skipped(if resp.message.is_empty() {
+                    attempts.push(TierAttempt {
+                        tier,
+                        outcome: TierOutcome::AlreadyHeld {
+                            message: resp.message.clone(),
+                        },
+                    });
+                    let skipped = StepResult::Skipped(if resp.message.is_empty() {
                         format!(
                             "already claimed (or under review) — using {}",
                             tier.as_str()
@@ -553,9 +639,16 @@ fn step_claim() -> StepResult<ClaimInfo> {
                     } else {
                         format!("{} ({})", resp.message, tier.as_str())
                     });
+                    return (skipped, attempts);
                 }
                 if resp.success {
-                    return StepResult::Ok(ClaimInfo {
+                    attempts.push(TierAttempt {
+                        tier,
+                        outcome: TierOutcome::Claimed {
+                            message: resp.message.clone(),
+                        },
+                    });
+                    let ok = StepResult::Ok(ClaimInfo {
                         message: if resp.message.is_empty() {
                             format!("claimed {}", tier.as_str())
                         } else {
@@ -564,11 +657,16 @@ fn step_claim() -> StepResult<ClaimInfo> {
                         duplicate: false,
                         plan_type: tier,
                     });
+                    return (ok, attempts);
                 }
                 // 2xx + success=false + duplicate=false: per-tier
-                // refusal (quota / not eligible). Remember the
-                // message and keep walking; if every tier refuses
-                // we surface this last reason.
+                // refusal (quota / not eligible / 暂无开放).
+                attempts.push(TierAttempt {
+                    tier,
+                    outcome: TierOutcome::Refused {
+                        message: resp.message.clone(),
+                    },
+                });
                 last_msg = if resp.message.is_empty() {
                     format!("{} claim refused", tier.as_str())
                 } else {
@@ -578,15 +676,26 @@ fn step_claim() -> StepResult<ClaimInfo> {
             Err(e) => {
                 // Transport / 5xx / parse failure — bail. These don't
                 // get more useful when retried at a lower tier.
-                return StepResult::Err(format!("claim {} request: {:#}", tier.as_str(), e));
+                let err_text = format!("{:#}", e);
+                attempts.push(TierAttempt {
+                    tier,
+                    outcome: TierOutcome::Errored {
+                        error: err_text.clone(),
+                    },
+                });
+                return (
+                    StepResult::Err(format!("claim {} request: {}", tier.as_str(), err_text)),
+                    attempts,
+                );
             }
         }
     }
-    StepResult::Err(if last_msg.is_empty() {
+    let overall = StepResult::Err(if last_msg.is_empty() {
         "claim failed at every tier (Max/Pro/Lite)".into()
     } else {
         format!("claim failed at every tier — {}", last_msg)
-    })
+    });
+    (overall, attempts)
 }
 
 fn step_models_and_register(
@@ -948,6 +1057,7 @@ mod tests {
                 duplicate: false,
                 plan_type: PlanType::Max,
             }),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["moonshotai/Kimi-K2-Instruct".into()],
                 provider_names: vec!["AtomGit".into()],
@@ -1002,6 +1112,7 @@ mod tests {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in as theo".into()),
             claim: StepResult::Skipped("already claimed / in review".into()),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
                 provider_names: vec!["AtomGit".into()],
@@ -1038,6 +1149,7 @@ mod tests {
                 duplicate: false,
                 plan_type: PlanType::Max,
             }),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
                 provider_names: vec!["AtomGit".into()],
@@ -1089,6 +1201,7 @@ mod tests {
         let report = SetupReport {
             login: StepResult::Err("browser handshake timed out".into()),
             claim: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            claim_attempts: Vec::new(),
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         };
@@ -1124,6 +1237,7 @@ mod tests {
                  — Transaction rolled back because it has been marked as rollback-only"
                     .into(),
             ),
+            claim_attempts: Vec::new(),
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         };
@@ -1138,6 +1252,7 @@ mod tests {
         let dup = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
             claim: StepResult::Skipped("already claimed / using Max".into()),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
                 provider_names: vec!["AtomGit".into()],
@@ -1153,6 +1268,172 @@ mod tests {
         );
     }
 
+    /// Per-tier cascade rendering: Max refused (额度已满) → Pro
+    /// refused (额度已满) → Lite claimed. Users should see ALL three
+    /// rows so they understand the cascade walked Max → Pro → Lite,
+    /// not just the winner.
+    #[test]
+    fn render_per_tier_cascade_shows_every_attempt() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in as Code_dh".into()),
+            claim: StepResult::Ok(ClaimInfo {
+                message: "claimed".into(),
+                duplicate: false,
+                plan_type: PlanType::Lite,
+            }),
+            claim_attempts: vec![
+                TierAttempt {
+                    tier: PlanType::Max,
+                    outcome: TierOutcome::Refused {
+                        message: "额度已满".into(),
+                    },
+                },
+                TierAttempt {
+                    tier: PlanType::Pro,
+                    outcome: TierOutcome::Refused {
+                        message: "额度已满".into(),
+                    },
+                },
+                TierAttempt {
+                    tier: PlanType::Lite,
+                    outcome: TierOutcome::Claimed {
+                        message: "领取成功".into(),
+                    },
+                },
+            ],
+            models: StepResult::Skipped("models step not exercised here".into()),
+            status: StepResult::Skipped("status not exercised here".into()),
+        };
+        let out = report.render();
+        // Max + Pro must surface as 领取失败 with the actual server
+        // message so users can tell the cascade walked past them
+        // (and why) instead of a single "claim failed: Lite: 额度已满".
+        assert!(
+            out.contains("CodingPlan Max 领取失败 — 额度已满")
+                || out.contains("CodingPlan Max claim failed — 额度已满"),
+            "Max refusal row missing: {}",
+            out
+        );
+        assert!(
+            out.contains("CodingPlan Pro 领取失败 — 额度已满")
+                || out.contains("CodingPlan Pro claim failed — 额度已满"),
+            "Pro refusal row missing: {}",
+            out
+        );
+        // Lite must surface as 领取成功 (the winner).
+        assert!(
+            out.contains("CodingPlan Lite 领取成功")
+                || out.contains("CodingPlan Lite claimed"),
+            "Lite success row missing: {}",
+            out
+        );
+        // The legacy single-line summary must NOT appear when
+        // claim_attempts is populated — would be a duplicate "claimed
+        // Lite" row.
+        assert!(
+            !out.contains("CodingPlan claimed"),
+            "legacy claim-summary row must be suppressed when per-tier rows present: {}",
+            out
+        );
+    }
+
+    /// Per-tier cascade where every tier refused — winning tier is
+    /// `None`, overall claim is `Err`. Each refused tier still gets
+    /// its own row.
+    #[test]
+    fn render_per_tier_cascade_all_refused() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Err(
+                "claim failed at every tier — Lite: 暂无开放".into(),
+            ),
+            claim_attempts: vec![
+                TierAttempt {
+                    tier: PlanType::Max,
+                    outcome: TierOutcome::Refused {
+                        message: "暂无开放".into(),
+                    },
+                },
+                TierAttempt {
+                    tier: PlanType::Pro,
+                    outcome: TierOutcome::Refused {
+                        message: "暂无开放".into(),
+                    },
+                },
+                TierAttempt {
+                    tier: PlanType::Lite,
+                    outcome: TierOutcome::Refused {
+                        message: "暂无开放".into(),
+                    },
+                },
+            ],
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+        };
+        let out = report.render();
+        // All three tier rows present with the 暂无开放 message.
+        for tier in &["Max", "Pro", "Lite"] {
+            let zh = format!("CodingPlan {} 领取失败 — 暂无开放", tier);
+            let en = format!("CodingPlan {} claim failed — 暂无开放", tier);
+            assert!(
+                out.contains(&zh) || out.contains(&en),
+                "{} refusal row missing: {}",
+                tier,
+                out
+            );
+        }
+        // Overall claim is Err but with claim_attempts populated, the
+        // legacy "✘ CodingPlan claim failed — ..." summary line is
+        // suppressed (per-tier rows already explain the failure).
+        assert!(
+            !out.contains("claim failed at every tier"),
+            "legacy err-summary row must not appear: {}",
+            out
+        );
+        // Models row also suppressed (cascade sentinel).
+        assert!(
+            !out.contains("Models step"),
+            "cascade-from-claim-fail must hide models row: {}",
+            out
+        );
+    }
+
+    /// Per-tier cascade where Max errored (5xx). `Errored` and
+    /// `Refused` both render as `领取失败` with the message — same
+    /// visual to the user, same cause from their POV. Make sure the
+    /// error text gets truncated so a long stack trace doesn't blow
+    /// up the row.
+    #[test]
+    fn render_per_tier_cascade_with_errored_tier_truncates_long_message() {
+        let long_err = "x".repeat(500);
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Err(format!("claim Max request: {}", long_err)),
+            claim_attempts: vec![TierAttempt {
+                tier: PlanType::Max,
+                outcome: TierOutcome::Errored {
+                    error: long_err.clone(),
+                },
+            }],
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+        };
+        let out = report.render();
+        // The Max row is present with 领取失败.
+        assert!(
+            out.contains("CodingPlan Max 领取失败 —")
+                || out.contains("CodingPlan Max claim failed —"),
+            "Max errored row missing: {}",
+            out
+        );
+        // The full 500-char error must NOT appear verbatim — truncated.
+        assert!(
+            !out.contains(&long_err),
+            "long error must be truncated, not pasted whole: {}",
+            out
+        );
+    }
+
     /// Render exercise: multi-model report. Verifies each provider
     /// name gets its own bullet + `(default)` marks only the first.
     #[test]
@@ -1164,6 +1445,7 @@ mod tests {
                 duplicate: false,
                 plan_type: PlanType::Max,
             }),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec![
                     "moonshotai/Kimi-K2-Instruct".into(),
@@ -1203,6 +1485,7 @@ mod tests {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in as theo".into()),
             claim: StepResult::Err("今日codingplan申请额度已满，请明天再试".into()),
+            claim_attempts: Vec::new(),
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         };
@@ -1225,6 +1508,7 @@ mod tests {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in as theo".into()),
             claim: StepResult::Skipped("already claimed".into()),
+            claim_attempts: Vec::new(),
             models: StepResult::Skipped("models cached locally".into()),
             status: StepResult::Skipped("server returned 503; using cached".into()),
         };
@@ -1248,6 +1532,7 @@ mod tests {
                 duplicate: false,
                 plan_type: PlanType::Max,
             }),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["a/b".into()],
                 provider_names: vec!["AtomGit".into()],
@@ -1477,6 +1762,7 @@ mod tests {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
             claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec![
                     "Kimi-K2-Instruct".into(),
@@ -1507,6 +1793,7 @@ mod tests {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
             claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["Kimi-K2-Instruct".into()],
                 provider_names: vec!["AtomGit-Kimi-K2-Instruct".into()],
@@ -1525,6 +1812,7 @@ mod tests {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
             claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec![
                     "Kimi-K2-Instruct".into(),
@@ -1552,6 +1840,7 @@ mod tests {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
             claim: StepResult::Ok(ClaimInfo { message: String::new(), duplicate: false, plan_type: PlanType::Max }),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["Kimi-K2-Instruct".into()],
                 provider_names: vec!["AtomGit-Kimi-K2-Instruct".into()],
@@ -1566,16 +1855,20 @@ mod tests {
     }
 
     /// Locked models (plan_available=false on a higher tier) must
-    /// surface in the rendered report with strikethrough + the
-    /// explicit "(require plan upgrade)" tag, appended to the same
-    /// `Added N provider(s)` bullet list as the available models so
-    /// users see the full slate at a glance. Pins the v2 spec's "若
-    /// 不可用的模型也展示出来（用横线划掉）" requirement, now backed
-    /// by U+0336 combining strikethrough rather than SGR 9 (the old
-    /// SGR path was being eaten by the TUI's CSI sanitizer before it
-    /// reached the terminal).
+    /// surface in the rendered report with a distinctive `✘` prefix
+    /// + the explicit "(require plan upgrade)" suffix, appended to
+    /// the same `Added N provider(s)` bullet list as the available
+    /// models so users see the full slate at a glance. Pins the v2
+    /// spec's "若不可用的模型也展示出来" requirement. Prefix matches
+    /// the existing CodingPlan failure rows (`✘ CodingPlan Max
+    /// claim failed — …`) so the visual language is consistent. An
+    /// earlier U+0336 combining-strikethrough pass was dropped after
+    /// a user report that fonts in the wild silently skip the overlay
+    /// glyph, leaving locked rows looking identical to available
+    /// ones; the older SGR 9 approach before that was eaten by the
+    /// TUI's CSI sanitizer entirely.
     #[test]
-    fn render_shows_locked_models_with_strikethrough() {
+    fn render_shows_locked_models_with_prefix_marker() {
         let avail = super::super::types::ModelEntry {
             id: 1,
             is_atomcode_exclusive: 0,
@@ -1595,6 +1888,7 @@ mod tests {
                 duplicate: false,
                 plan_type: PlanType::Lite,
             }),
+            claim_attempts: Vec::new(),
             models: StepResult::Ok(ModelsInfo {
                 display_names: vec!["lite/foo".into()],
                 provider_names: vec!["AtomGit".into()],
@@ -1609,25 +1903,26 @@ mod tests {
         assert!(out.contains("(CodingPlan Lite)"), "claim row must show tier:\n{out}");
         // Available model: standard provider line.
         assert!(out.contains("AtomGit") && out.contains("lite/foo"));
-        // Locked model: every char of the name is followed by U+0336
-        // combining strikethrough. We rebuild the expected sequence
-        // here rather than spelling it out so the test stays readable.
-        let struck_name: String = "max/super-secret"
-            .chars()
-            .flat_map(|c| [c, '\u{0336}'])
-            .collect();
+        // Locked model: `✘` prefix immediately before the name, plus
+        // the explicit `(require plan upgrade)` suffix. Two
+        // independent signals so a font lacking either glyph still
+        // leaves the meaning intact.
         assert!(
-            out.contains(&struck_name),
-            "locked model must have U+0336 strikethrough per char:\n{out}"
+            out.contains("✘ max/super-secret"),
+            "locked model must carry the ✘ prefix:\n{out}"
         );
-        // SGR 9 must NOT appear — the renderer's CSI sanitizer would
-        // delete it on the way to the terminal, and the previous SGR
-        // approach was the bug we're fixing.
+        assert!(out.contains("(require plan upgrade)"));
+        // No SGR / combining-mark legacy bytes — both prior
+        // strikethrough approaches were dropped and shouldn't sneak
+        // back via a future i18n edit.
         assert!(
             !out.contains("\x1b[9m"),
             "locked-model line must not emit SGR 9:\n{out}"
         );
-        assert!(out.contains("(require plan upgrade)"));
+        assert!(
+            !out.contains('\u{0336}'),
+            "locked-model line must not emit U+0336 combining strikethrough:\n{out}"
+        );
         // Locked model appears INSIDE the providers bullet list — its
         // line must come after the "Added N provider(s):" header and
         // before the next top-level section (Vision preprocessor /
@@ -1638,7 +1933,7 @@ mod tests {
             "no separate locked-model section expected:\n{out}"
         );
         let added_idx = out.find("Added 1 provider").expect("Added header");
-        let locked_idx = out.find(&struck_name).expect("locked model line");
+        let locked_idx = out.find("max/super-secret").expect("locked model line");
         let avail_idx = out.find("lite/foo").expect("available model line");
         assert!(
             locked_idx > added_idx,
