@@ -273,11 +273,19 @@ Then just type what you want:
 | `Ctrl+U` | Clear line |
 | `Ctrl+W` | Delete word |
 | `Ctrl+K` | Delete to end of line |
+| `Ctrl+V` | Paste image from clipboard (Windows: use `/paste`, see below) |
 
 > **Terminal compatibility for newline chords:**
 > - `Shift+Enter`, `Ctrl+Enter`, and `Ctrl+J` all need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals collapse them to plain `Enter` (which sends the message).
 > - `Alt+Enter` works at the byte level on most terminals, but **Windows Terminal binds it to "toggle full screen" by default** — remove that binding under Settings → Actions to free it up.
 > - Xshell does not support the Kitty protocol; in its keymap settings, map a free chord to send `ESC, Enter` (`\x1b\r`) to get the same effect, or paste multi-line text via the clipboard (bracketed paste is enabled).
+
+> **Pasting images on Windows:**
+> Windows Terminal and conhost bind `Ctrl+V` to their own `paste` action, which only forwards `CF_UNICODETEXT` from the clipboard — an image-only clipboard sends nothing, so the in-app `Ctrl+V` handler never fires. Two ways out:
+> 1. Use **`/paste`** — the slash command pulls the clipboard image and attaches it as `[Image #N]`. Works in every terminal, including Windows Terminal, PowerShell 7, conhost, and git bash. The TUI's bottom-right hint on Windows says `Image in clipboard · /paste` automatically.
+> 2. If you want `Ctrl+V` muscle memory: open Windows Terminal `settings.json` (`Ctrl+,` → "Open JSON file") and either delete the `{ "command": "paste", "keys": "ctrl+v" }` entry under `"actions"`, or rebind it to `ctrl+shift+v`. After a restart, `Ctrl+V` passes through to atomcode.
+>
+> Git Bash (MinTTY) doesn't intercept `Ctrl+V`, so it works there out of the box.
 
 ### Navigation
 
@@ -299,6 +307,7 @@ Then just type what you want:
 | `/model` | Switch model / provider |
 | `/login` | Login with AtomGit OAuth |
 | `/cd` | Change working directory |
+| `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
 | `/undo` | Undo last turn's edits |
 | `/diff` | Show git diff of current changes |
 | `/cost` | Show token usage for this session |
