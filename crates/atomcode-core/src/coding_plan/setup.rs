@@ -212,9 +212,9 @@ impl SetupReport {
                     info.display_names.iter().map(|s| s.as_str()).collect();
                 // Locked models render FIRST so the upgrade prompt is the
                 // first thing the eye lands on under "Added N providers:".
-                // Visual cue is an `✘` prefix matching the existing
-                // failure rows (`✘ CodingPlan Max claim failed — …`)
-                // plus the explicit `(require plan upgrade)` suffix —
+                // Visual cue is an `✗` prefix matching the existing
+                // failure rows (`✗ CodingPlan Max claim failed — …`)
+                // plus the explicit `(requires Pro plan or higher)` suffix —
                 // both plain text, so every renderer (alt-screen /
                 // retained / plain) and every terminal font carries
                 // the meaning. An earlier U+0336 combining strikethrough
@@ -752,7 +752,7 @@ fn step_models_and_register(
         .unwrap_or_else(|| PROVIDER_PREFIX.to_string());
 
     for (pname, m) in provider_names.iter().zip(available.iter()) {
-        let pc = build_codingplan_provider(&m.display_model_name);
+        let pc = build_codingplan_provider(m);
         config.providers.insert(pname.clone(), pc);
     }
     config.default_provider = default_provider.clone();
@@ -880,17 +880,40 @@ fn is_codingplan_provider_name(name: &str) -> bool {
     name == PROVIDER_PREFIX || name.starts_with(&format!("{}-", PROVIDER_PREFIX))
 }
 
-/// Build a ProviderConfig pointing at the AtomGit LLM gateway. `api_key`
-/// stays `None`: `create_provider()` loads the OAuth token at runtime.
-fn build_codingplan_provider(model: &str) -> ProviderConfig {
+/// Build a ProviderConfig from a model-list entry. The server's
+/// per-model fields take precedence; missing fields fall back to the
+/// historical constants (`LLM_BASE_URL` / `PROVIDER_TYPE` /
+/// `CONTEXT_WINDOW`) so older `models-v2` payloads without the new
+/// columns continue to work without code changes.
+///
+/// `api_key` stays `None` regardless — `create_provider()` loads the
+/// OAuth token at runtime via `auth.toml` so we never persist it into
+/// the user's `config.toml`.
+fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
     ProviderConfig {
-        provider_type: PROVIDER_TYPE.to_string(),
+        provider_type: entry
+            .provider_type
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| PROVIDER_TYPE.to_string()),
         api_key: None,
-        model: model.to_string(),
-        base_url: Some(LLM_BASE_URL.to_string()),
+        model: entry.display_model_name.clone(),
+        base_url: Some(
+            entry
+                .base_url
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| LLM_BASE_URL.to_string()),
+        ),
         system_prompt: None,
         user_agent: None,
-        context_window: CONTEXT_WINDOW,
+        // `context_window: 0` from a misconfigured row would degrade
+        // every request to a zero-token window; treat that as
+        // "missing" and fall back rather than ship a broken provider.
+        context_window: entry
+            .context_window
+            .filter(|n| *n > 0)
+            .unwrap_or(CONTEXT_WINDOW),
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
@@ -899,14 +922,28 @@ fn build_codingplan_provider(model: &str) -> ProviderConfig {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: false,
-
-}
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Build a `ModelEntry` for tests that only care about the
+    /// model name and want every other field to take its fallback
+    /// (`base_url` → `LLM_BASE_URL`, `provider_type` → `PROVIDER_TYPE`,
+    /// `context_window` → `CONTEXT_WINDOW`, `plan_available: true`).
+    /// Lets the bulk of the test suite stay short while the
+    /// per-field-override behaviour gets its own dedicated tests
+    /// further down.
+    fn entry(display_model_name: &str) -> super::super::types::ModelEntry {
+        super::super::types::ModelEntry {
+            display_model_name: display_model_name.to_string(),
+            plan_available: true,
+            ..Default::default()
+        }
+    }
 
     fn blank_config() -> Config {
         Config {
@@ -978,15 +1015,15 @@ mod tests {
         let mut config = blank_config();
         config.providers.insert(
             "AtomGit".to_string(),
-            build_codingplan_provider("stale-MiniMax"),
+            build_codingplan_provider(&entry("stale-MiniMax")),
         );
         config.providers.insert(
             "AtomGit-legacy".to_string(),
-            build_codingplan_provider("another-stale"),
+            build_codingplan_provider(&entry("another-stale")),
         );
         config.providers.insert(
             "claude".to_string(),
-            build_codingplan_provider("anthropic/claude-3.5"),
+            build_codingplan_provider(&entry("anthropic/claude-3.5")),
         );
 
         // Manually drive the "install" side without network — mirror
@@ -1005,7 +1042,7 @@ mod tests {
         for (pname, m) in provider_names.iter().zip(names.iter()) {
             config
                 .providers
-                .insert(pname.clone(), build_codingplan_provider(m));
+                .insert(pname.clone(), build_codingplan_provider(&entry(m)));
         }
         config.default_provider = provider_names[0].clone();
 
@@ -1031,7 +1068,11 @@ mod tests {
 
     #[test]
     fn build_provider_uses_canonical_defaults() {
-        let p = build_codingplan_provider("foo/bar");
+        // All optional server fields missing → fall back to the
+        // historical constants. Pins the back-compat path for
+        // older `models-v2` builds that don't yet emit `base_url`,
+        // `type`, or `context_window`.
+        let p = build_codingplan_provider(&entry("foo/bar"));
         assert_eq!(p.provider_type, "openai");
         assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
         assert_eq!(p.context_window, 64_000);
@@ -1040,6 +1081,96 @@ mod tests {
             "token loaded at runtime from auth.toml"
         );
         assert!(!p.ephemeral);
+    }
+
+    #[test]
+    fn build_provider_uses_server_overrides_when_present() {
+        // Per-model server fields take precedence over the
+        // hard-coded fallbacks. Mirrors the new wire shape:
+        // `base_url`, `type`, `context_window` all populated.
+        let e = super::super::types::ModelEntry {
+            id: 2052994857682014210,
+            is_infinity: 2,
+            is_atomcode_exclusive: 1,
+            display_model_name: "GLM-5.1".into(),
+            base_url: Some("https://custom.example.com/v1".into()),
+            provider_type: Some("claude".into()),
+            context_window: Some(128_000),
+            plan_available: true,
+        };
+        let p = build_codingplan_provider(&e);
+        assert_eq!(p.model, "GLM-5.1");
+        assert_eq!(p.provider_type, "claude");
+        assert_eq!(p.base_url.as_deref(), Some("https://custom.example.com/v1"));
+        assert_eq!(p.context_window, 128_000);
+    }
+
+    #[test]
+    fn build_provider_treats_empty_or_zero_overrides_as_missing() {
+        // Defensive: a malformed server row (empty string base_url /
+        // type, zero context window) shouldn't ship a provider that
+        // refuses every request. Fall back to constants instead.
+        let e = super::super::types::ModelEntry {
+            display_model_name: "weird".into(),
+            base_url: Some(String::new()),
+            provider_type: Some(String::new()),
+            context_window: Some(0),
+            plan_available: true,
+            ..Default::default()
+        };
+        let p = build_codingplan_provider(&e);
+        assert_eq!(p.provider_type, "openai");
+        assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
+        assert_eq!(p.context_window, 64_000);
+    }
+
+    #[test]
+    fn model_entry_deserialises_new_wire_shape() {
+        // The exact JSON payload from the spec —
+        // every new field must parse without error.
+        let raw = r#"[{
+            "id": 2052994857682014210,
+            "is_infinity": 2,
+            "is_atomcode_exclusive": 1,
+            "display_model_name": "GLM-5.1",
+            "base_url": "https://api-ai.gitcode.com/v1",
+            "type": "openai",
+            "context_window": 64000,
+            "plan_available": true
+        }]"#;
+        let list: Vec<super::super::types::ModelEntry> =
+            serde_json::from_str(raw).expect("payload deserialises");
+        assert_eq!(list.len(), 1);
+        let m = &list[0];
+        assert_eq!(m.id, 2052994857682014210);
+        assert_eq!(m.is_infinity, 2);
+        assert_eq!(m.is_atomcode_exclusive, 1);
+        assert_eq!(m.display_model_name, "GLM-5.1");
+        assert_eq!(m.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
+        assert_eq!(m.provider_type.as_deref(), Some("openai"));
+        assert_eq!(m.context_window, Some(64_000));
+        assert!(m.plan_available);
+    }
+
+    #[test]
+    fn model_entry_deserialises_legacy_wire_shape() {
+        // Older server build with only the v2-minimum fields. New
+        // fields default to `None` / `0` so older payloads keep
+        // working — the orchestrator falls back to the constants.
+        let raw = r#"[{
+            "id": 1,
+            "is_atomcode_exclusive": 0,
+            "display_model_name": "legacy/model",
+            "plan_available": true
+        }]"#;
+        let list: Vec<super::super::types::ModelEntry> =
+            serde_json::from_str(raw).expect("legacy payload deserialises");
+        let m = &list[0];
+        assert_eq!(m.display_model_name, "legacy/model");
+        assert!(m.base_url.is_none());
+        assert!(m.provider_type.is_none());
+        assert!(m.context_window.is_none());
+        assert_eq!(m.is_infinity, 0);
     }
 
     /// Render exercise: every step Ok. Verifies the three-line output
@@ -1094,7 +1225,7 @@ mod tests {
             }),
         };
         let out = report.render();
-        assert!(out.contains("✔ Logged in as Theo"));
+        assert!(out.contains("✓ Logged in as Theo"));
         assert!(out.contains("theo@example.com"));
         assert!(out.contains("CodingPlan claimed"));
         assert!(out.contains("Kimi-K2-Instruct"));
@@ -1123,12 +1254,12 @@ mod tests {
             status: StepResult::Err("request timeout".into()),
         };
         let out = report.render();
-        assert!(out.contains("✔ already logged in"));
+        assert!(out.contains("✓ already logged in"));
         assert!(out.contains("already claimed"));
-        assert!(!out.contains("✘ CodingPlan claim"), "duplicate ≠ failure");
-        // Status failed but it's warn-only: ⚠ prefix, NOT ✘.
+        assert!(!out.contains("✗ CodingPlan claim"), "duplicate ≠ failure");
+        // Status failed but it's warn-only: ⚠ prefix, NOT ✗.
         assert!(out.contains("⚠ Status fetch failed"));
-        assert!(!out.contains("✘ Status"));
+        assert!(!out.contains("✗ Status"));
         // Login skipped + models ok ⇒ config should still be persisted.
         assert!(report.should_persist_config());
     }
@@ -1206,7 +1337,7 @@ mod tests {
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         };
         let out = report.render();
-        assert!(out.contains("✘ Login failed"));
+        assert!(out.contains("✗ Login failed"));
         // Cascade rows must NOT appear.
         assert!(!out.contains("CodingPlan claim"), "no cascade claim row on login fail");
         assert!(!out.contains("Models step"), "no cascade models row on login fail");
@@ -1383,7 +1514,7 @@ mod tests {
             );
         }
         // Overall claim is Err but with claim_attempts populated, the
-        // legacy "✘ CodingPlan claim failed — ..." summary line is
+        // legacy "✗ CodingPlan claim failed — ..." summary line is
         // suppressed (per-tier rows already explain the failure).
         assert!(
             !out.contains("claim failed at every tier"),
@@ -1490,7 +1621,7 @@ mod tests {
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
         };
         let out = report.render();
-        assert!(out.contains("✘ CodingPlan claim failed"));
+        assert!(out.contains("✗ CodingPlan claim failed"));
         assert!(out.contains("今日codingplan申请额度已满"));
         // The cascade rows must NOT appear.
         assert!(!out.contains("Models step skipped"), "no cascade row for models");
@@ -1587,7 +1718,6 @@ mod tests {
     fn vl_model_entry(model: &str) -> super::super::types::ModelEntry {
         super::super::types::ModelEntry {
             id: 1,
-            is_atomcode_exclusive: 0,
             display_model_name: model.to_string(),
             // Tests in this section drive `run_register` directly with
             // a curated `Vec<ModelEntry>` — they're testing the
@@ -1595,6 +1725,11 @@ mod tests {
             // "available". The split-by-`plan_available` happens
             // upstream in the real `step_models_and_register`.
             plan_available: true,
+            // The new wire-shape optional fields default to None/0 —
+            // these tests only care about the model name and the
+            // availability flag, so let them fall back to the
+            // constants via `Default`.
+            ..Default::default()
         }
     }
 
@@ -1623,7 +1758,7 @@ mod tests {
         for (pname, m) in provider_names.iter().zip(models.iter()) {
             config
                 .providers
-                .insert(pname.clone(), build_codingplan_provider(&m.display_model_name));
+                .insert(pname.clone(), build_codingplan_provider(m));
         }
         config.default_provider = default_provider.clone();
 
@@ -1855,31 +1990,42 @@ mod tests {
     }
 
     /// Locked models (plan_available=false on a higher tier) must
-    /// surface in the rendered report with a distinctive `✘` prefix
-    /// + the explicit "(require plan upgrade)" suffix, appended to
-    /// the same `Added N provider(s)` bullet list as the available
-    /// models so users see the full slate at a glance. Pins the v2
-    /// spec's "若不可用的模型也展示出来" requirement. Prefix matches
-    /// the existing CodingPlan failure rows (`✘ CodingPlan Max
-    /// claim failed — …`) so the visual language is consistent. An
-    /// earlier U+0336 combining-strikethrough pass was dropped after
-    /// a user report that fonts in the wild silently skip the overlay
-    /// glyph, leaving locked rows looking identical to available
-    /// ones; the older SGR 9 approach before that was eaten by the
-    /// TUI's CSI sanitizer entirely.
+    /// surface in the rendered report with a distinctive `✗` prefix
+    /// + the explicit "(requires Pro plan or higher)" suffix, the whole row
+    /// wrapped in SGR 31 (terminal-theme red), and appended to the
+    /// same `Added N provider(s)` bullet list as the available models
+    /// so users see the full slate at a glance. Pins the v2 spec's
+    /// "若不可用的模型也展示出来" requirement.
+    ///
+    /// Three layered signals — colour, prefix glyph, suffix text —
+    /// because each can fail independently:
+    ///   * SGR 31 only fires when the renderer's sanitizer keeps SGR
+    ///     (alt_screen, plain) — retained's strict strip pathway
+    ///     drops the colour but the glyph + text still carry the
+    ///     meaning.
+    ///   * The `✗` glyph relies on font support (every common
+    ///     terminal font has it; this is the strongest of the three).
+    ///   * The "(requires Pro plan or higher)" suffix is plain ASCII / CJK
+    ///     and survives even font-fallback-tofu rendering.
+    ///
+    /// Earlier attempts at strikethrough (SGR 9 then U+0336
+    /// combining mark) were both dropped — SGR 9 was eaten by the
+    /// universal CSI sanitizer, and U+0336 was silently skipped by
+    /// some fonts in the wild — so this test also pins that those
+    /// markers do NOT regress back into the template.
     #[test]
     fn render_shows_locked_models_with_prefix_marker() {
         let avail = super::super::types::ModelEntry {
             id: 1,
-            is_atomcode_exclusive: 0,
             display_model_name: "lite/foo".into(),
             plan_available: true,
+            ..Default::default()
         };
         let locked = super::super::types::ModelEntry {
             id: 2,
-            is_atomcode_exclusive: 0,
             display_model_name: "max/super-secret".into(),
             plan_available: false,
+            ..Default::default()
         };
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
@@ -1903,21 +2049,21 @@ mod tests {
         assert!(out.contains("(CodingPlan Lite)"), "claim row must show tier:\n{out}");
         // Available model: standard provider line.
         assert!(out.contains("AtomGit") && out.contains("lite/foo"));
-        // Locked model: `✘` prefix immediately before the name, plus
-        // the explicit `(require plan upgrade)` suffix. Two
-        // independent signals so a font lacking either glyph still
-        // leaves the meaning intact.
+        // Locked model: `✗` prefix immediately before the name, plus
+        // the explicit `(requires Pro plan or higher)` suffix, all wrapped
+        // in SGR 31 (red fg) → SGR 39 (default fg) so the terminal
+        // renders the whole row in the theme's red.
         assert!(
-            out.contains("✘ max/super-secret"),
-            "locked model must carry the ✘ prefix:\n{out}"
+            out.contains("\x1b[31m✗ max/super-secret"),
+            "locked model must open with SGR 31 + ✗ prefix:\n{out}"
         );
-        assert!(out.contains("(require plan upgrade)"));
-        // No SGR / combining-mark legacy bytes — both prior
-        // strikethrough approaches were dropped and shouldn't sneak
-        // back via a future i18n edit.
+        assert!(out.contains("(requires Pro plan or higher)\x1b[39m"));
+        // Strikethrough is intentionally NOT used (SGR 9 was eaten by
+        // the renderer's CSI sanitizer; U+0336 was font-dependent and
+        // silently dropped on some setups). Lock those decisions in.
         assert!(
             !out.contains("\x1b[9m"),
-            "locked-model line must not emit SGR 9:\n{out}"
+            "locked-model line must not emit SGR 9 strikethrough:\n{out}"
         );
         assert!(
             !out.contains('\u{0336}'),

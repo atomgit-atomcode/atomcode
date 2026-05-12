@@ -58,21 +58,63 @@ pub struct ClaimResponse {
     pub message: String,
 }
 
-/// `GET /api/v5/coding-plan/models-v2` element. Wire shape per the v2
-/// spec: `is_infinity` (which gated availability in v1) is gone — the
-/// server now computes the eligibility check itself and exposes the
-/// result via `plan_available`. `id` and `is_atomcode_exclusive` map
-/// straight from `ami_chat_model.id` / `ami_chat_model.is_atomcode_exclusive`.
-#[derive(Debug, Clone, Deserialize)]
+/// `GET /api/v5/coding-plan/models-v2` element. Wire shape:
+///
+/// ```json
+/// {
+///   "id": 2052994857682014210,
+///   "is_infinity": 2,
+///   "is_atomcode_exclusive": 1,
+///   "display_model_name": "GLM-5.1",
+///   "base_url": "https://api-ai.gitcode.com/v1",
+///   "type": "openai",
+///   "context_window": 64000,
+///   "plan_available": true
+/// }
+/// ```
+///
+/// Every field is `#[serde(default)]` so an older server that
+/// omits a key still deserialises (atomcode falls back to the
+/// constants in `coding_plan::setup` — `LLM_BASE_URL`,
+/// `PROVIDER_TYPE`, `CONTEXT_WINDOW`). The eligibility check
+/// (whether the user's plan tier actually covers this model)
+/// lives in `plan_available`, the server-side decision —
+/// `is_infinity` and `is_atomcode_exclusive` are flagged
+/// for metadata / future routing.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelEntry {
     #[serde(default)]
     pub id: i64,
+    /// Unlimited-quota flag (`2` = unlimited, else gated). Server
+    /// metadata; atomcode doesn't act on it — `plan_available`
+    /// already encodes whether the current user can call this
+    /// model. Kept on the struct for forward-compat with whatever
+    /// the server eventually surfaces via this field.
+    #[serde(default)]
+    pub is_infinity: u8,
     #[serde(default)]
     pub is_atomcode_exclusive: u8,
     /// Human-readable model name, often of the form `org/model`.
     /// Used verbatim in the provider's `model` field.
     #[serde(default)]
     pub display_model_name: String,
+    /// LLM gateway base URL. `None` (key omitted on older server
+    /// builds) falls back to `coding_plan::setup::LLM_BASE_URL`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Provider type — `"openai"` / `"claude"` / `"ollama"`. Renamed
+    /// via serde because `type` is a Rust keyword. `None` falls
+    /// back to `coding_plan::setup::PROVIDER_TYPE` (`"openai"` — the
+    /// AtomGit gateway is OpenAI-compatible by default).
+    #[serde(default, rename = "type")]
+    pub provider_type: Option<String>,
+    /// Per-model context window in tokens. `None` falls back to
+    /// `coding_plan::setup::CONTEXT_WINDOW` (the 64k value the
+    /// legacy `/login` flow hard-coded). Letting the server drive
+    /// this lets bigger models (e.g. GLM-4.6 128k) avoid being
+    /// silently truncated to the historical default.
+    #[serde(default)]
+    pub context_window: Option<usize>,
     /// `true` iff the user's current plan tier (the one their `claim-v2`
     /// succeeded on) covers this model. `false` means it's a higher-tier
     /// model — show with strikethrough but DON'T register as a provider
