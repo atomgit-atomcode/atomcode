@@ -1430,6 +1430,34 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
+    /// SGR-aware variant of `push_body_text` for **trusted** content
+    /// that may carry inline `\x1b[...m` colour / bold / faint /
+    /// reverse spans (e.g. the `/codingplan` setup report's red
+    /// locked-model rows). Splits on `\n`, wraps each physical line,
+    /// and feeds each chunk through `push_str_cells_sgr` so the
+    /// working style mutates as cells are produced. SGR state resets
+    /// at every `\n` so a forgotten reset doesn't bleed colour into
+    /// the next logical row.
+    ///
+    /// Only used from the `UiLine::CommandOutput` arm — every other
+    /// caller has plain text and stays on the simpler
+    /// `push_body_text`.
+    fn push_body_text_sgr(&mut self, text: &str) {
+        let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+        if w == 0 {
+            return;
+        }
+        for phys in text.split('\n') {
+            let mut style = CellStyle::default();
+            for chunk in crate::width::wrap_line_to_width(phys, w) {
+                let mut row = Vec::new();
+                push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
+                style = crate::render::cell::push_str_cells_sgr(&mut row, &chunk, style);
+                self.push_body_row(row);
+            }
+        }
+    }
+
     /// Build one row with a leading `prefix` (often an accent
     /// glyph with its own style) and a plain-styled body. Used by
     /// User echo ("> …"), ToolCall ("▸ name(detail)"), etc.
@@ -2357,8 +2385,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text(&body, &warn_style);
             }
             UiLine::CommandOutput(text) => {
-                let safe = scrub_controls(&text);
-                self.push_body_text(&safe, &CellStyle::default());
+                // CommandOutput is trusted internal text — let SGR
+                // through the sanitizer so colour / bold / faint
+                // attributes survive (e.g. the `/codingplan` red
+                // locked-model row). `push_body_text_sgr` parses
+                // those escapes into `CellStyle` mutations so the
+                // cell pipeline renders the same colours alt_screen
+                // and plain do.
+                let safe = crate::sanitize::scrub_controls_keep_sgr(&text);
+                self.push_body_text_sgr(&safe);
             }
             UiLine::ImageAttachment(n) => {
                 // `└` at col 2, under the `[` of `[Image #N]` in the
@@ -6290,5 +6325,68 @@ mod tests {
             baseline + 2,
             "two attachments must add exactly two preview rows"
         );
+    }
+
+    /// Regression: SGR (`\x1b[31m…\x1b[39m`) embedded in a
+    /// `UiLine::CommandOutput` payload — emitted by the `/codingplan`
+    /// SetupReport for locked-model rows — must reach the cell grid
+    /// as a `CellStyle::fg = Some(DarkRed)` span rather than landing
+    /// as literal `^[[31m` characters. Without the SGR-aware
+    /// CommandOutput path in retained-mode, locked rows render
+    /// without the colour cue, defeating the visual signal the user
+    /// asked for.
+    #[test]
+    fn retained_command_output_renders_sgr_colour() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        // Construct the exact byte sequence the `Msg::CpLocked`
+        // template produces: red-fg open, visible content, default-fg
+        // close. PAD_COL (2 spaces) on the left is added by
+        // push_body_text_sgr; the template-level 6-space indent stays
+        // on the visible side.
+        let line = "      \x1b[31m✗ GLM-5.1  (requires Pro plan or higher)\x1b[39m\n";
+        r.render(UiLine::CommandOutput(line.into()));
+
+        // Find the row containing the locked-model name and check
+        // every glyph cell up to the closing SGR is DarkRed.
+        let mut found_red = false;
+        for row in &r.body_lines {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            if text.contains("GLM-5.1") {
+                for cell in row {
+                    // Skip the leading PAD_COL spaces (no colour applied
+                    // before SGR fires) — only assert the styled span.
+                    if cell.ch == ' ' && cell.style.fg.is_none() {
+                        continue;
+                    }
+                    assert_eq!(
+                        cell.style.fg,
+                        Some(Color::DarkRed),
+                        "cell '{}' in locked row must carry DarkRed fg, got {:?}",
+                        cell.ch, cell.style.fg,
+                    );
+                }
+                found_red = true;
+                break;
+            }
+        }
+        assert!(
+            found_red,
+            "no row containing 'GLM-5.1' found in body_lines:\n{:?}",
+            r.body_lines
+                .iter()
+                .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+
+        // And the raw `^[[31m` characters must NOT appear as cells —
+        // that's the bug we're guarding against.
+        for row in &r.body_lines {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            assert!(
+                !text.contains("[31m"),
+                "SGR bytes leaked into cells as literal text: {:?}",
+                text,
+            );
+        }
     }
 }

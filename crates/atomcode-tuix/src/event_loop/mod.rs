@@ -122,6 +122,21 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     None
 }
 
+/// Pull plain text off the system clipboard for the Ctrl+V → text-paste
+/// fallback. Returns `None` when arboard fails to open the clipboard
+/// or the clipboard holds no text — the caller is expected to swallow
+/// the keystroke in that case rather than insert a literal `v`.
+///
+/// Why a dedicated helper instead of inlining `arboard::Clipboard::new`:
+/// the Ctrl+V branch already shells out to `try_paste_clipboard_image`,
+/// which itself opens a fresh `Clipboard` handle; symmetry keeps the
+/// two call sites readable, and the helper drops the handle promptly
+/// (some Windows clipboards lock briefly after a read).
+fn try_paste_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get_text().ok().filter(|s| !s.is_empty())
+}
+
 /// Read NSPasteboard's `public.file-url` type and return the decoded
 /// filesystem path. Returns `None` when the type isn't on the
 /// pasteboard, the value isn't a `file://` URL, or percent-decoding
@@ -1240,6 +1255,48 @@ mod buffer_tests {
         assert!(!out.contains("[Pasted"));
     }
 
+    /// Regression: `clear_pastes` then `expand_pastes` is the broken
+    /// ordering that shipped before — the agent received the bare
+    /// `[Pasted #N +M lines]` placeholder instead of the pasted body
+    /// and (correctly) responded "I don't see any pasted content".
+    /// Callers MUST expand FIRST, clear SECOND. This test pins that
+    /// contract: if someone reintroduces an early clear, the
+    /// substitution silently turns into a no-op and the
+    /// `contains("important data")` assertion below catches it.
+    #[test]
+    fn clear_before_expand_loses_paste_body() {
+        let mut b = Buffer::new();
+        let body = "important data\n".repeat(200);
+        b.insert_paste(body.clone());
+        let line = b.text.clone();
+        // Mis-ordered: clear first.
+        b.clear_pastes();
+        let expanded = b.expand_pastes(&line);
+        assert!(
+            expanded.contains("[Pasted #1"),
+            "early-clear must leave the placeholder unsubstituted: {}",
+            expanded
+        );
+        assert!(
+            !expanded.contains("important data"),
+            "early-clear must NOT magically still have the body: {}",
+            expanded
+        );
+
+        // Sanity check the correct order: expand first, then clear.
+        let mut b = Buffer::new();
+        b.insert_paste(body.clone());
+        let line = b.text.clone();
+        let expanded = b.expand_pastes(&line);
+        b.clear_pastes();
+        assert!(
+            expanded.contains("important data"),
+            "expand-before-clear must surface the body: {}",
+            &expanded[..expanded.len().min(120)]
+        );
+        assert!(b.pastes.is_empty(), "clear after expand must still empty the registry");
+    }
+
     #[test]
     fn submit_with_trailing_backslash_inserts_newline() {
         // WSL + Windows Terminal swallows Shift/Ctrl/Alt+Enter, so we
@@ -2131,7 +2188,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
-    // printing to stdout, so the user sees the ✔/✘ lines in the chat
+    // printing to stdout, so the user sees the ✓/✗ lines in the chat
     // scrollback rather than scrolled off above the welcome banner.
     if let Ok(report) = std::env::var("ATOMCODE_CODINGPLAN_REPORT") {
         std::env::remove_var("ATOMCODE_CODINGPLAN_REPORT");
@@ -3062,6 +3119,38 @@ fn attach_image_to_input(
     Ok(true)
 }
 
+/// `/paste` slash-command handler. Exists for Windows users whose
+/// Ctrl+V is intercepted by Windows Terminal / conhost before the
+/// keystroke reaches atomcode — the terminal-layer `paste` action
+/// only forwards `CF_UNICODETEXT`, so an image-only clipboard never
+/// triggers the in-app `KeyCode::Char('v') + CONTROL` branch.
+/// `/paste` invokes the same `try_paste_clipboard_image` →
+/// `attach_image_to_input` pipeline directly, bypassing the
+/// terminal's keybinds. Works on every platform — Windows / macOS /
+/// Linux / git-bash — so it doubles as a discoverable backup
+/// regardless of how Ctrl+V is configured locally. Falls back to a
+/// scrollback error line when the clipboard has no image so the
+/// user isn't left wondering whether the command did anything.
+fn handle_paste_command(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+) -> Result<()> {
+    let img_hash = try_paste_clipboard_image();
+    if img_hash.is_none() {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
+        ));
+        renderer.flush();
+        if matches!(app.state.phase, UiPhase::Idle) {
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        return Ok(());
+    }
+    attach_image_to_input(app, ctx, renderer, img_hash)?;
+    Ok(())
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -3372,9 +3461,27 @@ fn handle_input(
                 if attach_image_to_input(app, ctx, renderer, img_hash)? {
                     return Ok(());
                 }
-                // No image on the clipboard — Ctrl+V has no other
-                // binding (key_action::classify maps it to NoOp), so
-                // swallow silently rather than insert a literal `v`.
+                // No image — fall back to clipboard text. Reaching this
+                // branch means the host terminal forwarded Ctrl+V as a
+                // real `\x16` key event rather than intercepting it as
+                // bracketed paste or character injection (classic
+                // conhost / older Windows Terminal configs / WT after
+                // the user removed the `paste` keybind per our Windows
+                // docs all hit this path). Without this fallback the
+                // keystroke is silently swallowed and the user's text
+                // paste disappears — a regression from before the
+                // Ctrl+V → image handler existed.
+                //
+                // Routing through `InputEvent::Paste` instead of
+                // `app.buf.insert_paste` directly so we get the modal-
+                // first dispatch, the image-from-path check, and the
+                // Streaming-vs-Idle redraw branching for free.
+                if let Some(text) = try_paste_clipboard_text() {
+                    return handle_input(app, ctx, renderer, InputEvent::Paste(text));
+                }
+                // Empty clipboard — Ctrl+V has no other binding
+                // (key_action::classify maps it to NoOp), so swallow
+                // silently rather than insert a literal `v`.
                 return Ok(());
             }
 
@@ -3805,16 +3912,24 @@ fn handle_idle_key(
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(
-                        cmd,
-                        arg,
-                        &mut app.state,
-                        ctx,
-                        renderer,
-                        &mut app.active_modal,
-                        &mut app.fixissue_pending,
-                        &mut app.fixissue_buffer,
-                    )?;
+                    if cmd.eq_ignore_ascii_case("paste") {
+                        // `/paste` needs `&mut app.buf` to insert the
+                        // `[Image #N]` marker at the cursor, which the
+                        // `execute_slash_command` signature doesn't
+                        // expose; short-circuit to the local handler.
+                        handle_paste_command(app, ctx, renderer)?;
+                    } else {
+                        execute_slash_command(
+                            cmd,
+                            arg,
+                            &mut app.state,
+                            ctx,
+                            renderer,
+                            &mut app.active_modal,
+                            &mut app.fixissue_pending,
+                            &mut app.fixissue_buffer,
+                        )?;
+                    }
                     if matches!(app.state.phase, UiPhase::Idle) {
                         redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                     }
@@ -3952,7 +4067,14 @@ fn handle_idle_key(
             renderer.render(UiLine::ClearTransient);
             app.buf.text.clear();
             app.buf.cursor = 0;
-            app.buf.clear_pastes();
+            // NB: `app.buf.clear_pastes()` is deferred until AFTER the
+            // submit path calls `expand_pastes(&line)` — wiping the
+            // paste Vec here used to leave `expand_pastes` with
+            // nothing to substitute, so the agent received the raw
+            // `[Pasted #N +M lines]` placeholder instead of the
+            // pasted body and answered "I don't see any pasted
+            // content". Mirrors the queue branch below which already
+            // clears AFTER expansion.
             app.menu.selected = 0;
             // Only treat `/name …` as a slash command when `name` is
             // actually registered. Unrecognised `/foo …` (e.g. the user
@@ -3974,19 +4096,31 @@ fn handle_idle_key(
                 // Slash commands carry no image markers — echo the
                 // user line as-typed, before dispatch.
                 renderer.render(UiLine::User(line.clone()));
-                execute_slash_command(
-                    cmd,
-                    arg,
-                    &mut app.state,
-                    ctx,
-                    renderer,
-                    &mut app.active_modal,
-                    &mut app.fixissue_pending,
-                    &mut app.fixissue_buffer,
-                )?;
+                if cmd.eq_ignore_ascii_case("paste") {
+                    // See `handle_paste_command` — short-circuited
+                    // here because the dispatcher signature can't
+                    // hand it `&mut app.buf`.
+                    handle_paste_command(app, ctx, renderer)?;
+                } else {
+                    execute_slash_command(
+                        cmd,
+                        arg,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                        &mut app.fixissue_pending,
+                        &mut app.fixissue_buffer,
+                    )?;
+                }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
+                // Slash commands don't consume pastes (they take a
+                // single short arg, not a pasted body), but the submit
+                // semantically consumes the buffer — drop them so the
+                // next message starts with a clean paste registry.
+                app.buf.clear_pastes();
             } else {
                 // Hydrate recalled attachments BEFORE echoing the user
                 // line, so `[Image #N]` markers in the visible body
@@ -4004,6 +4138,12 @@ fn handle_idle_key(
                 }
                 renderer.render(UiLine::User(line.clone()));
                 let expanded = app.buf.expand_pastes(&line);
+                // Pastes have now been substituted into `expanded`;
+                // safe to drop the registry. Doing it any earlier
+                // (e.g. up at the buf.text.clear() prep) was the
+                // exact bug that made the agent see only the
+                // `[Pasted #N]` placeholder.
+                app.buf.clear_pastes();
                 // Cache the full expanded form before dispatch. If the
                 // user hits Ctrl+C / Esc mid-stream, `handle_streaming_key`
                 // takes this Option and restores it to `app.buf.text`
@@ -4202,8 +4342,8 @@ mod parse_already_latest_versions_tests {
     use super::parse_already_latest_versions;
     #[test]
     fn extracts_both_versions() {
-        let s = "already on v4.22.0 (latest is v4.22.0). Pass --force to reinstall.";
-        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.0", "v4.22.0")));
+        let s = "already on v4.22.1 (latest is v4.22.1). Pass --force to reinstall.";
+        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.1", "v4.22.1")));
     }
     #[test]
     fn rejects_unrelated_strings() {
@@ -5153,7 +5293,7 @@ fn handle_agent_event(
                 } else {
                     match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &body) {
                         Ok(()) => renderer.render(UiLine::CommandOutput(format!(
-                            "  [fixissue] ✔ posted summary + applied 'fixed' label to issue #{}\n",
+                            "  [fixissue] ✓ posted summary + applied 'fixed' label to issue #{}\n",
                             issue_ref.number
                         ))),
                         Err(e) => renderer.render(UiLine::CommandOutput(format!(
@@ -5711,8 +5851,19 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         // just attach a dup. A NEW image (different fingerprint) appears
         // here as a fresh hint so the user can attach it too.
         let _ = h;
+        // Windows Terminal / conhost swallow Ctrl+V (they bind it to
+        // their own `paste` action that only forwards CF_UNICODETEXT,
+        // so an image-only clipboard never reaches the in-app
+        // handler). Surface the `/paste` fallback on Windows; macOS /
+        // Linux terminals pass Ctrl+V through cleanly, so they keep
+        // the snappier keybind hint.
+        let hint_msg = if cfg!(target_os = "windows") {
+            crate::i18n::Msg::StatusClipboardImageHintSlash
+        } else {
+            crate::i18n::Msg::StatusClipboardImageHint
+        };
         Some((
-            crate::i18n::t(crate::i18n::Msg::StatusClipboardImageHint).into_owned(),
+            crate::i18n::t(hint_msg).into_owned(),
             crate::render::HintSeverity::Info,
         ))
     } else {

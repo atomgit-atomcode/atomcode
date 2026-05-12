@@ -112,6 +112,14 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // dispatched by the `skills` arm in execute_slash_command.
     Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
     Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
+    // Windows fallback for Ctrl+V: Windows Terminal / conhost
+    // intercept Ctrl+V as their own `paste` action (which forwards
+    // only `CF_UNICODETEXT`) before the keystroke reaches atomcode,
+    // so an image-only clipboard never triggers the in-app handler.
+    // `/paste` calls the same `try_paste_clipboard_image` →
+    // `attach_image_to_input` pipeline directly so the user has a
+    // terminal-agnostic way to attach an image. Works on every OS.
+    Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false },
 ];
 
 /// Look up the i18n translation for a built-in command description.
@@ -157,6 +165,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "quit" => Msg::CmdDescQuit,
         "skills" => Msg::CmdDescSkills,
         "plugin" => Msg::CmdDescPlugin,
+        "paste" => Msg::CmdDescPaste,
         _ => return None,
     };
     Some(t(msg))

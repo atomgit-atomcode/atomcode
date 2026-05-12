@@ -835,9 +835,10 @@ impl AgentLoop {
                     self.cancel_token.cancel();
                     self.cancel_token = CancellationToken::new();
                     self.phase = AgentPhase::Idle;
-                    // Cancel the current turn - remove partial messages from conversation
+                    // Cancel the current turn — preserve completed content, backfill
+                    // (cancelled) for unpaired tool calls, and mark turn as Completed.
                     self.conversation.cancel_current_turn();
-                    // Sync the cleaned messages to TUI
+                    // Sync the preserved messages to TUI
                     let messages = self.conversation.messages.clone();
                     let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
                 }
@@ -2181,12 +2182,12 @@ impl AgentLoop {
                 }
                 TurnResult::Cancelled => {
                     // Check if turn was already cancelled by AgentCommand::Cancel
-                    // (which removes the turn from tracker immediately)
+                    // (which marks the turn as Completed immediately)
                     if self.conversation.turn_tracker.active_turn().is_none() {
                         // Already handled by AgentCommand::Cancel - just return
                         return;
                     }
-                    // Remove the current turn's messages before saving
+                    // Preserve completed content + backfill (cancelled) for unpaired tool calls
                     self.conversation.cancel_current_turn();
                     // Send TurnCancelled event for TUI to sync
                     let messages = self.conversation.messages.clone();
@@ -2196,7 +2197,8 @@ impl AgentLoop {
                     // TurnComplete on top buffers a stale "✓ done · N rounds" line
                     // that fires the next time the TUI's phase becomes Streaming —
                     // i.e. right after the user's next submission.
-                    self.conversation.turn_tracker.complete_current();
+                    // Note: cancel_current_turn() already marks the turn Completed,
+                    // so complete_current() is a no-op; kept as defensive safety net.
                     self.datalog
                         .end_turn(self.turn_tokens, self.tool_call_count);
                     self.turn_start = None;
@@ -2586,7 +2588,7 @@ impl AgentLoop {
         // accurate stats for the UI's "✓ Nailed it · N rounds · M tok"
         // line. `start_turn` resets them for the next message.
         if matches!(stop_reason, TurnStopReason::Error) {
-            self.conversation.cancel_current_turn();
+            self.conversation.cancel_current_turn_including_user();
         } else {
             self.conversation.turn_tracker.complete_current();
         }

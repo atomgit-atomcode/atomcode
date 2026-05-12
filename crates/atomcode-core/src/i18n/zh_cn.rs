@@ -20,39 +20,48 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan 配置：\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
-            format!("  ✔ 已登录：{} ({}，{})\n", who, username, email).into(),
+            format!("  ✓ 已登录：{} ({}，{})\n", who, username, email).into(),
         Msg::CpStepSkipped { reason } =>
-            format!("  ✔ {}\n", reason).into(),
+            format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✘ 登录失败 — {}\n", error).into(),
+            format!("  ✗ 登录失败 — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
-            format!("  ✔ CodingPlan 已领取 — {}（CodingPlan {}）\n", message, plan_type).into(),
+            format!("  ✓ CodingPlan 已领取 — {}（CodingPlan {}）\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "成功".into(),
         Msg::CpAlreadyClaimed { reason } =>
-            format!("  ✔ CodingPlan 已领取 — {}\n", reason).into(),
+            format!("  ✓ CodingPlan 已领取 — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✘ CodingPlan 领取失败 — {}\n", error).into(),
+            format!("  ✗ CodingPlan 领取失败 — {}\n", error).into(),
+        Msg::CpClaimTierSucceeded { tier } =>
+            format!("  ✓ CodingPlan {} 领取成功\n", tier).into(),
+        Msg::CpClaimTierAlreadyHeld { tier } =>
+            format!("  ✓ CodingPlan {} 已领取\n", tier).into(),
+        Msg::CpClaimTierFailed { tier, reason } =>
+            format!("  ✗ CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
-            format!("  ✔ 已添加 {} 个 Provider：\n", count).into(),
-        Msg::CpLockedJediterm { name } =>
-            format!("      ✗ {}  （已锁定：需要升级套餐）\n", name).into(),
-        Msg::CpLockedAnsi { name } =>
-            format!("      • \x1b[9m{}\x1b[29m  （需要升级套餐）\n", name).into(),
+            format!("  ✓ 已添加 {} 个 Provider：\n", count).into(),
+        Msg::CpLocked { name } =>
+            // SGR 31 / 39 = 标准红前景 + 默认色重置。用标准色（不
+            // 是亮色）让终端按当前主题映射 —— Solarized / Dracula /
+            // 浅色模式都会落到各自的「红」上，不会被一个写死的 RGB
+            // 锁住。retained 渲染器走严格 sanitizer 会把 SGR 剥光，
+            // 但 `✗ … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
+            format!("      \x1b[31m✗ {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  （默认）".into(),
         Msg::CpVisionAuto { kind } =>
-            format!("  ✔ 视觉预处理器 → {}  （自动检测）\n", kind).into(),
+            format!("  ✓ 视觉预处理器 → {}  （自动检测）\n", kind).into(),
         Msg::CpVisionUserSupplied { kind } =>
-            format!("  ✔ 视觉预处理器 → {}  （保留用户设置）\n", kind).into(),
+            format!("  ✓ 视觉预处理器 → {}  （保留用户设置）\n", kind).into(),
         Msg::CpVisionCleared =>
             "  ⚠ 视觉预处理器已清除 — 当前模型列表中没有可用的 VL/OCR 模型\n".into(),
         Msg::CpModelsSkipped { reason } =>
-            format!("  ✔ 模型步骤已跳过 — {}\n", reason).into(),
+            format!("  ✓ 模型步骤已跳过 — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✘ 模型步骤失败 — {}\n", error).into(),
+            format!("  ✗ 模型步骤失败 — {}\n", error).into(),
         Msg::CpStatusHeader =>
-            "  ✔ CodingPlan 状态：\n".into(),
+            "  ✓ CodingPlan 状态：\n".into(),
         Msg::CpPlanPending { plan } =>
             format!("      套餐：{}  ·  正在激活\n", plan).into(),
         Msg::CpPlanActive { plan, expires_at, remaining_days, total_days } =>
@@ -83,6 +92,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "（未配置）".into(),
         Msg::StatusClipboardImageHint =>
             "剪贴板有图片 · ctrl+v 粘贴".into(),
+        Msg::StatusClipboardImageHintSlash =>
+            "剪贴板有图片 · /paste 粘贴".into(),
 
         // ── /status 命令主体 ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -202,6 +213,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出会话失败：{error}").into(),
         Msg::SessionRenamed { old, new } =>
             format!("  已重命名：'{old}' -> '{new}'").into(),
+        Msg::SessionSaveFailed { error } =>
+            format!("保存会话失败：{error}。未持久化新名称。").into(),
         Msg::SessionNoneSelected =>
             "未选中会话".into(),
         Msg::SessionRenameEditing { buffer } =>
@@ -227,7 +240,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueTitleConfirmed { title } =>
             format!("✓ 标题：{title}").into(),
         Msg::IssueCreated { number, title, url } =>
-            format!("  [issue] ✔ 已创建 #{number}：{title}\n  {url}\n").into(),
+            format!("  [issue] ✓ 已创建 #{number}：{title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
             format!("  [issue] ✗ 创建失败：{error}\n").into(),
         Msg::IssueRequiredField { field } =>
@@ -599,6 +612,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescQuit => "退出 AtomCode".into(),
         Msg::CmdDescSkills => "浏览已加载的技能".into(),
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, list）".into(),
+        Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
+        Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>

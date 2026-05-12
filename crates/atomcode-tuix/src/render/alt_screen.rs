@@ -1656,7 +1656,14 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// physical line is its own body row.
     fn push_command_output(&mut self, text: &str) {
         self.flush_assistant_remainder();
-        let safe = scrub_controls(text);
+        // CommandOutput is trusted internal text (slash-command
+        // responses, setup reports, status echoes) — let SGR
+        // through so things like the `/codingplan` red locked-model
+        // row reach the terminal. Cursor moves, OSC, and other
+        // potentially-dangerous escapes are still stripped. The
+        // wrap helper below is SGR-aware so colour state survives
+        // line wrapping intact.
+        let safe = crate::sanitize::scrub_controls_keep_sgr(text);
         // Soft-wrap each line at the current terminal width. Without this,
         // `paint_body` truncates long lines (e.g. the OAuth URL in
         // /login) at the right edge — invisible content can't be

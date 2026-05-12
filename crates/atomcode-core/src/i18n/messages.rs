@@ -20,9 +20,24 @@ pub enum Msg<'a> {
     CpClaimSuccessFallback,
     CpAlreadyClaimed { reason: &'a str },
     CpClaimFailed { error: &'a str },
+    /// Per-tier cascade row — winning tier, fresh claim.
+    /// Example (zh-CN): `  ✓ CodingPlan Lite 领取成功`
+    CpClaimTierSucceeded { tier: &'a str },
+    /// Per-tier cascade row — winning tier, server reported the user
+    /// already holds this tier or higher (`duplicate=true`).
+    CpClaimTierAlreadyHeld { tier: &'a str },
+    /// Per-tier cascade row — tier was refused (2xx with success=
+    /// false / 5xx / transport). `reason` is the server's human-
+    /// readable message (e.g. `额度已满`, `暂无开放`) or a short
+    /// rendering of the transport error.
+    CpClaimTierFailed { tier: &'a str, reason: &'a str },
     CpAddedProviders { count: usize, plural_s: &'a str },
-    CpLockedJediterm { name: &'a str },
-    CpLockedAnsi { name: &'a str },
+    /// Locked-model row. `name` is expected to be pre-decorated with
+    /// U+0336 combining strikethrough by the caller (see
+    /// `coding_plan::setup::strikethrough`), so the template itself
+    /// stays a plain `format!` and survives every renderer's CSI
+    /// scrubber without needing SGR escapes.
+    CpLocked { name: &'a str },
     CpProviderRow { provider: &'a str, model: &'a str, default_suffix: &'a str },
     CpDefaultSuffix,
     CpVisionAuto { kind: &'a str },
@@ -51,7 +66,15 @@ pub enum Msg<'a> {
     StatusNoProvider,
     StatusUpgradeHint { version: &'a str },
     StatusModelNotConfigured,
+    /// macOS / Linux variant: "Image in clipboard · ctrl+v to paste".
+    /// Ctrl+V is intercepted by Windows Terminal / conhost before
+    /// reaching atomcode, so Windows builds emit
+    /// `StatusClipboardImageHintSlash` instead.
     StatusClipboardImageHint,
+    /// Windows variant: "Image in clipboard · /paste". Tells the
+    /// user to fall back on the `/paste` slash command, which works
+    /// in every terminal regardless of host keybinds.
+    StatusClipboardImageHintSlash,
 
     // ── /status command body ──
     StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
@@ -129,6 +152,7 @@ pub enum Msg<'a> {
     SessionNameControlChars,
     SessionListFailed { error: &'a str },
     SessionRenamed { old: &'a str, new: &'a str },
+    SessionSaveFailed { error: &'a str },
     SessionNoneSelected,
     SessionRenameEditing { buffer: &'a str },
 
@@ -388,6 +412,15 @@ pub enum Msg<'a> {
     CmdDescQuit,
     CmdDescSkills,
     CmdDescPlugin,
+    /// Description for the `/paste` slash command — pulls a clipboard
+    /// image and attaches it as `[Image #N]`. Exists for Windows
+    /// users whose Ctrl+V is swallowed by Windows Terminal / conhost
+    /// before reaching the app, but works on every platform.
+    CmdDescPaste,
+    /// `/paste` failed because the clipboard holds no image. Shown
+    /// in scrollback as an error line so the user isn't left
+    /// wondering whether the command did anything.
+    CmdPasteNoImage,
 
     // ── config save failed ──
     ConfigSaveFailed { error: &'a str },
