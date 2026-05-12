@@ -482,15 +482,21 @@ impl Tool for ReadFileTool {
 
         let offset = parsed.offset.unwrap_or(1).max(1) - 1;
 
-        // No hardcoded line limit — Layer A (auto_skeleton) is the only gate.
-        // If auto_skeleton didn't fire, the file fits in budget → return all lines.
-        // Ignore model-supplied limit when reading from start (offset=0): if the
-        // file passed Layer A, the model is just creating fragments by passing
-        // limit=100. GLM-5 does this despite "do NOT use offset/limit" instruction.
+        // Layer A (auto_skeleton) gates structured files. For files past
+        // SKELETON_LINE_THRESHOLD, when the model explicitly passes a
+        // `limit` (e.g. `Cargo.lock, limit=50`), HONOUR it — the
+        // earlier policy of forcing full content turned a 50-line peek
+        // into a 14K-token dump that blew past max-context. Small files
+        // (≤ threshold) keep the anti-fragmentation defence so GLM-5's
+        // habit of `limit=100` on a 200-line file still returns full.
         let limit = match (parsed.offset, parsed.limit) {
-            (None, Some(_)) => total_lines, // offset=0 + limit → ignore limit, give full
-            (Some(_), Some(l)) => l,        // explicit range → respect it
-            _ => total_lines,               // no limit → full
+            // Large file + model-supplied limit → respect (avoids huge dumps).
+            (None, Some(l)) if total_lines > SKELETON_LINE_THRESHOLD => l.min(total_lines),
+            // Small file + offset=0 + limit → ignore (anti-fragmentation).
+            (None, Some(_)) => total_lines,
+            // Explicit range → respect.
+            (Some(_), Some(l)) => l,
+            _ => total_lines,
         };
 
         // If offset > 0 but auto-expand would give the whole file, reset offset to 0

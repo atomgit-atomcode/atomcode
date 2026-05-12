@@ -2070,6 +2070,22 @@ impl AgentLoop {
                             .send(AgentEvent::Error(public_error_message(&e)));
                         self.finish_turn(TurnStopReason::Error);
                         return;
+                    } else if e.contains("[non-retryable]") {
+                        // Deterministic failure (e.g. soft-limit on streamed
+                        // tool-call args) — retrying just regenerates the
+                        // same oversized payload and gets cut at the same
+                        // place. Surface immediately and let the user (or
+                        // the next turn's prompt context, with breadcrumb
+                        // already injected by runner.rs) decide what to do.
+                        // 5/9 atomgr session: model spent 4+ minutes on
+                        // three identical 16 KB write_file retries, all
+                        // useless.
+                        self.datalog.log_error(&e);
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::Error(public_error_message(&e)));
+                        self.finish_turn(TurnStopReason::Error);
+                        return;
                     } else if self.retry_count < 3 {
                         self.retry_count += 1;
                         let wait = (self.retry_count as u64 * 3).min(15);

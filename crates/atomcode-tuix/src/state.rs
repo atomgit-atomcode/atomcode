@@ -204,6 +204,20 @@ pub struct UiState {
     /// summary line. Cleared with the rest of the dispatch state.
     pub sub_agent_started_at: Option<std::time::Instant>,
 
+    /// Cumulative byte count of `ReasoningDelta` text emitted in the
+    /// CURRENT turn. Lets the spinner show a quantitative thinking
+    /// estimate (`~4.2K tok`) so a 108s "Percolating" doesn't look
+    /// like the model is stuck — the chars keep climbing as long as
+    /// the upstream is producing reasoning chunks. Reset on submit /
+    /// turn complete / turn cancelled / error.
+    ///
+    /// We track bytes not tokens because we don't have a tokenizer
+    /// here; the displayed token figure is `bytes / 3`, a rough
+    /// chars-per-token estimate for mixed CJK + English + code that
+    /// matches what real tokenizers return within ~30%. The user
+    /// sees a `~` prefix to flag the approximation.
+    pub reasoning_chars: usize,
+
     /// Active tool batches, keyed by `batch_id`. Populated on
     /// `ToolBatchStarted` and cleared on `ToolBatchCompleted`. Used by
     /// per-call event handlers to detect "this ToolCallStarted/Result
@@ -265,9 +279,33 @@ impl UiState {
             sub_agent_tasks: Vec::new(),
             sub_agent_failed: 0,
             sub_agent_started_at: None,
+            reasoning_chars: 0,
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
         }
+    }
+
+    /// Render the cumulative thinking-progress estimate suitable for
+    /// appending to the spinner label. Returns None below the visibility
+    /// threshold so a brief sub-second think doesn't flicker `~12 tok`
+    /// onto the screen for a moment.
+    ///
+    /// Threshold: 600 bytes (~200 estimated tokens) — about 1-2 sentences
+    /// of mixed CJK/English. Below that the model probably hasn't even
+    /// committed to a direction yet, so showing a count would be
+    /// premature noise. Above it we know the model is meaningfully
+    /// engaged and the count keeps the user from wondering "is it stuck".
+    pub fn thinking_progress_label(&self) -> Option<String> {
+        if self.reasoning_chars < 600 {
+            return None;
+        }
+        let tokens = self.reasoning_chars / 3;
+        let body = if tokens < 1000 {
+            format!("~{} tok", tokens)
+        } else {
+            format!("~{:.1}K tok", tokens as f64 / 1000.0)
+        };
+        Some(body)
     }
 
     /// Single-character horizontal ellipsis (`…`, U+2026) when Unicode
@@ -369,6 +407,7 @@ impl UiState {
         let now = std::time::Instant::now();
         self.turn_started_at = Some(now);
         self.phase_started_at = Some(now);
+        self.reasoning_chars = 0;
     }
 
     pub fn on_turn_complete(&mut self) {
@@ -376,6 +415,7 @@ impl UiState {
         self.spinner_label.clear();
         self.turn_started_at = None;
         self.phase_started_at = None;
+        self.reasoning_chars = 0;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -389,6 +429,7 @@ impl UiState {
         self.spinner_label.clear();
         self.turn_started_at = None;
         self.phase_started_at = None;
+        self.reasoning_chars = 0;
     }
 
     pub fn on_error(&mut self) {
@@ -396,6 +437,7 @@ impl UiState {
         self.spinner_label.clear();
         self.turn_started_at = None;
         self.phase_started_at = None;
+        self.reasoning_chars = 0;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
@@ -785,5 +827,56 @@ mod tests {
     #[test]
     fn agent_mode_double_toggle_returns_to_original() {
         assert_eq!(AgentMode::Build.toggle().toggle(), AgentMode::Build);
+    }
+
+    // ── thinking-progress estimate ──
+
+    #[test]
+    fn thinking_progress_silent_below_threshold() {
+        // Sub-second think → no flicker. 599 bytes is one byte under
+        // the visibility cutoff; nothing should render.
+        let mut s = UiState::new();
+        s.reasoning_chars = 599;
+        assert!(s.thinking_progress_label().is_none());
+    }
+
+    #[test]
+    fn thinking_progress_renders_under_1k_tokens_as_integer() {
+        // 600 bytes / 3 = 200 tok exactly at the threshold.
+        let mut s = UiState::new();
+        s.reasoning_chars = 600;
+        assert_eq!(s.thinking_progress_label().as_deref(), Some("~200 tok"));
+
+        s.reasoning_chars = 2_999;
+        assert_eq!(s.thinking_progress_label().as_deref(), Some("~999 tok"));
+    }
+
+    #[test]
+    fn thinking_progress_renders_over_1k_tokens_as_kilo() {
+        // 12_600 bytes / 3 = 4200 tok → `~4.2K tok`.
+        let mut s = UiState::new();
+        s.reasoning_chars = 12_600;
+        assert_eq!(s.thinking_progress_label().as_deref(), Some("~4.2K tok"));
+    }
+
+    #[test]
+    fn thinking_progress_clears_on_lifecycle_transitions() {
+        let mut s = UiState::new();
+        s.reasoning_chars = 5_000;
+
+        s.on_submit();
+        assert_eq!(s.reasoning_chars, 0, "on_submit must reset for fresh turn");
+
+        s.reasoning_chars = 5_000;
+        s.on_turn_complete();
+        assert_eq!(s.reasoning_chars, 0, "on_turn_complete must reset");
+
+        s.reasoning_chars = 5_000;
+        s.on_turn_cancelled();
+        assert_eq!(s.reasoning_chars, 0, "on_turn_cancelled must reset");
+
+        s.reasoning_chars = 5_000;
+        s.on_error();
+        assert_eq!(s.reasoning_chars, 0, "on_error must reset");
     }
 }

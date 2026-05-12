@@ -60,6 +60,36 @@ pub const SKIP_DIRS: &[&str] = &[
 /// Covers `.venv-*` variants (`.venv-test`, `.venv-swebench`, etc.).
 pub const SKIP_DIR_PREFIXES: &[&str] = &[".venv-"];
 
+/// Sentinel content payload that signals a streaming-layer abort of a
+/// large `write_file` call. The provider's stream cap (provider/openai.rs)
+/// synthesises a clean `ToolCallDone` carrying this exact string as the
+/// `content` field when accumulated args exceed 32 KB — at that size the
+/// upstream provider's output-token cap is about to fire and there's no
+/// way for the LLM to finish the call cleanly.
+///
+/// `tool/write.rs::execute` recognises this sentinel and replies with the
+/// skeleton-protocol directive, so the model receives a normal tool
+/// failure result (not a turn-killing Error) and self-heals within the
+/// SAME turn. The string is intentionally unusable as actual file
+/// content (uppercase + bracketed marker) so a literal collision with
+/// real model output is impossible.
+pub const LARGE_WRITE_SENTINEL: &str =
+    "[ATOMCODE_FRAMEWORK_ABORTED_LARGE_WRITE_USE_SKELETON_PROTOCOL]";
+
+/// First-line marker the TUI uses to recognise a write_file auto-convert
+/// rejection so the scrollback row shows a compact `◇ write_file →
+/// skeleton+edits (auto-converted)` indicator instead of dumping the
+/// full skeleton-protocol directive into the user's view. The directive
+/// body still rides through to the model via the conversation message —
+/// only the user-facing render is condensed.
+///
+/// Embedded verbatim in `tool/write.rs::build_large_write_directive`;
+/// matched verbatim in `atomcode-tuix/src/event_loop/mod.rs` (ToolCallResult
+/// handler). Both sides must keep the exact string in sync — if you
+/// rename it, grep both crates.
+pub const LARGE_WRITE_AUTOCONVERT_TAG: &str =
+    "[atomcode] auto-converting to skeleton+edits protocol";
+
 /// Check if a directory name should be skipped (exact match OR prefix match).
 /// Use this instead of `SKIP_DIRS.contains()` for complete coverage.
 pub fn should_skip_dir(name: &str) -> bool {
@@ -98,6 +128,29 @@ pub fn diagnose_args(
         return Err(format!(
             "{tool} called with empty arguments — likely max_tokens cutoff. \
              Re-issue: {example}"
+        ));
+    }
+    // Truncation pre-check (aligned with CC's max_tokens handling in
+    // services/api/claude.ts:2266): args starting with `{` that never close
+    // are almost certainly streamed tool_call output that hit max_tokens
+    // mid-string. The generic "missing required field" diagnostic sends the
+    // model down the wrong recovery path (re-issue with the same too-large
+    // content). This branch surfaces the real cause so the model splits the
+    // call instead. 5KB threshold filters out tiny malformed cases that
+    // belong to the regular parse-error path.
+    //
+    // Provider-side handling in openai.rs:897 (length finish_reason → Error
+    // event) is the primary defense. This is defense in depth for any path
+    // where a truncated tool_call still reaches `diagnose_args` — e.g.
+    // tools called outside the streaming pipeline, or future providers that
+    // don't surface a `length` finish_reason.
+    let trim_end = args.trim_end();
+    if trim_end.starts_with('{') && !trim_end.ends_with('}') && args.len() > 5_000 {
+        return Err(format!(
+            "{tool}: tool_call arguments TRUNCATED ({} bytes, ended mid-string — \
+             output likely exceeded max_tokens). For large write_file: write a \
+             skeleton first, then use edit_file or search_replace to fill sections.",
+            args.len()
         ));
     }
     let value: serde_json::Value = serde_json::from_str(args).map_err(|_| {
@@ -1914,13 +1967,55 @@ mod tests {
         let home = real_home_dir().unwrap();
         let expanded = expand_user_path("~/test");
         assert_eq!(expanded, home.join("test"));
-        
+
         // Test that ~ alone expands to home
         let expanded = expand_user_path("~");
         assert_eq!(expanded, home);
-        
+
         // Test that non-tilde paths are preserved
         let expanded = expand_user_path("/absolute/path");
         assert_eq!(expanded, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn diagnose_args_reports_truncation_for_large_unclosed_object() {
+        // Regression for 2026-05-12 atomgr session: write_file streamed
+        // `{"content":"<60KB HTML>"` and stopped mid-string. Without the
+        // truncation pre-check, `extract_json_fields` salvaged the partial
+        // content into a fake-complete object missing `file_path`, and
+        // diagnose_args misreported "missing required [file_path]". The
+        // fix: surface "TRUNCATED" so the model splits the call.
+        let huge: String = "<div>x</div>".repeat(6_000); // ~72KB
+        let truncated = format!(r#"{{"content":"{huge}"#); // no closing " or }
+        let err = diagnose_args(
+            "write_file",
+            &truncated,
+            &[&["file_path", "content"]],
+            "write_file({\"file_path\":\"...\",\"content\":\"...\"})",
+        )
+        .expect_err("truncated args must error");
+        assert!(
+            err.contains("TRUNCATED"),
+            "expected truncation diagnostic, got: {err}"
+        );
+        assert!(
+            !err.contains("missing required"),
+            "must not emit misleading 'missing required' for truncated input: {err}"
+        );
+    }
+
+    #[test]
+    fn diagnose_args_still_flags_genuinely_missing_fields_when_args_complete() {
+        // Truncation pre-check must not steal cases where the model
+        // legitimately forgot a field on a small, well-formed object.
+        let err = diagnose_args(
+            "write_file",
+            r#"{"content": "hi"}"#,
+            &[&["file_path", "content"]],
+            "write_file({\"file_path\":\"...\",\"content\":\"...\"})",
+        )
+        .expect_err("missing field must still error");
+        assert!(err.contains("missing required"));
+        assert!(err.contains("file_path"));
     }
 }

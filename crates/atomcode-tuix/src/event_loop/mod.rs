@@ -1097,6 +1097,55 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_parallel_edit_lists_files() {
+        // Single file: just the basename.
+        let one = format_tool_detail(
+            "parallel_edit_files",
+            r#"{"files":[{"path":"src/foo.rs","instruction":"x"}],"contract":""}"#,
+        );
+        assert_eq!(one, "foo.rs");
+
+        // Multiple files: "N files: a.rs, b.rs" with no ellipsis when ≤3.
+        let three = format_tool_detail(
+            "parallel_edit_files",
+            r#"{"files":[
+                {"path":"src/a.rs","instruction":"x"},
+                {"path":"src/b.rs","instruction":"x"},
+                {"path":"src/c.rs","instruction":"x"}
+            ]}"#,
+        );
+        assert_eq!(three, "3 files: a.rs, b.rs, c.rs");
+
+        // More than 3: trailing ellipsis so the spinner still tells the
+        // user roughly which area of the codebase is being touched.
+        let many = format_tool_detail(
+            "parallel_edit_files",
+            r#"{"files":[
+                {"path":"a/x.rs","instruction":"x"},
+                {"path":"a/y.rs","instruction":"x"},
+                {"path":"b/z.rs","instruction":"x"},
+                {"path":"c/w.rs","instruction":"x"},
+                {"path":"d/q.rs","instruction":"x"}
+            ]}"#,
+        );
+        assert_eq!(many, "5 files: x.rs, y.rs, z.rs, …");
+    }
+
+    #[test]
+    fn format_tool_detail_parallel_edit_no_files_is_empty() {
+        // Defensive: empty array or missing key shouldn't panic and
+        // shouldn't pollute the inflight row with stray punctuation.
+        assert_eq!(
+            format_tool_detail("parallel_edit_files", r#"{"files":[]}"#),
+            ""
+        );
+        assert_eq!(
+            format_tool_detail("parallel_edit_files", r#"{}"#),
+            ""
+        );
+    }
+
+    #[test]
     fn summarise_single_line_returned_as_is() {
         assert_eq!(summarise("ok", true), "ok");
     }
@@ -3124,17 +3173,15 @@ fn handle_streaming_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
-    // Ctrl+O toggles verbose mode (real-time tool output + reasoning visibility)
+    // Ctrl+O toggles verbose mode (real-time tool output + reasoning visibility).
+    // No status line — every prior toggle pushed a CommandOutput row that
+    // never got cleaned up, so a user pressing Ctrl+O six times to peek at
+    // intermediate state ended up with six "Verbose mode enabled/disabled"
+    // rows stacking in the transcript. Silent toggle: the user sees the
+    // mode change immediately because reasoning/tool-output stops or
+    // starts appearing on the next event. No body-row noise.
     if code == KeyCode::Char('o') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         app.state.toggle_tool_output();
-        // Show feedback to the user about the current state
-        let status = if app.state.show_tool_output {
-            "  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+O to hide)\n"
-        } else {
-            "  ◯ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
-        };
-        renderer.render(UiLine::CommandOutput(status.to_string()));
-        renderer.flush();
         draw_spinner_now(
             &mut app.state,
             &app.buf,
@@ -3521,6 +3568,12 @@ fn handle_agent_event(
             }
         }
         AgentEvent::ReasoningDelta(text) => {
+            // Quantitative thinking-progress signal. Always tracked,
+            // surfaces on the spinner label as `~N tok` once enough
+            // chars have accumulated. Without this, a 108s "Percolating"
+            // looks indistinguishable from a stuck network call.
+            state.reasoning_chars = state.reasoning_chars.saturating_add(text.len());
+
             // Display reasoning/thinking content in verbose mode (Ctrl+O)
             // Only show when the user has enabled it
             if state.show_reasoning {
@@ -3677,6 +3730,28 @@ fn handle_agent_event(
             // in the conversation.
             let suppress_body_echo = name == "parallel_edit_files";
 
+            // ── Auto-convert friendly render ──
+            //
+            // write_file with oversized content gets rejected (either at
+            // 32 KB of streamed args by provider/openai.rs, or at 30 KB
+            // of parsed content by tool/write.rs as defense-in-depth)
+            // with a directive body whose first line is the
+            // `LARGE_WRITE_AUTOCONVERT_TAG` marker. Without this branch
+            // the user sees ~40 lines of "REQUIRED PROTOCOL — write a
+            // skeleton…" protocol text dumped into scrollback, which is
+            // useful instruction for the model but visual noise for the
+            // user — the model is about to ACT on it in the next round
+            // and the user just wants to know "AtomCode handled it".
+            //
+            // When the tag is present, we render a single compact muted
+            // line (no red ✗ Error styling, even though success=false)
+            // and skip the long body. The model still gets the full
+            // directive via the conversation; only the scrollback render
+            // is condensed.
+            let is_auto_convert = !success
+                && name == "write_file"
+                && output.starts_with(atomcode_core::tool::LARGE_WRITE_AUTOCONVERT_TAG);
+
             // Only emit the tool-call line here if ApprovalNeeded didn't
             // already render it — otherwise we'd print it twice.
             if !call_rendered && !suppress_body_echo {
@@ -3686,8 +3761,25 @@ fn handle_agent_event(
                 });
             }
             if !suppress_body_echo {
-                let summary = summarise(&output, success);
-                renderer.render(UiLine::ToolResult { success, summary });
+                if is_auto_convert {
+                    // Render `↪ auto-converting to skeleton+edits` —
+                    // pass success=true so the row paints in the muted/
+                    // success tone instead of red ✗, since this is a
+                    // designed framework behaviour, not a failure the
+                    // user needs to act on.
+                    let arrow = if state.unicode_symbols { "↪" } else { "->" };
+                    let summary = format!(
+                        "{} auto-converting to skeleton+edits (model is splitting the file)",
+                        arrow
+                    );
+                    renderer.render(UiLine::ToolResult {
+                        success: true,
+                        summary,
+                    });
+                } else {
+                    let summary = summarise(&output, success);
+                    renderer.render(UiLine::ToolResult { success, summary });
+                }
             }
             // Collect diff lines into a single batch — N individual
             // DiffLine renders each trigger a full footer redraw and
@@ -4510,6 +4602,17 @@ fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
     if let Some(d) = state.phase_elapsed() {
         out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
     }
+    // Cumulative thinking estimate. Only shown once the model has
+    // emitted enough reasoning content to be informative (≥600 bytes
+    // ~200 tokens). Solves the "Percolating · 108s" black-box: with
+    // a count attached the user can confirm tokens are still flowing
+    // versus the stream having silently stalled. CC doesn't surface
+    // this because Sonnet's thinking is sub-second; we need it
+    // because glm-5.1 / DeepSeek R1 / etc. routinely think for
+    // minutes on hard prompts.
+    if let Some(prog) = state.thinking_progress_label() {
+        out.push_str(&format!(" · {}", prog));
+    }
     if queue_len > 0 {
         out.push_str(&format!(" · {} queued", queue_len));
     }
@@ -4618,6 +4721,36 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),
+        "parallel_edit_files" => {
+            // args: { files: [{path, instruction}, ...], contract }.
+            // Show "N files: a.rs, b.rs, …" so the inflight spinner says
+            // what's being edited, not just "ParallelEditFiles". Without
+            // this the user sees a 30s+ animation with zero context for
+            // a tool that potentially touches their entire workspace.
+            let Some(files) = v.get("files").and_then(|x| x.as_array()) else {
+                return String::new();
+            };
+            let n = files.len();
+            if n == 0 {
+                return String::new();
+            }
+            let names: Vec<String> = files
+                .iter()
+                .take(3)
+                .filter_map(|f| {
+                    f.get("path")
+                        .and_then(|p| p.as_str())
+                        .map(basename)
+                })
+                .collect();
+            let head = names.join(", ");
+            let suffix = if n > names.len() { ", …" } else { "" };
+            if n == 1 {
+                head
+            } else {
+                format!("{} files: {}{}", n, head, suffix)
+            }
+        }
         _ => {
             // Fallback: try common single-key args that make sense as detail.
             for key in [

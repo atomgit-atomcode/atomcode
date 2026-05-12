@@ -71,28 +71,43 @@ pub fn render_line_with_width(
     let prefix_only = || -> Option<String> { prefix.as_ref().map(|p| p.clone()) };
 
     // Fenced code block fence (``` or ~~~)
+    // On open, emit a dim language tag line (e.g. `rust`, `bash`) so the
+    // reader knows what they're looking at without us painting the body
+    // in a syntax-highlight rainbow. Plain ``` with no language → no tag.
+    // Tags are still ASCII-only, so Windows cmd under non-UTF-8 codepages
+    // renders them cleanly (same constraint that drove the `│` removal).
     if is_fence(trimmed) {
-        state.in_code_block = !state.in_code_block;
+        let opening = !state.in_code_block;
+        state.in_code_block = opening;
+        if opening && caps.colors {
+            if let Some(lang) = extract_fence_lang(trimmed) {
+                return Some(prepend(format!("  \x1b[2m{}\x1b[22m", lang)));
+            }
+        }
         return prefix_only();
     }
 
-    // Inside code block: CC-style — plain code, no gutter glyph,
-    // default foreground. Two-space leading indent provides the
-    // visual offset that makes the block readable against
-    // surrounding prose; that's all CC does and it's what the user
-    // expects. We previously emitted `│` (U+2502 BOX DRAWINGS LIGHT
-    // VERTICAL) as a faint left bar, which renders cleanly on
-    // modern terminals but turns into garbage on Windows cmd.exe
-    // under non-UTF-8 codepages — the simplest fix is to not emit
-    // any non-ASCII chrome around code at all.
+    // Inside code block: 2-space indent + standard cyan (SGR 36).
+    // Headings already use BRIGHT cyan (SGR 96) so the two layers are
+    // distinguishable on every theme — code reads as a quieter, cooler
+    // sibling to the heading hierarchy. SGR 39 closes back to default
+    // foreground so any subsequent prose isn't tinted.
     //
-    // Earlier iterations tried bright white (`\x1b[1;97m`) and
-    // truecolor blue-500 to dodge palette remap; both painted every
-    // code line in a competing colour, drowning the surrounding
-    // markdown. Plain default-colour text wins on every theme and
-    // every terminal, including bare cmd.exe.
+    // Why not bold + bright white? Earlier iterations did, and 30-line
+    // code blocks dominated screen attention. Why not faint? Code is
+    // higher information density than prose; dimming it inverts the
+    // visual hierarchy.
+    //
+    // Why ASCII-safe? Same reason `│` was removed: Windows cmd.exe under
+    // non-UTF-8 codepage renders box-drawing as mojibake. Plain SGR
+    // colors are universal.
     if state.in_code_block {
-        return Some(prepend(format!("  {}", line)));
+        let body = if caps.colors {
+            format!("  \x1b[36m{}\x1b[39m", line)
+        } else {
+            format!("  {}", line)
+        };
+        return Some(prepend(body));
     }
 
     // Horizontal rule — render as a blank separator line, not a visible
@@ -465,6 +480,30 @@ fn is_fence(trimmed: &str) -> bool {
     }
 }
 
+/// Extract the language tag from a fence line. Returns the trimmed
+/// language string (e.g. `"rust"`, `"bash"`) when one is present, or
+/// `None` for a bare fence (plain `\`\`\`` with no info string).
+///
+/// We only look at the leading run of fence chars and what follows; if a
+/// caller passes something is_fence already rejected, this returns None.
+fn extract_fence_lang(trimmed: &str) -> Option<String> {
+    let bytes = trimmed.as_bytes();
+    let fence_char = match bytes.first()? {
+        b'`' => b'`',
+        b'~' => b'~',
+        _ => return None,
+    };
+    // Skip the opening fence run (3+ chars).
+    let info = trimmed
+        .trim_start_matches(|c: char| c as u32 == fence_char as u32)
+        .trim();
+    if info.is_empty() {
+        None
+    } else {
+        Some(info.to_string())
+    }
+}
+
 fn is_hrule(trimmed: &str) -> bool {
     if trimmed.len() < 3 {
         return false;
@@ -573,19 +612,26 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_block_renders_as_plain_indented_code() {
-        // CC-style: code blocks are plain text with a 2-space
-        // left margin and default foreground colour. No `│` gutter
-        // (turns to mojibake on Windows cmd.exe under non-UTF-8
-        // codepage), no bold+bright white, no truecolor blue. Pin
-        // the shape so a future "let's add a fancy bar" refactor
-        // catches itself in CI.
+    fn fenced_code_block_renders_with_cyan_body_and_indent() {
+        // 2-space indent + SGR 36 (standard cyan) + SGR 39 close.
+        // Pin the exact prefix shape so future "let's brighten it"
+        // refactors catch themselves in CI.
         let mut state = MdState::new();
-        let _ = render_line("```", &mut state, caps()); // open fence
+        let _ = render_line("```", &mut state, caps()); // open fence (no lang)
         let inside = render_line("let x = 1;", &mut state, caps()).unwrap_or_default();
         assert!(
-            inside.contains("  let x = 1;"),
-            "fenced code body should appear with 2-space indent: {:?}",
+            inside.starts_with("  \x1b[36m"),
+            "fenced code body must lead with 2-space indent + SGR 36: {:?}",
+            inside
+        );
+        assert!(
+            inside.contains("let x = 1;"),
+            "fenced code body must contain the literal source: {:?}",
+            inside
+        );
+        assert!(
+            inside.ends_with("\x1b[39m"),
+            "fenced code body must close with SGR 39 (default fg): {:?}",
             inside
         );
         assert!(
@@ -594,14 +640,49 @@ mod tests {
             inside
         );
         assert!(
-            !inside.contains("\x1b[1;97m"),
-            "fenced code block must NOT bold+bright-white the content: {:?}",
+            !inside.contains("\x1b[1;97m") && !inside.contains("\x1b[1;38;2;"),
+            "fenced code block must NOT bold+bright-white nor truecolor-blue: {:?}",
             inside
         );
-        assert!(
-            !inside.contains("\x1b[1;38;2;"),
-            "fenced code block must NOT truecolor-blue the content: {:?}",
-            inside
+    }
+
+    #[test]
+    fn fence_open_with_language_emits_dim_lang_tag() {
+        // ``` rust → dim "rust" tag line above the code block. The
+        // reader sees what they're looking at without per-token
+        // syntax highlighting machinery.
+        let mut state = MdState::new();
+        let tag = render_line("```rust", &mut state, caps()).unwrap_or_default();
+        assert_eq!(tag, "  \x1b[2mrust\x1b[22m");
+        assert!(state.in_code_block);
+    }
+
+    #[test]
+    fn fence_open_without_language_is_silent() {
+        // Bare ``` opens the block but emits nothing. We don't want
+        // a stray empty-tag line cluttering plain code blocks.
+        let mut state = MdState::new();
+        let out = render_line("```", &mut state, caps());
+        assert!(out.is_none() || out.as_deref() == Some(""));
+        assert!(state.in_code_block);
+    }
+
+    #[test]
+    fn extract_fence_lang_handles_common_shapes() {
+        assert_eq!(
+            super::extract_fence_lang("```rust").as_deref(),
+            Some("rust")
+        );
+        assert_eq!(
+            super::extract_fence_lang("```  bash  ").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(super::extract_fence_lang("```").as_deref(), None);
+        assert_eq!(super::extract_fence_lang("~~~python").as_deref(), Some("python"));
+        // 4 backticks (not a fence) — guard the parser against bytes-vs-chars off-by-one
+        assert_eq!(
+            super::extract_fence_lang("````ts").as_deref(),
+            Some("ts")
         );
     }
 
@@ -641,7 +722,11 @@ mod tests {
     #[test]
     fn fence_toggles_state_and_hides() {
         let mut st = MdState::new();
-        assert!(render_line("```rust", &mut st, caps()).is_none());
+        // Fence with a language now emits a dim tag line. The toggle
+        // still flips state.in_code_block — that's the load-bearing
+        // half of "hides". The bare-fence-is-None case is covered by
+        // `fence_open_without_language_is_silent`.
+        assert!(render_line("```rust", &mut st, caps()).is_some());
         assert!(st.in_code_block);
         let inside = render_line("let x = 1;", &mut st, caps()).unwrap();
         assert!(inside.contains("let x = 1;"));

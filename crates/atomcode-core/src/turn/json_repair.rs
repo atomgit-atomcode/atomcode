@@ -33,11 +33,29 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
     }
     // Last resort: key-value field extraction. Only return this if it actually
     // recovered something — an empty object is no better than the original garbage.
-    let extracted = extract_json_fields(args);
-    if let Some(obj) = extracted.as_object() {
-        if !obj.is_empty() {
-            if let Ok(s) = serde_json::to_string(&extracted) {
-                return s;
+    //
+    // Truncation gate (aligned with CC philosophy — see utils/messages.ts:2676
+    // which intentionally has NO repair layer and falls back to `{}`):
+    // when args start with `{` but never close AND are large enough that the
+    // open string couldn't possibly be intentional, the extractor's string-
+    // value loop would scan until EOF and "salvage" the partial value into a
+    // complete object. That fabricates a "model called with these fields"
+    // signal when the truth is "model output was truncated mid-string and we
+    // have no idea what the full args were." Skip extraction in that case —
+    // let the raw truncated args reach `diagnose_args`, which surfaces the
+    // truncation explicitly so the model splits the call instead of retrying
+    // with the same too-large content.
+    let trimmed_end = args.trim_end();
+    let looks_truncated = trimmed_end.starts_with('{')
+        && !trimmed_end.ends_with('}')
+        && trimmed_end.len() > 5_000;
+    if !looks_truncated {
+        let extracted = extract_json_fields(args);
+        if let Some(obj) = extracted.as_object() {
+            if !obj.is_empty() {
+                if let Ok(s) = serde_json::to_string(&extracted) {
+                    return s;
+                }
             }
         }
     }
@@ -582,5 +600,56 @@ mod tests {
         // the tool emits the real parse error (not a misleading repaired stub).
         let input = "!!!";
         assert_eq!(repair_tool_args("write_file", input), "!!!");
+    }
+
+    #[test]
+    fn repair_tool_args_does_not_salvage_truncated_write_file_content() {
+        // Regression for 2026-05-12 atomgr session: model streamed write_file
+        // with `content` first; max_tokens hit mid-content; args were
+        // 62KB starting with `{"content":"<DOCTYPE html..."` and ending at a
+        // mid-string Chinese character with no closing `"` and no `}`.
+        //
+        // Before the fix: `extract_json_fields` scanned the unterminated
+        // string to EOF and salvaged `{"content":"<62KB body>"}` — a valid
+        // JSON object missing only `file_path`. `diagnose_args` then reported
+        // a misleading "missing required [file_path]" instead of "truncated".
+        //
+        // After the fix: the truncation gate skips extraction, returning the
+        // raw truncated args so `diagnose_args` reports the real cause.
+        let huge_body: String = "<!DOCTYPE html>".to_string()
+            + &"<div>content</div>\\n".repeat(3000); // ~60KB
+        let truncated = format!("{{\"content\":\"{huge_body}"); // no closing " or }
+        assert!(truncated.len() > 50_000);
+
+        let out = repair_tool_args("write_file", &truncated);
+        // Must be unchanged — no salvage on truncated input
+        assert_eq!(
+            out, truncated,
+            "extract_json_fields salvaged a truncated string into a fake-complete object"
+        );
+    }
+
+    #[test]
+    fn repair_tool_args_still_salvages_short_broken_json() {
+        // Truncation gate must NOT regress legitimate rescue cases. A small
+        // malformed input (e.g. quotes the model fumbled) should still be
+        // extracted into a usable object.
+        let input = r#"{file_path: "/tmp/x.rs", content: "fn main(){}"}"#;
+        let out = repair_tool_args("write_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("repaired should parse");
+        assert_eq!(v["file_path"], "/tmp/x.rs");
+        assert_eq!(v["content"], "fn main(){}");
+    }
+
+    #[test]
+    fn repair_tool_args_does_not_salvage_truncated_below_threshold() {
+        // Right at the boundary: a small unterminated object COULD legitimately
+        // be model laziness rather than truncation. The 5KB threshold lets
+        // small cases fall through to extraction.
+        let input = r#"{"file_path": "/tmp/a.rs", "content": "fn main()"#;
+        let out = repair_tool_args("write_file", input);
+        // Small input → extraction still tried; should yield something parseable.
+        let _: serde_json::Value =
+            serde_json::from_str(&out).expect("small unterminated case still salvaged");
     }
 }

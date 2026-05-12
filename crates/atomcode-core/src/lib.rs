@@ -23,6 +23,7 @@ pub mod plugin;
 pub mod skill;
 pub mod stream;
 pub mod telemetry_bootstrap;
+pub mod tokenizer;
 pub mod tool;
 pub mod turn;
 pub mod version_check;

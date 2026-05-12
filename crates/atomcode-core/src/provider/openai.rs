@@ -559,10 +559,81 @@ impl LlmProvider for OpenAiProvider {
                 // and the truncation detector see real numbers.
                 let mut pending_finish: Option<crate::stream::StreamEvent> = None;
 
+                // ── Cumulative SSE wire bytes received this stream ──
+                //
+                // PURPOSE: bail BEFORE the upstream proxy cuts the response
+                // body. AtomGit / litellm-style endpoints truncate around
+                // 440-500 KB of SSE traffic; without a client-side cap, the
+                // model wastes 60-300s generating an oversized payload that
+                // never reaches us, then the agent loop burns three retry
+                // cycles regenerating the same doomed response.
+                //
+                // ── Why SSE bytes, NOT per-tool-call args bytes ──
+                //
+                // First attempt was an args-byte cap (10 KB). Wrong layer.
+                // Reason: SSE wire size = chunk count × per-chunk overhead
+                // + actual content. Per-chunk overhead is constant (~240 B
+                // of `{"id":...,"choices":[{"delta":{"tool_calls":[...]}}]}`
+                // wrapping). Chunk COUNT depends on how the upstream model
+                // tokenises and flushes — and that varies 10× across
+                // models. So a fixed args-byte cap is either too tight
+                // (cuts real source files at 10 KB on efficient streamers)
+                // or too loose (never fires for fragmented streamers
+                // before the proxy itself cuts).
+                //
+                // ── Why the GLM family is so fragmented ──
+                //
+                // 5/9 atomgr session, AtomGit endpoint, glm-5.1: ~7 chars
+                // of args content per chunk → 30× SSE-to-content ratio →
+                // 12 KB args produces 440 KB SSE. Initially suspected
+                // litellm of splitting upstream chunks. **Confirmed false**
+                // by direct comparison: 5/8 Siliconflow run, same model
+                // family (Pro/zai-org/GLM-5), completely different proxy,
+                // averaged 4 chars/chunk — even MORE fragmented than
+                // AtomGit. Two unrelated proxies showing the same pattern
+                // means it's the model's own tokeniser + inference engine
+                // emitting one subword token per SSE flush. The chat
+                // template can't influence chunk boundaries, and we
+                // can't make the model batch from this side.
+                //
+                // ── Why 350 KB ──
+                //
+                // 350 KB is just below the observed 440-500 KB cut on the
+                // AtomGit endpoint (the worst case in our data). Higher
+                // values risk racing the upstream cut; lower values cut
+                // off legitimate long generations (multi-tool turns with
+                // moderate reasoning routinely reach 200-300 KB SSE on
+                // GLM models, due to the same fragmentation). Don't
+                // lower this on intuition like "10 KB args feels big" —
+                // 10 KB args ≈ 300 KB SSE on glm-5.1, well within the
+                // legitimate band.
+                //
+                // ── What to do when this fires ──
+                //
+                // The model is trying to emit a giant single tool call
+                // (typically write_file with a full HTML report). There
+                // is no fix at the streaming layer beyond what we already
+                // do: emit `[non-retryable]` so the agent loop doesn't
+                // retry the same impossible payload, flush in-flight
+                // tool_calls so the breadcrumb path records what was
+                // attempted, surface a diagnostic that nudges the model
+                // toward skeleton + edit_file. Splitting is the only
+                // working pattern on this combination of model family
+                // and proxy.
+                let mut total_sse_bytes: usize = 0;
+
             loop {
-                // 120s idle timeout: if no data arrives for 2 minutes, treat as dead connection.
+                // 600s idle timeout: GLM-5/Kimi/etc. generating large
+                // edit_file outputs (100+ lines of dense HTML/code) on
+                // self-hosted NPU clusters can pause 2-4 minutes between
+                // SSE chunks — vllm batch reschedule, KV cache eviction,
+                // or no-think mode with internal reasoning that produces
+                // no visible content. The previous 120s ceiling killed
+                // real long edits well before completion. 10 min is
+                // wide enough for any plausible single decode while
+                // still detecting truly-dead connections.
                 let chunk = match tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
+                    std::time::Duration::from_secs(600),
                     byte_stream.next(),
                 )
                 .await
@@ -571,7 +642,7 @@ impl LlmProvider for OpenAiProvider {
                     Ok(None) => break, // stream ended
                     Err(_) => {
                         let _ = tx.send(Ok(StreamEvent::Error(
-                            "Stream timeout: no data received for 120 seconds".to_string(),
+                            "Stream timeout: no data received for 600 seconds".to_string(),
                         )));
                         return;
                     }
@@ -591,6 +662,57 @@ impl LlmProvider for OpenAiProvider {
                             {
                                 let _ = f.write_all(&bytes);
                             }
+                        }
+                        total_sse_bytes = total_sse_bytes.saturating_add(bytes.len());
+                        // 350 KB SSE cap. Tuned from observed 5/9 atomgr
+                        // behaviour: AtomGit / litellm-style endpoints
+                        // truncate the response body around 440-500 KB.
+                        // 350 KB is the largest "safe" headroom — well
+                        // under the cut, but generous enough that long
+                        // legitimate generations (many tool calls + long
+                        // reasoning) finish cleanly. Any in-flight
+                        // tool_calls are flushed via ToolCallDone so the
+                        // breadcrumb path captures what was attempted,
+                        // and the error carries `[non-retryable]` so the
+                        // agent loop doesn't burn three retry cycles on
+                        // a deterministic limit.
+                        const SSE_BYTE_LIMIT: usize = 350 * 1024;
+                        if total_sse_bytes > SSE_BYTE_LIMIT {
+                            for (id, name, args) in &tool_calls {
+                                if id.is_empty() {
+                                    continue;
+                                }
+                                let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                                    crate::tool::ToolCall {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        arguments: args.clone(),
+                                    },
+                                )));
+                            }
+                            let kb = total_sse_bytes as f64 / 1024.0;
+                            let inflight = tool_calls
+                                .iter()
+                                .find(|(id, _, _)| !id.is_empty())
+                                .map(|(_, name, args)| {
+                                    format!(" (in-flight: `{}`, {} KB args)", name, args.len() / 1024)
+                                })
+                                .unwrap_or_default();
+                            let msg = format!(
+                                "[non-retryable] Response stream exceeded {} KB SSE wire bytes \
+                                 ({:.0} KB received{}). AtomCode aborted before the upstream \
+                                 proxy cuts the connection (typical at ~440-500 KB on this \
+                                 endpoint). For large file writes, split: write_file with a \
+                                 SKELETON first (under 1 KB of structural placeholders), then \
+                                 use edit_file or search_replace to fill each section in \
+                                 separate calls. A retry would just regenerate the same \
+                                 oversized payload and fail the same way.",
+                                SSE_BYTE_LIMIT / 1024,
+                                kb,
+                                inflight,
+                            );
+                            let _ = tx.send(Ok(StreamEvent::Error(msg)));
+                            return;
                         }
                         byte_buffer.extend_from_slice(&bytes);
                     }
@@ -737,6 +859,84 @@ impl LlmProvider for OpenAiProvider {
                                                 let _ = tx.send(Ok(StreamEvent::ToolCallDelta(
                                                     args.clone(),
                                                 )));
+
+                                                // ── Tool-specific streaming early-abort ──
+                                                //
+                                                // Generic per-tool args-byte caps are a bad
+                                                // idea (5/9 atomgr postmortem): chunk overhead
+                                                // varies 10× across models, so a one-size cap
+                                                // is either too tight (cuts a real 10 KB
+                                                // source-file edit on efficient streamers) or
+                                                // too loose (never fires for fragmented GLM
+                                                // streams). But for `write_file` specifically
+                                                // it's NOT generic — the content body IS the
+                                                // payload and the math is fixed:
+                                                //
+                                                //   provider output ≤ 16K tokens (openai.rs:74)
+                                                //   ≈ 48 KB raw output
+                                                //   ≈ 38 KB JSON-encoded content (escape ×1.25)
+                                                //
+                                                // So write_file with args > 32 KB will hit
+                                                // `finish_reason=length` mid-stream with high
+                                                // probability and waste 4-5 min. We cut the
+                                                // stream NOW (~15 s burned, not 300 s) and
+                                                // synthesise a clean ToolCallDone whose
+                                                // `content` field is `LARGE_WRITE_SENTINEL` —
+                                                // `tool/write.rs::execute` recognises it and
+                                                // replies with the skeleton-protocol directive,
+                                                // so the model self-heals SAME TURN without
+                                                // needing the user to re-prompt.
+                                                //
+                                                // We preserve the original file_path (the args
+                                                // head is intact — the cut hits the long tail
+                                                // of `content`) so the directive can name the
+                                                // file the model was trying to write.
+                                                const WRITE_FILE_STREAM_CAP: usize = 32 * 1024;
+                                                if entry.1 == "write_file"
+                                                    && entry.2.len() > WRITE_FILE_STREAM_CAP
+                                                {
+                                                    let path = extract_write_file_path(&entry.2)
+                                                        .unwrap_or_else(|| "<unknown>".to_string());
+                                                    let synth_id = if entry.0.is_empty() {
+                                                        format!("synth_writecap_{}", idx)
+                                                    } else {
+                                                        entry.0.clone()
+                                                    };
+                                                    let synth_args = serde_json::to_string(
+                                                        &serde_json::json!({
+                                                            "file_path": path,
+                                                            "content": crate::tool::LARGE_WRITE_SENTINEL,
+                                                        }),
+                                                    )
+                                                    .unwrap_or_else(|_| {
+                                                        // Fallback: hand-roll JSON in the
+                                                        // (impossible) case serde fails. The
+                                                        // sentinel string contains no chars
+                                                        // that need escaping, so this is safe.
+                                                        format!(
+                                                            "{{\"file_path\":{:?},\"content\":{:?}}}",
+                                                            path,
+                                                            crate::tool::LARGE_WRITE_SENTINEL,
+                                                        )
+                                                    });
+                                                    let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                                                        crate::tool::ToolCall {
+                                                            id: synth_id,
+                                                            name: "write_file".to_string(),
+                                                            arguments: synth_args,
+                                                        },
+                                                    )));
+                                                    // Mark Done as truncated so the runner
+                                                    // does NOT also push the generic "stream
+                                                    // cut" breadcrumb — the dispatched
+                                                    // write_file failure already carries the
+                                                    // full directive, a breadcrumb on top
+                                                    // would be redundant noise.
+                                                    let _ = tx.send(Ok(StreamEvent::Done {
+                                                        truncated: true,
+                                                    }));
+                                                    return;
+                                                }
                                             }
                                         }
                                     }
@@ -766,11 +966,30 @@ impl LlmProvider for OpenAiProvider {
                                                 Some(StreamEvent::Done { truncated: false });
                                         }
                                         "length" | "max_tokens" => {
-                                            // Model hit token limit — flush partial tool
-                                            // calls so downstream sees what the model was
-                                            // attempting. (Args may be malformed;
-                                            // `repair_tool_args` + write.rs friendly errors
-                                            // handle that.)
+                                            // Aligned with CC's `stop_reason: max_tokens`
+                                            // handling (services/api/claude.ts:2266):
+                                            // surface truncation as a turn-level Error so
+                                            // the runner pushes a "[provider stream cut...]"
+                                            // breadcrumb into the conversation, instead of
+                                            // dispatching a partially-streamed tool_call.
+                                            //
+                                            // Why this matters: a streamed write_file with
+                                            // huge `content` will end mid-string (no closing
+                                            // `"` and no `}`). The previous code emitted
+                                            // Done{truncated:true} and let `repair_tool_args`
+                                            // run, where `extract_json_fields` would scan
+                                            // until EOF and "salvage" the partial content as
+                                            // a complete value, fabricating an object that
+                                            // happens to be missing `file_path`. The model
+                                            // then saw "missing required [file_path]" and
+                                            // retried with the same too-large content.
+                                            //
+                                            // ToolCallDone is still emitted so the runner's
+                                            // breadcrumb logic (runner.rs:620) can enumerate
+                                            // tool names and arg sizes for the conversation
+                                            // note. The partial args are NEVER dispatched
+                                            // because Error→Failed terminates the turn before
+                                            // the tool-execution loop.
                                             for (id, name, args) in &tool_calls {
                                                 let _ = tx.send(Ok(StreamEvent::ToolCallDone(
                                                     crate::tool::ToolCall {
@@ -781,6 +1000,16 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
+                                            let _ = tx.send(Ok(StreamEvent::Error(
+                                                "[non-retryable] Response exceeded max output \
+                                                 tokens mid tool_call. Same context + same \
+                                                 prompt re-runs deterministically to the same \
+                                                 length cut — retrying burns 5 min per cycle \
+                                                 for nothing. For large write_file content: \
+                                                 write a skeleton first, then use edit_file \
+                                                 calls to fill sections."
+                                                    .to_string(),
+                                            )));
                                             pending_finish =
                                                 Some(StreamEvent::Done { truncated: true });
                                         }
@@ -916,6 +1145,43 @@ impl LlmProvider for OpenAiProvider {
         }
         Self::derive_reasoning_policy(&self.model, &self.base_url)
     }
+}
+
+/// Pull `file_path` out of a partial `write_file` args stream so the
+/// streaming-abort directive can name the file the model was trying to
+/// write. Bounded scan over the args head (the cut never hits the head —
+/// only the long `content` tail gets truncated), so a degenerate input
+/// can't pull megabytes into the breadcrumb.
+///
+/// Honours backslash-escaped quotes in the path value. Caps the result
+/// at 240 chars defensively — a wildly malformed path shouldn't spill
+/// across the conversation.
+fn extract_write_file_path(args: &str) -> Option<String> {
+    let head_end = args.len().min(2048);
+    let mut end = head_end;
+    while end > 0 && !args.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &args[..end];
+    let key = "\"file_path\":\"";
+    let start = head.find(key)? + key.len();
+    let rest = &head[start..];
+    let mut prev = '\0';
+    let mut value_end = None;
+    for (i, c) in rest.char_indices() {
+        if c == '"' && prev != '\\' {
+            value_end = Some(i);
+            break;
+        }
+        prev = c;
+    }
+    let raw = match value_end {
+        Some(e) => &rest[..e],
+        None => rest,
+    };
+    let cleaned = raw.replace("\\\\", "\\").replace("\\\"", "\"");
+    let truncated: String = cleaned.chars().take(240).collect();
+    Some(truncated)
 }
 
 /// Repair common JSON issues in tool call arguments from weak models.
@@ -1130,8 +1396,8 @@ fn check_truncation(content_chars: usize, prompt_tokens: usize) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_truncation, parse_nonstream_response, sample_for_error, sum_message_content_chars,
-        OpenAiProvider, ReasoningPolicy,
+        check_truncation, extract_write_file_path, parse_nonstream_response, sample_for_error,
+        sum_message_content_chars, OpenAiProvider, ReasoningPolicy,
     };
     use crate::conversation::message::{ImagePart, Message, MessageContent, Role};
     use crate::stream::StreamEvent;
@@ -1720,5 +1986,66 @@ mod tests {
     fn sum_message_content_chars_safe_on_missing_messages() {
         let body = serde_json::json!({"model": "x"});
         assert_eq!(sum_message_content_chars(&body), 0);
+    }
+
+    // ── extract_write_file_path (streaming-cap path-hint extraction) ──
+
+    /// The streaming abort needs the file_path the model was writing to so
+    /// the directive can name it. The args head is always intact (cut hits
+    /// the long `content` tail), so a simple bounded scan over the leading
+    /// `"file_path":"..."` is enough.
+    #[test]
+    fn extract_path_picks_file_path_from_head() {
+        let args = r#"{"file_path":"/abs/report.html","content":"<html>...lots more..."#;
+        assert_eq!(
+            extract_write_file_path(args).as_deref(),
+            Some("/abs/report.html"),
+        );
+    }
+
+    /// Returns None on missing key — caller falls back to "<unknown>" so
+    /// the directive at least renders. We must NOT crash or hand back
+    /// garbage if a future provider sends args in a different shape.
+    #[test]
+    fn extract_path_none_when_key_missing() {
+        let args = r#"{"path":"/abs/report.html","content":"x"}"#;
+        assert!(extract_write_file_path(args).is_none());
+    }
+
+    /// Path with escaped quotes round-trips through JSON unescape so the
+    /// directive prints a usable path (not `/has \"q\" inside`). Real-
+    /// world hit: Windows paths with quoted segments under cygwin
+    /// shells, plus model-emitted paths that double-escape unnecessarily.
+    #[test]
+    fn extract_path_handles_escaped_quotes() {
+        let args = r#"{"file_path":"/has \"q\" inside","content":"x"}"#;
+        assert_eq!(
+            extract_write_file_path(args).as_deref(),
+            Some("/has \"q\" inside"),
+        );
+    }
+
+    /// Stream cut mid-path (closing `"` never arrived) → caller still
+    /// gets the partial path so the directive can be SOMETHING useful
+    /// instead of `<unknown>`. Important because the streaming cap fires
+    /// at 32 KB args — if the path itself is suspiciously long, the
+    /// truncation hit it, and we want to surface what we have.
+    #[test]
+    fn extract_path_returns_partial_when_value_unterminated() {
+        let args = r#"{"file_path":"/abs/path/to/very/long/name"#;
+        let p = extract_write_file_path(args).expect("partial value should still extract");
+        assert!(p.starts_with("/abs/path/to/very/long"));
+    }
+
+    /// 240-char display cap on the extracted path. A pathologically long
+    /// path (model hallucinated 500 chars of URL into file_path) shouldn't
+    /// blow up the directive into a screenful — the cap stops at 240
+    /// chars so the body row stays scannable.
+    #[test]
+    fn extract_path_caps_at_240_chars() {
+        let huge = "a".repeat(500);
+        let args = format!(r#"{{"file_path":"{}","content":"x"}}"#, huge);
+        let p = extract_write_file_path(&args).unwrap();
+        assert_eq!(p.chars().count(), 240);
     }
 }

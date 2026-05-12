@@ -197,13 +197,41 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
         match part.parse::<u32>().ok() {
             Some(0) => *style = CellStyle::default(),
             Some(1) => style.bold = true,
-            Some(22) => style.bold = false,
+            Some(2) => style.faint = true,
+            Some(22) => {
+                style.bold = false;
+                style.faint = false;
+            }
             // Italic (3/23) — no CellStyle bit; text renders plain.
             Some(3) | Some(23) => {}
             Some(7) => style.reverse = true,
             Some(27) => style.reverse = false,
+            // Standard 8-colour foregrounds. Currently only 36 (cyan,
+            // emitted for fenced code block bodies) is in active use;
+            // the others are mapped for symmetry so future markdown
+            // additions don't surprise-fail with "I emitted SGR but
+            // nothing changed" the way the first cyan code-block
+            // attempt did. crossterm::Color names are 1:1 with the
+            // ANSI 30-37 block.
+            Some(30) => style.fg = Some(Color::Black),
+            Some(31) => style.fg = Some(Color::DarkRed),
+            Some(32) => style.fg = Some(Color::DarkGreen),
+            Some(33) => style.fg = Some(Color::DarkYellow),
+            Some(34) => style.fg = Some(Color::DarkBlue),
+            Some(35) => style.fg = Some(Color::DarkMagenta),
+            Some(36) => style.fg = Some(Color::DarkCyan),
+            Some(37) => style.fg = Some(Color::Grey),
             Some(39) => style.fg = None,
+            // Bright (90-97) — used by headings (96 = cyan). 90 / 97
+            // pre-existed; the rest fill in the row so future emits
+            // don't drop on the floor.
             Some(90) => style.fg = Some(Color::DarkGrey),
+            Some(91) => style.fg = Some(Color::Red),
+            Some(92) => style.fg = Some(Color::Green),
+            Some(93) => style.fg = Some(Color::Yellow),
+            Some(94) => style.fg = Some(Color::Blue),
+            Some(95) => style.fg = Some(Color::Magenta),
+            Some(96) => style.fg = Some(Color::Cyan),
             Some(97) => style.fg = Some(Color::White),
             // 38;2;R;G;B — truecolor foreground. Markdown emits this
             // for inline code / code blocks / headings so the colour
@@ -225,8 +253,8 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
                 // through silently — markdown doesn't emit them.
             }
             _ => {
-                // Other ANSI colours (30-37, 91-96, bg, underline)
-                // silently ignored — markdown doesn't emit them.
+                // Background colours (40-47, 100-107) and underline
+                // silently ignored — no current emitter wants them.
             }
         }
         i += 1;

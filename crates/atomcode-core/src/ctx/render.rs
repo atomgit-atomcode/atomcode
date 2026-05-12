@@ -262,12 +262,16 @@ pub fn build_messages(
     // `HELLO_TEST_12345` bug where fixed-window stubbing could clip
     // the in-flight turn).
     //
-    // Threshold = min(budget × 70%, 100K chars). The 100K cap keeps
-    // long-session token savings (kicks in around ~25K tokens of
-    // history); the 70%-of-budget floor protects small-context models
-    // from compacting too eagerly.
+    // Threshold = min(budget × 50%, 60K chars). Tighter than the
+    // previous 70%/100K cap because atomcode's `estimate_tokens()`
+    // under-counts real GLM tokenization by ~24% (CJK in tool
+    // descriptions and chat-template wrappers blow past the naive
+    // `len/4` heuristic). When `total_chars` reads 60K, real prompt
+    // tokens land near 18-20K — still 60K runway under an 81920 cap,
+    // safely far from the validation cliff that 5/10 sessions kept
+    // crashing at.
     let microcompact_threshold =
-        ((token_budget as u64 * 4 * 70 / 100) as usize).min(100_000);
+        ((token_budget as u64 * 4 * 50 / 100) as usize).min(60_000);
     microcompact(&mut result, conv.messages.len(), microcompact_threshold);
 
     replace_stale_reads(&mut result);

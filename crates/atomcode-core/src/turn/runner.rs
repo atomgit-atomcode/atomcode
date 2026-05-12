@@ -618,6 +618,43 @@ impl TurnRunner {
                                     }
 
                                     Some(Ok(StreamEvent::Error(e))) => {
+                                        // Preserve in-flight tool-call breadcrumbs before
+                                        // failing the turn. Without this, when the provider
+                                        // cuts a mid-stream tool_call (e.g. write_file with
+                                        // 600 KB of HTML args), the partial call is dropped
+                                        // and the next user turn shows "I attempted to write
+                                        // a report" prose with no record of WHAT was being
+                                        // written. The user types "the 3 writes failed" and
+                                        // the model has no memory of the attempts. 5/9 atomgr
+                                        // session: model spun for 5 minutes on git status /
+                                        // ls trying to discover what failed.
+                                        //
+                                        // We append a one-line note per in-flight tool call,
+                                        // pulling a target hint (file_path / path / url)
+                                        // from the partial JSON args via head-byte regex
+                                        // (the args head is always intact — only the long
+                                        // tail gets cut). Goes through stream_buffer so
+                                        // finalize_stream picks it up as Assistant text.
+                                        if !tool_calls_buf.is_empty() {
+                                            let mut note = String::from(
+                                                "\n\n[provider stream cut — the following tool calls were attempted but could not complete:\n",
+                                            );
+                                            for tc in &tool_calls_buf {
+                                                let target = extract_args_target_hint(&tc.arguments);
+                                                let kb = tc.arguments.len() / 1024;
+                                                note.push_str(&format!(
+                                                    "  - {}({}) — {} KB of args streamed before cut\n",
+                                                    tc.name,
+                                                    target.unwrap_or_else(|| "?".into()),
+                                                    kb,
+                                                ));
+                                            }
+                                            note.push_str(
+                                                "Likely cause: provider's response stream got truncated on a long generation. \
+                                                 For large file writes, retry with a skeleton + edit_file approach.]",
+                                            );
+                                            conversation.push_delta(&note);
+                                        }
                                         conversation.finalize_stream();
                                         tel_return!(TurnResult::Failed(e), 0u32);
                                     }
@@ -1374,6 +1411,73 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// Pull a one-line "what was this tool call targeting" hint out of
+/// partial JSON tool-call arguments. Used by the mid-stream-cut breadcrumb
+/// path: when the provider terminates the response in the middle of a
+/// 600KB write_file args stream, we still want the next user turn to see
+/// "the model attempted write_file(/path/to/report.html)" rather than
+/// staring at silent assistant prose.
+///
+/// Strategy: head-byte regex over the args string. The args HEAD is
+/// always intact (the cut hits the long tail, never the leading
+/// `{"file_path":"…",`), so a non-recursive match on the first key=value
+/// pair is enough. We try `file_path` → `path` → `file` → `url` →
+/// `command` → `pattern`, in that order, returning the first hit. The
+/// match is bounded so a half-encoded value doesn't pull megabytes of
+/// HTML into the breadcrumb.
+fn extract_args_target_hint(args: &str) -> Option<String> {
+    // Cap how much of the args we scan — we only care about the leading
+    // key=value, not the body. 1 KB is generous for any realistic
+    // file_path / command / url. Walk back to the nearest char boundary
+    // so we don't slice through a multi-byte UTF-8 char (e.g. CJK
+    // punctuation like `」` straddling the 1024 mark would panic).
+    let head = if args.len() > 1024 {
+        let mut end = 1024;
+        while end > 0 && !args.is_char_boundary(end) {
+            end -= 1;
+        }
+        &args[..end]
+    } else {
+        args
+    };
+    for key in &[
+        "file_path", "path", "file", "url", "command", "pattern",
+    ] {
+        let needle = format!("\"{}\":\"", key);
+        if let Some(start) = head.find(&needle) {
+            let value_start = start + needle.len();
+            let rest = &head[value_start..];
+            // Find the closing quote, honouring backslash-escaped quotes.
+            // (Partial JSON: tail may be missing, but the leading value
+            // typically isn't.)
+            let mut prev = '\0';
+            let mut end = None;
+            for (i, c) in rest.char_indices() {
+                if c == '"' && prev != '\\' {
+                    end = Some(i);
+                    break;
+                }
+                prev = c;
+            }
+            let raw = match end {
+                Some(e) => &rest[..e],
+                None => rest, // truncated value — show what we have
+            };
+            // Decode the most common JSON escapes so the breadcrumb
+            // reads cleanly. Anything else, leave as-is.
+            let cleaned = raw
+                .replace("\\\\", "\\")
+                .replace("\\\"", "\"")
+                .replace("\\n", " ")
+                .replace("\\t", " ");
+            // Cap displayed length so a wild `command` doesn't spill
+            // a screenful into the conversation.
+            return Some(truncate(&cleaned, 120));
+        }
+    }
+    None
 }
 
 /// DeepSeek uses `<think>...</think>`, QwQ uses similar patterns.
@@ -2202,5 +2306,68 @@ mod tool_call_text_rescue_tests {
         visible.push_str(&f.feed("世界"));
         visible.push_str(&f.flush());
         assert_eq!(visible, "中文 hello 世界");
+    }
+
+    // ── extract_args_target_hint (mid-stream-cut breadcrumb) ──
+
+    #[test]
+    fn target_hint_picks_file_path_first() {
+        let args = r#"{"file_path":"/abs/path/report.html","content":"<html>...truncated"#;
+        assert_eq!(
+            super::extract_args_target_hint(args).as_deref(),
+            Some("/abs/path/report.html"),
+        );
+    }
+
+    #[test]
+    fn target_hint_falls_through_to_path() {
+        // list_directory uses `path`, not `file_path`.
+        let args = r#"{"path":"/some/dir","depth":2}"#;
+        assert_eq!(
+            super::extract_args_target_hint(args).as_deref(),
+            Some("/some/dir"),
+        );
+    }
+
+    #[test]
+    fn target_hint_returns_partial_value_when_cut_mid_string() {
+        // The classic mid-stream cut scenario: closing quote never arrives.
+        // We surface the partial value so the breadcrumb still gives
+        // useful info ("write_file(/abs/path/to/" tells the user roughly
+        // what was being written).
+        let args = r#"{"file_path":"/abs/path/to/very/long"#;
+        let hint = super::extract_args_target_hint(args);
+        assert!(hint.is_some());
+        assert!(hint.unwrap().starts_with("/abs/path/to/very/long"));
+    }
+
+    #[test]
+    fn target_hint_returns_none_when_no_known_key() {
+        // An args blob with none of the expected keys → no hint, caller
+        // displays "?" rather than fabricating.
+        let args = r#"{"random_field":"x"}"#;
+        assert!(super::extract_args_target_hint(args).is_none());
+    }
+
+    #[test]
+    fn target_hint_decodes_common_json_escapes() {
+        // Escaped quote in the path shouldn't confuse the regex nor
+        // appear literally as `\"` in the user-facing breadcrumb.
+        let args = r#"{"file_path":"/has \"quote\" inside"}"#;
+        let hint = super::extract_args_target_hint(args).unwrap();
+        assert_eq!(hint, "/has \"quote\" inside");
+    }
+
+    #[test]
+    fn target_hint_caps_displayed_length() {
+        // A `command` key carrying a multi-KB shell pipeline shouldn't
+        // spill the whole thing into the assistant message — the
+        // breadcrumb is supposed to be one line.
+        let long = "x".repeat(500);
+        let args = format!("{{\"command\":\"{}\"}}", long);
+        let hint = super::extract_args_target_hint(&args).unwrap();
+        // truncate(_, 120) caps at 120 chars + ellipsis.
+        assert!(hint.chars().count() <= 121);
+        assert!(hint.ends_with('…'));
     }
 }
