@@ -1323,7 +1323,7 @@ async fn run() -> Result<i32> {
                     if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
                         match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
                             Ok(()) => eprintln!(
-                                "[fixissue] ✔ posted summary + applied 'fixed' label to issue #{}",
+                                "[fixissue] ✓ posted summary + applied 'fixed' label to issue #{}",
                                 issue_ref.number
                             ),
                             Err(e) => eprintln!(

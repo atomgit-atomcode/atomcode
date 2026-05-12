@@ -2188,7 +2188,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
-    // printing to stdout, so the user sees the ✔/✘ lines in the chat
+    // printing to stdout, so the user sees the ✓/✗ lines in the chat
     // scrollback rather than scrolled off above the welcome banner.
     if let Ok(report) = std::env::var("ATOMCODE_CODINGPLAN_REPORT") {
         std::env::remove_var("ATOMCODE_CODINGPLAN_REPORT");
@@ -5293,7 +5293,7 @@ fn handle_agent_event(
                 } else {
                     match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &body) {
                         Ok(()) => renderer.render(UiLine::CommandOutput(format!(
-                            "  [fixissue] ✔ posted summary + applied 'fixed' label to issue #{}\n",
+                            "  [fixissue] ✓ posted summary + applied 'fixed' label to issue #{}\n",
                             issue_ref.number
                         ))),
                         Err(e) => renderer.render(UiLine::CommandOutput(format!(

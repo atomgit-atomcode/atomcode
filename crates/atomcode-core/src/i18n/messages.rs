@@ -21,7 +21,7 @@ pub enum Msg<'a> {
     CpAlreadyClaimed { reason: &'a str },
     CpClaimFailed { error: &'a str },
     /// Per-tier cascade row — winning tier, fresh claim.
-    /// Example (zh-CN): `  ✔ CodingPlan Lite 领取成功`
+    /// Example (zh-CN): `  ✓ CodingPlan Lite 领取成功`
     CpClaimTierSucceeded { tier: &'a str },
     /// Per-tier cascade row — winning tier, server reported the user
     /// already holds this tier or higher (`duplicate=true`).
