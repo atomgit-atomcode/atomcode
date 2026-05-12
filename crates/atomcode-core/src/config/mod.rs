@@ -462,27 +462,39 @@ impl Config {
 
     pub fn active_provider(&self, override_name: Option<&str>) -> Result<&ProviderConfig> {
         // Defence against an accidentally-empty `default_provider` (e.g.
-        // an older /logout path wrote "" back to config.toml). Rather
-        // than looking up the empty key and failing at startup, fall
-        // back to a lexicographically-first provider so the TUI still
-        // boots and the user can self-correct via /provider.
+        // an older /logout path wrote "" back to config.toml) OR a
+        // `default_provider` that points to a provider section the user
+        // has since deleted from config.toml.  Rather than failing at
+        // startup, fall back to a lexicographically-first provider so
+        // the TUI still boots and the user can self-correct via /provider.
         let name: &str = override_name
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.default_provider);
-        let name: &str = if name.is_empty() {
+        let fallback = || {
             self.providers
                 .keys()
                 .min()
                 .map(String::as_str)
                 .ok_or_else(|| {
                     anyhow::anyhow!("No providers configured — run /codingplan or /provider")
-                })?
+                })
+        };
+        let name: &str = if name.is_empty() {
+            fallback()?
         } else {
             name
         };
-        self.providers
-            .get(name)
-            .with_context(|| format!("Provider '{}' not found in config", name))
+        match self.providers.get(name) {
+            Some(p) => Ok(p),
+            None => {
+                // default_provider / override pointed to a key that no
+                // longer exists — fall back to the first available.
+                let fallback_name = fallback()?;
+                // SAFETY: fallback() just returned Ok from self.providers,
+                // so the key must exist.
+                Ok(self.providers.get(fallback_name).unwrap())
+            }
+        }
     }
 
     /// Resolve the atomcode config dir. Pure function for testability —
@@ -884,6 +896,70 @@ mod tests {
     fn active_provider_errors_with_no_providers_and_empty_default() {
         let toml_str = r#"
             default_provider = ""
+            [providers]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let err = config.active_provider(None).unwrap_err();
+        assert!(
+            err.to_string().contains("No providers configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn active_provider_falls_back_when_default_points_to_deleted_provider() {
+        // Regression test for https://gitcode.com/atomgit_atomcode/atomcode/issues/353
+        // User deletes a provider section from config.toml but leaves
+        // default_provider pointing at it — startup must still succeed by
+        // falling back to a lexicographically-first provider instead of
+        // failing with "Provider 'xxx' not found".
+        let toml_str = r#"
+            default_provider = "AtomGit-Qwen"
+
+            [providers.openai]
+            type = "openai"
+            api_key = "sk-test"
+            model = "gpt-4o"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-a"
+            model = "claude-opus-4-6"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let provider = config.active_provider(None).unwrap();
+        // Should fall back to "claude" (lexicographically first)
+        assert_eq!(provider.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn active_provider_falls_back_when_override_points_to_deleted_provider() {
+        // Same as above but via the --provider CLI override.
+        let toml_str = r#"
+            default_provider = "openai"
+
+            [providers.openai]
+            type = "openai"
+            api_key = "sk-test"
+            model = "gpt-4o"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-a"
+            model = "claude-opus-4-6"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let provider = config.active_provider(Some("nonexistent")).unwrap();
+        // Should fall back to "claude" (lexicographically first)
+        assert_eq!(provider.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn active_provider_errors_when_default_deleted_and_no_other_providers() {
+        // default_provider points to a deleted section AND there are no
+        // other providers — must error (nothing to fall back to).
+        let toml_str = r#"
+            default_provider = "deleted"
             [providers]
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
