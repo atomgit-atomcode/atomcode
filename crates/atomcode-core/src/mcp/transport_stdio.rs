@@ -73,8 +73,17 @@ impl StdioClient {
 
     /// Start the subprocess and set up communication.
     async fn start(&self) -> Result<()> {
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&self.args)
+        // On Windows, commands like `npx`, `npm` are .cmd/.bat scripts
+        // that cannot be spawned directly via Command::new(). Wrap them
+        // through `cmd.exe /C` so the OS can locate and execute them.
+        #[cfg(target_os = "windows")]
+        let (command, args) = windows_wrap_command(&self.command, &self.args);
+
+        #[cfg(not(target_os = "windows"))]
+        let (command, args) = (self.command.clone(), self.args.clone());
+
+        let mut cmd = Command::new(&command);
+        cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -85,9 +94,24 @@ impl StdioClient {
 
         crate::process_utils::suppress_console_window(&mut cmd);
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn MCP server: {}", self.command))?;
+        let mut child = cmd.spawn().with_context(|| {
+            #[cfg(target_os = "windows")]
+            {
+                let msg = format!(
+                    "Failed to spawn MCP server: {}. \
+                     On Windows, commands like 'npx' are .cmd scripts and must \
+                     be executed through 'cmd /C'. AtomCode wraps known commands \
+                     automatically; if this is a custom .cmd/.bat, set command to \
+                     'cmd' and add '/C' before the script name in args.",
+                    self.command
+                );
+                msg
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                format!("Failed to spawn MCP server: {}", self.command)
+            }
+        })?;
 
         let stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = child.stdout.take().context("Failed to get stdout")?;
@@ -371,6 +395,52 @@ async fn read_content_length_message(
     serde_json::from_slice(&body).context("Failed to parse JSON-RPC response")
 }
 
+/// On Windows, commands like `npx`, `npm`, `yarn`, `pnpm` are actually
+/// `.cmd`/`.bat` scripts that cannot be spawned directly via
+/// `Command::new()`. The OS `CreateProcess` API only launches `.exe`
+/// files directly. This function detects such commands and wraps them
+/// through `cmd.exe /C` so the OS can locate and execute the script.
+///
+/// If the user has already wrapped the command themselves (e.g.
+/// `command: "cmd"`, `args: ["/C", "npx", ...]`), this function is a
+/// no-op — `cmd` / `cmd.exe` are not in the wrap list.
+///
+/// The core logic is platform-independent (and testable on all platforms);
+/// the `shell` parameter is `"cmd.exe"` on Windows.
+fn wrap_cmd_script(command: &str, args: &[String], shell: &str) -> (String, Vec<String>) {
+    /// Commands that are known to be `.cmd`/`.bat` scripts on Windows.
+    /// Checked case-insensitively.
+    const CMD_SCRIPTS: &[&str] = &[
+        "npx",
+        "npm",
+        "npx.cmd",
+        "npm.cmd",
+        "yarn",
+        "yarn.cmd",
+        "pnpm",
+        "pnpm.cmd",
+    ];
+
+    let lower = command.to_ascii_lowercase();
+    let needs_wrap = CMD_SCRIPTS.iter().any(|&s| lower == s)
+        || lower.ends_with(".cmd")
+        || lower.ends_with(".bat");
+
+    if needs_wrap {
+        let mut wrapped_args = vec!["/C".to_string(), command.to_string()];
+        wrapped_args.extend(args.iter().cloned());
+        (shell.to_string(), wrapped_args)
+    } else {
+        (command.to_string(), args.to_vec())
+    }
+}
+
+/// Windows-specific entry point that passes `"cmd.exe"` as the shell.
+#[cfg(target_os = "windows")]
+fn windows_wrap_command(command: &str, args: &[String]) -> (String, Vec<String>) {
+    wrap_cmd_script(command, args, "cmd.exe")
+}
+
 impl Drop for StdioClient {
     fn drop(&mut self) {
         // Try to kill the subprocess gracefully
@@ -379,5 +449,101 @@ impl Drop for StdioClient {
                 let _ = child.start_kill();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Platform-independent tests for wrap_cmd_script logic ---
+    // These run on ALL platforms (macOS, Linux, Windows) so we can
+    // verify the wrapping logic locally without a Windows machine.
+
+    #[test]
+    fn wrap_npx() {
+        let (cmd, args) = wrap_cmd_script("npx", &["-y".into(), "@pkg/server".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "npx", "-y", "@pkg/server"]);
+    }
+
+    #[test]
+    fn wrap_npx_cmd_suffix() {
+        let (cmd, args) = wrap_cmd_script("npx.cmd", &["-y".into(), "@pkg/server".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "npx.cmd", "-y", "@pkg/server"]);
+    }
+
+    #[test]
+    fn wrap_npm() {
+        let (cmd, args) = wrap_cmd_script("npm", &["install".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "npm", "install"]);
+    }
+
+    #[test]
+    fn wrap_yarn() {
+        let (cmd, args) = wrap_cmd_script("yarn", &["add".into(), "lodash".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "yarn", "add", "lodash"]);
+    }
+
+    #[test]
+    fn wrap_pnpm() {
+        let (cmd, args) = wrap_cmd_script("pnpm", &["install".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "pnpm", "install"]);
+    }
+
+    #[test]
+    fn wrap_custom_bat() {
+        let (cmd, args) = wrap_cmd_script("my-script.bat", &["--flag".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "my-script.bat", "--flag"]);
+    }
+
+    #[test]
+    fn wrap_custom_cmd_suffix() {
+        let (cmd, args) = wrap_cmd_script("build.cmd", &[], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "build.cmd"]);
+    }
+
+    #[test]
+    fn no_wrap_exe() {
+        let (cmd, args) = wrap_cmd_script("node", &["server.js".into()], "cmd.exe");
+        assert_eq!(cmd, "node");
+        assert_eq!(args, vec!["server.js"]);
+    }
+
+    #[test]
+    fn no_wrap_already_wrapped() {
+        // If user already set command to "cmd", don't double-wrap
+        let (cmd, args) =
+            wrap_cmd_script("cmd", &["/C".into(), "npx".into(), "-y".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd");
+        assert_eq!(args, vec!["/C", "npx", "-y"]);
+    }
+
+    #[test]
+    fn wrap_case_insensitive() {
+        let (cmd, args) = wrap_cmd_script("NPX", &["-y".into(), "@pkg/server".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "NPX", "-y", "@pkg/server"]);
+    }
+
+    #[test]
+    fn wrap_preserves_original_command_in_args() {
+        // The original command (with original casing) should appear in args
+        let (cmd, args) = wrap_cmd_script("Npx", &["-y".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args[1], "Npx"); // original casing preserved
+    }
+
+    #[test]
+    fn no_wrap_python() {
+        let (cmd, args) = wrap_cmd_script("python", &["-m".into(), "server".into()], "cmd.exe");
+        assert_eq!(cmd, "python");
+        assert_eq!(args, vec!["-m", "server"]);
     }
 }

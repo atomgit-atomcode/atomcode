@@ -26,6 +26,8 @@
 #   ATOMCODE_VERSION=vX.Y.Z       Override version. Defaults to Cargo.toml.
 #   ATOMCODE_WINDOWS_TARGETS=x64  Comma-separated: x64,arm64,all. Defaults to x64.
 #   ATOMCODE_INCLUDE_DAEMON=1     Also build atomcode-daemon.exe.
+#   ATOMCODE_USE_MIRROR=1         Use rsproxy.cn (ByteDance) mirror for faster
+#                                 crates.io downloads in China.
 
 set -euo pipefail
 
@@ -34,6 +36,35 @@ ROOT="$(pwd)"
 
 if [ -x "$HOME/.cargo/bin/rustc" ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
+# --- China mirror (rsproxy.cn by ByteDance) ---
+# When ATOMCODE_USE_MIRROR=1, set rustup + cargo to use the fast domestic mirror.
+# This dramatically speeds up crate downloads and rustup target installs.
+if [ "${ATOMCODE_USE_MIRROR:-0}" = "1" ]; then
+    export RUSTUP_DIST_SERVER="https://rsproxy.cn"
+    export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+
+    CARGO_CONFIG="$HOME/.cargo/config.toml"
+    MIRROR_MARKER="# atomcode-mirror-rsproxy"
+    if [ ! -f "$CARGO_CONFIG" ] || ! grep -q "$MIRROR_MARKER" "$CARGO_CONFIG" 2>/dev/null; then
+        echo "[mirror] Configuring rsproxy.cn (ByteDance) for crates.io ..."
+        mkdir -p "$(dirname "$CARGO_CONFIG")"
+        cat >> "$CARGO_CONFIG" <<'MIRROR_EOF'
+# atomcode-mirror-rsproxy
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+MIRROR_EOF
+        echo "[mirror] Done. Appended rsproxy-sparse config to $CARGO_CONFIG"
+    else
+        echo "[mirror] rsproxy already configured in $CARGO_CONFIG, skipping."
+    fi
 fi
 
 VERSION="${ATOMCODE_VERSION:-}"
