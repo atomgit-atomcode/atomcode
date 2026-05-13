@@ -336,20 +336,35 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         const role = normalizeRole(m.role);
 
         if (role === 'tool') {
-          const lastAssistant = messages.findLast((msg) => msg.role === 'assistant' && msg.toolCalls?.length);
+          // Find the last assistant message with tool calls — we need to update
+          // it immutably (no direct mutation of objects already in the array).
+          const lastAssistantIdx = messages.findLastIndex(
+            (msg) => msg.role === 'assistant' && (msg.toolCalls?.length ?? 0) > 0,
+          );
+          if (lastAssistantIdx < 0) continue;
+
+          const lastAssistant = messages[lastAssistantIdx];
           const callId = m.tool_result?.call_id;
           const output = textFromContent(m.content);
-          if (lastAssistant?.toolCalls && output) {
+
+          if (lastAssistant.toolCalls && output) {
             const targetIndex = callId
               ? lastAssistant.toolCalls.findIndex((tool) => tool.id === callId)
               : lastAssistant.toolCalls.findIndex((tool) => tool.output === undefined);
+
             if (targetIndex >= 0) {
-              lastAssistant.toolCalls[targetIndex] = {
-                ...lastAssistant.toolCalls[targetIndex],
-                output,
-                success: m.tool_result?.success ?? true,
-                status: m.tool_result?.success === false ? 'error' : 'done',
-              };
+              // Immutable update: create new toolCalls array and new message object
+              const newToolCalls = lastAssistant.toolCalls.map((tool, i) =>
+                i === targetIndex
+                  ? {
+                      ...tool,
+                      output,
+                      success: m.tool_result?.success ?? true,
+                      status: (m.tool_result?.success === false ? 'error' : 'done') as 'done' | 'error',
+                    }
+                  : tool,
+              );
+              messages[lastAssistantIdx] = { ...lastAssistant, toolCalls: newToolCalls };
             }
           }
           continue;
