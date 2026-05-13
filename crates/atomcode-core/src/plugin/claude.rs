@@ -68,7 +68,7 @@ impl ClaudePluginAssets {
 
 /// Scan all plugins that Claude Code has installed and return those that
 /// have at least one asset directory (`skills/` or `commands/`) on disk.
-pub fn iter_claude_code_plugins() -> Vec<ClaudePluginAssets> {
+pub fn get_claude_code_plugins() -> Vec<ClaudePluginAssets> {
     let home = match crate::tool::real_home_dir() {
         Some(h) => h,
         None => return vec![],
@@ -188,17 +188,24 @@ mod tests {
     }
 
     #[test]
-    fn iter_skips_missing_state_file() {
-        // No file → empty result, no panic.
-        let results = iter_claude_code_plugins();
-        // Can't assert on length here because `real_home_dir()` may point
-        // at the actual user's home which *does* have the file.  Just
-        // verify it doesn't crash.
-        let _ = results;
+    fn get_skips_missing_state_file() {
+        // When the state file does not exist (or any I/O error occurs),
+        // the function returns an empty vector without panicking.
+        // We test this by temporarily relocating HOME to a path that
+        // definitely has no `.claude` directory.
+        let fake_home = tempfile::tempdir().expect("tempdir");
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+        let results = get_claude_code_plugins();
+        std::env::remove_var("HOME");
+        if let Some(h) = original_home {
+            std::env::set_var("HOME", h);
+        }
+        assert!(results.is_empty(), "should be empty when no Claude state file exists");
     }
 
     #[test]
-    fn iter_skips_missing_install_path() {
+    fn get_skips_missing_install_path() {
         // Install path in JSON but directory doesn't exist → skip.
         let dir = tempfile::tempdir().expect("tempdir");
         let state_path = dir.path().join("installed_plugins.json");

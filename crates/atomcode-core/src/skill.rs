@@ -425,13 +425,18 @@ impl SkillRegistry {
         // Code has installed in its own cache directory.  Each plugin's
         // `skills/` and `commands/` are loaded under its own namespace
         // (e.g. `superpowers:brainstorming`) matching Claude Code's
-        // `<plugin>:<skill>` convention.
-        for assets in crate::plugin::claude::iter_claude_code_plugins() {
+        // `<plugin>:<skill>` convention.  Loaded BEFORE AtomCode native
+        // plugins so the latter can override in case of name collisions
+        // (HashMap::insert keeps the last value for a given key).
+        for assets in crate::plugin::claude::get_claude_code_plugins() {
             self.load_skills_dir(&assets.skills_dir(), Some(&assets.plugin), &mut warnings);
             self.load_flat_commands(&assets.commands_dir(), Some(&assets.plugin), &mut warnings);
         }
 
-        // Plugin layer — installed plugins contribute namespaced skills.
+        // Plugin layer — installed AtomCode native plugins contribute
+        // namespaced skills.  Loaded AFTER Claude Code bridge so that a
+        // same-named AtomCode skill takes priority over the Claude Code
+        // bridge copy (last insert wins in load_skills_dir).
         for assets in crate::plugin::loader::iter_installed_plugin_assets() {
             self.load_skills_dir(&assets.skills_dir(), Some(&assets.plugin), &mut warnings);
         }
