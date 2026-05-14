@@ -677,7 +677,33 @@ impl LlmProvider for OpenAiProvider {
                         // agent loop doesn't burn three retry cycles on
                         // a deterministic limit.
                         const SSE_BYTE_LIMIT: usize = 350 * 1024;
+                        // Threshold for "args size that justifies bailing
+                        // vs trying to dispatch the partial". Tuned to
+                        // match the soft cap in `tool/write.rs::execute`
+                        // — anything above is treated as runaway content
+                        // (5+ min wasted on the same length-cut on retry),
+                        // anything below is treated as small-content +
+                        // proxy-fragmentation (5/14 atomgr session:
+                        // write_file with 3 KB args triggered the cap
+                        // because GLM-5.1 streaming on the AtomGit
+                        // litellm proxy ballooned to 117× SSE-to-content
+                        // overhead — 3 KB content in 350 KB SSE wire,
+                        // far past anything we can do client-side).
+                        const RUNAWAY_ARGS_THRESHOLD: usize = 16 * 1024;
                         if total_sse_bytes > SSE_BYTE_LIMIT {
+                            let max_args_size = tool_calls
+                                .iter()
+                                .filter(|(id, _, _)| !id.is_empty())
+                                .map(|(_, _, args)| args.len())
+                                .max()
+                                .unwrap_or(0);
+                            // Flush every in-flight tool_call as Done in
+                            // BOTH branches below — the small-args branch
+                            // then chases it with a clean Done event so
+                            // the runner dispatches the partials; the
+                            // large-args branch chases with an Error so
+                            // the agent bails non-retryable. Same prefix
+                            // either way, different suffix.
                             for (id, name, args) in &tool_calls {
                                 if id.is_empty() {
                                     continue;
@@ -690,6 +716,46 @@ impl LlmProvider for OpenAiProvider {
                                     },
                                 )));
                             }
+
+                            // ── Small-args + cap hit = proxy degeneracy path ──
+                            //
+                            // The model produced reasonable tool args (≤ 16 KB)
+                            // but the wire bytes ballooned past 350 KB due to
+                            // upstream per-chunk overhead (litellm-style proxy
+                            // backpressure, rate-limit chunks dripped between
+                            // content tokens, etc.). The args are likely
+                            // complete or nearly so — bailing here loses a
+                            // potentially-valid skeleton write. Hand the
+                            // partial off to the runner via a normal
+                            // Done(truncated) event; `repair_tool_args` will
+                            // close any unclosed JSON, write.rs's own size
+                            // cap (30 KB content) gates the rest, and a
+                            // genuinely broken tool_call still fails at
+                            // dispatch with a recoverable ToolResult error
+                            // the model can react to NEXT round.
+                            //
+                            // No NON_RETRYABLE marker here — this path is
+                            // recoverable by definition; the partial may
+                            // succeed, or its failure rolls into the normal
+                            // retry chain.
+                            if max_args_size > 0 && max_args_size <= RUNAWAY_ARGS_THRESHOLD {
+                                let _ = tx.send(Ok(StreamEvent::Done {
+                                    truncated: true,
+                                }));
+                                return;
+                            }
+
+                            // ── Large-args OR no-args + cap hit = real runaway ──
+                            //
+                            // Either: (a) the model is genuinely streaming a
+                            // huge tool_call body (>16 KB args), which will
+                            // deterministically re-fail the same way on
+                            // retry — surface the skeleton+edit_file
+                            // directive; or (b) no tool_call args
+                            // streamed at all, meaning the wire was full
+                            // of text/reasoning chunks that ballooned past
+                            // the cap — surface a proxy-degeneracy hint so
+                            // the user knows it's not their request shape.
                             let kb = total_sse_bytes as f64 / 1024.0;
                             let inflight = tool_calls
                                 .iter()
@@ -698,18 +764,32 @@ impl LlmProvider for OpenAiProvider {
                                     format!(" (in-flight: `{}`, {} KB args)", name, args.len() / 1024)
                                 })
                                 .unwrap_or_default();
+                            let advice = if max_args_size > RUNAWAY_ARGS_THRESHOLD {
+                                "For large file writes, split: write_file with a \
+                                 SKELETON first (under 1 KB of structural placeholders), \
+                                 then use edit_file or search_replace to fill each \
+                                 section in separate calls. A retry would just \
+                                 regenerate the same oversized payload and fail the \
+                                 same way."
+                            } else {
+                                "No tool args were streamed before the cap — the wire \
+                                 was carrying only text/reasoning chunks with extreme \
+                                 fragmentation overhead. This is upstream proxy \
+                                 degeneracy (litellm backpressure / rate-limit chunks \
+                                 mixed into the stream), not a payload-size issue. \
+                                 Wait 60+ seconds before retrying, or switch to a \
+                                 different provider via /provider."
+                            };
                             let msg = format!(
-                                "[non-retryable] Response stream exceeded {} KB SSE wire bytes \
-                                 ({:.0} KB received{}). AtomCode aborted before the upstream \
+                                "{marker} Response stream exceeded {limit_kb} KB SSE wire bytes \
+                                 ({kb:.0} KB received{inflight}). AtomCode aborted before the upstream \
                                  proxy cuts the connection (typical at ~440-500 KB on this \
-                                 endpoint). For large file writes, split: write_file with a \
-                                 SKELETON first (under 1 KB of structural placeholders), then \
-                                 use edit_file or search_replace to fill each section in \
-                                 separate calls. A retry would just regenerate the same \
-                                 oversized payload and fail the same way.",
-                                SSE_BYTE_LIMIT / 1024,
-                                kb,
-                                inflight,
+                                 endpoint). {advice}",
+                                marker = crate::provider::NON_RETRYABLE_MARKER,
+                                limit_kb = SSE_BYTE_LIMIT / 1024,
+                                kb = kb,
+                                inflight = inflight,
+                                advice = advice,
                             );
                             let _ = tx.send(Ok(StreamEvent::Error(msg)));
                             return;
@@ -1000,16 +1080,16 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
-                                            let _ = tx.send(Ok(StreamEvent::Error(
-                                                "[non-retryable] Response exceeded max output \
+                                            let _ = tx.send(Ok(StreamEvent::Error(format!(
+                                                "{marker} Response exceeded max output \
                                                  tokens mid tool_call. Same context + same \
                                                  prompt re-runs deterministically to the same \
                                                  length cut — retrying burns 5 min per cycle \
                                                  for nothing. For large write_file content: \
                                                  write a skeleton first, then use edit_file \
-                                                 calls to fill sections."
-                                                    .to_string(),
-                                            )));
+                                                 calls to fill sections.",
+                                                marker = crate::provider::NON_RETRYABLE_MARKER,
+                                            ))));
                                             pending_finish =
                                                 Some(StreamEvent::Done { truncated: true });
                                         }

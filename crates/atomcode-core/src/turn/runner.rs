@@ -618,24 +618,54 @@ impl TurnRunner {
                                     }
 
                                     Some(Ok(StreamEvent::Error(e))) => {
-                                        // Preserve in-flight tool-call breadcrumbs before
-                                        // failing the turn. Without this, when the provider
-                                        // cuts a mid-stream tool_call (e.g. write_file with
-                                        // 600 KB of HTML args), the partial call is dropped
-                                        // and the next user turn shows "I attempted to write
-                                        // a report" prose with no record of WHAT was being
-                                        // written. The user types "the 3 writes failed" and
-                                        // the model has no memory of the attempts. 5/9 atomgr
-                                        // session: model spun for 5 minutes on git status /
-                                        // ls trying to discover what failed.
+                                        // ── In-flight tool-call breadcrumb (conversation only) ──
                                         //
-                                        // We append a one-line note per in-flight tool call,
-                                        // pulling a target hint (file_path / path / url)
-                                        // from the partial JSON args via head-byte regex
-                                        // (the args head is always intact — only the long
-                                        // tail gets cut). Goes through stream_buffer so
-                                        // finalize_stream picks it up as Assistant text.
-                                        if !tool_calls_buf.is_empty() {
+                                        // PURPOSE: when a stream gets cut mid-tool-call, the
+                                        // partial call never makes it into `tool_calls_buf` as a
+                                        // committed entry. Without a breadcrumb, the next turn's
+                                        // model sees "I attempted to write a report" prose with
+                                        // no record of WHAT was being written and burns 5 min
+                                        // on git status / ls trying to discover its own crater
+                                        // (5/9 atomgr postmortem).
+                                        //
+                                        // CONVERSATION SIDE (preserved): we push the breadcrumb
+                                        // to `stream_buffer` ONLY when visible text has already
+                                        // streamed this turn — piggy-backing on the existing
+                                        // Assistant message so role alternation stays clean.
+                                        // When `text_buf` is empty, dropping the breadcrumb
+                                        // costs us model memory of the partial attempt; the
+                                        // alternative (orphan Assistant message → two adjacent
+                                        // Assistants on retry → glm-5.1 silently returns 0
+                                        // tokens, 5/13 18:53 Turn 16) was strictly worse.
+                                        //
+                                        // UI SIDE (REMOVED 5/14): the previous version of this
+                                        // code also fired `event_tx.send(TurnEvent::TextDelta)`
+                                        // to surface the breadcrumb in scrollback. Two
+                                        // problems with that:
+                                        //   1. SPAM — the agent's `is_rate_limited` retry path
+                                        //      re-runs the runner up to 5× per user turn, and
+                                        //      each retry hit the same stream-cut error,
+                                        //      firing the same TextDelta. Users saw the
+                                        //      breadcrumb 4-5× per failure cluster (5/14 00:31
+                                        //      atomgr Turn 13-17 in scrollback).
+                                        //   2. INTERLEAVING — TextDelta routes through the
+                                        //      markdown renderer's streaming pipeline (newline-
+                                        //      flushed, chunkable), while the subsequent
+                                        //      AgentEvent::Error renders as a single static
+                                        //      line via a different code path. The two
+                                        //      renderers raced, producing visually garbled
+                                        //      output: `[Error: ...]` literally inserted
+                                        //      mid-sentence of the breadcrumb text.
+                                        // Both go away by NOT emitting to UI here. The Error
+                                        // event that the agent layer surfaces already carries
+                                        // the in-flight tool name + arg byte count (see
+                                        // openai.rs:701 "in-flight: `<tool>`, N KB args"),
+                                        // so no information is lost to the user. The model
+                                        // still gets the breadcrumb when applicable via the
+                                        // conversation-side push below.
+                                        if !tool_calls_buf.is_empty()
+                                            && !text_buf.trim().is_empty()
+                                        {
                                             let mut note = String::from(
                                                 "\n\n[provider stream cut — the following tool calls were attempted but could not complete:\n",
                                             );
@@ -656,7 +686,49 @@ impl TurnRunner {
                                             conversation.push_delta(&note);
                                         }
                                         conversation.finalize_stream();
-                                        tel_return!(TurnResult::Failed(e), 0u32);
+                                        // ── Rate-limited mid-tool-call short-circuit ──
+                                        //
+                                        // When the provider cuts the stream mid-tool-call
+                                        // (tool_calls_buf is non-empty at Error time) AND the
+                                        // error string carries rate-limit indicators, the
+                                        // agent's retry chain currently tries up to 5× via
+                                        // `is_rate_limited`. Each retry re-issues the same
+                                        // LLM request, the model regenerates the SAME args,
+                                        // and the same per-minute output quota cuts the
+                                        // stream at the same byte. 3+6+9+12+15 = 45 s of dead
+                                        // wait per failure cluster (5/14 00:31 atomgr Turn
+                                        // 13-17: edit_file(?, 3 KB) cut 4 times before SSE
+                                        // cap finally bailed).
+                                        //
+                                        // Prepend NON_RETRYABLE_MARKER so the agent's
+                                        // NON_RETRYABLE branch (now positioned BEFORE
+                                        // is_rate_limited) catches it first and bails
+                                        // immediately. The model can recover next user turn
+                                        // — either by waiting past the rolling quota window
+                                        // (60 s+), splitting the edit smaller, or letting
+                                        // the user re-prompt with a different plan.
+                                        //
+                                        // We do NOT mark non-retryable when tool_calls_buf
+                                        // is empty: those rate-limit hits happened before
+                                        // any tool args streamed (just thinking phase),
+                                        // which retry CAN recover from after the window
+                                        // resets — the 5× backoff path stays useful there.
+                                        let final_err = if !tool_calls_buf.is_empty()
+                                            && looks_rate_limited(&e)
+                                            && !e.contains(crate::provider::NON_RETRYABLE_MARKER)
+                                        {
+                                            format!(
+                                                "{} Rate-limited mid-tool-call stream cut — \
+                                                 model was streaming tool args when the upstream \
+                                                 quota throttled the response. Same context will \
+                                                 regenerate the same args and hit the same quota \
+                                                 window on retry. Original error: {}",
+                                                crate::provider::NON_RETRYABLE_MARKER, e
+                                            )
+                                        } else {
+                                            e
+                                        };
+                                        tel_return!(TurnResult::Failed(final_err), 0u32);
                                     }
 
                                     Some(Ok(StreamEvent::Warning(w))) => {
@@ -710,9 +782,48 @@ impl TurnRunner {
         );
 
         if tool_calls_buf.is_empty() && text_buf.trim().is_empty() {
+            // Empty response — two distinct root causes that the runner
+            // cannot tell apart at this layer, but the agent loop can
+            // tell apart by RETRYING ONCE with backoff:
+            //
+            //   (a) SOFT RATE LIMIT — AtomGit's litellm proxy returns
+            //       200 + empty SSE (not 429) when per-minute output
+            //       token quota is exhausted. 5/13 21:15 atomgr session
+            //       Turn 12: 4.3 s response time with `text=""`,
+            //       `reasoning=""`, `tool_calls=[]` after Turn 11 emitted
+            //       1822 completion tokens. Other models in the same
+            //       proxy stack (Moonshot, ModelScope) behave similarly
+            //       when soft-throttled. Recoverable: wait 15 s + retry,
+            //       quota window resets.
+            //
+            //   (b) DETERMINISTIC EMPTY — model genuinely had no output
+            //       to produce: consumed its budget on internal
+            //       reasoning (`<think>` / `reasoning_content`) and
+            //       emitted EOS before any tool_call or visible text
+            //       formed; OR the conversation reached a state where
+            //       the model decided to silently stop. Same context
+            //       repeats the same EOS. 5/13 16:02 atomgr session
+            //       Turn 1/2: two 303 s silent turns back to back.
+            //
+            // We can't distinguish from the runner — neither HTTP status
+            // (200 either way) nor stream metadata reveals the cause.
+            // `agent/mod.rs::is_empty_response_error` matches THIS error
+            // string and runs ONE 15-s backoff retry, then routes to
+            // `[non-retryable]`. That balances:
+            //   * Case (a) recovers transparently after 15 s wait.
+            //   * Case (b) bails after ~20 s total (one fast empty +
+            //     15 s wait + one more fast empty), nowhere near the
+            //     historical 4-5 min generic-retry waste.
+            // No `[non-retryable]` marker here — the agent layer owns
+            // the retry policy for this class.
             tel_return!(
                 TurnResult::Failed(
-                    "Provider returned an empty response (no text, no tool calls).".to_string(),
+                    "Provider returned an empty response (no text, no tool calls). \
+                     Likely soft rate-limit (litellm proxy returns 200 + empty SSE \
+                     when per-minute output quota is exhausted) or deterministic \
+                     model EOS. The agent will retry once with backoff before \
+                     surfacing the failure."
+                        .to_string(),
                 ),
                 0u32
             );
@@ -1129,21 +1240,36 @@ impl TurnRunner {
             call
         };
 
-        // Schema gate: bounce malformed args back to the model BEFORE
-        // approval / execute. Provider stream truncation occasionally
-        // ships `{]` or `{"file_path":"..."]` (closing bracket wrong,
-        // required field missing); without this guard, write_file's
-        // fail-closed approval branch would prompt the user, the user
-        // would Allow, and execute would then fail with the same parse
-        // error — a wasted approval round-trip on a known-broken call.
-        // Runs AFTER `repair_tool_args` (so wrapper-shape / fence / nested
-        // payloads recover first) but BEFORE approval — the unrecoverable
-        // remainder is what gets bounced.
+        // Schema / semantic gate: bounce invalid args back to the model
+        // BEFORE approval / execute. Catches two distinct failure classes:
+        //   * Structural (provider stream cuts ship `{]` or
+        //     `{"file_path":"..."]`; required fields missing) — surfaced
+        //     by `diagnose_args` which already names the missing keys
+        //     and provides a `Re-issue: <example>` recovery hint.
+        //   * Semantic (e.g. `parallel_edit_files` duplicate-path
+        //     rejection) — validator returns its own actionable
+        //     directive ("call edit_file N times SEQUENTIALLY").
+        //
+        // Every current validator (write / edit / search_replace /
+        // parallel_edit) bakes its own recovery hint into the `reason`
+        // string, so we just prepend a single `Error:` marker for grep
+        // hygiene and emit the validator's text verbatim. An earlier
+        // version of this code appended a generic ". Re-issue <tool>
+        // with a complete JSON object containing all required fields."
+        // boilerplate, which CONTRADICTED semantic validators (5/13 20:16
+        // session: parallel_edit_files duplicate-path rejection told the
+        // model "use sequential edit_file" while the wrapper said "your
+        // JSON is incomplete" — glm-5.1 saw the contradiction and
+        // returned 0 tokens on the next round, killing the turn). If a
+        // future validator returns a message without recovery guidance,
+        // fix the validator — don't paper over it with a wrong-shape
+        // boilerplate at the runner layer.
+        //
+        // Runs AFTER `repair_tool_args` (so wrapper-shape / fence /
+        // nested payloads recover first) but BEFORE approval — the
+        // unrecoverable remainder is what gets bounced.
         if let Err(reason) = tool.validate_args(&call.arguments) {
-            let msg = format!(
-                "Error: {}. Re-issue {} with a complete JSON object containing all required fields.",
-                reason, call.name
-            );
+            let msg = format!("Error: {}", reason);
             let _ = event_tx.send(TurnEvent::ToolCallResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -1427,6 +1553,21 @@ fn truncate(s: &str, max: usize) -> String {
 /// `command` → `pattern`, in that order, returning the first hit. The
 /// match is bounded so a half-encoded value doesn't pull megabytes of
 /// HTML into the breadcrumb.
+/// Conservative substring match for the rate-limit signals the upstream
+/// provider mixes into mid-stream error frames. Kept loose (matches "rate"
+/// anywhere) intentionally — the runner only USES this signal to switch
+/// retry policy from "5× backoff" to "1× bail" when tool args were already
+/// in flight, and the cost of a false positive (bailing on a recoverable
+/// retry) is far smaller than the cost of a false negative (45 s wasted
+/// on a guaranteed-to-fail retry).
+///
+/// Mirrors `agent/mod.rs::is_rate_limited_error` keyword set so the two
+/// layers agree on what counts as rate-limited; if you tune one, tune
+/// both.
+fn looks_rate_limited(e: &str) -> bool {
+    e.contains("429") || e.contains("rate") || e.contains("Too Many")
+}
+
 fn extract_args_target_hint(args: &str) -> Option<String> {
     // Cap how much of the args we scan — we only care about the leading
     // key=value, not the body. 1 KB is generous for any realistic
@@ -2369,5 +2510,39 @@ mod tool_call_text_rescue_tests {
         // truncate(_, 120) caps at 120 chars + ellipsis.
         assert!(hint.chars().count() <= 121);
         assert!(hint.ends_with('…'));
+    }
+
+    // ── looks_rate_limited (mid-tool-call short-circuit signal) ──
+
+    /// Locks the keyword set this side of the boundary uses to decide
+    /// "stream cut + rate-limit substring → bail non-retryable". Must
+    /// match `agent/mod.rs::is_rate_limited_error` exactly — if either
+    /// side drifts, the runner could mark a non-retryable that the
+    /// agent then routes through generic catch-all retry (wrong wait
+    /// schedule) or vice versa.
+    #[test]
+    fn looks_rate_limited_matches_documented_signals() {
+        assert!(super::looks_rate_limited("HTTP 429 Too Many Requests"));
+        assert!(super::looks_rate_limited(
+            "API error (429): rate-limited mid-stream"
+        ));
+        assert!(super::looks_rate_limited("Too Many parallel requests"));
+        // `rate` substring on its own is enough; loose intentionally
+        // (see fn doc — false positive cost is small vs false negative).
+        assert!(super::looks_rate_limited("the server reports a rate cap"));
+    }
+
+    /// Negative cases — generic stream cuts, parse errors, auth
+    /// failures must NOT route through the rate-limit short-circuit.
+    /// Otherwise a one-off transient parse failure would get marked
+    /// non-retryable and the user would see a hard fail where one
+    /// retry would have recovered.
+    #[test]
+    fn looks_rate_limited_does_not_match_unrelated_errors() {
+        assert!(!super::looks_rate_limited("Stream timeout: no data received"));
+        assert!(!super::looks_rate_limited("401 Unauthorized"));
+        assert!(!super::looks_rate_limited("invalid_api_key"));
+        assert!(!super::looks_rate_limited("Connection closed by proxy"));
+        assert!(!super::looks_rate_limited(""));
     }
 }

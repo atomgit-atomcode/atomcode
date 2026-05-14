@@ -69,13 +69,19 @@ impl Tool for ParallelEditTool {
             description:
                 "Edit multiple INDEPENDENT files in parallel via fork sub-agents.\n\n\
                 Use ONLY when:\n\
-                - You have 2+ concrete files to edit, each with a clear instruction\n\
+                - You have 2+ DIFFERENT concrete files to edit, each with a clear instruction\n\
                 - Edits in different files don't depend on each other\n\
                 - You can express any cross-file invariants (shared trait/type/interface) in `contract`\n\n\
                 Do NOT use when:\n\
                 - You're still exploring or the edit isn't fully decided\n\
+                - You want to make several edits to the SAME file (use N sequential edit_file / search_replace calls instead — listing the same path twice causes a race where edits clobber each other)\n\
                 - Files have impl/decl splits that need coordinated edits (use sequential edit_file)\n\
                 - You want to read more files first (use read_file)\n\n\
+                Every `path` in `files` MUST be unique. The tool rejects duplicate paths because \
+                sub-agents run concurrently — two sub-agents editing the same file race on read/write \
+                and the later writer overwrites the earlier one's edits. To fill N sections of one \
+                file (e.g. a skeleton HTML with N <!-- SECTION:* --> markers), call edit_file N times \
+                sequentially.\n\n\
                 Each sub-agent sees only its assigned file content + the contract you provide. \
                 Cross-file changes that aren't expressed in `contract` will be missed by the merge — \
                 the sub-agents cannot see each other's edits. After all sub-agents settle, the \
@@ -137,8 +143,26 @@ impl Tool for ParallelEditTool {
                 parsed.files.len()
             ));
         }
+        // Track first-seen index per normalised path so a duplicate
+        // detection error can point at BOTH offending entries — the
+        // model needs to know which two indices to merge, not just
+        // "you have a duplicate somewhere". Trim only; we don't
+        // case-fold or resolve symlinks here because:
+        //   - case-sensitivity is FS-dependent (case-insensitive on
+        //     APFS-default macOS / Windows NTFS, case-sensitive on
+        //     ext4 / btrfs / case-sensitive APFS), so a normalised
+        //     comparison here would lie on half the platforms
+        //   - resolving requires async I/O against a sub-agent that
+        //     hasn't been dispatched yet; cheaper to let the literal
+        //     duplicate (the only case glm-5.1 actually produces —
+        //     5/13 atomgr session emitted security-audit-report.html
+        //     × 7 verbatim) get rejected here, and trust the OS to
+        //     race-protect any legitimate case-variant collisions
+        let mut seen_paths: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(parsed.files.len());
         for (i, f) in parsed.files.iter().enumerate() {
-            if f.path.trim().is_empty() {
+            let normalised = f.path.trim();
+            if normalised.is_empty() {
                 return Err(format!("files[{}].path is empty", i));
             }
             if f.instruction.trim().is_empty() {
@@ -148,6 +172,24 @@ impl Tool for ParallelEditTool {
                     i
                 ));
             }
+            if let Some(&first_idx) = seen_paths.get(normalised) {
+                let dup_count = parsed
+                    .files
+                    .iter()
+                    .filter(|other| other.path.trim() == normalised)
+                    .count();
+                return Err(format!(
+                    "parallel_edit_files rejected: path `{}` appears {} times \
+                     (first at files[{}], duplicate at files[{}]). Sub-agents run \
+                     concurrently — N sub-agents on the same file race on read/write \
+                     and the later writer clobbers earlier edits, so this is unsafe by \
+                     construction. To make {} edits to the same file, call edit_file \
+                     (or search_replace) {} times SEQUENTIALLY instead; only use \
+                     parallel_edit_files when the files are genuinely different.",
+                    normalised, dup_count, first_idx, i, dup_count, dup_count,
+                ));
+            }
+            seen_paths.insert(normalised.to_string(), i);
         }
         Ok(())
     }
@@ -532,6 +574,68 @@ mod validate_args_tests {
         let args = "not json at all";
         let err = tool().validate_args(args).unwrap_err();
         assert!(err.contains("parallel_edit_files arguments"), "got: {}", err);
+    }
+
+    /// Real-world failure mode from 5/13 atomgr session: glm-5.1 emitted
+    /// parallel_edit_files with 7 entries ALL pointing at
+    /// security-audit-report.html. Sub-agents ran concurrently and the
+    /// last writer clobbered the previous six edits. Even worse, the
+    /// post-dispatch round-trip silently returned an empty response —
+    /// 4-5 min of dead time per attempt.
+    ///
+    /// The validator must reject duplicate paths up-front so the model
+    /// receives a structured retry hint ("use N sequential edit_file
+    /// calls") instead of a corrupted file + agent confusion.
+    #[test]
+    fn rejects_duplicate_paths() {
+        let args = r#"{"files":[
+            {"path":"/abs/report.html","instruction":"fill section A"},
+            {"path":"/abs/report.html","instruction":"fill section B"}
+        ]}"#;
+        let err = tool().validate_args(args).unwrap_err();
+        assert!(err.contains("appears 2 times"), "got: {}", err);
+        assert!(
+            err.contains("files[0]") && err.contains("files[1]"),
+            "must name both offending indices for the model to merge them; got: {}",
+            err
+        );
+        assert!(
+            err.contains("edit_file") && err.contains("SEQUENTIALLY"),
+            "must hint at the correct alternative tool + ordering; got: {}",
+            err
+        );
+    }
+
+    /// 7-way duplication (the actual session shape) — count must be
+    /// exact so the model knows how many sequential edit_file calls
+    /// to make.
+    #[test]
+    fn duplicate_error_reports_exact_count() {
+        let files: Vec<String> = (0..7)
+            .map(|i| {
+                format!(
+                    r#"{{"path":"/abs/x.html","instruction":"section {}"}}"#,
+                    i
+                )
+            })
+            .collect();
+        let args = format!(r#"{{"files":[{}]}}"#, files.join(","));
+        let err = tool().validate_args(&args).unwrap_err();
+        assert!(err.contains("appears 7 times"), "got: {}", err);
+    }
+
+    /// Whitespace-only differences in `path` ARE treated as duplicates
+    /// (we trim before comparison). `" foo.rs"` and `"foo.rs"` resolve
+    /// to the same file on every platform we care about, so dispatching
+    /// both would still race.
+    #[test]
+    fn duplicate_detection_ignores_surrounding_whitespace() {
+        let args = r#"{"files":[
+            {"path":" /abs/x.rs ","instruction":"a"},
+            {"path":"/abs/x.rs","instruction":"b"}
+        ]}"#;
+        let err = tool().validate_args(args).unwrap_err();
+        assert!(err.contains("appears 2 times"), "got: {}", err);
     }
 
     // ── dedup-suffix logic ──

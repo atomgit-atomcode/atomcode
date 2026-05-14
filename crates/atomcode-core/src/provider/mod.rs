@@ -14,6 +14,27 @@ use crate::conversation::message::Message;
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
 
+/// Marker prefix that flags a turn-level error as deterministically
+/// unrecoverable. The agent loop (`agent/mod.rs::run_turn`) checks for
+/// this substring in the error message and skips the catch-all `retry
+/// up to 3×` branch — same context + same prompt + same model will
+/// produce the same failure, so retrying just burns minutes.
+///
+/// Centralised here (rather than hardcoded in each emission site) so
+/// the contract is **one string**, not five. Every error path that
+/// claims "no point retrying" — provider stream caps, max_output_tokens
+/// hits, write_file size caps, empty responses — formats this constant
+/// at the head of its error message. The agent loop does a single
+/// `.contains(NON_RETRYABLE_MARKER)` to decide.
+///
+/// Why a string-prefix marker and not a typed enum: errors flow through
+/// the `StreamEvent::Error(String)` boundary which is fundamentally
+/// untyped (providers may surface arbitrary upstream error bodies),
+/// and the layer that needs to read this flag (`run_turn`) only sees
+/// the string. A typed channel would require threading the type
+/// through three crates' worth of stream events for no real benefit.
+pub const NON_RETRYABLE_MARKER: &str = "[non-retryable]";
+
 /// Per-provider strategy for echoing back `reasoning_content` from historical
 /// assistant tool_call messages on subsequent requests.
 ///
