@@ -38,6 +38,8 @@
     { url: 'project-instructions.html', title: '项目指令文件' },
     { url: 'memory.html',              title: '永久记忆' },
     { url: 'skills.html',              title: 'Skills 扩展' },
+    { url: 'plugins.html',             title: 'Plugin 系统' },
+    { url: 'mcp.html',                 title: 'MCP 集成' },
     { url: 'faq.html',                 title: '常见问题' },
   ];
 

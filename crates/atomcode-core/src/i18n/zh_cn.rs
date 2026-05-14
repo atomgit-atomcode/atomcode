@@ -415,7 +415,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::InitAlreadyExists { path } =>
             format!("  {} 已存在。使用 `/init --force` 覆盖。\n", path).into(),
         Msg::InitWrote { path, bytes } =>
-            format!("  已写入 {}（{} 字节）。编辑以自定义；下次会话生效。\n", path, bytes).into(),
+            format!("  已写入 {}（{} 字节）。编辑以自定义；下一条消息生效。\n", path, bytes).into(),
         Msg::InitFailed { error } =>
             format!("  /init 失败：{}\n", error).into(),
 

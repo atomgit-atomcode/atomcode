@@ -4342,8 +4342,8 @@ mod parse_already_latest_versions_tests {
     use super::parse_already_latest_versions;
     #[test]
     fn extracts_both_versions() {
-        let s = "already on v4.22.1 (latest is v4.22.1). Pass --force to reinstall.";
-        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.1", "v4.22.1")));
+        let s = "already on v4.22.2 (latest is v4.22.2). Pass --force to reinstall.";
+        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.2", "v4.22.2")));
     }
     #[test]
     fn rejects_unrelated_strings() {

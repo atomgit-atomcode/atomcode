@@ -177,15 +177,22 @@ pub struct UsageInfo {
     pub usage_percent: f64,
     #[serde(default)]
     pub window_hours: i32,
-    #[serde(default)]
+    // Backend sends JSON `null` for these four String fields when the
+    // window hasn't accumulated usage yet (freshly-claimed plan, just
+    // after a window reset, etc.). Plain `#[serde(default)]` only
+    // fires on *missing* fields — explicit `null` would still try to
+    // deserialize against `String` and blow up the whole response
+    // with `invalid type: null, expected a string`. Mirror the
+    // `PlanInfo.claimed_at` / `expires_at` pattern above.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub reset_at: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub reset_at_display: String,
     #[serde(default)]
     pub seconds_until_reset: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub reset_label: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub usage_status_desc: String,
 }
 
@@ -441,5 +448,58 @@ mod tests {
         let s: StatusResponse = serde_json::from_str(body).unwrap();
         assert!(s.codingplan_free.is_none());
         assert!(s.current_usage.is_none());
+    }
+
+    /// Multi-user report: `/codingplan` and `/status` failed with
+    /// `parse status-v2 response (...): invalid type: null, expected
+    /// a string at line 1 column 318`. Position 318 falls inside
+    /// `current_usage`; the backend sends explicit `null` for the
+    /// four `UsageInfo` String fields when the window hasn't
+    /// accumulated usage yet (freshly-claimed plan, just after a
+    /// window reset). Plain `#[serde(default)]` only covers missing
+    /// fields, so `null` against `String` blew up the whole parse
+    /// and the user saw "状态获取失败" everywhere. This pins the
+    /// `null_to_default` treatment so the regression can't sneak back.
+    #[test]
+    fn usage_info_tolerates_null_string_fields() {
+        let body = r#"{
+            "codingplan_free": {
+                "plan_name": "CodingPlan Pro",
+                "plan_type": "Pro",
+                "status": 1,
+                "claimed_at": "2026-05-12",
+                "expires_at": "2026-06-11",
+                "remaining_days": 28,
+                "total_days": 30,
+                "apply_id": 158
+            },
+            "current_usage": {
+                "placeholder": false,
+                "window_token_limit": 50000,
+                "window_tokens_used": 0,
+                "usage_percent": 0,
+                "window_hours": 1,
+                "reset_at": null,
+                "reset_at_display": null,
+                "seconds_until_reset": 0,
+                "reset_label": null,
+                "usage_status_desc": null
+            },
+            "audit_status": 1,
+            "expires_at": "2026-06-11",
+            "window_quota_exhausted": false,
+            "window_quota_hint": null
+        }"#;
+        let s: StatusResponse = serde_json::from_str(body)
+            .expect("null UsageInfo String fields must not crash parsing");
+        let u = s.current_usage.expect("usage should be present");
+        assert_eq!(u.reset_at, "");
+        assert_eq!(u.reset_at_display, "");
+        assert_eq!(u.reset_label, "");
+        assert_eq!(u.usage_status_desc, "");
+        // display_desc falls back to a computed percentage when
+        // usage_status_desc is empty — should not panic on the
+        // null-collapsed-to-"" path.
+        assert_eq!(u.display_desc(), "当前时间窗口用量约 0%");
     }
 }

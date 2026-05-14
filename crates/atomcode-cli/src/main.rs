@@ -317,7 +317,7 @@ async fn run_prepare_upgrade_worker() -> i32 {
 /// and exits. "Detached" means:
 ///   * New session on Unix (`setsid`) — parent's Ctrl+C goes to parent's
 ///     foreground process group only; the child is in its own and ignores it.
-///   * `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` on Windows, same idea.
+///   * `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows, same idea
 ///   * stdin/stdout/stderr → /dev/null so the child can't scribble over the
 ///     parent's terminal and has no reason to stay attached to it.
 ///
@@ -354,8 +354,8 @@ fn spawn_detached_upgrade_prep() {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     let _ = cmd.spawn();
@@ -992,7 +992,11 @@ async fn run() -> Result<i32> {
         None
     };
 
-    let (provider_config, model_name) = if unavailable_reason.is_some() {
+    /// Build the placeholder `ProviderConfig` used when no real provider is
+    /// available.  The TUI still boots — the Welcome wizard / status-row
+    /// hints nudge the user to `/login` or `/codingplan`, and a successful
+    /// auth flow rebuilds the real provider via `rebuild_provider`.
+    fn dummy_provider_config() -> (ProviderConfig, String) {
         (
             ProviderConfig {
                 provider_type: "openai".to_string(),
@@ -1013,6 +1017,10 @@ async fn run() -> Result<i32> {
             },
             String::new(),
         )
+    }
+
+    let (provider_config, model_name) = if unavailable_reason.is_some() {
+        dummy_provider_config()
     } else {
         if let Some(ref model) = cli.model {
             let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
@@ -1023,9 +1031,25 @@ async fn run() -> Result<i32> {
         // Keep api_key as None here so `create_provider()` auto-loads
         // from `~/.atomcode/auth.toml`. Setting "not-configured" would
         // bypass that path and force the user to manually provide a key.
-        let pc = config.active_provider(cli.provider.as_deref())?.clone();
-        let name = pc.model.clone();
-        (pc, name)
+        //
+        // `active_provider` already falls back to the first available
+        // provider when `default_provider` points to a deleted section,
+        // but as a defence-in-depth measure we catch any remaining
+        // errors and swap in the dummy so the TUI still boots.
+        match config.active_provider(cli.provider.as_deref()) {
+            Ok(pc) => {
+                let name = pc.model.clone();
+                (pc.clone(), name)
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not resolve active provider ({}). \
+                     Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                    e
+                );
+                dummy_provider_config()
+            }
+        }
     };
 
     // `create_provider` may need to load an OAuth token from

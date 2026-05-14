@@ -902,33 +902,38 @@ impl LlmProvider for OpenAiProvider {
                 }
 
                 // Abrupt close discriminator: if the model never made
-                // tool-call progress AND the accumulated text is
-                // tiny (≤ 2 content chunks AND ≤ 200 chars), this
-                // wasn't a real truncation — gateways like GitCode's
-                // litellm proxy stream a single error blob
-                // (「请求负载过高，请稍后再试」 / "rate limit
-                // exceeded") and slam the connection closed without
-                // a [DONE] marker. Promoting that to `truncated=true`
+                // tool-call progress AND the body arrived as a single
+                // burst (≤ 2 content chunks), this wasn't a real
+                // truncation — gateways like GitCode's litellm proxy
+                // stream a single error blob (「请求负载过高，请稍后
+                // 再试」 / a verbose `litellm.InternalServerError` JSON
+                // envelope) and slam the connection closed without a
+                // [DONE] marker. Promoting that to `truncated=true`
                 // makes the agent inject "resume where you left off"
                 // and retry, which renders the SAME error a second
-                // time (see issue: GLM-5.1 网关限流双重渲染).
+                // time (see issue: GLM-5.1 网关限流双重渲染 /
+                // LiteLLM 429 cooldown_list 双重渲染).
                 // Diverting to `StreamEvent::Error` instead lets the
                 // agent's `is_rate_limited` retry path (with 3-30s
                 // backoff) handle it correctly — or, if it's an
                 // unfamiliar error string, surface it once and stop.
                 //
-                // Cap thresholds tuned for real-world gateway error
-                // payloads (typically 10-80 chars) vs legitimate
-                // short answers ("Yes.", "Done."). The real risk —
-                // misclassifying a 1-chunk legit reply — is mitigated
-                // by the fact that successful completions virtually
-                // always emit `[DONE]`; reaching this branch already
-                // means the stream ended anomalously.
+                // Discriminator is `content_chunks <= 2` alone: real
+                // streamed completions emit many small deltas (tens
+                // to hundreds of chunks), while gateway errors arrive
+                // as 1-2 large chunks regardless of payload size
+                // (Chinese 10-80-char banners or 700+-char LiteLLM
+                // JSON envelopes both qualify). The earlier ≤ 200
+                // char cap let the LiteLLM JSON shape slip through
+                // to the truncated-retry path and caused the double
+                // render. The real risk — misclassifying a 1-chunk
+                // legit reply — is mitigated by the fact that
+                // successful completions virtually always emit
+                // `[DONE]`; reaching this branch already means the
+                // stream ended anomalously.
                 let trimmed = accumulated_content.trim();
-                let looks_like_gateway_error = tool_calls.is_empty()
-                    && content_chunks <= 2
-                    && trimmed.chars().count() <= 200
-                    && !trimmed.is_empty();
+                let looks_like_gateway_error =
+                    tool_calls.is_empty() && content_chunks <= 2 && !trimmed.is_empty();
                 if looks_like_gateway_error {
                     let _ = tx.send(Ok(StreamEvent::Error(trimmed.to_string())));
                     return;

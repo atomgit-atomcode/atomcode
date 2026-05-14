@@ -421,7 +421,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::InitAlreadyExists { path } =>
             format!("  {} already exists. Use `/init --force` to overwrite.\n", path).into(),
         Msg::InitWrote { path, bytes } =>
-            format!("  Wrote {} ({} bytes). Edit to customise; takes effect on next session.\n", path, bytes).into(),
+            format!("  Wrote {} ({} bytes). Edit to customise; takes effect on next message.\n", path, bytes).into(),
         Msg::InitFailed { error } =>
             format!("  /init failed: {}\n", error).into(),
 

@@ -73791,18 +73791,25 @@
         for (const m of action.messages) {
           const role = normalizeRole(m.role);
           if (role === "tool") {
-            const lastAssistant = messages.findLast((msg) => msg.role === "assistant" && msg.toolCalls?.length);
+            const lastAssistantIdx = messages.findLastIndex(
+              (msg) => msg.role === "assistant" && (msg.toolCalls?.length ?? 0) > 0
+            );
+            if (lastAssistantIdx < 0) continue;
+            const lastAssistant = messages[lastAssistantIdx];
             const callId = m.tool_result?.call_id;
             const output = textFromContent(m.content);
-            if (lastAssistant?.toolCalls && output) {
+            if (lastAssistant.toolCalls && output) {
               const targetIndex = callId ? lastAssistant.toolCalls.findIndex((tool) => tool.id === callId) : lastAssistant.toolCalls.findIndex((tool) => tool.output === void 0);
               if (targetIndex >= 0) {
-                lastAssistant.toolCalls[targetIndex] = {
-                  ...lastAssistant.toolCalls[targetIndex],
-                  output,
-                  success: m.tool_result?.success ?? true,
-                  status: m.tool_result?.success === false ? "error" : "done"
-                };
+                const newToolCalls = lastAssistant.toolCalls.map(
+                  (tool, i) => i === targetIndex ? {
+                    ...tool,
+                    output,
+                    success: m.tool_result?.success ?? true,
+                    status: m.tool_result?.success === false ? "error" : "done"
+                  } : tool
+                );
+                messages[lastAssistantIdx] = { ...lastAssistant, toolCalls: newToolCalls };
               }
             }
             continue;
@@ -77756,32 +77763,50 @@ ${content}</tr>
   function MessageList() {
     const { state } = useChatContext();
     const bottomRef = (0, import_react9.useRef)(null);
+    const containerRef = (0, import_react9.useRef)(null);
+    const isUserScrolledUp = (0, import_react9.useRef)(false);
+    const handleScroll = (0, import_react9.useCallback)(() => {
+      const el = containerRef.current;
+      if (!el) return;
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      isUserScrolledUp.current = !atBottom;
+    }, []);
     (0, import_react9.useEffect)(() => {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      if (!isUserScrolledUp.current) {
+        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      }
     }, [state.messages, state.queuedMessages, state.isGenerating]);
     const query = state.searchQuery.toLowerCase();
     const hasSearch = query.length > 0;
     const lastMessageId = state.messages[state.messages.length - 1]?.id;
     return /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)(import_jsx_runtime11.Fragment, { children: [
       /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(SearchBar, {}),
-      /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)("div", { className: `messages-container${hasSearch ? " dimmed" : ""}`, children: [
-        state.messages.map((msg) => {
-          const matches = hasSearch && msg.text.toLowerCase().includes(query);
-          const highlightClass = `${matches ? " highlighted" : ""}${msg.id === lastMessageId ? " is-last" : ""}`;
-          if (msg.role === "user") return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(UserMessage, { message: msg, className: highlightClass }, msg.id);
-          if (msg.role === "assistant") return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(AssistantMessage, { message: msg, className: highlightClass }, msg.id);
-          if (msg.role === "error") {
-            return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: `timeline-message dot-error${highlightClass}`, children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "error-message-content", children: msg.text }) }, msg.id);
-          }
-          return null;
-        }),
-        state.queuedMessages.map((msg) => {
-          const matches = hasSearch && msg.text.toLowerCase().includes(query);
-          const highlightClass = matches ? " highlighted" : "";
-          return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(UserMessage, { message: msg, className: highlightClass }, msg.id);
-        }),
-        /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { ref: bottomRef })
-      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime11.jsxs)(
+        "div",
+        {
+          ref: containerRef,
+          className: `messages-container${hasSearch ? " dimmed" : ""}`,
+          onScroll: handleScroll,
+          children: [
+            state.messages.map((msg) => {
+              const matches = hasSearch && msg.text.toLowerCase().includes(query);
+              const highlightClass = `${matches ? " highlighted" : ""}${msg.id === lastMessageId ? " is-last" : ""}`;
+              if (msg.role === "user") return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(UserMessage, { message: msg, className: highlightClass }, msg.id);
+              if (msg.role === "assistant") return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(AssistantMessage, { message: msg, className: highlightClass }, msg.id);
+              if (msg.role === "error") {
+                return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: `timeline-message dot-error${highlightClass}`, children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "error-message-content", children: msg.text }) }, msg.id);
+              }
+              return null;
+            }),
+            state.queuedMessages.map((msg) => {
+              const matches = hasSearch && msg.text.toLowerCase().includes(query);
+              const highlightClass = matches ? " highlighted" : "";
+              return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(UserMessage, { message: msg, className: highlightClass }, msg.id);
+            }),
+            /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { ref: bottomRef })
+          ]
+        }
+      ),
       /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { className: "message-gradient" })
     ] });
   }

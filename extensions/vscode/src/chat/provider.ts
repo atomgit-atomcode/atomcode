@@ -162,7 +162,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this._patchThinking(msg.name, msg.thinking);
           break;
         case 'refreshSetupState':
-          await this._sendSetupState();
+          await this._sendSetupState(webview);
           break;
         case 'loadSession':
           await this._loadSession(msg.sessionId, msg.projectHash);
@@ -249,10 +249,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       const session = await this._client.createSession(undefined, workspaceFolder);
       this._sessionId = session.id;
-      this._postMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
+      this._broadcastMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
       await this._refreshSessions();
     } catch {
-      this._postMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
+      this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
     }
 
     this._postMessage({ type: 'clearChat' });
@@ -302,14 +302,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let fullMessage = trimmed;
     if (contextPaths && contextPaths.length > 0) {
       const parts: string[] = [];
+      const MAX_FILE_SIZE_BYTES = 512 * 1024; // 512 KB per file
+      const MAX_TOTAL_BYTES = 1024 * 1024;    // 1 MB total across all files
+      let totalBytes = 0;
+
       for (const filePath of contextPaths) {
         try {
           const uri = vscode.Uri.file(filePath);
           const content = await vscode.workspace.fs.readFile(uri);
+
+          if (content.byteLength > MAX_FILE_SIZE_BYTES) {
+            parts.push(`File: ${path.basename(filePath)}\n[File too large to attach (${Math.round(content.byteLength / 1024)} KB). Use a specific selection instead.]`);
+            continue;
+          }
+
+          if (totalBytes + content.byteLength > MAX_TOTAL_BYTES) {
+            parts.push(`File: ${path.basename(filePath)}\n[Skipped: total context size limit reached.]`);
+            continue;
+          }
+
           const decoded = Buffer.from(content).toString('utf-8');
           const fileName = path.basename(filePath);
           const ext = path.extname(filePath).slice(1);
           parts.push(`File: ${fileName}\n\`\`\`${ext}\n${decoded}\n\`\`\``);
+          totalBytes += content.byteLength;
         } catch {
           // Skip files that can't be read
         }
@@ -344,7 +360,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (sessionId) {
           this._sessionId = sessionId;
           this._loadedMessages = undefined;
-          this._postMessage({ type: 'sessionSelected', sessionId });
+          this._broadcastMessage({ type: 'sessionSelected', sessionId });
         }
         this._isGenerating = false;
         this._postMessage({ type: 'done', tokens, toolCalls, sessionId });
@@ -387,7 +403,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const session = await this._client.createSession(undefined, workspaceFolder);
     this._sessionId = session.id;
     this._loadedMessages = undefined;
-    this._postMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
+    this._broadcastMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
     await this._refreshSessions();
   }
 
@@ -407,7 +423,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _sendInitialState(webview?: vscode.Webview, mode: WebviewMode = 'tab') {
     let currentModelName = '';
 
-    await this._sendSetupState();
+    await this._sendSetupState(webview);
 
     // Send models
     try {
@@ -443,40 +459,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async _sendSetupState() {
+  private async _sendSetupState(webview?: vscode.Webview) {
     let auth: AuthStatusResponse | undefined;
     let providers: ProvidersResponse | undefined;
     let config: ConfigResponse | undefined;
     let models: ModelInfo[] | undefined;
+    const post = (msg: unknown) => webview
+      ? this._postMessage(msg, webview)
+      : this._broadcastMessage(msg);
 
     try {
       auth = await this._client.authStatus();
-      this._postMessage({ type: 'authStatus', auth });
+      post({ type: 'authStatus', auth });
     } catch (e) {
-      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      post({ type: 'setupError', message: this._messageFromError(e) });
     }
 
     try {
       providers = await this._client.listProviders();
-      this._postMessage({ type: 'providers', providers: providers.providers, defaultProvider: providers.default_provider });
+      post({ type: 'providers', providers: providers.providers, defaultProvider: providers.default_provider });
     } catch (e) {
-      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      post({ type: 'setupError', message: this._messageFromError(e) });
     }
 
     try {
       config = await this._client.getConfig();
-      this._postMessage({ type: 'config', config });
+      post({ type: 'config', config });
     } catch {
       // Older daemons may not have P0 APIs; provider fetch error already surfaces enough.
     }
 
     try {
       models = await this._client.listModels();
-      this._postMessage({ type: 'models', models });
+      post({ type: 'models', models });
     } catch {}
 
     const defaultProvider = providers?.providers.find((p) => p.is_default);
-    this._postMessage({
+    post({
       type: 'setupState',
       auth,
       providers: providers?.providers ?? [],
@@ -701,7 +720,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._sessionId = sessionId;
         this._loadedMessages = detail.messages;
         this.openInTab();
-        this._postMessage({ type: 'sessionSelected', sessionId, projectHash: hash });
+        this._broadcastMessage({ type: 'sessionSelected', sessionId, projectHash: hash });
         this._postMessage({ type: 'clearChat' });
         this._postMessage({ type: 'sessionMessages', messages: detail.messages });
         this.focusInput();
@@ -757,7 +776,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (this._sessionId === sessionId) {
         this._sessionId = undefined;
         this._loadedMessages = undefined;
-        this._postMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
+        this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
         this._postMessage({ type: 'clearChat' });
       }
       await this._refreshSessions();
@@ -862,14 +881,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _searchSessions(query: string) {
     try {
       const sessions = await this._client.searchSessions(query);
-      this._postMessage({ type: 'sessions', sessions });
+      this._broadcastMessage({ type: 'sessions', sessions });
     } catch {}
   }
 
   private async _refreshSessions() {
     try {
       const sessions = await this._client.listSessions();
-      this._postMessage({ type: 'sessions', sessions });
+      this._broadcastMessage({ type: 'sessions', sessions });
     } catch {}
   }
 
@@ -890,6 +909,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       webview.postMessage(msg);
       return;
     }
+    // Chat events should land in one active chat surface to avoid duplicate messages.
+    if (this._panel) {
+      this._panel.webview.postMessage(msg);
+    } else {
+      this._view?.webview.postMessage(msg);
+    }
+  }
+
+  private _broadcastMessage(msg: unknown) {
     this._view?.webview.postMessage(msg);
     this._panel?.webview.postMessage(msg);
   }
