@@ -129,8 +129,49 @@ atomcode --config ./custom.toml</code></pre>
         <li>输入框高度会随内容自动增长</li>
       </ul>
 
-      <h2>引用文件内容</h2>
-      <p>把一个文件路径粘贴到输入框里,AtomCode 会把它当作"附件"并在发送时读入该文件的内容作为上下文。这比"让模型自己去读"更可控,尤其适合大文件中的片段。</p>
+      <h2 id="at-mention"><code>@</code> 引用文件</h2>
+      <p>在输入框里敲一个 <code>@</code>(前面是空白或行首)就会弹出项目内文件/目录的候选菜单。这是把代码里某个具体路径"指给模型看"最快的方式 — 你只负责定位,要不要展开、读多少由模型按需调 <code>read_file</code> 决定。</p>
+
+      <h3>交互</h3>
+      <ul>
+        <li><strong>触发</strong> —— <code>@</code> 前面是空白或行首才生效。<code>email@host.com</code> 这种中间出现的 <code>@</code> 不会触发,避免误弹。</li>
+        <li><strong>过滤</strong> —— 继续敲字符做子串匹配(大小写不敏感)。例如 <code>@cra</code> 能命中 <code>crates/</code>;<code>@toml</code> 能命中所有 <code>*.toml</code>。</li>
+        <li><strong>下钻</strong> —— 敲 <code>/</code> 进入某个目录,菜单收紧到该目录的内容。例如 <code>@crates/</code> → <code>@crates/atomcode-cli/</code> → ...</li>
+        <li><strong>导航</strong> —— <code>↑</code> / <code>↓</code> 切换候选,<code>Enter</code> 或 <code>Tab</code> 都可以选中。<code>Esc</code> 关菜单不插入。</li>
+        <li><strong>插入形式</strong> —— 选中后,输入框里的 <code>@xxx</code> 部分被替换为 <code>@完整相对路径</code>(目录会带 <code>/</code>)再加一个尾随空格,光标停在空格后,可以直接继续打字。</li>
+        <li><strong>回退继续选</strong> —— 删掉尾随空格后,菜单会就地重开,方便从当前目录继续往下钻。</li>
+      </ul>
+
+      <h3>候选来自哪里</h3>
+      <ul>
+        <li>项目根目录下的<strong>所有文件和目录</strong> — 文件、目录都能选;目录用尾随 <code>/</code> 标识。</li>
+        <li><strong>尊重 <code>.gitignore</code></strong>(以及全局 ignore、<code>.git/info/exclude</code>),被忽略的路径不会出现在菜单里。</li>
+        <li><strong><code>.git/</code> 内部内容</strong>不出现在候选里 — 几乎没人想 <code>@</code> 引用 git 元数据。</li>
+        <li><strong>隐藏文件保留</strong> — <code>.env</code>、<code>.atomcode.md</code> 这类点开头文件能正常命中(只要没被 gitignore 屏蔽)。</li>
+        <li><strong>跨级模糊匹配</strong> — 一旦你开始打过滤字符,匹配会穿透多级目录(不只是当前 scope 的直接子项)。空过滤时只显示当前 scope 的直接子项。</li>
+        <li><strong>排序</strong>:当前 scope 的直接子项优先 → 目录优先于文件 → 字母序。</li>
+      </ul>
+
+      <h3>对模型意味着什么</h3>
+      <p>提交时,<code>@crates/atomcode-cli/src/main.rs</code> 作为<strong>字面文本</strong>一同发给模型 — AtomCode <em>不会</em>在前端预读文件内容并内联。模型看到这段路径后,会按需调用内置的 <code>read_file</code> 工具去读。这样:</p>
+      <ul>
+        <li>大文件不会无脑塞进上下文,token 预算更可控。</li>
+        <li>引用目录时模型会先 <code>list</code> 再决定读哪些。</li>
+        <li>多次复读不会重复内联同一份内容。</li>
+      </ul>
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>如果想强制把文件内容直接喂进对话(比如让模型针对某段代码做精读、不希望它再走一次 <code>read_file</code>),用粘贴 — 直接把内容粘进输入框,bracketed paste 会把它折叠成 <em>[paste #N]</em> 标记,提交时整段带入。</p>
+      </div>
+
+      <h3>限制</h3>
+      <ul>
+        <li>候选菜单一次最多展示 <strong>30 条</strong>,继续打过滤字符可以缩小命中范围。</li>
+        <li><strong>路径中含空格的文件不会出现在候选里</strong> — 因为 <code>@</code> 引用以空白作为终止符。</li>
+        <li>文件索引在会话内<strong>一次性构建</strong>,会话期间新建的文件不会自动出现在菜单里;切换会话或重启会重新扫描。</li>
+        <li>不跟随符号链接。</li>
+        <li>没有大小、类型过滤 — 所有未被 ignore 的文件都会出现。</li>
+      </ul>
 
       <h2>粘贴长文本</h2>
       <p>AtomCode 支持 bracketed paste。当你粘贴一段很长的内容(比如一堆日志)时,TUI 会把它折叠成一个紧凑的 <em>[paste #N · 132 lines]</em> 指示器,避免输入框被撑爆。发送时会完整带入。</p>
