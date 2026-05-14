@@ -60,9 +60,19 @@ fn collapse_home_with(path: &str, home: Option<&std::path::Path>) -> String {
             // the prefix is reliably stripped and the status row shows
             // `~/atomcode` instead of the raw `C:\USERS\alice\atomcode`.
             let rest = if cfg!(windows) {
-                path.to_lowercase()
-                    .strip_prefix(&home_str.to_lowercase())
-                    .map(|s| path[s.len()..].to_string())
+                // Case-insensitive prefix match on Windows: compare the
+                // lowercased forms, but slice the *original* path at
+                // `home_str.len()` — that offset is where the remainder
+                // starts regardless of casing differences.  Using the
+                // lowercase remainder's length (old code: `s.len()`) was
+                // wrong because it equals `path.len() - home_str.len()`,
+                // so `path[s.len()..]` took the *last* `home_str.len()`
+                // characters instead of everything after the home prefix.
+                if path.to_lowercase().starts_with(&home_str.to_lowercase()) {
+                    Some(path[home_str.len()..].to_string())
+                } else {
+                    None
+                }
             } else {
                 path.strip_prefix(&*home_str).map(|s| s.to_string())
             };
@@ -221,6 +231,48 @@ mod tests {
         assert_eq!(
             collapse_home_with(r"C:\Users\username", Some(home)),
             "~"
+        );
+    }
+
+    /// Regression test for the slice-offset bug in the Windows
+    /// case-insensitive branch.  The old code did:
+    ///
+    ///   path.to_lowercase()
+    ///       .strip_prefix(&home_str.to_lowercase())
+    ///       .map(|s| path[s.len()..].to_string())
+    ///
+    /// where `s` was the *lowercase remainder* after stripping the
+    /// home prefix.  `s.len()` equals `path.len() - home_str.len()`,
+    /// so `path[s.len()..]` took the **last** `home_str.len()` chars
+    /// of the original path instead of everything *after* the home
+    /// prefix.  For `C:\Users\hao\Documents\WPSDrive\NotLoginPage`
+    /// with home `C:\Users\hao`, the result was `~NotLoginPage`
+    /// instead of `~/Documents/WPSDrive/NotLoginPage`.
+    #[test]
+    fn collapse_home_windows_deeply_nested_path() {
+        let home = std::path::Path::new(r"C:\Users\hao");
+        assert_eq!(
+            collapse_home_with(
+                r"C:\Users\hao\Documents\WPSDrive\NotLoginPage",
+                Some(home),
+            ),
+            "~/Documents/WPSDrive/NotLoginPage"
+        );
+    }
+
+    /// Same bug, but exercising the verbatim-prefix path that
+    /// `std::fs::canonicalize` returns on Windows.  After the `\\?\`
+    /// prefix is stripped the remaining path must still be sliced at
+    /// `home_str.len()`, not at the lowercase-remainder length.
+    #[test]
+    fn collapse_home_windows_verbatim_deeply_nested_path() {
+        let home = std::path::Path::new(r"C:\Users\hao");
+        assert_eq!(
+            collapse_home_with(
+                r"\\?\C:\Users\hao\Documents\WPSDrive\NotLoginPage",
+                Some(home),
+            ),
+            "~/Documents/WPSDrive/NotLoginPage"
         );
     }
 

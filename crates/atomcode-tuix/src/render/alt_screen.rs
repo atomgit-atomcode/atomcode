@@ -1220,11 +1220,31 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             .mode_indicator
             .as_ref()
             .map(|s| scrub_controls(s));
-        let status_text = if !self.pending_status.model.is_empty()
-            || !self.pending_status.cwd.is_empty()
+        // Pre-truncate cwd so it does not overflow the terminal width.
+        // Compute a budget for cwd that accounts for model name, " · "
+        // separators, and mode badge — same logic as retained's
+        // build_status_row.
+        let model = scrub_controls(&self.pending_status.model);
+        let cwd_full = scrub_controls(&self.pending_status.cwd);
+        let mode_badge_w = mode_badge
+            .as_ref()
+            .map(|s| crate::width::display_width(s) + 1)
+            .unwrap_or(0);
+        let sep_w = if !model.is_empty() && !cwd_full.is_empty() { 3 } else { 0 };
+        let left_max = (self.width as usize).saturating_sub(mode_badge_w);
+        let cwd_budget = left_max
+            .saturating_sub(crate::width::display_width(&model))
+            .saturating_sub(sep_w);
+        let cwd = if !cwd_full.is_empty() && cwd_budget > 0
+            && crate::width::display_width(&cwd_full) > cwd_budget
         {
-            let model = scrub_controls(&self.pending_status.model);
-            let cwd = scrub_controls(&self.pending_status.cwd);
+            crate::width::truncate_path(&cwd_full, cwd_budget)
+        } else if !cwd_full.is_empty() && cwd_budget == 0 {
+            crate::width::truncate_path(&cwd_full, left_max)
+        } else {
+            cwd_full
+        };
+        let status_text = if !model.is_empty() || !cwd.is_empty() {
             if model.is_empty() {
                 format!("  {}", cwd)
             } else if cwd.is_empty() {

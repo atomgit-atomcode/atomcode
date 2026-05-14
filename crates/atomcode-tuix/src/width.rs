@@ -176,6 +176,55 @@ pub fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
     acc
 }
 
+/// Truncate a file-system path to `max_cols` display columns, using a
+/// path-aware strategy that preserves the **last segment** (the project or
+/// folder name — the most useful bit) and replaces leading segments with
+/// `.../`.  Both `/` and `\` are treated as separators.
+///
+/// Examples (max_cols = 20):
+///
+///   ~/Documents/WPSDrive/NotLoginPage
+///     → .../NotLoginPage          (keeps the last segment)
+///
+///   ~/a/b/c                       (max_cols = 6)
+///     → .../c                     (keeps `.../` + last segment)
+///
+///   ~/foo                         (max_cols = 5)
+///     → ~/foo                     (fits, no truncation)
+///
+/// If the last segment alone exceeds `max_cols`, the function falls back
+/// to a plain `truncate_with_ellipsis` so the output always fits.
+pub fn truncate_path(path: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if display_width(path) <= max_cols {
+        return path.to_string();
+    }
+
+    // Find the last separator and take everything after it.
+    let last_sep = path.rfind(|c: char| c == '/' || c == '\\');
+    let last_segment = match last_sep {
+        Some(i) => &path[i + 1..],
+        None => path, // no separator — the whole string is the "segment"
+    };
+
+    // Build the candidate: ".../" + last_segment
+    let ellipsis_prefix = ".../";
+    let candidate = format!("{}{}", ellipsis_prefix, last_segment);
+
+    if display_width(&candidate) <= max_cols {
+        return candidate;
+    }
+
+    // Last segment is too long even with ".../" prefix — truncate it.
+    // Reserve width for ".../" (4 cols).
+    let prefix_w = display_width(ellipsis_prefix);
+    let budget = max_cols.saturating_sub(prefix_w).max(1);
+    let truncated_last = truncate_to_width(last_segment, budget);
+    format!("{}{}", ellipsis_prefix, truncated_last)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +332,84 @@ mod tests {
         // char 好 (w=2) would overflow 2+2=4>3, so wrap).
         let (lines, _, _) = wrap_with_cursor("你好", 3, 0);
         assert_eq!(lines, vec!["你".to_string(), "好".to_string()]);
+    }
+
+    // --- truncate_path tests ---
+
+    #[test]
+    fn truncate_path_short_path_unchanged() {
+        // Path fits within max_cols → returned as-is.
+        assert_eq!(truncate_path("~/foo", 20), "~/foo");
+    }
+
+    #[test]
+    fn truncate_path_keeps_last_segment() {
+        // Long path: keep last segment with ".../" prefix.
+        assert_eq!(
+            truncate_path("~/Documents/WPSDrive/NotLoginPage", 20),
+            ".../NotLoginPage"
+        );
+    }
+
+    #[test]
+    fn truncate_path_exact_fit() {
+        // ".../NotLoginPage" = 16 cols. At max_cols = 16 it should fit.
+        assert_eq!(
+            truncate_path("~/Documents/WPSDrive/NotLoginPage", 16),
+            ".../NotLoginPage"
+        );
+    }
+
+    #[test]
+    fn truncate_path_very_tight_budget() {
+        // Even a single-char last segment + ".../" = 5 cols should fit.
+        assert_eq!(truncate_path("~/a/b/c", 6), ".../c");
+    }
+
+    #[test]
+    fn truncate_path_last_segment_too_long() {
+        // Last segment itself exceeds budget after ".../" prefix.
+        // ".../" = 4 cols, budget for last segment = 10 - 4 = 6 cols.
+        // "NotLoginPage" = 12 cols → truncated to 6 cols.
+        assert_eq!(
+            truncate_path("~/Documents/WPSDrive/NotLoginPage", 10),
+            ".../NotLog"
+        );
+    }
+
+    #[test]
+    fn truncate_path_no_separator() {
+        // No path separators → treat entire string as the "last segment".
+        // "verylongname" = 12 cols, max 8 → ".../" + 4 cols of name.
+        assert_eq!(truncate_path("verylongname", 8), ".../very");
+    }
+
+    #[test]
+    fn truncate_path_windows_backslash() {
+        // Windows paths with backslash separators.
+        assert_eq!(
+            truncate_path(r"~\Documents\WPSDrive\NotLoginPage", 20),
+            ".../NotLoginPage"
+        );
+    }
+
+    #[test]
+    fn truncate_path_zero_cols() {
+        assert_eq!(truncate_path("~/foo", 0), "");
+    }
+
+    #[test]
+    fn truncate_path_cjk_segment() {
+        // CJK project name: "项目" = 4 cols, ".../项目" = 8 cols.
+        assert_eq!(
+            truncate_path("~/Documents/工作/项目", 20),
+            ".../项目"
+        );
+    }
+
+    #[test]
+    fn truncate_path_cjk_tight_budget() {
+        // "项目" = 4 cols, ".../" = 4 cols, total = 8.
+        assert_eq!(truncate_path("~/a/b/项目", 8), ".../项目");
     }
 }

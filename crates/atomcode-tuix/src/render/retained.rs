@@ -715,22 +715,58 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .map(|s| crate::width::display_width(s) + 1) // +1 for the trailing space separator
             .unwrap_or(0);
 
-        let mut parts: Vec<String> = Vec::with_capacity(3);
-        if !status.model.is_empty() {
-            parts.push(scrub_controls(&status.model));
-        }
-        if !status.cwd.is_empty() {
-            parts.push(scrub_controls(&status.cwd));
-        }
-        if status.ctx_used > 0 {
-            parts.push(format_ctx_usage(status.ctx_used, status.ctx_window));
-        }
-        let left = parts.join(" · ");
         // Hint right-alignment math must reserve space for the mode badge
         // so the badge never collides with the right-aligned hint when the
         // status row is wide.
         let max = rule_width.max(1);
         let left_max = max.saturating_sub(mode_badge_w);
+
+        // Pre-truncate the cwd so that model + ctx_usage still get space
+        // on narrow terminals.  Budget for cwd: subtract model width and
+        // the " · " separator widths from left_max.  If the cwd alone
+        // would eat the entire row, `truncate_path` replaces leading
+        // segments with ".../" and keeps only the last segment.
+        let model_str = if !status.model.is_empty() {
+            scrub_controls(&status.model)
+        } else {
+            String::new()
+        };
+        let ctx_str = if status.ctx_used > 0 {
+            format_ctx_usage(status.ctx_used, status.ctx_window)
+        } else {
+            String::new()
+        };
+        // Widths of the static " · " separators between visible parts.
+        let sep_w = if !model_str.is_empty() { 3 } else { 0 }
+            + if !ctx_str.is_empty() && (!model_str.is_empty() || !status.cwd.is_empty()) {
+                3
+            } else {
+                0
+            };
+        let cwd_budget = left_max
+            .saturating_sub(crate::width::display_width(&model_str))
+            .saturating_sub(crate::width::display_width(&ctx_str))
+            .saturating_sub(sep_w);
+
+        let mut parts: Vec<String> = Vec::with_capacity(3);
+        if !model_str.is_empty() {
+            parts.push(model_str);
+        }
+        if !status.cwd.is_empty() {
+            let cwd_full = scrub_controls(&status.cwd);
+            let cwd_display = if cwd_budget > 0 && crate::width::display_width(&cwd_full) > cwd_budget {
+                crate::width::truncate_path(&cwd_full, cwd_budget)
+            } else if cwd_budget == 0 {
+                crate::width::truncate_path(&cwd_full, left_max)
+            } else {
+                cwd_full
+            };
+            parts.push(cwd_display);
+        }
+        if !ctx_str.is_empty() {
+            parts.push(ctx_str);
+        }
+        let left = parts.join(" · ");
 
         // Helper: emit the badge (with trailing space) then the rest, so
         // the mode indicator is always at column 0 (after PAD_COL) and
