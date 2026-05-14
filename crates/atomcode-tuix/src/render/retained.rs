@@ -460,7 +460,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// `push_body_prefixed`. Removes any previously rendered inflight
     /// tool lines from `body_lines` first so the spinner animation
     /// replaces in-place rather than accumulating rows.
-    fn render_inflight_tool(&mut self, icon: &str, name: &str, detail: &str) {
+    fn render_inflight_tool(&mut self, icon: &str, name: &str, detail: &str, meta: &str) {
         // Spinner ticks fire at ~80ms cadence and re-call this fn with a
         // new icon glyph each time. The OLD implementation truncated
         // `body_lines` and called `push_body_prefixed` → `push_body_row`
@@ -498,6 +498,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // This is a rendering safeguard only — the actual command
         // execution uses the original, untruncated arguments.
         let body_str = truncate_body_str(&body_str, 500);
+        // Append the spinner meta suffix (e.g. ` · 12s` or
+        // ` · 12s · 2 queued`) so the user has a time anchor while a
+        // long-running tool (cargo install, big test suite, etc.)
+        // executes. Without it the inflight row only shows
+        // `<spinner> Bash(cmd)` — no elapsed indicator — and looks
+        // indistinguishable from "stuck" once the user has been
+        // waiting >30s. `meta` carries its own leading ` · ` separator
+        // (or is empty); same single body style as the rest of the
+        // row, matching `build_spinner_body_row`'s convention where
+        // the suffix shares the label colour.
+        let body_str = if meta.is_empty() {
+            body_str
+        } else {
+            format!("{}{}", body_str, meta)
+        };
         let prefix = format!("{} ", icon);
         let prefix_style = self.style_for(Role::Muted);
         let body_style = self.style_bold(Role::ToolName);
@@ -1892,9 +1907,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 //
                 // When a tool call is in flight, the live rows
                 // carry the tool-call shape (`<frame> Bash(cmd)`)
-                // with the animation driving the icon frame.
+                // with the animation driving the icon frame. The
+                // spinner label here was built by `format_spinner_label`
+                // and carries the ` · 12s · N queued` metadata; pluck
+                // that suffix off and forward it to render_inflight_tool
+                // so the user gets a time anchor on long bashes.
                 if let Some((_id, name, detail)) = self.inflight_tool.clone() {
-                    self.render_inflight_tool(frame, &name, &detail);
+                    let meta = spinner_meta_suffix(&label);
+                    self.render_inflight_tool(frame, &name, &detail, meta);
                 } else {
                     let cells = self.build_spinner_body_row(frame, &label);
                     self.push_or_update_live_spinner(cells);
@@ -1902,7 +1922,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::Spinner { frame, label } => {
                 if let Some((_id, name, detail)) = self.inflight_tool.clone() {
-                    self.render_inflight_tool(frame, &name, &detail);
+                    let meta = spinner_meta_suffix(&label);
+                    self.render_inflight_tool(frame, &name, &detail, meta);
                 } else {
                     let cells = self.build_spinner_body_row(frame, &label);
                     self.push_or_update_live_spinner(cells);
@@ -2028,7 +2049,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     "*"
                 };
                 self.inflight_tool = Some((id, name.clone(), detail.clone()));
-                self.render_inflight_tool(initial, &name, &detail);
+                // Initial paint — no spinner tick has fired yet so no
+                // elapsed-time suffix to forward. The next Spinner /
+                // StreamingBox tick (~80ms later) supplies the meta.
+                self.render_inflight_tool(initial, &name, &detail, "");
             }
             UiLine::ToolCallCommit { call_id } => {
                 // Only commit if the inflight_tool matches the expected call_id,
@@ -2923,6 +2947,17 @@ fn truncate_body_str(body_str: &str, max_chars: usize) -> String {
     }
 }
 
+/// Pluck the metadata suffix (` · 12s` and/or ` · N queued`) out of a
+/// spinner label built by `format_spinner_label`. Labels have the
+/// shape `{base}{ellipsis}[ · {elapsed}][ · {n} queued]`, so the first
+/// ` · ` marks where the base ends and the metadata begins. Returns
+/// the slice **including** its leading ` · ` separator so callers can
+/// concatenate it directly, or `""` if the label has no metadata yet
+/// (no phase clock has ticked).
+fn spinner_meta_suffix(label: &str) -> &str {
+    label.find(" · ").map(|i| &label[i..]).unwrap_or("")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3518,7 +3553,7 @@ mod tests {
         let detail = "cd /Users/yubangxu/project/atomgr && cargo metadata --format-version 1 \
                       2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); \
                       print([p['name'] for p in d['packages']])\"";
-        r.render_inflight_tool("⠋", "bash", detail);
+        r.render_inflight_tool("⠋", "bash", detail, "");
         // Every wrapped row must fit the terminal — otherwise DECSTBM
         // auto-wrap on subsequent repaints turns into scroll residue.
         for (i, row) in r.body_lines.iter().enumerate() {
@@ -3535,7 +3570,7 @@ mod tests {
         // removes the prior inflight rows before re-rendering.
         let after_first = r.body_lines.len();
         for _ in 0..10 {
-            r.render_inflight_tool("⠙", "bash", detail);
+            r.render_inflight_tool("⠙", "bash", detail, "");
         }
         assert_eq!(
             r.body_lines.len(),
@@ -3573,7 +3608,7 @@ mod tests {
         let detail = "cd /Users/theo/Documents/workspace/atomcode && cargo build 2>&1 | tail -5";
 
         // First render: pushes scroll-style (prev_rows=0 → fallback path).
-        r.render_inflight_tool("⠋", "bash", detail);
+        r.render_inflight_tool("⠋", "bash", detail, "");
         let bytes_after_first = buf.lock().unwrap().len();
         assert!(
             bytes_after_first > 0,
@@ -3596,7 +3631,7 @@ mod tests {
             // icon arg actually changes each call. Same display width,
             // so prev_rows == new_rows and the in-place branch fires.
             let icon = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][i % 10];
-            r.render_inflight_tool(icon, "bash", detail);
+            r.render_inflight_tool(icon, "bash", detail, "");
         }
         let bytes_per_tick = buf.lock().unwrap().len() / 50;
         // ~150 bytes/tick is a comfortable upper bound for the in-place
@@ -3620,6 +3655,53 @@ mod tests {
              prev_rows count for in-place path",
             r.body_lines.len()
         );
+    }
+
+    /// User report (long `cargo install` looked stuck): the inflight
+    /// tool row is `<spinner> Bash(cmd)` with no elapsed indicator,
+    /// while the regular thinking spinner shows `Pondering… · 12s`.
+    /// After ~30s of waiting the user can't tell whether bash is
+    /// running or hung. Fix: forward the spinner-label metadata
+    /// (` · 12s · N queued`) into `render_inflight_tool` so the same
+    /// time anchor appears next to the tool row.
+    #[test]
+    fn retained_inflight_tool_renders_elapsed_meta_suffix() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        // Seed an inflight tool so the Spinner branch routes through
+        // render_inflight_tool (mirrors the real call path).
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: "cargo install cargo-udeps --locked".into(),
+        });
+        r.render(UiLine::Spinner {
+            frame: "⠋".into(),
+            label: "Running Bash… · 12s".into(),
+        });
+        let last = r.body_lines.last().expect("inflight row expected");
+        let text: String = last.iter().map(|c| c.ch).collect();
+        assert!(
+            text.contains("· 12s"),
+            "inflight tool row missing elapsed meta suffix; got: {:?}",
+            text
+        );
+        assert!(
+            text.contains("Bash(cargo install"),
+            "inflight tool row missing command detail; got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn spinner_meta_suffix_extracts_after_first_separator() {
+        assert_eq!(spinner_meta_suffix("Running Bash… · 12s"), " · 12s");
+        assert_eq!(
+            spinner_meta_suffix("Running Bash… · 12s · 2 queued"),
+            " · 12s · 2 queued"
+        );
+        // No metadata yet (no phase clock tick) → empty suffix.
+        assert_eq!(spinner_meta_suffix("Pondering…"), "");
+        assert_eq!(spinner_meta_suffix(""), "");
     }
 
     /// Regression (screenshot 42.png): user reported a stray blinking
