@@ -296,7 +296,7 @@ impl SelfDeleteStrategy for PlatformSelfDelete {
     fn run(&self, exe: &Path) -> io::Result<()> {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
-        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
         // Rename live exe to .atomcode.rolling so the install dir can be deleted.
@@ -309,10 +309,18 @@ impl SelfDeleteStrategy for PlatformSelfDelete {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no parent dir"))?;
         let dir_str = install_dir.to_string_lossy().to_string();
 
-        let cmd_arg = format!("ping -n 2 127.0.0.1 >nul & rmdir /S /Q \"{}\"", dir_str);
+        // Use `timeout` for the delay instead of `ping` — it is semantically
+        // clearer and avoids the "cmd window flashing ping 127.0.0.1" bug
+        // reported in gitcode.com/atomgit_atomcode/atomcode/issues/352.
+        // CREATE_NO_WINDOW prevents the console window from appearing at all
+        // (DETACHED_PROCESS does NOT reliably hide the window on Win10).
+        let cmd_arg = format!(
+            "timeout /t 2 /nobreak >nul & rmdir /S /Q \"{}\"",
+            dir_str
+        );
         Command::new("cmd")
             .args(["/C", &cmd_arg])
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
             .spawn()?;
         Ok(())
     }

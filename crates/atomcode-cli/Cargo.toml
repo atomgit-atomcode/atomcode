@@ -27,7 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 is-terminal = "0.4"
 
 # setsid() for the detached upgrade-prep subprocess. Unix-only — Windows
-# uses DETACHED_PROCESS creation flags instead (see main.rs).
+# uses CREATE_NO_WINDOW creation flags instead (see main.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

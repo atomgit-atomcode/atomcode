@@ -317,7 +317,7 @@ async fn run_prepare_upgrade_worker() -> i32 {
 /// and exits. "Detached" means:
 ///   * New session on Unix (`setsid`) — parent's Ctrl+C goes to parent's
 ///     foreground process group only; the child is in its own and ignores it.
-///   * `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` on Windows, same idea.
+///   * `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows, same idea
 ///   * stdin/stdout/stderr → /dev/null so the child can't scribble over the
 ///     parent's terminal and has no reason to stay attached to it.
 ///
@@ -354,8 +354,8 @@ fn spawn_detached_upgrade_prep() {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     let _ = cmd.spawn();
