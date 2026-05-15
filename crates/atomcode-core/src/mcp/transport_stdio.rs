@@ -407,6 +407,7 @@ async fn read_content_length_message(
 ///
 /// The core logic is platform-independent (and testable on all platforms);
 /// the `shell` parameter is `"cmd.exe"` on Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn wrap_cmd_script(command: &str, args: &[String], shell: &str) -> (String, Vec<String>) {
     /// Commands that are known to be `.cmd`/`.bat` scripts on Windows.
     /// Checked case-insensitively.
