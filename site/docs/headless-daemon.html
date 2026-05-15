@@ -42,7 +42,6 @@
         <a href="./sessions.html">会话与撤销</a>
         <a href="./project-instructions.html">项目指令文件</a>
         <a href="./memory.html">永久记忆</a>
-        <a href="./headless-daemon.html" aria-current="page">Headless 与 Daemon</a>
         <a href="./skills.html">Skills 扩展</a>
         <a href="./plugins.html">Plugin 系统</a>
         <a href="./mcp.html">MCP 集成</a>
@@ -68,10 +67,11 @@
           <tr><td><code>-p, --prompt TEXT</code></td><td>要执行的任务描述</td></tr>
           <tr><td><code>--prompt-file PATH</code></td><td>从文件读取 prompt(适合长文本,与 <code>-p</code> 互斥)</td></tr>
           <tr><td><code>-v, --verbose</code></td><td>把工具调用日志、token 用量、turn 摘要打到 <em>stderr</em>,不影响 stdout</td></tr>
-          <tr><td><code>--max-turns N</code></td><td>强制上限 N 轮 LLM 调用,避免 agent 在长任务里无限跑</td></tr>
-          <tr><td><code>--disable-tools LIST</code></td><td>禁用特定工具,比如 <code>bash,web_fetch</code></td></tr>
-          <tr><td><code>-C PATH</code></td><td>工作目录</td></tr>
+          <tr><td><code>--max-turns N</code></td><td>强制上限 N 轮 LLM 调用,避免 agent 在长任务里无限跑。默认不设上限</td></tr>
+          <tr><td><code>--disable-tools LIST</code></td><td>禁用特定工具,比如 <code>bash,web_fetch</code>。被禁用的工具不会出现在 schema 列表中,模型不会尝试调用</td></tr>
+          <tr><td><code>-C, --dir PATH</code></td><td>工作目录,默认为当前目录</td></tr>
           <tr><td><code>--provider / --model</code></td><td>临时覆盖 provider 或模型</td></tr>
+          <tr><td><code>--no-telemetry</code></td><td>本次调用关闭遥测上报</td></tr>
         </tbody>
       </table>
 
@@ -96,53 +96,137 @@ atomcode -p "解释这段代码" --provider local --model qwen2.5:14b</code></pr
       </ul>
 
       <div class="callout callout-warn">
-        <strong>注意</strong>
-        <p>Headless 模式下没有交互式的权限确认对话框。当前实现中,需要确认的 <code>bash</code> 调用会自动批准并把原因写到 stderr;其他需要确认的工具会被拒绝。如果你不希望 CI 中执行 shell,可以显式加上 <code>--disable-tools bash</code>。</p>
+        <strong>注意:权限模型</strong>
+        <p>Headless 模式没有交互式权限确认对话框。当前实现中,需要确认的 <code>bash</code> 调用会自动批准,并把原因写到 stderr:</p>
+        <pre><code>[headless] auto-approved bash: &lt;reason&gt;</code></pre>
+        <p>其他需要确认的工具(<code>edit</code>、<code>write</code>、<code>web_fetch</code> 等的高风险路径)会被自动拒绝:</p>
+        <pre><code>[approval-denied] tool=&lt;name&gt; reason=&lt;reason&gt;</code></pre>
+        <p>出现 <code>[approval-denied]</code> 时进程会以非 0 退出码结束。如果你不希望 CI 中执行 shell,可以显式加上 <code>--disable-tools bash</code> 把它从工具列表里彻底移除。</p>
       </div>
 
       <h2>atomcode-daemon</h2>
-      <p><code>atomcode-daemon</code> 是独立的二进制,直接复用 <code>atomcode-core</code>。它对外暴露 HTTP + Server-Sent Events 接口,可以被任意 Web 前端、IDE 插件、编辑器扩展消费。</p>
+      <p><code>atomcode-daemon</code> 是独立的二进制,直接复用 <code>atomcode-core</code>。它对外暴露 HTTP + Server-Sent Events 接口,可以被 Web 前端、IDE 插件、编辑器扩展消费。AtomCode 官方的 VS Code 扩展和 AtomCode Air 桌面端都是通过它连过来的。</p>
 
       <h3>启动</h3>
-      <pre><code># 从源码构建
-cargo run -p atomcode-daemon
+      <pre><code># 推荐:通过 CLI 子命令启动,自动调用同目录下的 atomcode-daemon 二进制
+atomcode daemon
 
-# 或通过编译好的二进制
-atomcode-daemon</code></pre>
-      <p>默认监听一个本地端口(详见启动日志输出),并读取与 CLI 相同的 <code>~/.atomcode/config.toml</code>。</p>
+# 指定端口与客户端身份(用于遥测分流)
+atomcode daemon --port 13456 --client vscode
 
-      <h3>主要端点</h3>
+# 也可以直接调用 daemon 二进制(支持更多参数)
+atomcode-daemon --host 127.0.0.1 --port 13456 \
+                --client atomcode-air --idle-timeout 1800</code></pre>
+      <p>daemon 读取与 CLI 相同的 <code>~/.atomcode/config.toml</code>,登录态、provider 配置、会话历史全部共享。</p>
+
+      <h3>启动参数</h3>
       <table>
         <thead>
-          <tr><th>Method + Path</th><th>说明</th></tr>
+          <tr><th>参数</th><th>说明</th></tr>
         </thead>
         <tbody>
+          <tr><td><code>--host HOST</code></td><td>监听地址,默认 <code>127.0.0.1</code>。非 loopback 地址会触发警告(daemon 没有鉴权,不应暴露到公网)</td></tr>
+          <tr><td><code>--port PORT</code></td><td>监听端口,默认 <code>13456</code></td></tr>
+          <tr><td><code>--client NAME</code></td><td>客户端身份,目前识别 <code>vscode</code> / <code>atomcode-air</code>,其他值视为通用 IDE。影响遥测打点与部分行为</td></tr>
+          <tr><td><code>--idle-timeout SECS</code></td><td>空闲超时(秒)。默认 1800(30 分钟),<code>0</code> 表示禁用,非零值最小钳制到 60。也可用环境变量 <code>ATOMCODE_DAEMON_IDLE_TIMEOUT</code></td></tr>
+          <tr><td><code>--no-telemetry</code></td><td>关闭本次进程的遥测上报</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-warn">
+        <strong>安全</strong>
+        <p>daemon 没有内置鉴权,默认只监听 <code>127.0.0.1</code>。<strong>切勿把它直接暴露到公网或局域网</strong> —— 调用方相当于直接拿到本机所有工具的执行权(包括 <code>bash</code>、<code>write</code>、<code>edit</code>)。需要远程使用时,请在前置反代上自行做认证 / TLS / 来源限制。</p>
+      </div>
+
+      <h3>端点总览</h3>
+      <p>所有端点都注册在 <code>crates/atomcode-daemon/src/main.rs</code>,以下按功能分组。</p>
+
+      <h4>健康与生命周期</h4>
+      <table>
+        <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
+        <tbody>
           <tr><td><code>GET /health</code></td><td>健康检查</td></tr>
+          <tr><td><code>POST /shutdown</code></td><td>主动关闭 daemon(用于客户端退出时优雅关停)</td></tr>
+        </tbody>
+      </table>
+
+      <h4>会话 / 项目</h4>
+      <table>
+        <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
+        <tbody>
           <tr><td><code>GET /sessions</code></td><td>列出所有会话</td></tr>
-          <tr><td><code>POST /sessions</code></td><td>创建一个新会话</td></tr>
+          <tr><td><code>POST /sessions</code></td><td>创建新会话</td></tr>
           <tr><td><code>GET /sessions/search</code></td><td>按关键词搜索历史会话</td></tr>
-          <tr><td><code>GET /projects</code></td><td>列出所有有过会话的项目</td></tr>
-          <tr><td><code>GET /projects/:hash/sessions</code></td><td>列出某个项目下的会话</td></tr>
-          <tr><td><code>GET /projects/:hash/sessions/:id</code></td><td>查看单个会话的详细消息</td></tr>
-          <tr><td><code>DELETE /projects/:hash/sessions/:id</code></td><td>删除单个会话</td></tr>
-          <tr><td><code>PATCH /projects/:hash/sessions/:id/rename</code></td><td>重命名会话</td></tr>
-          <tr><td><code>GET /project</code></td><td>获取当前工作目录相关的项目状态</td></tr>
+          <tr><td><code>GET /project</code></td><td>当前工作目录的项目状态</td></tr>
           <tr><td><code>POST /cd</code></td><td>切换工作目录</td></tr>
-          <tr><td><code>GET /models</code></td><td>列出当前配置中的所有可用 provider / model</td></tr>
-          <tr><td><code>POST /chat</code></td><td>发送一条 prompt,返回 SSE 流式响应</td></tr>
-          <tr><td><code>POST /chat/stop</code></td><td>停止某个正在进行的 <code>/chat</code> 请求</td></tr>
+          <tr><td><code>GET /projects</code></td><td>列出所有有过会话的项目</td></tr>
+          <tr><td><code>GET /projects/:hash/sessions</code></td><td>某个项目下的会话列表</td></tr>
+          <tr><td><code>GET /projects/:hash/sessions/:id</code></td><td>会话详情</td></tr>
+          <tr><td><code>DELETE /projects/:hash/sessions/:id</code></td><td>删除会话</td></tr>
+          <tr><td><code>PATCH /projects/:hash/sessions/:id/rename</code></td><td>重命名会话</td></tr>
+        </tbody>
+      </table>
+
+      <h4>聊天与模型</h4>
+      <table>
+        <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET /models</code></td><td>列出可用的 provider / model</td></tr>
+          <tr><td><code>POST /chat</code></td><td>发送一条 prompt,返回 SSE 流</td></tr>
+          <tr><td><code>POST /chat/stop</code></td><td>停止正在进行的 <code>/chat</code></td></tr>
+        </tbody>
+      </table>
+
+      <h4>配置 / Provider</h4>
+      <table>
+        <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET /config</code></td><td>读取当前 <code>config.toml</code></td></tr>
+          <tr><td><code>POST /config/reload</code></td><td>重新加载 <code>config.toml</code></td></tr>
+          <tr><td><code>GET /providers</code></td><td>列出所有 provider</td></tr>
+          <tr><td><code>POST /providers</code></td><td>新增 provider</td></tr>
+          <tr><td><code>PATCH /providers/:name</code></td><td>修改 provider</td></tr>
+          <tr><td><code>DELETE /providers/:name</code></td><td>删除 provider</td></tr>
+          <tr><td><code>POST /providers/:name/default</code></td><td>把该 provider 设为默认</td></tr>
+          <tr><td><code>PATCH /providers/:name/thinking</code></td><td>切换/调整 provider 的 thinking 模式</td></tr>
+        </tbody>
+      </table>
+
+      <h4>MCP</h4>
+      <table>
+        <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET /mcp/status</code></td><td>MCP server 接入状态</td></tr>
+          <tr><td><code>POST /mcp/reload</code></td><td>重新加载 <code>.mcp.json</code></td></tr>
+        </tbody>
+      </table>
+
+      <h4>认证 / CodingPlan</h4>
+      <table>
+        <thead><tr><th>Method + Path</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET /auth/status</code></td><td>当前登录状态</td></tr>
+          <tr><td><code>POST /auth/login/start</code></td><td>启动 AtomGit OAuth 登录流程</td></tr>
+          <tr><td><code>POST /auth/login/:login_id/poll</code></td><td>轮询登录结果</td></tr>
+          <tr><td><code>DELETE /auth/login/:login_id</code></td><td>取消正在进行的登录</td></tr>
+          <tr><td><code>POST /auth/logout</code></td><td>登出</td></tr>
+          <tr><td><code>POST /codingplan/setup</code></td><td>领取 CodingPlan 并写入 provider 配置(等同 CLI <code>atomcode codingplan</code>)</td></tr>
         </tbody>
       </table>
 
       <h3>SSE 流式聊天</h3>
-      <p><code>POST /chat</code> 返回的 SSE 流使用的事件包含:AI 增量文本、工具调用开始 / 结束、token 统计、错误等。具体事件 schema 见 <code>atomcode-core</code> 的 <code>TurnEvent</code> 定义。</p>
-      <p>前端可以用原生 <code>EventSource</code> 消费,也可以借助任何 SSE 客户端库。daemon 已经配置了 CORS,本地调试前端可以直接连。</p>
+      <p><code>POST /chat</code> 返回的 SSE 流事件包含:AI 增量文本、推理 (reasoning) 增量、工具调用批次 (开始 / 结束)、token 统计、错误等。具体事件 schema 见 <code>crates/atomcode-core/src/turn/event.rs</code> 的 <code>TurnEvent</code> 定义。</p>
+      <p>前端可以用原生 <code>EventSource</code> 消费,也可以借助任何 SSE 客户端库。</p>
+
+      <h3>CORS</h3>
+      <p>daemon 配置了 CORS,<strong>仅允许 loopback origin</strong>:host 必须是 <code>localhost</code>、<code>127.0.0.1</code> 或 <code>::1</code>(端口任意,协议任意)。其他来源会被拒绝,这是配合 <code>--host 127.0.0.1</code> 默认监听做的纵深防御 —— 即便有人通过 DNS rebinding 等方式构造请求,跨域那一层也过不去。</p>
 
       <h3>典型应用</h3>
       <ul>
-        <li>编辑器插件/IDE 扩展(把 atomcode 嵌入 VSCode / JetBrains)</li>
-        <li>自建 Web UI(把终端 agent 搬到浏览器)</li>
-        <li>内网协作 / 团队共享会话历史</li>
+        <li>编辑器插件 / IDE 扩展(VSCode、JetBrains)</li>
+        <li>桌面端 GUI(如官方 AtomCode Air)</li>
+        <li>自建本地 Web UI(把终端 agent 搬到浏览器)</li>
+        <li>本地脚本编排:用 HTTP 调度多任务、共享会话历史</li>
       </ul>
 
       <h2>下一步</h2>
