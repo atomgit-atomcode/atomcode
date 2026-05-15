@@ -68,6 +68,11 @@ enum RenderCmd {
     BeginSelection(u16, u16),
     UpdateSelection(u16, u16),
     EndSelection,
+    /// Copy the current selection to the system clipboard (arboard).
+    /// Returns `true` via the ACK channel if a non-empty selection was
+    /// copied. Used by Ctrl+C to copy selected text on Windows where
+    /// OSC 52 is not supported.
+    CopySelection(mpsc::Sender<bool>),
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -202,6 +207,14 @@ impl Renderer for TaskRenderer {
     fn end_selection(&mut self) {
         let _ = self.cmd_tx.send(RenderCmd::EndSelection);
     }
+
+    fn copy_selection(&mut self) -> bool {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if self.cmd_tx.send(RenderCmd::CopySelection(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+    }
 }
 
 impl Drop for TaskRenderer {
@@ -278,6 +291,10 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             }
             RenderCmd::EndSelection => {
                 inner.end_selection();
+            }
+            RenderCmd::CopySelection(ack) => {
+                let result = inner.copy_selection();
+                let _ = ack.send(result);
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();

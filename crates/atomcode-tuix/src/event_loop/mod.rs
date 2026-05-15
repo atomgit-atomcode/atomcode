@@ -2118,6 +2118,16 @@ pub struct App {
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
+    /// Timestamp of the last Ctrl+C that was consumed by `copy_selection()`
+    /// via the Windows OS-level signal handler. On Windows, the OS Ctrl+C
+    /// signal fires *before* the keyboard event arrives in the input
+    /// buffer (biased `tokio::select!` prioritises the signal arm), so
+    /// after the signal handler copies the selection, the keyboard event
+    /// still shows up in `handle_input` and would trigger Cancel/exit.
+    /// This timestamp lets the keyboard path detect and suppress that
+    /// stale echo within a short debounce window.
+    #[cfg(windows)]
+    pub last_ctrl_c_copy: Option<std::time::Instant>,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -2137,6 +2147,8 @@ impl App {
             fixissue_pending: None,
             fixissue_buffer: String::new(),
             reasoning_buffer: String::new(),
+            #[cfg(windows)]
+            last_ctrl_c_copy: None,
         }
     }
 }
@@ -2750,9 +2762,31 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // when that path is silent. Single-press exit: skips the
             // 2-press confirm because if we got here, the user has no
             // working keyboard route to confirm with anyway.
+            //
+            // However, on Windows the OS Ctrl+C signal fires *before*
+            // the keyboard event arrives in the input buffer (and the
+            // `biased` select gives this arm priority), so when the
+            // user has a mouse selection active they expect Ctrl+C to
+            // *copy* — not exit. Try copy_selection first; only fall
+            // through to Shutdown when there's nothing selected.
             Some(()) = win_ctrl_c.recv() => {
-                crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
-                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                if renderer.copy_selection() {
+                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> copy_selection (had selection)");
+                    // Stamp so the keyboard-event echo (which arrives
+                    // shortly after via input_rx) knows to suppress
+                    // itself instead of triggering Cancel/exit.
+                    app.last_ctrl_c_copy = Some(std::time::Instant::now());
+                } else if matches!(app.state.phase, UiPhase::Streaming) {
+                    // In Streaming phase, Ctrl+C should cancel the
+                    // running turn (matching keyboard-path behaviour)
+                    // rather than shut down the whole application.
+                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> Cancel (streaming)");
+                    ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+                    restore_cancelled_message_to_buf(&mut app, renderer, &ctx);
+                } else {
+                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
+                    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                }
             }
 
             // ── Deferred-render trailing edge ──
@@ -3425,6 +3459,44 @@ fn handle_input(
             // before — those rely on the host terminal's native
             // scrollback). We intercept BEFORE phase dispatch so
             // scrolling works in Idle / Streaming alike.
+
+            // ── Ctrl+C: copy selection ──────────────────────────────
+            // On Windows, OSC 52 is not supported by Windows Terminal /
+            // conhost, so the user cannot copy text by mouse-selecting
+            // alone (end_selection's OSC 52 write is silently ignored).
+            // Ctrl+C is the user's natural instinct to copy selected
+            // text. We intercept it here: if a selection exists in the
+            // alt-screen renderer, copy its text to the system clipboard
+            // via arboard and clear the selection. If no selection exists,
+            // fall through to the normal Cancel behaviour.
+            //
+            // This also helps on macOS / Linux when the user prefers
+            // Ctrl+C / Cmd+C over the mouse-release OSC 52 auto-copy,
+            // or when the terminal ignores OSC 52 (macOS Terminal.app
+            // without the opt-in setting).
+            if code == crossterm::event::KeyCode::Char('c')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
+            {
+                // Windows: the OS Ctrl+C signal handler may have already
+                // consumed this Ctrl+C as a copy (see the `win_ctrl_c`
+                // select arm above). The keyboard event arrives shortly
+                // after via input_rx. If the signal handler stamped
+                // `last_ctrl_c_copy` within the last 500 ms, suppress
+                // the keyboard echo so it doesn't trigger Cancel/exit.
+                #[cfg(windows)]
+                if let Some(ts) = app.last_ctrl_c_copy.take() {
+                    if ts.elapsed() < Duration::from_millis(500) {
+                        crate::tuix_trace!("KEY", "ctrl+c keyboard echo suppressed (OS signal already handled copy)");
+                        return Ok(());
+                    }
+                }
+                if renderer.copy_selection() {
+                    return Ok(());
+                }
+                // No selection — fall through to Cancel below.
+            }
 
             // Ctrl+V: pull the system clipboard image and attach as
             // `[Image #N]` — independent of whether the host terminal

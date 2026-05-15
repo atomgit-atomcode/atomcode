@@ -2229,6 +2229,37 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         let text = self.extract_selection_text();
         self.write_osc52_clipboard(&text);
     }
+
+    fn copy_selection(&mut self) -> bool {
+        let text = self.extract_selection_text();
+        if text.is_empty() {
+            return false;
+        }
+        // Use arboard to write the system clipboard directly. OSC 52
+        // is unreliable on Windows (Windows Terminal / conhost ignore
+        // it), so this is the primary copy path on that platform.
+        // macOS and Linux terminals that honour OSC 52 already got the
+        // text via end_selection, but copy_selection is still useful
+        // when the user re-selects or the OSC 52 write failed silently.
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            if clipboard.set_text(&text).is_ok() {
+                // Clear the visual selection so the user sees feedback
+                // that the copy was consumed (mirrors how most editors
+                // deselect after Ctrl+C).
+                self.selection = None;
+                self.body_dirty = true;
+                self.paint_frame();
+                return true;
+            }
+        }
+        // arboard failed (e.g. another process holds the clipboard) —
+        // fall back to OSC 52 as a best-effort retry.
+        self.write_osc52_clipboard(&text);
+        self.selection = None;
+        self.body_dirty = true;
+        self.paint_frame();
+        true // text was non-empty, selection existed
+    }
 }
 
 impl<W: Write + Send> Drop for AltScreenRenderer<W> {
