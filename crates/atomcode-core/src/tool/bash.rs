@@ -7,6 +7,9 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct BashTool;
@@ -334,8 +337,9 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
     #[cfg(target_os = "windows")]
     let mut child = {
         let mut cmd = Command::new("cmd.exe");
-        cmd.args(&["/C", &parsed.command])
-            .current_dir(&wd)
+        cmd.arg("/C");
+        cmd.as_std_mut().raw_arg(&parsed.command);
+        cmd.current_dir(&wd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
