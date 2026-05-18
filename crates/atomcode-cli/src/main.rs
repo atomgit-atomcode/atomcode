@@ -1257,11 +1257,6 @@ async fn run() -> Result<i32> {
         conversation,
     );
     agent_loop.set_max_turns(cli.max_turns);
-    // CLI override for the cadence reflection knob. Matches the max_turns
-    // pattern — leave unset to honor config.toml; explicitly pass to force.
-    if let Some(n) = cli.reflection_cadence {
-        agent_loop.config.reflection_cadence = n;
-    }
     let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline;

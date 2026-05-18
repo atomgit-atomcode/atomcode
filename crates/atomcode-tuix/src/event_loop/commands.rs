@@ -970,7 +970,7 @@ pub(super) fn execute_slash_command(
             };
             client
                 .cmd_tx
-                .send(AgentCommand::SendMessage(task.to_string()))
+                .send(AgentCommand::SendMessage { text: task.to_string(), images: Vec::new(), image_markers: Vec::new() })
                 .ok();
             renderer.render(UiLine::CommandOutput(format!(
                 "  Background: [#{}] {} (state: running)\n",

@@ -2676,40 +2676,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.agent.event_rx.recv() => {
-                let Some(ev) = maybe else { break };
-                let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                if pre_phase != app.state.phase {
-                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
-                }
-                if matches!(app.state.phase, UiPhase::Streaming)
-                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
-                {
-                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    last_spinner_draw = std::time::Instant::now();
-                }
-                if matches!(app.state.phase, UiPhase::Idle) {
-                    // Turn just ended — drain the type-ahead queue.
-                    // Pop the oldest queued message, echo as a User
-                    // line, dispatch to the agent, and transition
-                    // back to Streaming. Remaining queue entries
-                    // fire in order on subsequent completions.
-                    if let Some(queued) = app.message_queue.pop_front() {
-                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.text.clone()));
-                        renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                            text: queued.text,
-                            images: queued.images,
-                            image_markers: queued.image_markers,
-                        }).ok();
-                        app.state.on_submit();
-                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    } else {
-                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
-                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
-
+            maybe = ctx.runtime_event_rx.recv() => {
+                let Some(runtime_event) = maybe else { break };
+                if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let pre_phase = app.state.phase;
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                    if pre_phase != app.state.phase {
+                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
                     if matches!(app.state.phase, UiPhase::Streaming)
                         && last_spinner_draw.elapsed() >= Duration::from_millis(100)
@@ -2725,9 +2698,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // fire in order on subsequent completions.
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            renderer.render(UiLine::User(queued.clone()));
+                            renderer.render(UiLine::User(queued.text.clone()));
                             renderer.flush();
-                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                text: queued.text,
+                                images: queued.images,
+                                image_markers: queued.image_markers,
+                            }).ok();
                             app.state.on_submit();
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
@@ -2980,35 +2957,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.agent.event_rx.recv() => {
-                let Some(ev) = maybe else { break };
-                let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                if pre_phase != app.state.phase {
-                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
-                }
-                if matches!(app.state.phase, UiPhase::Streaming)
-                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
-                {
-                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    last_spinner_draw = std::time::Instant::now();
-                }
-                if matches!(app.state.phase, UiPhase::Idle) {
-                    if let Some(queued) = app.message_queue.pop_front() {
-                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.text.clone()));
-                        renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                            text: queued.text,
-                            images: queued.images,
-                            image_markers: queued.image_markers,
-                        }).ok();
-                        app.state.on_submit();
-                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    } else {
-                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
-                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
-
+            maybe = ctx.runtime_event_rx.recv() => {
+                let Some(runtime_event) = maybe else { break };
+                if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let pre_phase = app.state.phase;
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                    if pre_phase != app.state.phase {
+                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
                     if matches!(app.state.phase, UiPhase::Streaming)
                         && last_spinner_draw.elapsed() >= Duration::from_millis(100)
@@ -3019,9 +2974,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if matches!(app.state.phase, UiPhase::Idle) {
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            renderer.render(UiLine::User(queued.clone()));
+                            renderer.render(UiLine::User(queued.text.clone()));
                             renderer.flush();
-                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage(queued)).ok();
+                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                text: queued.text,
+                                images: queued.images,
+                                image_markers: queued.image_markers,
+                            }).ok();
                             app.state.on_submit();
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
