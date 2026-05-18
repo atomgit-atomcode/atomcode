@@ -2098,7 +2098,33 @@ fn run_codingplan_core(
         },
     };
 
-    let report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+    // If the stored token is locally valid (file present, expires_in
+    // not yet past) but the server rejects it (revoked, refresh-token
+    // dead, etc.), the orchestrator sets `report.auth_expired = true`.
+    // Run OAuth *once* on that path — same flow `atomcode login` would
+    // use — then re-run setup against the fresh token. Without this
+    // the user sees the report ending in "claim failed — run `atomcode
+    // login` again" and has to do manually what `codingplan` could
+    // do itself.
+    let mut report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+    if report.auth_expired {
+        use atomcode_core::i18n::{t, Msg};
+        print!("{}", t(Msg::CpReauthAfter401));
+        match atomcode_core::auth::login(telemetry)
+            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+        {
+            Ok(_) => {
+                report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+            }
+            Err(e) => {
+                // Re-OAuth itself failed (user pressed Ctrl+C, network
+                // dead, etc.). Print the *original* report so users
+                // still see what triggered the retry, then bail.
+                println!("{}", report.render());
+                anyhow::bail!("re-authentication failed: {:#}", e);
+            }
+        }
+    }
 
     if report.should_persist_config() {
         if let Some(parent) = path.parent() {

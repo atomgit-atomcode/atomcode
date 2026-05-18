@@ -11,6 +11,13 @@ pub enum Msg<'a> {
 
     // ── /codingplan ──
     CodingPlanSetupFailed { error: &'a str },
+    /// Emitted inline by /codingplan and `atomcode codingplan` when the
+    /// stored OAuth token comes back 401 from the CodingPlan API
+    /// mid-flow. We re-run the same OAuth dance `/login` uses, save the
+    /// fresh token, and retry the whole setup once — this line tells
+    /// the user that's what's about to happen so the second
+    /// "Open this URL in any browser…" block isn't a surprise.
+    CpReauthAfter401,
     // SetupReport renderer (core/coding_plan/setup.rs)
     CpSetupHeader,
     CpLoggedIn { who: &'a str, username: &'a str, email: &'a str },

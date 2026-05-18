@@ -2660,7 +2660,43 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
     // Phase 2: claim/models/status. Pure HTTP + config mutation — no
     // stdin / stdout interaction, so we don't need to suspend the
     // renderer. `step_login` short-circuits via `is_logged_in()`.
-    let report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+    //
+    // If the stored token is locally valid (file present, expires_in
+    // not yet past) but the server rejects it (revoked, refresh-token
+    // dead, etc.), the orchestrator surfaces `report.auth_expired =
+    // true`. Run OAuth *once* on that path — same flow `/login` would
+    // have used — then re-run setup against the fresh token. Without
+    // this the user sees "✓ already logged in as X" followed by
+    // "✗ claim failed — run `atomcode login` again" and has to do
+    // manually what `/codingplan` could do itself.
+    let mut report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+    if matches!(&report, Ok(r) if r.auth_expired) {
+        renderer.render(UiLine::CommandOutput(
+            t(Msg::CpReauthAfter401).into_owned(),
+        ));
+        renderer.flush();
+        match run_oauth_with_renderer(renderer, ctx)
+            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+        {
+            Ok(_) => {
+                report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+            }
+            Err(e) => {
+                // Re-OAuth itself failed (user pressed ESC, network
+                // dead, etc.). Render the *original* report so they
+                // still see what triggered the retry, then surface the
+                // OAuth error.
+                if let Ok(r) = &report {
+                    renderer.render(UiLine::CommandOutput(r.render()));
+                }
+                renderer.render(UiLine::Error(
+                    t(Msg::CodingPlanSetupFailed { error: &e.to_string() }).into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+        }
+    }
 
     match report {
         Ok(report) => {

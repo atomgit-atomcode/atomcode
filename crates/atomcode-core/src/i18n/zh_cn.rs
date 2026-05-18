@@ -17,6 +17,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── /codingplan ──
         Msg::CodingPlanSetupFailed { error } =>
             format!("CodingPlan 设置失败：{error}").into(),
+        Msg::CpReauthAfter401 =>
+            "  ⚠ 登录凭证已失效 — 正在重新登录...\n".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan 配置：\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
