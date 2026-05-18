@@ -66,7 +66,7 @@ pub fn signer() -> &'static dyn RequestSigner {
 /// gateway. Host-based — does NOT trust provider config keys. Rejects
 /// non-HTTP(S) schemes, subdomain spoofs, and the legacy
 /// `api-ai.gitcode.com` host (still served plaintext until P3 cutover).
-pub fn is_atomgit_gateway(base_url: &str) -> bool {
+pub(crate) fn is_atomgit_gateway(base_url: &str) -> bool {
     let url = match url::Url::parse(base_url) {
         Ok(u) => u,
         Err(_) => return false,
