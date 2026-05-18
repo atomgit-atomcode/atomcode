@@ -342,8 +342,9 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
     if reset {
         renderer.reset();
     }
+    let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel { name: &session.name }).into_owned();
     renderer.render(UiLine::TurnSeparator {
-        label: crate::i18n::t(crate::i18n::Msg::SessionResumedLabel { name: &session.name }).into_owned(),
+        label: resumed.clone(),
     });
     for m in &session.messages {
         match (&m.role, &m.content) {
@@ -391,6 +392,9 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
         }
     }
     renderer.render(UiLine::TurnComplete);
+    renderer.render(UiLine::TurnSeparator {
+        label: resumed,
+    });
     renderer.flush();
 }
 
