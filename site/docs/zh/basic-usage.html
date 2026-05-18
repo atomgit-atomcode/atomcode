@@ -101,9 +101,9 @@ atomcode --config ./custom.toml</code></pre>
           <tr><td><code>--provider NAME</code></td><td>—</td><td>覆盖默认 provider</td></tr>
           <tr><td><code>--model NAME</code></td><td>—</td><td>覆盖当前 provider 的 model</td></tr>
           <tr><td><code>--config PATH</code></td><td>—</td><td>使用指定的配置文件</td></tr>
-          <tr><td><code>--prompt TEXT</code></td><td><code>-p</code></td><td>Headless 模式,单次执行并把回复写到 stdout</td></tr>
+          <tr><td><code>--prompt TEXT</code></td><td><code>-p</code></td><td>非交互模式,单次执行并把回复写到 stdout</td></tr>
           <tr><td><code>--prompt-file PATH</code></td><td>—</td><td>从文件读取 prompt(适合长文本,与 <code>-p</code> 互斥)</td></tr>
-          <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>Headless 模式下把工具调用、token 用量等信息打到 stderr</td></tr>
+          <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>非交互模式下把工具调用、token 用量等信息打到 stderr</td></tr>
           <tr><td><code>--max-turns N</code></td><td>—</td><td>强制限制 Agent 循环的最大轮数,防止无限跑下去</td></tr>
           <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>逗号分隔,禁用某些工具。例如 <code>--disable-tools bash,web_fetch</code></td></tr>
         </tbody>

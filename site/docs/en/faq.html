@@ -93,7 +93,7 @@
       <h2>Login &amp; models</h2>
 
       <h3>The browser doesn't open during OAuth login</h3>
-      <p>Check whether you're on a headless remote server. For remote environments, prefer API-key login (see <a href="./login.html">Login Methods</a>), or finish OAuth locally and copy <code>~/.atomcode/auth.json</code> to the same path on the server.</p>
+      <p>Check whether you're on a remote server without a desktop session. For remote environments, prefer API-key login (see <a href="./login.html">Login Methods</a>), or finish OAuth locally and copy <code>~/.atomcode/auth.json</code> to the same path on the server.</p>
 
       <h3>Can't reach the model / hangs forever / timeouts</h3>
       <ul>
@@ -118,8 +118,7 @@
       <p>That's the default safety policy. You can:</p>
       <ul>
         <li>Allow ad-hoc: pick "Always allow this kind of action" in the confirmation prompt;</li>
-        <li>Allow via config: add commands to the <code>[permissions]</code> allowlist in <code>config.toml</code>;</li>
-        <li>Headless mode has no <code>--yes</code> flag — the current behaviour is to auto-approve <code>bash</code> commands that ask for confirmation, and reject all other confirmation-requiring tools (the rejection is written to stderr).</li>
+        <li>Allow via config: add commands to the <code>[permissions]</code> allowlist in <code>config.toml</code>.</li>
       </ul>
 
       <h3>Where does AtomCode send my code?</h3>
@@ -153,14 +152,6 @@
 
       <h3>What's the difference between <code>.atomcode.md</code> and a skill?</h3>
       <p>The former is an "always on" project-level convention; the latter is an explicitly invoked workflow. See <a href="./skills.html#与项目指令的分工">Skills · Versus project instructions</a>.</p>
-
-      <h2>Headless &amp; daemon</h2>
-
-      <h3>How do I run AtomCode in CI?</h3>
-      <p>Use the non-interactive mode: <code>atomcode -p "task description"</code>; the result is written to stdout. <code>bash</code> commands that would prompt are auto-approved; other tools that need confirmation are rejected (with details on stderr). Remember to provide the API key via env var or secret. Full reference at <a href="./headless-daemon.html">Headless &amp; Daemon</a>.</p>
-
-      <h3>Daemon port already in use / fails to start</h3>
-      <p>The default port is <code>17890</code>; change it with <code>atomcode-daemon --port 1234</code> or via config. Check <code>~/.atomcode/logs/daemon.log</code> for the specific error.</p>
 
       <h2>Troubleshooting</h2>
       <div class="callout callout-tip">

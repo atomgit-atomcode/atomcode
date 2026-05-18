@@ -170,7 +170,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         </thead>
         <tbody>
           <tr><td>TUI</td><td>Connects in parallel in the background — doesn't block the UI</td><td>Each server registers as it connects, possibly slightly after the first frame</td></tr>
-          <tr><td>Headless (<code>-p</code>)</td><td>Connects synchronously at launch; waits for enabled servers' connection attempts to finish</td><td>MCP only mounts once at least one batch of tools is available</td></tr>
+          <tr><td>One-shot (<code>-p</code>)</td><td>Connects synchronously at launch; waits for enabled servers' connection attempts to finish</td><td>MCP only mounts once at least one batch of tools is available</td></tr>
         </tbody>
       </table>
       <p>In the TUI you'll see <code>✓ MCP server 'github' connected</code> or <code>✗ MCP server '…' failed: …</code> in the session area. <strong>A single server failure does not break other servers or the main program.</strong></p>

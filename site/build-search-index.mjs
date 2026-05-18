@@ -22,7 +22,7 @@ const GROUPS = [
   { name: '开始',   slugs: ['getting-started', 'login', 'configuration'] },
   { name: '使用',   slugs: ['basic-usage', 'slash-commands', 'keybindings', 'sessions'] },
   { name: '进阶',   slugs: ['tools', 'skills', 'mcp', 'plugins', 'memory', 'project-instructions'] },
-  { name: '运维',   slugs: ['headless-daemon', 'faq'] },
+  { name: '运维',   slugs: ['faq'] },
 ];
 
 function groupOf(slug) {

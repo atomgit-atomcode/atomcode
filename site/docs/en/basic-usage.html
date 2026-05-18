@@ -101,9 +101,9 @@ atomcode --config ./custom.toml</code></pre>
           <tr><td><code>--provider NAME</code></td><td>—</td><td>Override the default provider</td></tr>
           <tr><td><code>--model NAME</code></td><td>—</td><td>Override the current provider's model</td></tr>
           <tr><td><code>--config PATH</code></td><td>—</td><td>Use the given config file</td></tr>
-          <tr><td><code>--prompt TEXT</code></td><td><code>-p</code></td><td>Headless mode: one-shot execution, reply to stdout</td></tr>
+          <tr><td><code>--prompt TEXT</code></td><td><code>-p</code></td><td>Non-interactive mode: one-shot execution, reply to stdout</td></tr>
           <tr><td><code>--prompt-file PATH</code></td><td>—</td><td>Read prompt from file (useful for long input; mutually exclusive with <code>-p</code>)</td></tr>
-          <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>In headless mode, print tool calls and token usage to stderr</td></tr>
+          <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>In non-interactive mode, print tool calls and token usage to stderr</td></tr>
           <tr><td><code>--max-turns N</code></td><td>—</td><td>Cap the number of agent loop iterations; prevents runaway loops</td></tr>
           <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>Comma-separated tools to disable, e.g. <code>--disable-tools bash,web_fetch</code></td></tr>
         </tbody>

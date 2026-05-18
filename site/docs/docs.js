@@ -67,7 +67,6 @@
     'side.plugins':{zh:'Plugin 系统',en:'Plugin System'},
     'side.memory':{zh:'永久记忆',en:'Persistent Memory'},
     'side.project-instructions':{zh:'项目指令文件',en:'Project Instructions'},
-    'side.headless-daemon':{zh:'Headless / Daemon',en:'Headless / Daemon'},
     'side.faq':{zh:'常见问题',en:'FAQ'},
     // index page hero
     'hero.eyebrow':{zh:'AtomCode · 开源终端 AI 编码助手',en:'AtomCode · Open-source Terminal AI Coding Assistant'},
