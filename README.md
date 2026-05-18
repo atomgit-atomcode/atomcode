@@ -105,7 +105,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Code blocks** with language labels, line numbers, and `base16-ocean.dark` theme
 - **Multi-line input** with Shift+Enter (or `\` + Enter), auto-growing height, input history
 - **Text selection** with mouse drag, auto-scroll, and clipboard copy
-- **Slash commands** — `/model`, `/provider`, `/resume`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
+- **Slash commands** — `/model`, `/provider`, `/resume`, `/bg`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
 - **File attachment** — paste file paths to attach content as context
 - **Bracketed paste** — long paste content collapsed to a compact indicator
 - **Skills** — user-defined commands loaded from your skill directory, invoked like any slash command
@@ -303,6 +303,8 @@ Then just type what you want:
 |---------|--------|
 | `/resume` | Resume or switch session |
 | `/session` | Create a new session |
+| `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
+| `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
 | `/provider` | Manage providers |
 | `/model` | Switch model / provider |
 | `/login` | Login with AtomGit OAuth |

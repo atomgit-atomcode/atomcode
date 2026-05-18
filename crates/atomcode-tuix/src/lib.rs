@@ -18,9 +18,8 @@ pub mod trace;
 pub mod width;
 
 use anyhow::Result;
-use atomcode_core::agent::AgentHandle;
+use atomcode_core::agent::{AgentHandle, AgentRuntimeFactory};
 use atomcode_core::config::Config;
-use atomcode_core::tool::ToolContext;
 use crossterm::{
     event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
@@ -169,7 +168,7 @@ pub async fn run(
     config: Config,
     model_name: String,
     agent_handle: AgentHandle,
-    _tool_context: ToolContext,
+    runtime_factory: AgentRuntimeFactory,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
@@ -262,9 +261,7 @@ pub async fn run(
     // Phase 5 upgrades the auto-fallback to alt-screen so users
     // get the full UI).
     let force_plain = force_plain_env;
-    let auto_alt_screen = !force_plain_env
-        && !force_retain
-        && (is_jediterm || is_legacy_conhost);
+    let auto_alt_screen = !force_plain_env && !force_retain && (is_jediterm || is_legacy_conhost);
 
     // Marker env vars so the event loop can render a one-line hint
     // explaining what just happened and how to recover. Only set
@@ -303,8 +300,7 @@ pub async fn run(
     // setting any env var. Manual `ATOMCODE_RETAIN=1` still bypasses
     // (lets the curious try retained on those terminals despite the
     // known DECSTBM issues).
-    let want_alt_screen =
-        (force_alt_env || auto_alt_screen) && !force_plain_env && was_real_tty;
+    let want_alt_screen = (force_alt_env || auto_alt_screen) && !force_plain_env && was_real_tty;
 
     // When force_plain wins, strip raw-mode-related capabilities so
     // every downstream branch (TerminalGuard activate, reader spawn,
@@ -500,18 +496,36 @@ pub async fn run(
         dirs
     };
 
-    let custom_commands =
-        atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+    let custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
     // Same Arc the agent loop holds — reload() calls there propagate
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.
-    let skill_registry = agent_handle.skill_registry.clone();
+    let foreground_runtime_id = event_loop::bg_runtime::RuntimeId::new(1);
+    let agent_client = agent_handle.client.clone();
+    let skill_registry = agent_client.skill_registry.clone();
+    let (runtime_event_tx, runtime_event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<event_loop::bg_runtime::RuntimeEvent>();
+    event_loop::bg_runtime::spawn_event_forwarder(
+        foreground_runtime_id,
+        agent_handle.event_rx,
+        runtime_event_tx.clone(),
+    );
+    let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(
+        current_session.clone(),
+        foreground_runtime_id,
+        agent_client.clone(),
+    );
 
     let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
         config,
         model_name,
-        agent: agent_handle,
+        agent: agent_client,
+        runtime_factory,
+        bg_manager,
+        foreground_runtime_id,
+        runtime_event_tx,
+        runtime_event_rx,
         working_dir,
         previous_dir: None,
         recent_dirs,

@@ -83,7 +83,8 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false },
     Command { name: "cd",      desc: "Change working directory", needs_args: false },
     Command { name: "init",    desc: "Generate .atomcode.md project instructions from the working directory", needs_args: false },
-    Command { name: "background", desc: "Run a one-shot task in an isolated background context (read-only-ish tool subset)", needs_args: true },
+    Command { name: "bg",      desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>", needs_args: false },
+    Command { name: "background", desc: "Compatibility alias: start a one-shot task in a /bg slot", needs_args: true },
     Command { name: "diff",    desc: "Show git diff", needs_args: false },
     Command { name: "clear",   desc: "Clear screen", needs_args: false },
     Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false },
@@ -256,6 +257,14 @@ mod tests {
         let reg = CommandRegistry::builtin();
         assert!(reg.find("quit").is_some());
         assert!(reg.find("nonexistent").is_none());
+    }
+
+    #[test]
+    fn builtin_contains_bg_command() {
+        let registry = CommandRegistry::builtin();
+        let cmd = registry.find("bg").unwrap();
+        assert_eq!(cmd.name, "bg");
+        assert!(!cmd.needs_args);
     }
 
     #[test]

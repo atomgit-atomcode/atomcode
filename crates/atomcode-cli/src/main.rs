@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 mod telemetry_cmd;
 mod uninstall;
 
-use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
+use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop, AgentRuntimeFactory};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
@@ -1257,6 +1257,7 @@ async fn run() -> Result<i32> {
         conversation,
     );
     agent_loop.set_max_turns(cli.max_turns);
+    let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
     // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
@@ -1385,7 +1386,7 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
             Ok(0)
         };
 
@@ -1424,7 +1425,7 @@ async fn run_headless(
     let notifications = agent_loop.config.notifications.clone();
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
-        (handle.cmd_tx, handle.event_rx)
+        (handle.client.cmd_tx, handle.event_rx)
     };
 
     let ctx = atomcode_telemetry::CurrentContext::current();

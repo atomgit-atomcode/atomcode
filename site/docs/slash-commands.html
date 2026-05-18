@@ -62,6 +62,8 @@
           <tr><td><code>/login</code></td><td>仅完成 AtomGit OAuth 身份认证,<strong>不动 provider 配置</strong>(给已有 API Key 但想用 <code>/issue</code> 等 AtomGit 集成的用户)</td></tr>
           <tr><td><code>/resume</code></td><td>打开会话选择器,恢复任意一个之前的持久化会话(含消息、目录和模型状态)</td></tr>
           <tr><td><code>/session</code></td><td>创建一个全新的、干净的会话</td></tr>
+          <tr><td><code>/bg</code></td><td>将当前会话放到后台并打开新的前台会话;子命令: <code>/bg list</code>、<code>/bg &lt;N&gt;</code>、<code>/bg drop &lt;N&gt;</code>、<code>/bg help</code></td></tr>
+          <tr><td><code>/background &lt;task&gt;</code></td><td>兼容入口:在一个 <code>/bg</code> 槽位中启动一次性后台任务</td></tr>
           <tr><td><code>/rename &lt;新名字&gt;</code></td><td>重命名当前会话(影响 <code>/resume</code> 选择器里的显示名)</td></tr>
           <tr><td><code>/provider</code></td><td>打开 provider 管理界面,增删改切换</td></tr>
           <tr><td><code>/model</code></td><td>在当前 provider 下切换模型,或跨 provider 切换</td></tr>
