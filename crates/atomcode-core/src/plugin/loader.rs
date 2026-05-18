@@ -16,8 +16,24 @@ pub struct InstalledPluginAssets {
 }
 
 impl InstalledPluginAssets {
+    /// Primary skills directory — the first entry from the manifest's
+    /// `skills` field, or the default `"skills"` when absent.
     pub fn skills_dir(&self) -> PathBuf {
         self.plugin_dir.join(self.manifest.skills_path())
+    }
+    /// All skills directories declared in the manifest.
+    ///
+    /// When `skills` is absent this returns a single default `"skills"`
+    /// entry (same as `skills_dir()`). When it is a CC-style array
+    /// (`["./skills/foo", "./skills/bar"]`) each entry is resolved
+    /// relative to `plugin_dir`, allowing multiple skill directories
+    /// to contribute.
+    pub fn skills_dirs(&self) -> Vec<PathBuf> {
+        self.manifest
+            .skills_paths()
+            .into_iter()
+            .map(|p| self.plugin_dir.join(p))
+            .collect()
     }
     pub fn commands_dir(&self) -> PathBuf {
         self.plugin_dir.join(self.manifest.commands_path())
