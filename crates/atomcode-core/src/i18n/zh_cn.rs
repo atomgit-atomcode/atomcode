@@ -81,6 +81,23 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ⚠ 状态获取已跳过 — {}\n", reason).into(),
         Msg::CpStatusFetchFailed { error } =>
             format!("  ⚠ 状态获取失败（非致命） — {}\n", error).into(),
+        Msg::CpOfficialBuildRequired => Cow::Borrowed(
+            "此功能需要官方 AtomCode 构建，请前往 \
+             https://atomgit.com/atomgit_atomcode/atomcode/releases 下载安装。",
+        ),
+        Msg::CpSignStaleClockSkew => Cow::Borrowed(
+            "请求被服务端拒绝：签名时间戳已过期。请校准本地系统时间（NTP 同步）后重试。",
+        ),
+        Msg::CpSignReplayRetrying => Cow::Borrowed(
+            "请求被识别为重放，正在使用新的 nonce 自动重试\u{2026}",
+        ),
+        Msg::CpSignVersionTooOld => Cow::Borrowed(
+            "当前 AtomCode 版本过旧，签名方案已被服务端弃用。\
+             请升级 AtomCode 后继续使用 CodingPlan。",
+        ),
+        Msg::CpUpgradeRequired => Cow::Borrowed(
+            "需要升级才能继续使用 CodingPlan，请前往官方发布页安装最新版 AtomCode。",
+        ),
 
         Msg::ErrUnsupportedLocale { input } =>
             format!("不支持的语言：{input}").into(),
@@ -738,5 +755,42 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("错误：{error}").into(),
         Msg::BgTaskCancelled => "已取消。".into(),
         Msg::BgTaskNoSummary => "任务完成（无摘要文本）。".into(),
+    }
+}
+
+#[cfg(test)]
+mod codingplan_crypto_tests {
+    use super::*;
+    use crate::i18n::Msg;
+
+    #[test]
+    fn zh_official_build_required_mentions_official_and_releases() {
+        let s = zh_cn(Msg::CpOfficialBuildRequired);
+        assert!(s.contains("官方"));
+        assert!(s.contains("releases") || s.contains("发布"));
+    }
+
+    #[test]
+    fn zh_stale_clock_mentions_time() {
+        let s = zh_cn(Msg::CpSignStaleClockSkew);
+        assert!(s.contains("时间") || s.contains("时钟"));
+    }
+
+    #[test]
+    fn zh_replay_retrying_is_non_empty() {
+        let s = zh_cn(Msg::CpSignReplayRetrying);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn zh_version_too_old_mentions_upgrade() {
+        let s = zh_cn(Msg::CpSignVersionTooOld);
+        assert!(s.contains("升级") || s.contains("更新"));
+    }
+
+    #[test]
+    fn zh_upgrade_required_is_non_empty() {
+        let s = zh_cn(Msg::CpUpgradeRequired);
+        assert!(!s.is_empty());
     }
 }
