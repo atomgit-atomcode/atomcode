@@ -69,13 +69,15 @@
       <h2>AtomGit CodingPlan(推荐)</h2>
       <p>AtomGit 是 CSDN / 开放原子开源基金会旗下的开源代码托管平台,AtomCode 原生集成了它的 OAuth 和 CodingPlan。<code>/codingplan</code> 是新用户最省事的入口,一次操作完成登录 → 申领免费 token 额度 → 自动根据额度内的模型列表写好 provider 配置。用完这条命令,直接就能开始聊天。</p>
 
-      <h3>从首次运行欢迎界面接入</h3>
+      <h3>从首次运行启动向导接入</h3>
       <ol>
-        <li>首次启动 <code>atomcode</code>,会进入欢迎界面。</li>
-        <li>用方向键选中 <strong>Set up CodingPlan · Free tokens · recommended</strong>,回车。</li>
+        <li>首次启动 <code>atomcode</code>,会自动弹出 3 步启动向导。</li>
+        <li>第 1 步(欢迎)按 Enter,第 2 步(语言)按 <code>1</code>/<code>2</code>/<code>3</code> 选语言。</li>
+        <li>第 3 步(配置)选 <strong>用 AtomGit CodingPlan 一键接入</strong>(选项 1)。</li>
         <li>浏览器会自动打开 AtomGit 授权页面,点击允许即可。</li>
         <li>授权完成后 TUI 会自动申领 CodingPlan 并写入 provider 配置,无需再动 <code>config.toml</code>,直接开始发消息。</li>
       </ol>
+      <p>如果跳过过了想重新跑一遍向导,任何时候执行 <code>/welcome</code> 即可。</p>
 
       <h3>在已有会话里接入</h3>
       <p>已经进入 TUI 后,任意时刻执行:</p>

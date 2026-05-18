@@ -9,6 +9,36 @@ pub enum Role {
     Tool,
 }
 
+/// A single image attachment, base64-encoded.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImagePart {
+    /// MIME type, e.g. "image/png", "image/jpeg".
+    pub media_type: String,
+    /// Base64-encoded image data.
+    pub data: String,
+}
+
+/// One Anthropic-style extended-thinking content block. Anthropic's API
+/// returns thinking output as a sequence of `{type:"thinking", thinking,
+/// signature}` blocks; the `signature` is a server-issued cryptographic
+/// token that we MUST echo back unchanged on every subsequent assistant
+/// turn or the API rejects the request with `400 The content[].thinking
+/// in the thinking mode must be passed back to the API`. Per Anthropic
+/// docs, thinking blocks must also appear before text/tool_use blocks
+/// inside the assistant message — `provider/claude.rs::format_messages`
+/// enforces that ordering.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ThinkingBlock {
+    /// The thinking text streamed via `thinking_delta` events.
+    pub text: String,
+    /// Server-issued signature received via `signature_delta`. Required
+    /// for round-trip; an empty string means we never received one (older
+    /// session files, non-Anthropic provider) — emit anyway, the upstream
+    /// either accepts empty or rejects only when thinking + tool_use is
+    /// active (in which case we already had a signature).
+    pub signature: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MessageContent {
     Text(String),
@@ -25,11 +55,25 @@ pub enum MessageContent {
         /// Always captured on the receive side so we don't lose data.
         #[serde(default)]
         reasoning_content: Option<String>,
+        /// Anthropic-style extended-thinking blocks received alongside this
+        /// turn. Carries the cryptographic `signature` that Claude (and
+        /// Anthropic-compatible proxies routing models like deepseek-v4-pro
+        /// through claude.rs) require us to echo verbatim on every
+        /// subsequent request. Empty when the upstream isn't Anthropic
+        /// or thinking was disabled. `provider/claude.rs::format_messages`
+        /// emits these as the first elements of the `content` array.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thinking_blocks: Vec<ThinkingBlock>,
     },
     ToolResult(ToolResult),
     /// Lightweight reference to a tool result whose full output is cached on disk.
     /// Used for new tool results; old `ToolResult` variant kept for backward compat.
     ToolResultRef(ToolResultRef),
+    /// User message with text and/or image attachments (vision models).
+    MultiPart {
+        text: Option<String>,
+        images: Vec<ImagePart>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,20 +96,33 @@ impl Message {
             MessageContent::AssistantWithToolCalls { text, .. } => text.as_deref(),
             MessageContent::ToolResult(r) => Some(&r.output),
             MessageContent::ToolResultRef(r) => Some(&r.summary),
+            MessageContent::MultiPart { text, .. } => text.as_deref(),
         }
     }
 
-    /// Rough token estimate: chars / 3.5 for English, / 2 for CJK-heavy, + overhead per message.
-    /// This is intentionally conservative (overestimates) to avoid overflowing the context.
+    /// Rough token estimate: bytes / 4 with a per-message overhead.
+    ///
+    /// Note on accuracy: this is a coarse approximation regardless of language.
+    /// For OpenAI-style BPE tokenizers it tracks reality within ~30% on mixed
+    /// English+CJK code/prose. We deliberately keep the formula simple and
+    /// per-content-type aware (tool args expanded, ToolResultRef counted by
+    /// what's actually sent on the wire) — small refinements to the divisor
+    /// are dwarfed by tokenizer differences across providers, so anything
+    /// short of a real tokenizer would be false precision.
     pub fn estimate_tokens(&self) -> usize {
-        let char_count = match &self.content {
+        let byte_count = match &self.content {
             MessageContent::Text(s) => s.len(),
             MessageContent::AssistantWithToolCalls {
                 text,
                 tool_calls,
                 reasoning_content,
+                ..
             } => {
                 let text_len = text.as_ref().map_or(0, |t| t.len());
+                // Each tool_use contributes name + JSON-stringified args + a
+                // small per-call overhead (id, type, wrapper braces).
+                // Matches CC's `name + jsonStringify(input)` accounting in
+                // services/tokenEstimation.ts:roughTokenCountEstimationForBlock.
                 let calls_len: usize = tool_calls
                     .iter()
                     .map(|tc| tc.name.len() + tc.arguments.len() + 20)
@@ -74,12 +131,20 @@ impl Message {
                 text_len + calls_len + reasoning_len
             }
             MessageContent::ToolResult(r) => r.output.len() + 10,
-            // ToolResultRef: kept for backward compat (loading old conversations).
-            // Estimate from full size since old conversations may still contain these.
-            MessageContent::ToolResultRef(r) => r.byte_size + 10,
+            // ToolResultRef carries `byte_size` (the full original content
+            // size, kept for the cache lookup) AND `summary` (the short
+            // representation actually sent on the wire). The estimator must
+            // count what gets sent, not what's stashed on disk — the
+            // previous behaviour overestimated externalised results by 5-50×,
+            // pushing compression to fire on phantom budget pressure.
+            MessageContent::ToolResultRef(r) => r.summary.len() + 10,
+            MessageContent::MultiPart { text, images } => {
+                let text_len = text.as_ref().map_or(0, |t| t.len());
+                // Each image ≈ 1600 tokens (conservative estimate for vision models).
+                return (text_len / 4).max(1) + images.len() * 1600 + 4;
+            }
         };
-        // ~4 chars per token for English, add 4 tokens overhead per message
-        (char_count / 4).max(1) + 4
+        (byte_count / 4).max(1) + 4
     }
 
     /// Create a condensed version of this message for context budget savings.
@@ -130,6 +195,8 @@ impl Message {
             }
             // ToolResultRef is already condensed (only holds a summary).
             MessageContent::ToolResultRef(_) => self.clone(),
+            // MultiPart messages (images + text) are not condensable.
+            MessageContent::MultiPart { .. } => self.clone(),
             _ => self.clone(),
         }
     }
@@ -339,5 +406,158 @@ mod tests {
         };
         assert!(!r.output.contains("[File skeleton"));
         assert_eq!(r.output.lines().count(), 1);
+    }
+
+    // ── ImagePart / MultiPart tests ────────────────────────────────────────
+
+    fn sample_image_part() -> ImagePart {
+        ImagePart {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgoAAAANSUhEUg==".to_string(),
+        }
+    }
+
+    #[test]
+    fn image_part_serde_roundtrip() {
+        let img = sample_image_part();
+        let json = serde_json::to_string(&img).expect("serialize ImagePart");
+        let deserialized: ImagePart = serde_json::from_str(&json).expect("deserialize ImagePart");
+        assert_eq!(deserialized.media_type, "image/png");
+        assert_eq!(deserialized.data, img.data);
+    }
+
+    #[test]
+    fn multipart_serde_roundtrip_with_text_and_images() {
+        let content = MessageContent::MultiPart {
+            text: Some("describe this image".to_string()),
+            images: vec![sample_image_part()],
+        };
+        let json = serde_json::to_string(&content).expect("serialize MultiPart");
+        let deserialized: MessageContent =
+            serde_json::from_str(&json).expect("deserialize MultiPart");
+        match deserialized {
+            MessageContent::MultiPart { text, images } => {
+                assert_eq!(text.as_deref(), Some("describe this image"));
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].media_type, "image/png");
+            }
+            other => panic!("expected MultiPart, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multipart_serde_roundtrip_no_text() {
+        let content = MessageContent::MultiPart {
+            text: None,
+            images: vec![sample_image_part(), sample_image_part()],
+        };
+        let json = serde_json::to_string(&content).expect("serialize");
+        let deserialized: MessageContent = serde_json::from_str(&json).expect("deserialize");
+        match deserialized {
+            MessageContent::MultiPart { text, images } => {
+                assert!(text.is_none());
+                assert_eq!(images.len(), 2);
+            }
+            other => panic!("expected MultiPart, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multipart_text_returns_some_when_present() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("hello".to_string()),
+                images: vec![],
+            },
+        };
+        assert_eq!(msg.text(), Some("hello"));
+    }
+
+    #[test]
+    fn multipart_text_returns_none_when_absent() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: None,
+                images: vec![],
+            },
+        };
+        assert_eq!(msg.text(), None);
+    }
+
+    #[test]
+    fn multipart_estimate_tokens_includes_image_cost() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("short".to_string()),
+                images: vec![sample_image_part(), sample_image_part()],
+            },
+        };
+        let tokens = msg.estimate_tokens();
+        // 2 images * 1600 = 3200, plus text and message overhead.
+        assert!(
+            tokens >= 3200,
+            "token estimate should include ~1600 per image, got {}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn multipart_estimate_tokens_no_images() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("hello world".to_string()),
+                images: vec![],
+            },
+        };
+        let tokens = msg.estimate_tokens();
+        // No images: "hello world" = 11 chars -> 11/4 = 2 (max with 1) + 0*1600 + 4 = 6
+        assert!(tokens < 100, "no-image multipart should have small token count, got {}", tokens);
+        assert!(tokens >= 5, "should have at least text + overhead, got {}", tokens);
+    }
+
+    #[test]
+    fn multipart_is_tool_result_returns_false() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("look at this".to_string()),
+                images: vec![sample_image_part()],
+            },
+        };
+        assert!(!msg.is_tool_result());
+    }
+
+    #[test]
+    fn multipart_condensed_returns_clone() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("analyze this".to_string()),
+                images: vec![sample_image_part()],
+            },
+        };
+        let condensed = msg.condensed("");
+        match (&msg.content, &condensed.content) {
+            (
+                MessageContent::MultiPart {
+                    text: t1,
+                    images: i1,
+                },
+                MessageContent::MultiPart {
+                    text: t2,
+                    images: i2,
+                },
+            ) => {
+                assert_eq!(t1, t2);
+                assert_eq!(i1.len(), i2.len());
+                assert_eq!(i1[0].media_type, i2[0].media_type);
+                assert_eq!(i1[0].data, i2[0].data);
+            }
+            _ => panic!("condensed MultiPart should remain MultiPart"),
+        }
     }
 }

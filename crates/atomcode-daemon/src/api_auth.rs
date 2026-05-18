@@ -7,6 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use atomcode_core::auth;
+use atomcode_telemetry::Event;
 
 use crate::{api_config::cleanup_expired_sessions, json_error, AppState, LoginSessionEntry};
 
@@ -158,21 +159,30 @@ pub(crate) async fn auth_login_start(
 /// POST /auth/login/:login_id/poll - Polls one OAuth login session.
 pub(crate) async fn auth_login_poll(
     State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<atomcode_telemetry::SessionMode>,
     Path(login_id): Path<String>,
 ) -> impl IntoResponse {
-    match poll_login_session(&state, &login_id).await {
-        Ok(LoginPollStep::Pending) => Json(LoginPollResponse {
-            status: "pending".to_string(),
-            user: None,
-        })
-        .into_response(),
-        Ok(LoginPollStep::Authorized(user)) => Json(LoginPollResponse {
-            status: "authorized".to_string(),
-            user: Some(user),
-        })
-        .into_response(),
-        Err((status, message)) => json_error(status, message).into_response(),
-    }
+    let state_inner = state.clone();
+    crate::telemetry_scope::daemon_scope(&state, None, client_mode, || async move {
+        match poll_login_session(&state_inner, &login_id).await {
+            Ok(LoginPollStep::Pending) => Json(LoginPollResponse {
+                status: "pending".to_string(),
+                user: None,
+            })
+            .into_response(),
+            Ok(LoginPollStep::Authorized(user)) => {
+                state_inner.telemetry.set_account_id(Some(user.id.to_string()));
+                state_inner.telemetry.track(Event::LoginSuccess);
+                Json(LoginPollResponse {
+                    status: "authorized".to_string(),
+                    user: Some(user),
+                })
+                .into_response()
+            }
+            Err((status, message)) => json_error(status, message).into_response(),
+        }
+    })
+    .await
 }
 
 /// DELETE /auth/login/:login_id - Cancels and removes an in-flight login session.
@@ -189,25 +199,33 @@ pub(crate) async fn auth_login_cancel(
 }
 
 /// POST /auth/logout - Logs out (removes stored auth).
-pub(crate) async fn auth_logout() -> impl IntoResponse {
-    match auth::logout() {
-        Ok(()) => {
-            // Return auth status after logout
-            let auth_path = auth::auth_file_path();
-            Json(AuthStatusResponse {
-                logged_in: false,
-                auth_path: auth_path.to_string_lossy().to_string(),
-                user: None,
-                token: None,
-            })
-            .into_response()
+pub(crate) async fn auth_logout(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<atomcode_telemetry::SessionMode>,
+) -> impl IntoResponse {
+    let state_inner = state.clone();
+    crate::telemetry_scope::daemon_scope(&state, None, client_mode, || async move {
+        match auth::logout() {
+            Ok(()) => {
+                state_inner.telemetry.set_account_id(None);
+                // Return auth status after logout
+                let auth_path = auth::auth_file_path();
+                Json(AuthStatusResponse {
+                    logged_in: false,
+                    auth_path: auth_path.to_string_lossy().to_string(),
+                    user: None,
+                    token: None,
+                })
+                .into_response()
+            }
+            Err(e) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Logout failed: {:#}", e),
+            )
+            .into_response(),
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Logout failed: {:#}", e),
-        )
-        .into_response(),
-    }
+    })
+    .await
 }
 
 pub(crate) async fn poll_login_session(

@@ -16,6 +16,9 @@ use uuid::Uuid;
 pub enum SessionMode {
     Headless,
     Tui,
+    Ide,
+    Vscode,
+    AtomcodeAir,
 }
 
 // ---------- Envelope (common to every event) ----------
@@ -314,5 +317,13 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["event_id"], "telemetry_disabled");
+    }
+
+    #[test]
+    fn session_mode_ide_serializes_as_ide() {
+        assert_eq!(
+            serde_json::to_string(&SessionMode::Ide).unwrap(),
+            "\"ide\""
+        );
     }
 }

@@ -14,13 +14,18 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod telemetry_cmd;
+mod uninstall;
 
 use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop, AgentRuntimeFactory};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::lsp::manager::build_lsp_manager;
-use atomcode_core::mcp::{merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpRegistry};
+use atomcode_core::mcp::{
+    load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
+    merge_stdio_mcp_server_into_json_file, register_mcp_tools, McpHttpAuthConfig,
+    McpOAuthLoginOptions, McpRegistry, McpTokenStore, McpTransportConfig,
+};
 use atomcode_core::provider::{create_provider, unavailable_provider};
 use atomcode_core::session::SessionManager;
 use atomcode_core::tool::bash::BashTool;
@@ -261,7 +266,7 @@ async fn sync_stage_and_apply_if_newer() {
                     eprintln!("✓ Upgrading to {}...", applied.version);
                     // Save the CURRENT version (before upgrade) so TUI can show "Upgraded old → new"
                     std::env::set_var(UPGRADED_FROM_ENV, &current);
-                    match self_update::re_exec_self() {
+                    match self_update::re_exec_self(Some(&applied.exe)) {
                         Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
                         Err(e) => {
                             eprintln!(
@@ -312,7 +317,7 @@ async fn run_prepare_upgrade_worker() -> i32 {
 /// and exits. "Detached" means:
 ///   * New session on Unix (`setsid`) — parent's Ctrl+C goes to parent's
 ///     foreground process group only; the child is in its own and ignores it.
-///   * `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` on Windows, same idea.
+///   * `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows, same idea
 ///   * stdin/stdout/stderr → /dev/null so the child can't scribble over the
 ///     parent's terminal and has no reason to stay attached to it.
 ///
@@ -349,8 +354,8 @@ fn spawn_detached_upgrade_prep() {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     let _ = cmd.spawn();
@@ -382,6 +387,10 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
+    /// Set interface language (e.g. en, zh-CN, zh)
+    #[arg(long)]
+    lang: Option<String>,
+
     /// Path to config file
     #[arg(long)]
     config: Option<PathBuf>,
@@ -410,13 +419,6 @@ struct Cli {
     /// no tool calls or when the step budget (tool-call cap) is reached.
     #[arg(long)]
     max_turns: Option<usize>,
-
-    /// Inject a "restate goal / what ruled out / next output" reflection
-    /// prompt every N tool calls. 0 disables the checkpoint entirely.
-    /// Overrides the value in config.toml for this run. Default: use
-    /// config.toml's reflection_cadence (which itself defaults to 10).
-    #[arg(long, value_name = "N")]
-    reflection_cadence: Option<usize>,
 
     /// Disable auto-update for this launch. Skips applying any staged
     /// upgrade, skips the sync stage+apply on startup, and skips the
@@ -475,6 +477,9 @@ enum Commands {
         /// Port to listen on (default: 13456)
         #[arg(long, default_value = "13456")]
         port: u16,
+        /// Client identifier for telemetry (e.g. "vscode", "atomcode-air")
+        #[arg(long)]
+        client: Option<String>,
     },
     /// Telemetry controls
     Telemetry {
@@ -486,6 +491,24 @@ enum Commands {
     /// slash command — anything installed via either path is visible to both.
     #[command(subcommand)]
     Plugin(PluginCli),
+    /// Uninstall AtomCode: remove the binary, PATH edit, and (interactively)
+    /// data under ~/.atomcode/. With no flags, runs interactively and asks
+    /// per-group; pass --yes / --purge / --keep-data for non-interactive use.
+    Uninstall {
+        /// Skip prompts; use per-group default decisions
+        /// (binary=yes, credentials=no, state=yes).
+        #[arg(long)]
+        yes: bool,
+        /// Wipe ~/.atomcode/ entirely.
+        #[arg(long, conflicts_with = "keep_data")]
+        purge: bool,
+        /// Keep ~/.atomcode/ entirely (only remove binary + PATH edit).
+        #[arg(long)]
+        keep_data: bool,
+        /// Print the plan; do nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -541,6 +564,40 @@ enum McpCli {
         /// Directory for project `.mcp.json` (defaults to current directory)
         #[arg(short = 'C', long)]
         dir: Option<PathBuf>,
+    },
+    /// Add GitHub's remote MCP server using OAuth.
+    AddGithubOauth {
+        /// Server key (tools appear as `mcp__<name>__…`)
+        #[arg(default_value = "github")]
+        name: String,
+        /// Write `~/.atomcode/mcp.json` instead of `<dir>/.mcp.json`
+        #[arg(long)]
+        global: bool,
+        /// Directory for project `.mcp.json` (defaults to current directory)
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+    },
+    /// Complete OAuth login for a remote MCP server.
+    Login {
+        /// Server key in mcpServers (for GitHub, usually `github`)
+        name: String,
+        /// OAuth provider to use.
+        #[arg(long, default_value = "github")]
+        provider: String,
+        /// OAuth client id. Defaults to ATOMCODE_GITHUB_MCP_CLIENT_ID.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// Environment variable containing the OAuth client secret.
+        #[arg(long)]
+        client_secret_env: Option<String>,
+        /// OAuth scopes. Defaults to GitHub MCP's broad repo-oriented set.
+        #[arg(long, value_delimiter = ',')]
+        scopes: Vec<String>,
+    },
+    /// Remove saved OAuth credentials for a remote MCP server.
+    Logout {
+        /// Server key in mcpServers.
+        name: String,
     },
 }
 
@@ -631,7 +688,7 @@ async fn main() {
                 // Pass the CURRENT version (before upgrade) to the re-exec'd child so the TUI
                 // can surface a welcome-screen confirmation exactly once.
                 std::env::set_var(UPGRADED_FROM_ENV, &current_version);
-                match atomcode_core::self_update::re_exec_self() {
+                match atomcode_core::self_update::re_exec_self(Some(&applied.exe)) {
                     Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
                     Err(e) => {
                         eprintln!(
@@ -816,7 +873,7 @@ async fn run() -> Result<i32> {
                     }
                 }
             }
-            Commands::Daemon { port } => {
+            Commands::Daemon { port, client } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 eprintln!("Starting AtomCode daemon on port {}...", port);
                 eprintln!("Press Ctrl+C to stop.");
@@ -834,9 +891,12 @@ async fn run() -> Result<i32> {
                 });
                 match daemon_bin {
                     Some(bin) => {
-                        let status = std::process::Command::new(bin)
-                            .arg("--port")
-                            .arg(port.to_string())
+                        let mut cmd = std::process::Command::new(bin);
+                        cmd.arg("--port").arg(port.to_string());
+                        if let Some(ref c) = client {
+                            cmd.arg("--client").arg(c);
+                        }
+                        let status = cmd
                             .status()
                             .context("Failed to start atomcode-daemon")?;
                         return Ok(if status.success() { 0 } else { 1 });
@@ -893,10 +953,12 @@ async fn run() -> Result<i32> {
                 datalog: Default::default(),
                 notifications: Default::default(),
                 auto_update: true,
-                reflection_cadence: 7,
                 telemetry: Default::default(),
                 lsp: Default::default(),
                 auto_commit: false,
+                subagent: Default::default(),
+                vision_preprocessor_provider: None,
+                language: None,
             }
         })
     } else {
@@ -908,20 +970,33 @@ async fn run() -> Result<i32> {
             datalog: Default::default(),
             notifications: Default::default(),
             auto_update: true,
-            reflection_cadence: 7,
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: None,
+            language: None,
         }
     };
 
+    // ── i18n locale ──
+    let locale = atomcode_tuix::i18n::resolve_initial_locale(
+        cli.lang.as_deref(),
+        config.language,
+    );
+    atomcode_tuix::i18n::set_locale(locale);
+
     let unavailable_reason = if config.providers.is_empty() {
-        Some("未配置 provider。请使用 /provider 添加 provider 后再试。".to_string())
+        Some(atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::CmdNoActiveProvider).into_owned())
     } else {
         None
     };
 
-    let (provider_config, model_name) = if unavailable_reason.is_some() {
+    /// Build the placeholder `ProviderConfig` used when no real provider is
+    /// available.  The TUI still boots — the Welcome wizard / status-row
+    /// hints nudge the user to `/login` or `/codingplan`, and a successful
+    /// auth flow rebuilds the real provider via `rebuild_provider`.
+    fn dummy_provider_config() -> (ProviderConfig, String) {
         (
             ProviderConfig {
                 provider_type: "openai".to_string(),
@@ -942,6 +1017,10 @@ async fn run() -> Result<i32> {
             },
             String::new(),
         )
+    }
+
+    let (provider_config, model_name) = if unavailable_reason.is_some() {
+        dummy_provider_config()
     } else {
         if let Some(ref model) = cli.model {
             let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
@@ -952,9 +1031,25 @@ async fn run() -> Result<i32> {
         // Keep api_key as None here so `create_provider()` auto-loads
         // from `~/.atomcode/auth.toml`. Setting "not-configured" would
         // bypass that path and force the user to manually provide a key.
-        let pc = config.active_provider(cli.provider.as_deref())?.clone();
-        let name = pc.model.clone();
-        (pc, name)
+        //
+        // `active_provider` already falls back to the first available
+        // provider when `default_provider` points to a deleted section,
+        // but as a defence-in-depth measure we catch any remaining
+        // errors and swap in the dummy so the TUI still boots.
+        match config.active_provider(cli.provider.as_deref()) {
+            Ok(pc) => {
+                let name = pc.model.clone();
+                (pc.clone(), name)
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not resolve active provider ({}). \
+                     Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                    e
+                );
+                dummy_provider_config()
+            }
+        }
     };
 
     // `create_provider` may need to load an OAuth token from
@@ -1109,7 +1204,20 @@ async fn run() -> Result<i32> {
     };
 
     // Build LSP manager from config and inject into ToolContext.
-    let lsp_manager = build_lsp_manager(&config.lsp, &working_dir);
+    // TUI mode uses the event-channel constructor so server start /
+    // failure surfaces in scrollback (✓/✗ lines) instead of being
+    // eprintln!'d directly to stderr — which would land inside the
+    // input box while the renderer owns the terminal. Headless keeps
+    // the no-channel path: stderr leakage doesn't matter when no TUI
+    // is active and CI logs benefit from raw error visibility.
+    let (lsp_manager, lsp_connect_rx) = if is_headless {
+        (build_lsp_manager(&config.lsp, &working_dir), None)
+    } else {
+        match atomcode_core::lsp::build_lsp_manager_with_events(&config.lsp, &working_dir) {
+            Some((mgr, rx)) => (Some(mgr), Some(rx)),
+            None => (None, None),
+        }
+    };
     if lsp_manager.is_some() && enabled("diagnostics") {
         tool_registry.register_sync(Box::new(DiagnosticsTool));
     }
@@ -1134,13 +1242,11 @@ async fn run() -> Result<i32> {
         None
     };
 
-    // Start with a fresh conversation each session. The TUI replays
-    // `session_to_continue` (when present) into scrollback for visual
-    // continuity, but the agent's model context starts empty —
-    // re-injecting raw messages caused old tool_call format
-    // incompatibilities, stale file paths from old working dirs, and
-    // 100+ message context pollution. Users who want full model-side
-    // restoration use the `/resume` slash command.
+    // Start with a fresh conversation each session. When `session_to_continue`
+    // is present (via `-c` / `--continue`), the TUI replays the prior session's
+    // messages into scrollback AND sends them to the agent via
+    // `AgentCommand::SetMessages` so the model context is fully restored.
+    // Bare `atomcode` (no `-c`) starts completely fresh.
     let conversation = Conversation::new();
 
     let (mut agent_loop, agent_handle) = AgentLoop::new(
@@ -1247,7 +1353,7 @@ async fn run() -> Result<i32> {
                     if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
                         match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
                             Ok(()) => eprintln!(
-                                "[fixissue] ✔ posted summary + applied 'fixed' label to issue #{}",
+                                "[fixissue] ✓ posted summary + applied 'fixed' label to issue #{}",
                                 issue_ref.number
                             ),
                             Err(e) => eprintln!(
@@ -1285,7 +1391,7 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, telemetry.clone()).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
             Ok(0)
         };
 
@@ -1331,7 +1437,11 @@ async fn run_headless(
     tokio::spawn(async move {
         atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
     });
-    cmd_tx.send(AgentCommand::SendMessage(prompt))?;
+    cmd_tx.send(AgentCommand::SendMessage {
+        text: prompt,
+        images: vec![],
+        image_markers: vec![],
+    })?;
 
     let mut exit_code: i32 = 0;
     let mut had_denial = false;
@@ -1488,6 +1598,12 @@ async fn run_headless(
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
+            AgentEvent::Warning(w) => {
+                // Headless CLI: warnings go to stderr always (they're
+                // meant to be loud). No exit-code change, no shutdown —
+                // we expect the turn to keep running.
+                eprintln!("[warning] {}", w);
+            }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 if verbose {
                     eprintln!("[cwd] {}", new_dir.display());
@@ -1496,9 +1612,70 @@ async fn run_headless(
             AgentEvent::ContextStats { .. } => {
                 // Silent in headless mode
             }
-            AgentEvent::SubAgentProgress { file, status } => {
+            AgentEvent::ToolBatchStarted { batch_id: _, calls } => {
                 if verbose {
-                    eprintln!("[sub-agent] {} {}", file, status);
+                    eprintln!("[tool-batch] {} calls in parallel", calls.len());
+                }
+            }
+            AgentEvent::ToolBatchCompleted {
+                batch_id: _,
+                ok,
+                total,
+                elapsed_ms,
+            } => {
+                if verbose {
+                    eprintln!(
+                        "[tool-batch] completed {}/{} ok in {}ms",
+                        ok, total, elapsed_ms
+                    );
+                }
+            }
+            AgentEvent::SubAgentDispatchStart { tasks } => {
+                if verbose {
+                    eprintln!("[sub-agent] dispatching {} in parallel", tasks.len());
+                    for (i, t) in tasks.iter().enumerate() {
+                        eprintln!("[sub-agent {}] {}{}", i, t.path, t.dedup_suffix);
+                    }
+                }
+            }
+            AgentEvent::SubAgentDispatchEnd => {
+                if verbose {
+                    eprintln!("[sub-agent] dispatch complete");
+                }
+            }
+            AgentEvent::SubAgentTaskStarted { index } => {
+                if verbose {
+                    eprintln!("[sub-agent {}] running", index);
+                }
+            }
+            AgentEvent::SubAgentTaskDone {
+                index,
+                elapsed_ms,
+                turns,
+                summary: _,
+            } => {
+                if verbose {
+                    eprintln!(
+                        "[sub-agent {}] done {}s · {}T",
+                        index,
+                        elapsed_ms / 1000,
+                        turns
+                    );
+                }
+            }
+            AgentEvent::SubAgentTaskFailed {
+                index,
+                elapsed_ms,
+                turns: _,
+                reason,
+            } => {
+                if verbose {
+                    eprintln!(
+                        "[sub-agent {}] failed {}s · {}",
+                        index,
+                        elapsed_ms / 1000,
+                        reason.lines().next().unwrap_or("")
+                    );
                 }
             }
             AgentEvent::BackgroundComplete {
@@ -1512,6 +1689,19 @@ async fn run_headless(
                 if verbose && !files_edited.is_empty() {
                     eprintln!("[background files={}]", files_edited.join(","));
                 }
+            }
+            // VL preprocessor failure restores pending image bytes for the
+            // TUI to re-attach. CLI has no interactive input buffer to put
+            // them in, so just ignore — the failure itself was already
+            // surfaced as AgentEvent::Warning above, and the conversation
+            // proceeds with the placeholder. No retry path exists in CLI.
+            AgentEvent::RestorePendingImages { .. } => {}
+            // VL preprocessor success notice. Mirror the TUI behaviour
+            // briefly to stderr so non-interactive users (CI, scripts)
+            // still see that VL ran. Char count helps spot degenerate
+            // outputs.
+            AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
+                eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
             }
         }
     }
@@ -1568,6 +1758,17 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Upgrade { force } => run_upgrade_cli(force).await,
         Commands::Rollback => run_rollback_cli(),
+        Commands::Uninstall {
+            yes,
+            purge,
+            keep_data,
+            dry_run,
+        } => uninstall::run(uninstall::Args {
+            yes,
+            purge,
+            keep_data,
+            dry_run,
+        }),
         Commands::Fixissue { .. } => {
             unreachable!("Fixissue is handled inline in run() before handle_command")
         }
@@ -1608,6 +1809,77 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
                 program,
                 args.len()
             );
+            Ok(())
+        }
+        Commands::Mcp(McpCli::AddGithubOauth { name, global, dir }) => {
+            let base = resolve_working_dir(dir);
+            let path = if global {
+                Config::config_dir().join("mcp.json")
+            } else {
+                base.join(".mcp.json")
+            };
+            merge_http_oauth_mcp_server_into_json_file(
+                &path,
+                &name,
+                "https://api.githubcopilot.com/mcp/",
+                "github",
+            )?;
+            println!(
+                "  Added GitHub OAuth MCP server {:?} → {}",
+                name,
+                path.display()
+            );
+            Ok(())
+        }
+        Commands::Mcp(McpCli::Login {
+            name,
+            provider,
+            client_id,
+            client_secret_env,
+            scopes,
+        }) => {
+            let configs = load_mcp_config(&std::env::current_dir()?)?;
+            let server = configs
+                .into_iter()
+                .find(|config| config.name == name)
+                .ok_or_else(|| anyhow::anyhow!("MCP server {:?} not found in config", name))?;
+            let is_github_server = matches!(
+                &server.config,
+                McpTransportConfig::Http {
+                    auth: Some(McpHttpAuthConfig::OAuth(auth)),
+                    ..
+                } if auth.provider.as_deref() == Some("github")
+            );
+            let client_id = client_id.or_else(|| {
+                if is_github_server && provider == "github" {
+                    std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok()
+                } else {
+                    None
+                }
+            });
+            let token = login_mcp_oauth(
+                &server,
+                McpOAuthLoginOptions {
+                    client_id,
+                    client_secret_env,
+                    scopes,
+                },
+            )?;
+            println!(
+                "  Saved {} OAuth token for MCP server {:?} with {} scope(s)",
+                token.provider,
+                name,
+                token.scopes.len()
+            );
+            Ok(())
+        }
+        Commands::Mcp(McpCli::Logout { name }) => {
+            let removed = McpTokenStore::default().delete_token(&name)?;
+            if removed {
+                println!("  Removed saved OAuth token for MCP server {:?}", name);
+            } else {
+                println!("  No saved OAuth token found for MCP server {:?}", name);
+            }
             Ok(())
         }
     }
@@ -1746,7 +2018,11 @@ async fn run_upgrade_cli(force: bool) -> Result<()> {
             UpgradeEvent::Replacing => {
                 println!("==> Replacing binary");
             }
-            UpgradeEvent::Done { version, backup } => {
+            UpgradeEvent::Done {
+                version,
+                backup,
+                exe: _,
+            } => {
                 println!(
                     "\n✓ Upgraded to {} (previous version kept at {})",
                     version,
@@ -1817,11 +2093,13 @@ fn run_codingplan_core(
             providers: std::collections::HashMap::new(),
             datalog: Default::default(),
             auto_update: true,
-            reflection_cadence: 7,
             notifications: Default::default(),
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: None,
+            language: None,
         },
     };
 

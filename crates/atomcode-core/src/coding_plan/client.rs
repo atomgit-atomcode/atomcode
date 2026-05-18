@@ -12,9 +12,13 @@
 
 use anyhow::{anyhow, Context, Result};
 
-use super::types::{ClaimResponse, ModelEntry, StatusResponse};
+use super::types::{ClaimResponse, ModelEntry, PlanType, StatusResponse};
 use crate::auth;
 
+/// Prod API base. v2 rollout (tier-based claim/models/status) has
+/// landed on `api.gitcode.com`; the previous `pre-api.gitcode.com`
+/// staging endpoint is no longer needed. Single edit here flips
+/// every claim-v2 / models-v2 / status-v2 call.
 pub const API_BASE: &str = "https://api.gitcode.com/api/v5";
 
 /// Token-authenticated blocking REST client for CodingPlan endpoints.
@@ -52,18 +56,24 @@ impl Client {
         Ok(Self { http, token })
     }
 
-    /// `POST /coding-plan/claim` — submit a CodingPlan application. The
-    /// server reports `duplicate=true` when the user already has an
-    /// in-flight application or a still-valid entitlement; callers should
-    /// treat that as "proceed", not as an error.
-    pub fn claim(&self) -> Result<ClaimResponse> {
-        let url = format!("{}/coding-plan/claim", API_BASE);
+    /// `POST /coding-plan/claim-v2` — claim a specific CodingPlan tier.
+    /// Server reports `duplicate=true` when the user already holds the
+    /// tier (or a higher one); callers should treat that as success and
+    /// stop the cascade rather than retrying lower tiers — those would
+    /// either also report duplicate or unnecessarily downgrade.
+    ///
+    /// Body shape: `{"plan_type": "Max" | "Pro" | "Lite"}`. The user
+    /// asked us to start at Max and walk down, so the orchestrator
+    /// (`step_claim`) calls this in `PlanType::CASCADE_ORDER`.
+    pub fn claim_v2(&self, plan_type: PlanType) -> Result<ClaimResponse> {
+        let url = format!("{}/coding-plan/claim-v2", API_BASE);
+        let body_str = format!(r#"{{"plan_type":"{}"}}"#, plan_type.as_str());
         let resp = self
             .http
             .post(&url)
             .bearer_auth(&self.token)
             .header("Content-Type", "application/json")
-            .body("{}") // empty JSON body — endpoint takes no params
+            .body(body_str)
             .send()
             .with_context(|| format!("POST {} failed", url))?;
 
@@ -76,21 +86,28 @@ impl Client {
         }
         let body = resp.text().unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("{}", format_api_error("claim", status, &body)));
+            return Err(anyhow!("{}", format_api_error("claim-v2", status, &body)));
         }
         serde_json::from_str::<ClaimResponse>(&body).with_context(|| {
             format!(
-                "parse claim response (body: {})",
+                "parse claim-v2 response (body: {})",
                 truncate_for_error(&body, 200)
             )
         })
     }
 
-    /// `GET /coding-plan/models` — returns the list of models the current
-    /// CodingPlan grants. Empty list is a legitimate return (not an error)
-    /// when the entitlement isn't provisioned yet.
-    pub fn list_models(&self) -> Result<Vec<ModelEntry>> {
-        let url = format!("{}/coding-plan/models", API_BASE);
+    /// `GET /coding-plan/models-v2?plan_type=<tier>` — model catalogue
+    /// from the v2 endpoint. Every entry now carries `plan_available`
+    /// telling the caller whether the user's tier covers that model;
+    /// the renderer uses it to apply strikethrough on locked entries.
+    /// Empty list is a legitimate return when the entitlement hasn't
+    /// been provisioned yet.
+    pub fn list_models_v2(&self, plan_type: PlanType) -> Result<Vec<ModelEntry>> {
+        let url = format!(
+            "{}/coding-plan/models-v2?plan_type={}",
+            API_BASE,
+            plan_type.as_str()
+        );
         let resp = self
             .http
             .get(&url)
@@ -107,19 +124,21 @@ impl Client {
         }
         let body = resp.text().unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("{}", format_api_error("models", status, &body)));
+            return Err(anyhow!("{}", format_api_error("models-v2", status, &body)));
         }
         serde_json::from_str::<Vec<ModelEntry>>(&body).with_context(|| {
             format!(
-                "parse models response (body: {})",
+                "parse models-v2 response (body: {})",
                 truncate_for_error(&body, 200)
             )
         })
     }
 
-    /// `GET /coding-plan/status` — audit/quota/expiry snapshot.
-    pub fn status(&self) -> Result<StatusResponse> {
-        let url = format!("{}/coding-plan/status", API_BASE);
+    /// `GET /coding-plan/status-v2` — audit/quota/expiry snapshot. Same
+    /// response envelope as v1; only the path changed under the v2
+    /// rollout, so the parser type stays put.
+    pub fn status_v2(&self) -> Result<StatusResponse> {
+        let url = format!("{}/coding-plan/status-v2", API_BASE);
         let resp = self
             .http
             .get(&url)
@@ -136,11 +155,11 @@ impl Client {
         }
         let body = resp.text().unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("{}", format_api_error("status", status, &body)));
+            return Err(anyhow!("{}", format_api_error("status-v2", status, &body)));
         }
         serde_json::from_str::<StatusResponse>(&body).with_context(|| {
             format!(
-                "parse status response (body: {})",
+                "parse status-v2 response (body: {})",
                 truncate_for_error(&body, 200)
             )
         })

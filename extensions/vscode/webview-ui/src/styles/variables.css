@@ -44,6 +44,7 @@ html {
   --app-success-foreground: var(--vscode-gitDecoration-addedResourceForeground, #74c991);
   --app-error-foreground: var(--vscode-errorForeground, #c74e39);
   --app-warning-accent: #e5a54b;
+  --app-timeline-end-dot: var(--app-warning-accent);
   --app-spinner-foreground: var(--app-brand);
   --app-disabled-foreground: var(--vscode-disabledForeground);
 

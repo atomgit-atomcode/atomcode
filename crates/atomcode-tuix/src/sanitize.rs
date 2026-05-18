@@ -10,6 +10,33 @@
 /// - C1 controls (0x80..0x9F in UTF-8 as U+0080..U+009F) — alternate CSI forms
 /// - Bare ESC (\x1b not followed by a recognised intro)
 pub fn scrub_controls(input: &str) -> String {
+    scrub_inner(input, false)
+}
+
+/// Same as [`scrub_controls`] but preserves CSI sequences whose final
+/// byte is `m` — i.e. **SGR (Select Graphic Rendition)**: colour,
+/// bold, italic, underline, strikethrough, faint, reverse-video, etc.
+///
+/// SGR is purely cosmetic — it changes how subsequent text is drawn
+/// but never moves the cursor, queries terminal state, touches the
+/// clipboard, sets the window title, or otherwise reaches outside
+/// the display rectangle. Allowing it through is what `less`, `git`,
+/// `bat`, and every other "safe ANSI" tool does, and it lets trusted
+/// internal output (e.g. the `/codingplan` SetupReport's locked-model
+/// rows that render in the terminal's theme red) survive sanitisation
+/// without each caller having to roll its own emission path.
+///
+/// Use this on **trusted** output — strings the app itself builds
+/// (slash-command return text, status lines, setup reports). Do NOT
+/// use it on text that came from a remote LLM or any other untrusted
+/// channel: SGR can still be used to hide content (faint, black-on-
+/// black) or impersonate UI chrome (✓ in green next to a lie), so
+/// LLM streams continue to go through the strict [`scrub_controls`].
+pub fn scrub_controls_keep_sgr(input: &str) -> String {
+    scrub_inner(input, true)
+}
+
+fn scrub_inner(input: &str, keep_sgr: bool) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
@@ -23,11 +50,26 @@ pub fn scrub_controls(input: &str) -> String {
                         Some(&'[') => {
                             chars.next(); // consume [
                                           // CSI: params, intermediates, final byte 0x40..=0x7E
+                            let mut buf = String::new();
+                            buf.push('\x1b');
+                            buf.push('[');
+                            let mut final_byte: Option<char> = None;
                             while let Some(&p) = chars.peek() {
                                 chars.next();
+                                buf.push(p);
                                 if ('\x40'..='\x7E').contains(&p) {
+                                    final_byte = Some(p);
                                     break;
                                 }
+                            }
+                            // SGR (CSI ... m) is pure presentation —
+                            // when the caller asked to keep SGR, emit
+                            // the buffered sequence verbatim. Other
+                            // CSI finals (cursor moves, DSR queries,
+                            // erase-in-display, etc.) stay dropped on
+                            // both paths.
+                            if keep_sgr && final_byte == Some('m') {
+                                out.push_str(&buf);
                             }
                         }
                         Some(&']') => {
@@ -125,5 +167,44 @@ mod tests {
     #[test]
     fn bare_esc_removed() {
         assert_eq!(scrub_controls("a\x1bb"), "ab");
+    }
+
+    #[test]
+    fn keep_sgr_lets_color_through() {
+        // SGR 31 (red fg) + SGR 39 (default fg) survives.
+        assert_eq!(
+            scrub_controls_keep_sgr("\x1b[31mred\x1b[39m tail"),
+            "\x1b[31mred\x1b[39m tail"
+        );
+    }
+
+    #[test]
+    fn keep_sgr_still_strips_cursor_csi() {
+        // Cursor moves (\x1b[2J, \x1b[H, \x1b[6n) and any non-SGR CSI
+        // are still rejected even on the SGR-allowing path.
+        assert_eq!(
+            scrub_controls_keep_sgr("\x1b[2J\x1b[Hhi\x1b[6n"),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn keep_sgr_still_strips_osc() {
+        // OSC payloads (clipboard injection, set title) stay rejected.
+        assert_eq!(
+            scrub_controls_keep_sgr("\x1b]0;pwned\x07safe"),
+            "safe"
+        );
+    }
+
+    #[test]
+    fn keep_sgr_preserves_multi_param_sgr() {
+        // SGR can carry multiple parameters in one sequence —
+        // e.g. `\x1b[1;31m` = bold + red. Verify both the
+        // separator and the parameter chain pass through intact.
+        assert_eq!(
+            scrub_controls_keep_sgr("\x1b[1;31mbold-red\x1b[0m"),
+            "\x1b[1;31mbold-red\x1b[0m"
+        );
     }
 }

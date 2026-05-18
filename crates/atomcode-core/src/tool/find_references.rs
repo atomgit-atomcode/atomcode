@@ -73,8 +73,8 @@ impl Tool for FindReferencesTool {
 
         // Use ripgrep to find all occurrences (word boundary match)
         let pattern = format!(r"\b{}\b", regex::escape(&parsed.symbol));
-        let output = Command::new("rg")
-            .args(&[
+        let mut cmd = Command::new("rg");
+        cmd.args(&[
                 "--line-number",
                 "--no-heading",
                 "--color=never",
@@ -82,9 +82,9 @@ impl Tool for FindReferencesTool {
                 "-w", // word boundary
                 &pattern,
                 &search_dir,
-            ])
-            .output()
-            .await;
+            ]);
+        crate::process_utils::suppress_console_window(&mut cmd);
+        let output = cmd.output().await;
 
         let rg_output = match output {
             Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),

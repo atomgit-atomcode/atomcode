@@ -60,7 +60,7 @@
         <li>macOS / Linux / HarmonyOS PC:<code>~/.atomcode/config.toml</code></li>
         <li>Windows:<code>%USERPROFILE%\.atomcode\config.toml</code></li>
       </ul>
-      <p>也可以通过 <code>--config /path/to/config.toml</code> 指定任意路径。首次运行时,若该文件不存在,欢迎界面会引导你完成初始化。</p>
+      <p>也可以通过 <code>--config /path/to/config.toml</code> 指定任意路径。首次运行时,若该文件不存在,3 步启动向导会引导你完成初始化。</p>
 
       <h2>最小示例</h2>
       <pre><code>default_provider = "deepseek"
@@ -82,6 +82,7 @@ context_window = 64000</code></pre>
           <tr><td><code>default_provider</code></td><td>string</td><td>启动时默认使用的 provider 名(必须是 <code>[providers.*]</code> 中定义过的 key)</td></tr>
           <tr><td><code>default_workdir</code></td><td>string?</td><td>默认工作目录。用 <code>/cd</code> 切换目录时自动写回这里,下次启动恢复</td></tr>
           <tr><td><code>providers</code></td><td>table</td><td>provider 名到 <a href="#provider-config">ProviderConfig</a> 的映射</td></tr>
+          <tr><td><code>vision_preprocessor_provider</code></td><td>string?</td><td>当主 provider 不支持图片但用户 attach 了图时,把图片转交给这里指定的 provider 做 OCR / 描述,结果以文本形式 splice 给主模型。详见 <a href="#vision-preprocessor">视觉预处理器</a></td></tr>
         </tbody>
       </table>
 
@@ -187,6 +188,31 @@ model = "qwen2.5:14b"
 base_url = "http://localhost:11434"</code></pre>
       <p>在 TUI 中可以用 <code>/provider</code> 在这些条目之间切换,用 <code>/model</code> 只切换当前 provider 下的模型。命令行启动时也支持一次性覆盖:</p>
       <pre><code>atomcode --provider deepseek --model deepseek-reasoner</code></pre>
+
+      <h2 id="vision-preprocessor">视觉预处理器</h2>
+      <p>当当前 active provider 的模型不支持图片输入(纯文本模型,比如 DeepSeek-V3 / Kimi),用户却 <a href="./basic-usage.html#image-attach">attach 了图片</a>时,AtomCode 不会直接拒绝,而是会把图片转给一个独立的"视觉预处理 provider"做 OCR + 描述,把结果以文本形式 splice 进用户消息里再发给主模型。</p>
+      <p>启用方式:在配置里指定一个支持图片的 provider key 作为 <code>vision_preprocessor_provider</code>:</p>
+      <pre><code>default_provider = "deepseek"
+vision_preprocessor_provider = "qwen-vl"
+
+[providers.deepseek]
+type = "openai"
+api_key = "sk-..."
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+
+[providers.qwen-vl]
+type = "openai"
+api_key = "sk-..."
+model = "Qwen/Qwen3-VL-32B-Instruct"
+base_url = "https://api.siliconflow.cn/v1"</code></pre>
+      <ul>
+        <li>这里的 <code>qwen-vl</code> 必须是 <code>[providers.*]</code> 里已经定义过的 key,且对应的模型支持视觉输入(常见的有 <code>Qwen3-VL-*</code> / <code>GLM-4V-*</code> / <code>claude-3+</code> / <code>gpt-4o</code> / <code>gemini-*</code> 等)。</li>
+        <li>当前 active provider 自身就支持图片时,<strong>不会</strong>走预处理器,直接发原始图片字节。</li>
+        <li><code>/codingplan</code> 流程会从下发的模型列表中自动挑选一个 VL/OCR 模型并写入这个字段(可在事后手动覆盖)。</li>
+        <li>VL 调用使用<strong>无进展超时</strong>(idle timeout):只要 stream 持续吐 chunk 不限总时长;30 秒没动静才超时。失败时主模型仍会收到带 "图片识别失败" 标记的消息,而不是静默吞掉。</li>
+      </ul>
+      <p>用法层面的细节参见 <a href="./basic-usage.html#image-attach">基本使用 · 图片附件 / 截图</a>。</p>
 
       <h2>编辑配置的三种方式</h2>
       <ul>

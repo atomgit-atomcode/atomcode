@@ -15,8 +15,11 @@
 
 pub(crate) mod bg_runtime;
 pub(crate) mod commands;
+pub(crate) mod file_index;
 pub(crate) mod monitor;
+pub(crate) mod usage_monitor;
 use commands::execute_slash_command;
+pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -27,9 +30,12 @@ use atomcode_core::agent::{
     AgentClient, AgentCommand, AgentEvent, AgentPhase, AgentRuntimeFactory,
 };
 use atomcode_core::config::Config;
-use atomcode_core::session::SessionManager;
+use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
+
+use base64::Engine;
+use atomcode_core::conversation::message::ImagePart;
 
 use crate::commands::{parse_slash_line, CommandRegistry};
 use crate::input::history::History;
@@ -38,6 +44,599 @@ use crate::input::InputEvent;
 use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
+
+/// Encode raw RGBA pixel data as a PNG image in memory.
+fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut encoder = png::Encoder::new(&mut buf, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(rgba).ok()?;
+    drop(writer);
+    Some(buf)
+}
+
+/// Try to grab an image from the system clipboard via `arboard`.
+/// Returns `Some((ImagePart, fingerprint))` if the clipboard holds an
+/// image, `None` otherwise. The fingerprint is hashed off the raw RGBA
+/// Try to get an image from the clipboard. First attempts to read image
+/// bytes directly (screenshots, Preview Copy). If that fails, falls back
+/// to reading a file:// URL from the clipboard text (Finder Cmd+C case)
+/// and loading the image from that path.
+/// Returns the image data and a fingerprint hash.
+/// bytes (not the PNG-encoded base64) — same hash function the status
+/// poll uses, so paste-side and poll-side fingerprints line up for the
+/// "is this the same image we already attached?" check.
+fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
+    // Three-tier fallback chain for Ctrl+V → image attach. Each tier
+    // covers a real-world clipboard shape Cmd+V already handled via
+    // bracketed paste; Ctrl+V is intercepted at the key layer before
+    // the terminal's paste pipeline runs, so we have to reproduce
+    // those shapes from the clipboard ourselves.
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+
+    // Tier 1: raw bytes (NSPasteboardTypePNG / TIFF / NSImage).
+    //   Sources: Cmd+Shift+Ctrl+4 screenshot, Preview "Copy", browser
+    //   "Copy image", any app's Edit-menu Copy on a bitmap. arboard's
+    //   get_image decodes these into RGBA.
+    if let Ok(img) = clipboard.get_image() {
+        let hash = rgba_fingerprint(img.width, img.height, img.bytes.as_ref());
+        let png_data = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+        return Some((
+            ImagePart {
+                media_type: "image/png".into(),
+                data: b64,
+            },
+            hash,
+        ));
+    }
+
+    // Tier 2: file URL / path arriving via the text type (`public.utf8-
+    // plain-text` on macOS, `text/uri-list` on X11/Wayland through
+    // arboard's text bridge). Some apps mirror their file-URL into
+    // text as a courtesy ("Copy as path" tools, browser drag-source,
+    // certain file managers). Trim, strip `file://`, percent-decode,
+    // hand off to the existing path attachment helper.
+    if let Ok(text) = clipboard.get_text() {
+        let trimmed = text.trim();
+        let stripped = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+        if let Ok(decoded) = urlencoding::decode(stripped) {
+            if let Some(result) = try_attach_image_from_path(&decoded) {
+                return Some(result);
+            }
+        }
+    }
+
+    // Tier 3 (macOS only): read NSPasteboard's `public.file-url` type
+    // directly. This is the case Finder `Cmd+C` on an image file
+    // produces — there are NO image bytes and the text type is
+    // typically NOT auto-populated. iTerm2's Cmd+V handles this by
+    // querying the file-URL type and writing the temp path to the
+    // PTY; we read the same type via AppKit so Ctrl+V matches.
+    #[cfg(target_os = "macos")]
+    if let Some(path) = read_macos_clipboard_file_url() {
+        if let Some(result) = try_attach_image_from_path(&path) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+/// Pull plain text off the system clipboard for the Ctrl+V → text-paste
+/// fallback. Returns `None` when arboard fails to open the clipboard
+/// or the clipboard holds no text — the caller is expected to swallow
+/// the keystroke in that case rather than insert a literal `v`.
+///
+/// Why a dedicated helper instead of inlining `arboard::Clipboard::new`:
+/// the Ctrl+V branch already shells out to `try_paste_clipboard_image`,
+/// which itself opens a fresh `Clipboard` handle; symmetry keeps the
+/// two call sites readable, and the helper drops the handle promptly
+/// (some Windows clipboards lock briefly after a read).
+fn try_paste_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get_text().ok().filter(|s| !s.is_empty())
+}
+
+/// Read NSPasteboard's `public.file-url` type and return the decoded
+/// filesystem path. Returns `None` when the type isn't on the
+/// pasteboard, the value isn't a `file://` URL, or percent-decoding
+/// fails — caller should fall through, not abort.
+///
+/// Why AppKit instead of arboard: arboard 3.x doesn't expose any
+/// pasteboard type beyond `image` and `text`. Finder `Cmd+C` writes
+/// to `public.file-url` exclusively, so we have to query that type
+/// directly. The `objc2-app-kit` / `objc2-foundation` deps are
+/// already in the tree transitively (arboard pulls them on macOS),
+/// so this is cheap to add — just wires up a binding we own.
+#[cfg(target_os = "macos")]
+fn read_macos_clipboard_file_url() -> Option<String> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
+    let pb = NSPasteboard::generalPasteboard();
+    let raw = unsafe { pb.stringForType(NSPasteboardTypeFileURL) }?.to_string();
+    let stripped = raw.strip_prefix("file://").unwrap_or(&raw);
+    let decoded = urlencoding::decode(stripped).ok()?;
+    Some(decoded.into_owned())
+}
+
+/// Map an `ImagePart::media_type` to a cache filename extension.
+/// Unknown MIMEs degrade to `bin` — they still round-trip via the
+/// stored `media_type` field on `HistoryImageRef`, so the extension is
+/// purely informational for humans poking at `~/.atomcode/image-cache/`.
+fn ext_for_mt(mt: &str) -> &'static str {
+    match mt {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "bin",
+    }
+}
+
+/// Best-effort cache write. Decodes `img.data` (base64) and persists
+/// the raw bytes to `<cache_dir>/<hex_hash>.<ext>`. Skips if the file
+/// already exists (cache is content-addressable). Failures are
+/// trace-logged and swallowed — the in-memory pending_images path is
+/// the source of truth for the current submit.
+fn cache_write_image(cache_dir: &std::path::Path, img: &atomcode_core::conversation::message::ImagePart, hash: u64) {
+    let path = cache_dir.join(format!("{:016x}.{}", hash, ext_for_mt(&img.media_type)));
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        crate::tuix_trace!("IMG", "cache mkdir failed: {}", e);
+        return;
+    }
+    let raw = match base64::engine::general_purpose::STANDARD.decode(&img.data) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::tuix_trace!("IMG", "cache base64 decode failed: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&path, &raw) {
+        crate::tuix_trace!("IMG", "cache write failed: {}", e);
+    }
+}
+
+/// Compute the set of `[Image #N]` markers in `buf_text` whose `N`
+/// actually corresponds to image bytes that will be sent on submit.
+///
+/// Two sources count as "real attachment":
+///   1. Freshly-attached this session — the marker `N` lives in
+///      `state.pending_image_markers`, with bytes in
+///      `state.pending_images` at the same index.
+///   2. Cache-recalled via arrow-up — the marker `N` lives in
+///      `state.pending_recalled_attachments[*].n` (still using the
+///      saved-history numbering; will be renumbered on submit by
+///      `hydrate_recalled_attachments`).
+///
+/// Markers in `buf_text` that match neither (e.g. user typed
+/// `[Image #99]` literally as text) are excluded. Result preserves
+/// the order markers appear in `buf_text` and de-duplicates so the
+/// same marker referenced twice surfaces a single preview row.
+///
+/// Used by `redraw_idle_plain` / `draw_spinner_now` / similar to
+/// populate `UiLine::InputPrompt { attachments }`, which the
+/// renderer then turns into `└ [Image #N]` preview rows under the
+/// input box. Mirror of the post-submit echo (`UiLine::ImageAttachment`)
+/// — same visual treatment so users see the attachment status pre-
+/// AND post-submit identically.
+pub(crate) fn compute_input_attachments(
+    state: &crate::state::UiState,
+    buf_text: &str,
+) -> Vec<usize> {
+    let mut available: std::collections::HashSet<usize> =
+        state.pending_image_markers.iter().copied().collect();
+    for refed in &state.pending_recalled_attachments {
+        available.insert(refed.n);
+    }
+    if available.is_empty() {
+        return Vec::new();
+    }
+    // Walk `buf_text` once collecting `[Image #N]` markers in order.
+    // De-dupe while preserving first-occurrence order.
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let bytes = buf_text.as_bytes();
+    let needle = b"[Image #";
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let mut j = i + needle.len();
+            let mut n: usize = 0;
+            let mut had_digit = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n.saturating_mul(10).saturating_add((bytes[j] - b'0') as usize);
+                j += 1;
+                had_digit = true;
+            }
+            if had_digit && j < bytes.len() && bytes[j] == b']' {
+                if available.contains(&n) && seen.insert(n) {
+                    out.push(n);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Drain `state.pending_recalled_attachments`. For each entry: read the
+/// cache file, allocate a fresh marker via `session_image_count`, rewrite
+/// `[Image #old]` → `[Image #new]` in `line`, and push into the live
+/// pending_* vecs. On cache miss, strip the marker and accumulate a
+/// notice string for the caller to render.
+///
+/// Returns the list of notice strings (empty when every attachment hit).
+pub(crate) fn hydrate_recalled_attachments(
+    state: &mut UiState,
+    line: &mut String,
+    cache_dir: &std::path::Path,
+) -> Vec<String> {
+    use base64::Engine;
+    let mut notices = Vec::new();
+    if state.pending_recalled_attachments.is_empty() {
+        return notices;
+    }
+    for refed in std::mem::take(&mut state.pending_recalled_attachments) {
+        let cache_path = cache_dir.join(format!("{}.{}", refed.hash, ext_for_mt(&refed.mt)));
+        match std::fs::read(&cache_path) {
+            Ok(raw) => {
+                state.session_image_count += 1;
+                let new_marker = state.session_image_count;
+                *line = line.replace(
+                    &format!("[Image #{}]", refed.n),
+                    &format!("[Image #{}]", new_marker),
+                );
+                let hash_u64 = u64::from_str_radix(&refed.hash, 16).unwrap_or(0);
+                state.pending_images.push(atomcode_core::conversation::message::ImagePart {
+                    media_type: refed.mt.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(&raw),
+                });
+                state.pending_image_hashes.push(hash_u64);
+                state.pending_image_markers.push(new_marker);
+            }
+            Err(_) => {
+                *line = line.replace(&format!("[Image #{}]", refed.n), "");
+                notices.push(format!(
+                    "[Image #{}] 缓存已丢失，已从消息中移除",
+                    refed.n
+                ));
+            }
+        }
+    }
+    notices
+}
+
+/// Upper bound on a single attached image (20 MB raw bytes). OpenAI's
+/// chat/completions cap is 20 MB per image; Anthropic's is 5 MB. We pick
+/// the looser of the two as the tool-side gate so the attempt at least
+/// reaches the API — the server's 413 with a clearer reason is a better
+/// signal than a silent local rejection.
+const MAX_PATH_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Try to interpret a paste payload as a filesystem path to an image
+/// file and load it as an [`ImagePart`]. Returns `Some` only when the
+/// payload looks unambiguously like an image-attachment intent, never
+/// for plain prose that happens to mention a file name.
+///
+/// The two real-world flows this covers:
+///
+/// 1. **iTerm2 Cmd+V on image clipboard** — iTerm2 saves the clipboard
+///    image to a temp file under `/var/folders/.../T/com.googlecode.iterm2/`
+///    and pastes the **file path** as plaintext through the PTY. The
+///    image bytes never travel through `InputEvent::Paste`'s text payload
+///    or through the system clipboard's "text" slot, so the existing
+///    `try_paste_clipboard_image()` empty-text fallback wouldn't fire.
+///    Recognising the path is the only way to attach the image. This is
+///    the workflow Claude Code / Aider / cursor-cli all support.
+/// 2. **Finder drag-and-drop into the terminal** — terminal types the
+///    file's absolute path as plaintext, optionally quoted (paths with
+///    spaces wrap in `'...'`) or shell-escaped (`\ ` for spaces).
+///
+/// Acceptance criteria — all must hold:
+/// * Single-line content (no `\n`).
+/// * After trimming + stripping balanced outer quotes + unescaping
+///   `\<space>`, the remainder is an absolute path.
+/// * Extension is one of png/jpg/jpeg/gif/webp (case-insensitive).
+/// * The path resolves to an existing regular file.
+/// * File size ≤ `MAX_PATH_IMAGE_BYTES`.
+///
+/// Returns `None` for anything that fails any of these — including
+/// legitimate text pastes, relative paths (a literal `notes.png` typed
+/// at the prompt is ambiguous: text or attachment?), missing files, and
+/// oversized files.
+///
+/// The fingerprint is hashed off the raw file bytes via the same
+/// [`rgba_fingerprint`] helper. Identical paste of the same path
+/// produces the same hash so the dedup check in `pending_image_hashes`
+/// works; collisions with a clipboard-paste of the same image (which
+/// hashes RGBA, not file bytes) are out of scope — the hash is a
+/// per-source dedup signal, not a global content identity.
+fn try_attach_image_from_path(text: &str) -> Option<(ImagePart, u64)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    // Strip a single layer of matched outer quotes. Finder drag of paths
+    // containing spaces wraps in `'...'`; some shells produce `"..."`.
+    let unquoted: &str = if trimmed.len() >= 2
+        && ((trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    // Unescape shell-escaped spaces (iTerm2 / drag-and-drop emit
+    // `/path/with\ space.png`). Backslash before any other char is left
+    // alone — no other shell-escape forms occur in real-world drag
+    // pastes.
+    let unescaped = unquoted.replace("\\ ", " ");
+    let candidate = unescaped.trim();
+    let path = std::path::Path::new(candidate);
+    if !path.is_absolute() {
+        return None;
+    }
+    let media_type = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => return None,
+    };
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_PATH_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let hash = rgba_fingerprint(0, 0, &bytes);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some((
+        ImagePart {
+            media_type: media_type.into(),
+            data: b64,
+        },
+        hash,
+    ))
+}
+
+#[cfg(test)]
+mod image_path_tests {
+    use super::*;
+    use std::io::Write as _;
+    use tempfile::tempdir;
+
+    /// Materialise a small file at `<dir>/<name>` whose contents are
+    /// `bytes`. Returned absolute path is what the user-facing paste
+    /// detector sees on iTerm2 Cmd+V or Finder drag.
+    fn write_tmp_file(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        let mut f = std::fs::File::create(&p).expect("create tmp file");
+        f.write_all(bytes).expect("write tmp file");
+        p
+    }
+
+    /// PNG path → ImagePart with `image/png` media type. The single
+    /// happy-path covering iTerm2's Cmd+V-of-image temp-file shape.
+    #[test]
+    fn png_path_attaches_as_image_png() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "snap.png", b"\x89PNG\r\n\x1a\nstub-bytes");
+        let res = try_attach_image_from_path(p.to_str().unwrap());
+        let (img, _) = res.expect("PNG path must be recognised");
+        assert_eq!(img.media_type, "image/png");
+        assert!(!img.data.is_empty(), "base64 data must be populated");
+    }
+
+    /// JPG and JPEG both map to `image/jpeg` (case-insensitive ext).
+    #[test]
+    fn jpg_and_jpeg_map_to_image_jpeg() {
+        let dir = tempdir().unwrap();
+        for name in ["a.jpg", "b.JPEG", "c.Jpg"] {
+            let p = write_tmp_file(&dir, name, b"\xff\xd8\xff\xe0\x00\x10JFIF stub");
+            let (img, _) = try_attach_image_from_path(p.to_str().unwrap())
+                .unwrap_or_else(|| panic!("expected attachment for {name}"));
+            assert_eq!(
+                img.media_type, "image/jpeg",
+                "{name} must map to image/jpeg"
+            );
+        }
+    }
+
+    /// Quoted absolute path (Finder drag of paths-with-spaces) is
+    /// recognised after a single layer of outer quotes is stripped.
+    /// Both ASCII single and double quotes are accepted.
+    #[test]
+    fn quoted_absolute_path_is_recognised() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "shot with space.png", b"stub");
+        let path_str = p.to_str().unwrap();
+        let single_quoted = format!("'{}'", path_str);
+        let double_quoted = format!("\"{}\"", path_str);
+        assert!(try_attach_image_from_path(&single_quoted).is_some());
+        assert!(try_attach_image_from_path(&double_quoted).is_some());
+    }
+
+    /// Shell-escaped spaces (`\ `) are unescaped before fs lookup —
+    /// matches the form some terminals emit on drag-and-drop.
+    #[test]
+    fn shell_escaped_space_is_unescaped() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "shot with space.png", b"stub");
+        let abs = p.to_str().unwrap();
+        // Replace each space in the absolute path with `\<space>` to
+        // simulate the drag-paste form.
+        let escaped = abs.replace(' ', "\\ ");
+        assert!(
+            try_attach_image_from_path(&escaped).is_some(),
+            "shell-escaped path must be unescaped before fs lookup"
+        );
+    }
+
+    /// Trailing whitespace (iTerm2 often appends a space after the
+    /// path) must not defeat detection.
+    #[test]
+    fn trailing_whitespace_is_trimmed() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "snap.png", b"stub");
+        let with_trailing_ws = format!("{}   \t  ", p.to_str().unwrap());
+        assert!(try_attach_image_from_path(&with_trailing_ws).is_some());
+    }
+
+    /// Same path pasted twice → same fingerprint, so the dedup check in
+    /// `pending_image_hashes` works.
+    #[test]
+    fn same_path_yields_same_fingerprint() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "snap.png", b"stub-bytes");
+        let path_str = p.to_str().unwrap();
+        let (_, h1) = try_attach_image_from_path(path_str).unwrap();
+        let (_, h2) = try_attach_image_from_path(path_str).unwrap();
+        assert_eq!(h1, h2, "deterministic hash for the same file");
+    }
+
+    /// Plain prose containing words must NOT be treated as a path.
+    #[test]
+    fn prose_paste_is_not_an_image() {
+        assert!(try_attach_image_from_path("hello world").is_none());
+        assert!(try_attach_image_from_path("see /tmp/notes for context").is_none());
+        assert!(try_attach_image_from_path("").is_none());
+        assert!(try_attach_image_from_path("   ").is_none());
+    }
+
+    /// Multi-line paste (real text content) is rejected — the path
+    /// detector is a single-line gate.
+    #[test]
+    fn multi_line_paste_is_not_an_image() {
+        let two_lines = "/tmp/snap.png\nsecond line";
+        assert!(try_attach_image_from_path(two_lines).is_none());
+    }
+
+    /// Relative paths are ambiguous (could be intentional text). Must
+    /// not be auto-attached — only absolute paths flip the switch.
+    #[test]
+    fn relative_path_is_not_attached() {
+        assert!(try_attach_image_from_path("snap.png").is_none());
+        assert!(try_attach_image_from_path("./snap.png").is_none());
+        assert!(try_attach_image_from_path("../snap.png").is_none());
+    }
+
+    /// Non-image extensions are rejected even when the file exists.
+    /// Defends against the user pasting an absolute path to a `.txt` /
+    /// `.json` / etc. — that's clearly text-attachment intent, not
+    /// image-attachment intent.
+    #[test]
+    fn non_image_extension_is_rejected() {
+        let dir = tempdir().unwrap();
+        let p = write_tmp_file(&dir, "notes.txt", b"hello");
+        assert!(try_attach_image_from_path(p.to_str().unwrap()).is_none());
+        let p2 = write_tmp_file(&dir, "data.json", b"{}");
+        assert!(try_attach_image_from_path(p2.to_str().unwrap()).is_none());
+    }
+
+    /// Absolute path with image extension but no file on disk — the
+    /// paste was just a literal-looking path string that happens to
+    /// match the shape. Reject so we don't silently swallow the text.
+    #[test]
+    fn missing_file_is_rejected() {
+        // Nonexistent path under a real tempdir prefix — guaranteed
+        // unique and unwriteable in normal test layout.
+        assert!(
+            try_attach_image_from_path("/this/path/definitely/does/not/exist/snap.png").is_none()
+        );
+    }
+
+    /// Files larger than `MAX_PATH_IMAGE_BYTES` are rejected. The cap
+    /// is the looser of OpenAI / Anthropic's per-image limits — beyond
+    /// it, server-side rejection is certain and round-tripping the
+    /// payload wastes bandwidth.
+    #[test]
+    fn oversized_file_is_rejected() {
+        let dir = tempdir().unwrap();
+        let huge = vec![0u8; (MAX_PATH_IMAGE_BYTES + 1) as usize];
+        let p = write_tmp_file(&dir, "huge.png", &huge);
+        assert!(
+            try_attach_image_from_path(p.to_str().unwrap()).is_none(),
+            "files over MAX_PATH_IMAGE_BYTES must be rejected before read"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compute_input_attachments_tests {
+    use super::compute_input_attachments;
+    use crate::input::history::HistoryImageRef;
+    use crate::state::UiState;
+
+    fn recalled(n: usize) -> HistoryImageRef {
+        HistoryImageRef {
+            hash: "0".repeat(16),
+            mt: "image/png".into(),
+            n,
+        }
+    }
+
+    #[test]
+    fn fresh_paste_marker_emits_preview() {
+        let mut s = UiState::default();
+        s.pending_image_markers.push(3);
+        let attachments = compute_input_attachments(&s, "look [Image #3] here");
+        assert_eq!(attachments, vec![3]);
+    }
+
+    #[test]
+    fn cache_recalled_marker_emits_preview() {
+        let mut s = UiState::default();
+        s.pending_recalled_attachments.push(recalled(7));
+        let attachments = compute_input_attachments(&s, "[Image #7] from history");
+        assert_eq!(attachments, vec![7]);
+    }
+
+    #[test]
+    fn typed_marker_with_no_pending_emits_no_preview() {
+        let s = UiState::default();
+        let attachments = compute_input_attachments(&s, "I typed [Image #99] literally");
+        assert!(attachments.is_empty(), "literal text must not surface a preview row");
+    }
+
+    #[test]
+    fn marker_deleted_from_buffer_disappears_from_preview() {
+        let mut s = UiState::default();
+        s.pending_image_markers.push(1);
+        let with_marker = compute_input_attachments(&s, "see [Image #1]");
+        assert_eq!(with_marker, vec![1]);
+        let without_marker = compute_input_attachments(&s, "no marker now");
+        assert!(without_marker.is_empty(), "removing marker text must drop preview row");
+    }
+
+    #[test]
+    fn duplicate_markers_dedup_to_first_occurrence() {
+        let mut s = UiState::default();
+        s.pending_image_markers.push(2);
+        let attachments = compute_input_attachments(&s, "[Image #2] then [Image #2] again");
+        assert_eq!(attachments, vec![2], "same marker referenced twice must surface a single preview row");
+    }
+
+    #[test]
+    fn preserves_first_occurrence_order_across_sources() {
+        let mut s = UiState::default();
+        s.pending_image_markers.push(5);
+        s.pending_recalled_attachments.push(recalled(3));
+        let attachments = compute_input_attachments(&s, "first [Image #5] then [Image #3]");
+        assert_eq!(attachments, vec![5, 3], "preview rows follow buffer text order, not source order");
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct McpReloadProgress {
@@ -92,6 +691,18 @@ pub struct LoopCtx {
     /// timestamp; startup + `/model` switch bypass the cooldown.
     /// `None` = no check has run yet this session.
     pub monitor_last_check_at: Option<std::time::Instant>,
+    /// CodingPlan token-usage snapshot. Populated by
+    /// `usage_monitor::spawn_check` at startup and after each
+    /// TurnComplete (30s cooldown). Read on every redraw to construct
+    /// the right-aligned usage hint when usage_percent ≥ 80% and the
+    /// current model is on a CodingPlan provider.
+    pub usage_slot: std::sync::Arc<
+        std::sync::Mutex<Option<atomcode_core::coding_plan::types::UsageInfo>>,
+    >,
+    /// Last time `usage_monitor::spawn_check` was invoked. Used to
+    /// enforce `usage_monitor::USAGE_COOLDOWN` on TurnComplete-triggered
+    /// refreshes. `None` = no check has run yet this session.
+    pub usage_last_check_at: Option<std::time::Instant>,
     /// Last-observed timestamp from the shared CodingPlan sync marker
     /// (`~/.atomcode/codingplan_sync.json`). On every user input we
     /// re-read it; a change means ANOTHER atomcode process (e.g. a
@@ -138,17 +749,18 @@ pub struct LoopCtx {
     /// branch POSTs the issue to AtomGit and echoes the URL of the
     /// newly-created issue back into the conversation.
     pub pending_new_issue: Option<NewIssueDraft>,
-    /// Set by `WelcomeWizard` when the user picks option 0 (Set up
-    /// CodingPlan). The event loop drains this on modal close and
-    /// runs the full CodingPlan setup flow (login if needed → claim →
-    /// fetch models → register providers). Needs raw-mode
-    /// suspend/resume, something modals can't drive themselves. Same
-    /// pattern as `pending_new_issue`.
+    /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
+    /// option 0 (Set up CodingPlan). The event loop drains this on
+    /// modal close and runs the full CodingPlan setup flow (login if
+    /// needed → claim → fetch models → register providers). Needs
+    /// raw-mode suspend/resume, something modals can't drive
+    /// themselves. Same pattern as `pending_new_issue`.
     pub pending_run_codingplan: bool,
-    /// Set by `WelcomeWizard` when the user picks option 1 (Configure
-    /// manually). The event loop drains this on modal close and swaps in
-    /// `ProviderWizard::MainMenu` — a Modal-to-Modal transition that
-    /// needs mutable `active_modal` access only the event loop has.
+    /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
+    /// option 1 (Configure manually). The event loop drains this on
+    /// modal close and swaps in `ProviderWizard::MainMenu` — a
+    /// Modal-to-Modal transition that needs mutable `active_modal`
+    /// access only the event loop has.
     pub pending_open_provider_wizard: bool,
     /// MCP server registry for `/mcp` status display. `None` when no MCP
     /// servers are configured or all failed to connect.
@@ -160,6 +772,12 @@ pub struct LoopCtx {
     /// When `/mcp reload` is invoked, we track progress until every configured
     /// server reports Connected/Failed, then emit a one-line summary.
     pub mcp_reload: Option<McpReloadProgress>,
+    /// Channel for receiving LSP connection status events (Started / Failed
+    /// / Warning). Same plumbing as `mcp_connect_rx` — wired in TUI mode
+    /// so the manager's start failures land in scrollback as `✗ LSP server
+    /// 'rust-analyzer' for .rs failed: ...` instead of leaking to stderr
+    /// and printing inside the input box.
+    pub lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
@@ -181,12 +799,57 @@ pub struct LoopCtx {
     /// and ellipsis. Same value as `RetainedRenderer` was constructed
     /// with — single source of truth.
     pub caps: crate::terminal::TerminalCaps,
-    /// Session loaded by the CLI auto-continue path (`atomcode -c` or
-    /// the default behavior of `atomcode` when a prior session exists
-    /// for this working dir). Replayed into scrollback once on first
-    /// `run_loop` entry, then dropped — purely visual continuity, the
-    /// agent's model context starts fresh.
+    /// Session loaded by the CLI auto-continue path (`atomcode -c` /
+    /// `--continue`). Replayed into scrollback AND restored into the
+    /// agent's model context via `AgentCommand::SetMessages` on first
+    /// `run_loop` entry, then dropped — matching `/resume` behaviour.
     pub replay_on_start: Option<atomcode_core::session::Session>,
+    /// Lazy file/dir index for `@`-mention popup. Built on first `@`
+    /// keystroke via `FileIndex::filter`; session-life cache.
+    pub file_index: file_index::FileIndex,
+    /// Active session id once `/resume` has loaded one. Required by the
+    /// `/rename` slash command to know which session file to update.
+    pub current_session_id: Option<SessionId>,
+    /// Cached "clipboard currently holds an image" flag, with a short TTL
+    /// so the right-aligned `Image in clipboard · ctrl+v to paste` hint
+    /// stays current without thrashing the system clipboard on every
+    /// redraw. Refreshed lazily inside `build_status`.
+    pub clipboard_check: std::sync::Arc<std::sync::Mutex<ClipboardCheckState>>,
+    /// `true` when the TUI was launched with `PlainRenderer` (CI / pipe
+    /// / non-TTY). The onboarding wizard checks this — plain mode can't
+    /// run interactive multi-step flows, so first-run falls through to
+    /// the existing "no provider configured" status hint.
+    pub is_plain_renderer: bool,
+}
+
+/// Memoised result of the most recent clipboard probe. The hash is a
+/// content fingerprint of the clipboard image's raw RGBA bytes (or
+/// `None` when the clipboard holds no image). Letting `build_status`
+/// compare this against `UiState::pending_image_hashes` is what powers
+/// the "hide hint after I already pasted THIS image, but show it again
+/// if the user copies a different one" UX.
+#[derive(Debug, Default)]
+pub struct ClipboardCheckState {
+    pub image_hash: Option<u64>,
+    pub last_checked: Option<std::time::Instant>,
+}
+
+/// Cheap content fingerprint for clipboard images. Hashes width, height,
+/// total byte length, plus the first and last 1KB of RGBA bytes — enough
+/// to distinguish typical screenshots while keeping the per-poll cost
+/// O(2KB) regardless of image dimensions (a 4K screenshot's 32MB raw
+/// buffer would be too slow to hash in full at 1.5s polling cadence).
+fn rgba_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    bytes.len().hash(&mut hasher);
+    let head_end = bytes.len().min(1024);
+    bytes[..head_end].hash(&mut hasher);
+    let tail_start = bytes.len().saturating_sub(1024);
+    bytes[tail_start..].hash(&mut hasher);
+    hasher.finish()
 }
 
 /// What the `/issue` wizard hands back to the event loop after the user
@@ -250,6 +913,15 @@ impl Buffer {
     /// to the user's stashed draft.
     pub fn is_in_history(&self) -> bool {
         self.history_idx.is_some()
+    }
+
+    /// The index into history of the entry currently being displayed,
+    /// or `None` if the buffer is showing the user's own draft. Used
+    /// by `event_loop` to look up `HistoryEntry::images` after every
+    /// `apply()` so `pending_recalled_attachments` mirrors what the
+    /// buffer is showing.
+    pub fn history_idx(&self) -> Option<usize> {
+        self.history_idx
     }
 
     /// Insert a pasted block. Folds into a `[Pasted …]` placeholder if
@@ -339,7 +1011,7 @@ impl Buffer {
     pub(crate) fn apply(
         &mut self,
         action: Action,
-        history: &[String],
+        history: &[crate::input::history::HistoryEntry],
         commands: &CommandRegistry,
     ) -> BufferResult {
         match action {
@@ -350,6 +1022,19 @@ impl Buffer {
                 BufferResult::Redraw
             }
             Action::Submit => {
+                // Line continuation: a `\` immediately before the cursor
+                // is consumed and replaced with `\n`. Lets users insert
+                // newlines on terminals that swallow Shift/Ctrl/Alt+Enter
+                // (notably WSL + Windows Terminal). Mirrors Claude Code's
+                // behavior and matches the shell line-continuation
+                // convention Linux users already know.
+                if self.cursor > 0 && self.text.as_bytes()[self.cursor - 1] == b'\\' {
+                    let bs = self.cursor - 1;
+                    self.text.replace_range(bs..self.cursor, "\n");
+                    self.cursor = bs + 1;
+                    self.history_idx = None;
+                    return BufferResult::Redraw;
+                }
                 let line = self.text.trim().to_string();
                 if line.is_empty() {
                     return BufferResult::Redraw;
@@ -455,7 +1140,7 @@ impl Buffer {
                 };
                 self.history_idx = new_idx;
                 if let Some(i) = new_idx {
-                    self.text = history[i].clone();
+                    self.text = history[i].text.clone();
                     // Park cursor at column 0 — recalled history is for
                     // re-running, not editing in place. A `/session foo`
                     // pulled from history would otherwise leave the
@@ -474,7 +1159,7 @@ impl Buffer {
                         // Still inside history — same cursor-at-0 rule
                         // as HistoryPrev.
                         self.history_idx = Some(i + 1);
-                        self.text = history[i + 1].clone();
+                        self.text = history[i + 1].text.clone();
                         self.cursor = 0;
                     } else {
                         // Past the newest entry — restore the user's
@@ -577,6 +1262,107 @@ mod buffer_tests {
         assert!(out.contains("B\n"));
         assert!(!out.contains("[Pasted"));
     }
+
+    /// Regression: `clear_pastes` then `expand_pastes` is the broken
+    /// ordering that shipped before — the agent received the bare
+    /// `[Pasted #N +M lines]` placeholder instead of the pasted body
+    /// and (correctly) responded "I don't see any pasted content".
+    /// Callers MUST expand FIRST, clear SECOND. This test pins that
+    /// contract: if someone reintroduces an early clear, the
+    /// substitution silently turns into a no-op and the
+    /// `contains("important data")` assertion below catches it.
+    #[test]
+    fn clear_before_expand_loses_paste_body() {
+        let mut b = Buffer::new();
+        let body = "important data\n".repeat(200);
+        b.insert_paste(body.clone());
+        let line = b.text.clone();
+        // Mis-ordered: clear first.
+        b.clear_pastes();
+        let expanded = b.expand_pastes(&line);
+        assert!(
+            expanded.contains("[Pasted #1"),
+            "early-clear must leave the placeholder unsubstituted: {}",
+            expanded
+        );
+        assert!(
+            !expanded.contains("important data"),
+            "early-clear must NOT magically still have the body: {}",
+            expanded
+        );
+
+        // Sanity check the correct order: expand first, then clear.
+        let mut b = Buffer::new();
+        b.insert_paste(body.clone());
+        let line = b.text.clone();
+        let expanded = b.expand_pastes(&line);
+        b.clear_pastes();
+        assert!(
+            expanded.contains("important data"),
+            "expand-before-clear must surface the body: {}",
+            &expanded[..expanded.len().min(120)]
+        );
+        assert!(b.pastes.is_empty(), "clear after expand must still empty the registry");
+    }
+
+    #[test]
+    fn submit_with_trailing_backslash_inserts_newline() {
+        // WSL + Windows Terminal swallows Shift/Ctrl/Alt+Enter, so we
+        // give users a `\<Enter>` continuation escape. The `\` itself
+        // must not survive into the buffer.
+        let reg = CommandRegistry::builtin();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "hello\\".to_string();
+        b.cursor = b.text.len();
+        let r = b.apply(Action::Submit, &history, &reg);
+        assert!(matches!(r, BufferResult::Redraw));
+        assert_eq!(b.text, "hello\n");
+        assert_eq!(b.cursor, b.text.len());
+    }
+
+    #[test]
+    fn submit_with_backslash_mid_buffer_inserts_newline_at_cursor() {
+        let reg = CommandRegistry::builtin();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "abc\\def".to_string();
+        b.cursor = 4; // right after the backslash
+        let r = b.apply(Action::Submit, &history, &reg);
+        assert!(matches!(r, BufferResult::Redraw));
+        assert_eq!(b.text, "abc\ndef");
+        assert_eq!(b.cursor, 4);
+    }
+
+    #[test]
+    fn submit_without_trailing_backslash_commits_normally() {
+        let reg = CommandRegistry::builtin();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "ship it".to_string();
+        b.cursor = b.text.len();
+        let r = b.apply(Action::Submit, &history, &reg);
+        match r {
+            BufferResult::Commit(s) => assert_eq!(s, "ship it"),
+            _ => panic!("expected Commit"),
+        }
+    }
+
+    #[test]
+    fn submit_with_backslash_not_before_cursor_commits_normally() {
+        // Backslash exists in the buffer but cursor isn't right after
+        // it — Enter should still submit, not insert a newline.
+        let reg = CommandRegistry::builtin();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
+        let mut b = Buffer::new();
+        b.text = "abc\\def".to_string();
+        b.cursor = b.text.len(); // at end, byte before is 'f'
+        let r = b.apply(Action::Submit, &history, &reg);
+        match r {
+            BufferResult::Commit(s) => assert_eq!(s, "abc\\def"),
+            _ => panic!("expected Commit"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -588,14 +1374,14 @@ mod menu_tests {
     fn non_slash_input_returns_no_menu() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        assert!(build_menu_items("hello world", &reg, &custom, None).is_none());
+        assert!(build_menu_items("hello world", 0, &reg, &custom, None, None).is_none());
     }
 
     #[test]
     fn slash_prefix_returns_all_commands() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let items = build_menu_items("/", &reg, &custom, None).expect("menu should show for '/'");
+        let items = build_menu_items("/", 0, &reg, &custom, None, None).expect("menu should show for '/'");
         assert!(!items.is_empty(), "builtin registry should have commands");
     }
 
@@ -603,8 +1389,8 @@ mod menu_tests {
     fn slash_with_filter_narrows_list() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let all = build_menu_items("/", &reg, &custom, None).unwrap();
-        let filtered = build_menu_items("/he", &reg, &custom, None).unwrap_or_default();
+        let all = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
+        let filtered = build_menu_items("/he", 0, &reg, &custom, None, None).unwrap_or_default();
         assert!(
             filtered.len() < all.len(),
             "prefix '/he' should filter builtin commands"
@@ -625,15 +1411,15 @@ mod menu_tests {
         // start navigating a stale palette.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        assert!(build_menu_items("/cd ", &reg, &custom, None).is_none());
-        assert!(build_menu_items("/cd /tmp", &reg, &custom, None).is_none());
+        assert!(build_menu_items("/cd ", 0, &reg, &custom, None, None).is_none());
+        assert!(build_menu_items("/cd /tmp", 0, &reg, &custom, None, None).is_none());
     }
 
     #[test]
     fn slash_with_no_matches_returns_none() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        assert!(build_menu_items("/zzznomatch", &reg, &custom, None).is_none());
+        assert!(build_menu_items("/zzznomatch", 0, &reg, &custom, None, None).is_none());
     }
 
     fn skill_fixture(name: &str, desc: &str, user_invocable: bool) -> atomcode_core::skill::Skill {
@@ -665,13 +1451,13 @@ mod menu_tests {
         // /bra — no skill should appear; /bra falls through to "no
         // matches" since no built-in starts with bra either.
         assert!(
-            build_menu_items("/bra", &reg, &custom, Some(&lock)).is_none(),
+            build_menu_items("/bra", 0, &reg, &custom, Some(&lock), None).is_none(),
             "individual skills must not leak into the top-level menu"
         );
 
         // /skills — only the built-in gateway entry, never the
         // individual skills.
-        let items = build_menu_items("/skills", &reg, &custom, Some(&lock))
+        let items = build_menu_items("/skills", 0, &reg, &custom, Some(&lock), None)
             .expect("/skills must include the built-in gateway");
         assert!(items.iter().any(|(n, _)| n == "skills"));
         for (n, _) in &items {
@@ -696,12 +1482,12 @@ mod menu_tests {
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
 
-        let items = build_menu_items("/skills ", &reg, &custom, Some(&lock))
+        let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("/skills (with space) must list skills");
-        assert!(items.iter().any(|(n, _)| n == "brainstorming"));
-        assert!(items.iter().any(|(n, _)| n == "web-access"));
+        assert!(items.iter().any(|(n, _)| n == "skills:brainstorming"));
+        assert!(items.iter().any(|(n, _)| n == "skills:web-access"));
         for (n, _) in &items {
-            assert!(!n.contains(':'), "sub-mode names must be bare: {}", n);
+            assert!(n.contains(':'), "sub-mode names must be qualified: {}", n);
         }
     }
 
@@ -716,17 +1502,17 @@ mod menu_tests {
         skills.register(skill_fixture("skills:web-access", "Web", true));
         let lock = std::sync::RwLock::new(skills);
 
-        let bra = build_menu_items("/skills bra", &reg, &custom, Some(&lock))
+        let bra = build_menu_items("/skills bra", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(bra.len(), 1);
-        assert_eq!(bra[0].0, "brainstorming");
+        assert_eq!(bra[0].0, "skills:brainstorming");
 
-        let web = build_menu_items("/skills web", &reg, &custom, Some(&lock))
+        let web = build_menu_items("/skills web", 0, &reg, &custom, Some(&lock), None)
             .expect("filter must produce a result");
         assert_eq!(web.len(), 1);
-        assert_eq!(web[0].0, "web-access");
+        assert_eq!(web[0].0, "skills:web-access");
 
-        assert!(build_menu_items("/skills zz", &reg, &custom, Some(&lock)).is_none());
+        assert!(build_menu_items("/skills zz", 0, &reg, &custom, Some(&lock), None).is_none());
     }
 
     #[test]
@@ -739,9 +1525,7 @@ mod menu_tests {
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
-        assert!(
-            build_menu_items("/skills brainstorming why", &reg, &custom, Some(&lock)).is_none()
-        );
+        assert!(build_menu_items("/skills brainstorming why", 0, &reg, &custom, Some(&lock), None).is_none());
     }
 
     #[test]
@@ -755,11 +1539,11 @@ mod menu_tests {
         skills.register(skill_fixture("skills:hidden", "hidden", false));
         let lock = std::sync::RwLock::new(skills);
 
-        let items = build_menu_items("/skills ", &reg, &custom, Some(&lock))
+        let items = build_menu_items("/skills ", 0, &reg, &custom, Some(&lock), None)
             .expect("at least one visible skill should produce a menu");
-        assert!(items.iter().any(|(n, _)| n == "visible"));
+        assert!(items.iter().any(|(n, _)| n == "skills:visible"));
         assert!(
-            !items.iter().any(|(n, _)| n == "hidden"),
+            !items.iter().any(|(n, _)| n == "skills:hidden"),
             "user_invocable=false skill leaked into sub-menu"
         );
     }
@@ -769,9 +1553,9 @@ mod menu_tests {
         // Ensures the legacy call path (None) keeps working.
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let with_none = build_menu_items("/", &reg, &custom, None).unwrap();
+        let with_none = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
         let empty_skills = std::sync::RwLock::new(atomcode_core::skill::SkillRegistry::new());
-        let with_empty = build_menu_items("/", &reg, &custom, Some(&empty_skills)).unwrap();
+        let with_empty = build_menu_items("/", 0, &reg, &custom, Some(&empty_skills), None).unwrap();
         assert_eq!(
             with_none.len(),
             with_empty.len(),
@@ -789,7 +1573,7 @@ mod menu_tests {
     fn history_prev_parks_cursor_at_zero_and_marks_history_mode() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec!["/session foo".to_string()];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
 
@@ -802,7 +1586,7 @@ mod menu_tests {
     fn history_next_back_to_stash_restores_cursor_to_end() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec!["/session foo".to_string()];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
 
         // Type a partial draft, then scroll into history and back out.
         let _ = buf.apply(Action::Insert('h'), &history, &reg);
@@ -824,18 +1608,291 @@ mod menu_tests {
         // re-appear naturally once the user starts editing the recall.
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec!["/session foo".to_string()];
+        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
         assert!(buf.is_in_history());
         let _ = buf.apply(Action::Insert('x'), &history, &reg);
         assert!(!buf.is_in_history());
     }
+
+    #[test]
+    fn sync_recalled_attachments_mirrors_buffer_history_idx() {
+        use crate::input::history::{HistoryEntry, HistoryImageRef};
+        let history: Vec<HistoryEntry> = vec![
+            HistoryEntry { text: "no img".into(), images: vec![] },
+            HistoryEntry {
+                text: "with img".into(),
+                images: vec![HistoryImageRef {
+                    hash: "deadbeef12345678".into(),
+                    mt: "image/png".into(),
+                    n: 1,
+                }],
+            },
+        ];
+        let reg = CommandRegistry::builtin();
+        let mut buf = Buffer::new();
+        let mut state = UiState::new();
+        // ↑ once → newest entry (idx=1, has image).
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert_eq!(state.pending_recalled_attachments.len(), 1);
+        // ↑ again → idx=0 (no images) → wholesale replace empties the vec.
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert!(state.pending_recalled_attachments.is_empty());
+        // Type a char on an empty-images entry → history_idx clears
+        // but the retain pass keeps the (already empty) vec empty.
+        let _ = buf.apply(Action::Insert('a'), &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert!(state.pending_recalled_attachments.is_empty());
+    }
+
+    /// Regression: arrow-up recalls `[Image #1]这是什么？`, user appends
+    /// ` 现在不清楚为啥...`, submits — the trailing edit must NOT drop
+    /// the recalled image. Pre-fix, `Insert` cleared `history_idx` and
+    /// the wholesale `clear()` wiped `pending_recalled_attachments`,
+    /// so the marker text reached the model as literal `[Image #1]`
+    /// without bytes. Post-fix, the retain pass keeps refs whose
+    /// marker is still in `buf.text`.
+    #[test]
+    fn sync_recalled_attachments_retains_on_edit_when_marker_present() {
+        use crate::input::history::{HistoryEntry, HistoryImageRef};
+        let history: Vec<HistoryEntry> = vec![HistoryEntry {
+            text: "[Image #1]hello".into(),
+            images: vec![HistoryImageRef {
+                hash: "deadbeef12345678".into(),
+                mt: "image/png".into(),
+                n: 1,
+            }],
+        }];
+        let reg = CommandRegistry::builtin();
+        let mut buf = Buffer::new();
+        let mut state = UiState::new();
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert_eq!(state.pending_recalled_attachments.len(), 1);
+        // Append a char — history_idx clears, but `[Image #1]` is still
+        // in buf, so the recalled ref must survive.
+        let _ = buf.apply(Action::Insert('!'), &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert_eq!(
+            state.pending_recalled_attachments.len(),
+            1,
+            "edit that leaves marker intact must preserve recalled ref"
+        );
+    }
+
+    /// Companion to the retain-on-edit test: when the user backspaces
+    /// over the `[Image #N]` marker itself, the recalled ref tied to
+    /// that marker should drop — otherwise `hydrate_recalled_attachments`
+    /// would inject orphan bytes the user explicitly removed.
+    #[test]
+    fn sync_recalled_attachments_drops_when_marker_removed() {
+        use crate::input::history::{HistoryEntry, HistoryImageRef};
+        let history: Vec<HistoryEntry> = vec![HistoryEntry {
+            text: "[Image #1]hi".into(),
+            images: vec![HistoryImageRef {
+                hash: "deadbeef12345678".into(),
+                mt: "image/png".into(),
+                n: 1,
+            }],
+        }];
+        let reg = CommandRegistry::builtin();
+        let mut buf = Buffer::new();
+        let mut state = UiState::new();
+        let _ = buf.apply(Action::HistoryPrev, &history, &reg);
+        super::sync_recalled_attachments(&mut state, &buf, &history);
+        assert_eq!(state.pending_recalled_attachments.len(), 1);
+        // Replace the buffer text so the marker is gone — simulates the
+        // user backspacing over `[Image #1]`. We use a direct edit
+        // through Action::Insert + delete is overkill; mutating the
+        // buf's text via a fresh Buffer simulates the same end state.
+        // Drop history_idx by inserting a char then verify retain
+        // strips the ref since the marker is no longer present.
+        // We force buf.text to a no-marker string by replaying from
+        // empty + Insert sequence:
+        let mut buf2 = Buffer::new();
+        let _ = buf2.apply(Action::Insert('h'), &history, &reg);
+        let _ = buf2.apply(Action::Insert('i'), &history, &reg);
+        // pending_recalled_attachments still has the entry from earlier
+        // (state isn't reset between buffer swaps in the real loop —
+        // sync runs on each apply).
+        super::sync_recalled_attachments(&mut state, &buf2, &history);
+        assert!(
+            state.pending_recalled_attachments.is_empty(),
+            "removed marker must drop the matching recalled ref"
+        );
+    }
+
+    #[test]
+    fn cache_write_image_writes_and_is_idempotent() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let img = atomcode_core::conversation::message::ImagePart {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"hello"),
+        };
+        super::cache_write_image(dir.path(), &img, 0xdead_beef_1234_5678);
+        let p = dir.path().join("deadbeef12345678.png");
+        assert!(p.exists());
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        // Calling again must not error and not change the file mtime.
+        let mtime1 = std::fs::metadata(&p).unwrap().modified().unwrap();
+        super::cache_write_image(dir.path(), &img, 0xdead_beef_1234_5678);
+        let mtime2 = std::fs::metadata(&p).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2, "second call must short-circuit on exists");
+    }
+
+    #[test]
+    fn hydrate_renumbers_and_rewrites_line() {
+        use crate::input::history::HistoryImageRef;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        // Write a fake cache file at hash=deadbeef12345678.
+        std::fs::write(cache_dir.join("deadbeef12345678.png"), b"\x89PNG").unwrap();
+
+        let mut state = UiState::new();
+        state.session_image_count = 5; // current session already used #1..#5
+        state.pending_recalled_attachments.push(HistoryImageRef {
+            hash: "deadbeef12345678".into(),
+            mt: "image/png".into(),
+            n: 2, // recalled marker number from the saved entry
+        });
+        let mut line = "look at [Image #2] please".to_string();
+        let notice = super::hydrate_recalled_attachments(&mut state, &mut line, &cache_dir);
+
+        assert_eq!(notice.len(), 0, "no cache miss expected");
+        assert_eq!(line, "look at [Image #6] please", "marker renumbered to #6");
+        assert_eq!(state.pending_images.len(), 1);
+        assert_eq!(state.pending_image_markers, vec![6]);
+        assert_eq!(state.session_image_count, 6);
+        assert!(state.pending_recalled_attachments.is_empty());
+    }
+
+    #[test]
+    fn hydrate_strips_marker_on_cache_miss() {
+        use crate::input::history::HistoryImageRef;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        // No cache file written → cache miss.
+        let mut state = UiState::new();
+        state.pending_recalled_attachments.push(HistoryImageRef {
+            hash: "0000000000000000".into(),
+            mt: "image/png".into(),
+            n: 3,
+        });
+        let mut line = "before [Image #3] after".to_string();
+        let notice = super::hydrate_recalled_attachments(&mut state, &mut line, &cache_dir);
+
+        assert_eq!(line, "before  after", "marker stripped on cache miss");
+        assert_eq!(state.pending_images.len(), 0);
+        assert!(state.pending_recalled_attachments.is_empty());
+        assert_eq!(notice.len(), 1, "expected one cache-miss notice");
+        assert!(notice[0].contains("[Image #3]"));
+        assert!(notice[0].contains("缓存"));
+    }
+
+    #[test]
+    fn paste_submit_recall_submit_rehydrates_image() {
+        use crate::input::history::{History, HistoryEntry, HistoryImageRef};
+        use base64::Engine;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("image-cache");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let hist_path = tmp.path().join("hist");
+        let mut history = History::load_with_cache(&hist_path, cache_dir.clone());
+
+        // ── Turn 1: paste image, submit ────────────────────────────────
+        let raw_bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        let img = atomcode_core::conversation::message::ImagePart {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(&raw_bytes),
+        };
+        let hash: u64 = 0xdead_beef_1234_5678;
+        super::cache_write_image(&cache_dir, &img, hash);
+        history.push(HistoryEntry {
+            text: "describe [Image #1]".into(),
+            images: vec![HistoryImageRef {
+                hash: format!("{:016x}", hash),
+                mt: img.media_type.clone(),
+                n: 1,
+            }],
+        });
+        history.save().unwrap();
+        // GC must NOT delete our file (it's referenced).
+        assert!(cache_dir.join(format!("{:016x}.png", hash)).exists());
+
+        // ── Reload (new "session") ─────────────────────────────────────
+        let history2 = History::load_with_cache(&hist_path, cache_dir.clone());
+        assert_eq!(history2.entries().len(), 1);
+        assert_eq!(history2.entries()[0].images.len(), 1);
+
+        // ── Turn 2: simulate up-arrow + submit ─────────────────────────
+        let mut state = UiState::new();
+        // Up-arrow handler would do this:
+        state.pending_recalled_attachments = history2.entries()[0].images.clone();
+        let mut line = history2.entries()[0].text.clone();
+        let notices = super::hydrate_recalled_attachments(&mut state, &mut line, &cache_dir);
+        assert!(notices.is_empty(), "cache hit, no notice expected");
+        assert_eq!(state.pending_images.len(), 1, "image rehydrated");
+        let rehydrated = base64::engine::general_purpose::STANDARD
+            .decode(&state.pending_images[0].data)
+            .unwrap();
+        assert_eq!(rehydrated, raw_bytes, "bytes round-trip exact");
+        // Marker renumbered (recalled was #1, new session also starts at #1
+        // but session_image_count was 0 → bumped to 1, so new marker = 1).
+        assert_eq!(line, "describe [Image #1]");
+        assert_eq!(state.pending_image_markers, vec![1]);
+    }
+
+    #[test]
+    fn hydrate_runs_for_streaming_queued_submit_too() {
+        // Regression: handle_streaming_key's Commit branch must also
+        // hydrate `pending_recalled_attachments` so a user who pressed
+        // ↑ during streaming and queued the recalled message travels
+        // with their image. Pre-fix, the queue carried empty images.
+        use crate::input::history::HistoryImageRef;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        std::fs::write(cache_dir.join("deadbeef12345678.png"), b"\x89PNG").unwrap();
+
+        let mut state = UiState::new();
+        state.pending_recalled_attachments.push(HistoryImageRef {
+            hash: "deadbeef12345678".into(),
+            mt: "image/png".into(),
+            n: 4,
+        });
+        let mut line = "describe [Image #4]".to_string();
+        let _ = super::hydrate_recalled_attachments(&mut state, &mut line, &cache_dir);
+        // After hydrate, the line + pending state should match what the
+        // queued-submit pending-drain loop expects to see.
+        assert_eq!(state.pending_images.len(), 1);
+        assert_eq!(line, "describe [Image #1]"); // first paste this session
+        assert_eq!(state.pending_image_markers, vec![1]);
+        assert!(line.contains("[Image #1]"), "marker survives in line for the survival filter");
+    }
 }
 
 #[cfg(test)]
 mod tool_format_tests {
     use super::*;
+
+    #[test]
+    fn fmt_elapsed_under_one_minute_uses_seconds_only() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(999), "0s");
+        assert_eq!(fmt_elapsed(1_000), "1s");
+        assert_eq!(fmt_elapsed(45_500), "45s");
+    }
+
+    #[test]
+    fn fmt_elapsed_above_one_minute_splits_minutes_and_seconds() {
+        assert_eq!(fmt_elapsed(60_000), "1m0s");
+        assert_eq!(fmt_elapsed(141_000), "2m21s");
+        assert_eq!(fmt_elapsed(342_000), "5m42s");
+    }
 
     #[test]
     fn display_tool_name_snake_to_pascal() {
@@ -850,6 +1907,28 @@ mod tool_format_tests {
         assert_eq!(display_tool_name("x"), "X");
         assert_eq!(display_tool_name("x_"), "X");
         assert_eq!(display_tool_name("_x"), "X");
+    }
+
+    /// Short form strips the redundant noun suffix so batch UI shows
+    /// `Read(mod.rs)` instead of `ReadFile(mod.rs)` — matches CC's
+    /// function-call-style tool labels. Strip list is generic
+    /// (`_file`, `_files`, `_directory`); other suffixes pass through
+    /// untouched so `search_replace` stays `SearchReplace` (no
+    /// disambiguation lost).
+    #[test]
+    fn display_tool_name_short_strips_redundant_noun() {
+        assert_eq!(display_tool_name_short("read_file"), "Read");
+        assert_eq!(display_tool_name_short("write_file"), "Write");
+        assert_eq!(display_tool_name_short("edit_file"), "Edit");
+        assert_eq!(display_tool_name_short("create_file"), "Create");
+        assert_eq!(display_tool_name_short("list_directory"), "List");
+        assert_eq!(display_tool_name_short("parallel_edit_files"), "ParallelEdit");
+        // Suffixes not in strip list pass through.
+        assert_eq!(display_tool_name_short("bash"), "Bash");
+        assert_eq!(display_tool_name_short("grep"), "Grep");
+        assert_eq!(display_tool_name_short("search_replace"), "SearchReplace");
+        assert_eq!(display_tool_name_short("web_fetch"), "WebFetch");
+        assert_eq!(display_tool_name_short("blast_radius"), "BlastRadius");
     }
 
     #[test]
@@ -1017,7 +2096,7 @@ pub struct App {
     /// Drained one-at-a-time from the head whenever the current turn
     /// finishes. Matches CC's "type-ahead" UX — queue the next prompt
     /// while the model is still thinking and it fires automatically.
-    pub message_queue: VecDeque<String>,
+    pub message_queue: VecDeque<crate::state::QueuedMessage>,
     /// Streaming-state `<think>…</think>` stripper. Kept on App (not
     /// a local in the streaming arm) because it carries state across
     /// agent events — a tag straddling two chunks would break if the
@@ -1070,7 +2149,25 @@ impl App {
     }
 }
 
-pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<()> {
+/// Why the event loop exited. Callers (currently just `atomcode-tuix::run`)
+/// use this to decide whether to re-exec into the new binary after an
+/// in-place upgrade or just terminate normally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitReason {
+    /// Normal termination (user quit, Ctrl+C, etc.).
+    Normal,
+    /// `/upgrade` or `/upgrade rollback` succeeded; the live binary has been
+    /// replaced and the caller should `re_exec_self` to start the new version.
+    ///
+    /// Carries the *original* exe path (e.g. `atomcode.exe`) captured
+    /// **before** `replace_binary` renamed the running binary. On Windows,
+    /// `std::env::current_exe()` returns the renamed path after the swap,
+    /// so callers MUST use this path for `re_exec_self` instead of
+    /// `current_exe()`.
+    UpgradeRestart { exe: std::path::PathBuf },
+}
+
+pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
 
     crate::tuix_trace!(
@@ -1093,14 +2190,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     if let Ok(prev) = std::env::var("ATOMCODE_UPGRADED_FROM") {
         std::env::remove_var("ATOMCODE_UPGRADED_FROM");
         let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-        renderer.render(UiLine::CommandOutput(format!(
-            "  ✓ Upgraded {} → {}\n",
-            prev, current
-        )));
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::UpgradeSuccess { from: &prev, to: &current }).into_owned(),
+        ));
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
-    // printing to stdout, so the user sees the ✔/✘ lines in the chat
+    // printing to stdout, so the user sees the ✓/✗ lines in the chat
     // scrollback rather than scrolled off above the welcome banner.
     if let Ok(report) = std::env::var("ATOMCODE_CODINGPLAN_REPORT") {
         std::env::remove_var("ATOMCODE_CODINGPLAN_REPORT");
@@ -1109,21 +2205,51 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         }
     }
 
-    // Terminal keyboard hint: when the terminal doesn't support Kitty
-    // keyboard protocol (CSI u), Shift+Enter is indistinguishable from
-    // plain Enter. Show a hint so users know to use Alt+Enter or
-    // Ctrl+Enter for newline insertion instead.
-    if std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok() {
+    // Terminal keyboard hint: shown when crossterm couldn't negotiate
+    // the Kitty keyboard protocol (CSI u). The previous copy claimed
+    // "Shift+Enter won't work" — but Kitty is only ONE of several ways
+    // a terminal can disambiguate modifier+Enter. Windows Terminal,
+    // VSCode (xterm.js), mintty/Git Bash, and modern PowerShell hosts
+    // all forward Shift/Alt/Ctrl+Enter via VT modifyOtherKeys without
+    // ever negotiating CSI u, so the user sees Shift+Enter work in
+    // their daily session yet boots into a banner asserting it can't.
+    // Re-frame as informational guidance rather than a definitive
+    // "won't work" claim, and surface `\<Enter>` as the universal
+    // fallback so legacy-conhost users (where modifier+Enter IS
+    // genuinely swallowed at the OS layer) have a guaranteed path.
+    //
+    // Also suppressed when the legacy-conhost hint is firing — that
+    // hint already covers the only environment where the chord
+    // truly fails, so dual-firing produced wall-of-text noise (see
+    // user feedback 2026-05-09 "全部展示的是…可以更精细化下").
+    let kbd_hint_set = std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok();
+    let jediterm_set = std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok();
+    if kbd_hint_set {
         std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
-        // Show platform-appropriate hint. On macOS, Option+Enter may not work
-        // in all terminals, so we recommend Ctrl+Enter as the primary fallback.
-        #[cfg(target_os = "macos")]
+    }
+    // Suppress the standalone keyboard hint when the JediTerm banner
+    // is firing — that banner already carries its own newline
+    // guidance, so dual-firing produced wall-of-text noise. Otherwise
+    // emit a single universal hint pointing at `\<Enter>`.
+    //
+    // Why the universal-fallback message instead of per-terminal
+    // chord recommendations: the previous helper detected MSYSTEM /
+    // WT_SESSION / ConEmuPID / TERM_PROGRAM and named the most
+    // reliable chord per terminal, but the detection misfires
+    // whenever the env vars don't survive (e.g. PowerShell sessions
+    // launched in Windows Terminal that lose WT_SESSION through a
+    // helper process — observed in user feedback 2026-05-09). The
+    // `\<Enter>` line continuation is implemented at the buffer
+    // layer (event_loop/mod.rs Action::Submit handler), so it
+    // works on EVERY terminal regardless of keyboard protocol or
+    // env var fidelity. Modifier+Enter chords stay supported in
+    // `key_action.rs::classify`; users who know they have them just
+    // use them. The startup hint targets the user who doesn't know,
+    // and for them a guaranteed-works recommendation beats a
+    // sometimes-wrong terminal-specific one.
+    if kbd_hint_set && !jediterm_set {
         renderer.render(UiLine::CommandOutput(
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
-        ));
-        #[cfg(not(target_os = "macos"))]
-        renderer.render(UiLine::CommandOutput(
-            "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
+            crate::i18n::t(crate::i18n::Msg::HintMultiLineInput).into_owned(),
         ));
     }
 
@@ -1139,8 +2265,17 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     // informed choices don't get lectured.
     if std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok() {
         std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
+        // Includes newline-insertion guidance because the standalone
+        // keyboard hint is suppressed when this banner fires (see
+        // kbd_hint_set block above). Lead with `\<Enter>` — the
+        // buffer-layer fallback that works regardless of which
+        // chord the IDE's JediTerm fork happens to forward. Modifier
+        // chords still supported by `key_action.rs::classify`; users
+        // who know they have them just use them.
         renderer.render(UiLine::CommandOutput(
             "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
+            Newlines: end the line with `\\` then press Enter (Shift / Alt /\n    \
+            Ctrl + Enter may also work depending on your IDE version).\n    \
             Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
             Native terminal scrollback is unavailable while atomcode runs;\n    \
             on exit your host terminal restores its pre-atomcode state.\n    \
@@ -1150,72 +2285,66 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
         ));
     }
 
-    // Legacy Windows console (cmd.exe / classic conhost) auto-fallback
-    // hint: lib.rs detected Windows + neither WT_SESSION nor
-    // TERM_PROGRAM, which means the user is on stock conhost where
-    // DECSTBM misbehaves (rows duplicate in scrollback on Page-Up).
-    // Phase 5: now routes to AltScreenRenderer. Mutually exclusive
-    // with the JediTerm hint (lib.rs gates legacy_conhost on
-    // `!is_jediterm`).
-    if std::env::var("ATOMCODE_LEGACY_CONHOST_FALLBACK").is_ok() {
-        std::env::remove_var("ATOMCODE_LEGACY_CONHOST_FALLBACK");
-        renderer.render(UiLine::CommandOutput(
-            "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs.\n    \
-            For full host-terminal scrollback support, install Windows Terminal\n    \
-            (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
-            bypass this fallback (may show duplicated content on scroll).\n\n"
-                .into(),
-        ));
-    }
+    // The legacy-Windows-conhost fallback banner used to fire here
+    // (gated on ATOMCODE_LEGACY_CONHOST_FALLBACK set by lib.rs). It
+    // walked the user through wheel-scroll, PageUp/Down, third-party
+    // terminal alternatives, and the ATOMCODE_PLAIN / ATOMCODE_RETAIN
+    // bypass switches. Removed in v4.22 once alt-screen on conhost
+    // shipped working wheel + PageUp/Down + SGR mouse: the wall of
+    // text became dead weight (every conhost user immediately
+    // wanted it gone). Newline guidance still reaches them via the
+    // universal `\<Enter>` block above (kbd_hint_set arm), which is
+    // one line and terminal-agnostic.
 
     // Auto-continue: if the CLI loaded the most recent session for this
-    // working dir, replay its messages into scrollback so the user sees
-    // "where I left off". Visual-only — agent context starts fresh, so
-    // any follow-up question that depends on prior history will surprise
-    // the user. The hint below sets that expectation. Users who want
-    // full restoration (model context too) should run `/resume`.
+    // working dir (via `atomcode -c` / `--continue`), replay its messages
+    // into scrollback AND restore the agent's model context so follow-up
+    // questions can reference prior conversation. This mirrors the `/resume`
+    // slash command's behaviour: visual replay + AgentCommand::SetMessages.
     if let Some(session) = ctx.replay_on_start.take() {
         if !session.messages.is_empty() {
             crate::modals::session_picker::replay_session(renderer, &session, false);
+            // Sync messages into the agent loop so the LLM has full context.
+            ctx.agent
+                .cmd_tx
+                .send(AgentCommand::SetMessages(session.messages.clone()))
+                .ok();
+            // Continue accumulating into the same session file — future
+            // TurnComplete saves overwrite it instead of creating a new one.
+            if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
+                ctx.telemetry.set_session_id(uuid);
+            }
+            ctx.current_session = session;
+            app.state.on_turn_complete();
             renderer.render(UiLine::CommandOutput(
-                "  ⓘ Showing previous session — model context starts fresh.\n    \
-                Use /resume to fully restore the conversation including model memory.\n\n"
-                    .into(),
+                crate::i18n::t(crate::i18n::Msg::SessionReplayHint).into_owned(),
             ));
             renderer.flush();
         }
     }
 
     // First-run onboarding: no providers configured AND no OAuth login
-    // on disk means the user has never set this up. Show the legacy-tui
-    // 3-choice wizard (Login / Configure manually / Skip) as a modal —
-    // same mechanism as /resume, /provider, etc. Users with a config or
-    // prior OAuth auth are never shown this and boot straight to idle.
-    let is_first_run =
-        ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none();
-    if is_first_run {
-        // Body-side guide — pushed to scrollback above the footer menu,
-        // gives the user context before they navigate the MenuPayload.
-        // Kept compact (5 lines) so on small terminals the menu still
-        // fits without scrolling the welcome banner off-screen.
-        renderer.render(UiLine::CommandOutput(
-            "\n  Welcome to AtomCode. Pick an option to get started:\n  \
-            (↑↓ to navigate, Enter to confirm, Esc to skip)\n\n"
-                .into(),
-        ));
-        app.active_modal = Some(Box::new(crate::modals::WelcomeWizard::new()));
-        if let Some(m) = app.active_modal.as_mut() {
-            m.draw(&app.buf, &app.state, &ctx, renderer);
-        }
+    // on disk means the user has never set this up — open the
+    // OnboardingWizard. Users with a config or prior OAuth auth are
+    // never shown this and boot straight to idle. Plain renderer
+    // (CI / pipe / non-TTY) is also gated out — the bordered box
+    // would just garble its output channel with no human to see it.
+    if should_auto_show_onboarding(&ctx) {
+        // Modal trait imported so `wizard.draw(...)` resolves; the
+        // OnboardingWizard's Modal impl owns the per-step box drawing.
+        use crate::modals::Modal;
+        renderer.clear_screen();
+        let wizard = crate::modals::OnboardingWizard::new()
+            .with_initial_language(ctx.config.language);
+        wizard.draw(&app.buf, &app.state, &ctx, renderer);
+        app.active_modal = Some(Box::new(wizard));
     } else {
         renderer.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
             menu: None,
             status: build_status(&app.state, &ctx),
+            attachments: Vec::new(),
         });
         renderer.flush();
     }
@@ -1250,6 +2379,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                 ctx.wake_tx.clone(),
             );
         }
+        // Startup usage check (separate cooldown — 30s vs drift's 15min).
+        // Always fires once at startup so the user sees current quota
+        // immediately if they're already over 80%.
+        ctx.usage_last_check_at = Some(std::time::Instant::now());
+        usage_monitor::spawn_check(ctx.usage_slot.clone(), ctx.wake_tx.clone());
     }
 
     // Spinner tick channel — a background task fires a tick every 100ms
@@ -1311,7 +2445,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     // True once Done fired successfully — the loop exits after the
     // current pending message finishes so the user sees the success
     // line before the TUI shuts down.
-    let mut upgrade_done = false;
+    let mut upgrade_done: Option<std::path::PathBuf> = None;
 
     // DEVIATION from plan:
     // 1. plan uses `SignalKind::terminal_stop()` which does not exist in tokio 1.x.
@@ -1324,6 +2458,20 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     #[cfg(unix)]
     let mut sigcont =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGCONT))?;
+
+    // Windows-only OS-level Ctrl+C fallback. The keyboard path
+    // (crossterm KeyEvent → handle_input → 2-press confirm) is the
+    // primary route, but on legacy conhost the Ctrl+C keystroke is
+    // sometimes swallowed before reaching the input buffer when raw
+    // mode + ENABLE_VIRTUAL_TERMINAL_INPUT are both active — users
+    // report "completely no reaction" with no hint shown.
+    // `tokio::signal::windows::ctrl_c` hooks SetConsoleCtrlHandler so
+    // the OS signal still lands here regardless of whether the
+    // keystroke ever made it into the console input queue. Single-press
+    // exit on this path: when the keypress chain is broken, this is the
+    // user's only escape — a 2-press confirm would just trap them.
+    #[cfg(windows)]
+    let mut win_ctrl_c = tokio::signal::windows::ctrl_c()?;
 
     loop {
         #[cfg(unix)]
@@ -1378,7 +2526,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                 use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
                 match &ev {
                     McpConnectEvent::Connected { name } => {
-                        renderer.render(UiLine::CommandOutput(format!("✓ MCP server '{}' connected", name)));
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::McpServerConnected { name }).into_owned(),
+                        ));
                         // Register tools from this newly connected server.
                         // Important: do this in a background task so a slow `tools/list`
                         // can't block the TUI event loop and freeze input.
@@ -1388,8 +2538,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                             let name = name.clone();
                             let tx = registry.event_sender();
                             tokio::spawn(async move {
+                                let list_timeout = registry.list_tools_timeout(&name).await;
                                 let server_tools = match tokio::time::timeout(
-                                    Duration::from_secs(15),
+                                    list_timeout,
                                     registry.list_tools_for_server(&name),
                                 )
                                 .await
@@ -1399,8 +2550,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                                         if let Some(tx) = tx {
                                             let _ = tx.send(McpConnectEvent::Warning {
                                                 name,
-                                                message: "tools/list timed out after 15s during auto-registration"
-                                                    .to_string(),
+                                                message: format!(
+                                                    "tools/list timed out after {}s during auto-registration",
+                                                    list_timeout.as_secs()
+                                                ),
                                             });
                                         }
                                         return;
@@ -1413,7 +2566,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                         }
                     }
                     McpConnectEvent::Failed { name, error } => {
-                        renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::McpServerFailed { name, error }).into_owned(),
+                        ));
                     }
                     McpConnectEvent::Warning { name, message } => {
                         // Default: keep MCP startup/runtime noise out of scrollback.
@@ -1462,10 +2617,44 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                 renderer.flush();
             }
 
+            // ── LSP server start / failure ──
+            // Mirrors the MCP arm above. Without this, `LspManager`'s
+            // raw `eprintln!` on a failed server start would land in the
+            // input box (TUI owns the screen, stderr-fd writes hit
+            // wherever the cursor sits — between the cyan rules).
+            // Started → ✓ in scrollback. Failed → ✗ as an Error line.
+            // Warning is non-actionable noise (e.g. shutdown teardown
+            // errors) and routed to the trace log instead.
+            Some(ev) = async {
+                if let Some(rx) = ctx.lsp_connect_rx.as_mut() {
+                    rx.recv().await
+                } else {
+                    None
+                }
+            }, if ctx.lsp_connect_rx.is_some() => {
+                use atomcode_core::lsp::LspConnectEvent;
+                match &ev {
+                    LspConnectEvent::Started { command, ext } => {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LspServerStarted { name: command, ext }).into_owned(),
+                        ));
+                    }
+                    LspConnectEvent::Failed { command, ext, error } => {
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::LspServerFailed { name: command, ext, error }).into_owned(),
+                        ));
+                    }
+                    LspConnectEvent::Warning { ext, message } => {
+                        crate::tuix_trace!("LSP", "ext='{}' warning: {}", ext, message);
+                    }
+                }
+                renderer.flush();
+            }
+
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
-                if upgrade_done { break; }
+                if upgrade_done.is_some() { break; }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
@@ -1487,13 +2676,40 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.runtime_event_rx.recv() => {
-                let Some(runtime_event) = maybe else { break };
-                if runtime_event.runtime_id == ctx.foreground_runtime_id {
-                    let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                    if pre_phase != app.state.phase {
-                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
+            maybe = ctx.agent.event_rx.recv() => {
+                let Some(ev) = maybe else { break };
+                let pre_phase = app.state.phase;
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                if pre_phase != app.state.phase {
+                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
+                }
+                if matches!(app.state.phase, UiPhase::Streaming)
+                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                {
+                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                    last_spinner_draw = std::time::Instant::now();
+                }
+                if matches!(app.state.phase, UiPhase::Idle) {
+                    // Turn just ended — drain the type-ahead queue.
+                    // Pop the oldest queued message, echo as a User
+                    // line, dispatch to the agent, and transition
+                    // back to Streaming. Remaining queue entries
+                    // fire in order on subsequent completions.
+                    if let Some(queued) = app.message_queue.pop_front() {
+                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
+                        renderer.render(UiLine::User(queued.text.clone()));
+                        renderer.flush();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                            text: queued.text,
+                            images: queued.images,
+                            image_markers: queued.image_markers,
+                        }).ok();
+                        app.state.on_submit();
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                    } else {
+                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+
                     }
                     if matches!(app.state.phase, UiPhase::Streaming)
                         && last_spinner_draw.elapsed() >= Duration::from_millis(100)
@@ -1554,9 +2770,29 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             }
         }
 
-        #[cfg(not(unix))]
+        // Was `cfg(not(unix))` to bracket the whole non-Unix select.
+        // Narrowed to `cfg(windows)` because the only arm that needs
+        // this branch (`win_ctrl_c.recv()`) is itself Windows-only,
+        // and tokio's `select!` macro doesn't accept arm-level
+        // `#[cfg(...)]` attributes — it tries to expand them inside
+        // its own ruleset and fails with "no rules expected `#`".
+        // We only support Unix + Windows, so cfg(not(unix)) ≡
+        // cfg(windows) for our build matrix anyway.
+        #[cfg(windows)]
         tokio::select! {
             biased;
+
+            // ── Windows OS-level Ctrl+C ──
+            // Fallback for conhost configurations where the keystroke
+            // never lands in the input buffer. Healthy terminals fire
+            // the keypress arm in `handle_input` first; this only wins
+            // when that path is silent. Single-press exit: skips the
+            // 2-press confirm because if we got here, the user has no
+            // working keyboard route to confirm with anyway.
+            Some(()) = win_ctrl_c.recv() => {
+                crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
+                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+            }
 
             // ── Deferred-render trailing edge ──
             // Drains any InputPrompt / StreamingBox payload the
@@ -1596,7 +2832,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                 use atomcode_core::mcp::{McpConnectEvent, register_mcp_tools_async};
                 match &ev {
                     McpConnectEvent::Connected { name } => {
-                        renderer.render(UiLine::CommandOutput(format!("✓ MCP server '{}' connected", name)));
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::McpServerConnected { name }).into_owned(),
+                        ));
                         // Register tools from this newly connected server (backgrounded).
                         if let Some(registry) = &ctx.mcp_registry {
                             let registry = registry.clone();
@@ -1604,8 +2842,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                             let name = name.clone();
                             let tx = registry.event_sender();
                             tokio::spawn(async move {
+                                let list_timeout = registry.list_tools_timeout(&name).await;
                                 let server_tools = match tokio::time::timeout(
-                                    Duration::from_secs(15),
+                                    list_timeout,
                                     registry.list_tools_for_server(&name),
                                 )
                                 .await
@@ -1615,8 +2854,10 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                                         if let Some(tx) = tx {
                                             let _ = tx.send(McpConnectEvent::Warning {
                                                 name,
-                                                message: "tools/list timed out after 15s during auto-registration"
-                                                    .to_string(),
+                                                message: format!(
+                                                    "tools/list timed out after {}s during auto-registration",
+                                                    list_timeout.as_secs()
+                                                ),
                                             });
                                         }
                                         return;
@@ -1629,7 +2870,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                         }
                     }
                     McpConnectEvent::Failed { name, error } => {
-                        renderer.render(UiLine::Error(format!("✗ MCP server '{}' failed: {}", name, error)));
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::McpServerFailed { name, error }).into_owned(),
+                        ));
                     }
                     McpConnectEvent::Warning { name, message } => {
                         // Default: keep MCP startup/runtime noise out of scrollback.
@@ -1678,10 +2921,44 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
                 renderer.flush();
             }
 
+            // ── LSP server start / failure ──
+            // Mirrors the MCP arm above. Without this, `LspManager`'s
+            // raw `eprintln!` on a failed server start would land in the
+            // input box (TUI owns the screen, stderr-fd writes hit
+            // wherever the cursor sits — between the cyan rules).
+            // Started → ✓ in scrollback. Failed → ✗ as an Error line.
+            // Warning is non-actionable noise (e.g. shutdown teardown
+            // errors) and routed to the trace log instead.
+            Some(ev) = async {
+                if let Some(rx) = ctx.lsp_connect_rx.as_mut() {
+                    rx.recv().await
+                } else {
+                    None
+                }
+            }, if ctx.lsp_connect_rx.is_some() => {
+                use atomcode_core::lsp::LspConnectEvent;
+                match &ev {
+                    LspConnectEvent::Started { command, ext } => {
+                        renderer.render(UiLine::CommandOutput(
+                            crate::i18n::t(crate::i18n::Msg::LspServerStarted { name: command, ext }).into_owned(),
+                        ));
+                    }
+                    LspConnectEvent::Failed { command, ext, error } => {
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::LspServerFailed { name: command, ext, error }).into_owned(),
+                        ));
+                    }
+                    LspConnectEvent::Warning { ext, message } => {
+                        crate::tuix_trace!("LSP", "ext='{}' warning: {}", ext, message);
+                    }
+                }
+                renderer.flush();
+            }
+
             // ── /upgrade progress ──
             Some(ev) = ctx.upgrade_rx.recv() => {
                 handle_upgrade_event(ev, &mut upgrade_last_pct, &mut upgrade_done, &mut ctx, renderer);
-                if upgrade_done { break; }
+                if upgrade_done.is_some() { break; }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
@@ -1703,13 +2980,35 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.runtime_event_rx.recv() => {
-                let Some(runtime_event) = maybe else { break };
-                if runtime_event.runtime_id == ctx.foreground_runtime_id {
-                    let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                    if pre_phase != app.state.phase {
-                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
+            maybe = ctx.agent.event_rx.recv() => {
+                let Some(ev) = maybe else { break };
+                let pre_phase = app.state.phase;
+                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                if pre_phase != app.state.phase {
+                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
+                }
+                if matches!(app.state.phase, UiPhase::Streaming)
+                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                {
+                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                    last_spinner_draw = std::time::Instant::now();
+                }
+                if matches!(app.state.phase, UiPhase::Idle) {
+                    if let Some(queued) = app.message_queue.pop_front() {
+                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
+                        renderer.render(UiLine::User(queued.text.clone()));
+                        renderer.flush();
+                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                            text: queued.text,
+                            images: queued.images,
+                            image_markers: queued.image_markers,
+                        }).ok();
+                        app.state.on_submit();
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                    } else {
+                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
+                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+
                     }
                     if matches!(app.state.phase, UiPhase::Streaming)
                         && last_spinner_draw.elapsed() >= Duration::from_millis(100)
@@ -1751,7 +3050,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<(
     // beyond the interval timer.
     spin_task.abort();
     let _ = ctx.history.save();
-    Ok(())
+
+    // Determine the exit reason. If the upgrade_done flag was set,
+    // the loop exited because /upgrade (or /upgrade rollback) succeeded
+    // and the live binary has been replaced — the caller should re-exec.
+    if let Some(exe) = upgrade_done {
+        Ok(ExitReason::UpgradeRestart { exe })
+    } else {
+        Ok(ExitReason::Normal)
+    }
 }
 
 /// If another atomcode process just ran `/codingplan` (i.e. the shared
@@ -1797,6 +3104,117 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
         *g = None;
     }
     ctx.monitor_last_check_at = None;
+    // Same logic for the usage slot — a cross-process /codingplan
+    // re-sync may also have rotated the quota window. Clear + reset
+    // so the next opportunity fetches fresh.
+    if let Ok(mut g) = ctx.usage_slot.lock() {
+        *g = None;
+    }
+    ctx.usage_last_check_at = None;
+}
+
+/// Common attach-orchestration shared by every "I just got an image
+/// from somewhere" entry point: bracketed-paste with empty payload
+/// (clipboard image), bracketed-paste with file-path payload (iTerm2
+/// Cmd+V on image / Finder drag-and-drop), and the explicit Ctrl+V
+/// keystroke that pulls the clipboard image without going through any
+/// paste event at all (the iTerm2 default-Cmd+V case where iTerm2
+/// sends nothing through the PTY for image-only clipboards).
+///
+/// `img_hash` is the result of whichever provider the caller used —
+/// `None` means no image was found and the caller should fall through
+/// to its own non-image handling. When `Some`, this function takes
+/// over: capability-checks the active model, emits a `[Image #N]`
+/// marker into the input buffer, pushes the image bytes to
+/// `pending_images` (drained at submit), writes the bytes to the
+/// shared image cache so /resume can rehydrate, and triggers a
+/// redraw appropriate to the current phase.
+///
+/// Returns:
+///   - `Ok(true)`  — image was attached OR rejected with an error
+///                    message; caller must `return Ok(())`.
+///   - `Ok(false)` — no image to attach (`img_hash == None`); caller
+///                    continues with its non-image flow.
+fn attach_image_to_input(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    img_hash: Option<(ImagePart, u64)>,
+) -> Result<bool> {
+    let Some((img, hash)) = img_hash else {
+        return Ok(false);
+    };
+    if !ctx.config.can_handle_attached_images() {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport {
+                model: &ctx.model_name,
+            })
+            .into_owned(),
+        ));
+        renderer.flush();
+        if matches!(app.state.phase, UiPhase::Idle) {
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        return Ok(true);
+    }
+    // N comes from `session_image_count` (monotonic across turns), NOT
+    // `pending_images.len()+1` — otherwise turn 1's first paste and
+    // turn 2's first paste would both render as `[Image #1]` in
+    // scrollback, ambiguous when scrolling back.
+    app.state.session_image_count += 1;
+    let n = app.state.session_image_count;
+    app.state.pending_images.push(img.clone());
+    app.state.pending_image_hashes.push(hash);
+    app.state.pending_image_markers.push(n);
+    cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
+    let marker = format!("[Image #{}]", n);
+    app.buf.text.insert_str(app.buf.cursor, &marker);
+    app.buf.cursor += marker.len();
+    if matches!(app.state.phase, UiPhase::Streaming) {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+    } else {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+    }
+    Ok(true)
+}
+
+/// `/paste` slash-command handler. Exists for Windows users whose
+/// Ctrl+V is intercepted by Windows Terminal / conhost before the
+/// keystroke reaches atomcode — the terminal-layer `paste` action
+/// only forwards `CF_UNICODETEXT`, so an image-only clipboard never
+/// triggers the in-app `KeyCode::Char('v') + CONTROL` branch.
+/// `/paste` invokes the same `try_paste_clipboard_image` →
+/// `attach_image_to_input` pipeline directly, bypassing the
+/// terminal's keybinds. Works on every platform — Windows / macOS /
+/// Linux / git-bash — so it doubles as a discoverable backup
+/// regardless of how Ctrl+V is configured locally. Falls back to a
+/// scrollback error line when the clipboard has no image so the
+/// user isn't left wondering whether the command did anything.
+fn handle_paste_command(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+) -> Result<()> {
+    let img_hash = try_paste_clipboard_image();
+    if img_hash.is_none() {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
+        ));
+        renderer.flush();
+        if matches!(app.state.phase, UiPhase::Idle) {
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        return Ok(());
+    }
+    attach_image_to_input(app, ctx, renderer, img_hash)?;
+    Ok(())
 }
 
 fn handle_input(
@@ -1850,12 +3268,41 @@ fn handle_input(
         InputEvent::MouseUp => {
             renderer.end_selection();
         }
-        InputEvent::Resize(cols, rows) => {
+        InputEvent::Resize(mut cols, mut rows) => {
+            // Coalesce burst-fired SIGWINCH events. gnome-terminal /
+            // alacritty / iTerm2 send a Resize per pixel during a
+            // window drag — a 200ms drag fires 30+ events. Without
+            // coalescing each one runs `on_resize` (per-row CUP+EL
+            // wipe + body re-emit + footer repaint), which the user
+            // sees as flicker / 刷屏 (Linux Mint bug report).
+            //
+            // Drain whatever is already queued in `input_rx`:
+            //   - adjacent Resize events collapse to the latest size
+            //     (intermediate sizes are discarded — only the final
+            //     geometry matters)
+            //   - non-Resize events are buffered and dispatched AFTER
+            //     `on_resize` settles, so they read `screen.width()` /
+            //     `screen.height()` at the new geometry rather than
+            //     an in-flight intermediate.
+            //
             // Forward to the renderer so DECSTBM-based backends can
             // re-issue their scroll region and repaint the footer at
             // the new geometry. Fire-and-forget; the render worker
             // serialises this against in-flight content writes.
+            let mut deferred: Vec<InputEvent> = Vec::new();
+            while let Ok(next) = ctx.input_rx.try_recv() {
+                match next {
+                    InputEvent::Resize(w, h) => {
+                        cols = w;
+                        rows = h;
+                    }
+                    other => deferred.push(other),
+                }
+            }
             renderer.on_resize(cols, rows);
+            for ev in deferred {
+                handle_input(app, ctx, renderer, ev)?;
+            }
         }
         InputEvent::Paste(text) => {
             // Route paste to the active modal when one is installed — the
@@ -1877,6 +3324,30 @@ fn handle_input(
             // No modal: paste goes into the type-ahead buffer just like
             // keyboard input (Idle or Streaming, both consume it).
             if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming) {
+                // Image-paste detection — two parallel providers, mutually
+                // exclusive on `text` shape:
+                //   * `text` empty → terminal sent bracketed paste with
+                //     no payload because the system clipboard holds image
+                //     bytes, not text. Pull via `arboard`. Terminals with
+                //     bracketed paste enabled go through here on Cmd+V.
+                //   * `text` non-empty + parses as an image filesystem
+                //     path → iTerm2 Cmd+V on image clipboard (saves to a
+                //     temp file under
+                //     `/var/folders/.../T/com.googlecode.iterm2/` and
+                //     pastes the path instead of bytes), Finder
+                //     drag-and-drop, kitty/wezterm drag-and-drop. Without
+                //     this branch the user just sees the literal path
+                //     string land in their input buffer — Cmd+V on iTerm2
+                //     felt broken vs. Claude Code / Aider, which all do
+                //     this same path-recognition.
+                let image_paste: Option<(ImagePart, u64)> = if text.trim().is_empty() {
+                    try_paste_clipboard_image()
+                } else {
+                    try_attach_image_from_path(&text)
+                };
+                if attach_image_to_input(app, ctx, renderer, image_paste)? {
+                    return Ok(());
+                }
                 app.buf.insert_paste(text);
                 if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(
@@ -1919,6 +3390,23 @@ fn handle_input(
             // Modal trumps phase handlers when it's installed — /model,
             // /provider, /resume all install a modal and the event loop
             // funnels every keystroke through it until it reports Close.
+            //
+            // Exception: Ctrl+C is a global exit shortcut and must NOT
+            // be trappable by any modal. The OnboardingWizard's Intro
+            // screen explicitly promises "Ctrl+C exits anytime" — and
+            // more broadly, the universal keyboard escape hatch should
+            // never depend on whichever modal happens to be open
+            // forwarding it. Dismiss the modal and send Shutdown so
+            // the run-loop tears down cleanly.
+            if matches!(app.state.phase, UiPhase::Idle)
+                && code == KeyCode::Char('c')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && app.active_modal.is_some()
+            {
+                app.active_modal = None;
+                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                return Ok(());
+            }
             if matches!(app.state.phase, UiPhase::Idle) {
                 if let Some(modal) = app.active_modal.as_mut() {
                     let action = modal.handle_key(
@@ -1948,21 +3436,25 @@ fn handle_input(
                                             draft.owner, draft.repo, created.number
                                         )
                                     });
-                                    renderer.render(UiLine::CommandOutput(format!(
-                                        "  [issue] ✔ created #{}: {}\n  {}\n",
-                                        created.number, created.title, shown_url,
-                                    )));
+                                    renderer.render(UiLine::CommandOutput(
+                                        crate::i18n::t(crate::i18n::Msg::IssueCreated {
+                                            number: created.number,
+                                            title: &created.title,
+                                            url: &shown_url,
+                                        }).into_owned(),
+                                    ));
                                 }
                                 Err(e) => {
-                                    renderer.render(UiLine::CommandOutput(format!(
-                                        "  [issue] ✗ create failed: {:#}\n",
-                                        e
-                                    )));
+                                    renderer.render(UiLine::CommandOutput(
+                                        crate::i18n::t(crate::i18n::Msg::IssueCreateFailed {
+                                            error: &format!("{:#}", e),
+                                        }).into_owned(),
+                                    ));
                                 }
                             }
                             renderer.flush();
                         }
-                        // WelcomeWizard signals its follow-up via two bool
+                        // OnboardingWizard signals its follow-up via two bool
                         // flags. Drain one, execute it here — the
                         // CodingPlan flow (which internally handles
                         // OAuth login when needed) needs suspend/resume
@@ -1999,6 +3491,66 @@ fn handle_input(
             // before — those rely on the host terminal's native
             // scrollback). We intercept BEFORE phase dispatch so
             // scrolling works in Idle / Streaming alike.
+
+            // Ctrl+V: pull the system clipboard image and attach as
+            // `[Image #N]` — independent of whether the host terminal
+            // forwarded a Paste event for the keystroke. The status
+            // line hint "Image in clipboard · ctrl+v to paste"
+            // already promises this chord, but iTerm2's default Cmd+V
+            // on an image-only clipboard sends NOTHING through the
+            // PTY (no plaintext to paste, so iTerm2's Paste action
+            // becomes a no-op), which made Cmd+V feel broken vs.
+            // Claude Code on the same setup. Catching the literal
+            // Ctrl+V (\x16, KeyCode::Char('v') + CONTROL) here closes
+            // the gap on every terminal in one place — no per-host
+            // OSC negotiation needed.
+            //
+            // For users who want Cmd+V muscle memory: remap iTerm2's
+            // Cmd+V to "Send: 0x16" in Preferences → Profiles → Keys
+            // → Key Mappings, then Cmd+V → Ctrl+V → this handler.
+            //
+            // Gated to Idle / Streaming. Approval and Suspended don't
+            // accept input; modals (handled above) get first refusal.
+            // Shift / Alt with Ctrl+V are excluded so reserved chords
+            // (e.g. terminal-emulator-defined Ctrl+Shift+V "Paste as
+            // Plain Text") still pass through to whatever else might
+            // bind them in the future.
+            if matches!(
+                app.state.phase,
+                UiPhase::Idle | UiPhase::Streaming
+            ) && code == crossterm::event::KeyCode::Char('v')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
+            {
+                let img_hash = try_paste_clipboard_image();
+                if attach_image_to_input(app, ctx, renderer, img_hash)? {
+                    return Ok(());
+                }
+                // No image — fall back to clipboard text. Reaching this
+                // branch means the host terminal forwarded Ctrl+V as a
+                // real `\x16` key event rather than intercepting it as
+                // bracketed paste or character injection (classic
+                // conhost / older Windows Terminal configs / WT after
+                // the user removed the `paste` keybind per our Windows
+                // docs all hit this path). Without this fallback the
+                // keystroke is silently swallowed and the user's text
+                // paste disappears — a regression from before the
+                // Ctrl+V → image handler existed.
+                //
+                // Routing through `InputEvent::Paste` instead of
+                // `app.buf.insert_paste` directly so we get the modal-
+                // first dispatch, the image-from-path check, and the
+                // Streaming-vs-Idle redraw branching for free.
+                if let Some(text) = try_paste_clipboard_text() {
+                    return handle_input(app, ctx, renderer, InputEvent::Paste(text));
+                }
+                // Empty clipboard — Ctrl+V has no other binding
+                // (key_action::classify maps it to NoOp), so swallow
+                // silently rather than insert a literal `v`.
+                return Ok(());
+            }
+
             if let Some(handled) = handle_scroll_key(code, modifiers, renderer, &app.buf) {
                 if handled {
                     return Ok(());
@@ -2110,10 +3662,33 @@ pub use crate::modals::ProviderWizard;
 /// command with the same name as a built-in) are suppressed.
 fn build_menu_items(
     buf: &str,
+    cursor: usize,
     commands: &CommandRegistry,
     custom: &atomcode_core::commands::CustomCommandRegistry,
     skill_registry: Option<&std::sync::RwLock<atomcode_core::skill::SkillRegistry>>,
+    file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
+    // `@`-mention branch — checked first so it takes priority over any
+    // `/` interpretation.
+    if let (Some(idx), Some(token)) =
+        (file_index, file_index::detect_at_mention(buf, cursor))
+    {
+        let (scope_dir, filter) = file_index::split_token(&token);
+        let entries = idx.filter(&scope_dir, &filter);
+        if entries.is_empty() {
+            return None;
+        }
+        // Show the FULL relative path (including the scope prefix) so the
+        // user always sees where they are. e.g. when scope is `crates/`,
+        // list `crates/atomcode-cli/` not just `atomcode-cli/`.
+        return Some(
+            entries
+                .into_iter()
+                .map(|e| (e.rel_path, String::new()))
+                .collect(),
+        );
+    }
+
     if !buf.starts_with('/') {
         return None;
     }
@@ -2191,7 +3766,12 @@ fn build_menu_items(
     let mut matches: Vec<(String, String)> = commands
         .matching_prefix(rest)
         .into_iter()
-        .map(|c| (c.name.to_string(), c.desc.to_string()))
+        .map(|c| {
+            let desc = crate::commands::cmd_desc_i18n(c.name)
+                .map(|cow| cow.into_owned())
+                .unwrap_or_else(|| c.desc.to_string());
+            (c.name.to_string(), desc)
+        })
         .collect();
     for (name, desc) in custom.command_names_and_descriptions() {
         if name.starts_with(&prefix_lower) && !matches.iter().any(|(n, _)| *n == name) {
@@ -2219,12 +3799,7 @@ fn handle_idle_key(
     let menu_items = if app.buf.is_in_history() {
         None
     } else {
-        build_menu_items(
-            &app.buf.text,
-            &ctx.commands,
-            &ctx.custom_commands,
-            Some(&ctx.skill_registry),
-        )
+        build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
     };
     if let Some(items) = &menu_items {
         // Clamp selection in range.
@@ -2267,7 +3842,44 @@ fn handle_idle_key(
                 );
                 return Ok(());
             }
-            (KeyCode::Enter, m) if !m.contains(crossterm::event::KeyModifiers::SHIFT) => {
+            (KeyCode::Enter | KeyCode::Tab, m)
+                if !m.contains(crossterm::event::KeyModifiers::SHIFT) =>
+            {
+                // Tab and Enter both pick the highlighted entry, but
+                // they diverge on no-arg top-level commands:
+                //   * Enter   → execute immediately (legacy behavior).
+                //   * Tab     → complete only — rewrite the buffer to
+                //               `/name ` and park the cursor, mirroring
+                //               shell tab-completion. The user reviews
+                //               the line and presses Enter to fire.
+                // For @-mentions, `needs_args` commands, and the
+                // `/skills` palette, both keys behave identically
+                // because those branches were already complete-only.
+                // Shift+Enter (hard newline) is excluded by the
+                // modifier guard; crossterm reports Shift+Tab as
+                // `KeyCode::BackTab` so it doesn't match this arm.
+                //
+                // `@`-mention selection: insert `@<full_path> ` at the
+                // token range, with trailing space as terminator.
+                // Backspace on the trailing space lets the user re-open
+                // the menu for drill-down.
+                if !items.is_empty() {
+                    if let Some((at_pos, end)) =
+                        file_index::detect_at_mention_range(&app.buf.text, app.buf.cursor)
+                    {
+                        // `items[selected].0` is the full relative path
+                        // (e.g. `crates/atomcode-cli/`); prepend `@` and a
+                        // trailing space terminator.
+                        let selected_path = items[app.menu.selected].0.clone();
+                        let replacement = format!("@{} ", selected_path);
+                        app.buf.text.replace_range(at_pos..end, &replacement);
+                        app.buf.cursor = at_pos + replacement.len();
+                        app.menu.selected = 0;
+                        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                        return Ok(());
+                    }
+                }
+
                 // Accept the highlighted command. Two shapes:
                 //   * arg-less commands (e.g. /help, /quit, /login) → execute
                 //     immediately on Enter, as before.
@@ -2301,14 +3913,36 @@ fn handle_idle_key(
                     if name == "skills" {
                         if let Some(items) = build_menu_items(
                             &app.buf.text,
+                            app.buf.cursor,
                             &ctx.commands,
                             &ctx.custom_commands,
                             Some(&ctx.skill_registry),
+                            Some(&ctx.file_index),
                         ) {
                             app.menu.selected = 0;
                             redraw_with_menu(&app.buf, &items, 0, &app.state, ctx, renderer);
                             return Ok(());
                         }
+                        // Empty sub-mode: build_menu_items returned None
+                        // for the `/skills ` form, which at this point
+                        // can only mean the registry has zero
+                        // user-invocable skills (the filter is empty —
+                        // we just appended a space — so there's no
+                        // "no matches" case here, only "no skills").
+                        // Without feedback the user sees `/skills `
+                        // with no menu and concludes the feature is
+                        // broken (reported by a Windows user with a
+                        // clean install). Emit a one-time scrollback
+                        // hint pointing at the install paths so they
+                        // know what to do next; keep the buffer at
+                        // `/skills ` so backspace still recovers.
+                        renderer.render(UiLine::CommandOutput(
+                            "  \u{24d8} No user-invocable skills installed yet.\n    \
+                            \u{2022} Drop SKILL.md into ~/.atomcode/skills/<name>/ \n      \
+                              (Windows: %USERPROFILE%\\.atomcode\\skills\\<name>\\)\n    \
+                            \u{2022} Or install a plugin that ships skills via /plugin install <git-url>\n\n"
+                                .into(),
+                        ));
                     }
 
                     redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -2316,31 +3950,63 @@ fn handle_idle_key(
                 }
 
                 // Sub-mode submit: items in the skills palette carry
-                // bare names (e.g. "brainstorming"). Re-prefix with
-                // `/skills ` so dispatch routes through the `skills`
-                // arm in execute_slash_command, which performs the
-                // registry lookup + expand.
+                // bare names (e.g. "brainstorming"). Mirror the
+                // `needs_args` branch above — Enter from the palette
+                // auto-completes to `/skills <name> ` and parks the
+                // cursor at the end so the user can append args
+                // (passed to `/use_skill` as `argument`). A second
+                // Enter (with or without args) commits through the
+                // regular BufferResult::Commit path. Without this,
+                // skills always fired without args, and there was no
+                // way to pass `argument` into the skill from the
+                // picker.
                 let in_skills_sub_mode = app.buf.text.starts_with("/skills ");
-                let committed = if in_skills_sub_mode {
-                    format!("/skills {}", name)
-                } else {
-                    format!("/{}", name)
-                };
+                if in_skills_sub_mode {
+                    app.buf.text = format!("/skills {} ", name);
+                    app.buf.cursor = app.buf.text.len();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
+
+                // Top-level no-arg command (e.g. /quit, /help).
+                // Tab → complete-only: insert `/name ` and park the
+                // cursor so the user can review/edit before pressing
+                // Enter to fire. The trailing space causes
+                // build_menu_items to hide the menu on the next redraw
+                // (parse_slash_line treats `/name ` as a fully-named
+                // command with empty arg).
+                if code == KeyCode::Tab {
+                    app.buf.text = format!("/{} ", name);
+                    app.buf.cursor = app.buf.text.len();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                    return Ok(());
+                }
+
+                // Enter: execute immediately, as before.
+                let committed = format!("/{}", name);
                 renderer.render(UiLine::ClearTransient);
                 renderer.render(UiLine::User(committed.clone()));
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(
-                        cmd,
-                        arg,
-                        &mut app.state,
-                        ctx,
-                        renderer,
-                        &mut app.active_modal,
-                        &mut app.fixissue_pending,
-                        &mut app.fixissue_buffer,
-                    )?;
+                    if cmd.eq_ignore_ascii_case("paste") {
+                        // `/paste` needs `&mut app.buf` to insert the
+                        // `[Image #N]` marker at the cursor, which the
+                        // `execute_slash_command` signature doesn't
+                        // expose; short-circuit to the local handler.
+                        handle_paste_command(app, ctx, renderer)?;
+                    } else {
+                        execute_slash_command(
+                            cmd,
+                            arg,
+                            &mut app.state,
+                            ctx,
+                            renderer,
+                            &mut app.active_modal,
+                            &mut app.fixissue_pending,
+                            &mut app.fixissue_buffer,
+                        )?;
+                    }
                     if matches!(app.state.phase, UiPhase::Idle) {
                         redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                     }
@@ -2379,8 +4045,55 @@ fn handle_idle_key(
         return Ok(());
     }
 
+    // Ctrl+V: try clipboard image first, fall back to text paste.
+    if code == KeyCode::Char('v') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if let Some((img, hash)) = try_paste_clipboard_image() {
+            // Refuse to attach an image when there is no path for it to
+            // reach a vision-capable model — neither the active provider
+            // accepts images, nor a vision_preprocessor is configured to
+            // OCR them first. Without this gate, sending burns a turn on
+            // a 400 from the upstream's param validator (e.g.
+            // ModelArts.81001 "message[N].content[0] has invalid
+            // field(s): text, type" for GLM-5.1). Helper in
+            // `Config::can_handle_attached_images`.
+            if !ctx.config.can_handle_attached_images() {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::ModelNoImageSupport {
+                        model: &ctx.model_name,
+                    })
+                    .into_owned(),
+                ));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            // Insert the `[Image #N]` marker into the input buffer at
+            // cursor — same pattern as `insert_paste` for long text.
+            // The marker echoes through to scrollback on submit; image
+            // bytes are stashed in `pending_images` and drained then.
+            // N comes from `session_image_count` (monotonic across
+            // turns), NOT `pending_images.len()+1` — otherwise turn 1's
+            // first paste and turn 2's first paste would both render as
+            // `[Image #1]` in scrollback, ambiguous when scrolling back.
+            app.state.session_image_count += 1;
+            let n = app.state.session_image_count;
+            app.state.pending_images.push(img.clone());
+            app.state.pending_image_hashes.push(hash);
+            app.state.pending_image_markers.push(n);
+            cache_write_image(&crate::platform::image_cache_dir(), &img, hash);
+            let marker = format!("[Image #{}]", n);
+            app.buf.text.insert_str(app.buf.cursor, &marker);
+            app.buf.cursor += marker.len();
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            return Ok(());
+        }
+        // No image in clipboard — fall through to normal key handling
+        // (the `v` char will be inserted as a regular character via classify).
+    }
+
     let action = classify(code, modifiers);
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
         "KEY",
         "idle result={} buf_len={} cursor={}",
@@ -2408,12 +4121,7 @@ fn handle_idle_key(
             let items = if app.buf.is_in_history() {
                 None
             } else {
-                build_menu_items(
-                    &app.buf.text,
-                    &ctx.commands,
-                    &ctx.custom_commands,
-                    Some(&ctx.skill_registry),
-                )
+                build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
             };
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
@@ -2433,14 +4141,17 @@ fn handle_idle_key(
             }
         }
         BufferResult::Commit(line) => {
-            // Expand paste placeholders so the agent sees full content
-            // while the echoed user line and history stay compact.
-            let expanded = app.buf.expand_pastes(&line);
             renderer.render(UiLine::ClearTransient);
-            renderer.render(UiLine::User(line.clone()));
             app.buf.text.clear();
             app.buf.cursor = 0;
-            app.buf.clear_pastes();
+            // NB: `app.buf.clear_pastes()` is deferred until AFTER the
+            // submit path calls `expand_pastes(&line)` — wiping the
+            // paste Vec here used to leave `expand_pastes` with
+            // nothing to substitute, so the agent received the raw
+            // `[Pasted #N +M lines]` placeholder instead of the
+            // pasted body and answered "I don't see any pasted
+            // content". Mirrors the queue branch below which already
+            // clears AFTER expansion.
             app.menu.selected = 0;
             // Only treat `/name …` as a slash command when `name` is
             // actually registered. Unrecognised `/foo …` (e.g. the user
@@ -2459,29 +4170,106 @@ fn handle_idle_key(
                         .unwrap_or(false)
             });
             if let Some((cmd, arg)) = as_slash {
-                execute_slash_command(
-                    cmd,
-                    arg,
-                    &mut app.state,
-                    ctx,
-                    renderer,
-                    &mut app.active_modal,
-                    &mut app.fixissue_pending,
-                    &mut app.fixissue_buffer,
-                )?;
+                // Slash commands carry no image markers — echo the
+                // user line as-typed, before dispatch.
+                renderer.render(UiLine::User(line.clone()));
+                if cmd.eq_ignore_ascii_case("paste") {
+                    // See `handle_paste_command` — short-circuited
+                    // here because the dispatcher signature can't
+                    // hand it `&mut app.buf`.
+                    handle_paste_command(app, ctx, renderer)?;
+                } else {
+                    execute_slash_command(
+                        cmd,
+                        arg,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                        &mut app.fixissue_pending,
+                        &mut app.fixissue_buffer,
+                    )?;
+                }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 }
+                // Slash commands don't consume pastes (they take a
+                // single short arg, not a pasted body), but the submit
+                // semantically consumes the buffer — drop them so the
+                // next message starts with a clean paste registry.
+                app.buf.clear_pastes();
             } else {
-                ctx.history.push(line.clone());
+                // Hydrate recalled attachments BEFORE echoing the user
+                // line, so `[Image #N]` markers in the visible body
+                // match the renumbered markers that the
+                // `└ [Image #N]` post-submit echo (and the actual
+                // submit payload) use. Without this, an arrow-up
+                // recall + edit would render `[Image #1]` in the body
+                // while the echo + payload carry `[Image #2]` — the
+                // user reasonably reads that as a bug ("two different
+                // numbers for the same image").
+                let cache_dir = crate::platform::image_cache_dir();
+                let mut line = line; // shadow as mutable so hydrate can rewrite it
+                for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
+                    renderer.render(UiLine::Warning(n));
+                }
+                renderer.render(UiLine::User(line.clone()));
+                let expanded = app.buf.expand_pastes(&line);
+                // Pastes have now been substituted into `expanded`;
+                // safe to drop the registry. Doing it any earlier
+                // (e.g. up at the buf.text.clear() prep) was the
+                // exact bug that made the agent see only the
+                // `[Pasted #N]` placeholder.
+                app.buf.clear_pastes();
                 // Cache the full expanded form before dispatch. If the
                 // user hits Ctrl+C / Esc mid-stream, `handle_streaming_key`
                 // takes this Option and restores it to `app.buf.text`
                 // so the cancelled message can be edited and resent.
                 app.state.last_submitted_message = Some(expanded.clone());
+                // Only attach images whose `[Image #N]` marker survived
+                // editing — if the user deleted the marker from the input
+                // buffer, the corresponding image must not be sent. Echo
+                // the kept images as `└ [Image #N]` sub-lines so scrollback
+                // shows what was actually sent.
+                let pending = std::mem::take(&mut app.state.pending_images);
+                let pending_markers = std::mem::take(&mut app.state.pending_image_markers);
+                let pending_hashes = std::mem::take(&mut app.state.pending_image_hashes);
+                let mut images: Vec<ImagePart> = Vec::with_capacity(pending.len());
+                let mut kept_markers: Vec<usize> = Vec::with_capacity(pending.len());
+                let mut kept_refs: Vec<crate::input::history::HistoryImageRef> =
+                    Vec::with_capacity(pending.len());
+                // Use the marker `n` recorded at paste time, NOT the index.
+                // Once `session_image_count` became monotonic, paste-time
+                // markers diverge from positional indices — using the index
+                // would silently drop every image after the first turn that
+                // had a paste.
+                for ((img, n), hash) in pending
+                    .into_iter()
+                    .zip(pending_markers.into_iter())
+                    .zip(pending_hashes.into_iter())
+                {
+                    if line.contains(&format!("[Image #{}]", n)) {
+                        renderer.render(UiLine::ImageAttachment(n));
+                        kept_refs.push(crate::input::history::HistoryImageRef {
+                            hash: format!("{:016x}", hash),
+                            mt: img.media_type.clone(),
+                            n,
+                        });
+                        images.push(img);
+                        kept_markers.push(n);
+                    }
+                }
+                ctx.history.push(crate::input::history::HistoryEntry {
+                    text: line.clone(),
+                    images: kept_refs,
+                });
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage(expanded))
+                    .send(AgentCommand::SendMessage {
+                        text: expanded,
+                        images,
+                        image_markers: kept_markers,
+                    })
                     .ok();
                 app.state.on_submit();
                 // CodingPlan drift check — fire before every turn sent
@@ -2518,7 +4306,7 @@ fn handle_idle_key(
             } else {
                 app.exit_pending = Some(now);
                 renderer.render(UiLine::CommandOutput(
-                    "  (press Ctrl+C again to exit)\n".into(),
+                    crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
                 ));
                 renderer.flush();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
@@ -2536,30 +4324,108 @@ fn redraw_with_menu(
     ctx: &LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
+    let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
+        crate::render::MenuKind::AtMention
+    } else {
+        crate::render::MenuKind::SlashCommand
+    };
     let payload = crate::render::MenuPayload {
         items: items.to_vec(),
         selected,
+        kind,
     };
+    let attachments = compute_input_attachments(state, &buf.text);
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         menu: Some(payload),
         status: build_status(state, ctx),
+        attachments,
     });
     renderer.flush();
+}
+
+/// Synchronize `state.pending_recalled_attachments` with whatever
+/// history entry the buffer is currently showing. Called after every
+/// `buf.apply()` so:
+///   - HistoryPrev/Next sets the recalled attachments to the new entry
+///   - Insert/Delete (which clear `history_idx` to None) only drop the
+///     refs whose `[Image #N]` marker is no longer in `buf.text`. A
+///     user who arrow-up'd a `[Image #1]这是什么？` entry and then
+///     appended `还有一个问题` should keep the image attached on
+///     submit — the marker is still there, so `hydrate_recalled_attachments`
+///     can still match it. Wiping wholesale (the prior behaviour) sent
+///     the literal `[Image #1]` as text and silently dropped the bytes.
+pub(crate) fn sync_recalled_attachments(
+    state: &mut UiState,
+    buf: &Buffer,
+    history: &[crate::input::history::HistoryEntry],
+) {
+    match buf.history_idx() {
+        Some(i) if i < history.len() => {
+            state.pending_recalled_attachments = history[i].images.clone();
+        }
+        _ => {
+            state
+                .pending_recalled_attachments
+                .retain(|r| buf.text.contains(&format!("[Image #{}]", r.n)));
+        }
+    }
 }
 
 /// Idle prompt without any menu/picker — used by the common
 /// "Redraw" path and the post-event-loop fallback after an agent
 /// event returns the UI to Idle.
 fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    let attachments = compute_input_attachments(state, &buf.text);
     renderer.render(UiLine::InputPrompt {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
         menu: None,
         status: build_status(state, ctx),
+        attachments,
     });
     renderer.flush();
+}
+
+/// True iff startup should auto-open the OnboardingWizard:
+/// no providers configured AND no OAuth login on disk AND we're
+/// running in an interactive renderer. Plain mode (CI / pipe /
+/// non-TTY) falls through to the "no provider configured" status
+/// hint instead — the bordered-panel wizard can't sensibly run
+/// without a human watching keystrokes.
+pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
+    if ctx.is_plain_renderer {
+        return false;
+    }
+    ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none()
+}
+
+/// Extract current + latest version from the `ALREADY_LATEST` error
+/// body. The shape is fixed by `self_update.rs`:
+///   `already on {current} (latest is {latest}). Pass --force to reinstall.`
+/// Returns None if the format ever drifts — caller falls back to "?"
+/// placeholders so the localized sentence still renders cleanly.
+fn parse_already_latest_versions(s: &str) -> Option<(&str, &str)> {
+    let after_on = s.strip_prefix("already on ")?;
+    let (current, rest) = after_on.split_once(" (latest is ")?;
+    let latest = rest.strip_suffix(". Pass --force to reinstall.")?;
+    let latest = latest.strip_suffix(')')?;
+    Some((current, latest))
+}
+
+#[cfg(test)]
+mod parse_already_latest_versions_tests {
+    use super::parse_already_latest_versions;
+    #[test]
+    fn extracts_both_versions() {
+        let s = "already on v4.22.2 (latest is v4.22.2). Pass --force to reinstall.";
+        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.2", "v4.22.2")));
+    }
+    #[test]
+    fn rejects_unrelated_strings() {
+        assert!(parse_already_latest_versions("something else entirely").is_none());
+    }
 }
 
 /// Redraw after running a slash command. If the command installed a
@@ -2627,7 +4493,7 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 .send(AgentCommand::ReloadConfig(ctx.config.clone()));
         }
         Err(e) => {
-            renderer.render(UiLine::Error(format!("config save failed: {}", e)));
+            renderer.render(UiLine::Error(crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed { error: &format!("{}", e) }).into_owned()));
             renderer.flush();
         }
     }
@@ -2676,7 +4542,7 @@ fn handle_streaming_key(
         let status = if app.state.show_tool_output {
             "  ○ Verbose mode enabled (tool output + reasoning visible) (Ctrl+O to hide)\n"
         } else {
-            "  ◯ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
+            "  ○ Verbose mode disabled (Ctrl+O to show tool output + reasoning)\n"
         };
         renderer.render(UiLine::CommandOutput(status.to_string()));
         renderer.flush();
@@ -2715,12 +4581,7 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(
-        &app.buf.text,
-        &ctx.commands,
-        &ctx.custom_commands,
-        Some(&ctx.skill_registry),
-    );
+    let menu_items = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index));
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -2771,17 +4632,14 @@ fn handle_streaming_key(
     }
 
     let action = classify(code, modifiers);
-    match app.buf.apply(action, ctx.history.entries(), &ctx.commands) {
+    let apply_result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
+    sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
+    match apply_result {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(
-                &app.buf.text,
-                &ctx.commands,
-                &ctx.custom_commands,
-                Some(&ctx.skill_registry),
-            ) {
+            if let Some(items) = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)) {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
@@ -2847,11 +4705,53 @@ fn handle_streaming_key(
                 );
                 return Ok(());
             }
-            // Expand any paste placeholders — agent sees full payload,
-            // scrollback echo stays compact.
+            // Hydrate recalled attachments BEFORE building the queue
+            // payload — same prelude as the idle submit path, so a user
+            // who pressed ↑ during streaming sees their recalled images
+            // travel with the queued message instead of being silently
+            // dropped on dispatch.
+            let mut line = line;
+            let cache_dir_for_hydrate = crate::platform::image_cache_dir();
+            for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir_for_hydrate) {
+                renderer.render(UiLine::Warning(n));
+            }
             let expanded = app.buf.expand_pastes(&line);
-            ctx.history.push(line.clone());
-            app.message_queue.push_back(expanded);
+            // Mirror the main submit path's image filtering: only
+            // attachments whose `[Image #N]` marker survived editing
+            // travel with this submission, both into the queue
+            // payload and into the persisted history entry.
+            let pending = std::mem::take(&mut app.state.pending_images);
+            let pending_markers = std::mem::take(&mut app.state.pending_image_markers);
+            let pending_hashes = std::mem::take(&mut app.state.pending_image_hashes);
+            let mut q_images: Vec<ImagePart> = Vec::with_capacity(pending.len());
+            let mut q_markers: Vec<usize> = Vec::with_capacity(pending.len());
+            let mut q_refs: Vec<crate::input::history::HistoryImageRef> =
+                Vec::with_capacity(pending.len());
+            for ((img, n), hash) in pending
+                .into_iter()
+                .zip(pending_markers.into_iter())
+                .zip(pending_hashes.into_iter())
+            {
+                if line.contains(&format!("[Image #{}]", n)) {
+                    renderer.render(UiLine::ImageAttachment(n));
+                    q_refs.push(crate::input::history::HistoryImageRef {
+                        hash: format!("{:016x}", hash),
+                        mt: img.media_type.clone(),
+                        n,
+                    });
+                    q_images.push(img);
+                    q_markers.push(n);
+                }
+            }
+            ctx.history.push(crate::input::history::HistoryEntry {
+                text: line.clone(),
+                images: q_refs,
+            });
+            app.message_queue.push_back(crate::state::QueuedMessage {
+                text: expanded,
+                images: q_images,
+                image_markers: q_markers,
+            });
             crate::tuix_trace!("QUE", "push_back len={}", app.message_queue.len());
             app.buf.text.clear();
             app.buf.cursor = 0;
@@ -2901,7 +4801,7 @@ fn handle_approval_key(
             ctx.agent.cmd_tx.send(AgentCommand::DenyTool).ok();
             app.state.on_approval_resolved();
             renderer.render(UiLine::CommandOutput(
-                "  (press Ctrl+C again to exit)\n".into(),
+                crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
             ));
             renderer.flush();
         }
@@ -2995,7 +4895,7 @@ pub(super) fn handle_plugin_job_event(
 pub(super) fn handle_upgrade_event(
     ev: atomcode_core::self_update::UpgradeEvent,
     last_pct: &mut i32,
-    done: &mut bool,
+    done: &mut Option<std::path::PathBuf>,
     ctx: &mut LoopCtx,
     renderer: &mut dyn Renderer,
 ) {
@@ -3003,7 +4903,9 @@ pub(super) fn handle_upgrade_event(
     match ev {
         UpgradeEvent::ManifestFetched { version } => {
             *last_pct = -1;
-            renderer.render(UiLine::CommandOutput(format!("  最新版本: {}\n", version)));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeManifestFetched { version: &version }).into_owned(),
+            ));
         }
         UpgradeEvent::Downloading { bytes, total } => {
             let pct = if total == 0 {
@@ -3017,53 +4919,73 @@ pub(super) fn handle_upgrade_event(
                 // progress would flood the append-only renderer with lines
                 // since there's no in-place update here.
                 if pct == 25 || pct == 50 || pct == 75 || pct == 100 {
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  下载中 {}% ({} / {} bytes)\n",
-                        pct, bytes, total
-                    )));
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::UpgradeDownloading { pct, bytes, total }).into_owned(),
+                    ));
                 }
             }
         }
         UpgradeEvent::Verifying => {
-            renderer.render(UiLine::CommandOutput("  正在校验 SHA256\n".into()));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeVerifying).into_owned(),
+            ));
         }
         UpgradeEvent::Replacing => {
-            renderer.render(UiLine::CommandOutput("  正在替换二进制文件\n".into()));
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeReplacing).into_owned(),
+            ));
         }
-        UpgradeEvent::Done { version, backup } => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "\n✓ 已升级到 {}（旧版本保留为 {}）\n  请退出后重新运行 `atomcode` 以加载新版本。\n",
-                version,
-                backup.display()
-            )));
+        UpgradeEvent::Done { version, backup, exe } => {
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeDone {
+                    version: &version,
+                    backup: &backup.display().to_string(),
+                }).into_owned(),
+            ));
             // Push the hint in the status bar to match the new reality —
             // the little "↑ vX" arrow goes away for this session.
             if let Ok(mut g) = ctx.update_hint.lock() {
                 *g = None;
             }
-            *done = true;
+            // Store the *original* exe path so `re_exec_self` uses it
+            // instead of `current_exe()` (which on Windows returns the
+            // renamed `.atomcode.rolling` after `replace_binary`).
+            *done = Some(exe);
             // Tell the agent to shut down so the loop exits cleanly.
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
         UpgradeEvent::Failed(msg) => {
             if msg.contains(atomcode_core::self_update::ALREADY_LATEST) {
-                // Already latest — informational, not an error.
-                let info = msg.replace(
+                // Friendly path — not an error, just "nothing to do".
+                // self_update.rs's anyhow!() error is fixed-format
+                // English: "already on {current} (latest is {latest}).
+                // Pass --force to reinstall." Pull the two version
+                // strings out so each locale formats the full sentence
+                // itself instead of pasting English into a translated
+                // wrapper.
+                let friendly = msg.replace(
                     &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
                     "",
                 );
-                renderer.render(UiLine::CommandOutput(format!("  {}", info)));
+                let (current, latest) = parse_already_latest_versions(&friendly)
+                    .unwrap_or(("?", "?"));
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::UpgradeAlreadyLatest { current, latest }).into_owned(),
+                ));
             } else {
-                renderer.render(UiLine::Error(format!("升级失败: {}", msg)));
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::UpgradeFailed { error: &msg }).into_owned(),
+                ));
             }
         }
         UpgradeEvent::RolledBack { exe, backup } => {
-            renderer.render(UiLine::CommandOutput(format!(
-                "\n✓ 已回滚。当前二进制: {}；另一版本保存在 {}\n  请退出后重新运行 `atomcode` 加载回滚版本。\n",
-                exe.display(),
-                backup.display()
-            )));
-            *done = true;
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::UpgradeRolledBack {
+                    exe: &exe.display().to_string(),
+                    backup: &backup.display().to_string(),
+                }).into_owned(),
+            ));
+            *done = Some(exe);
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         }
     }
@@ -3114,13 +5036,23 @@ fn handle_agent_event(
             name,
             arguments,
         } => {
-            // Emit the ▸ line immediately so users can see what command
-            // is running, especially for long-running bash commands.
-            // The line will be shown before the command completes.
             let detail = format_tool_detail(&name, &arguments);
             let display = display_tool_name(&name);
 
-            // Close any in-flight assistant line before emitting the tool call.
+            // If this call is part of an active batch, the
+            // ToolBatchStarted handler already rendered the group header
+            // + child rows — skip the standalone ▸ ToolCallInFlight
+            // line. Still record into `pending_tools` so the matching
+            // ToolCallResult knows the display name + detail and skips
+            // its own ▸ render too.
+            if state.call_id_to_batch.contains_key(&id) {
+                pending_tools.insert(id, (display.clone(), detail, true));
+                state.on_tool_call_started(&display);
+                return;
+            }
+
+            // Emit the ▸ line immediately so users can see what command
+            // is running, especially for long-running bash commands.
             renderer.render(UiLine::AssistantLineBreak);
             renderer.render(UiLine::ToolCallInFlight {
                 id: id.clone(),
@@ -3149,6 +5081,64 @@ fn handle_agent_event(
             success,
             ..
         } => {
+            // If this call belongs to an active batch, the group header
+            // already accounts for it; emit a single-line `  ↳ ✓ / ✗`
+            // child completion and skip the full ▸ + ⎿ body render.
+            // The model still gets the full output via the ToolResult
+            // message in the conversation. Task 1.3 will upgrade this
+            // to in-place checkmarks on the existing child rows instead
+            // of appending new lines.
+            if let Some(batch_id) = state.call_id_to_batch.get(&call_id).cloned() {
+                // CC-style result-data update: `⎿ Read(mod.rs) → 200 lines`.
+                // The result snippet is generic line count of the
+                // output (works across read/grep/glob/bash without
+                // per-tool extraction). Failure shows `→ ✗` so the
+                // user can spot the broken child without reading
+                // bytes-of-output.
+                //
+                // Renderer's ToolGroupChildUpdate finds the row by
+                // call_id and CUPs to its terminal position. Falls
+                // back to no-op if the group has been frozen —
+                // model still gets the full ToolResult through the
+                // conversation.
+                // └ (U+2514 Box Drawing), → (U+2192 Arrows), ✗ (U+2717
+                // Dingbats), ● (U+25CF Geometric Shapes): all in WGL4 so
+                // every Windows monospace font (Consolas, NSimSun,
+                // Cascadia, Microsoft YaHei) ships them. Hardcoded —
+                // no `unicode_symbols` ASCII fallback — matching
+                // `alt_screen::push_tool_call`'s ● treatment for visual
+                // parity between batched and single tool-call paths.
+                let child_glyph = "\u{2514}";
+                let arrow = "\u{2192}";
+                let suffix = if success {
+                    let n = output.lines().count().max(1);
+                    let unit = if n == 1 { "line" } else { "lines" };
+                    format!(" {} {} {}", arrow, n, unit)
+                } else {
+                    format!(" {} \u{2717}", arrow)
+                };
+                // Reuse the original Tool(arg) prefix the
+                // ToolBatchStarted handler painted. pending_tools
+                // holds (display, detail) — strip the previous "name
+                // detail" join and rebuild as Short(detail) for
+                // visual consistency with the initial child row.
+                let prefix = pending_tools
+                    .remove(&call_id)
+                    .map(|(_, det, _)| format!(
+                        "{}({})",
+                        display_tool_name_short(&name),
+                        det
+                    ))
+                    .unwrap_or_else(|| display_tool_name_short(&name));
+                renderer.render(UiLine::ToolGroupChildUpdate {
+                    batch_id,
+                    call_id: call_id.clone(),
+                    new_text: format!("  {} {}{}", child_glyph, prefix, suffix),
+                });
+                renderer.flush();
+                return;
+            }
+
             // Close any in-flight assistant line before emitting the pair.
             renderer.render(UiLine::AssistantLineBreak);
             // Freeze the animated in-flight tool-call row to its final
@@ -3176,47 +5166,85 @@ fn handle_agent_event(
                 display_name
             };
 
+            // ParallelEditFiles already streamed a per-task line tree
+            // and an aggregate summary line via the SubAgentDispatch*
+            // events — the ToolResult body would just repeat the same
+            // info as a markdown table, doubling vertical space and
+            // truncating mid-word at terminal boundaries. Skip both
+            // the ▸ tool-call line and the ⎿ result line; the model
+            // still receives full output via the ToolResult message
+            // in the conversation.
+            let suppress_body_echo = name == "parallel_edit_files";
+
             // Only emit the tool-call line here if ApprovalNeeded didn't
             // already render it — otherwise we'd print it twice.
-            if !call_rendered {
+            if !call_rendered && !suppress_body_echo {
                 renderer.render(UiLine::ToolCall {
                     name: safe_name.clone(),
                     detail: detail.clone(),
                 });
             }
-            let summary = summarise(&output, success);
-            renderer.render(UiLine::ToolResult { success, summary });
+            if !suppress_body_echo {
+                let summary = summarise(&output, success);
+                renderer.render(UiLine::ToolResult { success, summary });
+            }
             // Collect diff lines into a single batch — N individual
             // DiffLine renders each trigger a full footer redraw and
             // tens of KB of ANSI, which blocks the event loop long
             // enough to stall the spinner during edit tool results.
-            let diff_entries: Vec<crate::render::DiffEntry> = output
-                .lines()
-                .take(120)
-                .filter_map(|line| {
-                    if let Some(rest) = line.strip_prefix("+ ") {
-                        Some(crate::render::DiffEntry {
-                            added: true,
-                            text: rest.to_string(),
-                        })
-                    } else if let Some(rest) = line.strip_prefix("- ") {
-                        Some(crate::render::DiffEntry {
-                            added: false,
-                            text: rest.to_string(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !diff_entries.is_empty() {
-                renderer.render(UiLine::DiffBlock(diff_entries));
+            //
+            // Gated on edit-class tools because the `+ ` / `- ` line
+            // detection is purely textual: markdown bullet lists
+            // (`- item`) inside non-edit tool outputs trip the same
+            // pattern. The deepseek-v4-flash screenshot symptom was a
+            // 162-line `UseSkill(brainstorming)` template — every `- `
+            // bullet got rendered as a removed-diff line and the whole
+            // skill body leaked into the scrollback. Restricting to
+            // tools that actually emit diff payloads (`edit_file`,
+            // `write_file`, `create_file`, `search_replace`) closes
+            // that without losing the diff render where it's wanted.
+            let emits_diff = matches!(
+                name.as_str(),
+                "edit_file" | "write_file" | "create_file" | "search_replace"
+            );
+            if emits_diff {
+                let diff_entries: Vec<crate::render::DiffEntry> = output
+                    .lines()
+                    .take(120)
+                    .filter_map(|line| {
+                        if let Some(rest) = line.strip_prefix("+ ") {
+                            Some(crate::render::DiffEntry {
+                                added: true,
+                                text: rest.to_string(),
+                            })
+                        } else if let Some(rest) = line.strip_prefix("- ") {
+                            Some(crate::render::DiffEntry {
+                                added: false,
+                                text: rest.to_string(),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !diff_entries.is_empty() {
+                    renderer.render(UiLine::DiffBlock(diff_entries));
+                }
             }
-            // Show hint for bash commands if real-time output is disabled
-            // Display AFTER the result so user sees the command first
+            // Show hint for bash commands if real-time output is disabled.
+            // Display AFTER the result so user sees the command first.
+            // Trailing `\n` is intentional: `push_body_text` splits on
+            // `\n` and the empty chunk after the `\n` pushes ONE blank
+            // row, which becomes the breathing-room separator between
+            // consecutive bash blocks. Without it adjacent bash results
+            // visually run together (screenshot 47.png) and the eye
+            // can't tell where one block ends and the next begins.
+            // The previous over-correction (screenshot 44 → 47) showed
+            // that "looks like 2 blank lines" is just font line-height
+            // padding — the actual row count is 1, which is correct.
             if name == "bash" && !state.show_tool_output {
                 renderer.render(UiLine::CommandOutput(
-                    "  ◯ Press Ctrl+O to show real-time output\n".to_string(),
+                    "  ○ Press Ctrl+O to show real-time output\n".to_string(),
                 ));
             }
             renderer.flush();
@@ -3306,10 +5334,14 @@ fn handle_agent_event(
             pending_tools.clear();
             let done = state.next_done_label();
             let dur = crate::render::fmt_dur(duration);
-            let label = format!(
-                "✓ {} · {} rounds · {} tools · {} · {} tokens",
-                done, turn_count, tool_call_count, dur, total_tokens
-            );
+            let label = crate::i18n::t(crate::i18n::Msg::TurnSummary {
+                done,
+                turn_count,
+                tool_call_count,
+                duration: &dur,
+                total_tokens,
+            })
+            .into_owned();
             renderer.render(UiLine::TurnSeparator { label });
             renderer.flush();
             state.on_turn_complete();
@@ -3330,6 +5362,24 @@ fn handle_agent_event(
             // find it after a clean exit — the whole point of sessions.
             persist_current_session(ctx, messages);
 
+            // CodingPlan usage refresh — fire after each completed turn
+            // (with cooldown) so the right-aligned hint reflects the
+            // tokens the turn just consumed. Gated to CodingPlan users
+            // only; non-CodingPlan paths skip all network activity.
+            if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                let cooled = ctx
+                    .usage_last_check_at
+                    .map(|t| t.elapsed() >= usage_monitor::USAGE_COOLDOWN)
+                    .unwrap_or(true);
+                if cooled {
+                    ctx.usage_last_check_at = Some(std::time::Instant::now());
+                    usage_monitor::spawn_check(
+                        ctx.usage_slot.clone(),
+                        ctx.wake_tx.clone(),
+                    );
+                }
+            }
+
             // fixissue post-run side effects — only on successful TurnComplete
             // (TurnCancelled / Error arms below clear `fixissue_pending`
             // without posting). Takes the IssueRef out so only this turn's
@@ -3344,7 +5394,7 @@ fn handle_agent_event(
                 } else {
                     match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &body) {
                         Ok(()) => renderer.render(UiLine::CommandOutput(format!(
-                            "  [fixissue] ✔ posted summary + applied 'fixed' label to issue #{}\n",
+                            "  [fixissue] ✓ posted summary + applied 'fixed' label to issue #{}\n",
                             issue_ref.number
                         ))),
                         Err(e) => renderer.render(UiLine::CommandOutput(format!(
@@ -3414,6 +5464,58 @@ fn handle_agent_event(
             // aborted turn is another way to leave `<think>` half-open.
             think.reset();
         }
+        AgentEvent::Warning(w) => {
+            // Non-fatal — flush a yellow advisory line and let the turn
+            // continue. Don't touch state/think/buffers; the warning is
+            // purely informational. Used today for the OpenAI provider's
+            // truncation detector (`prompt_tokens` reported by the proxy
+            // is implausibly low for the body we sent).
+            renderer.render(UiLine::Warning(w));
+            renderer.flush();
+        }
+        AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
+            // Format here (not in agent) so we can localize / restyle
+            // without bumping the AgentEvent contract. Char count helps
+            // users notice degenerate near-zero VL outputs that would
+            // mislead the main model into "image failed" responses.
+            let msg = crate::i18n::t(crate::i18n::Msg::VisionPreprocessSuccess { char_count })
+                .into_owned();
+            renderer.render(UiLine::VisionPreprocessSuccess {
+                msg,
+                model: vl_key,
+            });
+            renderer.flush();
+        }
+        AgentEvent::RestorePendingImages { images, markers } => {
+            // VL preprocessing failed — re-attach the user's images to
+            // the input state so they can retry without re-pasting from
+            // clipboard. The `[Image #N]` text marker is gone (lives in
+            // the conversation history echo at this point), so the user
+            // typically UP-recalls or retypes the caption + Enter to
+            // resubmit. The attached image bytes ride along automatically
+            // with the next submit.
+            //
+            // Hash table is rebuilt as best-effort: we hash the base64
+            // payload (not raw RGBA), which means a fresh clipboard copy
+            // of the same image won't dedupe against this restored entry.
+            // Minor UX nit, not a correctness issue.
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            // markers length should match images length (agent passed them
+            // back); zip is best-effort if it doesn't (truncates).
+            for (img, marker) in images.into_iter().zip(markers.into_iter()) {
+                let mut hasher = DefaultHasher::new();
+                img.data.hash(&mut hasher);
+                let h = hasher.finish();
+                cache_write_image(&crate::platform::image_cache_dir(), &img, h);
+                state.pending_image_hashes.push(h);
+                state.pending_images.push(img);
+                state.pending_image_markers.push(marker);
+            }
+            // Don't redraw — TUI is in Streaming phase here (turn isn't
+            // over yet); the next idle/streaming redraw picks up the new
+            // pending state on its own.
+        }
         AgentEvent::TokenUsage(u) => {
             state.prompt_tokens += u.prompt_tokens;
             state.completion_tokens += u.completion_tokens;
@@ -3473,25 +5575,210 @@ fn handle_agent_event(
                 }
             }
         }
-        AgentEvent::SubAgentProgress { .. } => {}
-        AgentEvent::BackgroundComplete {
-            summary,
-            files_edited,
-            turns,
-            success,
-        } => {
-            let header = if success {
-                format!(
-                    "  Background task complete ({} turn{}):\n",
-                    turns,
-                    if turns == 1 { "" } else { "s" }
-                )
+        AgentEvent::ToolBatchStarted { batch_id, calls } => {
+            // Header label: "Reading 4 files in parallel" when all calls
+            // share a tool name (common case for batched read_file /
+            // grep / glob); otherwise generic "Running 4 tools in
+            // parallel". No tech-stack hardcoding — tool names come from
+            // the model's own tool_calls.name.
+            let count = calls.len();
+            let unique_names: std::collections::HashSet<&str> =
+                calls.iter().map(|c| c.name.as_str()).collect();
+            // Generic header — no per-tool verb table inside the
+            // framework. Same-name batches surface the model's own
+            // tool name; mixed batches use "tools". This avoids
+            // a `match tool_name { "bash" => "Running" ... }` table
+            // that drifts whenever new tools land or models invent
+            // names (mcp.foo, custom plugins).
+            let label = if unique_names.len() == 1 {
+                let single = unique_names.iter().next().copied().unwrap_or("tool");
+                format!("Running {} {} calls in parallel", count, single)
             } else {
-                format!(
-                    "  Background task failed after {} turn{}:\n",
-                    turns,
-                    if turns == 1 { "" } else { "s" }
-                )
+                format!("Running {} tools in parallel", count)
+            };
+            // Header alone — child rows are NOT pre-rendered. Each
+            // child surfaces as a `  ↳ ✓ name` line when its
+            // ToolCallResult arrives. Trade-off:
+            // - PRO: zero duplication; children "trickle in" as they
+            //   complete, so user sees real progress on slow batches
+            //   (4 reads finishing within 1s look near-atomic; a 4-call
+            //   batch where 3 are fast + 1 is `cargo check` shows the
+            //   slow tail clearly).
+            // - PRO: avoids the retained-renderer's "in-place mutation
+            //   of older body rows" problem (rows already scrolled into
+            //   native terminal scrollback can't be modified).
+            // - CON: user doesn't see batch contents until first child
+            //   completes. Acceptable: footer spinner conveys "working",
+            //   contents become visible immediately on first result.
+            // Glyphs: ● (BLACK CIRCLE U+25CF) for batch header,
+            // └ (BOX DRAWINGS LIGHT UP AND RIGHT U+2514) for each
+            // child row. Picked over ⏺/⎿ because Cascadia Code
+            // (Windows VSCode default) renders ⏺ as a flat oval and
+            // ⎿ as a backslash-shaped fallback -- both are widely
+            // supported monospace glyphs that survive the same fonts
+            // where the dental-symbols block tofu's. Aligns with the
+            // single-tool-call ● glyph (retained::ToolCall arm) so
+            // batched and single calls share one visual anchor, and
+            // with `└` for tool-result rows below the call. Both
+            // glyphs are in WGL4 (Consolas, NSimSun, Cascadia, Microsoft
+            // YaHei all ship them), so no `unicode_symbols` ASCII
+            // fallback — matches `alt_screen::push_tool_call`'s
+            // hardcoded ● for visual parity between batched and single
+            // tool-call paths.
+            let head_glyph = "\u{25cf}";
+            let child_glyph = "\u{2514}";
+            // Build header + child rows; renderer keeps the group
+            // "live" while it's the bottom of body_lines, so each
+            // ToolCallResult below can update the matching child row
+            // in place (CC-style result data light-up).
+            //
+            // Child format: `⎿ Read(mod.rs)`. Tool name is the short
+            // form (Read not ReadFile); detail is wrapped in parens
+            // (Tool(arg) reads as a function call, mirroring CC).
+            let header_text = format!("{} {}", head_glyph, label);
+            let children: Vec<crate::render::ToolGroupChild> = calls
+                .iter()
+                .map(|c| crate::render::ToolGroupChild {
+                    call_id: c.id.clone(),
+                    text: format!(
+                        "  {} {}({})",
+                        child_glyph,
+                        display_tool_name_short(&c.name),
+                        format_tool_detail(&c.name, &c.arguments)
+                    ),
+                })
+                .collect();
+            renderer.render(UiLine::AssistantLineBreak);
+            renderer.render(UiLine::ToolGroupRender {
+                batch_id: batch_id.clone(),
+                header: header_text,
+                children,
+            });
+            renderer.flush();
+
+            let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
+            for cid in &call_ids {
+                state
+                    .call_id_to_batch
+                    .insert(cid.clone(), batch_id.clone());
+            }
+            state.active_tool_batches.insert(
+                batch_id.clone(),
+                crate::state::ActiveToolBatch { call_ids },
+            );
+        }
+        AgentEvent::ToolBatchCompleted {
+            batch_id,
+            ok: _,
+            total: _,
+            elapsed_ms: _,
+        } => {
+            // CC-style: NO standalone batch-summary row. Each child
+            // row already shows its own `→ N lines` / `→ ✗`, so an
+            // aggregate `batch 4/4 ok · Xs wall` line would just be
+            // visual noise repeating what's already visible above.
+            //
+            // SubAgentDispatchEnd (different code path) STILL emits
+            // its `▸ ParallelEditFiles · ...` summary because sub-agent
+            // turns/elapsed per-task is hidden by Task 3's collapse —
+            // that summary is the only place the user can see how
+            // long it took.
+            //
+            // Just clear batch state so subsequent per-call events
+            // fall back to the standard single-tool render path.
+            if let Some(b) = state.active_tool_batches.remove(&batch_id) {
+                for cid in b.call_ids {
+                    state.call_id_to_batch.remove(&cid);
+                }
+            }
+        }
+        AgentEvent::SubAgentDispatchStart { tasks } => {
+            // Header line: announce the dispatch. The model gets this
+            // same fact in the ToolResult; the UI line tells the user
+            // "the wait is intentional, not a hang". Per-task running/
+            // done lines are suppressed (Task 3 — CC alignment); the
+            // footer spinner conveys mid-flight progress, the
+            // DispatchEnd summary lands the final count.
+            renderer.render(UiLine::CommandOutput(format!(
+                "Dispatching {} sub-agents in parallel...",
+                tasks.len()
+            )));
+            renderer.flush();
+            state.on_sub_agent_dispatch_start(tasks);
+        }
+        AgentEvent::SubAgentTaskStarted { index: _ } => {
+            // Per-task running lines suppressed for CC-style collapsed
+            // view. State tracking still happens via DispatchStart's
+            // task list. Nothing to render here.
+        }
+        AgentEvent::SubAgentTaskDone { index: _, elapsed_ms: _, turns: _, summary: _ } => {
+            // Per-task done lines suppressed — final count shows in
+            // DispatchEnd summary. Still tick the counter so the
+            // aggregate `N/M ok` reflects this completion.
+            state.on_sub_agent_task_done();
+        }
+        AgentEvent::SubAgentTaskFailed { index, elapsed_ms, turns: _, reason } => {
+            // Failures KEEP their per-task line. Rationale: the user
+            // needs to know which sub-agent failed for diagnosis;
+            // collapsing into "1 fail" leaves them blind. Successes
+            // collapse silently (no actionable info per success).
+            state.on_sub_agent_task_failed();
+            if let Some(info) = state.sub_agent_tasks.get(index) {
+                let cross = "\u{2717}";
+                let short_reason = reason.lines().next().unwrap_or("").trim();
+                renderer.render(UiLine::CommandOutput(format!(
+                    "  {} {}{} — {} · {}",
+                    cross,
+                    info.path,
+                    info.dedup_suffix,
+                    fmt_elapsed(elapsed_ms),
+                    if short_reason.is_empty() { "failed" } else { short_reason }
+                )));
+                renderer.flush();
+            }
+        }
+        AgentEvent::SubAgentDispatchEnd => {
+            // Compute the aggregate before clearing state. This is the
+            // single line that replaces the old multi-row pipe-table
+            // result block — the model still sees the full breakdown
+            // in the ToolResult content, but the UI only needs the
+            // bottom line.
+            let total = state.sub_agent_total;
+            let failed = state.sub_agent_failed;
+            let ok = total.saturating_sub(failed);
+            let elapsed = state
+                .sub_agent_started_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            if total > 0 {
+                let arrow = "\u{25cf}";
+                let summary = if failed == 0 {
+                    format!(
+                        "{} ParallelEditFiles · {}/{} ok · {} wall",
+                        arrow,
+                        ok,
+                        total,
+                        fmt_elapsed(elapsed)
+                    )
+                } else {
+                    format!(
+                        "{} ParallelEditFiles · {} ok · {} fail · {} wall",
+                        arrow,
+                        ok,
+                        failed,
+                        fmt_elapsed(elapsed)
+                    )
+                };
+                renderer.render(UiLine::ToolGroupSummary { text: summary });
+                renderer.flush();
+            }
+            state.on_sub_agent_dispatch_end();
+        }
+        AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
+            let header = if success {
+                crate::i18n::t(crate::i18n::Msg::BackgroundComplete { turns }).into_owned()
+            } else {
+                crate::i18n::t(crate::i18n::Msg::BackgroundFailed { turns }).into_owned()
             };
             let mut body = String::from(&header);
             body.push_str("  ");
@@ -3500,7 +5787,7 @@ fn handle_agent_event(
                 body.push('\n');
             }
             if !files_edited.is_empty() {
-                body.push_str("  Files edited:\n");
+                body.push_str(&crate::i18n::t(crate::i18n::Msg::BackgroundFilesEdited));
                 for f in &files_edited {
                     body.push_str(&format!("    - {}\n", f));
                 }
@@ -3646,6 +5933,28 @@ mod session_naming_tests {
 /// Build the persistent status line shown directly below the input box.
 /// Pulls model name from ctx, cwd from ctx.working_dir (with $HOME
 /// collapsed to `~`), and running token count from state.
+/// Probe the system clipboard for an image, memoising the result inside
+/// the supplied cache for `CLIPBOARD_HINT_TTL_MS`. `build_status` calls
+/// this on every redraw, so without caching every spinner tick (~12/s
+/// during streaming) would round-trip to the platform clipboard API.
+const CLIPBOARD_HINT_TTL_MS: u64 = 1500;
+
+fn clipboard_image_hash(cache: &std::sync::Mutex<ClipboardCheckState>) -> Option<u64> {
+    let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = state
+        .last_checked
+        .map(|t| t.elapsed() >= std::time::Duration::from_millis(CLIPBOARD_HINT_TTL_MS))
+        .unwrap_or(true);
+    if stale {
+        state.image_hash = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_image())
+            .ok()
+            .map(|img| rgba_fingerprint(img.width, img.height, img.bytes.as_ref()));
+        state.last_checked = Some(std::time::Instant::now());
+    }
+    state.image_hash
+}
+
 pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::StatusLine {
     let cwd = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
     // Priority:
@@ -3658,17 +5967,48 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     let no_provider =
         ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none();
     // Priority: no-provider (Warning red) > CodingPlan drift monitor
-    // (both ModelMissing and StaleList render as Warning red — model
-    // list drift is an actionable UX event worth the same visual weight
-    // as "active model gone") > upgrade banner (Info dim).
-    // Only one hint can render at a time (right-aligned on the status row).
+    // (Warning red) > CodingPlan token-usage hint (Info ≥80%, Warning
+    // ≥95%) > upgrade banner (Info dim). Usage outranks upgrade because
+    // ">80% in this rolling window" is more actionable than "new
+    // version available". Only one hint renders at a time (right-aligned
+    // on the status row).
     let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
         Some((
-            "no provider · /provider to configure".into(),
+            crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
     } else if let Some(warning) = ctx.monitor_warning.lock().ok().and_then(|g| g.clone()) {
         Some((warning.display_text(), crate::render::HintSeverity::Warning))
+    } else if let Some(usage) =
+        usage_monitor::build_usage_hint(&ctx.usage_slot, &ctx.config.default_provider)
+    {
+        Some(usage)
+    } else if let Some(h) = clipboard_image_hash(&ctx.clipboard_check)
+        .filter(|h| !state.pending_image_hashes.contains(h))
+    {
+        // Transient cue — beats the upgrade banner because the action
+        // window is "now" (the image is in the clipboard right now).
+        // Suppressed when the clipboard's image fingerprint matches one
+        // already in `pending_images`: the input box already shows
+        // `[Image #N]`, prompting another paste of the same image would
+        // just attach a dup. A NEW image (different fingerprint) appears
+        // here as a fresh hint so the user can attach it too.
+        let _ = h;
+        // Windows Terminal / conhost swallow Ctrl+V (they bind it to
+        // their own `paste` action that only forwards CF_UNICODETEXT,
+        // so an image-only clipboard never reaches the in-app
+        // handler). Surface the `/paste` fallback on Windows; macOS /
+        // Linux terminals pass Ctrl+V through cleanly, so they keep
+        // the snappier keybind hint.
+        let hint_msg = if cfg!(target_os = "windows") {
+            crate::i18n::Msg::StatusClipboardImageHintSlash
+        } else {
+            crate::i18n::Msg::StatusClipboardImageHint
+        };
+        Some((
+            crate::i18n::t(hint_msg).into_owned(),
+            crate::render::HintSeverity::Info,
+        ))
     } else {
         ctx.update_hint
             .lock()
@@ -3676,7 +6016,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .and_then(|g| g.clone())
             .map(|v| {
                 (
-                    format!("↑ {} 使用/upgrade升级", v),
+                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned(),
                     crate::render::HintSeverity::Info,
                 )
             })
@@ -3686,15 +6026,36 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // line reads as a glitch. Replace with an explicit placeholder so the
     // user sees the state, not a rendering artifact.
     let model = if no_provider {
-        "(not configured)".to_string()
+        crate::i18n::t(crate::i18n::Msg::StatusModelNotConfigured).into_owned()
     } else {
         ctx.model_name.clone()
+    };
+    // Mode indicator: only rendered when the user has explicitly
+    // switched away from the default Build mode. Plan disables file
+    // edits + shell, so making it prominent in the status line guards
+    // against the user being confused why the agent refuses to write
+    // files. Default Build = None, no visual noise.
+    let mode_indicator = match state.agent_mode {
+        crate::state::AgentMode::Plan => Some("PLAN".to_string()),
+        crate::state::AgentMode::Build => None,
+    };
+    // Pull current ctx usage from the last ContextStats emission. Pre-
+    // first-turn `last_context` is None — render shows nothing then.
+    // Using `sent_tokens` (what was actually sent to the model on the
+    // last turn) instead of cumulative `total_tokens` because the user
+    // cares about "how close to overflow am I", not "how many tokens
+    // has this session burned in total". See render::StatusLine docs.
+    let (ctx_used, ctx_window) = match state.last_context.as_ref() {
+        Some(snap) => (snap.sent_tokens, snap.ctx_window),
+        None => (0, 0),
     };
     crate::render::StatusLine {
         model,
         cwd,
-        total_tokens: state.total_tokens,
+        ctx_used,
+        ctx_window,
         hint,
+        mode_indicator,
     }
 }
 
@@ -3716,16 +6077,16 @@ fn draw_spinner_now(
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
-    let menu = build_menu_items(
-        &buf.text,
-        &ctx.commands,
-        &ctx.custom_commands,
-        Some(&ctx.skill_registry),
-    )
-    .map(|items| {
+    let menu = build_menu_items(&buf.text, buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
-        crate::render::MenuPayload { items, selected }
+        let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
+            crate::render::MenuKind::AtMention
+        } else {
+            crate::render::MenuKind::SlashCommand
+        };
+        crate::render::MenuPayload { items, selected, kind }
     });
+    let attachments = compute_input_attachments(state, &buf.text);
     renderer.render(UiLine::StreamingBox {
         buf: buf.text.clone(),
         cursor_byte: buf.cursor,
@@ -3733,6 +6094,7 @@ fn draw_spinner_now(
         label,
         status,
         menu,
+        attachments,
     });
     renderer.flush();
 }
@@ -3745,7 +6107,11 @@ fn draw_spinner_now(
 fn format_spinner_label(state: &UiState, queue_len: usize) -> String {
     let base = &state.spinner_label;
     let mut out = format!("{}{}", base, state.ellipsis());
-    if let Some(d) = state.turn_elapsed() {
+    // Phase elapsed (NOT total turn elapsed) — `Pondering… 8s`,
+    // `Running ReadFile… 4s`. CC behaviour: timer resets on every
+    // phase transition so the user reads "this thing has been
+    // running for N seconds", not "the whole turn so far is 1301s".
+    if let Some(d) = state.phase_elapsed() {
         out.push_str(&format!(" · {}", crate::render::fmt_dur(d)));
     }
     if queue_len > 0 {
@@ -3768,6 +6134,29 @@ pub fn display_tool_name(snake: &str) -> String {
         }
     }
     out
+}
+
+/// CC-style short tool name. Strips the redundant `_file` /
+/// `_directory` / `_files` suffixes (the noun is implicit from the
+/// arg) before PascalCase conversion. Generic — no per-tool match
+/// arms; works for any future tool that follows the
+/// `<verb>_<noun>` convention.
+///
+/// Examples:
+/// - `read_file` → `Read`
+/// - `write_file` → `Write`
+/// - `list_directory` → `List`
+/// - `parallel_edit_files` → `ParallelEdit`
+/// - `bash` → `Bash` (no suffix to strip)
+/// - `search_replace` → `SearchReplace` (suffix `_replace` not in
+///    strip list, kept verbatim → preserves disambiguation)
+pub fn display_tool_name_short(snake: &str) -> String {
+    const STRIP_SUFFIXES: &[&str] = &["_files", "_file", "_directory"];
+    let trimmed = STRIP_SUFFIXES
+        .iter()
+        .find_map(|s| snake.strip_suffix(s))
+        .unwrap_or(snake);
+    display_tool_name(trimmed)
 }
 
 pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
@@ -3852,6 +6241,18 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             }
             String::new()
         }
+    }
+}
+
+/// Render an `elapsed_ms` value as `XmYs` (over 60 s) or `Ts` (under).
+/// Tens of milliseconds aren't useful for the UI; whole seconds match
+/// what users see on a wall clock and align column-wise across rows.
+pub(crate) fn fmt_elapsed(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    if total_secs >= 60 {
+        format!("{}m{}s", total_secs / 60, total_secs % 60)
+    } else {
+        format!("{}s", total_secs)
     }
 }
 

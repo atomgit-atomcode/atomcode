@@ -76,19 +76,13 @@ impl CtxBuilder for OllamaCtx {
         crate::ctx::render::build_messages(conv, &sys, self.ctx_window, turn_reminder)
     }
 
-    /// 更早触发压缩:35% 阈值,而非 Default 的 50%。
+    /// 复用 ctx::render::needs_compression — 它的绝对 headroom 公式
+    /// `ctx_window - min(13K, ctx_window/4)` 在小窗口下天然偏紧
+    /// (8K Ollama → 6K threshold = 75% 触发, 比之前的 35% 晚但更接近"撑爆前一刻"的真实 headroom)。
+    /// 之前的 35% hardcoded 阈值是为 4-8K Ollama 量身的早触发, 但在
+    /// 16K-32K Ollama 上反而过早。新公式自适应窗口大小, 不再需要单独的 Ollama tier。
     fn needs_compression(&self, conv: &Conversation, system_tokens: usize) -> bool {
-        // 消息少于 12 条不压,和 ctx::render::needs_compression 保持一致
-        if conv.messages.len() < 12 {
-            return false;
-        }
-        let total: usize = system_tokens
-            + conv
-                .messages
-                .iter()
-                .map(|m| m.estimate_tokens())
-                .sum::<usize>();
-        total > self.ctx_window * 35 / 100
+        crate::ctx::render::needs_compression(conv, system_tokens, self.ctx_window)
     }
 
     fn compression_plan(&self, conv: &Conversation) -> Option<(String, usize)> {
@@ -156,7 +150,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        }
+
+}
     }
 
     #[test]

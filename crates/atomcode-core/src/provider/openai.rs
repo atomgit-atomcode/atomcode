@@ -32,6 +32,12 @@ pub struct OpenAiProvider {
     /// `ProviderConfig::reasoning_history` at construction so bad values
     /// fail early at load time with a clear error, not silently mid-turn.
     reasoning_history_override: Option<ReasoningPolicy>,
+    /// Whether the active model accepts image inputs. Drives `MultiPart`
+    /// serialisation: vision-capable → OpenAI image_url schema, text-only
+    /// → flat string. Computed once from `ProviderConfig::accepts_images()`
+    /// at construction; a `/model` switch rebuilds the provider so this
+    /// stays in sync with the live config.
+    supports_vision: bool,
 }
 
 impl OpenAiProvider {
@@ -69,6 +75,7 @@ impl OpenAiProvider {
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
+            supports_vision: config.accepts_images(),
         })
     }
 
@@ -126,9 +133,18 @@ impl OpenAiProvider {
         Some(serde_json::Value::Object(obj))
     }
 
+    /// `supports_vision` toggles how `MessageContent::MultiPart` historical
+    /// turns are serialised. When the target model accepts images, the
+    /// content is emitted as the OpenAI vision schema (array of
+    /// `image_url` + `text` blocks). When it doesn't (text-only proxies
+    /// like GLM-5.1 on ModelArts), `MultiPart` is degraded to a flat
+    /// string — keeps the conversation replayable across `/model`
+    /// switches between vision-capable and text-only providers without
+    /// throwing the upstream's `invalid field(s): text, type` 400.
     fn format_messages(
         messages: &[Message],
         reasoning_policy: ReasoningPolicy,
+        supports_vision: bool,
     ) -> Vec<serde_json::Value> {
         messages
             .iter()
@@ -169,6 +185,10 @@ impl OpenAiProvider {
                         text,
                         tool_calls,
                         reasoning_content,
+                        // Anthropic-only field; OpenAI-style endpoints don't
+                        // accept `thinking` content blocks. We persist them
+                        // for cross-provider switches but don't emit here.
+                        thinking_blocks: _,
                     } => {
                         if tool_calls.is_empty() {
                             // No tool calls — send as plain assistant text
@@ -238,6 +258,37 @@ impl OpenAiProvider {
                             })
                             .collect::<Vec<_>>());
                         Some(msg)
+                    }
+                    MessageContent::MultiPart { text, images } => {
+                        if supports_vision {
+                            let mut parts: Vec<serde_json::Value> = Vec::new();
+                            for img in images {
+                                parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!(
+                                            "data:{};base64,{}",
+                                            img.media_type, img.data
+                                        ),
+                                    }
+                                }));
+                            }
+                            if let Some(t) = text {
+                                parts.push(json!({"type": "text", "text": t}));
+                            }
+                            Some(json!({"role": "user", "content": parts}))
+                        } else {
+                            // Degrade to text-only — the model's wire schema
+                            // doesn't support image blocks. The user's
+                            // caption survives (and already has `[Image #N]`
+                            // markers from the input buffer); the image bytes
+                            // simply aren't representable here.
+                            let content = match text {
+                                Some(t) if !t.is_empty() => t.clone(),
+                                _ => "[image attached]".to_string(),
+                            };
+                            Some(json!({"role": "user", "content": content}))
+                        }
                     }
                     MessageContent::ToolResult(r) => {
                         if r.call_id.is_empty() {
@@ -350,7 +401,7 @@ impl LlmProvider for OpenAiProvider {
         let url = normalize_base_url(&self.base_url);
         let mut body = json!({
             "model": self.model,
-            "messages": Self::format_messages(messages, self.reasoning_history_policy()),
+            "messages": Self::format_messages(messages, self.reasoning_history_policy(), self.supports_vision),
             "stream": true,
             "stream_options": { "include_usage": true },
             "max_tokens": self.max_tokens,
@@ -382,49 +433,150 @@ impl LlmProvider for OpenAiProvider {
             body["thinking"] = th;
         }
 
-        let request = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body);
-
         let policy = crate::provider::retry::RetryPolicy::default_policy();
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // ── TEMP WIRE-DUMP (debug only) ────────────────────────────────
+        // Set ATOMCODE_WIRE_DUMP=1 to dump every outbound LLM request body
+        // to ~/.atomcode/wire-dump/<timestamp>.json so we can verify what
+        // litellm / the proxy actually receives. Used to diagnose
+        // "tool_call results appear empty to the model" — comparing the
+        // wire body's `messages[N].content` against the conversation
+        // snapshot proves whether atomcode or the proxy is the source of
+        // truncation. Remove once root-caused.
+        if std::env::var("ATOMCODE_WIRE_DUMP").ok().as_deref() == Some("1") {
+            if let Ok(home) = std::env::var("HOME") {
+                let dir = std::path::PathBuf::from(home).join(".atomcode/wire-dump");
+                let _ = std::fs::create_dir_all(&dir);
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+                    .unwrap_or_else(|_| "0".to_string());
+                let path = dir.join(format!("{}.json", ts));
+                if let Ok(serialized) = serde_json::to_string_pretty(&body) {
+                    let _ = std::fs::write(&path, serialized);
+                }
+            }
+        }
+        // ────────────────────────────────────────────────────────────────
+
+        // Provider truncation detector input: char count of message contents
+        // and tool_call arguments. We compare this to provider-reported
+        // prompt_tokens; if the ratio is way above any tokenizer can
+        // explain, the proxy is silently dropping content (e.g. GitCode
+        // litellm's hidden ~6.2K cap on glm-5 — 5/8 atomgr session).
+        let body_content_chars = sum_message_content_chars(&body);
+
+        // Move the pieces needed to rebuild the request into the task — the
+        // outer mid-stream retry loop reconstructs the builder on each
+        // attempt because `RequestBuilder` is single-use.
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let provider_label = self.model.clone();
+
         tokio::spawn(async move {
-            let response = match crate::provider::retry::send_with_retry(request, &policy).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    let _ = tx.send(Ok(StreamEvent::Error(format!("Connection failed: {}", e))));
+            // Mid-stream retry: when the provider opens the stream but the
+            // chunked body errors out BEFORE any SSE `data:` line is parsed,
+            // it's safe to redo the whole request — no text/tool-call has
+            // been committed to the conversation, no UI delta has been
+            // emitted. Common cause: self-hosted endpoints that reset the
+            // connection at request open under load (the failure mode
+            // `error decoding response body` surfaces as). Once `data:` has
+            // been seen, retry would produce duplicated output, so the
+            // error is surfaced verbatim with a humanised explanation.
+            const MAX_STREAM_ATTEMPTS: u32 = 2;
+            let mut attempt: u32 = 0;
+            'retry: loop {
+                attempt += 1;
+                let request = client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&body);
+
+                let response = match crate::provider::retry::send_with_retry(request, &policy).await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        let _ = tx.send(Ok(StreamEvent::Error(format!(
+                            "Connection failed: {}",
+                            e
+                        ))));
+                        return;
+                    }
+                };
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let resp_url = response.url().to_string();
+                    let body = response.text().await.unwrap_or_default();
+                    let _ = tx.send(Ok(StreamEvent::Error(format!(
+                        "API error ({}) at `{}`:\n{}",
+                        status, resp_url, body
+                    ))));
                     return;
                 }
-            };
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let resp_url = response.url().to_string();
-                let body = response.text().await.unwrap_or_default();
-                let _ = tx.send(Ok(StreamEvent::Error(format!(
-                    "API error ({}) at `{}`:\n{}",
-                    status, resp_url, body
-                ))));
-                return;
-            }
+                // Per-attempt local state. Reset on each retry so a partial
+                // first attempt's accumulated bytes don't leak into the
+                // second attempt's parser.
+                let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
+                let mut buffer = String::new();
+                let mut byte_stream = response.bytes_stream();
 
-            // Use byte buffer to properly handle UTF-8 characters that span chunk boundaries
-            let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
-            let mut buffer = String::new();
-            let mut byte_stream = response.bytes_stream();
-            // Track multiple tool calls by index: Vec<(id, name, args)>
-            let mut tool_calls: Vec<(String, String, String)> = Vec::new();
-            // Track the last usage report — some providers (DeepSeek) send cumulative
-            // usage in every chunk, so we only emit the final value.
-            let mut last_usage: Option<crate::stream::TokenUsage> = None;
-            let mut saw_data_line = false;
-            let mut saw_valid_chunk = false;
-            let mut invalid_chunk_samples: Vec<String> = Vec::new();
+                // ── TEMP RESPONSE WIRE-DUMP (debug only) ──────────────
+                // Pairs with the request dump — captures the raw SSE
+                // bytes coming back so we can verify whether litellm /
+                // proxy returns a standard OpenAI stream format. Files
+                // are named with `_resp` suffix to pair with the
+                // request dump preceding them. Bytes are appended so
+                // multi-chunk streams accumulate into one file.
+                let resp_dump_path: Option<std::path::PathBuf> =
+                    if std::env::var("ATOMCODE_WIRE_DUMP").ok().as_deref() == Some("1") {
+                        std::env::var("HOME").ok().map(|home| {
+                            let dir = std::path::PathBuf::from(home).join(".atomcode/wire-dump");
+                            let _ = std::fs::create_dir_all(&dir);
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+                                .unwrap_or_else(|_| "0".to_string());
+                            dir.join(format!("{}_resp.sse", ts))
+                        })
+                    } else {
+                        None
+                    };
+                // ────────────────────────────────────────────────────────
+                let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+                let mut last_usage: Option<crate::stream::TokenUsage> = None;
+                let mut saw_data_line = false;
+                let mut saw_valid_chunk = false;
+                let mut invalid_chunk_samples: Vec<String> = Vec::new();
+                // Track how much real content the stream actually
+                // produced. Used by the abrupt-close branch below to
+                // distinguish:
+                //   * many chunks + much content → real mid-output
+                //     truncation (table cut, list mid-row, …) → keep
+                //     emitting Done(truncated=true) so the agent's
+                //     "resume where you left off" retry can fire.
+                //   * 0-2 chunks, short text, no tool calls → gateway
+                //     streamed a single error blob like 「请求负载
+                //     过高，请稍后再试」 and hung up. NOT a real
+                //     truncation; emit StreamEvent::Error so the
+                //     agent's rate-limit / failure path takes over
+                //     instead of looping the resume retry.
+                let mut content_chunks: usize = 0;
+                let mut accumulated_content = String::new();
+                // One-shot guard: if the provider's prompt_tokens looks
+                // implausibly low for our content size, log a warning once
+                // per request stream so we don't spam.
+                let mut truncation_warned = false;
+                // Held-back Done event: GitCode-style gateways emit usage
+                // in a chunk AFTER finish_reason. We capture finish_reason
+                // here, keep parsing for the trailing usage chunk, and
+                // emit this on `[DONE]` (or stream end) so token counters
+                // and the truncation detector see real numbers.
+                let mut pending_finish: Option<crate::stream::StreamEvent> = None;
 
             loop {
                 // 120s idle timeout: if no data arrives for 2 minutes, treat as dead connection.
@@ -446,10 +598,33 @@ impl LlmProvider for OpenAiProvider {
 
                 match chunk {
                     Ok(bytes) => {
+                        // TEMP wire-dump (response side): append raw
+                        // bytes as they arrive so we can inspect the
+                        // exact SSE stream litellm sent back.
+                        if let Some(ref p) = resp_dump_path {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(p)
+                            {
+                                let _ = f.write_all(&bytes);
+                            }
+                        }
                         byte_buffer.extend_from_slice(&bytes);
                     }
                     Err(e) => {
-                        let _ = tx.send(Ok(StreamEvent::Error(e.to_string())));
+                        // Safe-to-retry condition: stream opened but no SSE
+                        // `data:` line was parsed yet. Common with
+                        // self-hosted endpoints that open the response,
+                        // immediately fail to start streaming, and reset
+                        // the chunked body — at this point nothing has
+                        // been committed downstream, so a fresh request
+                        // is equivalent to a first attempt.
+                        if !saw_data_line && attempt < MAX_STREAM_ATTEMPTS {
+                            continue 'retry;
+                        }
+                        let _ = tx.send(Ok(StreamEvent::Error(humanise_stream_error(&e))));
                         return;
                     }
                 }
@@ -485,7 +660,14 @@ impl LlmProvider for OpenAiProvider {
                             if let Some(usage) = last_usage.take() {
                                 let _ = tx.send(Ok(StreamEvent::Usage(usage)));
                             }
-                            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                            // Emit the held-back Done from finish_reason if present;
+                            // otherwise default to a non-truncated Done (e.g. providers
+                            // that close the stream with [DONE] but never emit a
+                            // finish_reason field).
+                            let done = pending_finish
+                                .take()
+                                .unwrap_or(StreamEvent::Done { truncated: false });
+                            let _ = tx.send(Ok(done));
                             return;
                         }
                         if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
@@ -504,8 +686,28 @@ impl LlmProvider for OpenAiProvider {
                                             .and_then(|d| d.cached_tokens)
                                     })
                                     .unwrap_or(0);
+                                let pt = usage.prompt_tokens.unwrap_or(0);
+                                if !truncation_warned {
+                                    if let Some(ratio) =
+                                        check_truncation(body_content_chars, pt)
+                                    {
+                                        truncation_warned = true;
+                                        let msg = format!(
+                                            "Provider may be truncating input on \
+                                             model={}: {} content chars vs {} reported \
+                                             prompt_tokens (ratio {:.1} chars/token; \
+                                             normal mixed-content runs 2-4). If turns \
+                                             spiral, the proxy may be capping context.",
+                                            provider_label,
+                                            body_content_chars,
+                                            pt,
+                                            ratio,
+                                        );
+                                        let _ = tx.send(Ok(StreamEvent::Warning(msg)));
+                                    }
+                                }
                                 last_usage = Some(crate::stream::TokenUsage {
-                                    prompt_tokens: usage.prompt_tokens.unwrap_or(0),
+                                    prompt_tokens: pt,
                                     completion_tokens: usage.completion_tokens.unwrap_or(0),
                                     cached_tokens: cached,
                                 });
@@ -513,6 +715,8 @@ impl LlmProvider for OpenAiProvider {
                             for choice in chunk.choices {
                                 if let Some(content) = choice.delta.content {
                                     if !content.is_empty() {
+                                        content_chunks += 1;
+                                        accumulated_content.push_str(&content);
                                         let _ = tx.send(Ok(StreamEvent::Delta(content)));
                                     }
                                 }
@@ -559,13 +763,16 @@ impl LlmProvider for OpenAiProvider {
                                     }
                                 }
                                 if let Some(ref reason) = choice.finish_reason {
-                                    // Emit final usage before Done (only the last value, not cumulative sum)
-                                    if let Some(usage) = last_usage.take() {
-                                        let _ = tx.send(Ok(StreamEvent::Usage(usage)));
-                                    }
+                                    // Don't return here — flush tool_calls + remember the
+                                    // finish_reason, then keep parsing until [DONE]. Some
+                                    // gateways (GitCode litellm proxy on glm-5 confirmed
+                                    // 5/8) send `usage` in a chunk AFTER `finish_reason`,
+                                    // and a previous version of this code returned on
+                                    // finish_reason → usage chunk silently dropped → both
+                                    // the token counters and the truncation detector saw
+                                    // 0 prompt_tokens for entire sessions.
                                     match reason.as_str() {
                                         "tool_calls" => {
-                                            // Emit a ToolCallDone for every accumulated tool call
                                             for (id, name, args) in &tool_calls {
                                                 let _ = tx.send(Ok(StreamEvent::ToolCallDone(
                                                     crate::tool::ToolCall {
@@ -576,18 +783,15 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
-                                            let _ =
-                                                tx.send(Ok(StreamEvent::Done { truncated: false }));
-                                            return;
+                                            pending_finish =
+                                                Some(StreamEvent::Done { truncated: false });
                                         }
                                         "length" | "max_tokens" => {
-                                            // Model hit token limit — response was truncated.
-                                            // Flush any accumulated tool calls so the upper layer
-                                            // sees what the model was attempting (args may be
-                                            // partial/malformed; repair_tool_args + write.rs friendly
-                                            // error handle that downstream). Without this, partial
-                                            // tool calls are silently dropped and the retry sees an
-                                            // empty assistant turn with no context.
+                                            // Model hit token limit — flush partial tool
+                                            // calls so downstream sees what the model was
+                                            // attempting. (Args may be malformed;
+                                            // `repair_tool_args` + write.rs friendly errors
+                                            // handle that.)
                                             for (id, name, args) in &tool_calls {
                                                 let _ = tx.send(Ok(StreamEvent::ToolCallDone(
                                                     crate::tool::ToolCall {
@@ -598,14 +802,12 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
-                                            let _ =
-                                                tx.send(Ok(StreamEvent::Done { truncated: true }));
-                                            return;
+                                            pending_finish =
+                                                Some(StreamEvent::Done { truncated: true });
                                         }
                                         "stop" | _ => {
-                                            let _ =
-                                                tx.send(Ok(StreamEvent::Done { truncated: false }));
-                                            return;
+                                            pending_finish =
+                                                Some(StreamEvent::Done { truncated: false });
                                         }
                                     }
                                 }
@@ -648,7 +850,112 @@ impl LlmProvider for OpenAiProvider {
                 return;
             }
 
-            let _ = tx.send(Ok(StreamEvent::Done { truncated: false }));
+                // ── Stream ended without close marker ──
+                // Reaching here means we parsed valid SSE chunks but the
+                // stream's `bytes_stream.next()` returned `Ok(None)` (clean
+                // close at TCP/HTTP level) WITHOUT either:
+                //   a. a `data: [DONE]` line (handled at line ~519, returns
+                //      with truncated=false), or
+                //   b. a `finish_reason` of `stop` / `length` / `tool_calls`
+                //      (handled inline in the chunk parser around line ~610,
+                //      returns with the appropriate truncated flag).
+                //
+                // Observed three times across May 2026 atomgr/atomcode
+                // sessions on the self-hosted glm-5.1 endpoint:
+                //   - 5/4 21:21 Turn 23 — `error decoding response body` (Err
+                //     path, separately fixed by mid-stream retry).
+                //   - 5/5 10:06 Turn 10 — text response stopped at "1.\n"
+                //     mid-list, no close marker (this path).
+                //   - 5/5 19:37 Turn 72-73 — markdown table truncated
+                //     mid-row, no close marker (this path).
+                //
+                // Pre-fix this branch emitted `Done { truncated: false }`,
+                // making the agent loop treat the partial output as a
+                // complete response and `finish_turn(Natural)` immediately.
+                // The user saw a cut-off table / list with no error, no
+                // retry, and no indication that anything went wrong.
+                //
+                // Post-fix (this commit):
+                //   1. Flush any in-flight tool calls so partial-args don't
+                //      silently disappear (mirrors the `length` branch's
+                //      handling at line ~622).
+                //   2. Emit a TextDelta marker so the user (and datalog) can
+                //      see why the response was cut. Goes through the
+                //      normal stream_filter path; doesn't pollute model
+                //      context with control sequences.
+                //   3. Emit `Done { truncated: true }` so the agent loop's
+                //      existing retry-with-resume path (`agent/mod.rs:1854`,
+                //      `if truncated && retry_count < 1`) injects the
+                //      "Output limit hit. … resume where you left off"
+                //      hint and triggers a continuation turn.
+                // If finish_reason had already arrived (we held the Done
+                // back waiting for trailing usage), don't downgrade it to
+                // a truncated=true close — the model finished cleanly and
+                // the stream just lacked a [DONE] marker. Flush any
+                // buffered usage first so token counters are honest.
+                if let Some(usage) = last_usage.take() {
+                    let _ = tx.send(Ok(StreamEvent::Usage(usage)));
+                }
+                if let Some(done) = pending_finish.take() {
+                    let _ = tx.send(Ok(done));
+                    return;
+                }
+
+                // Abrupt close discriminator: if the model never made
+                // tool-call progress AND the body arrived as a single
+                // burst (≤ 2 content chunks), this wasn't a real
+                // truncation — gateways like GitCode's litellm proxy
+                // stream a single error blob (「请求负载过高，请稍后
+                // 再试」 / a verbose `litellm.InternalServerError` JSON
+                // envelope) and slam the connection closed without a
+                // [DONE] marker. Promoting that to `truncated=true`
+                // makes the agent inject "resume where you left off"
+                // and retry, which renders the SAME error a second
+                // time (see issue: GLM-5.1 网关限流双重渲染 /
+                // LiteLLM 429 cooldown_list 双重渲染).
+                // Diverting to `StreamEvent::Error` instead lets the
+                // agent's `is_rate_limited` retry path (with 3-30s
+                // backoff) handle it correctly — or, if it's an
+                // unfamiliar error string, surface it once and stop.
+                //
+                // Discriminator is `content_chunks <= 2` alone: real
+                // streamed completions emit many small deltas (tens
+                // to hundreds of chunks), while gateway errors arrive
+                // as 1-2 large chunks regardless of payload size
+                // (Chinese 10-80-char banners or 700+-char LiteLLM
+                // JSON envelopes both qualify). The earlier ≤ 200
+                // char cap let the LiteLLM JSON shape slip through
+                // to the truncated-retry path and caused the double
+                // render. The real risk — misclassifying a 1-chunk
+                // legit reply — is mitigated by the fact that
+                // successful completions virtually always emit
+                // `[DONE]`; reaching this branch already means the
+                // stream ended anomalously.
+                let trimmed = accumulated_content.trim();
+                let looks_like_gateway_error =
+                    tool_calls.is_empty() && content_chunks <= 2 && !trimmed.is_empty();
+                if looks_like_gateway_error {
+                    let _ = tx.send(Ok(StreamEvent::Error(trimmed.to_string())));
+                    return;
+                }
+
+                for (id, name, args) in &tool_calls {
+                    let _ = tx.send(Ok(StreamEvent::ToolCallDone(
+                        crate::tool::ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: args.clone(),
+                        },
+                    )));
+                }
+                tool_calls.clear();
+                let _ = tx.send(Ok(StreamEvent::Delta(
+                    "\n[stream ended without close marker — response above may be incomplete]\n"
+                        .to_string(),
+                )));
+                let _ = tx.send(Ok(StreamEvent::Done { truncated: true }));
+                return;
+            }
         });
 
         Ok(Box::pin(
@@ -780,10 +1087,255 @@ fn sample_for_error(s: &str) -> String {
     sample
 }
 
+/// Translate a `reqwest::Error` from the streaming body into something a
+/// non-engineer user can act on. The bare `Display` for these errors is
+/// shaped for HTTP-protocol context ("error decoding response body",
+/// "operation timed out") and lands in the chat as gibberish — users
+/// can't tell whether to retry, switch providers, or wait. Three buckets:
+///
+/// 1. `is_decode()` — the most common self-hosted-endpoint failure: the
+///    server cut the chunked body mid-flight (worker timeout, OOM,
+///    upstream proxy reset). Recoverable by resending; tell the user so.
+/// 2. `is_timeout()` — request-level timeout. Same recovery signal.
+/// 3. `is_connect()` — TCP connect failed late (rare mid-stream, but
+///    possible on connection-pool churn). Recoverable.
+/// Everything else falls through to the bare error text.
+pub(crate) fn humanise_stream_error(e: &reqwest::Error) -> String {
+    if e.is_decode() {
+        format!(
+            "Endpoint terminated the response stream mid-flight ({}). \
+             The provider may have hit a worker timeout or upstream-proxy \
+             read limit on a long generation. Try resending the message; \
+             if it recurs, increase the endpoint's read/write timeouts \
+             or split the request into smaller chunks.",
+            e
+        )
+    } else if e.is_timeout() {
+        format!(
+            "Stream timeout ({}). The provider didn't deliver chunks \
+             within the configured window. Try resending or check provider \
+             status.",
+            e
+        )
+    } else if e.is_connect() {
+        format!(
+            "Connection lost mid-stream ({}). Try resending; check \
+             network reachability if it persists.",
+            e
+        )
+    } else {
+        format!("Stream error: {}", e)
+    }
+}
+
+/// Sum of every message's `content` length plus every tool_call's
+/// `arguments` length. Used as the denominator for the
+/// chars/prompt_tokens ratio that flags a silently-truncating proxy.
+/// We deliberately ignore JSON keys/braces — those are constant overhead
+/// across all bodies and would dilute the signal.
+fn sum_message_content_chars(body: &serde_json::Value) -> usize {
+    let mut total = 0usize;
+    let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) else {
+        return 0;
+    };
+    for m in msgs {
+        if let Some(s) = m.get("content").and_then(|c| c.as_str()) {
+            total = total.saturating_add(s.len());
+        } else if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+            // Vision multipart content: sum text fragments only (image
+            // payloads are URL-or-base64 strings the model doesn't read
+            // as text tokens, so counting them inflates the ratio).
+            for part in arr {
+                if let Some(s) = part.get("text").and_then(|t| t.as_str()) {
+                    total = total.saturating_add(s.len());
+                }
+            }
+        }
+        if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
+            for tc in tcs {
+                if let Some(args) = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                {
+                    total = total.saturating_add(args.len());
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Returns `Some(ratio)` if the chars-per-token ratio is high enough to
+/// suggest the provider silently truncated the input.
+///
+/// Normal tokenizers across mixed CJK/English/code run 2-4 chars/token.
+/// The threshold is 6.0: any tokenizer producing 6+ chars/token would
+/// be doing something unprecedented; the realistic explanation is that
+/// the proxy capped the input and reported tokens for the truncated
+/// view. Returns None when there's nothing to compare against.
+fn check_truncation(content_chars: usize, prompt_tokens: usize) -> Option<f64> {
+    // Skip tiny requests (system-only ping, etc.) — ratio noise.
+    if content_chars < 4_000 || prompt_tokens == 0 {
+        return None;
+    }
+    let ratio = content_chars as f64 / prompt_tokens as f64;
+    if ratio > 6.0 {
+        Some(ratio)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_nonstream_response, sample_for_error};
+    use super::{
+        check_truncation, parse_nonstream_response, sample_for_error, sum_message_content_chars,
+        OpenAiProvider, ReasoningPolicy,
+    };
+    use crate::conversation::message::{ImagePart, Message, MessageContent, Role};
     use crate::stream::StreamEvent;
+
+    /// Wire shape for `MessageContent::MultiPart`: must match OpenAI's
+    /// vision schema exactly — `role: user`, `content: [...]` array,
+    /// each block tagged with `type` ("image_url" or "text"). Order
+    /// is image(s) first, text second. The PR added the multipart code
+    /// path but no test for the wire output; without this regression
+    /// guard a future field-rename or order-flip would silently break
+    /// every vision-capable provider.
+    #[test]
+    fn multipart_serialises_to_openai_vision_schema() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("describe this".to_string()),
+                images: vec![ImagePart {
+                    media_type: "image/png".to_string(),
+                    data: "AAAA".to_string(),
+                }],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
+        assert_eq!(out.len(), 1, "one message in, one out");
+        let m = &out[0];
+        assert_eq!(m["role"], "user");
+        let content = m["content"].as_array().expect("content must be an array");
+        assert_eq!(content.len(), 2, "image + text = 2 blocks");
+        // Block 0: image, must have exactly `type` and `image_url`.
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+        assert!(content[0].get("text").is_none(), "image block must not have text field");
+        // Block 1: text, must use `type: text` + `text: <string>`.
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "describe this");
+    }
+
+    /// Multi-image variant: all images come before the text block, in
+    /// the order they were attached.
+    #[test]
+    fn multipart_preserves_image_order_then_text() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("compare".to_string()),
+                images: vec![
+                    ImagePart { media_type: "image/png".into(), data: "FIRST".into() },
+                    ImagePart { media_type: "image/jpeg".into(), data: "SECOND".into() },
+                ],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,FIRST");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/jpeg;base64,SECOND");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "compare");
+    }
+
+    /// Image-only multipart (no caption): content array contains just
+    /// the image block, no empty trailing text block.
+    #[test]
+    fn multipart_without_text_omits_text_block() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: None,
+                images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "single image block, no text block");
+        assert_eq!(content[0]["type"], "image_url");
+    }
+
+    /// Regression: the user pasted an image with a vision-capable model
+    /// (Claude/Opus), got a reply, then ran `/model` to switch to GLM-5.1
+    /// (text-only) and tried to send a follow-up. The conversation still
+    /// carried the historical `MultiPart` user turn; serialising it
+    /// against GLM-5.1's text-only schema sent `content: [...]` to the
+    /// upstream which rejected with `ModelArts.81001 message[N].content[0]
+    /// has invalid field(s): text, type`. The provider must gracefully
+    /// degrade `MultiPart` → text-only string when `supports_vision = false`,
+    /// preserving the user's caption (with our `[Image #N]` marker still
+    /// inside) but stripping the image bytes the wire schema can't
+    /// represent.
+    #[test]
+    fn multipart_degrades_to_text_when_target_is_text_only() {
+        let history = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("[Image #1] 这是什么图啊".into()),
+                images: vec![ImagePart { media_type: "image/png".into(), data: "AAAA".into() }],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
+        assert_eq!(out.len(), 1);
+        let m = &out[0];
+        assert_eq!(m["role"], "user");
+        // Content must be a flat string, NOT an array — anything else is
+        // a 400 against text-only proxies (ModelArts, ZhipuAI, etc.).
+        assert!(
+            m["content"].is_string(),
+            "text-only target must receive content as a string, got: {}",
+            m["content"]
+        );
+        let content = m["content"].as_str().unwrap();
+        assert!(
+            content.contains("这是什么图啊"),
+            "user's caption must survive degradation: {:?}",
+            content
+        );
+        // No image_url block leakage.
+        assert!(
+            !content.contains("data:image"),
+            "image bytes must not appear in degraded payload: {:?}",
+            content
+        );
+    }
+
+    /// When `MultiPart` had no text at all (image-only paste, no caption)
+    /// and the target is text-only, the degraded payload must still be
+    /// non-empty — empty user content is rejected by some proxies (e.g.
+    /// "messages must contain a non-empty content"). Use a placeholder
+    /// so the conversation flow stays valid.
+    #[test]
+    fn multipart_text_only_target_uses_placeholder_when_caption_empty() {
+        let history = Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: None,
+                images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
+            },
+        };
+        let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
+        let content = out[0]["content"].as_str().expect("string content");
+        assert!(!content.is_empty(), "must be non-empty placeholder");
+    }
 
     #[test]
     fn parses_nonstream_text_response() {
@@ -897,7 +1449,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        };
+
+};
         let p = OpenAiProvider::new(&cfg).expect("provider builds");
         assert_eq!(p.reasoning_history_policy(), ReasoningPolicy::Exclude);
 
@@ -935,7 +1488,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        };
+
+};
         let err = match OpenAiProvider::new(&cfg) {
             Err(e) => e,
             Ok(_) => panic!("bad reasoning_history value must reject"),
@@ -976,6 +1530,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 reasoning_content: reasoning.map(|s| s.to_string()),
+                thinking_blocks: Vec::new(),
             },
         }
     }
@@ -984,9 +1539,28 @@ mod tests {
     fn format_messages_include_with_some_reasoning_emits_field() {
         use super::{OpenAiProvider, ReasoningPolicy};
         let msgs = vec![atc_message(Some("thinking text"))];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["reasoning_content"], "thinking text");
+    }
+
+    #[test]
+    fn placeholder_send_side_matches_shared_constant() {
+        // `TurnRunner::Done` skips reasoning→text promotion when the
+        // accumulated reasoning_buf equals exactly this placeholder.
+        // Send-side (format_messages, three call sites) MUST emit the
+        // same byte string — otherwise a buggy gateway echoing it
+        // back would slip past the guard and cause silent
+        // "(no reasoning recorded) · Nailed it" stops. Pin the
+        // contract by routing both sides through one constant.
+        use super::{OpenAiProvider, ReasoningPolicy};
+        use crate::provider::REASONING_PLACEHOLDER;
+        let msgs = vec![atc_message(None)];
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
+        assert_eq!(
+            out[0]["reasoning_content"].as_str().unwrap(),
+            REASONING_PLACEHOLDER,
+        );
     }
 
     #[test]
@@ -998,7 +1572,7 @@ mod tests {
         // a short non-empty placeholder so BOTH providers accept the message.
         use super::{OpenAiProvider, ReasoningPolicy};
         let msgs = vec![atc_message(None)];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         let rc = out[0]["reasoning_content"].as_str().unwrap();
         assert!(
             !rc.is_empty(),
@@ -1020,7 +1594,7 @@ mod tests {
             role: Role::Assistant,
             content: MessageContent::Text("当前系统时间是 …".into()),
         }];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
         let rc = out[0]["reasoning_content"].as_str();
         assert!(
@@ -1031,7 +1605,7 @@ mod tests {
 
         // Under Exclude (V3/default) the key must NOT appear on Text — sending
         // it would regress V3 R1 which rejects any reasoning_content echo.
-        let out_ex = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude);
+        let out_ex = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude, true);
         assert!(
             out_ex[0]
                 .as_object()
@@ -1050,7 +1624,7 @@ mod tests {
         // replaced with the non-empty placeholder before sending.
         use super::{OpenAiProvider, ReasoningPolicy};
         let msgs = vec![atc_message(Some(""))];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         let rc = out[0]["reasoning_content"].as_str().unwrap();
         assert!(
             !rc.is_empty(),
@@ -1064,7 +1638,7 @@ mod tests {
         // so under Exclude we must NOT emit the key even when we have a value.
         use super::{OpenAiProvider, ReasoningPolicy};
         let msgs = vec![atc_message(Some("should be stripped"))];
-        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude);
+        let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Exclude, true);
         assert!(
             out[0]
                 .as_object()
@@ -1140,5 +1714,244 @@ mod tests {
             }
             other => panic!("unexpected variant: {:?}", other),
         }
+    }
+
+    // ── provider truncation detector ──
+
+    #[test]
+    fn truncation_detector_flags_gitcode_real_world_ratio() {
+        // 5/8 atomgr session: GitCode reported 6233 prompt_tokens for a
+        // body atomcode counted at ~78K content chars. Ratio 12.58.
+        // This is the canary: if check_truncation ever stops firing on
+        // this number, weak-model debugging gets harder by hours.
+        let ratio = check_truncation(78_381, 6_233)
+            .expect("12.58 chars/token must be flagged as truncation");
+        assert!(ratio > 12.0 && ratio < 13.0, "ratio={}", ratio);
+    }
+
+    #[test]
+    fn truncation_detector_silent_on_normal_tokenizer() {
+        // Siliconflow Pro/zai-org/GLM-5 same session: 127K chars / 45K
+        // tokens = 2.81. Healthy upstream — must not warn.
+        assert!(check_truncation(127_763, 45_518).is_none());
+    }
+
+    #[test]
+    fn truncation_detector_silent_on_english_heavy_4chars_per_token() {
+        // Pure-English code-only request can hit ~4 chars/token. The
+        // threshold (6.0) leaves headroom so non-truncated requests
+        // never noise the log.
+        assert!(check_truncation(40_000, 10_000).is_none());
+    }
+
+    #[test]
+    fn truncation_detector_skips_tiny_bodies() {
+        // System-only ping or a bare "hi" — ratio noise dominates,
+        // so the detector stays silent under 4K chars regardless of
+        // the count.
+        assert!(check_truncation(1_500, 100).is_none());
+    }
+
+    #[test]
+    fn truncation_detector_handles_zero_prompt_tokens() {
+        // Some self-hosted gateways drop usage entirely. Don't divide
+        // by zero, just stay silent.
+        assert!(check_truncation(50_000, 0).is_none());
+    }
+
+    #[test]
+    fn sum_message_content_chars_sums_strings_and_tool_args() {
+        let body = serde_json::json!({
+            "model": "x",
+            "messages": [
+                {"role": "system", "content": "abc"},     // 3
+                {"role": "user", "content": "hello"},      // 5
+                {"role": "assistant", "content": "",
+                 "tool_calls": [
+                     {"function": {"name": "read_file",
+                                   // JSON-decoded length = 12 chars
+                                   "arguments": "{\"path\":\"a\"}"}},
+                 ]},
+                {"role": "tool", "content": "result"},     // 6
+            ]
+        });
+        assert_eq!(sum_message_content_chars(&body), 3 + 5 + 12 + 6);
+    }
+
+    #[test]
+    fn sum_message_content_chars_ignores_image_urls_in_multipart() {
+        // Vision payloads have URL/base64 strings that aren't real
+        // text tokens — counting them would falsely inflate the
+        // chars/token ratio for vision requests.
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},  // 8
+                    {"type": "image_url",
+                     "image_url": {"url": "data:image/png;base64,AAAAAAAAAA"}},
+                ]
+            }]
+        });
+        assert_eq!(sum_message_content_chars(&body), 8);
+    }
+
+    #[test]
+    fn sum_message_content_chars_safe_on_missing_messages() {
+        let body = serde_json::json!({"model": "x"});
+        assert_eq!(sum_message_content_chars(&body), 0);
+    }
+
+    // ── abrupt-close gateway-error discriminator ───────────────────
+    //
+    // GLM-5.1 / litellm-style gateways respond to a 429 by streaming
+    // a single SSE chunk carrying a Chinese error message and then
+    // hanging up without `data: [DONE]`. Before this code path
+    // existed, the provider mapped both that case AND "real
+    // mid-output truncation" to `Done { truncated: true }`, causing
+    // the agent's resume-from-truncation retry to re-fire the same
+    // request and render the same error message twice. Tests below
+    // pin the new behavior:
+    //
+    //   * 1 short content chunk, no `[DONE]`           → Error
+    //   * many content chunks + abrupt close           → Done(truncated=true)
+    //   * 1 short chunk + tool_call + abrupt close     → Done(truncated=true)
+    //     (model was making tool progress; let resume retry try again)
+
+    use crate::config::provider::ProviderConfig;
+    use crate::provider::LlmProvider;
+    use futures::StreamExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn provider_pointing_at(url: &str) -> OpenAiProvider {
+        OpenAiProvider::new(&ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: Some("sk-test".into()),
+            model: "test-model".into(),
+            base_url: Some(format!("{}/v1", url)),
+            system_prompt: None,
+            user_agent: None,
+            context_window: 8000,
+            max_tokens: Some(1024),
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+        })
+        .expect("provider construction")
+    }
+
+    async fn collect_stream(p: &OpenAiProvider) -> Vec<StreamEvent> {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::Text("hi".into()),
+        };
+        let mut stream = p.chat_stream(&[msg], None).expect("stream");
+        let mut out = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                Ok(e) => out.push(e),
+                Err(e) => panic!("transport error: {:#}", e),
+            }
+        }
+        out
+    }
+
+    /// Gateway streams ONE chunk with an error blob, no DONE, then
+    /// closes. Provider must surface that as `Error(blob)`, NOT as
+    /// `Done { truncated: true }` (which would trigger the agent's
+    /// resume-retry and render the same blob twice).
+    #[tokio::test]
+    async fn abrupt_close_with_single_error_chunk_becomes_stream_error() {
+        let server = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\
+                   \"模型「GLM-5.1」的请求负载过高，请稍后再试。\"}}]}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        let events = collect_stream(&p).await;
+        let has_error = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error(s) if s.contains("请求负载过高")));
+        let has_truncated_done = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Done { truncated: true }));
+        let has_marker_delta = events.iter().any(|e| {
+            matches!(e, StreamEvent::Delta(s) if s.contains("stream ended without close marker"))
+        });
+        assert!(
+            has_error,
+            "expected StreamEvent::Error(gateway blob), got: {:?}",
+            events
+        );
+        assert!(
+            !has_truncated_done,
+            "abrupt close on tiny error blob must NOT emit Done(truncated=true): {:?}",
+            events
+        );
+        assert!(
+            !has_marker_delta,
+            "abrupt close on tiny error blob must NOT emit the [stream ended …] marker delta: {:?}",
+            events
+        );
+    }
+
+    /// Real-truncation case: many chunks of substantive content,
+    /// then abrupt close (no DONE / no finish_reason). Stays on the
+    /// existing `Done { truncated: true }` path so the agent's
+    /// "resume where you left off" retry can salvage the partial
+    /// output (table-cut, list-cut, etc.).
+    #[tokio::test]
+    async fn abrupt_close_with_substantive_content_still_emits_truncated_done() {
+        let server = MockServer::start().await;
+        // 5 chunks × ~50 chars each = ~250 chars of real content.
+        // Above the 200-char and 2-chunk thresholds → not a
+        // gateway error.
+        let mut sse = String::new();
+        for i in 0..5 {
+            sse.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\
+                 \"line {} with enough content to clear the heuristic thresholds. \"}}}}]}}\n\n",
+                i
+            ));
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        let events = collect_stream(&p).await;
+        let has_truncated_done = events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Done { truncated: true }));
+        let has_error = events.iter().any(|e| matches!(e, StreamEvent::Error(_)));
+        assert!(
+            has_truncated_done,
+            "substantive content + abrupt close must keep Done(truncated=true): {:?}",
+            events
+        );
+        assert!(
+            !has_error,
+            "real truncation must NOT be misclassified as Error: {:?}",
+            events
+        );
     }
 }

@@ -11,10 +11,12 @@ pub mod glob;
 pub mod grep;
 pub mod list_dir;
 pub mod list_symbols;
+pub mod parallel_edit;
 pub mod read;
 pub mod read_symbol;
 pub mod result_store;
 pub mod search_replace;
+pub mod todo;
 pub mod trace_callees;
 pub mod trace_callers;
 pub mod trace_chain;
@@ -62,6 +64,92 @@ pub const SKIP_DIR_PREFIXES: &[&str] = &[".venv-"];
 /// Use this instead of `SKIP_DIRS.contains()` for complete coverage.
 pub fn should_skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name) || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Model-friendly tool-arguments validator.
+///
+/// Why this exists: serde's "missing field `X` at line 1 column 793" error
+/// reads to weak models (GLM-5.1, Qwen) as a *parser-position* complaint and
+/// reliably triggers hallucinated "fixes" like "I should use positional
+/// arguments" — wasting a turn or six on the same tool call. See datalog
+/// `atomgr-2d99b47d/2026-05-06_08-43-12.md` Turns 64–75 for the failure
+/// mode this replaces.
+///
+/// What it returns instead, on failure:
+/// - the **keys the model actually provided**
+/// - the **keys it's missing** for the closest mode
+/// - a **one-line example** of a correct call
+///
+/// `required_modes` is a list of accepted key sets — any one fully matched
+/// passes. Single-mode tools pass `&[&[required_keys]]`. Multi-mode tools
+/// like `edit_file` pass one slice per mode; the diagnostic picks the mode
+/// with the fewest missing keys for the hint.
+///
+/// Returns the parsed `Value` on success so callers can avoid a second
+/// parse pass.
+pub fn diagnose_args(
+    tool: &str,
+    args: &str,
+    required_modes: &[&[&str]],
+    example: &str,
+) -> std::result::Result<serde_json::Value, String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return Err(format!(
+            "{tool} called with empty arguments — likely max_tokens cutoff. \
+             Re-issue: {example}"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(args).map_err(|_| {
+        format!(
+            "{tool} arguments are not valid JSON. Re-issue: {example}"
+        )
+    })?;
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => {
+            let kind = match &value {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => unreachable!(),
+            };
+            return Err(format!(
+                "{tool} expected a JSON object, got {kind}. Re-issue: {example}"
+            ));
+        }
+    };
+    if required_modes
+        .iter()
+        .any(|m| m.iter().all(|k| obj.contains_key(*k)))
+    {
+        return Ok(value);
+    }
+    let provided: Vec<&str> = obj.keys().map(String::as_str).collect();
+    // Pick the mode with the fewest missing keys — that's the call shape
+    // the model was probably aiming at.
+    let (closest, missing) = required_modes
+        .iter()
+        .map(|m| {
+            let miss: Vec<&str> = m
+                .iter()
+                .filter(|k| !obj.contains_key(**k))
+                .copied()
+                .collect();
+            (*m, miss)
+        })
+        .min_by_key(|(_, miss)| miss.len())
+        .expect("required_modes must be non-empty");
+    Err(format!(
+        "{tool}: provided keys [{}], missing required [{}] for mode [{}]. \
+         Re-issue: {}",
+        provided.join(", "),
+        missing.join(", "),
+        closest.join("+"),
+        example,
+    ))
 }
 
 /// Lightweight sensitive-path precheck for raw tool arguments before a
@@ -653,10 +741,18 @@ impl PermissionStore {
 /// args the model sent — different slicing windows cache separately.
 pub type ReadCacheKey = (PathBuf, Option<usize>, Option<usize>);
 
-/// Read cache entry: (file mtime at cache time, rendered tool output).
-/// mtime acts as the invalidation signal — if disk mtime differs on next read,
-/// the cache is stale regardless of other state (edit/write tools change mtime).
-pub type ReadCacheEntry = (std::time::SystemTime, String);
+/// Read cache entry: (file mtime at cache time, rendered tool output, number of
+/// times this exact (path, offset, limit, mtime) tuple has been served).
+///
+/// The hit count drives the "you keep re-reading the same region" hint emitted
+/// by `read.rs` on cache hits — it replaced the prior `runner.rs` BLOCKED guard
+/// (deleted alongside) which was a soft-text error the model could ignore. By
+/// returning the cached content WITH a count-aware note instead of refusing the
+/// call, the framework lets the model see that the answer hasn't changed
+/// while still giving a clear "stop re-reading" signal. mtime is still the
+/// invalidation key — if disk mtime differs on next read, the entry is replaced
+/// and the count resets to 1.
+pub type ReadCacheEntry = (std::time::SystemTime, String, usize);
 
 /// Holds a shared working directory that tools can read (and `CdTool` can write).
 #[derive(Clone)]
@@ -700,6 +796,22 @@ pub struct ToolContext {
     pub event_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<crate::turn::event::TurnEvent>>>,
     /// Current tool call ID for event correlation.
     pub current_call_id: Option<String>,
+    /// Shared registry handle for tools that dispatch fork sub-agents
+    /// (currently only `parallel_edit_files`). Set by `AgentLoop::new`
+    /// after the registry is wrapped in `Arc`. Reading the registry via
+    /// `ctx` instead of holding it in the tool struct avoids creating a
+    /// `Tool ↔ Registry` `Arc` cycle that would otherwise leak memory
+    /// for the lifetime of the process. `None` in headless / test
+    /// contexts that don't need fork dispatch.
+    pub tool_registry: Option<Arc<ToolRegistry>>,
+    /// D3 file content store. read_file pushes large file content
+    /// here transparently and consults it on subsequent reads of any
+    /// range — disk hit only on first read or after edit. Conversation
+    /// messages carry only the rendered text (with line numbers) for
+    /// the requested region. edit_file / write_file invalidate
+    /// entries on success so a stale entry cannot serve outdated
+    /// bytes.
+    pub file_store: Arc<RwLock<crate::ctx::file_store::FileStore>>,
 }
 
 impl ToolContext {
@@ -733,6 +845,8 @@ impl ToolContext {
             lsp: None,
             event_tx: None,
             current_call_id: None,
+            tool_registry: None,
+            file_store: Arc::new(RwLock::new(crate::ctx::file_store::FileStore::new())),
         }
     }
 
@@ -744,6 +858,10 @@ impl ToolContext {
         ctx.graph = self.graph.clone();
         ctx.telemetry = self.telemetry.clone();
         ctx.lsp = self.lsp.clone();
+        // Share the FileStore — sub-agents reading the same file reuse
+        // the parent's disk work and benefit from invalidation events
+        // emitted by either side.
+        ctx.file_store = self.file_store.clone();
         ctx
     }
 
@@ -823,6 +941,29 @@ pub trait Tool: Send + Sync {
         self.approval(args)
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult>;
+
+    /// Pre-flight syntactic check on raw tool-call arguments. The runner
+    /// calls this **before** approval and before execute, so a parse
+    /// failure short-circuits to a tool-result error and the model
+    /// receives a structured retry hint without bothering the user.
+    ///
+    /// Default impl: `Ok(())`. Tools with strict required-field schemas
+    /// (write_file / edit_file / search_replace) override to surface the
+    /// serde error early. Implementations should be cheap (parse only,
+    /// no I/O) — the runner re-parses inside `execute()` for actual use.
+    ///
+    /// Trigger context (2026-05-02 datalog evidence): provider-side
+    /// stream truncation can deliver `[RAW ARGS: {]` or
+    /// `[RAW ARGS: {"file_path":"..."]` (closing-bracket wrong, content
+    /// missing). The previous flow let those reach `approval_with_context`
+    /// where the tool's own fail-closed branch returned
+    /// `RequireApproval("Could not parse … for safety check.")` and the
+    /// user saw an approval prompt for an obviously-broken call. Pressing
+    /// Allow then died on the same parse in `execute()`. Validating up
+    /// front eliminates the user-visible round-trip entirely.
+    fn validate_args(&self, _args: &str) -> std::result::Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct ToolRegistry {
@@ -911,6 +1052,7 @@ impl ToolRegistry {
         }
         n
     }
+
 }
 
 /// Wrapper key names atomgit's gateway has been observed to inject around

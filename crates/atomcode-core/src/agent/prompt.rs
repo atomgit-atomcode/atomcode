@@ -56,6 +56,38 @@ impl AgentLoop {
             model_display, wd = wd.display(), env_info = env_info,
         );
 
+        // Git commit attribution. Mirrors Claude Code's convention:
+        // when the agent runs git commit on the user's behalf, append
+        // a Co-Authored-By trailer naming AtomCode + the model so
+        // history reflects which AI did the work. Hardcoded into the
+        // prompt rather than enforced via a bash wrapper because:
+        //
+        // 1. wrapping `git commit` would also catch revert/amend/cherry-
+        //    pick paths that the user may not want tagged;
+        // 2. the LLM constructs commit messages anyway, so injecting at
+        //    the prompt layer is sufficient and keeps the bash tool
+        //    transparent;
+        // 3. users who want a different attribution can override this
+        //    with `[providers.<name>] system_prompt = "..."` since that
+        //    short-circuits the entire prompt assembly above.
+        //
+        // The trailer is consistent with GitHub / GitLab co-author
+        // convention (case-insensitive `co-authored-by:` recognised by
+        // both for "Co-authored" attribution display).
+        prompt.push_str(&format!(
+            "\n=== GIT COMMITS ===\n\
+             When you create a git commit on the user's behalf, end the commit \
+             message with this trailer (preceded by a blank line):\n\
+             \n\
+             Co-Authored-By: AtomCode ({}) <noreply@atomgit.com>\n\
+             \n\
+             Use a HEREDOC for `git commit -m` so the trailer's blank line is \
+             preserved verbatim. Skip this trailer for `git commit --amend` \
+             and `git revert` (those operate on existing commits whose \
+             attribution shouldn't change).\n",
+            model_display
+        ));
+
         // Layered instructions (global / project / user)
         if !merged_instructions.is_empty() {
             prompt.push_str(&format!("\n{}\n", merged_instructions));

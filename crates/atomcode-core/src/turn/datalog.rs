@@ -415,6 +415,19 @@ impl DatalogWriter {
         self.flush();
     }
 
+    /// Log a non-fatal advisory (e.g. provider truncation detector).
+    /// Persisting it here makes post-hoc datalog inspection useful even
+    /// when the live TUI line scrolls past — the user can grep the
+    /// markdown for `**Warning:**` after the run.
+    pub fn log_warning(&mut self, warning: &str) {
+        if !self.active {
+            return;
+        }
+        let _ = writeln!(&mut self.buf, "**Warning:** {}", warning);
+        let _ = writeln!(&mut self.buf);
+        self.flush();
+    }
+
     /// End the turn: write duration and final flush.
     pub fn end_turn(&mut self, total_tokens: usize, tool_call_count: usize) {
         if !self.active {

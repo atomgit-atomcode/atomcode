@@ -77,7 +77,7 @@
       <p>顶层键固定为 <code>mcpServers</code>(旧键 <code>servers</code> 仍兼容)。每个 server 建议只写一种 transport:</p>
       <ul>
         <li><strong>stdio</strong>:<code>command</code>(必填)+ 可选 <code>args</code>、<code>env</code>、<code>timeout_ms</code>、<code>disabled</code></li>
-        <li><strong>HTTP</strong>:<code>url</code>(必填)+ 可选 <code>headers</code>、<code>timeout_ms</code>、<code>disabled</code></li>
+        <li><strong>HTTP</strong>:<code>url</code>(必填)+ 可选 <code>headers</code>、<code>auth</code>、<code>timeout_ms</code>、<code>disabled</code></li>
       </ul>
       <p>如果同一个 server 同时写了 <code>command</code> 和 <code>url</code>,当前实现会优先按 stdio(<code>command</code>)处理;为避免歧义,对外配置请不要双写。</p>
       <p>字符串里支持 <code>${VAR}</code> 与 <code>${VAR:-默认值}</code> 的环境变量展开;敏感令牌不要写死,放到环境变量里。<code>disabled: true</code> 可临时关掉某个 server 而不删条目。</p>
@@ -106,7 +106,25 @@
   }
 }</code></pre>
 
-      <h2>一行命令添加 stdio server</h2>
+      <h3>GitHub remote MCP + OAuth</h3>
+      <pre><code>{
+  "mcpServers": {
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "auth": {
+        "type": "oauth",
+        "provider": "github"
+      }
+    }
+  }
+}</code></pre>
+      <p>首次使用前需准备 AtomCode 自己的 GitHub OAuth App client id,然后运行:</p>
+      <pre><code>atomcode mcp add-github-oauth --global
+ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github
+atomcode</code></pre>
+      <p>TUI 内也可在设置好环境变量后运行 <code>/mcp login github</code>,登录成功后用 <code>/mcp reload</code> 重连。</p>
+
+      <h2>一行命令添加 server</h2>
       <p><code>atomcode mcp add</code> 自动把 stdio 配置写入 JSON,不用手动编辑:</p>
       <pre><code># 写入项目根 .mcp.json(默认当前目录)
 atomcode mcp add playwright npx @playwright/mcp@latest
@@ -117,9 +135,12 @@ atomcode mcp add playwright npx @playwright/mcp@latest --global
 # 指定项目目录
 atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo</code></pre>
       <p>第一个参数是 server 键名(将出现在工具名里),后面跟可执行文件 + 参数。</p>
+      <p>GitHub remote MCP OAuth 可用专用入口:</p>
+      <pre><code>atomcode mcp add-github-oauth --global
+ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code></pre>
       <div class="callout callout-info">
         <strong>注意</strong>
-        <p>同名会<strong>整段覆盖</strong>该 server(只保留 <code>command</code> / <code>args</code>,原来的 <code>env</code> 等字段会被清空)。HTTP 类型的 server 仍需手写 JSON。</p>
+        <p>同名会<strong>整段覆盖</strong>该 server。GitHub OAuth token 保存在 <code>~/.atomcode/mcp_auth.toml</code>,不会写入 <code>.mcp.json</code>。</p>
       </div>
 
       <h2>启动后会发生什么</h2>

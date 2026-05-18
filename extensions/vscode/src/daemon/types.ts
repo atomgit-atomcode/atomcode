@@ -8,8 +8,8 @@ export interface ChatRequest {
 
 export type ChatEvent =
   | { type: 'text'; content: string }
-  | { type: 'tool_start'; name: string; arguments: string }
-  | { type: 'tool_result'; name: string; output: string; success: boolean; duration_ms: number }
+  | { type: 'tool_start'; id?: string; name: string; arguments: string }
+  | { type: 'tool_result'; id?: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
   | { type: 'artifact_start'; id: string; artifact_type: string; language?: string; title?: string }
   | { type: 'artifact_content'; id: string; content: string }
@@ -46,6 +46,131 @@ export interface ModelInfo {
   model: string;
   provider_type: string;
   is_default: boolean;
+  has_api_key?: boolean;
+  base_url?: string;
+  thinking_enabled?: boolean;
+  thinking_budget?: number;
+}
+
+// Auth / config / providers
+export interface UserInfo {
+  id: string;
+  username: string;
+  name?: string;
+  email?: string;
+  avatar_url?: string;
+}
+
+export interface AuthStatusResponse {
+  logged_in: boolean;
+  auth_path: string;
+  user: UserInfo | null;
+  token: {
+    token_type: string;
+    expires_in?: number;
+    created_at: number;
+    has_refresh_token: boolean;
+  } | null;
+}
+
+export interface LoginStartResponse {
+  login_id: string;
+  url: string;
+  expires_in_seconds: number;
+}
+
+export interface LoginPollResponse {
+  status: 'pending' | 'authorized';
+  user: UserInfo | null;
+}
+
+export interface ProviderInfo {
+  name: string;
+  type: string;
+  model: string;
+  base_url?: string;
+  has_api_key: boolean;
+  is_default: boolean;
+  context_window: number;
+  max_tokens?: number;
+  thinking_enabled?: boolean;
+  thinking_budget?: number;
+  thinking_type?: string;
+  thinking_keep?: string;
+  reasoning_history?: string;
+  skip_tls_verify: boolean;
+  ephemeral: boolean;
+}
+
+export interface ConfigResponse {
+  path: string;
+  default_provider: string;
+  default_workdir?: string;
+  providers: ProviderInfo[];
+}
+
+export interface ProvidersResponse {
+  default_provider: string;
+  providers: ProviderInfo[];
+}
+
+export interface CreateProviderRequest {
+  name: string;
+  type: string;
+  model: string;
+  api_key?: string;
+  base_url?: string;
+  user_agent?: string;
+  context_window?: number;
+  max_tokens?: number;
+  thinking_type?: string;
+  thinking_keep?: string;
+  reasoning_history?: string;
+  thinking_enabled?: boolean;
+  thinking_budget?: number;
+  skip_tls_verify?: boolean;
+  set_default?: boolean;
+}
+
+export interface PatchProviderRequest {
+  type?: string;
+  model?: string;
+  api_key?: string | null;
+  clear_api_key?: boolean;
+  base_url?: string | null;
+  clear_base_url?: boolean;
+  user_agent?: string | null;
+  clear_user_agent?: boolean;
+  context_window?: number;
+  max_tokens?: number | null;
+  clear_max_tokens?: boolean;
+  thinking_enabled?: boolean | null;
+  thinking_budget?: number | null;
+  thinking_type?: string | null;
+  thinking_keep?: string | null;
+  reasoning_history?: string | null;
+  skip_tls_verify?: boolean;
+}
+
+export interface PatchThinkingRequest {
+  enabled?: boolean;
+  budget?: number;
+  type?: string | null;
+  keep?: string | null;
+  reasoning_history?: string | null;
+}
+
+export interface CodingPlanSetupResponse {
+  success: boolean;
+  report_text: string;
+  default_provider: string;
+  providers: ProviderInfo[];
+  steps: {
+    login: { status: string; message: string };
+    claim: { status: string; message: string };
+    models: { status: string; message: string };
+    status: { status: string; message: string };
+  };
 }
 
 // Sessions
@@ -84,6 +209,7 @@ export interface ToolCallInfo {
 }
 
 export interface ToolResultInfo {
+  call_id?: string;
   success: boolean;
   summary: string;
   line_count: number;
@@ -108,8 +234,8 @@ export interface CreateSessionResponse {
 // Callbacks for SSE streaming
 export interface ChatStreamCallbacks {
   onText: (content: string) => void;
-  onToolStart: (name: string, args: string) => void;
-  onToolResult: (name: string, output: string, success: boolean, durationMs: number) => void;
+  onToolStart: (id: string | undefined, name: string, args: string) => void;
+  onToolResult: (id: string | undefined, name: string, output: string, success: boolean, durationMs: number) => void;
   onTokens: (prompt: number, completion: number, total: number) => void;
   onArtifactStart: (id: string, type: string, language?: string, title?: string) => void;
   onArtifactContent: (id: string, content: string) => void;

@@ -47,6 +47,38 @@ pub fn platform_rules() -> &'static str {
     }
 }
 
+/// Sub-agent execution policy (enable + resilience knobs).
+/// Drives `agent::sub_agent::SubAgentTask::execute` and the
+/// `try_sub_agent_dispatch` config gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubAgentConfig {
+    /// Master switch. `false` makes `try_sub_agent_dispatch` return None
+    /// immediately and the parent agent falls back to serial execution.
+    pub enabled: bool,
+    /// Initial per-task turn budget. Adaptive logic may extend up to
+    /// `max_turns`. See `ResilienceConfig::initial_turns`.
+    pub initial_turns: usize,
+    /// Hard cap on per-task turns regardless of progress signals.
+    pub max_turns: usize,
+    /// Max parallel sub-agents per pool batch.
+    pub max_concurrent: usize,
+    /// Wall-time timeout for a single sub-agent (seconds).
+    pub timeout_secs: u64,
+}
+
+impl Default for SubAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial_turns: 4,
+            max_turns: 12,
+            max_concurrent: 3,
+            timeout_secs: 300,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub default_provider: String,
@@ -73,14 +105,6 @@ pub struct Config {
     /// works manually. Missing from older configs → defaults to `true`.
     #[serde(default = "default_true")]
     pub auto_update: bool,
-    /// Every N tool calls, inject a "restate goal / what ruled out / next
-    /// output" reflection prompt before the next turn. 0 disables the
-    /// checkpoint entirely. Default 7: dogfooding showed 10 is too slow
-    /// to catch early "same command, different flag" loops (6-7 tries
-    /// before the first checkpoint) while 5 over-injects on normal tasks.
-    /// 7 catches early loops in 1-2 retries without disturbing focused work.
-    #[serde(default = "default_reflection_cadence")]
-    pub reflection_cadence: usize,
     /// Telemetry configuration. Missing from older configs → defaults to
     /// enabled=None (consent-pending), endpoint=None (use the built-in default).
     /// Uses `#[serde(default)]` because `TelemetryConfig` has its own `Default`
@@ -94,6 +118,48 @@ pub struct Config {
     /// Only applies when working inside a git repository.
     #[serde(default)]
     pub auto_commit: bool,
+    /// Sub-agent execution policy. Missing from older configs → defaults to
+    /// enabled=true, initial_turns=4, max_turns=12, max_concurrent=3, timeout_secs=300.
+    #[serde(default)]
+    pub subagent: SubAgentConfig,
+    /// Provider key (matches a key in `Config.providers`) of a vision-language
+    /// model used to preprocess images before forwarding to a non-vision main
+    /// provider. When `None` or empty, image preprocessing is disabled — pasted
+    /// images either go directly to a vision-capable main provider, or get
+    /// degraded to `"[image attached]"` placeholder by the existing path.
+    ///
+    /// Example value: `"AtomGit-Qwen-Qwen3-VL-32B-Instruct"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_preprocessor_provider: Option<String>,
+    /// UI / prompt language override. `None` means auto-detect from the
+    /// environment (LC_ALL / LANG / system default). Persisted as the
+    /// short key defined by `Locale`'s serde rename (e.g. `"zh_CN"`).
+    #[serde(default)]
+    pub language: Option<crate::locale::Locale>,
+}
+
+impl Config {
+    /// True iff attaching an image to the active turn will reach a model
+    /// that can process it — either the active provider accepts images
+    /// directly, or `vision_preprocessor_provider` points at a real entry
+    /// in `providers` that will OCR them before forwarding. Used by the
+    /// TUIX Ctrl+V paste gate to decide whether to accept the image or
+    /// reject with the "switch to a vision-capable model" hint.
+    pub fn can_handle_attached_images(&self) -> bool {
+        let active_accepts = self
+            .providers
+            .get(&self.default_provider)
+            .map(|p| p.accepts_images())
+            .unwrap_or(false);
+        if active_accepts {
+            return true;
+        }
+        let vp_key = match self.vision_preprocessor_provider.as_deref() {
+            Some(k) if !k.is_empty() => k,
+            _ => return false,
+        };
+        self.providers.contains_key(vp_key)
+    }
 }
 
 impl Default for Config {
@@ -154,13 +220,24 @@ pub struct NotificationConfig {
 }
 
 /// Controls LSP (Language Server Protocol) integration.
+///
+/// Off by default. 5-7 atomgr datalog (build 942b615): the only `diagnostics`
+/// call in a 99-turn session took 33.6s (cold rust-analyzer spin-up) and
+/// returned "No diagnostics found", contributing nothing to task completion.
+/// LSP is also platform/toolchain-specific (rust-analyzer, gopls, etc.) and
+/// pulling those binaries unprompted violates the project's
+/// tech-stack-neutrality rule. Users who want it can flip `enabled = true`
+/// in their config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspConfig {
-    /// Master switch for LSP diagnostics.
-    #[serde(default = "default_true")]
+    /// Master switch for LSP diagnostics. Off by default — opt-in only.
+    #[serde(default)]
     pub enabled: bool,
-    /// Automatically detect and start language servers from the built-in registry.
-    #[serde(default = "default_true")]
+    /// Automatically detect and start language servers from the built-in
+    /// registry. Off by default — even when `enabled = true`, users must
+    /// explicitly opt in to auto-detect (or list specific `servers`) to
+    /// avoid surprising the user with binary spawns.
+    #[serde(default)]
     pub auto_detect: bool,
     /// Custom server configurations keyed by file extension.
     #[serde(default)]
@@ -179,19 +256,47 @@ fn default_diagnostics_settle_delay_ms() -> u64 {
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            auto_detect: true,
+            enabled: false,
+            auto_detect: false,
             servers: Default::default(),
             diagnostics_settle_delay_ms: default_diagnostics_settle_delay_ms(),
         }
     }
 }
 
+/// One-shot migration for users who had atomcode installed before the
+/// "LSP off by default" flip (commit 5b07e2a, 2026-05-07). The setup
+/// wizard at install time used `LspConfig::default()` which **at that
+/// time** was `enabled=true, auto_detect=true, delay=150, servers={}`,
+/// and `Config::save()` serialized those literals into
+/// `~/.atomcode/config.toml`. Subsequent loads see explicit `enabled=true`
+/// and ignore the new in-memory default — old installs keep spawning
+/// rust-analyzer / gopls and surface init failures the user never asked
+/// for.
+///
+/// Heuristic: if the on-disk LspConfig matches the OLD wizard-written
+/// shape **byte-for-byte** (every field equals its old default), reset
+/// to the new default. Any deviation (custom server, non-default delay,
+/// auto_detect=false) means the user customised it intentionally —
+/// leave alone.
+///
+/// False-positive risk: a user who manually wrote `enabled=true +
+/// auto_detect=true + delay=150 + servers={}` exactly gets silently
+/// reset. The shape is identical to the auto-written default, so
+/// distinguishing intent is impossible without a schema-version field.
+/// Probability is low; failure mode is mild (re-enable explicitly).
+fn migrate_legacy_lsp_default(cfg: &mut Config) {
+    let looks_auto_written = cfg.lsp.enabled
+        && cfg.lsp.auto_detect
+        && cfg.lsp.diagnostics_settle_delay_ms == 150
+        && cfg.lsp.servers.is_empty();
+    if looks_auto_written {
+        cfg.lsp = LspConfig::default();
+    }
+}
+
 fn default_true() -> bool {
     true
-}
-fn default_reflection_cadence() -> usize {
-    7
 }
 fn default_notification_min_duration_secs() -> u64 {
     8
@@ -278,6 +383,7 @@ fn render_instructions_section() -> String {
         "#   2. <project>/.atomcode.md            (project — team-shared, commit to git)\n",
     );
     out.push_str("#      or <project>/ATOMCODE.md\n");
+    out.push_str("#      or <project>/CLAUDE.md / claude.md (Claude Code compat)\n");
     out.push_str(
         "#   3. <project>/.atomcode.user.md       (user — personal per-project, .gitignore)\n",
     );
@@ -343,8 +449,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
-        let config: Config = toml::from_str(&content)
+        let mut config: Config = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+        migrate_legacy_lsp_default(&mut config);
         Ok(config)
     }
 
@@ -378,27 +485,39 @@ impl Config {
 
     pub fn active_provider(&self, override_name: Option<&str>) -> Result<&ProviderConfig> {
         // Defence against an accidentally-empty `default_provider` (e.g.
-        // an older /logout path wrote "" back to config.toml). Rather
-        // than looking up the empty key and failing at startup, fall
-        // back to a lexicographically-first provider so the TUI still
-        // boots and the user can self-correct via /provider.
+        // an older /logout path wrote "" back to config.toml) OR a
+        // `default_provider` that points to a provider section the user
+        // has since deleted from config.toml.  Rather than failing at
+        // startup, fall back to a lexicographically-first provider so
+        // the TUI still boots and the user can self-correct via /provider.
         let name: &str = override_name
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.default_provider);
-        let name: &str = if name.is_empty() {
+        let fallback = || {
             self.providers
                 .keys()
                 .min()
                 .map(String::as_str)
                 .ok_or_else(|| {
                     anyhow::anyhow!("No providers configured — run /codingplan or /provider")
-                })?
+                })
+        };
+        let name: &str = if name.is_empty() {
+            fallback()?
         } else {
             name
         };
-        self.providers
-            .get(name)
-            .with_context(|| format!("Provider '{}' not found in config", name))
+        match self.providers.get(name) {
+            Some(p) => Ok(p),
+            None => {
+                // default_provider / override pointed to a key that no
+                // longer exists — fall back to the first available.
+                let fallback_name = fallback()?;
+                // SAFETY: fallback() just returned Ok from self.providers,
+                // so the key must exist.
+                Ok(self.providers.get(fallback_name).unwrap())
+            }
+        }
     }
 
     /// Resolve the atomcode config dir. Pure function for testability —
@@ -427,6 +546,131 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LSP must default to disabled. 5-7 atomgr datalog (build 942b615):
+    /// the only `diagnostics` call in 99 turns took 33.6s for a "No
+    /// diagnostics found" reply. Spinning up rust-analyzer / gopls /
+    /// pyright unprompted also conflicts with the framework's
+    /// tech-stack-neutrality stance. Users must opt in explicitly.
+    #[test]
+    fn lsp_config_defaults_to_disabled_opt_in() {
+        let cfg = LspConfig::default();
+        assert!(!cfg.enabled, "LSP enabled must default to false");
+        assert!(
+            !cfg.auto_detect,
+            "LSP auto_detect must default to false even if enabled flips on"
+        );
+    }
+
+    /// Migration: on-disk config that looks like it was auto-written by
+    /// the OLD setup wizard (enabled=true + auto_detect=true + delay=150
+    /// + no custom servers) must be silently reset to disabled. Without
+    /// this, users installed before commit 5b07e2a keep spawning
+    /// rust-analyzer / gopls every startup despite the new default.
+    #[test]
+    fn migrate_resets_auto_written_lsp_to_disabled() {
+        let mut cfg = blank_config_with_lsp(LspConfig {
+            enabled: true,
+            auto_detect: true,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: 150,
+        });
+        migrate_legacy_lsp_default(&mut cfg);
+        assert!(!cfg.lsp.enabled, "auto-written shape must reset to disabled");
+        assert!(!cfg.lsp.auto_detect);
+    }
+
+    /// User who deliberately customised LSP (e.g. added a custom server
+    /// or tuned the settle delay) must NOT be reset. Migration only fires
+    /// for byte-perfect old-default shape.
+    #[test]
+    fn migrate_keeps_user_customised_lsp_intact() {
+        // Case 1: custom server registered.
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "rs".to_string(),
+            crate::lsp::registry::LspServerConfig {
+                command: "my-custom-rust-ls".to_string(),
+                args: vec![],
+                root_markers: vec![],
+            },
+        );
+        let mut cfg = blank_config_with_lsp(LspConfig {
+            enabled: true,
+            auto_detect: true,
+            servers,
+            diagnostics_settle_delay_ms: 150,
+        });
+        migrate_legacy_lsp_default(&mut cfg);
+        assert!(cfg.lsp.enabled, "custom servers means user opt-in; keep");
+
+        // Case 2: tuned settle delay.
+        let mut cfg2 = blank_config_with_lsp(LspConfig {
+            enabled: true,
+            auto_detect: true,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: 500,
+        });
+        migrate_legacy_lsp_default(&mut cfg2);
+        assert!(cfg2.lsp.enabled, "non-default delay means user tuned; keep");
+
+        // Case 3: auto_detect=false but enabled=true (explicit narrow
+        // setup with `servers` listed) — already deviates, keep.
+        let mut cfg3 = blank_config_with_lsp(LspConfig {
+            enabled: true,
+            auto_detect: false,
+            servers: Default::default(),
+            diagnostics_settle_delay_ms: 150,
+        });
+        migrate_legacy_lsp_default(&mut cfg3);
+        assert!(cfg3.lsp.enabled, "auto_detect=false means user picked manual; keep");
+    }
+
+    /// Already-disabled config: migration must be a no-op (don't flip
+    /// disabled → re-disabled, but more importantly don't trigger any
+    /// surprise side effects).
+    #[test]
+    fn migrate_noop_on_already_disabled() {
+        let mut cfg = blank_config_with_lsp(LspConfig::default());
+        migrate_legacy_lsp_default(&mut cfg);
+        assert!(!cfg.lsp.enabled);
+        assert!(!cfg.lsp.auto_detect);
+    }
+
+    fn blank_config_with_lsp(lsp: LspConfig) -> Config {
+        Config {
+            default_provider: "x".into(),
+            default_workdir: None,
+            providers: Default::default(),
+            datalog: Default::default(),
+            auto_update: true,
+            notifications: Default::default(),
+            telemetry: Default::default(),
+            lsp,
+            auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: None,
+            language: None,
+        }
+    }
+
+    /// Empty/missing `[lsp]` section in user TOML must produce the
+    /// disabled default — not silently flip back to enabled via a
+    /// stray `default = "default_true"` serde attribute.
+    #[test]
+    fn lsp_section_omitted_in_toml_yields_disabled() {
+        let toml_str = r#"
+            default_provider = "claude"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-ant-test"
+            model = "claude-opus-4-6"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("config parses");
+        assert!(!cfg.lsp.enabled, "missing [lsp] must keep LSP off");
+        assert!(!cfg.lsp.auto_detect);
+    }
 
     #[test]
     fn test_resolve_config_dir_uses_env_when_set() {
@@ -563,10 +807,12 @@ mod tests {
             },
             notifications: NotificationConfig::default(),
             auto_update: true,
-            reflection_cadence: 7,
             telemetry: Default::default(),
             lsp: Default::default(),
             auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: None,
+            language: None,
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -586,7 +832,8 @@ mod tests {
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
-            },
+
+},
         );
         cfg.save(&tmp).unwrap();
         let text = std::fs::read_to_string(&tmp).unwrap();
@@ -681,6 +928,259 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+    #[test]
+    fn active_provider_falls_back_when_default_points_to_deleted_provider() {
+        // Regression test for https://gitcode.com/atomgit_atomcode/atomcode/issues/353
+        // User deletes a provider section from config.toml but leaves
+        // default_provider pointing at it — startup must still succeed by
+        // falling back to a lexicographically-first provider instead of
+        // failing with "Provider 'xxx' not found".
+        let toml_str = r#"
+            default_provider = "AtomGit-Qwen"
+
+            [providers.openai]
+            type = "openai"
+            api_key = "sk-test"
+            model = "gpt-4o"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-a"
+            model = "claude-opus-4-6"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let provider = config.active_provider(None).unwrap();
+        // Should fall back to "claude" (lexicographically first)
+        assert_eq!(provider.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn active_provider_falls_back_when_override_points_to_deleted_provider() {
+        // Same as above but via the --provider CLI override.
+        let toml_str = r#"
+            default_provider = "openai"
+
+            [providers.openai]
+            type = "openai"
+            api_key = "sk-test"
+            model = "gpt-4o"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-a"
+            model = "claude-opus-4-6"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let provider = config.active_provider(Some("nonexistent")).unwrap();
+        // Should fall back to "claude" (lexicographically first)
+        assert_eq!(provider.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn active_provider_errors_when_default_deleted_and_no_other_providers() {
+        // default_provider points to a deleted section AND there are no
+        // other providers — must error (nothing to fall back to).
+        let toml_str = r#"
+            default_provider = "deleted"
+            [providers]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let err = config.active_provider(None).unwrap_err();
+        assert!(
+            err.to_string().contains("No providers configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vision_preprocessor_provider_defaults_to_none() {
+        // Existing config.toml files (pre-feature) must parse cleanly with
+        // `vision_preprocessor_provider` defaulting to None — feature is opt-in
+        // and absence must not break load.
+        let toml_str = r#"
+            default_provider = "claude"
+            [providers.claude]
+            type = "claude"
+            model = "claude-sonnet-4-5"
+            api_key = "sk-test"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse minimal config");
+        assert_eq!(cfg.vision_preprocessor_provider, None);
+    }
+
+    #[test]
+    fn saved_config_roundtrips_language() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut cfg = Config {
+            default_provider: "p".to_string(),
+            default_workdir: None,
+            providers: HashMap::new(),
+            datalog: DatalogConfig::default(),
+            notifications: NotificationConfig::default(),
+            auto_update: true,
+            telemetry: Default::default(),
+            lsp: Default::default(),
+            auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: None,
+            language: Some(crate::locale::Locale::ZhCn),
+        };
+        cfg.providers.insert(
+            "p".to_string(),
+            ProviderConfig {
+                provider_type: "openai".to_string(),
+                api_key: Some("k".to_string()),
+                model: "m".to_string(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 16000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral: false,
+            },
+        );
+        cfg.save(tmp.path()).unwrap();
+
+        let loaded = Config::load(tmp.path()).unwrap();
+        assert_eq!(loaded.language, Some(crate::locale::Locale::ZhCn));
+    }
+
+    #[test]
+    fn config_default_has_no_language() {
+        let toml_str = r#"
+            default_provider = "test"
+            [providers]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.language, None);
+    }
+
+    #[test]
+    fn config_missing_language_field_loads_as_none() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "default_provider = \"foo\"\n[providers]\n").unwrap();
+        let loaded = Config::load(tmp.path()).unwrap();
+        assert_eq!(loaded.language, None);
+    }
+
+    #[test]
+    fn vision_preprocessor_provider_round_trips_through_toml() {
+        let toml_str = r#"
+            default_provider = "claude"
+            vision_preprocessor_provider = "AtomGit-Qwen-Qwen3-VL-32B-Instruct"
+            [providers.claude]
+            type = "claude"
+            model = "claude-sonnet-4-5"
+            api_key = "sk-test"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            cfg.vision_preprocessor_provider.as_deref(),
+            Some("AtomGit-Qwen-Qwen3-VL-32B-Instruct"),
+        );
+    }
+
+    /// Helper: minimal Config with one provider, configurable model name +
+    /// optional preprocessor key. Used by the can_handle_attached_images tests.
+    fn cfg_with(active_model: &str, preprocessor_key: Option<&str>) -> Config {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "active".to_string(),
+            crate::config::provider::ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: Some("sk-test".into()),
+                model: active_model.into(),
+                base_url: Some("http://127.0.0.1/".into()),
+                system_prompt: None,
+                user_agent: None,
+                context_window: 8000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral: false,
+            },
+        );
+        Config {
+            default_provider: "active".into(),
+            default_workdir: None,
+            providers,
+            datalog: Default::default(),
+            auto_update: true,
+            notifications: Default::default(),
+            telemetry: Default::default(),
+            lsp: Default::default(),
+            auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: preprocessor_key.map(|s| s.to_string()),
+            language: None,
+        }
+    }
+
+    #[test]
+    fn can_handle_attached_images_true_when_active_provider_accepts_images() {
+        // Vision-capable main provider — preprocessor irrelevant.
+        let cfg = cfg_with("claude-sonnet-4-5", None);
+        assert!(cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn can_handle_attached_images_false_for_text_only_main_and_no_preprocessor() {
+        // The original gate's behaviour: refuse paste.
+        let cfg = cfg_with("deepseek-v4-flash", None);
+        assert!(!cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn can_handle_attached_images_false_when_preprocessor_key_does_not_resolve() {
+        // Configured but the key is missing from `providers`. Must NOT
+        // accept the paste — the user would just hit `[图片识别失败]` on
+        // every send. Better to surface the error at paste time.
+        let cfg = cfg_with("deepseek-v4-flash", Some("NoSuchProvider"));
+        assert!(!cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn can_handle_attached_images_false_when_preprocessor_key_is_empty_string() {
+        let cfg = cfg_with("deepseek-v4-flash", Some(""));
+        assert!(!cfg.can_handle_attached_images());
+    }
+
+    #[test]
+    fn can_handle_attached_images_true_when_preprocessor_resolves() {
+        // Main is text-only but a preprocessor is configured + present.
+        let mut cfg = cfg_with("deepseek-v4-flash", Some("vl-helper"));
+        cfg.providers.insert(
+            "vl-helper".into(),
+            crate::config::provider::ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: Some("sk-vl".into()),
+                model: "Qwen/Qwen3-VL-32B-Instruct".into(),
+                base_url: Some("http://127.0.0.1/".into()),
+                system_prompt: None,
+                user_agent: None,
+                context_window: 8000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral: false,
+            },
+        );
+        assert!(cfg.can_handle_attached_images());
+    }
 }
 
 #[cfg(test)]
@@ -688,35 +1188,19 @@ mod reflection_config_tests {
     use super::*;
 
     #[test]
-    fn reflection_cadence_defaults_to_seven_when_missing_from_toml() {
-        let toml_text = r#"
-default_provider = "claude"
-[providers]
-"#;
-        let cfg: Config = toml::from_str(toml_text).expect("parses minimal config");
-        assert_eq!(cfg.reflection_cadence, 7);
-    }
-
-    #[test]
-    fn reflection_cadence_zero_means_disabled() {
-        let toml_text = r#"
-default_provider = "claude"
-reflection_cadence = 0
-[providers]
-"#;
-        let cfg: Config = toml::from_str(toml_text).expect("parses config with 0");
-        assert_eq!(cfg.reflection_cadence, 0);
-    }
-
-    #[test]
-    fn reflection_cadence_custom_value_is_preserved() {
+    fn legacy_reflection_cadence_field_is_silently_ignored() {
+        // Older configs in the wild still carry `reflection_cadence = 7`
+        // (the field's value at the time the mechanism was removed).
+        // toml + serde's default permissiveness means the unknown field
+        // is dropped without erroring; this test pins that behaviour so
+        // an accidental `#[serde(deny_unknown_fields)]` later doesn't
+        // start rejecting users' on-disk configs.
         let toml_text = r#"
 default_provider = "claude"
 reflection_cadence = 7
 [providers]
 "#;
-        let cfg: Config = toml::from_str(toml_text).expect("parses");
-        assert_eq!(cfg.reflection_cadence, 7);
+        let _cfg: Config = toml::from_str(toml_text).expect("legacy field ignored");
     }
 
     #[test]

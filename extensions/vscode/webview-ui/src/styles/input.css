@@ -102,20 +102,38 @@
   font-size: 11px;
 }
 
-.footer-attach-btn {
+.footer-attach-btn,
+.footer-slash-btn {
   display: flex;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
   background: transparent;
-  border: none;
+  border: 1px solid transparent;
   color: var(--app-secondary-foreground);
   cursor: pointer;
-  padding: 2px 4px;
   border-radius: var(--corner-radius-small);
-  font-size: 11px;
+  font-size: 12px;
+  line-height: 1;
 }
 
-.footer-attach-btn:hover {
+.footer-attach-btn {
+  gap: 4px;
+  padding: 2px 4px;
+  font-size: 11px;
+  border: none;
+}
+
+.footer-slash-btn {
+  width: 22px;
+  height: 22px;
+  font-family: var(--app-monospace-font-family);
+  font-weight: 700;
+  color: var(--app-primary-foreground);
+  border-color: var(--app-input-border);
+}
+
+.footer-attach-btn:hover,
+.footer-slash-btn:hover {
   background: var(--app-ghost-button-hover-background);
   color: var(--app-primary-foreground);
 }

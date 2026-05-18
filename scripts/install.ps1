@@ -3,12 +3,16 @@
 #   irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.ps1 | iex
 #
 # Env overrides:
-#   $env:ATOMCODE_VERSION   release tag to install (default: v4.21.2)
+#   $env:ATOMCODE_VERSION   release tag to install (default: v4.22.2)
 #   $env:ATOMCODE_PREFIX    install dir (default: %LOCALAPPDATA%\AtomCode)
+# IMPORTANT: when changing install paths, registry edits, or filenames here,
+# also update scripts/uninstall.ps1 AND
+# crates/atomcode-core/src/uninstall/paths.rs. The CI parity test guards
+# the manifest, but binary path / PATH edit are not checked.
 
 $ErrorActionPreference = "Stop"
 
-$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.21.2" }
+$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.22.2" }
 $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 
 # --- detect arch ---

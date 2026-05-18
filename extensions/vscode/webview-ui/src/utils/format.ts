@@ -3,9 +3,19 @@ export function formatTokenCount(total: number): string {
   return `${(total / 1000).toFixed(1)}k tokens`;
 }
 
-export function formatTimeAgo(dateStr?: string): string {
-  if (!dateStr) return '';
-  const diff = Date.now() - new Date(dateStr).getTime();
+function toTimestamp(value?: string | number): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value === 'number') return value < 10_000_000_000 ? value * 1000 : value;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+export function formatTimeAgo(dateStr?: string | number): string {
+  const ts = toTimestamp(dateStr);
+  if (!ts) return '';
+  const diff = Date.now() - ts;
   const mins = Math.floor(diff / 60000);
   if (mins < 1) return 'just now';
   if (mins < 60) return `${mins}m ago`;
@@ -25,14 +35,14 @@ export function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
-export function groupSessionsByDate<T extends { updated_at?: string; created_at?: string }>(
+export function groupSessionsByDate<T extends { updated_at?: string | number; created_at?: string | number }>(
   sessions: T[],
 ): Record<string, T[]> {
   const groups: Record<string, T[]> = {};
   const now = Date.now();
   const oneDay = 86400000;
   sessions.forEach((s) => {
-    const ts = new Date(s.updated_at ?? s.created_at ?? now).getTime();
+    const ts = toTimestamp(s.updated_at ?? s.created_at) ?? now;
     const diff = now - ts;
     let label: string;
     if (diff < oneDay) label = 'Today';

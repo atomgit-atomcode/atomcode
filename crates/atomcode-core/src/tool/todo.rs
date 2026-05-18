@@ -35,7 +35,7 @@ impl TodoTool {
     }
 
     /// Format the todo list for display.
-    pub async fn format_list(items: &Arc<Mutex<Vec<TodoItem>>>) -> String {
+    async fn format_list(items: &Arc<Mutex<Vec<TodoItem>>>) -> String {
         let items = items.lock().await;
         if items.is_empty() {
             return "No tasks.".to_string();

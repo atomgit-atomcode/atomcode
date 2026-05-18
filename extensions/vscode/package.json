@@ -1,20 +1,19 @@
 {
-  "name": "atomcode-vscode",
-  "displayName": "AtomCode",
+  "name": "atomcode-tools",
+  "displayName": "AtomCode for VS Code",
   "description": "AI coding agent powered by AtomCode — terminal-grade AI inside VS Code",
-  "version": "0.1.0",
-  "publisher": "atomgit",
+  "version": "0.0.5",
+  "publisher": "atomcode-tools",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://gitcode.com/atomgit_atomcode/atomcode.git",
+    "url": "https://atomgit.com/atomgit_atomcode/atomcode.git",
     "directory": "extensions/vscode"
   },
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
-    "AI",
     "Programming Languages",
     "Other"
   ],
@@ -39,31 +38,43 @@
       },
       {
         "command": "atomcode.openTab",
-        "title": "AtomCode: Open in New Tab"
+        "title": "AtomCode: Open in New Tab",
+        "icon": "$(hubot)"
+      },
+      {
+        "command": "atomcode.openPreferredLocation",
+        "title": "AtomCode: Open Preferred Location",
+        "icon": "$(hubot)"
       },
       {
         "command": "atomcode.focusInput",
-        "title": "AtomCode: Focus Input"
+        "title": "AtomCode: Focus Input",
+        "icon": "$(edit)"
       },
       {
         "command": "atomcode.newConversation",
-        "title": "AtomCode: New Conversation"
+        "title": "AtomCode: New Conversation",
+        "icon": "$(add)"
       },
       {
         "command": "atomcode.explain",
-        "title": "AtomCode: Explain Selection"
+        "title": "AtomCode: Explain Selection",
+        "icon": "$(question)"
       },
       {
         "command": "atomcode.fix",
-        "title": "AtomCode: Fix Selection"
+        "title": "AtomCode: Fix Selection",
+        "icon": "$(wrench)"
       },
       {
         "command": "atomcode.optimize",
-        "title": "AtomCode: Optimize Selection"
+        "title": "AtomCode: Optimize Selection",
+        "icon": "$(rocket)"
       },
       {
         "command": "atomcode.stop",
-        "title": "AtomCode: Stop Generation"
+        "title": "AtomCode: Stop Generation",
+        "icon": "$(stop-circle)"
       }
     ],
     "viewsContainers": {
@@ -80,7 +91,8 @@
         {
           "type": "webview",
           "id": "atomcode.chatView",
-          "name": "Chat"
+          "name": "Sessions",
+          "icon": "resources/icon.svg"
         }
       ]
     },
@@ -165,14 +177,14 @@
       },
       {
         "command": "atomcode.explain",
-        "key": "ctrl+shift+e",
-        "mac": "cmd+shift+e",
+        "key": "ctrl+shift+alt+e",
+        "mac": "cmd+shift+alt+e",
         "when": "editorHasSelection"
       },
       {
         "command": "atomcode.newConversation",
-        "key": "ctrl+n",
-        "mac": "cmd+n",
+        "key": "ctrl+shift+alt+n",
+        "mac": "cmd+shift+alt+n",
         "when": "atomcode.chatFocused"
       }
     ]
@@ -180,11 +192,14 @@
   "scripts": {
     "build:webview": "node webview-ui/esbuild.js",
     "watch:webview": "node webview-ui/esbuild.js --watch",
+    "bundle:daemon": "node scripts/bundle-daemon.js",
+    "bundle:daemon:required": "node scripts/bundle-daemon.js --require",
     "compile": "tsc -p ./ && npm run build:webview",
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && npm run bundle:daemon",
     "watch": "npx concurrently \"tsc -watch -p ./\" \"npm run watch:webview\"",
     "lint": "eslint src --ext ts",
-    "package": "vsce package --no-dependencies"
+    "package:local": "vsce package --no-dependencies",
+    "package": "npm run bundle:daemon:required && vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/dompurify": "^3.0.5",
