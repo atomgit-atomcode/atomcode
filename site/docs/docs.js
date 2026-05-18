@@ -1,305 +1,294 @@
-// Shared behavior for docs pages: theme toggle, mobile sidebar, icon sync, search.
-(function () {
-  function getTheme() { return document.documentElement.getAttribute('data-theme') || 'dark'; }
-  function syncIcon() {
-    var icon = document.getElementById('themeIcon');
-    if (!icon) return;
-    icon.textContent = getTheme() === 'dark' ? '\u263C' : '\u263E'; // ☼ / ☾
-  }
-  window.toggleDocsTheme = function () {
-    var next = getTheme() === 'dark' ? 'light' : 'dark';
-    document.documentElement.setAttribute('data-theme', next);
-    try { localStorage.setItem('atomcode-theme', next); } catch (e) {}
-    syncIcon();
-  };
-  document.addEventListener('DOMContentLoaded', function () {
-    syncIcon();
-    var toggle = document.getElementById('sidebarToggle');
-    var sidebar = document.getElementById('docsSidebar');
-    if (toggle && sidebar) {
-      toggle.addEventListener('click', function () { sidebar.classList.toggle('open'); });
+/* AtomCode docs — shared chrome behavior
+ * Loads a pre-built JSON index for search; no per-page HTTP fetching.
+ */
+(function(){
+  'use strict';
+
+  // ── theme ──
+  const html=document.documentElement;
+  function isLight(){return html.classList.contains('light')||html.getAttribute('data-theme')==='light'}
+  function applyTheme(theme){
+    const light=theme==='light';
+    html.classList.toggle('light',light);
+    if(light) html.setAttribute('data-theme','light'); else html.removeAttribute('data-theme');
+    const btn=document.getElementById('themeBtn');
+    if(btn){
+      btn.innerHTML=light
+        ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>'
+        : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+      btn.setAttribute('aria-label',light?'Switch to dark':'Switch to light');
     }
+    try{localStorage.setItem('atomcode_theme',theme)}catch(e){}
+  }
+  function readTheme(){
+    try{
+      const s=localStorage.getItem('atomcode_theme');
+      if(s==='light'||s==='dark') return s;
+      const old=localStorage.getItem('atomcode-theme');
+      if(old==='light'||old==='dark') return old;
+    }catch(e){}
+    return matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
+  }
+  applyTheme(readTheme());
+  window.toggleDocsTheme=function(){applyTheme(isLight()?'dark':'light')};
+
+  // ── i18n (chrome only — page content stays as authored) ──
+  const T={
+    'badge.docs':{zh:'DOCS',en:'DOCS'},
+    'search.placeholder':{zh:'搜索文档…',en:'Search docs…'},
+    'search.trigger.text':{zh:'搜索文档…',en:'Search docs…'},
+    'search.empty':{zh:'没有匹配结果',en:'No matches'},
+    'search.notloaded':{zh:'搜索索引未加载（请通过 http:// 服务后再试）',en:'Search index not loaded (serve over http:// and retry)'},
+    'aria.theme':{zh:'切换主题',en:'Toggle theme'},
+    'aria.lang':{zh:'切换语言',en:'Toggle language'},
+    'aria.sidebar':{zh:'目录',en:'Menu'},
+    'aria.search':{zh:'搜索文档',en:'Search docs'},
+    'hdr.repo':{zh:'仓库 →',en:'Repo →'},
+    'ftr.copy':{zh:'© 2026 AtomCode · MIT',en:'© 2026 AtomCode · MIT'},
+    'ftr.issue':{zh:'报告问题',en:'Report an issue'},
+    // sidebar group titles
+    'side.g.overview':{zh:'概览',en:'Overview'},
+    'side.g.start':{zh:'开始',en:'Get Started'},
+    'side.g.usage':{zh:'使用',en:'Usage'},
+    'side.g.advanced':{zh:'进阶',en:'Advanced'},
+    'side.g.ops':{zh:'问题',en:'Help'},
+    // sidebar page labels
+    'side.index':{zh:'文档首页',en:'Documentation Home'},
+    'side.getting-started':{zh:'快速开始',en:'Quickstart'},
+    'side.login':{zh:'登录方式',en:'Login Methods'},
+    'side.configuration':{zh:'配置文件',en:'Configuration'},
+    'side.basic-usage':{zh:'基本使用',en:'Basic Usage'},
+    'side.slash-commands':{zh:'斜杠命令',en:'Slash Commands'},
+    'side.keybindings':{zh:'快捷键',en:'Keybindings'},
+    'side.sessions':{zh:'会话与撤销',en:'Sessions & Undo'},
+    'side.tools':{zh:'内置工具',en:'Built-in Tools'},
+    'side.skills':{zh:'Skills 扩展',en:'Skills'},
+    'side.mcp':{zh:'MCP 集成',en:'MCP Integration'},
+    'side.plugins':{zh:'Plugin 系统',en:'Plugin System'},
+    'side.memory':{zh:'永久记忆',en:'Persistent Memory'},
+    'side.project-instructions':{zh:'项目指令文件',en:'Project Instructions'},
+    'side.faq':{zh:'常见问题',en:'FAQ'},
+    // index page hero
+    'hero.eyebrow':{zh:'AtomCode · 开源终端 AI 编码助手',en:'AtomCode · Open-source Terminal AI Coding Assistant'},
+    'hero.tag.license':{zh:'许可证 MIT',en:'License: MIT'},
+    'hero.tag.lang':{zh:'语言 Rust 1.88+',en:'Language: Rust 1.88+'},
+    'hero.tag.platforms':{zh:'平台 macOS · Linux · HarmonyOS PC · Windows',en:'Platforms: macOS · Linux · HarmonyOS PC · Windows'},
+    'hero.tag.ai':{zh:'100% AI 生成',en:'100% AI-generated'},
+  };
+  // Determine lang from URL path first (/docs/zh/ vs /docs/en/), fall back
+  // to localStorage, default zh.
+  function detectLang(){
+    const m=location.pathname.match(/\/docs\/(zh|en)\//);
+    if(m) return m[1];
+    try{const s=localStorage.getItem('atomcode_lang');if(s==='zh'||s==='en') return s;}catch(e){}
+    return 'zh';
+  }
+  let LANG=detectLang();
+  try{localStorage.setItem('atomcode_lang',LANG)}catch(e){}
+  function t(k){const v=T[k];if(!v)return k;return v[LANG]||v.zh||k;}
+  function applyI18n(){
+    document.documentElement.lang=LANG==='zh'?'zh-CN':'en';
+    document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n)});
+    document.querySelectorAll('[data-i18n-aria]').forEach(el=>{el.setAttribute('aria-label',t(el.dataset.i18nAria))});
+    document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{el.setAttribute('placeholder',t(el.dataset.i18nPlaceholder))});
+    const lb=document.getElementById('langBtn');
+    if(lb){lb.textContent=LANG==='zh'?'EN':'中';lb.setAttribute('aria-label',t('aria.lang'))}
+  }
+  function setLang(l){
+    LANG=l;
+    try{localStorage.setItem('atomcode_lang',LANG)}catch(e){}
+    // Navigate to the equivalent page in the other lang directory
+    const p=location.pathname;
+    const m=p.match(/^(.*\/docs\/)(zh|en)\/([^/]+)$/);
+    if(m){location.href=m[1]+l+'/'+m[3]+location.hash;return}
+    applyI18n();
+  }
+  window.toggleDocsLang=function(){setLang(LANG==='zh'?'en':'zh')};
+
+  function onReady(fn){
+    if(document.readyState!=='loading') fn();
+    else document.addEventListener('DOMContentLoaded',fn);
+  }
+  onReady(function(){
+    applyI18n();
+    const tb=document.getElementById('themeBtn');
+    if(tb) tb.addEventListener('click',window.toggleDocsTheme);
+    const lb=document.getElementById('langBtn');
+    if(lb) lb.addEventListener('click',window.toggleDocsLang);
+
+    const hdr=document.querySelector('.dhdr');
+    if(hdr){
+      const onScroll=()=>hdr.classList.toggle('scrolled',scrollY>30);
+      onScroll();addEventListener('scroll',onScroll,{passive:true});
+    }
+
+    const sb=document.getElementById('dside');
+    const sbToggle=document.getElementById('sbToggle');
+    if(sb&&sbToggle){
+      sbToggle.addEventListener('click',()=>sb.classList.toggle('open'));
+      sb.addEventListener('click',e=>{if(e.target.closest('a')) sb.classList.remove('open')});
+    }
+
+    const page=document.body.getAttribute('data-page');
+    if(page&&sb){
+      sb.querySelectorAll('.dside-link').forEach(a=>{
+        const slug=(a.getAttribute('data-slug')||a.getAttribute('href')||'').replace(/^\.?\//,'').replace(/\.html$/,'');
+        if(slug===page){a.classList.add('active');a.setAttribute('aria-current','page')}
+      });
+    }
+
     initSearch();
   });
 
-  // ── Client-side docs search ──
-  var searchIndex = null; // [{url, pageTitle, heading, text, raw}]
+  // ── Search ──
+  let SEARCH=null;
+  let LOAD_PROMISE=null;
+  let CUR_RESULTS=[];
+  let CUR_SEL=0;
 
-  var DOC_PAGES = [
-    { url: 'index.html',                title: '概览' },
-    { url: 'getting-started.html',      title: '快速开始' },
-    { url: 'configuration.html',        title: '配置文件' },
-    { url: 'login.html',                title: '登录方式' },
-    { url: 'basic-usage.html',          title: '基本使用' },
-    { url: 'slash-commands.html',       title: '斜杠命令' },
-    { url: 'keybindings.html',          title: '快捷键' },
-    { url: 'tools.html',               title: '内置工具' },
-    { url: 'sessions.html',            title: '会话与撤销' },
-    { url: 'project-instructions.html', title: '项目指令文件' },
-    { url: 'memory.html',              title: '永久记忆' },
-    { url: 'skills.html',              title: 'Skills 扩展' },
-    { url: 'plugins.html',             title: 'Plugin 系统' },
-    { url: 'mcp.html',                 title: 'MCP 集成' },
-    { url: 'faq.html',                 title: '常见问题' },
-  ];
+  function resolveIndexUrl(){
+    // page lives at /docs/<lang>/<slug>.html — index lives at /docs/search-index.<lang>.json
+    const m=location.pathname.match(/^(.*\/docs\/)(zh|en)\//);
+    if(m) return m[1]+'search-index.'+m[2]+'.json';
+    // fallback: legacy flat layout
+    const path=location.pathname;
+    const lastSlash=path.lastIndexOf('/');
+    return (lastSlash>=0?path.slice(0,lastSlash+1):'./')+'search-index.'+LANG+'.json';
+  }
+  function loadIndex(){
+    if(SEARCH) return Promise.resolve(SEARCH);
+    if(LOAD_PROMISE) return LOAD_PROMISE;
+    LOAD_PROMISE=fetch(resolveIndexUrl(),{cache:'no-cache'})
+      .then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status)))
+      .then(j=>{SEARCH=j;return j})
+      .catch(err=>{console.warn('[docs] search index load failed:',err);return null});
+    return LOAD_PROMISE;
+  }
 
-  function initSearch() {
-    var container = document.getElementById('docsSearch');
-    if (!container) return;
+  function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+  function escapeRe(s){return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
 
-    container.innerHTML =
-      '<div class="docs-search-wrap">' +
-        '<input id="searchInput" type="text" placeholder="搜索文档… (⌘K)" autocomplete="off" />' +
-        '<div id="searchResults" class="docs-search-results" style="display:none"></div>' +
-      '</div>';
+  function initSearch(){
+    const modal=document.getElementById('searchModal');
+    const input=document.getElementById('searchInput');
+    const results=document.getElementById('searchResults');
+    const triggers=document.querySelectorAll('[data-open-search]');
+    if(!modal||!input||!results) return;
+    const bg=modal.querySelector('.search-modal-bg');
 
-    var input = document.getElementById('searchInput');
-    var results = document.getElementById('searchResults');
-    var debounce = null;
+    function open(){
+      modal.classList.add('open');
+      loadIndex().then(()=>{
+        input.value='';render('');
+        setTimeout(()=>input.focus(),0);
+      });
+    }
+    function close(){modal.classList.remove('open')}
 
-    input.addEventListener('input', function () {
-      clearTimeout(debounce);
-      debounce = setTimeout(function () { runSearch(input.value.trim(), results); }, 200);
-    });
+    triggers.forEach(t=>t.addEventListener('click',e=>{e.preventDefault();open()}));
+    bg.addEventListener('click',close);
 
-    input.addEventListener('focus', function () {
-      if (input.value.trim().length >= 1) runSearch(input.value.trim(), results);
-    });
-
-    document.addEventListener('click', function (e) {
-      if (!container.contains(e.target)) results.style.display = 'none';
-    });
-
-    document.addEventListener('keydown', function (e) {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    addEventListener('keydown',e=>{
+      const isModK=(e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k';
+      const tag=document.activeElement&&document.activeElement.tagName||'';
+      const isSlash=e.key==='/'&&!modal.classList.contains('open')&&!/^(INPUT|TEXTAREA)$/i.test(tag);
+      if(isModK||isSlash){e.preventDefault();open();return}
+      if(!modal.classList.contains('open')) return;
+      if(e.key==='Escape'){e.preventDefault();close()}
+      else if(e.key==='ArrowDown'){e.preventDefault();move(1)}
+      else if(e.key==='ArrowUp'){e.preventDefault();move(-1)}
+      else if(e.key==='Enter'){
         e.preventDefault();
-        input.focus();
-        input.select();
-      }
-      if (e.key === 'Escape') {
-        results.style.display = 'none';
-        input.blur();
+        const hit=CUR_RESULTS[CUR_SEL];
+        if(hit) location.href=hit.href;
       }
     });
+    input.addEventListener('input',()=>render(input.value));
 
-    // Pre-build index on idle so first search is instant
-    if (window.requestIdleCallback) {
-      window.requestIdleCallback(function () { buildIndex(function () {}); });
-    } else {
-      setTimeout(function () { buildIndex(function () {}); }, 1000);
-    }
-  }
-
-  // Resolve URL relative to current page's directory
-  function resolveUrl(rel) {
-    // Get the directory of the current page
-    var base = window.location.href;
-    var lastSlash = base.lastIndexOf('/');
-    if (lastSlash >= 0) base = base.substring(0, lastSlash + 1);
-    return base + rel;
-  }
-
-  function buildIndex(callback) {
-    if (searchIndex) { callback(searchIndex); return; }
-
-    // Strategy 1: fetch pages via HTTP (works on http:// servers)
-    // Strategy 2: if fetch fails (file://), index the current page only
-    var useCurrentPageOnly = window.location.protocol === 'file:';
-
-    if (useCurrentPageOnly) {
-      searchIndex = indexCurrentPage();
-      callback(searchIndex);
-      return;
+    function move(d){
+      if(!CUR_RESULTS.length) return;
+      CUR_SEL=(CUR_SEL+d+CUR_RESULTS.length)%CUR_RESULTS.length;
+      results.querySelectorAll('.search-item').forEach((el,i)=>el.classList.toggle('active',i===CUR_SEL));
+      const sel=results.querySelector('.search-item.active');
+      if(sel) sel.scrollIntoView({block:'nearest'});
     }
 
-    searchIndex = [];
-    var remaining = DOC_PAGES.length;
+    function score(text,term){
+      if(!text) return 0;
+      const t=text.toLowerCase();
+      if(t===term) return 10;
+      if(t.startsWith(term)) return 6;
+      if(t.indexOf(term)>=0) return 3;
+      return 0;
+    }
+    function bodyMatch(body,term){
+      if(!body) return {score:0,snippet:''};
+      const t=body.toLowerCase();
+      const idx=t.indexOf(term);
+      if(idx<0) return {score:0,snippet:''};
+      const start=Math.max(0,idx-40);
+      const end=Math.min(body.length,idx+term.length+80);
+      return {score:1,snippet:(start>0?'…':'')+body.slice(start,end)+(end<body.length?'…':'')};
+    }
+    function highlight(snip,term){
+      if(!snip||!term) return escapeHtml(snip||'');
+      const safe=escapeHtml(snip);
+      return safe.replace(new RegExp(escapeRe(term),'gi'),m=>'<mark>'+m+'</mark>');
+    }
 
-    DOC_PAGES.forEach(function (page) {
-      fetch(resolveUrl(page.url))
-        .then(function (r) {
-          if (!r.ok) throw new Error(r.status);
-          return r.text();
-        })
-        .then(function (html) {
-          var entries = parsePageHtml(html, page.url, page.title);
-          searchIndex = searchIndex.concat(entries);
-        })
-        .catch(function () {
-          // Page fetch failed — skip silently
-        })
-        .finally(function () {
-          remaining--;
-          if (remaining <= 0) callback(searchIndex);
-        });
-    });
-  }
+    function pageHref(slug){return slug==='index'?'./index.html':'./'+slug+'.html'}
 
-  // Index just the current page (file:// fallback)
-  function indexCurrentPage() {
-    var main = document.querySelector('.prose-docs') || document.querySelector('main');
-    if (!main) return [];
-    var title = document.title.split('·')[0].trim() || '文档';
-    var url = window.location.pathname.split('/').pop() || 'index.html';
-    return extractSections(main, url, title);
-  }
-
-  // Parse fetched HTML string into search entries
-  function parsePageHtml(html, url, pageTitle) {
-    var parser = new DOMParser();
-    var doc = parser.parseFromString(html, 'text/html');
-    var main = doc.querySelector('.prose-docs') || doc.querySelector('main') || doc.body;
-    return extractSections(main, url, pageTitle);
-  }
-
-  // Extract sections from a DOM element, split by h2/h3
-  function extractSections(root, url, pageTitle) {
-    var entries = [];
-    var headings = root.querySelectorAll('h1, h2, h3');
-
-    if (headings.length === 0) {
-      // No headings — index the whole page as one entry
-      var text = (root.textContent || '').replace(/\s+/g, ' ').trim();
-      if (text) {
-        entries.push({
-          url: url,
-          pageTitle: pageTitle,
-          heading: pageTitle,
-          text: text.toLowerCase(),
-          raw: text,
-        });
+    function render(q){
+      const term=(q||'').trim().toLowerCase();
+      if(!SEARCH){
+        results.innerHTML='<div class="search-empty">'+t('search.notloaded')+'</div>';
+        CUR_RESULTS=[];return;
       }
-      return entries;
-    }
-
-    // Walk through all elements, grouping text by heading
-    var currentHeading = pageTitle;
-    var currentText = '';
-
-    function flush() {
-      var cleaned = currentText.replace(/\s+/g, ' ').trim();
-      if (cleaned) {
-        entries.push({
-          url: url,
-          pageTitle: pageTitle,
-          heading: currentHeading,
-          text: cleaned.toLowerCase(),
-          raw: cleaned,
-        });
+      if(!term){
+        CUR_RESULTS=SEARCH.map(p=>({
+          href:pageHref(p.slug),page:p.group||p.title,heading:p.title,snippet:p.lede||''
+        }));
+        renderList('');return;
       }
-    }
-
-    // Collect text between headings using TreeWalker for deep text extraction
-    var allElements = root.querySelectorAll('*');
-    var headingSet = new Set(headings);
-    var seenText = new Set();
-
-    for (var i = 0; i < allElements.length; i++) {
-      var el = allElements[i];
-      if (headingSet.has(el)) {
-        flush();
-        currentHeading = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        currentText = '';
-      } else if (el.children.length === 0 || el.tagName === 'TD' || el.tagName === 'LI' || el.tagName === 'P' || el.tagName === 'CODE') {
-        // Leaf nodes or content containers — grab their text
-        var t = (el.textContent || '').trim();
-        if (t && !seenText.has(t)) {
-          seenText.add(t);
-          currentText += ' ' + t;
+      const hits=[];
+      const seenPage={};
+      for(const p of SEARCH){
+        const pageMatch=score(p.title,term);
+        let sectionHit=false;
+        for(const s of p.sections){
+          const hMatch=score(s.heading,term);
+          const bMatch=bodyMatch(s.body,term);
+          if(pageMatch+hMatch+bMatch.score===0) continue;
+          hits.push({
+            score:pageMatch*3+hMatch*2+bMatch.score,
+            href:pageHref(p.slug)+(s.id?'#'+s.id:''),
+            page:p.title,heading:s.heading||p.title,snippet:bMatch.snippet||s.body.slice(0,120),
+          });
+          sectionHit=true;
+        }
+        if(pageMatch>0&&!sectionHit){
+          if(!seenPage[p.slug]){
+            seenPage[p.slug]=true;
+            hits.push({score:pageMatch*3,href:pageHref(p.slug),page:p.title,heading:p.title,snippet:p.lede||''});
+          }
         }
       }
+      hits.sort((a,b)=>b.score-a.score);
+      CUR_RESULTS=hits.slice(0,30);
+      renderList(term);
     }
-    flush();
 
-    return entries;
-  }
-
-  function runSearch(query, resultsEl) {
-    if (query.length < 1) { resultsEl.style.display = 'none'; return; }
-
-    buildIndex(function (index) {
-      var q = query.toLowerCase();
-      var keywords = q.split(/\s+/).filter(function (w) { return w.length > 0; });
-      if (keywords.length === 0) { resultsEl.style.display = 'none'; return; }
-
-      var matches = [];
-      index.forEach(function (entry) {
-        var score = 0;
-        var matchAll = keywords.every(function (kw) {
-          var inText = entry.text.indexOf(kw) !== -1;
-          var inHeading = entry.heading.toLowerCase().indexOf(kw) !== -1;
-          if (inHeading) score += 10;
-          if (inText) score += 1;
-          return inText || inHeading;
-        });
-        if (!matchAll) return;
-
-        var snippet = extractSnippet(entry.raw, keywords, 50);
-        matches.push({
-          url: entry.url,
-          pageTitle: entry.pageTitle,
-          heading: entry.heading,
-          snippet: snippet,
-          score: score,
-        });
-      });
-
-      // Sort by relevance (heading matches first)
-      matches.sort(function (a, b) { return b.score - a.score; });
-
-      if (matches.length === 0) {
-        resultsEl.innerHTML = '<div class="search-empty">没有找到 "' + escHtml(query) + '" 相关结果</div>';
-        resultsEl.style.display = 'block';
-        return;
+    function renderList(term){
+      CUR_SEL=0;
+      if(!CUR_RESULTS.length){
+        results.innerHTML='<div class="search-empty">'+t('search.empty')+'</div>';return;
       }
-
-      // Deduplicate by url+heading
-      var seen = {};
-      var unique = [];
-      matches.forEach(function (m) {
-        var key = m.url + '#' + m.heading;
-        if (!seen[key]) { seen[key] = true; unique.push(m); }
-      });
-
-      var html = unique.slice(0, 10).map(function (m) {
-        var highlighted = highlightSnippet(m.snippet, keywords);
-        return '<a class="search-item" href="' + escHtml(m.url) + '">' +
-          '<span class="search-page">' + escHtml(m.pageTitle) + '</span>' +
-          '<span class="search-heading">' + escHtml(m.heading) + '</span>' +
-          '<span class="search-snippet">' + highlighted + '</span>' +
-        '</a>';
-      }).join('');
-
-      resultsEl.innerHTML = html;
-      resultsEl.style.display = 'block';
-    });
-  }
-
-  function extractSnippet(raw, keywords, radius) {
-    var lower = raw.toLowerCase();
-    var pos = -1;
-    for (var i = 0; i < keywords.length; i++) {
-      pos = lower.indexOf(keywords[i]);
-      if (pos !== -1) break;
+      results.innerHTML=CUR_RESULTS.map((h,i)=>`
+        <a class="search-item${i===0?' active':''}" href="${h.href}">
+          <span class="search-item-page">${escapeHtml(h.page)}</span>
+          <span class="search-item-h">${escapeHtml(h.heading)}</span>
+          ${h.snippet?`<span class="search-item-snip">${highlight(h.snippet,term||'')}</span>`:''}
+        </a>`).join('');
     }
-    if (pos === -1) return raw.substring(0, radius * 2);
-    var start = Math.max(0, pos - radius);
-    var end = Math.min(raw.length, pos + radius * 2);
-    var snippet = raw.substring(start, end);
-    if (start > 0) snippet = '…' + snippet;
-    if (end < raw.length) snippet += '…';
-    return snippet;
   }
-
-  function highlightSnippet(text, keywords) {
-    var escaped = escHtml(text);
-    keywords.forEach(function (kw) {
-      var re = new RegExp('(' + escRegex(escHtml(kw)) + ')', 'gi');
-      escaped = escaped.replace(re, '<mark>$1</mark>');
-    });
-    return escaped;
-  }
-
-  function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
-  function escRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 })();

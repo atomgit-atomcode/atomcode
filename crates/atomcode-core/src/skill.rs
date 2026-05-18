@@ -423,7 +423,9 @@ impl SkillRegistry {
 
         // Plugin layer — installed plugins contribute namespaced skills.
         for assets in crate::plugin::loader::iter_installed_plugin_assets() {
-            self.load_skills_dir(&assets.skills_dir(), Some(&assets.plugin), &mut warnings);
+            for skills_dir in assets.skills_dirs() {
+                self.load_skills_dir(&skills_dir, Some(&assets.plugin), &mut warnings);
+            }
         }
         warnings
     }
@@ -511,11 +513,36 @@ impl SkillRegistry {
     }
 
     /// Load directory-style skills from a `skills/` directory.
-    /// Each subdirectory that contains a `SKILL.md` becomes one skill.
+    ///
+    /// Two layouts are supported:
+    ///
+    /// 1. **AtomCode / parent-directory layout**: `dir/` contains subdirectories
+    ///    each with a `SKILL.md` — e.g. `dir/brainstorming/SKILL.md`.
+    /// 2. **Claude Code array layout**: `dir/` itself contains a `SKILL.md`,
+    ///    meaning `dir` *is* the skill directory. This happens when `plugin.json`
+    ///    declares `skills: ["./skills/foo"]` — each entry points directly to a
+    ///    skill directory rather than to a parent of skill directories.
+    ///
+    /// Both layouts can coexist: if `dir/SKILL.md` exists it is loaded first,
+    /// then any `dir/*/SKILL.md` subdirectory skills are loaded after (and win
+    /// on name collision, matching the higher-priority-wins convention).
     fn load_skills_dir(&mut self, dir: &Path, namespace: Option<&str>, warnings: &mut Vec<String>) {
         if !dir.is_dir() {
             return;
         }
+        // CC array layout: the directory itself is a skill directory.
+        let self_md = dir.join("SKILL.md");
+        if self_md.exists() {
+            match parse_skill_dir(dir, &self_md, namespace) {
+                Ok(skill) => {
+                    self.skills.insert(skill.name.clone(), skill);
+                }
+                Err(e) => {
+                    warnings.push(format!("[skill] skipping {}: {}", dir.display(), e));
+                }
+            }
+        }
+        // AtomCode / parent-directory layout: each subdirectory with a SKILL.md.
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -822,6 +849,107 @@ mod tests {
         let mut reg = SkillRegistry::new();
         reg.reload(working.path());
         assert!(reg.get("p:hello").is_some(), "expected namespaced plugin skill");
+
+        std::env::remove_var("ATOMCODE_HOME");
+    }
+
+    /// Regression test: when `load_skills_dir` is given a directory that
+    /// *directly* contains `SKILL.md` (CC array layout where the `skills`
+    /// field points at the skill directory itself, not a parent), the skill
+    /// must still be loaded.
+    #[test]
+    fn test_load_skills_dir_cc_array_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Create a skill directory that contains SKILL.md directly
+        // (CC-style: skills: ["./skills/karpathy-guidelines"])
+        let skill_dir = tmp.path().join("skills/karpathy-guidelines");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: karpathy-guidelines\ndescription: Guidelines\n---\nBe simple.",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        // Pass the skill directory itself, not the parent "skills/" dir
+        reg.load_skills_dir(&skill_dir, Some("karpathy-skills"), &mut warnings);
+
+        assert!(
+            reg.get("karpathy-skills:karpathy-guidelines").is_some(),
+            "CC array layout: skill directory containing SKILL.md should be loaded"
+        );
+        assert!(warnings.is_empty(), "no warnings expected");
+    }
+
+    /// When a directory both contains SKILL.md itself and has subdirectories
+    /// with SKILL.md, both are loaded (subdirectory skills win on collision).
+    #[test]
+    fn test_load_skills_dir_hybrid_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Self-SKILL.md
+        std::fs::write(
+            tmp.path().join("SKILL.md"),
+            "---\nname: hybrid\ndescription: self\n---\nself body",
+        )
+        .unwrap();
+
+        // Subdirectory SKILL.md
+        let sub = tmp.path().join("sub-skill");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("SKILL.md"),
+            "---\nname: sub-skill\ndescription: sub\n---\nsub body",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        reg.load_skills_dir(tmp.path(), Some("test"), &mut warnings);
+
+        assert!(reg.get("test:hybrid").is_some(), "self SKILL.md should load");
+        assert!(reg.get("test:sub-skill").is_some(), "subdirectory SKILL.md should load");
+    }
+
+    /// Regression test for the full plugin install path with CC-style
+    /// `skills: ["./skills/karpathy-guidelines"]` in plugin.json.
+    #[test]
+    #[serial_test::serial]
+    fn reload_picks_up_cc_array_plugin_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+
+        // Fake a plugin whose plugin.json uses CC array format.
+        let plugins_root = tmp.path().join(".atomcode/plugins");
+        let plugin_dir = plugins_root.join("marketplaces/karpathy-skills");
+        let skill_dir = plugin_dir.join("skills/karpathy-guidelines");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: karpathy-guidelines\ndescription: Guidelines\n---\nBe simple.",
+        )
+        .unwrap();
+        // CC-style plugin.json with skills as an array of individual skill dirs
+        std::fs::create_dir_all(plugin_dir.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            plugin_dir.join(".claude-plugin/plugin.json"),
+            r#"{"name":"andrej-karpathy-skills","skills":["./skills/karpathy-guidelines"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugins_root.join("installed_plugins.json"),
+            r#"{"version":1,"plugins":{"andrej-karpathy-skills@karpathy-skills":{"marketplace":"karpathy-skills","plugin":"andrej-karpathy-skills","plugin_dir":"marketplaces/karpathy-skills","installed_at":"x"}}}"#,
+        )
+        .unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let mut reg = SkillRegistry::new();
+        reg.reload(working.path());
+        assert!(
+            reg.get("andrej-karpathy-skills:karpathy-guidelines").is_some(),
+            "CC array plugin: skill should be loaded from direct skill directory"
+        );
 
         std::env::remove_var("ATOMCODE_HOME");
     }

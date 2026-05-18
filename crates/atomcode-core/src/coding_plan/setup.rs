@@ -32,7 +32,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use super::client::Client;
+use super::client::{is_auth_expired, Client};
 use super::types::{ModelEntry, PlanType, StatusResponse};
 use crate::auth;
 use crate::config::provider::ProviderConfig;
@@ -371,6 +371,16 @@ pub struct SetupReport {
     pub claim_attempts: Vec<TierAttempt>,
     pub models: StepResult<ModelsInfo>,
     pub status: StepResult<StatusResponse>,
+    /// True when any API call rejected the stored bearer token
+    /// (401/403). `is_logged_in()` only checks "does auth.toml exist"
+    /// and `get_valid_token` only refreshes when the recorded
+    /// `expires_in` says so — neither catches a server-side revocation
+    /// or a refresh-token that the broker no longer accepts. Shells
+    /// (TUI `/codingplan`, CLI `atomcode codingplan`) read this flag
+    /// to drive an inline re-OAuth + retry instead of leaving the user
+    /// staring at a "claim failed — run `atomcode login` again" line
+    /// when `/login` would have fixed it in one step.
+    pub auth_expired: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -468,11 +478,12 @@ pub fn run(
             claim_attempts: Vec::new(),
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: false,
         });
     }
 
     // Step 2: claim — cascade Max → Pro → Lite, first success wins.
-    let (claim, claim_attempts) = step_claim();
+    let (claim, claim_attempts, claim_auth_expired) = step_claim();
     if claim.is_err() {
         // Claim failed at every tier — adding providers / fetching
         // status both make no sense without an active plan. Bail
@@ -485,6 +496,7 @@ pub fn run(
             claim_attempts,
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: claim_auth_expired,
         });
     }
 
@@ -504,7 +516,7 @@ pub fn run(
     };
 
     // Step 3: models — critical. Without models there's nothing to set up.
-    let models = step_models_and_register(config, plan_type_for_models);
+    let (models, models_auth_expired) = step_models_and_register(config, plan_type_for_models);
     if models.is_err() {
         if let Some(t) = tel {
             t.track(atomcode_telemetry::Event::TakeCodingplan {
@@ -520,11 +532,14 @@ pub fn run(
             claim_attempts,
             models,
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: models_auth_expired,
         });
     }
 
-    // Step 4: status — warn-only.
-    let status = step_status();
+    // Step 4: status — warn-only. A 401 here is rare (claim+models
+    // both passed) but still worth surfacing so a retry has a chance
+    // to capture the warm token.
+    let (status, status_auth_expired) = step_status();
 
     // All critical steps (login + models) succeeded. Emit success event.
     if let Some(t) = tel {
@@ -539,6 +554,7 @@ pub fn run(
         claim_attempts,
         models,
         status,
+        auth_expired: status_auth_expired,
     })
 }
 
@@ -601,7 +617,7 @@ fn step_login(tel: Option<&Arc<atomcode_telemetry::Telemetry>>) -> StepResult<Lo
 /// retrying lower tiers would just stack identical failures.
 /// Walk the cascade and capture every tier's outcome.
 ///
-/// Returns `(overall, attempts)`:
+/// Returns `(overall, attempts, auth_expired)`:
 /// * `overall` — the legacy single-summary view of what happened
 ///   (`Ok` / `Skipped` / `Err`). Drives `should_persist_config` and
 ///   the downstream `step_models_and_register` plan-type selection.
@@ -609,13 +625,19 @@ fn step_login(tel: Option<&Arc<atomcode_telemetry::Telemetry>>) -> StepResult<Lo
 ///   Renderer walks this to emit one row per tier (refused /
 ///   errored / claimed) so users can see the full picture instead
 ///   of just the winner.
-fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>) {
+/// * `auth_expired` — true iff the failure was a 401/403 from
+///   `claim-v2` (or a `from_stored_auth` refresh failure). Bubbled
+///   up to `SetupReport.auth_expired` so the shell knows to
+///   re-OAuth and retry instead of just printing the failure.
+fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>, bool) {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
         Err(e) => {
+            let auth_expired = is_auth_expired(&e);
             return (
                 StepResult::Err(format!("build client: {:#}", e)),
                 Vec::new(),
+                auth_expired,
             );
         }
     };
@@ -639,7 +661,7 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>) {
                     } else {
                         format!("{} ({})", resp.message, tier.as_str())
                     });
-                    return (skipped, attempts);
+                    return (skipped, attempts, false);
                 }
                 if resp.success {
                     attempts.push(TierAttempt {
@@ -657,7 +679,7 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>) {
                         duplicate: false,
                         plan_type: tier,
                     });
-                    return (ok, attempts);
+                    return (ok, attempts, false);
                 }
                 // 2xx + success=false + duplicate=false: per-tier
                 // refusal (quota / not eligible / 暂无开放).
@@ -675,7 +697,10 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>) {
             }
             Err(e) => {
                 // Transport / 5xx / parse failure — bail. These don't
-                // get more useful when retried at a lower tier.
+                // get more useful when retried at a lower tier. Capture
+                // the auth-expired bit BEFORE flattening `e` to a string
+                // so the shell layer can retry with a fresh OAuth.
+                let auth_expired = is_auth_expired(&e);
                 let err_text = format!("{:#}", e);
                 attempts.push(TierAttempt {
                     tier,
@@ -686,6 +711,7 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>) {
                 return (
                     StepResult::Err(format!("claim {} request: {}", tier.as_str(), err_text)),
                     attempts,
+                    auth_expired,
                 );
             }
         }
@@ -695,24 +721,39 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>) {
     } else {
         format!("claim failed at every tier — {}", last_msg)
     });
-    (overall, attempts)
+    (overall, attempts, false)
 }
 
 fn step_models_and_register(
     config: &mut Config,
     plan_type: PlanType,
-) -> StepResult<ModelsInfo> {
+) -> (StepResult<ModelsInfo>, bool) {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
-        Err(e) => return StepResult::Err(format!("build client: {:#}", e)),
+        Err(e) => {
+            let auth_expired = is_auth_expired(&e);
+            return (
+                StepResult::Err(format!("build client: {:#}", e)),
+                auth_expired,
+            );
+        }
     };
     let all_models = match client.list_models_v2(plan_type) {
         Ok(v) => v,
-        Err(e) => return StepResult::Err(format!("list models-v2: {:#}", e)),
+        Err(e) => {
+            let auth_expired = is_auth_expired(&e);
+            return (
+                StepResult::Err(format!("list models-v2: {:#}", e)),
+                auth_expired,
+            );
+        }
     };
     if all_models.is_empty() {
-        return StepResult::Err(
-            "server returned an empty model list — cannot set up any provider".into(),
+        return (
+            StepResult::Err(
+                "server returned an empty model list — cannot set up any provider".into(),
+            ),
+            false,
         );
     }
 
@@ -723,11 +764,14 @@ fn step_models_and_register(
     // first request.
     let available: Vec<&ModelEntry> = all_models.iter().filter(|m| m.plan_available).collect();
     if available.is_empty() {
-        return StepResult::Err(format!(
-            "no models available on plan {} — server returned {} locked entries",
-            plan_type.as_str(),
-            all_models.len()
-        ));
+        return (
+            StepResult::Err(format!(
+                "no models available on plan {} — server returned {} locked entries",
+                plan_type.as_str(),
+                all_models.len()
+            )),
+            false,
+        );
     }
 
     // Wipe any stale AtomGit* entries so we don't accumulate old names.
@@ -795,23 +839,38 @@ fn step_models_and_register(
         }
     };
 
-    StepResult::Ok(ModelsInfo {
-        display_names: names,
-        provider_names,
-        default_provider,
-        vision_preprocessor,
-        all_models,
-    })
+    (
+        StepResult::Ok(ModelsInfo {
+            display_names: names,
+            provider_names,
+            default_provider,
+            vision_preprocessor,
+            all_models,
+        }),
+        false,
+    )
 }
 
-fn step_status() -> StepResult<StatusResponse> {
+fn step_status() -> (StepResult<StatusResponse>, bool) {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
-        Err(e) => return StepResult::Err(format!("build client: {:#}", e)),
+        Err(e) => {
+            let auth_expired = is_auth_expired(&e);
+            return (
+                StepResult::Err(format!("build client: {:#}", e)),
+                auth_expired,
+            );
+        }
     };
     match client.status_v2() {
-        Ok(s) => StepResult::Ok(s),
-        Err(e) => StepResult::Err(format!("status-v2: {:#}", e)),
+        Ok(s) => (StepResult::Ok(s), false),
+        Err(e) => {
+            let auth_expired = is_auth_expired(&e);
+            (
+                StepResult::Err(format!("status-v2: {:#}", e)),
+                auth_expired,
+            )
+        }
     }
 }
 
@@ -1223,6 +1282,7 @@ mod tests {
                 window_quota_exhausted: false,
                 window_quota_hint: None,
             }),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(out.contains("✓ Logged in as Theo"));
@@ -1252,6 +1312,7 @@ mod tests {
                 all_models: vec![],
             }),
             status: StepResult::Err("request timeout".into()),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(out.contains("✓ already logged in"));
@@ -1304,6 +1365,7 @@ mod tests {
                 window_quota_exhausted: false,
                 window_quota_hint: None,
             }),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(out.contains("Plan: CodingPlan Free"), "plan name still shown: {}", out);
@@ -1335,6 +1397,7 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(out.contains("✗ Login failed"));
@@ -1371,6 +1434,7 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: false,
         };
         assert!(
             !report.should_persist_config(),
@@ -1392,10 +1456,65 @@ mod tests {
                 all_models: vec![],
             }),
             status: StepResult::Err("status fetch timeout".into()),
+            auth_expired: false,
         };
         assert!(
             dup.should_persist_config(),
             "duplicate-claim Skipped must still allow persist (it's the model-sync path)",
+        );
+    }
+
+    /// `auth_expired = true` MUST NOT flip `should_persist_config()`
+    /// open on its own — the gate already requires every critical step
+    /// to be `is_ok_or_skipped`, and that's where the actual safety
+    /// lives. `auth_expired` is a side-channel for the shell to decide
+    /// "retry with fresh OAuth"; it's orthogonal to "is this report
+    /// good enough to write to disk". Regression guard: a future
+    /// refactor that ANDs `auth_expired` into the predicate would
+    /// double-gate (claim Err + auth_expired both block) but a future
+    /// refactor that ORs it the wrong way would open the persist gate
+    /// on an auth-expired-but-otherwise-skipped report. Lock the
+    /// orthogonality in.
+    #[test]
+    fn auth_expired_alone_does_not_change_persist_gate() {
+        // All-Skipped report (login skipped, no claim attempted, etc.)
+        // with auth_expired=true. Persist gate is driven by the step
+        // outcomes — Skipped counts as "ok or skipped" — so this should
+        // still allow persist.
+        let allow = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Skipped("already claimed".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(ModelsInfo {
+                display_names: vec!["a/b".into()],
+                provider_names: vec!["AtomGit".into()],
+                default_provider: "AtomGit".into(),
+                vision_preprocessor: VisionPreprocessorOutcome::UnchangedNone,
+                all_models: vec![],
+            }),
+            status: StepResult::Skipped("ok".into()),
+            auth_expired: true,
+        };
+        assert!(
+            allow.should_persist_config(),
+            "auth_expired must not gate persist when every critical step \
+             is ok/skipped — it's a side-channel for retry, not safety",
+        );
+
+        // Claim Err report. Persist gate already false, auth_expired
+        // doesn't matter.
+        let block = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Err("auth failed".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: true,
+        };
+        assert!(
+            !block.should_persist_config(),
+            "claim Err already blocks persist — auth_expired doesn't \
+             relax it",
         );
     }
 
@@ -1434,6 +1553,7 @@ mod tests {
             ],
             models: StepResult::Skipped("models step not exercised here".into()),
             status: StepResult::Skipped("status not exercised here".into()),
+            auth_expired: false,
         };
         let out = report.render();
         // Max + Pro must surface as 领取失败 with the actual server
@@ -1500,6 +1620,7 @@ mod tests {
             ],
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: false,
         };
         let out = report.render();
         // All three tier rows present with the 暂无开放 message.
@@ -1548,6 +1669,7 @@ mod tests {
             }],
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: false,
         };
         let out = report.render();
         // The Max row is present with 领取失败.
@@ -1593,6 +1715,7 @@ mod tests {
                 all_models: vec![],
             }),
             status: StepResult::Err("status endpoint 500".into()),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(out.contains("Added 3 providers"));
@@ -1619,6 +1742,7 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
             status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(out.contains("✗ CodingPlan claim failed"));
@@ -1642,6 +1766,7 @@ mod tests {
             claim_attempts: Vec::new(),
             models: StepResult::Skipped("models cached locally".into()),
             status: StepResult::Skipped("server returned 503; using cached".into()),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(out.contains("Models step skipped — models cached locally"));
@@ -1672,6 +1797,7 @@ mod tests {
                 all_models: vec![],
             }),
             status: StepResult::Err(huge),
+            auth_expired: false,
         };
         let out = report.render();
         // Find the status line and check its length is bounded.
@@ -1914,6 +2040,7 @@ mod tests {
                 all_models: vec![],
             }),
             status: StepResult::Skipped("status check skipped for this test".into()),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(
@@ -1937,6 +2064,7 @@ mod tests {
                 all_models: vec![],
             }),
             status: StepResult::Skipped("test skip".into()),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(out.contains("Vision preprocessor cleared"));
@@ -1964,6 +2092,7 @@ mod tests {
                 all_models: vec![],
             }),
             status: StepResult::Skipped("test skip".into()),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(out.contains("Vision preprocessor → Qwen3-VL-32B-Instruct"));
@@ -1984,6 +2113,7 @@ mod tests {
                 all_models: vec![],
             }),
             status: StepResult::Skipped("test skip".into()),
+            auth_expired: false,
         };
         let out = report.render();
         assert!(!out.contains("Vision preprocessor"));
@@ -2043,6 +2173,7 @@ mod tests {
                 all_models: vec![avail, locked],
             }),
             status: StepResult::Skipped("test skip".into()),
+            auth_expired: false,
         };
         let out = report.render();
         // Plan tier appears next to claim line.

@@ -17,6 +17,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── /codingplan ──
         Msg::CodingPlanSetupFailed { error } =>
             format!("codingplan setup failed: {error}").into(),
+        Msg::CpReauthAfter401 =>
+            "  ⚠ Stored login expired — re-authenticating...\n".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan setup:\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
@@ -594,8 +596,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescConfig => "Show config path".into(),
         Msg::CmdDescReload => "Reload ~/.atomcode/config.toml from disk".into(),
         Msg::CmdDescCd => "Change working directory".into(),
-        Msg::CmdDescInit => "Generate .atomcode.md project instructions from the working directory".into(),
-        Msg::CmdDescBackground => "Run a one-shot task in an isolated background context (read-only-ish tool subset)".into(),
+Msg::CmdDescInit => "Generate .atomcode.md project instructions from the working directory".into(),
+Msg::CmdDescBg => "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>".into(),
+Msg::CmdDescBackground => "Run a one-shot task in an isolated background context (read-only-ish tool subset)".into(),
         Msg::CmdDescDiff => "Show git diff".into(),
         Msg::CmdDescClear => "Clear screen".into(),
         Msg::CmdDescSession => "Start a new session (clears conversation)".into(),
@@ -707,5 +710,43 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \
             depending on the terminal's keyboard protocol — try them out.)\n\n"
                 .into(),
+
+        // ── /bg (background sessions) ──
+        Msg::BgHelp =>
+            "  /bg                 Send current session to background and open a new foreground\n  /bg list            List background sessions\n  /bg <N>             Resume background slot N\n  /bg drop <N>        Drop background slot N\n  /bg help            Show this help\n".into(),
+        Msg::BgListEmpty => "  No background sessions.\n".into(),
+        Msg::BgListHeader => "  #   ID        State      Created   Summary\n".into(),
+        Msg::BgListRow { slot, short_id, state, age, summary } =>
+            format!("  {:<3} {:<8}  {:<9}  {:<8}  {}\n", slot, short_id, state, age, summary).into(),
+        Msg::BgStateRunning => "running".into(),
+        Msg::BgStateIdle => "idle".into(),
+        Msg::BgStateDone => "done".into(),
+        Msg::BgStateCancelled => "cancelled".into(),
+        Msg::BgStateError => "error".into(),
+        Msg::BgAgeNow => "now".into(),
+        Msg::BgAgeMinutes { n } => format!("{n}m").into(),
+        Msg::BgAgeHours { n } => format!("{n}h").into(),
+        Msg::BgAgeDays { n } => format!("{n}d").into(),
+        Msg::BgSlotLimitReached { max } =>
+            format!("background slot limit reached ({max})").into(),
+        Msg::BgBackgroundCurrent { new_id, slot, old_id, state } =>
+            format!("  New foreground session [{new_id}]\n  Background: [#{slot}] {old_id} (state: {state})\n").into(),
+        Msg::BgInvalidSlot { slot, available } =>
+            format!("invalid background slot {slot} (available: {available})").into(),
+        Msg::BgNoRuntimeClient => "background slot has no runtime client".into(),
+        Msg::BgResumed { slot, short_id } =>
+            format!("  Resumed background [#{slot}] {short_id}\n").into(),
+        Msg::BgPreviousForegroundMoved { slot } =>
+            format!("  Previous foreground moved to [#{slot}]\n").into(),
+        Msg::BgDropped { slot, short_id } =>
+            format!("  Dropped background [#{slot}] {short_id}\n").into(),
+        Msg::BgTaskStarted { slot, short_id } =>
+            format!("  Background: [#{slot}] {short_id} (state: running)\n").into(),
+        Msg::BgTaskTimedOut { secs } =>
+            format!("Background task timed out after {secs}s.").into(),
+        Msg::BgTaskError { error } =>
+            format!("Error: {error}").into(),
+        Msg::BgTaskCancelled => "Cancelled.".into(),
+        Msg::BgTaskNoSummary => "Task completed (no summary text).".into(),
     }
 }

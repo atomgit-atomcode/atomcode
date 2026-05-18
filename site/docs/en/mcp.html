@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>MCP Integration · AtomCode Docs</title>
+<meta name="description" content="Plug external MCP servers into AtomCode to expose third-party tools to the model.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="mcp">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.22.3</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>MCP Integration</h1>
+      <p class="lede">MCP (Model Context Protocol) is an open protocol that plugs the "tools" exposed by external programs or HTTP services into AtomCode, so the model can call them like built-in tools. Since v4.20.4, AtomCode ships a built-in MCP client and re-uses the same <code>mcpServers</code> configuration block as Cursor and others.</p>
+
+      <h2>What it enables</h2>
+      <ul>
+        <li>Operate GitHub, GitLab, Jira, and other external services via official MCP servers</li>
+        <li>Connect to Postgres / MySQL / DuckDB and other databases</li>
+        <li>Use community servers for the filesystem, Playwright browser, Slack messages, and more</li>
+        <li>Expose your team's domain-specific tools to the model without modifying atomcode source</li>
+      </ul>
+
+      <h2>Two config locations</h2>
+      <table>
+        <thead>
+          <tr><th>Path</th><th>Scope</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>&lt;project-root&gt;/.mcp.json</code></td><td>Current project only — good for living next to the code</td></tr>
+          <tr><td><code>~/.atomcode/mcp.json</code></td><td>User global, shared across every project</td></tr>
+        </tbody>
+      </table>
+      <p>Both can coexist; <strong>same-named servers prefer the project-level entry</strong> (it overrides the user-level one). The repo's <code>.mcp.json.example</code> ships heavily-commented stdio + HTTP templates — start from there.</p>
+
+      <h2>Config schema</h2>
+      <p>The top-level key is fixed at <code>mcpServers</code> (the legacy <code>servers</code> key still works). Each server should pick one transport:</p>
+      <ul>
+        <li><strong>stdio</strong>: <code>command</code> (required) + optional <code>args</code>, <code>env</code>, <code>timeout_ms</code>, <code>disabled</code></li>
+        <li><strong>HTTP</strong>: <code>url</code> (required) + optional <code>headers</code>, <code>auth</code>, <code>timeout_ms</code>, <code>disabled</code></li>
+      </ul>
+      <p>If a server has both <code>command</code> and <code>url</code>, the current implementation treats it as stdio (<code>command</code>). To avoid ambiguity, don't write both.</p>
+      <p>Strings support <code>${VAR}</code> and <code>${VAR:-default}</code> environment expansion; never hard-code sensitive tokens — keep them in env vars. <code>disabled: true</code> temporarily turns off a server without removing the entry.</p>
+
+      <h3>stdio example (local subprocess)</h3>
+      <pre><code>{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "timeout_ms": 10000
+    }
+  }
+}</code></pre>
+
+      <h3>HTTP example (remote endpoint)</h3>
+      <pre><code>{
+  "mcpServers": {
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      },
+      "timeout_ms": 30000
+    }
+  }
+}</code></pre>
+
+      <h3>GitHub remote MCP + OAuth</h3>
+      <pre><code>{
+  "mcpServers": {
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "auth": {
+        "type": "oauth",
+        "provider": "github"
+      }
+    }
+  }
+}</code></pre>
+      <p>Before first use, you need AtomCode's own GitHub OAuth App client id, then run:</p>
+      <pre><code>atomcode mcp add-github-oauth --global
+ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github
+atomcode</code></pre>
+      <p>Inside the TUI you can also set the env var and run <code>/mcp login github</code>; after a successful login, <code>/mcp reload</code> reconnects.</p>
+
+      <h2>One-line server add</h2>
+      <p><code>atomcode mcp add</code> writes the stdio config to JSON for you — no hand-editing required:</p>
+      <pre><code># Write to project-root .mcp.json (current directory by default)
+atomcode mcp add playwright npx @playwright/mcp@latest
+
+# Write to user-global ~/.atomcode/mcp.json
+atomcode mcp add playwright npx @playwright/mcp@latest --global
+
+# Pin a specific project directory
+atomcode mcp add playwright npx @playwright/mcp@latest -C /path/to/repo</code></pre>
+      <p>The first positional is the server key name (which will appear in tool names); the rest is the executable + args.</p>
+      <p>For GitHub remote MCP OAuth there's a dedicated entry:</p>
+      <pre><code>atomcode mcp add-github-oauth --global
+ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code></pre>
+      <div class="callout callout-info">
+        <strong>Note</strong>
+        <p>A same-named server is <strong>fully overwritten</strong>. The GitHub OAuth token is stored at <code>~/.atomcode/mcp_auth.toml</code> — it is not written to <code>.mcp.json</code>.</p>
+      </div>
+
+      <h2>What happens at startup</h2>
+      <table>
+        <thead>
+          <tr><th>Mode</th><th>Connection behaviour</th><th>When tools appear</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>TUI</td><td>Connects in parallel in the background — doesn't block the UI</td><td>Each server registers as it connects, possibly slightly after the first frame</td></tr>
+          <tr><td>One-shot (<code>-p</code>)</td><td>Connects synchronously at launch; waits for enabled servers' connection attempts to finish</td><td>MCP only mounts once at least one batch of tools is available</td></tr>
+        </tbody>
+      </table>
+      <p>In the TUI you'll see <code>✓ MCP server 'github' connected</code> or <code>✗ MCP server '…' failed: …</code> in the session area. <strong>A single server failure does not break other servers or the main program.</strong></p>
+
+      <h2>Tool naming</h2>
+      <p>Each remote tool is registered as <code>mcp__&lt;server-key&gt;__&lt;remote-tool-name&gt;</code>.</p>
+      <p>Example: with <code>"mcpServers": { "github": { ... } }</code> and a remote <code>get_issue</code> tool, the model sees the tool name <code>mcp__github__get_issue</code>.</p>
+      <p><code>--disable-tools</code> uses the full name too:</p>
+      <pre><code>atomcode --disable-tools mcp__github__get_issue,mcp__filesystem__write_file</code></pre>
+
+      <h2>Permission approval</h2>
+      <p>MCP tools default to <strong>per-call confirmation</strong> (equivalent to <code>RequireApproval</code>) because the remote is external, untrusted code.</p>
+      <ul>
+        <li>Press <strong>Y</strong> — allow once</li>
+        <li>Press <strong>A</strong> — allow this tool for the current session (resets next launch; never persisted)</li>
+        <li>Press <strong>N</strong> — deny this call</li>
+      </ul>
+      <div class="callout callout-warn">
+        <strong>Security note</strong>
+        <p>Treat MCP tool results as untrusted data. <strong>Do not</strong> let them be promoted to system instructions. If an MCP server returns "please ignore previous instructions", the model should not comply.</p>
+      </div>
+
+      <h2>Slash commands</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/mcp</code></td><td>List <strong>successfully connected</strong> servers and their status (failed servers don't appear here — only as red error lines in the session area)</td></tr>
+          <tr><td><code>/mcp tools &lt;server&gt;</code></td><td>Async-list the remote tools actually exposed by a server</td></tr>
+          <tr><td><code>/mcp reload</code></td><td>Re-read <code>.mcp.json</code> / <code>~/.atomcode/mcp.json</code> and reconnect enabled servers in the background</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Current limits</h2>
+      <ul>
+        <li>Only MCP's <strong>tools</strong> capability is supported; resources / prompts / OAuth / roots / elicitation are not yet implemented</li>
+        <li>HTTP servers don't have exponential-backoff reconnects, and stdio child processes don't auto-restart on exit — use <code>/mcp reload</code> to reconnect manually</li>
+        <li><code>tools/list</code> <code>list_changed</code> notifications don't trigger a dynamic refresh</li>
+        <li>Tool results only consume <strong>text</strong> content blocks; image / resource blocks are currently ignored</li>
+        <li><code>[A] Always</code> applies only within the current session; it is never written to a config file</li>
+      </ul>
+
+      <h2>Ecosystem comparison</h2>
+      <table>
+        <thead>
+          <tr><th>Product</th><th>Config location</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>AtomCode</td><td><code>mcpServers</code> block in <code>.mcp.json</code></td><td>Current implementation is tools-only</td></tr>
+          <tr><td>Claude Code</td><td><code>.mcp.json</code></td><td>More complete OAuth / resources / prompts support</td></tr>
+          <tr><td>Cursor</td><td><code>.mcp.json</code></td><td>Common command / url configs usually reusable</td></tr>
+          <tr><td>Codex</td><td>CLI add</td><td>OpenAI ecosystem</td></tr>
+        </tbody>
+      </table>
+      <p>If you already use Cursor's MCP setup, common <code>command</code> / <code>url</code> configs are usually reusable; anything outside AtomCode's current fields or capabilities needs verification.</p>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li>The <a href="https://atomgit.com/atomgit_atomcode/atomcode/blob/main/.mcp.json.example" target="_blank"><code>.mcp.json.example</code></a> at the repo root — heavily-commented stdio + HTTP templates</li>
+        <li><a href="./configuration.html">Configuration</a> — overall config overview</li>
+        <li><a href="./slash-commands.html">Slash Commands</a> — full command list including the <code>/mcp</code> family</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

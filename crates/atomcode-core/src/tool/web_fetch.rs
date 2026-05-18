@@ -482,17 +482,36 @@ fn remove_tag_content(html: &str, tag: &str) -> String {
     let lower = html.to_lowercase();
 
     loop {
-        if let Some(start) = lower[pos..].find(&open) {
-            let abs_start = pos + start;
-            result.push_str(&html[pos..abs_start]);
-            if let Some(end) = lower[abs_start..].find(&close) {
-                pos = abs_start + end + close.len();
-            } else {
-                // No closing tag — skip to end
-                break;
-            }
-        } else {
+        let Some(rel) = lower[pos..].find(&open) else {
             result.push_str(&html[pos..]);
+            break;
+        };
+        let abs_start = pos + rel;
+        // Boundary check: `<head` must not match `<header`. The byte right
+        // after `<{tag}` has to be a real tag-name terminator. Without this,
+        // a `<header>` later in the document hijacks the `<head>` pass,
+        // fails to find a `</head>` closer, and (with the old `break`) would
+        // silently drop the rest of the page — which is exactly what was
+        // wiping body text out of gitcode.com SSR pages.
+        let after = abs_start + open.len();
+        let next = lower.as_bytes().get(after).copied();
+        let is_tag_boundary = matches!(
+            next,
+            None | Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        );
+        if !is_tag_boundary {
+            // Prefix collision (e.g. `<header` while searching `<head`).
+            // Emit `<` literally, advance one byte, keep scanning.
+            result.push_str(&html[pos..=abs_start]);
+            pos = abs_start + 1;
+            continue;
+        }
+        result.push_str(&html[pos..abs_start]);
+        if let Some(end) = lower[abs_start..].find(&close) {
+            pos = abs_start + end + close.len();
+        } else {
+            // Truly unclosed tag — drop from here to EOF (matches the
+            // historical browser-tolerant behavior for `<script>` etc.).
             break;
         }
     }
@@ -507,19 +526,30 @@ fn replace_tag_with(html: &str, tag: &str, replacement: &str) -> String {
     let mut pos = 0;
 
     loop {
-        if let Some(start) = lower[pos..].find(&open) {
-            let abs_start = pos + start;
-            result.push_str(&html[pos..abs_start]);
-            // Skip to end of the tag
-            if let Some(end) = html[abs_start..].find('>') {
-                result.push_str(replacement);
-                pos = abs_start + end + 1;
-            } else {
-                pos = abs_start + open.len();
-            }
-        } else {
+        let Some(rel) = lower[pos..].find(&open) else {
             result.push_str(&html[pos..]);
             break;
+        };
+        let abs_start = pos + rel;
+        // Same boundary check as remove_tag_content — `<p` must not match
+        // `<pre>`, `<h1` must not match `<h10>` (defensive), etc.
+        let after = abs_start + open.len();
+        let next = lower.as_bytes().get(after).copied();
+        let is_tag_boundary = matches!(
+            next,
+            None | Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        );
+        if !is_tag_boundary {
+            result.push_str(&html[pos..=abs_start]);
+            pos = abs_start + 1;
+            continue;
+        }
+        result.push_str(&html[pos..abs_start]);
+        if let Some(end) = html[abs_start..].find('>') {
+            result.push_str(replacement);
+            pos = abs_start + end + 1;
+        } else {
+            pos = abs_start + open.len();
         }
     }
     result
@@ -785,5 +815,74 @@ mod tests {
             "unexpected error: {}",
             r.output
         );
+    }
+
+    // ── html_to_text / tag matching ────────────────────────────────────────
+
+    #[test]
+    fn remove_tag_content_keeps_prefix_collision_tags() {
+        // Repro for the gitcode.com/cann SSR page: `<head>...</head>` is
+        // followed later by `<header>...</header>`. The old naive prefix
+        // match treated `<header` as if it opened a `<head>` block, searched
+        // for a `</head>` that did not exist, and silently dropped the rest
+        // of the document.
+        let html = "<head><title>t</title></head>\
+                    <body><header>nav</header><main>BODY-CONTENT</main></body>";
+        let out = remove_tag_content(html, "head");
+        assert!(
+            out.contains("BODY-CONTENT"),
+            "body content was discarded: {}",
+            out
+        );
+        assert!(
+            out.contains("<header>nav</header>"),
+            "header element should be preserved (only <head> removed): {}",
+            out
+        );
+        assert!(
+            !out.contains("<title>"),
+            "real <head> contents must still be removed: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn replace_tag_with_keeps_prefix_collision_tags() {
+        // Same boundary bug surface: replacing `<p>` opens must not also
+        // replace `<pre>` opens.
+        let out = replace_tag_with("<p>A</p><pre>B</pre>", "p", "\n");
+        // `<p>` becomes "\n", but `<pre>` must stay untouched.
+        assert!(
+            out.contains("<pre>B</pre>"),
+            "<pre> should not be matched by <p>: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn html_to_text_extracts_body_when_header_follows_head() {
+        // End-to-end: structure mirrors what gitcode.com/cann ships.
+        let html = "<!doctype html><html><head><title>x</title></head>\
+                    <body><header class=\"nav\">topbar</header>\
+                    <main><h1>Title</h1><p>Real article text.</p></main>\
+                    </body></html>";
+        let text = html_to_text(html);
+        assert!(
+            text.contains("Real article text."),
+            "main body lost: {:?}",
+            text
+        );
+        assert!(text.contains("Title"), "heading lost: {:?}", text);
+    }
+
+    #[test]
+    fn remove_tag_content_handles_truly_unclosed_tag() {
+        // If a tag really has no closing element, the function should still
+        // surface earlier content rather than dropping everything from the
+        // unclosed tag onward. We accept either: the open-tag-and-after is
+        // kept verbatim, OR is stripped — but content BEFORE it must survive.
+        let html = "<p>KEEP-ME</p><script>oops no close";
+        let out = remove_tag_content(html, "script");
+        assert!(out.contains("KEEP-ME"), "leading content lost: {}", out);
     }
 }

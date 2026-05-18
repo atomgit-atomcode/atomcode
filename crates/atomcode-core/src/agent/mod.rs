@@ -17,7 +17,7 @@ mod tool_dispatch;
 mod verify;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -73,14 +73,23 @@ pub enum AgentCommand {
     /// Manually compact conversation history. `prompt` is accepted for
     /// forward-compat with an eventual LLM-backed summarize-with-instruction
     /// path; currently unused — this is the mechanical path only.
-    Compact { prompt: Option<String> },
-    Remember { content: String, global: bool },
-    Forget { keyword: String },
+    Compact {
+        prompt: Option<String>,
+    },
+    Remember {
+        content: String,
+        global: bool,
+    },
+    Forget {
+        keyword: String,
+    },
     ShowMemory,
     /// Run a one-shot task in an isolated background context (read-only-ish
     /// tool subset, independent conversation, capped turns + timeout).
     /// Result is returned via `AgentEvent::BackgroundComplete`.
-    Background { task: String },
+    Background {
+        task: String,
+    },
     /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
     /// this before rendering so the user never sees a stale cache — the
     /// cache is only refreshed on LLM round-trips, so between turns (or
@@ -91,6 +100,12 @@ pub enum AgentCommand {
     /// or other change to plugin state. Cheap (just re-reads JSON files);
     /// does NOT touch provider/model state, unlike ReloadConfig.
     ReloadHooks,
+    /// Request a snapshot of the current conversation messages.
+    /// The agent responds with `AgentEvent::MessagesSync` carrying
+    /// `conversation.messages`. Used by the TUI before `/bg` to ensure
+    /// the session has up-to-date message history even when a turn is
+    /// still in progress (e.g. waiting for tool approval).
+    SyncMessages,
     /// Shutdown the agent.
     Shutdown,
 }
@@ -190,10 +205,7 @@ pub enum AgentEvent {
     },
     /// Real-time output chunk from a running tool (e.g., bash command).
     /// Sent during tool execution before ToolCallResult.
-    ToolOutputChunk {
-        call_id: String,
-        chunk: String,
-    },
+    ToolOutputChunk { call_id: String, chunk: String },
     /// A tool call completed with a result.
     ToolCallResult {
         call_id: String,
@@ -207,6 +219,11 @@ pub enum AgentEvent {
         tool_name: String,
         reason: String,
         call: ToolCall,
+        /// Snapshot of `conversation.messages` at the time the approval
+        /// request was raised. Lets the TUI persist mid-turn session
+        /// state (e.g. when `/bg` backgrounds a session that is waiting
+        /// for approval).
+        messages: Vec<crate::conversation::message::Message>,
     },
     /// Token usage update.
     TokenUsage(crate::stream::TokenUsage),
@@ -232,6 +249,13 @@ pub enum AgentEvent {
     /// The conversation has been cleaned up - partial messages removed.
     /// Contains the cleaned message list for TUI to sync.
     TurnCancelled {
+        messages: Vec<crate::conversation::message::Message>,
+    },
+    /// Response to `AgentCommand::SyncMessages`. Carries a snapshot of
+    /// `conversation.messages` at the time the agent processed the command.
+    /// Used by the TUI to sync session state before backgrounding a session
+    /// that is mid-turn (e.g. waiting for tool approval).
+    MessagesSync {
         messages: Vec<crate::conversation::message::Message>,
     },
     /// An error occurred.
@@ -528,10 +552,10 @@ pub struct AgentLoop {
     event_tx: mpsc::UnboundedSender<AgentEvent>,
 }
 
-/// Handle for the UI to communicate with the agent.
-pub struct AgentHandle {
+/// Cloneable sender side for UI/runtime code to communicate with the agent.
+#[derive(Clone)]
+pub struct AgentClient {
     pub cmd_tx: mpsc::UnboundedSender<AgentCommand>,
-    pub event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     /// Shared tool registry for dynamic MCP tool registration.
     pub tool_registry: std::sync::Arc<ToolRegistry>,
     /// Loaded skills, shared with the agent loop. The TUI uses this
@@ -542,18 +566,139 @@ pub struct AgentHandle {
     pub skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
 }
 
+/// Handle for the UI to communicate with the agent.
+pub struct AgentHandle {
+    pub client: AgentClient,
+    pub event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+}
+
+#[derive(Clone)]
+pub struct AgentRuntimeFactory {
+    pub config: Config,
+    pub working_dir: PathBuf,
+    pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    pub lsp: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
+    pub shared_tools: std::sync::Arc<ToolRegistry>,
+    pub skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
+    pub max_turns: Option<usize>,
+    runtime_counter: std::sync::Arc<AtomicU64>,
+}
+
+impl AgentRuntimeFactory {
+    pub fn set_config(&mut self, config: Config) {
+        self.config = config;
+    }
+
+    pub fn set_working_dir(&mut self, working_dir: PathBuf) {
+        self.working_dir = working_dir;
+    }
+
+    fn next_runtime_label(&self) -> String {
+        let id = self.runtime_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("runtime-{id}")
+    }
+
+    pub fn build_provider(&self) -> Box<dyn LlmProvider> {
+        let Some(provider_config) = self.config.providers.get(&self.config.default_provider) else {
+            return crate::provider::unavailable_provider(
+                "未配置 provider。请使用 /provider 添加 provider 后再试。",
+            );
+        };
+
+        match crate::provider::create_provider(provider_config) {
+            Ok(provider) => provider,
+            Err(e) => crate::provider::unavailable_provider(format!("provider 初始化失败: {e:#}")),
+        }
+    }
+
+    pub fn spawn_runtime(
+        &self,
+        conversation: Conversation,
+    ) -> (
+        AgentClient,
+        tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    ) {
+        let provider = self.build_provider();
+        let mut tool_context = ToolContext::with_telemetry(
+            self.working_dir.clone(),
+            "default",
+            self.telemetry.clone(),
+        );
+        let runtime_label = self.next_runtime_label();
+        tool_context.file_history = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::tool::file_history::FileHistory::new(&runtime_label),
+        ));
+        tool_context.lsp = self.lsp.clone();
+
+        let (mut loop_, handle) = AgentLoop::new_with_shared_parts(
+            self.config.clone(),
+            provider,
+            self.shared_tools.clone(),
+            self.skill_registry.clone(),
+            Some(runtime_label),
+            tool_context,
+            conversation,
+        );
+        loop_.set_max_turns(self.max_turns);
+
+        let ctx = atomcode_telemetry::CurrentContext::current();
+        tokio::spawn(async move {
+            atomcode_telemetry::CurrentContext::scope(ctx, || loop_.run()).await
+        });
+
+        (handle.client, handle.event_rx)
+    }
+
+    pub fn from_initial_loop(agent_loop: &AgentLoop, max_turns: Option<usize>) -> Self {
+        let working_dir = agent_loop
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| PathBuf::from("."));
+
+        Self {
+            config: agent_loop.config.clone(),
+            working_dir,
+            telemetry: agent_loop.turn_runner.context.telemetry.clone(),
+            lsp: agent_loop.turn_runner.context.lsp.clone(),
+            shared_tools: agent_loop.tool_registry.clone(),
+            skill_registry: agent_loop.skill_registry.clone(),
+            max_turns,
+            runtime_counter: std::sync::Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn new_for_test(
+        config: Config,
+        working_dir: PathBuf,
+        shared_tools: std::sync::Arc<ToolRegistry>,
+        skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
+    ) -> Self {
+        let telemetry = ToolContext::new(working_dir.clone()).telemetry;
+        Self {
+            config,
+            working_dir,
+            telemetry,
+            lsp: None,
+            shared_tools,
+            skill_registry,
+            max_turns: None,
+            runtime_counter: std::sync::Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
 impl AgentLoop {
     /// Create a new agent loop and its corresponding UI handle.
     pub fn new(
         config: Config,
         provider: Box<dyn LlmProvider>,
         mut tool_registry: ToolRegistry,
-        mut tool_context: ToolContext,
+        tool_context: ToolContext,
         conversation: Conversation,
     ) -> (Self, AgentHandle) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-
         // Load skills from disk and register the use_skill tool.
         let working_dir = tool_context
             .working_dir
@@ -561,11 +706,6 @@ impl AgentLoop {
             .map(|g| g.clone())
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
-        // Load persisted code graph from disk and share with ToolContext
-        let graph_path = working_dir.join(".atomcode").join("graph.bin");
-        let code_graph = crate::graph::persist::load(&graph_path);
-        let graph = std::sync::Arc::new(tokio::sync::RwLock::new(code_graph));
-        tool_context.graph = graph.clone();
         let mut registry = SkillRegistry::new();
         let _ = registry.reload(&working_dir);
         let has_skills = !registry.is_empty();
@@ -619,6 +759,67 @@ impl AgentLoop {
                 tool_registry.register_sync(Box::new(crate::tool::blast_radius::BlastRadiusTool));
             }
         }
+
+        let shared_tools = std::sync::Arc::new(tool_registry);
+        Self::new_from_shared_bootstrap(
+            config,
+            provider,
+            shared_tools,
+            skill_registry,
+            None,
+            tool_context,
+            conversation,
+        )
+    }
+
+    /// Create a new runtime using the already-shared tool and skill registries.
+    /// This path intentionally does not reload skills or register `use_skill` /
+    /// graph tools; the initial runtime owns that one-time setup.
+    pub fn new_with_shared_parts(
+        config: Config,
+        provider: Box<dyn LlmProvider>,
+        shared_tools: std::sync::Arc<ToolRegistry>,
+        skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
+        runtime_label: Option<String>,
+        tool_context: ToolContext,
+        conversation: Conversation,
+    ) -> (Self, AgentHandle) {
+        Self::new_from_shared_bootstrap(
+            config,
+            provider,
+            shared_tools,
+            skill_registry,
+            runtime_label,
+            tool_context,
+            conversation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_from_shared_bootstrap(
+        config: Config,
+        provider: Box<dyn LlmProvider>,
+        shared_tools: std::sync::Arc<ToolRegistry>,
+        skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
+        runtime_label: Option<String>,
+        mut tool_context: ToolContext,
+        conversation: Conversation,
+    ) -> (Self, AgentHandle) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+        let working_dir = tool_context
+            .working_dir
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        // Load persisted code graph from disk and share with ToolContext.
+        let graph_path = working_dir.join(".atomcode").join("graph.bin");
+        let code_graph = crate::graph::persist::load(&graph_path);
+        let graph = std::sync::Arc::new(tokio::sync::RwLock::new(code_graph));
+        tool_context.graph = graph;
+
         // Build approval channels for interactive permission flow
         let (approval_req_tx, approval_req_rx) = mpsc::unbounded_channel();
         let (approval_resp_tx, approval_resp_rx) = mpsc::unbounded_channel();
@@ -632,19 +833,22 @@ impl AgentLoop {
                 permission_store.clone(),
             ));
 
-        // Share tool registry between AgentLoop and TurnRunner via Arc.
-        let shared_tools = std::sync::Arc::new(tool_registry);
-
         // Hand the registry handle to ToolContext so active-dispatch tools
         // (parallel_edit_files) can read it at execute time without
         // creating a Tool ↔ Registry Arc cycle.
         tool_context.tool_registry = Some(shared_tools.clone());
-
         // Convert Box → Arc so provider can be shared with sub-agents.
         let provider: std::sync::Arc<dyn LlmProvider> = std::sync::Arc::from(provider);
 
         // Build the datalog writer before `config` is moved into the agent below.
-        let datalog = crate::turn::datalog::DatalogWriter::new(&working_dir, &config.datalog);
+        let datalog = match runtime_label.as_deref() {
+            Some(label) => crate::turn::datalog::DatalogWriter::new_with_filename_tag(
+                &working_dir,
+                &config.datalog,
+                label,
+            ),
+            None => crate::turn::datalog::DatalogWriter::new(&working_dir, &config.datalog),
+        };
 
         // Select the context-construction strategy once for this session.
         // Rebuilds on ReloadConfig when the provider changes.
@@ -677,9 +881,7 @@ impl AgentLoop {
             };
 
         let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
-        let hook_executor = std::sync::Arc::new(
-            crate::hook::executor::HookExecutor::new(hooks)
-        );
+        let hook_executor = std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
 
         let turn_runner = TurnRunner {
             provider,
@@ -746,12 +948,12 @@ impl AgentLoop {
             event_tx,
         };
 
-        let handle = AgentHandle {
+        let client = AgentClient {
             cmd_tx,
-            event_rx,
             tool_registry: shared_tools.clone(),
             skill_registry: agent.skill_registry.clone(),
         };
+        let handle = AgentHandle { client, event_rx };
 
         (agent, handle)
     }
@@ -812,18 +1014,25 @@ impl AgentLoop {
 
         // --- SessionStart Hook ---
         if self.hook_executor.has_hooks() {
-            let wd = self.turn_runner.context.working_dir
+            let wd = self
+                .turn_runner
+                .context
+                .working_dir
                 .try_read()
                 .map(|g| g.display().to_string())
                 .unwrap_or_default();
             let ctx = crate::hook::HookContext {
                 event: "session_start".into(),
-                tool_name: None, tool_args: None,
-                tool_result: None, tool_success: None,
+                tool_name: None,
+                tool_args: None,
+                tool_result: None,
+                tool_success: None,
                 session_id: String::new(),
                 working_dir: wd,
             };
-            self.hook_executor.run_session_event(crate::hook::HookEvent::SessionStart, &ctx).await;
+            self.hook_executor
+                .run_session_event(crate::hook::HookEvent::SessionStart, &ctx)
+                .await;
         }
 
         while let Some(cmd) = self.cmd_rx.recv().await {
@@ -860,14 +1069,16 @@ impl AgentLoop {
                         .map(|p| p.provider_type.clone());
                     self.config = new_config;
                     // Rebuild hook executor from JSON config files.
-                    let wd = self.turn_runner.context.working_dir
+                    let wd = self
+                        .turn_runner
+                        .context
+                        .working_dir
                         .try_read()
                         .map(|g| g.clone())
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
                     let hooks = crate::hook::json_config::load_hooks_config(&wd);
-                    self.hook_executor = std::sync::Arc::new(
-                        crate::hook::executor::HookExecutor::new(hooks)
-                    );
+                    self.hook_executor =
+                        std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
                     self.turn_runner.hook_executor = self.hook_executor.clone();
                     let new_provider_name = self.config.default_provider.clone();
                     let new_type = self
@@ -971,36 +1182,49 @@ impl AgentLoop {
                     let store = if global {
                         MemoryStore::global()
                     } else {
-                        let wd = self.turn_runner.context.working_dir.try_read()
-                            .map(|g| g.clone()).unwrap_or_default();
+                        let wd = self
+                            .turn_runner
+                            .context
+                            .working_dir
+                            .try_read()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
                         MemoryStore::project(&wd)
                     };
                     match store.append(&content) {
                         Ok(_) => {
                             let scope = if global { "global" } else { "project" };
-                            let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                format!("(remembered in {} memory: {})\n", scope, content)
-                            ));
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                                "(remembered in {} memory: {})\n",
+                                scope, content
+                            )));
                         }
                         Err(e) => {
-                            let _ = self.event_tx.send(AgentEvent::TextDelta(
-                                format!("(failed to save memory: {})\n", e)
-                            ));
+                            let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                                "(failed to save memory: {})\n",
+                                e
+                            )));
                         }
                     }
                 }
                 AgentCommand::Forget { keyword } => {
                     use crate::config::memory::MemoryStore;
-                    let wd = self.turn_runner.context.working_dir.try_read()
-                        .map(|g| g.clone()).unwrap_or_default();
+                    let wd = self
+                        .turn_runner
+                        .context
+                        .working_dir
+                        .try_read()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
                     let global = MemoryStore::global();
                     let project = MemoryStore::project(&wd);
                     let g_matches = global.find_matching(&keyword);
                     let p_matches = project.find_matching(&keyword);
                     if g_matches.is_empty() && p_matches.is_empty() {
-                        let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            format!("(no memory entries matching '{}')\n", keyword)
-                        ));
+                        let _ = self.event_tx.send(AgentEvent::TextDelta(format!(
+                            "(no memory entries matching '{}')\n",
+                            keyword
+                        )));
                     } else {
                         let mut msg = String::new();
                         for entry in &g_matches {
@@ -1012,34 +1236,50 @@ impl AgentLoop {
                         let g_result = global.remove_matching(&keyword);
                         let p_result = project.remove_matching(&keyword);
                         if g_result.is_err() || p_result.is_err() {
-                            msg.push_str("(warning: some entries could not be removed from disk)\n");
+                            msg.push_str(
+                                "(warning: some entries could not be removed from disk)\n",
+                            );
                         }
                         let total = g_matches.len() + p_matches.len();
-                        msg.push_str(&format!("(removed {} matching entr{})\n", total, if total == 1 { "y" } else { "ies" }));
+                        msg.push_str(&format!(
+                            "(removed {} matching entr{})\n",
+                            total,
+                            if total == 1 { "y" } else { "ies" }
+                        ));
                         let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
                     }
                 }
                 AgentCommand::ShowMemory => {
                     use crate::config::memory::MemoryStore;
-                    let wd = self.turn_runner.context.working_dir.try_read()
-                        .map(|g| g.clone()).unwrap_or_default();
+                    let wd = self
+                        .turn_runner
+                        .context
+                        .working_dir
+                        .try_read()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
                     let global = MemoryStore::global();
                     let project = MemoryStore::project(&wd);
                     let g_entries = global.load();
                     let p_entries = project.load();
                     if g_entries.is_empty() && p_entries.is_empty() {
                         let _ = self.event_tx.send(AgentEvent::TextDelta(
-                            "(no memories saved yet — use /remember <fact> to add one)\n".to_string()
+                            "(no memories saved yet — use /remember <fact> to add one)\n"
+                                .to_string(),
                         ));
                     } else {
                         let mut msg = String::new();
                         if !g_entries.is_empty() {
                             msg.push_str(&format!("  [Global] ({})\n", global.path().display()));
-                            for e in &g_entries { msg.push_str(&format!("    - {}\n", e)); }
+                            for e in &g_entries {
+                                msg.push_str(&format!("    - {}\n", e));
+                            }
                         }
                         if !p_entries.is_empty() {
                             msg.push_str(&format!("  [Project] ({})\n", project.path().display()));
-                            for e in &p_entries { msg.push_str(&format!("    - {}\n", e)); }
+                            for e in &p_entries {
+                                msg.push_str(&format!("    - {}\n", e));
+                            }
                         }
                         let _ = self.event_tx.send(AgentEvent::TextDelta(msg));
                     }
@@ -1049,7 +1289,8 @@ impl AgentLoop {
                     // completion so the next dispatcher sees the cleared flag.
                     if self.background_running.swap(true, Ordering::AcqRel) {
                         let _ = self.event_tx.send(AgentEvent::Error(
-                            "A background task is already running. Wait for it to finish.".to_string(),
+                            "A background task is already running. Wait for it to finish."
+                                .to_string(),
                         ));
                     } else {
                         let provider = self.turn_runner.provider.clone();
@@ -1083,8 +1324,10 @@ impl AgentLoop {
                                         .try_read()
                                         .map(|g| g.clone())
                                         .unwrap_or_default();
-                                    match git_auto_commit::auto_commit_edited_files(&wd, files_edited)
-                                    {
+                                    match git_auto_commit::auto_commit_edited_files(
+                                        &wd,
+                                        files_edited,
+                                    ) {
                                         git_auto_commit::AutoCommitOutcome::Committed {
                                             sha,
                                             message,
@@ -1112,7 +1355,8 @@ impl AgentLoop {
                     let (msgs, _) = self
                         .ctx
                         .build_messages(&self.conversation, &system_prompt, "");
-                    self.emit_rich_context_stats(&self.conversation, &msgs).await;
+                    self.emit_rich_context_stats(&self.conversation, &msgs)
+                        .await;
                 }
                 AgentCommand::ReloadHooks => {
                     // Triggered by /plugin install|uninstall in the TUI so
@@ -1127,26 +1371,36 @@ impl AgentLoop {
                         .map(|g| g.clone())
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
                     let hooks = crate::hook::json_config::load_hooks_config(&wd);
-                    self.hook_executor = std::sync::Arc::new(
-                        crate::hook::executor::HookExecutor::new(hooks),
-                    );
+                    self.hook_executor =
+                        std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
                     self.turn_runner.hook_executor = self.hook_executor.clone();
+                }
+                AgentCommand::SyncMessages => {
+                    let messages = self.conversation.messages.clone();
+                    let _ = self.event_tx.send(AgentEvent::MessagesSync { messages });
                 }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
                     if self.hook_executor.has_hooks() {
-                        let wd = self.turn_runner.context.working_dir
+                        let wd = self
+                            .turn_runner
+                            .context
+                            .working_dir
                             .try_read()
                             .map(|g| g.display().to_string())
                             .unwrap_or_default();
                         let ctx = crate::hook::HookContext {
                             event: "session_end".into(),
-                            tool_name: None, tool_args: None,
-                            tool_result: None, tool_success: None,
+                            tool_name: None,
+                            tool_args: None,
+                            tool_result: None,
+                            tool_success: None,
                             session_id: String::new(),
                             working_dir: wd,
                         };
-                        self.hook_executor.run_session_event(crate::hook::HookEvent::SessionEnd, &ctx).await;
+                        self.hook_executor
+                            .run_session_event(crate::hook::HookEvent::SessionEnd, &ctx)
+                            .await;
                     }
                     break;
                 }
@@ -1839,18 +2093,27 @@ impl AgentLoop {
                                     // when the LLM is just navigating.
                                     let _ = event_tx.send(AgentEvent::WorkingDirChanged(new_dir));
                                 }
+                                TurnEvent::ApprovalRequested { tool_name, reason, call, messages } => {
+                                    // Forward approval request to TUI, including
+                                    // a snapshot of conversation.messages so the
+                                    // TUI can persist mid-turn session state.
+                                    let _ = event_tx.send(AgentEvent::ApprovalNeeded {
+                                        tool_name,
+                                        reason,
+                                        call,
+                                        messages,
+                                    });
+                                    *phase = AgentPhase::WaitingApproval;
+                                    let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
+                                }
                             }
                         }
 
                         Some(req) = approval_req_rx.recv() => {
-                            // Forward approval request to TUI
-                            let _ = event_tx.send(AgentEvent::ApprovalNeeded {
-                                tool_name: req.call.name.clone(),
-                                reason: req.reason.clone(),
-                                call: req.call.clone(),
-                            });
-                            *phase = AgentPhase::WaitingApproval;
-                            let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
+                            // The ApprovalNeeded event was already sent from the
+                            // TurnEvent::ApprovalRequested handler above (which
+                            // has access to conversation.messages).  Here we
+                            // only record the request for later approve/deny.
                             *last_approval_request = Some(req);
                         }
 
@@ -1891,6 +2154,9 @@ impl AgentLoop {
                                         *pending_input = Some(text);
                                     }
                                 }
+                                // SyncMessages is handled in the outer loop
+                                // (after turn completes) because `conv` is
+                                // mutably borrowed by `turn_fut` here.
                                 _ => {} // Other commands ignored during turn
                             }
                         }
@@ -2269,7 +2535,11 @@ impl AgentLoop {
         let summarize_prompt = Self::default_summarize_prompt(&content);
 
         let summary = self.run_llm_summary(&summarize_prompt).await;
-        let final_summary = if summary.trim().is_empty() { content } else { summary };
+        let final_summary = if summary.trim().is_empty() {
+            content
+        } else {
+            summary
+        };
 
         let _ = self.try_apply_compression(system_prompt, n_turns, final_summary, true);
     }
@@ -2464,7 +2734,8 @@ impl AgentLoop {
     /// made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
         let system_prompt = self.build_system_prompt();
-        let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation) else {
+        let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation)
+        else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 crate::i18n::t(crate::i18n::Msg::CompactNothingShort).into_owned(),
             ));
@@ -2527,7 +2798,8 @@ impl AgentLoop {
         let (msgs, _) = self
             .ctx
             .build_messages(&self.conversation, &system_prompt, "");
-        self.emit_rich_context_stats(&self.conversation, &msgs).await;
+        self.emit_rich_context_stats(&self.conversation, &msgs)
+            .await;
     }
 
     fn default_summarize_prompt(content: &str) -> String {
@@ -2553,7 +2825,11 @@ impl AgentLoop {
             let stream_timeout = std::time::Duration::from_secs(30);
             let mut got_token = false;
             loop {
-                let timeout = if got_token { stream_timeout } else { first_timeout };
+                let timeout = if got_token {
+                    stream_timeout
+                } else {
+                    first_timeout
+                };
                 match tokio::time::timeout(timeout, stream.next()).await {
                     Ok(Some(Ok(crate::stream::StreamEvent::Delta(text)))) => {
                         got_token = true;
@@ -3101,6 +3377,92 @@ fn fmt_k_tokens(t: usize) -> String {
         format!("{:.1}K", t as f64 / 1000.0)
     } else {
         format!("{}", t)
+    }
+}
+
+#[cfg(test)]
+mod agent_handle_tests {
+    use super::{AgentClient, AgentHandle, AgentRuntimeFactory};
+
+    #[test]
+    fn agent_client_clones_command_sender_and_registries() {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool_registry = std::sync::Arc::new(crate::tool::ToolRegistry::new());
+        let skill_registry =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new()));
+
+        let client = AgentClient {
+            cmd_tx,
+            tool_registry: tool_registry.clone(),
+            skill_registry: skill_registry.clone(),
+        };
+        let handle = AgentHandle {
+            client: client.clone(),
+            event_rx,
+        };
+
+        assert!(std::sync::Arc::ptr_eq(
+            &client.tool_registry,
+            &handle.client.tool_registry
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &client.skill_registry,
+            &handle.client.skill_registry
+        ));
+    }
+
+    #[test]
+    fn runtime_factory_reports_missing_provider_as_unavailable() {
+        let mut config = crate::config::Config::default();
+        config.default_provider = "missing".to_string();
+        config.providers.clear();
+
+        let factory = AgentRuntimeFactory::new_for_test(
+            config,
+            std::path::PathBuf::from("/tmp/project"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+        );
+
+        let provider = factory.build_provider();
+
+        assert_eq!(
+            provider.availability_error(),
+            Some("未配置 provider。请使用 /provider 添加 provider 后再试。")
+        );
+    }
+
+    #[test]
+    fn runtime_factory_setters_update_snapshots() {
+        let mut factory = AgentRuntimeFactory::new_for_test(
+            crate::config::Config::default(),
+            std::path::PathBuf::from("/tmp/old"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+        );
+
+        let mut config = crate::config::Config::default();
+        config.default_provider = "fresh".to_string();
+        factory.set_config(config);
+        factory.set_working_dir(std::path::PathBuf::from("/tmp/new"));
+
+        assert_eq!(factory.config.default_provider, "fresh");
+        assert_eq!(factory.working_dir, std::path::PathBuf::from("/tmp/new"));
+    }
+
+    #[test]
+    fn cloned_runtime_factories_allocate_unique_labels() {
+        let factory = AgentRuntimeFactory::new_for_test(
+            crate::config::Config::default(),
+            std::path::PathBuf::from("/tmp/project"),
+            std::sync::Arc::new(crate::tool::ToolRegistry::new()),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::skill::SkillRegistry::new())),
+        );
+        let cloned = factory.clone();
+
+        assert_eq!(factory.next_runtime_label(), "runtime-2");
+        assert_eq!(cloned.next_runtime_label(), "runtime-3");
     }
 }
 

@@ -268,6 +268,19 @@ pub trait Renderer: Send {
     fn begin_selection(&mut self, _col: u16, _row: u16) {}
     fn update_selection(&mut self, _col: u16, _row: u16) {}
     fn end_selection(&mut self) {}
+
+    /// Copy the current mouse-selection text to the system clipboard
+    /// (using arboard, not OSC 52) and clear the selection highlight.
+    /// Returns `true` if a non-empty selection was copied.
+    ///
+    /// This is the Ctrl+C fallback for terminals (Windows Terminal,
+    /// conhost) that ignore OSC 52 — the user selects text with the
+    /// mouse, then presses Ctrl+C to copy it. AltScreenRenderer
+    /// implements this; other backends return `false` (they use the
+    /// host terminal's native selection).
+    fn copy_selection(&mut self) -> bool {
+        false
+    }
 }
 
 /// Visual style for the menu popup. Drives whether the renderer prefixes

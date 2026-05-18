@@ -13,6 +13,7 @@
 // Over time more subfiles should split out (agent_events, redraw helpers,
 // Buffer); modal overlays already live in `crate::modals`.
 
+pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod file_index;
 pub(crate) mod monitor;
@@ -25,7 +26,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle, AgentPhase};
+use atomcode_core::agent::{
+    AgentClient, AgentCommand, AgentEvent, AgentPhase, AgentRuntimeFactory,
+};
 use atomcode_core::config::Config;
 use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -648,7 +651,12 @@ pub struct McpReloadProgress {
 pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
-    pub agent: AgentHandle,
+    pub agent: AgentClient,
+    pub runtime_factory: AgentRuntimeFactory,
+    pub bg_manager: bg_runtime::BgRuntimeManager,
+    pub foreground_runtime_id: bg_runtime::RuntimeId,
+    pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    pub runtime_event_rx: mpsc::UnboundedReceiver<bg_runtime::RuntimeEvent>,
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
     /// Recently visited project directories, most recent first (max 5).
@@ -2072,7 +2080,7 @@ fn next_boundary(s: &str, mut p: usize) -> usize {
 /// and the call sites filled a paragraph. Now the handlers take
 /// `(&mut App, &mut LoopCtx, &mut dyn Renderer, …event)` — the LoopCtx
 /// stays separate because the tokio `select!` in `run_loop` needs to
-/// borrow `ctx.input_rx`, `ctx.agent.event_rx`, `ctx.wake_rx`
+/// borrow `ctx.input_rx`, `ctx.runtime_event_rx`, `ctx.wake_rx`
 /// independently, and bundling them into App would fight the borrow
 /// checker on every arm.
 pub struct App {
@@ -2118,6 +2126,16 @@ pub struct App {
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
+    /// Timestamp of the last Ctrl+C that was consumed by `copy_selection()`
+    /// via the Windows OS-level signal handler. On Windows, the OS Ctrl+C
+    /// signal fires *before* the keyboard event arrives in the input
+    /// buffer (biased `tokio::select!` prioritises the signal arm), so
+    /// after the signal handler copies the selection, the keyboard event
+    /// still shows up in `handle_input` and would trigger Cancel/exit.
+    /// This timestamp lets the keyboard path detect and suppress that
+    /// stale echo within a short debounce window.
+    #[cfg(windows)]
+    pub last_ctrl_c_copy: Option<std::time::Instant>,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -2137,6 +2155,8 @@ impl App {
             fixissue_pending: None,
             fixissue_buffer: String::new(),
             reasoning_buffer: String::new(),
+            #[cfg(windows)]
+            last_ctrl_c_copy: None,
         }
     }
 }
@@ -2668,40 +2688,48 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.agent.event_rx.recv() => {
-                let Some(ev) = maybe else { break };
-                let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                if pre_phase != app.state.phase {
-                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
-                }
-                if matches!(app.state.phase, UiPhase::Streaming)
-                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
-                {
-                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    last_spinner_draw = std::time::Instant::now();
-                }
-                if matches!(app.state.phase, UiPhase::Idle) {
-                    // Turn just ended — drain the type-ahead queue.
-                    // Pop the oldest queued message, echo as a User
-                    // line, dispatch to the agent, and transition
-                    // back to Streaming. Remaining queue entries
-                    // fire in order on subsequent completions.
-                    if let Some(queued) = app.message_queue.pop_front() {
-                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.text.clone()));
-                        renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                            text: queued.text,
-                            images: queued.images,
-                            image_markers: queued.image_markers,
-                        }).ok();
-                        app.state.on_submit();
-                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    } else {
-                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
-                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            maybe = ctx.runtime_event_rx.recv() => {
+                let Some(runtime_event) = maybe else { break };
+                if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let pre_phase = app.state.phase;
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                    if pre_phase != app.state.phase {
+                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
+                    if matches!(app.state.phase, UiPhase::Streaming)
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    {
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        last_spinner_draw = std::time::Instant::now();
+                    }
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        // Turn just ended — drain the type-ahead queue.
+                        // Pop the oldest queued message, echo as a User
+                        // line, dispatch to the agent, and transition
+                        // back to Streaming. Remaining queue entries
+                        // fire in order on subsequent completions.
+                        if let Some(queued) = app.message_queue.pop_front() {
+                            crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
+                            renderer.render(UiLine::User(queued.text.clone()));
+                            renderer.flush();
+                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                text: queued.text,
+                                images: queued.images,
+                                image_markers: queued.image_markers,
+                            }).ok();
+                            app.state.on_submit();
+                            draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        } else {
+                            crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                } else {
+                    ctx.bg_manager.apply_background_event(
+                        runtime_event.runtime_id,
+                        runtime_event.event,
+                        &ctx.session_manager,
+                    );
                 }
             }
 
@@ -2750,9 +2778,31 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // when that path is silent. Single-press exit: skips the
             // 2-press confirm because if we got here, the user has no
             // working keyboard route to confirm with anyway.
+            //
+            // However, on Windows the OS Ctrl+C signal fires *before*
+            // the keyboard event arrives in the input buffer (and the
+            // `biased` select gives this arm priority), so when the
+            // user has a mouse selection active they expect Ctrl+C to
+            // *copy* — not exit. Try copy_selection first; only fall
+            // through to Shutdown when there's nothing selected.
             Some(()) = win_ctrl_c.recv() => {
-                crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
-                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                if renderer.copy_selection() {
+                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> copy_selection (had selection)");
+                    // Stamp so the keyboard-event echo (which arrives
+                    // shortly after via input_rx) knows to suppress
+                    // itself instead of triggering Cancel/exit.
+                    app.last_ctrl_c_copy = Some(std::time::Instant::now());
+                } else if matches!(app.state.phase, UiPhase::Streaming) {
+                    // In Streaming phase, Ctrl+C should cancel the
+                    // running turn (matching keyboard-path behaviour)
+                    // rather than shut down the whole application.
+                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> Cancel (streaming)");
+                    ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+                    restore_cancelled_message_to_buf(&mut app, renderer, &ctx);
+                } else {
+                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
+                    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                }
             }
 
             // ── Deferred-render trailing edge ──
@@ -2941,35 +2991,43 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.agent.event_rx.recv() => {
-                let Some(ev) = maybe else { break };
-                let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                if pre_phase != app.state.phase {
-                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
-                }
-                if matches!(app.state.phase, UiPhase::Streaming)
-                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
-                {
-                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    last_spinner_draw = std::time::Instant::now();
-                }
-                if matches!(app.state.phase, UiPhase::Idle) {
-                    if let Some(queued) = app.message_queue.pop_front() {
-                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.text.clone()));
-                        renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                            text: queued.text,
-                            images: queued.images,
-                            image_markers: queued.image_markers,
-                        }).ok();
-                        app.state.on_submit();
-                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    } else {
-                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
-                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            maybe = ctx.runtime_event_rx.recv() => {
+                let Some(runtime_event) = maybe else { break };
+                if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let pre_phase = app.state.phase;
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                    if pre_phase != app.state.phase {
+                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
+                    if matches!(app.state.phase, UiPhase::Streaming)
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    {
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        last_spinner_draw = std::time::Instant::now();
+                    }
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        if let Some(queued) = app.message_queue.pop_front() {
+                            crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
+                            renderer.render(UiLine::User(queued.text.clone()));
+                            renderer.flush();
+                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                text: queued.text,
+                                images: queued.images,
+                                image_markers: queued.image_markers,
+                            }).ok();
+                            app.state.on_submit();
+                            draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        } else {
+                            crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                } else {
+                    ctx.bg_manager.apply_background_event(
+                        runtime_event.runtime_id,
+                        runtime_event.event,
+                        &ctx.session_manager,
+                    );
                 }
             }
         }
@@ -3020,6 +3078,7 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
     let path = atomcode_core::config::Config::default_path();
     if let Ok(fresh) = atomcode_core::config::Config::load(&path) {
         ctx.config = fresh;
+        ctx.runtime_factory.set_config(ctx.config.clone());
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
         }
@@ -3426,6 +3485,44 @@ fn handle_input(
             // scrollback). We intercept BEFORE phase dispatch so
             // scrolling works in Idle / Streaming alike.
 
+            // ── Ctrl+C: copy selection ──────────────────────────────
+            // On Windows, OSC 52 is not supported by Windows Terminal /
+            // conhost, so the user cannot copy text by mouse-selecting
+            // alone (end_selection's OSC 52 write is silently ignored).
+            // Ctrl+C is the user's natural instinct to copy selected
+            // text. We intercept it here: if a selection exists in the
+            // alt-screen renderer, copy its text to the system clipboard
+            // via arboard and clear the selection. If no selection exists,
+            // fall through to the normal Cancel behaviour.
+            //
+            // This also helps on macOS / Linux when the user prefers
+            // Ctrl+C / Cmd+C over the mouse-release OSC 52 auto-copy,
+            // or when the terminal ignores OSC 52 (macOS Terminal.app
+            // without the opt-in setting).
+            if code == crossterm::event::KeyCode::Char('c')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
+            {
+                // Windows: the OS Ctrl+C signal handler may have already
+                // consumed this Ctrl+C as a copy (see the `win_ctrl_c`
+                // select arm above). The keyboard event arrives shortly
+                // after via input_rx. If the signal handler stamped
+                // `last_ctrl_c_copy` within the last 500 ms, suppress
+                // the keyboard echo so it doesn't trigger Cancel/exit.
+                #[cfg(windows)]
+                if let Some(ts) = app.last_ctrl_c_copy.take() {
+                    if ts.elapsed() < Duration::from_millis(500) {
+                        crate::tuix_trace!("KEY", "ctrl+c keyboard echo suppressed (OS signal already handled copy)");
+                        return Ok(());
+                    }
+                }
+                if renderer.copy_selection() {
+                    return Ok(());
+                }
+                // No selection — fall through to Cancel below.
+            }
+
             // Ctrl+V: pull the system clipboard image and attach as
             // `[Image #N]` — independent of whether the host terminal
             // forwarded a Paste event for the keystroke. The status
@@ -3648,7 +3745,8 @@ fn build_menu_items(
         let mut items: Vec<(String, String)> = Vec::new();
         if let Some(reg) = skill_registry {
             if let Ok(reg) = reg.read() {
-                for skill in reg.user_invocable() {
+                let skills: Vec<_> = reg.user_invocable().collect();
+                for skill in &skills {
                     // Match against either the bare suffix (`adapter-check…`)
                     // or the full qualified name (`ascend-model-agent-plugin:
                     // adapter-check…`). Bare match keeps the shorthand UX;
@@ -3663,11 +3761,21 @@ fn build_menu_items(
                     if bare_lower.starts_with(&prefix_lower)
                         || full_lower.starts_with(&prefix_lower)
                     {
-                        // Display the qualified name so users see which
-                        // plugin a skill belongs to. Suffix-fallback in
-                        // SkillRegistry::get still resolves the bare form
-                        // when invoked.
-                        items.push((skill.name.clone(), skill.description.clone()));
+                        let bare_is_unique = skills.iter().all(|other| {
+                            other.name == skill.name
+                                || other
+                                    .name
+                                    .split_once(':')
+                                    .map(|(_, s)| s)
+                                    .unwrap_or(other.name.as_str())
+                                    != bare
+                        });
+                        let display = if bare_is_unique {
+                            bare.to_string()
+                        } else {
+                            skill.name.clone()
+                        };
+                        items.push((display, skill.description.clone()));
                     }
                 }
             }
@@ -4115,6 +4223,14 @@ fn handle_idle_key(
                 }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                } else if matches!(app.state.phase, UiPhase::Approval) {
+                    // After /bg <N> resume into an approval-waiting session,
+                    // redraw the footer with an empty input box. Don't use
+                    // draw_spinner_now because spinner_label was cleared by
+                    // on_turn_complete() — it would show "◓ …" which is
+                    // misleading. The next agent event (ApprovalNeeded /
+                    // TurnComplete) will update the footer naturally.
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 }
                 // Slash commands don't consume pastes (they take a
                 // single short arg, not a pasted body), but the submit
@@ -4409,6 +4525,7 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     let path = Config::default_path();
     match ctx.config.save(&path) {
         Ok(()) => {
+            ctx.runtime_factory.set_config(ctx.config.clone());
             let _ = ctx
                 .agent
                 .cmd_tx
@@ -4583,6 +4700,29 @@ fn handle_streaming_key(
             // leave the buf alone. Gate strictly on *registered*
             // commands; unrecognised `/foo …` falls through to the
             // type-ahead queue as a regular message.
+            let bg_background_current = parse_slash_line(&line)
+                .map(|(cmd, arg)| cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty())
+                .unwrap_or(false);
+            if bg_background_current {
+                commands::execute_slash_command(
+                    "bg",
+                    "",
+                    &mut app.state,
+                    ctx,
+                    renderer,
+                    &mut app.active_modal,
+                    &mut app.fixissue_pending,
+                    &mut app.fixissue_buffer,
+                )?;
+                app.message_queue.clear();
+                app.pending_tools.clear();
+                app.think.reset();
+                app.reasoning_buffer.clear();
+                app.buf.text.clear();
+                app.buf.cursor = 0;
+                app.menu.selected = 0;
+                return Ok(());
+            }
             let is_known_slash = parse_slash_line(&line)
                 .map(|(cmd, _)| ctx.commands.find(cmd).is_some())
                 .unwrap_or(false);
@@ -5150,8 +5290,16 @@ fn handle_agent_event(
             let _ = name;
         }
         AgentEvent::ApprovalNeeded {
-            tool_name, call, ..
+            tool_name, call, messages, ..
         } => {
+            // Persist mid-turn messages to session so /bg can recover
+            // the conversation even when the turn hasn't finished yet.
+            if !messages.is_empty() {
+                apply_session_messages(&mut ctx.current_session, messages);
+                ctx.bg_manager
+                    .set_foreground_session(ctx.current_session.clone());
+            }
+
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
             // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
@@ -5430,6 +5578,7 @@ fn handle_agent_event(
             // restarts the session.
             if ctx.working_dir != new_dir {
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
+                ctx.runtime_factory.set_working_dir(new_dir.clone());
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
@@ -5697,6 +5846,16 @@ fn handle_agent_event(
             }
             renderer.flush();
         }
+        AgentEvent::MessagesSync { messages } => {
+            // Response to AgentCommand::SyncMessages. Persist the
+            // snapshot to the current session so /bg can recover
+            // the conversation state.
+            if !messages.is_empty() {
+                apply_session_messages(&mut ctx.current_session, messages);
+                ctx.bg_manager
+                    .set_foreground_session(ctx.current_session.clone());
+            }
+        }
     }
 }
 
@@ -5712,8 +5871,21 @@ fn persist_current_session(
     if messages.is_empty() {
         return;
     }
-    ctx.current_session.messages = messages;
-    ctx.current_session.touch();
+    apply_session_messages(&mut ctx.current_session, messages);
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    let _ = ctx.session_manager.save(&ctx.current_session);
+}
+
+pub(crate) fn apply_session_messages(
+    session: &mut atomcode_core::session::Session,
+    messages: Vec<atomcode_core::conversation::message::Message>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    session.messages = messages;
+    session.touch();
     // Triggers for renaming:
     //   * `default` / `session-<ts>` — never renamed yet
     //   * leading `[` — previous rename grabbed a synthetic system-meta
@@ -5722,13 +5894,12 @@ fn persist_current_session(
     //     Role::User message for plumbing reasons. Re-derive from the
     //     next non-synthetic user turn so the /resume picker stops
     //     showing those as session titles.
-    let should_rename = ctx.current_session.name == "default"
-        || ctx.current_session.name.starts_with("session-")
-        || ctx.current_session.name.trim_start().starts_with('[');
+    let should_rename = session.name == "default"
+        || session.name.starts_with("session-")
+        || session.name.trim_start().starts_with('[');
     if should_rename {
         use atomcode_core::conversation::message::Role;
-        let first_real_user = ctx
-            .current_session
+        let first_real_user = session
             .messages
             .iter()
             .filter(|m| matches!(m.role, Role::User))
@@ -5736,14 +5907,13 @@ fn persist_current_session(
         if let Some(text) = first_real_user {
             let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
             if !name.is_empty() {
-                ctx.current_session.name = name;
+                session.name = name;
             }
         }
         // Else: leave the existing default/session-<ts>/[...]-marker
         // name. Better to keep a generic placeholder than to commit to
         // a synthetic injection as the title.
     }
-    let _ = ctx.session_manager.save(&ctx.current_session);
 }
 
 /// True when `text` looks like a synthetic user-channel injection
@@ -5758,7 +5928,37 @@ fn is_synthetic_user_text(text: &str) -> bool {
 
 #[cfg(test)]
 mod session_naming_tests {
-    use super::is_synthetic_user_text;
+    use super::{apply_session_messages, is_synthetic_user_text};
+
+    #[test]
+    fn apply_session_messages_renames_from_first_real_user() {
+        use atomcode_core::conversation::message::{Message, Role};
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        let messages = vec![
+            Message::new(Role::User, "[System meta · not a user message]\nread this"),
+            Message::new(Role::User, "implement background sessions\nwith tests"),
+        ];
+
+        apply_session_messages(&mut session, messages);
+
+        assert_eq!(session.name, "implement background sessions");
+        assert_eq!(session.messages.len(), 2);
+    }
+
+    #[test]
+    fn apply_session_messages_preserves_custom_name() {
+        use atomcode_core::conversation::message::{Message, Role};
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        session.name = "manual name".to_string();
+
+        apply_session_messages(&mut session, vec![Message::new(Role::User, "new task")]);
+
+        assert_eq!(session.name, "manual name");
+    }
 
     #[test]
     fn synthetic_system_meta_is_detected() {

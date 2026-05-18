@@ -21,6 +21,44 @@ use crate::auth;
 /// every claim-v2 / models-v2 / status-v2 call.
 pub const API_BASE: &str = "https://api.gitcode.com/api/v5";
 
+/// Typed error surfaced when the API rejects the bearer token (401/403).
+///
+/// Carried inside `anyhow::Error` by every `Client` method so the
+/// orchestrator can `downcast_ref::<AuthExpired>()` and decide to
+/// re-run OAuth instead of just printing the failure. Before this
+/// existed `/codingplan` would emit "already logged in" + "claim failed
+/// — run `atomcode login` again" and leave the user to do it manually,
+/// even though `/login` would have fixed it in one step.
+///
+/// The Display text matches the legacy error string verbatim so
+/// rendered reports stay byte-identical when no recovery happens
+/// (e.g. running `atomcode` against a server we never reach for
+/// re-auth, or a non-interactive scripted invocation).
+#[derive(Debug)]
+pub struct AuthExpired {
+    pub status: u16,
+}
+
+impl std::fmt::Display for AuthExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "authentication failed ({}) — run `atomcode login` again",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for AuthExpired {}
+
+/// True iff `err` (or any error in its cause chain) is an `AuthExpired`.
+/// Centralised so the orchestrator and shell callers agree on what
+/// "stale token" looks like — anywhere we want to decide "rerun OAuth?"
+/// goes through here.
+pub fn is_auth_expired(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<AuthExpired>())
+}
+
 /// Token-authenticated blocking REST client for CodingPlan endpoints.
 pub struct Client {
     http: reqwest::blocking::Client,
@@ -37,8 +75,19 @@ impl Client {
                 "not logged in — run `atomcode login` (or the codingplan flow) first"
             ));
         }
-        let token = auth::get_valid_token()
-            .context("failed to load OAuth token (try `atomcode login` again)")?;
+        // If the local access token can't be made valid (expired and the
+        // broker refused our refresh_token, or the file is malformed),
+        // there's no way to proceed without a fresh OAuth round-trip.
+        // Surface as `AuthExpired` so the orchestrator triggers the same
+        // recovery path it uses for an API-side 401, instead of bailing
+        // with a generic "build client" error that callers can't act on.
+        let token = match auth::get_valid_token() {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(anyhow::Error::new(AuthExpired { status: 401 })
+                    .context(format!("local token unusable: {:#}", e)));
+            }
+        };
         // Timeouts are critical here: `/status` and the background drift
         // monitor both call these endpoints synchronously from the TUI
         // event loop, and without a cap a slow / unreachable gateway
@@ -79,10 +128,9 @@ impl Client {
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(anyhow!(
-                "authentication failed ({}) — run `atomcode login` again",
-                status.as_u16()
-            ));
+            return Err(anyhow::Error::new(AuthExpired {
+                status: status.as_u16(),
+            }));
         }
         let body = resp.text().unwrap_or_default();
         if !status.is_success() {
@@ -117,10 +165,9 @@ impl Client {
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(anyhow!(
-                "authentication failed ({}) — run `atomcode login` again",
-                status.as_u16()
-            ));
+            return Err(anyhow::Error::new(AuthExpired {
+                status: status.as_u16(),
+            }));
         }
         let body = resp.text().unwrap_or_default();
         if !status.is_success() {
@@ -148,10 +195,9 @@ impl Client {
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(anyhow!(
-                "authentication failed ({}) — run `atomcode login` again",
-                status.as_u16()
-            ));
+            return Err(anyhow::Error::new(AuthExpired {
+                status: status.as_u16(),
+            }));
         }
         let body = resp.text().unwrap_or_default();
         if !status.is_success() {
@@ -213,6 +259,44 @@ fn format_api_error(descriptor: &str, status: reqwest::StatusCode, body: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `AuthExpired` must Display identically to the legacy
+    /// `anyhow!("authentication failed (NNN) — run `atomcode login` again")`
+    /// string so existing renderers / log scrapers / users that grep
+    /// for the hint don't see a stealth wording change.
+    #[test]
+    fn auth_expired_display_matches_legacy_string() {
+        let e = AuthExpired { status: 401 };
+        assert_eq!(
+            e.to_string(),
+            "authentication failed (401) — run `atomcode login` again"
+        );
+        let e = AuthExpired { status: 403 };
+        assert_eq!(
+            e.to_string(),
+            "authentication failed (403) — run `atomcode login` again"
+        );
+    }
+
+    /// `is_auth_expired` finds the marker on a direct `AuthExpired`
+    /// error AND through the `with_context` chain that callers wrap
+    /// around it ("build client: ...", "list models-v2: ..."). Without
+    /// walking the chain we'd miss it the moment any step layers a
+    /// context onto the original anyhow::Error.
+    #[test]
+    fn is_auth_expired_walks_cause_chain() {
+        let raw = anyhow::Error::new(AuthExpired { status: 401 });
+        assert!(is_auth_expired(&raw));
+
+        let wrapped: anyhow::Error =
+            Err::<(), _>(anyhow::Error::new(AuthExpired { status: 401 }))
+                .context("list models-v2")
+                .unwrap_err();
+        assert!(is_auth_expired(&wrapped));
+
+        let unrelated = anyhow!("some other failure");
+        assert!(!is_auth_expired(&unrelated));
+    }
 
     #[test]
     fn format_api_error_extracts_message_from_product_payload() {

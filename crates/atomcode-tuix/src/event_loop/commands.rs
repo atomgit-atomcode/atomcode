@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use super::{save_and_reload, LoopCtx};
+use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
@@ -23,7 +23,8 @@ use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
-use atomcode_core::session::{SessionId, SessionManager};
+use atomcode_core::conversation::Conversation;
+use atomcode_core::session::{Session, SessionId, SessionManager};
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
@@ -47,6 +48,105 @@ fn build_oauth_provider() -> ProviderConfig {
         ephemeral: false,
 
 }
+}
+
+fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
+    if matches!(
+        state.phase,
+        crate::state::UiPhase::Streaming | crate::state::UiPhase::Approval
+    ) {
+        bg_runtime::RuntimeState::Running
+    } else {
+        bg_runtime::RuntimeState::Idle
+    }
+}
+
+fn render_welcome(renderer: &mut dyn Renderer, ctx: &LoopCtx) {
+    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    renderer.render(UiLine::Welcome {
+        model: ctx.model_name.clone(),
+        working_dir: dir_display,
+    });
+}
+
+fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
+    if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
+        ctx.telemetry.set_session_id(uuid);
+    }
+}
+
+/// Scan session messages for a pending tool approval — an
+/// `AssistantWithToolCalls` message whose tool calls lack corresponding
+/// `ToolResult` entries.  Returns `(display_name, detail)` of the first
+/// unpaired tool call, or `None` if all tool calls have results.
+fn find_pending_approval(session: &Session) -> Option<(String, String)> {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    use crate::event_loop::format_tool_detail;
+
+    // Collect all call_ids that already have a ToolResult.
+    let mut answered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in &session.messages {
+        if let (Role::Tool, MessageContent::ToolResult(r)) = (&m.role, &m.content) {
+            answered_ids.insert(r.call_id.clone());
+        }
+    }
+
+    // Walk messages in reverse to find the most recent unpaired tool call.
+    for m in session.messages.iter().rev() {
+        if let (
+            Role::Assistant,
+            MessageContent::AssistantWithToolCalls { tool_calls, .. },
+        ) = (&m.role, &m.content)
+        {
+            for tc in tool_calls.iter().rev() {
+                if !answered_ids.contains(&tc.id) {
+                    let display = super::display_tool_name(&tc.name);
+                    let detail = format_tool_detail(&tc.name, &tc.arguments);
+                    return Some((display, detail));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn short_task_name(task: &str) -> String {
+    let first_line = task.lines().next().unwrap_or(task).trim();
+    let mut out: String = first_line.chars().take(80).collect();
+    if out.is_empty() {
+        out = "background task".to_string();
+    }
+    out
+}
+
+fn spawn_runtime(
+    ctx: &mut LoopCtx,
+    session: Session,
+) -> (
+    bg_runtime::RuntimeId,
+    atomcode_core::agent::AgentClient,
+    Session,
+) {
+    let runtime_id = ctx.bg_manager.allocate_runtime_id();
+    let (client, event_rx) = ctx.runtime_factory.spawn_runtime(Conversation::new());
+    bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
+    (runtime_id, client, session)
+}
+
+/// Synchronise the current foreground session into `BgRuntimeManager`.
+///
+/// Mid-turn session state (including conversations where the agent is
+/// waiting for tool approval) is already persisted to
+/// `ctx.current_session` by `handle_agent_event` when it processes
+/// `AgentEvent::ApprovalNeeded` (which carries a snapshot of
+/// `conversation.messages`).  So by the time `/bg` runs,
+/// `ctx.current_session.messages` should be up-to-date.
+fn sync_bg_foreground(ctx: &mut LoopCtx) {
+    ctx.bg_manager.set_foreground_runtime(
+        ctx.foreground_runtime_id,
+        ctx.agent.clone(),
+        ctx.current_session.clone(),
+    );
 }
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
@@ -248,6 +348,7 @@ pub(super) fn execute_slash_command(
                         .map(|p| p.model.clone())
                         .unwrap_or_else(|| new_default.clone());
                     ctx.config = new_cfg.clone();
+                    ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
                     ctx.agent
                         .cmd_tx
@@ -301,6 +402,8 @@ pub(super) fn execute_slash_command(
             // it can still be `/resume`d; we just stop writing into it.
             ctx.current_session =
                 atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone());
             // Bind telemetry session_id to the new session's UUID.
             if let Ok(uuid) = uuid::Uuid::parse_str(ctx.current_session.id.as_str()) {
                 ctx.telemetry.set_session_id(uuid);
@@ -476,7 +579,10 @@ pub(super) fn execute_slash_command(
                 0
             };
             let cost = atomcode_core::pricing::calculate_cost(
-                &ctx.model_name, state.prompt_tokens, state.completion_tokens, state.cached_tokens,
+                &ctx.model_name,
+                state.prompt_tokens,
+                state.completion_tokens,
+                state.cached_tokens,
             );
             let cost_str = atomcode_core::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(
@@ -527,6 +633,7 @@ pub(super) fn execute_slash_command(
             let text = arg.trim();
             if text.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
+
                 renderer.flush();
             } else {
                 let (content, global) = if text.starts_with("--global ") {
@@ -536,9 +643,13 @@ pub(super) fn execute_slash_command(
                 };
                 if content.is_empty() {
                     renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
+
                     renderer.flush();
                 } else {
-                    ctx.agent.cmd_tx.send(AgentCommand::Remember { content, global }).ok();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::Remember { content, global })
+                        .ok();
                 }
             }
         }
@@ -548,7 +659,12 @@ pub(super) fn execute_slash_command(
                 renderer.render(UiLine::Error(t(Msg::ForgetUsage).into_owned()));
                 renderer.flush();
             } else {
-                ctx.agent.cmd_tx.send(AgentCommand::Forget { keyword: keyword.to_string() }).ok();
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::Forget {
+                        keyword: keyword.to_string(),
+                    })
+                    .ok();
             }
         }
         "memory" => {
@@ -720,12 +836,153 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "bg" => {
+            match bg_runtime::parse_bg_command(arg) {
+                bg_runtime::BgCommand::Help => {
+                    renderer.render(UiLine::CommandOutput(bg_runtime::render_bg_help()));
+                }
+                bg_runtime::BgCommand::List => {
+                    renderer.render(UiLine::CommandOutput(bg_runtime::render_bg_list(
+                        ctx.bg_manager.backgrounds(),
+                    )));
+                }
+                bg_runtime::BgCommand::BackgroundCurrent => {
+                    sync_bg_foreground(ctx);
+                    if !ctx.bg_manager.has_capacity() {
+                        renderer.render(UiLine::Error(
+                            t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    let old_short_id = ctx.current_session.short_id().to_string();
+                    let new_session = Session::default_session(ctx.working_dir.clone());
+                    let new_short_id = new_session.short_id().to_string();
+                    let (runtime_id, client, new_session) = spawn_runtime(ctx, new_session);
+                    let old_state = foreground_state_from_ui(state);
+                    let slot = match ctx.bg_manager.background_current(
+                        client.clone(),
+                        new_session.clone(),
+                        runtime_id,
+                        old_state,
+                    ) {
+                        Ok(slot) => slot,
+                        Err(bg_runtime::BgError::SlotLimit { max }) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgSlotLimitReached { max }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+                    };
+
+                    ctx.agent = client;
+                    ctx.foreground_runtime_id = runtime_id;
+                    ctx.current_session = new_session;
+                    bind_telemetry_to_session(ctx, &ctx.current_session);
+                    state.on_turn_complete();
+                    renderer.reset();
+                    render_welcome(renderer, ctx);
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::BgBackgroundCurrent {
+                            new_id: &new_short_id,
+                            slot,
+                            old_id: &old_short_id,
+                            state: &old_state.localised(),
+                        }).into_owned(),
+                    ));
+                }
+                bg_runtime::BgCommand::Resume(slot) => {
+                    sync_bg_foreground(ctx);
+                    let outcome = match ctx
+                        .bg_manager
+                        .resume_slot(slot, foreground_state_from_ui(state))
+                    {
+                        Ok(outcome) => outcome,
+                        Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::SlotLimit { max }) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgSlotLimitReached { max }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                    };
+                    let Some(client) = outcome.resumed_client else {
+                        renderer.render(UiLine::Error(
+                            t(Msg::BgNoRuntimeClient).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    };
+
+                    ctx.agent = client;
+                    ctx.foreground_runtime_id = outcome.resumed_runtime_id;
+                    ctx.current_session = outcome.resumed_session;
+                    bind_telemetry_to_session(ctx, &ctx.current_session);
+                    state.on_turn_complete();
+                    crate::modals::session_picker::replay_session(
+                        renderer,
+                        &ctx.current_session,
+                        true,
+                    );
+
+                    // If the resumed session was waiting for tool approval,
+                    // re-render the approval prompt so the user can
+                    // continue interacting.  Detect this by looking for
+                    // an AssistantWithToolCalls message whose tool_calls
+                    // lack corresponding ToolResult entries.
+                    let pending_approval = find_pending_approval(&ctx.current_session);
+                    if let Some((tool_name, detail)) = pending_approval {
+                        renderer.render(UiLine::ApprovalPrompt { tool: tool_name, detail });
+                        state.on_approval_needed("");
+                    }
+
+                    let short_id = ctx.current_session.short_id().to_string();
+                    let mut msg = t(Msg::BgResumed { slot, short_id: &short_id }).into_owned();
+                    if let Some(previous_slot) = outcome.previous_foreground_slot {
+                        msg.push_str(&t(Msg::BgPreviousForegroundMoved { slot: previous_slot }).into_owned());
+                    }
+                    renderer.render(UiLine::CommandOutput(msg));
+                }
+                bg_runtime::BgCommand::Drop(slot) => {
+                    let dropped = match ctx.bg_manager.drop_slot(slot) {
+                        Ok(dropped) => dropped,
+                        Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::SlotLimit { .. }) => unreachable!(),
+                    };
+                    if matches!(dropped.state, bg_runtime::RuntimeState::Running) {
+                        if let Some(client) = dropped.client.as_ref() {
+                            client.cmd_tx.send(AgentCommand::Cancel).ok();
+                        }
+                    }
+                    if !dropped.session.messages.is_empty() {
+                        let _ = ctx.session_manager.save(&dropped.session);
+                    }
+                    let short_id = dropped.session.short_id().to_string();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::BgDropped { slot, short_id: &short_id }).into_owned(),
+                    ));
+                }
+            }
+            renderer.flush();
+        }
         "background" => {
-            // Send the task to the agent loop; result comes back as
-            // AgentEvent::BackgroundComplete (rendered in event_loop/mod.rs).
-            // The agent loop guards against concurrent background tasks via
-            // an AtomicBool — second invocation while one is running gets
-            // an Error event back.
+            // Compatibility wrapper around `/bg`: start a one-shot task in a
+            // real background runtime, keep the current foreground active.
             let task = arg.trim();
             if task.is_empty() {
                 renderer.render(UiLine::CommandOutput(
@@ -734,10 +991,41 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
                 return Ok(());
             }
-            ctx.agent
+            if !ctx.bg_manager.has_capacity() {
+                renderer.render(UiLine::Error(
+                    t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+            let mut session = Session::default_session(ctx.working_dir.clone());
+            session.name = short_task_name(task);
+            let short_id = session.short_id().to_string();
+            let (runtime_id, client, session) = spawn_runtime(ctx, session);
+            let slot = match ctx.bg_manager.push_background_runtime(
+                runtime_id,
+                client.clone(),
+                session,
+                bg_runtime::RuntimeState::Running,
+            ) {
+                Ok(slot) => slot,
+                Err(bg_runtime::BgError::SlotLimit { max }) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::BgSlotLimitReached { max }).into_owned(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+                Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+            };
+            client
                 .cmd_tx
-                .send(AgentCommand::Background { task: task.to_string() })
+                .send(AgentCommand::SendMessage { text: task.to_string(), images: Vec::new(), image_markers: Vec::new() })
                 .ok();
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::BgTaskStarted { slot, short_id: &short_id }).into_owned(),
+            ));
+            renderer.flush();
         }
         "init" => {
             // Generate .atomcode.md from project structure. Refuses to
@@ -883,6 +1171,7 @@ pub(super) fn execute_slash_command(
                 };
 
                 let mut header = t(Msg::McpReloading { count: configs.len() }).into_owned();
+
                 if !configs.is_empty() {
                     header.push_str(&t(Msg::McpConnecting));
                     for c in &configs {
@@ -1106,6 +1395,7 @@ pub(super) fn execute_slash_command(
                                 renderer.render(UiLine::Error(
                                     t(Msg::ThinkBudgetUsage).into_owned(),
                                 ));
+
                                 renderer.flush();
                             }
                         }
@@ -1453,6 +1743,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::WorktreeNoActive).into_owned(),
                         ));
+
                     } else {
                         let mut txt = t(Msg::WorktreeActiveHeader).into_owned();
                         for (branch, path, has_changes) in &worktrees {
@@ -1468,6 +1759,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                             } else {
                                 "".into()
                             };
+
                             txt.push_str(&format!(
                                 "    {} {:<16} {}  {}{}\n",
                                 marker,
@@ -1917,6 +2209,7 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
         .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
         .ok();
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
+    ctx.runtime_factory.set_working_dir(path.clone());
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }
@@ -2081,12 +2374,7 @@ fn compose_login_chrome_inner(url: &str, unicode: bool, omit_url: bool) -> Strin
 /// passed through `decide_qr_style` so the decision logic stays unit
 /// testable.
 fn pick_qr_style(unicode: bool) -> Option<crate::render::qr::QrStyle> {
-    let env_flag = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-    };
+    let env_flag = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).is_some();
     let is_jediterm = std::env::var("TERMINAL_EMULATOR")
         .map(|v| v == "JetBrains-JediTerm")
         .unwrap_or(false);
@@ -2421,7 +2709,43 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
     // Phase 2: claim/models/status. Pure HTTP + config mutation — no
     // stdin / stdout interaction, so we don't need to suspend the
     // renderer. `step_login` short-circuits via `is_logged_in()`.
-    let report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+    //
+    // If the stored token is locally valid (file present, expires_in
+    // not yet past) but the server rejects it (revoked, refresh-token
+    // dead, etc.), the orchestrator surfaces `report.auth_expired =
+    // true`. Run OAuth *once* on that path — same flow `/login` would
+    // have used — then re-run setup against the fresh token. Without
+    // this the user sees "✓ already logged in as X" followed by
+    // "✗ claim failed — run `atomcode login` again" and has to do
+    // manually what `/codingplan` could do itself.
+    let mut report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+    if matches!(&report, Ok(r) if r.auth_expired) {
+        renderer.render(UiLine::CommandOutput(
+            t(Msg::CpReauthAfter401).into_owned(),
+        ));
+        renderer.flush();
+        match run_oauth_with_renderer(renderer, ctx)
+            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+        {
+            Ok(_) => {
+                report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+            }
+            Err(e) => {
+                // Re-OAuth itself failed (user pressed ESC, network
+                // dead, etc.). Render the *original* report so they
+                // still see what triggered the retry, then surface the
+                // OAuth error.
+                if let Ok(r) = &report {
+                    renderer.render(UiLine::CommandOutput(r.render()));
+                }
+                renderer.render(UiLine::Error(
+                    t(Msg::CodingPlanSetupFailed { error: &e.to_string() }).into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+        }
+    }
 
     match report {
         Ok(report) => {

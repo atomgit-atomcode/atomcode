@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Built-in Tools · AtomCode Docs</title>
+<meta name="description" content="All 21 built-in tools — filesystem, shell, code graph, web, automation.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="tools">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.22.3</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Built-in Tools</h1>
+      <p class="lede">AtomCode currently ships 21 built-in tools, grouped into four categories: filesystem &amp; shell, code graph, web, automation. The model picks tools per task — you almost never need to specify by hand.</p>
+
+      <h2>Filesystem &amp; shell (9)</h2>
+      <table>
+        <thead>
+          <tr><th>Tool</th><th>Purpose</th><th>Confirmation?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>read_file</code></td><td>Read file content; supports line offset and range</td><td>No</td></tr>
+          <tr><td><code>write_file</code></td><td>Write a full file (overwrite)</td><td>Sensitive paths: yes</td></tr>
+          <tr><td><code>edit_file</code></td><td>String-match local edits; returns the edited context</td><td>Sensitive paths: yes</td></tr>
+          <tr><td><code>search_replace</code></td><td>Batch string replacements; good for multi-line / multi-site patterns</td><td>Sensitive paths: yes</td></tr>
+          <tr><td><code>bash</code></td><td>Run shell commands; destructive commands trigger the permission dialog</td><td>Destructive: yes</td></tr>
+          <tr><td><code>grep</code></td><td>Regex search with ripgrep semantics</td><td>No</td></tr>
+          <tr><td><code>glob</code></td><td>Filename glob matching (e.g. <code>src/**/*.ts</code>)</td><td>No</td></tr>
+          <tr><td><code>list_directory</code></td><td>List directory contents</td><td>No</td></tr>
+          <tr><td><code>change_dir</code></td><td>Switch the agent's current working directory</td><td>No</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-info">
+        <strong>Sensitive paths</strong>
+        <p>Writes to paths like <code>/etc</code>, <code>~/.ssh</code>, and shell rc files always trigger the permission dialog — "always allow" cannot skip them. Likewise, <code>rm</code> on source files always needs explicit confirmation.</p>
+      </div>
+
+      <h2>Code graph (8)</h2>
+      <p>This is what sets AtomCode apart from generic agents. With the code-graph index, the model can pinpoint symbols, references, and call relationships without scanning the entire tree — especially valuable on large repos.</p>
+      <table>
+        <thead>
+          <tr><th>Tool</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>list_symbols</code></td><td>List all symbols defined in a file or directory (functions, classes, constants, …)</td></tr>
+          <tr><td><code>read_symbol</code></td><td>Read a symbol's full definition surgically, without dragging the entire file into context</td></tr>
+          <tr><td><code>find_references</code></td><td>Find every location that references a symbol</td></tr>
+          <tr><td><code>trace_callers</code></td><td>Walk the caller chain of a function backwards</td></tr>
+          <tr><td><code>trace_callees</code></td><td>Expand a function's downstream calls</td></tr>
+          <tr><td><code>trace_chain</code></td><td>Search for a possible call chain between two symbols</td></tr>
+          <tr><td><code>file_deps</code></td><td>Analyse a file's imports / dependency graph</td></tr>
+          <tr><td><code>blast_radius</code></td><td>Estimate the files / symbols a change to a given symbol could affect</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Typical scenarios</h3>
+      <ul>
+        <li><strong>Pre-refactor risk assessment</strong> — "How big is the blast if I change <code>formatDate</code>'s signature?" The model calls <code>blast_radius</code> + <code>find_references</code>.</li>
+        <li><strong>Bug root-causing</strong> — "Why doesn't this button respond?" Start at the entry function and <code>trace_callees</code> downward.</li>
+        <li><strong>Understanding unfamiliar code</strong> — "Walk me through <code>AuthService.login</code>" &rarr; <code>read_symbol</code> + <code>trace_callees</code>.</li>
+      </ul>
+
+      <h2>Web (2)</h2>
+      <table>
+        <thead>
+          <tr><th>Tool</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>web_search</code></td><td>Search the web for keywords; returns a list of title / snippet / URL</td></tr>
+          <tr><td><code>web_fetch</code></td><td>Fetch a URL and convert it to markdown for the model</td></tr>
+        </tbody>
+      </table>
+      <p>Typical uses: looking up the latest docs, comparing library APIs, reading a GitHub issue. In offline environments or to save cost, disable them with <code>--disable-tools web_search,web_fetch</code>.</p>
+
+      <h2>Automation (2)</h2>
+      <table>
+        <thead>
+          <tr><th>Tool</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>auto_fix</code></td><td>Run the project's lint / typecheck and iterate over the error list until clean</td></tr>
+          <tr><td><code>use_skill</code></td><td>Invoke a user-defined skill — package a multi-step flow as a reusable command</td></tr>
+        </tbody>
+      </table>
+      <p>See <a href="./skills.html">Skills</a> for details.</p>
+
+      <h2>Disabling specific tools</h2>
+      <p>Use the <code>--disable-tools</code> flag at launch to hide tools from the model entirely. For example, inside the SWE-bench sandbox:</p>
+      <pre><code>atomcode -p "solve this issue" --disable-tools web_search,web_fetch</code></pre>
+      <p>Disabled tools don't appear in the tool schemas, so the model won't attempt to call a tool guaranteed to fail.</p>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li><a href="./sessions.html">Sessions &amp; Undo</a> — every file-edit tool routes through file-history, so <code>/undo</code> can roll back changes</li>
+        <li><a href="./skills.html">Skills</a> — wrap your own workflows with <code>use_skill</code></li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

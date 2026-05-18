@@ -11,6 +11,13 @@ pub enum Msg<'a> {
 
     // ── /codingplan ──
     CodingPlanSetupFailed { error: &'a str },
+    /// Emitted inline by /codingplan and `atomcode codingplan` when the
+    /// stored OAuth token comes back 401 from the CodingPlan API
+    /// mid-flow. We re-run the same OAuth dance `/login` uses, save the
+    /// fresh token, and retry the whole setup once — this line tells
+    /// the user that's what's about to happen so the second
+    /// "Open this URL in any browser…" block isn't a surprise.
+    CpReauthAfter401,
     // SetupReport renderer (core/coding_plan/setup.rs)
     CpSetupHeader,
     CpLoggedIn { who: &'a str, username: &'a str, email: &'a str },
@@ -389,6 +396,7 @@ pub enum Msg<'a> {
     CmdDescReload,
     CmdDescCd,
     CmdDescInit,
+    CmdDescBg,
     CmdDescBackground,
     CmdDescDiff,
     CmdDescClear,
@@ -530,4 +538,67 @@ pub enum Msg<'a> {
     /// guaranteed-works `\<Enter>` multi-line trick. Multi-line
     /// payload with leading indent + trailing paragraph break.
     HintMultiLineInput,
+
+    // ── /bg (background sessions) ──
+    /// Help text for `/bg help`. Multi-line string with leading indent
+    /// and trailing newlines baked in.
+    BgHelp,
+    /// Empty state for `/bg list`.
+    BgListEmpty,
+    /// Table header for `/bg list`. Trailing newline baked in.
+    BgListHeader,
+    /// Row format for `/bg list`. `state` is the localised state label,
+    /// `age` is the humanised age string, `summary` is the session name.
+    BgListRow { slot: usize, short_id: &'a str, state: &'a str, age: &'a str, summary: &'a str },
+    /// Localised label for `RuntimeState::Running`.
+    BgStateRunning,
+    /// Localised label for `RuntimeState::Idle`.
+    BgStateIdle,
+    /// Localised label for `RuntimeState::Done`.
+    BgStateDone,
+    /// Localised label for `RuntimeState::Cancelled`.
+    BgStateCancelled,
+    /// Localised label for `RuntimeState::Error`.
+    BgStateError,
+    /// Age string: less than 60 seconds.
+    BgAgeNow,
+    /// Age string: minutes. `n` is the number of minutes.
+    BgAgeMinutes { n: u64 },
+    /// Age string: hours. `n` is the number of hours.
+    BgAgeHours { n: u64 },
+    /// Age string: days. `n` is the number of days.
+    BgAgeDays { n: u64 },
+    /// Error: too many background slots. `max` is the slot limit.
+    BgSlotLimitReached { max: usize },
+    /// Output after `/bg` sends the current session to background.
+    /// `new_id` is the new foreground session short id,
+    /// `slot` is the background slot number,
+    /// `old_id` is the backgrounded session short id,
+    /// `state` is the localised runtime state.
+    BgBackgroundCurrent { new_id: &'a str, slot: usize, old_id: &'a str, state: &'a str },
+    /// Error: invalid slot number. `slot` is the requested slot,
+    /// `available` is the number of available slots.
+    BgInvalidSlot { slot: usize, available: usize },
+    /// Error: background slot has no runtime client.
+    BgNoRuntimeClient,
+    /// Output after `/bg <N>` resumes a background session.
+    /// `slot` is the resumed slot, `short_id` is the session short id.
+    BgResumed { slot: usize, short_id: &'a str },
+    /// When resuming moves the previous foreground into a background slot.
+    /// `slot` is the new background slot number.
+    BgPreviousForegroundMoved { slot: usize },
+    /// Output after `/bg drop <N>`. `slot` is the dropped slot,
+    /// `short_id` is the session short id.
+    BgDropped { slot: usize, short_id: &'a str },
+    /// Output after `/background <task>` starts a one-shot task.
+    /// `slot` is the background slot, `short_id` is the session short id.
+    BgTaskStarted { slot: usize, short_id: &'a str },
+    /// Background task timed out. `secs` is the timeout in seconds.
+    BgTaskTimedOut { secs: u64 },
+    /// Background task internal error. `error` is the error message.
+    BgTaskError { error: &'a str },
+    /// Background task was cancelled.
+    BgTaskCancelled,
+    /// Background task finished but produced no summary text.
+    BgTaskNoSummary,
 }

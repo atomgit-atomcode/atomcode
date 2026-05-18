@@ -1,836 +1,1402 @@
-<!DOCTYPE html>
-<html lang="zh-CN" class="scroll-smooth">
+<!doctype html>
+<html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AtomCode — 开源终端 AI 编码助手</title>
-  <link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
-  <link rel="stylesheet" href="dist.css">
-  <style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>AtomCode · 在你的终端中运行的 AI 编程助手</title>
+<meta name="description" content="AtomCode — Claude Code 的开源平替。连接任意大模型，自主多步执行，30 秒上手。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#0a0a0a;color:#fff;font-family:"PingFang SC","Microsoft YaHei",Inter,sans-serif;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+  a{color:inherit;text-decoration:none}
+  button,input,textarea,select{font-family:inherit;border:none;outline:none;color:inherit;background:none}
+  button{cursor:pointer;padding:0}
+  :root{
+    --bg:#0a0a0a;--panel:#111;--paper:#f6f3ec;
+    --line:rgba(255,255,255,.10);
+    --muted:rgba(255,255,255,.55);
+    --accent:#e8a050;
+    --rust:#b7410e;
+    --green:#69d28a;
+    --red:#ff6e6e;
+    --blue:#7aa6ff;
+    --mono:Menlo,Monaco,Consolas,"Courier New",monospace;
+  }
 
-    /* Prevent horizontal scroll */
-    html, body { overflow-x: hidden; max-width: 100vw; }
-    * { box-sizing: border-box; }
-    
-    /* Theme Variables */
-    :root {
-      --bg-primary: #020617;
-      --bg-secondary: #0f172a;
-      --bg-card: rgba(255,255,255,0.03);
-      --text-primary: #f8fafc;
-      --text-secondary: #94a3b8;
-      --border-color: rgba(255,255,255,0.06);
-      --code-bg: #0d1117;
-    }
-    
-    [data-theme="light"] {
-      --bg-primary: #f8fafc;
-      --bg-secondary: #f1f5f9;
-      --bg-card: rgba(0,0,0,0.02);
-      --text-primary: #0f172a;
-      --text-secondary: #475569;
-      --border-color: rgba(0,0,0,0.1);
-      --code-bg: #e2e8f0;
-    }
-    
-    body {
-      background-color: var(--bg-primary);
-      color: var(--text-primary);
-      transition: background-color 0.3s ease, color 0.3s ease;
-    }
-    
-    .gradient-text { background: linear-gradient(135deg, #8b5cf6, #06b6d4, #8b5cf6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-size: 200% 200%; animation: shimmer 6s ease infinite; }
-    @keyframes shimmer { 0%,100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
-    
-    .glass { background: var(--bg-card); backdrop-filter: blur(20px); border: 1px solid var(--border-color); transition: all 0.3s ease; }
-    .stat-glow { box-shadow: 0 0 40px rgba(139,92,246,0.08); }
-    .code-block { background: var(--code-bg); border: 1px solid var(--border-color); transition: all 0.3s ease; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-    .fade-in { animation: fadeUp 0.8s ease forwards; opacity: 0; transform: translateY(30px); }
-    @keyframes fadeUp { to { opacity: 1; transform: translateY(0); } }
-    .table-row:hover { background: rgba(139,92,246,0.04); }
-    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-    .lang-btn.active { background: rgba(139,92,246,0.3); }
-    .theme-opt.active { background: rgba(139,92,246,0.3); border: 1px solid rgba(139,92,246,0.5); }
-    
-    /* Nav background for themes */
-    nav { background: rgba(2,6,23,0.85); backdrop-filter: blur(16px); transition: all 0.3s ease; }
-    [data-theme="light"] nav { background: rgba(248,250,252,0.9); border-color: rgba(0,0,0,0.06); }
-    
-    /* Light theme text overrides */
-    [data-theme="light"] .text-white { color: var(--text-primary) !important; }
-    [data-theme="light"] .text-slate-300 { color: #334155 !important; }
-    [data-theme="light"] .text-slate-400 { color: #475569 !important; }
-    [data-theme="light"] .text-slate-500 { color: #64748b !important; }
-    [data-theme="light"] .text-slate-600 { color: #94a3b8 !important; }
-    [data-theme="light"] .border-white\/5 { border-color: var(--border-color) !important; }
-    [data-theme="light"] .border-white\/10 { border-color: rgba(0,0,0,0.12) !important; }
-    [data-theme="light"] .bg-white\/5 { background: rgba(15,23,42,0.04); }
-    [data-theme="light"] .bg-white\/10 { background: rgba(15,23,42,0.06); }
-    [data-theme="light"] .hover\:bg-white\/10:hover { background: rgba(15,23,42,0.08); }
-    [data-theme="light"] .shadow-black\/50 { box-shadow: 0 25px 50px -12px rgba(15,23,42,0.15); }
-    [data-theme="light"] .glass { background: rgba(255,255,255,0.85); border-color: rgba(15,23,42,0.08); box-shadow: 0 1px 3px rgba(15,23,42,0.04); }
-    [data-theme="light"] #settingsDropdown { background: rgba(255,255,255,0.98); border-color: rgba(15,23,42,0.08); }
+  /* ---------- shared ---------- */
+  .progress-track{position:fixed;top:0;left:0;right:0;height:2px;z-index:1001;background:rgba(255,255,255,.04);pointer-events:none}
+  .progress-bar{height:100%;width:0;background:linear-gradient(90deg,#e8a050,#f6f3ec 60%,#e8a050);background-size:200% 100%;box-shadow:0 0 10px rgba(232,160,80,.55);animation:shineFlow 3s linear infinite;transition:width .12s linear}
+  @keyframes shineFlow{0%{background-position:0 0}100%{background-position:200% 0}}
+  .aurora{position:fixed;inset:0;z-index:9000;pointer-events:none;background:radial-gradient(circle 360px at var(--mx,-200px) var(--my,-200px),rgba(232,160,80,.18) 0%,rgba(232,160,80,.06) 30%,rgba(232,160,80,0) 60%);mix-blend-mode:screen}
+  .ripple{position:fixed;left:0;top:0;width:8px;height:8px;border-radius:50%;pointer-events:none;z-index:9100;background:rgba(232,160,80,.55);transform:translate(-50%,-50%);animation:rip .65s cubic-bezier(.22,1,.36,1) forwards}
+  @keyframes rip{0%{width:6px;height:6px;background:rgba(232,160,80,.85)}100%{width:160px;height:160px;background:rgba(232,160,80,0)}}
+  .toast{position:fixed;bottom:40px;left:50%;transform:translateX(-50%);z-index:2000;padding:12px 24px;font-size:13px;letter-spacing:1px;background:#000;color:#f6f3ec;border:1px solid var(--accent);border-radius:6px;font-family:var(--mono);opacity:0;transition:opacity .2s,transform .2s;white-space:nowrap}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(-6px)}
+  [data-magnetic]{transition:transform .35s cubic-bezier(.22,1,.36,1);will-change:transform}
 
-    /* Light theme accent colors — darkened for AA contrast on white bg */
-    [data-theme="light"] .text-brand-400 { color: #7c3aed !important; }
-    [data-theme="light"] .text-emerald-400 { color: #059669 !important; }
-    [data-theme="light"] .text-amber-400 { color: #b45309 !important; }
-    [data-theme="light"] .text-cyan-400 { color: #0e7490 !important; }
-    [data-theme="light"] .text-rose-400 { color: #be123c !important; }
-    [data-theme="light"] .text-red-400 { color: #b91c1c !important; }
-    [data-theme="light"] .text-indigo-400 { color: #4338ca !important; }
-    [data-theme="light"] .text-fuchsia-400 { color: #a21caf !important; }
-    [data-theme="light"] .text-teal-400 { color: #0f766e !important; }
-    [data-theme="light"] .text-sky-400 { color: #0369a1 !important; }
-    [data-theme="light"] .text-blue-400 { color: #1d4ed8 !important; }
-    [data-theme="light"] .text-yellow-400 { color: #a16207 !important; }
-    [data-theme="light"] .text-green-400 { color: #15803d !important; }
+  /* ---------- header ---------- */
+  .hdr{position:fixed;top:0;left:0;right:0;z-index:1000;height:60px;padding:0 30px;display:flex;align-items:center;justify-content:space-between;background:rgba(10,10,10,.55);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line);transition:background .25s}
+  .hdr.scrolled{background:rgba(10,10,10,.92)}
+  .hdr-logo{display:flex;align-items:center;gap:10px;font-family:Inter,sans-serif;font-weight:600;font-size:15px;letter-spacing:.5px}
+  .hdr-logo img{width:24px;height:24px;border-radius:6px;flex-shrink:0}
+  .ver{display:inline-flex;align-items:center;padding:2px 7px;margin-left:6px;font-family:var(--mono);font-size:10px;letter-spacing:.5px;color:var(--accent);border:1px solid rgba(232,160,80,.4);border-radius:3px;font-weight:500;background:rgba(232,160,80,.08);transition:all .25s}
+  .ver:hover{background:var(--accent);color:#000;border-color:var(--accent)}
+  .hdr-nav{display:flex;gap:22px;font-family:var(--mono);font-size:12px;letter-spacing:1.5px;text-transform:uppercase}
+  .hdr-nav a{position:relative;padding:6px 2px;color:rgba(255,255,255,.65);transition:color .2s}
+  .hdr-nav a::after{content:"";position:absolute;bottom:0;left:0;right:0;height:1px;background:var(--accent);transform:scaleX(0);transform-origin:left;transition:transform .25s}
+  .hdr-nav a:hover,.hdr-nav a.active{color:#fff}
+  .hdr-nav a.active::after{transform:scaleX(1)}
+  .hdr-nav a.nav-cp{color:var(--accent);position:relative;padding-left:14px;display:inline-flex;align-items:center;gap:8px}
+  .hdr-nav a.nav-cp::before{content:"";position:absolute;left:4px;top:50%;width:5px;height:5px;border-radius:50%;background:var(--accent);transform:translateY(-50%);box-shadow:0 0 6px var(--accent);animation:dotPulse 2s ease-in-out infinite}
+  .hdr-nav a.nav-cp:hover{color:#fff}
+  .hdr-nav a.nav-cp .free-badge{padding:1px 6px;font-size:9px;font-weight:600;letter-spacing:1px;background:rgba(232,160,80,.18);color:var(--accent);border:1px solid rgba(232,160,80,.4);border-radius:3px;text-transform:uppercase}
+  html.light .hdr-nav a.nav-cp{color:#c87618}
+  html.light .hdr-nav a.nav-cp::before{background:#c87618;box-shadow:0 0 6px #c87618}
+  html.light .hdr-nav a.nav-cp:hover{color:#0d0d0d}
+  html.light .hdr-nav a.nav-cp .free-badge{background:rgba(200,118,24,.12);color:#c87618;border-color:rgba(200,118,24,.4)}
+  .hdr-right{display:flex;gap:10px;align-items:center}
+  .btn-pill{height:32px;padding:0 14px;display:inline-flex;align-items:center;gap:6px;border:1px solid rgba(255,255,255,.25);font-size:11px;letter-spacing:1.5px;color:#fff;font-family:var(--mono);transition:background .2s,color .2s,border-color .2s}
+  .btn-pill:hover{background:#fff;color:#000;border-color:#fff}
+  .btn-pill.primary{background:var(--accent);color:#000;border-color:var(--accent)}
+  .btn-pill.primary:hover{background:#fff;color:#000;border-color:#fff}
+  .icon-btn{width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.75);transition:all .2s}
+  .icon-btn:hover{color:#fff;border-color:#fff;background:rgba(255,255,255,.05)}
 
-    /* Keep white text on solid brand-colored buttons/surfaces in light mode.
-       Without this, the global .text-white override above would turn the
-       "Get Started" button label dark on a purple background. */
-    [data-theme="light"] .bg-brand-600.text-white,
-    [data-theme="light"] .bg-brand-500.text-white,
-    [data-theme="light"] .bg-brand-700.text-white,
-    [data-theme="light"] .bg-brand-600 .text-white,
-    [data-theme="light"] .bg-brand-500 .text-white,
-    [data-theme="light"] .bg-brand-700 .text-white { color: #ffffff !important; }
+  /* ---------- hero ---------- */
+  .hero{position:relative;padding:130px 30px 80px;overflow:hidden}
+  .hero::before{content:"";position:absolute;inset:0;background:
+    radial-gradient(ellipse 80% 50% at 50% 0%,rgba(232,160,80,.15),transparent 60%),
+    repeating-linear-gradient(transparent 0,transparent 39px,rgba(255,255,255,.025) 40px);
+    pointer-events:none}
+  .hero-wrap{width:min(1180px,100%);margin:0 auto;display:grid;grid-template-columns:1.1fr 1fr;gap:60px;align-items:center;position:relative}
+  .hero-left .badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;letter-spacing:2.5px;color:var(--accent);text-transform:uppercase;padding:6px 12px;border:1px solid rgba(232,160,80,.35);border-radius:999px;margin-bottom:22px}
+  .hero-left .badge .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);animation:dotPulse 2s ease-in-out infinite}
+  @keyframes dotPulse{0%,50%{opacity:1}25%{opacity:.3}}
+  .hero h1{margin:0 0 18px;font-family:Inter,sans-serif;font-size:60px;font-weight:600;line-height:1.05;letter-spacing:-1.5px}
+  .hero h1 .l1{display:block;background:linear-gradient(180deg,#fff,#9ba3b3);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .hero h1 .l2{display:block;background:linear-gradient(90deg,#e8a050,#ffd194);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .hero .sub{font-size:16px;line-height:1.7;color:rgba(255,255,255,.7);max-width:560px;margin:0 0 32px}
+  .hero .sub b{color:#fff;font-weight:500}
 
-    /* Light theme hover fixes */
-    [data-theme="light"] .hover\:text-white:hover { color: #7c3aed !important; }
-    [data-theme="light"] .hover\:bg-white\/5:hover { background: rgba(124,58,237,0.06); }
+  /* hero install — auto-detect OS */
+  .install-box{background:#000;border:1px solid var(--line);border-radius:10px;overflow:hidden;font-family:var(--mono);max-width:560px}
+  .install-tabs{display:flex;border-bottom:1px solid var(--line);background:rgba(255,255,255,.02)}
+  .install-tab{padding:11px 16px;font-size:11px;letter-spacing:1.5px;color:rgba(255,255,255,.55);cursor:pointer;border-right:1px solid var(--line);transition:color .2s,background .2s;display:flex;align-items:center;gap:6px}
+  .install-tab.active{color:var(--accent);background:rgba(232,160,80,.06)}
+  .install-tab .ind{font-size:10px;color:var(--green);opacity:0;transition:opacity .2s}
+  .install-tab.active .ind{opacity:1}
+  .install-body{padding:18px 18px 14px;position:relative}
+  .install-cmd{font-size:13px;color:#e8e8e8;white-space:pre;overflow-x:auto;line-height:1.5}
+  .install-cmd .accent{color:var(--accent)}
+  .install-cmd .str{color:#9ecbff}
+  .install-cmd .com{color:rgba(255,255,255,.4)}
+  .install-actions{margin-top:14px;display:flex;align-items:center;justify-content:space-between;font-size:11px;letter-spacing:.5px;color:rgba(255,255,255,.45)}
+  .install-actions .left{display:flex;align-items:center;gap:10px}
+  .cp-btn{padding:7px 14px;background:rgba(232,160,80,.18);border:1px solid rgba(232,160,80,.4);color:var(--accent);font-family:var(--mono);font-size:11px;letter-spacing:1.5px;transition:all .2s}
+  .cp-btn:hover{background:var(--accent);color:#000}
+  .cp-btn.copied{background:var(--green);color:#000;border-color:var(--green)}
+  .hero-cta{margin-top:22px;display:flex;gap:14px;flex-wrap:wrap}
+  .btn{padding:14px 22px;font-family:var(--mono);font-size:12px;letter-spacing:1.8px;transition:all .2s ease;display:inline-flex;align-items:center;gap:8px}
+  .btn-primary{background:var(--accent);color:#000;border:1px solid var(--accent);font-weight:600;box-shadow:0 8px 26px rgba(232,160,80,.25)}
+  .btn-primary:hover{transform:translateY(-1px);box-shadow:0 14px 36px rgba(232,160,80,.45)}
+  .btn-outline{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.4)}
+  .btn-outline:hover{background:#fff;color:#000;border-color:#fff}
 
-    /* Light theme nav & code-block tweaks */
-    [data-theme="light"] nav { box-shadow: 0 1px 0 rgba(15,23,42,0.06); }
-    [data-theme="light"] .code-block { background: #f1f5f9; border-color: rgba(15,23,42,0.08); }
-    [data-theme="light"] ::-webkit-scrollbar-thumb { background: #cbd5e1; }
-    [data-theme="light"] .stat-glow { box-shadow: 0 1px 20px rgba(124,58,237,0.06); }
-    [data-theme="light"] .table-row:hover { background: rgba(124,58,237,0.05); }
-    
-    /* Mobile table scroll */
-    .table-container { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-    .table-container table { min-width: 500px; }
-    
-    /* Mobile code font size */
-    @media (max-width: 640px) {
-      .code-block pre { font-size: 11px; line-height: 1.4; }
-      .code-block { margin-left: -1rem; margin-right: -1rem; border-radius: 0; border-left: none; border-right: none; }
-    }
-  </style>
+  /* ---------- terminal demo ---------- */
+  .terminal{background:#000;border:1px solid var(--line);border-radius:12px;font-family:var(--mono);font-size:13px;line-height:1.65;box-shadow:0 24px 60px rgba(0,0,0,.6);overflow:hidden}
+  .term-head{padding:10px 14px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;color:rgba(255,255,255,.5);font-size:11px;letter-spacing:1px}
+  .term-dots{display:flex;gap:6px}
+  .term-dots span{width:10px;height:10px;border-radius:50%}
+  .term-dots span:nth-child(1){background:#ff5f56}
+  .term-dots span:nth-child(2){background:#ffbd2e}
+  .term-dots span:nth-child(3){background:#27c93f}
+  .term-title{flex:1;text-align:center;color:rgba(255,255,255,.4)}
+  .term-tag{font-size:10px;letter-spacing:1.5px;color:rgba(255,255,255,.4);padding:2px 8px;border:1px solid var(--line)}
+  .term-chips{display:flex;gap:6px;padding:10px 14px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.015)}
+  .term-chip{padding:5px 11px;font-size:11px;letter-spacing:.5px;color:rgba(255,255,255,.55);border:1px solid var(--line);transition:all .2s;cursor:pointer}
+  .term-chip:hover{color:#fff;border-color:rgba(232,160,80,.5)}
+  .term-chip.active{background:var(--accent);color:#000;border-color:var(--accent);font-weight:500}
+  .term-body{padding:16px 18px;min-height:380px;max-height:380px;overflow:auto;color:#d8d8d8}
+  .tl{display:block;margin:2px 0;opacity:0;transform:translateY(4px);animation:tlIn .25s ease forwards;white-space:pre-wrap;word-break:break-word}
+  @keyframes tlIn{to{opacity:1;transform:translateY(0)}}
+  .tl.user{color:var(--accent);font-weight:500}
+  .tl.user::before{content:"› ";color:rgba(232,160,80,.7)}
+  .tl.thinking{color:rgba(255,255,255,.55);font-style:italic}
+  .tl.thinking::before{content:"~ "}
+  .tl.tool{color:var(--blue)}
+  .tl.tool::before{content:"▸ "}
+  .tl.output{color:rgba(255,255,255,.7);padding-left:14px;border-left:2px solid var(--line)}
+  .tl.success{color:var(--green)}
+  .tl.success::before{content:"✓ "}
+  .tl.error{color:var(--red)}
+  .tl.assistant{color:#fff;background:rgba(232,160,80,.08);padding:8px 12px;margin-top:8px;border-left:2px solid var(--accent)}
+  .tl.diff-add{color:var(--green)}
+  .tl.diff-del{color:var(--red)}
+  .caret{display:inline-block;width:8px;height:14px;background:var(--accent);vertical-align:middle;margin-left:2px;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+
+  /* ---------- stats ---------- */
+  .stats{padding:80px 30px 40px}
+  .stats-wrap{width:min(1180px,100%);margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+  .stat-card{padding:32px 24px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,0));position:relative;cursor:default;transition:border-color .25s,transform .3s}
+  .stat-card:hover{border-color:rgba(232,160,80,.45);transform:translateY(-3px)}
+  .stat-card .v{font-family:Inter,sans-serif;font-size:56px;font-weight:600;line-height:1;letter-spacing:-2px;color:#fff;font-variant-numeric:tabular-nums}
+  .stat-card .v .suf{font-size:24px;color:var(--accent);margin-left:4px}
+  .stat-card .l{margin-top:10px;font-family:var(--mono);font-size:12px;letter-spacing:1.5px;color:rgba(255,255,255,.55);text-transform:uppercase}
+  .stat-card .pop{position:absolute;top:100%;left:0;right:0;margin-top:8px;background:#000;border:1px solid var(--line);padding:14px;font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.7);line-height:1.6;opacity:0;pointer-events:none;transform:translateY(-4px);transition:all .2s ease;z-index:10}
+  .stat-card:hover .pop{opacity:1;pointer-events:auto;transform:translateY(0)}
+  .stat-card .pop b{color:var(--accent)}
+
+  /* ---------- section common ---------- */
+  .section-head{width:min(1180px,100%);margin:0 auto 40px;display:flex;align-items:flex-end;justify-content:space-between;flex-wrap:wrap;gap:20px;padding:0 12px;border-bottom:1px solid var(--line);padding-bottom:18px}
+  .section-head h2{margin:0;font-family:Inter,sans-serif;font-size:34px;font-weight:600;letter-spacing:-1px;color:#fff}
+  .section-head h2 .mono{font-family:var(--mono);font-size:14px;color:var(--accent);letter-spacing:3px;text-transform:uppercase;display:block;margin-bottom:8px;font-weight:400}
+  .section-head .hint{font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.5);letter-spacing:1px}
+
+  /* ---------- features ---------- */
+  .features{padding:60px 30px 100px}
+  .grid-features{width:min(1180px,100%);margin:0 auto;display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+  .feat{position:relative;padding:28px 26px 22px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,0));transition:border-color .25s,transform .3s cubic-bezier(.22,1,.36,1);overflow:hidden;min-height:280px;display:flex;flex-direction:column}
+  .feat::before{content:"";position:absolute;inset:0;background:radial-gradient(circle 220px at var(--mx,50%) var(--my,50%),rgba(232,160,80,.16),transparent 60%);opacity:0;transition:opacity .25s;pointer-events:none}
+  .feat:hover::before{opacity:1}
+  .feat:hover{border-color:rgba(232,160,80,.45);transform:translateY(-2px)}
+  .feat > *{position:relative;z-index:1}
+  .feat .icon{width:40px;height:40px;border-radius:8px;background:rgba(232,160,80,.15);color:var(--accent);display:flex;align-items:center;justify-content:center;margin-bottom:14px;font-family:Inter,sans-serif;font-weight:700;font-size:18px}
+  .feat h3{margin:0 0 8px;font-family:Inter,sans-serif;font-size:18px;font-weight:600;color:#fff}
+  .feat p{margin:0;font-size:13px;line-height:1.65;color:rgba(255,255,255,.6)}
+  .feat .demo{margin-top:16px;padding-top:14px;border-top:1px dashed var(--line);flex:1;display:flex;align-items:center;justify-content:center;min-height:90px}
+
+  /* mini demos */
+  .agent-loop{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:11px;letter-spacing:.5px;color:rgba(255,255,255,.6)}
+  .agent-loop .node{padding:6px 10px;border:1px solid var(--line);transition:all .3s}
+  .agent-loop .node.active{background:rgba(232,160,80,.18);color:var(--accent);border-color:var(--accent)}
+  .agent-loop .arrow{color:rgba(255,255,255,.3)}
+  .model-strip{display:flex;gap:8px;animation:strip 12s linear infinite;white-space:nowrap}
+  @keyframes strip{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+  .model-strip span{padding:6px 12px;background:rgba(255,255,255,.05);border:1px solid var(--line);font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.7);letter-spacing:.5px;flex-shrink:0}
+  .graph-mini{width:100%;height:80px}
+  .vis-drop{width:100%;padding:14px;border:1px dashed rgba(232,160,80,.4);background:rgba(232,160,80,.04);font-family:var(--mono);font-size:11px;color:rgba(232,160,80,.8);text-align:center;letter-spacing:.5px}
+  .vis-drop b{color:var(--accent);font-weight:500}
+  .gitcmd{font-family:var(--mono);font-size:11px;line-height:1.8;width:100%}
+  .gitcmd .l1{color:var(--accent)}
+  .gitcmd .l2{color:var(--green)}
+  .plugin-row{display:flex;gap:6px;width:100%;overflow:hidden}
+  .plugin-row .p{flex:1;padding:8px 10px;border:1px solid var(--line);font-family:var(--mono);font-size:10px;color:rgba(255,255,255,.7);letter-spacing:.3px;background:rgba(255,255,255,.02)}
+  .plugin-row .p b{color:#fff;display:block;font-size:11px;font-weight:500}
+
+  /* ---------- comparison ---------- */
+  .compare{padding:60px 30px 100px;background:linear-gradient(180deg,rgba(255,255,255,.015),transparent)}
+  .cmp-wrap{width:min(1180px,100%);margin:0 auto}
+  .cmp-controls{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;margin-bottom:24px}
+  .cmp-chips{display:flex;gap:6px;flex-wrap:wrap}
+  .cmp-chip{padding:7px 12px;border:1px solid var(--line);font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.65);letter-spacing:.5px;transition:all .2s}
+  .cmp-chip:hover{border-color:rgba(232,160,80,.5);color:#fff}
+  .cmp-chip.active{background:var(--accent);color:#000;border-color:var(--accent);font-weight:500}
+  .cmp-toggle{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.7);letter-spacing:.5px;cursor:pointer;user-select:none}
+  .cmp-toggle .sw{width:36px;height:20px;background:rgba(255,255,255,.1);border:1px solid var(--line);border-radius:10px;position:relative;transition:background .25s}
+  .cmp-toggle .sw::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;background:#fff;border-radius:50%;transition:transform .25s}
+  .cmp-toggle.on .sw{background:var(--accent);border-color:var(--accent)}
+  .cmp-toggle.on .sw::after{transform:translateX(16px);background:#000}
+
+  /* perf bars */
+  .perf{margin-bottom:40px;padding:24px;background:rgba(255,255,255,.015);border:1px solid var(--line)}
+  .perf h3{margin:0 0 8px;font-family:Inter,sans-serif;font-size:18px;font-weight:600;color:#fff}
+  .perf .desc{font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.5);margin-bottom:18px;letter-spacing:.5px}
+  .perf-legend{display:flex;gap:18px;margin-bottom:14px;font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.6);letter-spacing:.5px}
+  .perf-legend .sw{width:12px;height:12px;display:inline-block;vertical-align:middle;margin-right:6px}
+  .perf-legend .sw.a{background:var(--accent)}
+  .perf-legend .sw.c{background:rgba(255,255,255,.4)}
+  .perf-row{display:grid;grid-template-columns:1.4fr 1fr 90px;gap:14px;align-items:center;padding:10px 0;border-top:1px dashed var(--line);font-family:var(--mono);font-size:12px}
+  .perf-row .name{color:rgba(255,255,255,.8)}
+  .perf-bars{display:flex;flex-direction:column;gap:5px}
+  .perf-bar{height:16px;background:rgba(255,255,255,.05);position:relative;overflow:hidden;border-radius:3px}
+  .perf-bar .fill{height:100%;transition:width 1s cubic-bezier(.22,1,.36,1)}
+  .perf-bar.a .fill{background:linear-gradient(90deg,var(--accent),#ffd194)}
+  .perf-bar.c .fill{background:rgba(255,255,255,.4)}
+  .perf-bar .lbl{position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:9px;font-weight:600;letter-spacing:.4px;padding:1px 6px;border-radius:3px;background:rgba(0,0,0,.6);color:#fff}
+  .perf-status{font-family:var(--mono);font-size:11px;letter-spacing:.5px;text-align:right}
+  .perf-status.eq{color:var(--green)}
+  .perf-status.near{color:var(--blue)}
+  .perf-status.gap{color:var(--accent)}
+
+  /* feature table */
+  .ftab-wrap{border:1px solid var(--line);overflow-x:auto;position:relative}
+  .ftab{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px;min-width:600px}
+  .ftab th{position:sticky;top:60px;background:#000;text-align:left;padding:14px 18px;font-size:11px;font-weight:500;letter-spacing:1.5px;color:rgba(255,255,255,.55);text-transform:uppercase;border-bottom:1px solid var(--line);z-index:10}
+  .ftab th.atom{color:var(--accent)}
+  .ftab th.claude{color:rgba(255,255,255,.7)}
+  .ftab td{padding:14px 18px;border-bottom:1px solid var(--line);color:rgba(255,255,255,.8);transition:background .2s}
+  .ftab tr:hover td{background:rgba(232,160,80,.04)}
+  .ftab tr:last-child td{border-bottom:none}
+  .ftab td.win{color:var(--accent);font-weight:500}
+  .ftab td.lose{color:rgba(255,255,255,.5)}
+  .ftab .cat{display:inline-block;padding:2px 7px;font-size:10px;background:rgba(255,255,255,.06);border:1px solid var(--line);margin-right:8px;letter-spacing:.5px}
+  .ftab tr.hidden{display:none}
+
+  .gap-note{margin-top:28px;padding:18px 20px;border:1px dashed var(--line);background:rgba(232,160,80,.03);font-family:var(--mono);font-size:12px;line-height:1.7;color:rgba(255,255,255,.7)}
+  .gap-note b{color:var(--accent)}
+
+  /* ---------- install full section ---------- */
+  .install{padding:60px 30px 100px}
+  .install-wrap{width:min(1180px,100%);margin:0 auto}
+  .install-grid{display:grid;grid-template-columns:1.1fr 1fr;gap:32px;align-items:flex-start}
+  .install-block{background:#000;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .stepper{display:grid;grid-template-columns:repeat(3,1fr);gap:0;font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.6);letter-spacing:1px;margin-top:24px;border:1px solid var(--line)}
+  .step{padding:18px 20px;border-right:1px solid var(--line);position:relative}
+  .step:last-child{border-right:none}
+  .step .n{font-size:24px;color:var(--accent);font-weight:600;font-family:Inter,sans-serif;letter-spacing:-.5px}
+  .step .t{margin-top:6px;font-size:13px;color:#fff;font-family:Inter,sans-serif}
+  .step .d{margin-top:4px;font-size:11px;color:rgba(255,255,255,.5)}
+  .step .ch{position:absolute;top:50%;right:-10px;transform:translateY(-50%);background:#000;border:1px solid var(--line);color:rgba(255,255,255,.45);width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:10px;z-index:1}
+  .step:last-child .ch{display:none}
+  .download-row{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:14px}
+  .dl-btn{padding:10px 14px;background:rgba(255,255,255,.03);border:1px solid var(--line);font-family:var(--mono);font-size:12px;color:#fff;letter-spacing:.5px;display:flex;justify-content:space-between;align-items:center;transition:all .2s}
+  .dl-btn:hover{border-color:var(--accent);color:var(--accent)}
+  .dl-btn small{color:rgba(255,255,255,.4);font-size:10px}
+
+  /* wizard panel */
+  .wiz{background:#000;border:1px solid var(--line);border-radius:10px;font-family:var(--mono);font-size:13px;color:#d8d8d8;overflow:hidden}
+  .wiz-head{padding:12px 16px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:1.5px;color:var(--accent)}
+  .wiz-body{padding:18px 18px;line-height:1.7}
+  .wiz-step{display:none}
+  .wiz-step.active{display:block}
+  .wiz-step .tt{color:var(--accent);margin-bottom:6px;font-size:12px;letter-spacing:1.5px}
+  .wiz-step .qq{color:#fff;margin-bottom:14px;font-size:14px}
+  .wiz-step .opt{padding:10px 12px;border:1px solid var(--line);margin-bottom:6px;cursor:pointer;transition:all .2s;display:flex;justify-content:space-between;align-items:center}
+  .wiz-step .opt:hover,.wiz-step .opt.sel{border-color:var(--accent);background:rgba(232,160,80,.06);color:#fff}
+  .wiz-step .opt small{color:rgba(255,255,255,.4);font-size:10px}
+  .wiz-step .intro-list{list-style:none;margin:8px 0 14px;padding:0;color:rgba(255,255,255,.8);font-size:13px;line-height:2}
+  .wiz-step .intro-list li{padding-left:14px;position:relative}
+  .wiz-step .intro-list li::before{content:"•";position:absolute;left:0;color:var(--accent)}
+  .wiz-step .intro-hint{margin-top:14px;padding-top:10px;border-top:1px dashed var(--line);font-size:11px;color:rgba(255,255,255,.5);letter-spacing:.5px}
+  .wiz-step .intro-hint.inline{margin:0 0 14px;padding-top:0;border-top:none}
+  .wiz-nav-hint{margin-top:14px;padding:10px 12px;border:1px dashed var(--line);font-size:11px;color:rgba(255,255,255,.5);letter-spacing:.5px;text-align:center}
+  .wiz-nav{margin-top:14px;display:flex;justify-content:space-between;align-items:center}
+  .wiz-dots{display:flex;gap:6px}
+  .wiz-dots span{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.2)}
+  .wiz-dots span.on{background:var(--accent)}
+  .wiz-nav button{padding:6px 12px;border:1px solid var(--line);font-size:11px;letter-spacing:1px;color:rgba(255,255,255,.7);transition:all .2s}
+  .wiz-nav button:hover{color:#fff;border-color:#fff}
+
+  /* ---------- footer ---------- */
+  .ftr{padding:50px 30px 30px;text-align:center;font-family:Outfit,Inter,sans-serif;font-size:12px;color:rgba(255,255,255,.4);border-top:1px solid var(--line)}
+  .ftr-row{margin-bottom:14px;font-family:var(--mono);letter-spacing:1px}
+  .ftr-row a{margin:0 6px}
+  .ftr-row a:hover{color:#fff}
+  .ftr-tag{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border:1px solid var(--line);font-family:var(--mono);font-size:11px;color:var(--rust);margin-top:8px}
+
+  /* ---------- LIGHT theme ---------- */
+  html.light{color-scheme:light}
+  html.light body{background:#f6f3ec;color:#0d0d0d}
+  html.light .aurora{mix-blend-mode:multiply;background:radial-gradient(circle 360px at var(--mx,-200px) var(--my,-200px),rgba(232,160,80,.30) 0%,rgba(232,160,80,.10) 30%,rgba(232,160,80,0) 60%)}
+  html.light .ripple{background:rgba(200,118,24,.55)}
+  html.light .progress-track{background:rgba(0,0,0,.05)}
+
+  html.light .hdr{background:rgba(246,243,236,.6);border-bottom-color:rgba(0,0,0,.10);color:#0d0d0d}
+  html.light .hdr.scrolled{background:rgba(246,243,236,.92)}
+  html.light .hdr-nav a{color:rgba(0,0,0,.55)}
+  html.light .hdr-nav a:hover,html.light .hdr-nav a.active{color:#0d0d0d}
+  html.light .btn-pill{color:#0d0d0d;border-color:rgba(0,0,0,.25)}
+  html.light .btn-pill:hover{background:#0d0d0d;color:#fff;border-color:#0d0d0d}
+  html.light .btn-pill.primary{background:#c87618;color:#fff;border-color:#c87618}
+  html.light .btn-pill.primary:hover{background:#0d0d0d;color:#fff;border-color:#0d0d0d}
+  html.light .icon-btn{color:rgba(0,0,0,.65);border-color:rgba(0,0,0,.2)}
+  html.light .icon-btn:hover{color:#fff;background:#0d0d0d;border-color:#0d0d0d}
+
+  html.light .ver{color:#c87618;border-color:rgba(200,118,24,.5);background:rgba(232,160,80,.10)}
+  html.light .ver:hover{background:#c87618;color:#fff}
+
+  html.light .hero::before{background:radial-gradient(ellipse 80% 50% at 50% 0%,rgba(232,160,80,.20),transparent 60%),repeating-linear-gradient(transparent 0,transparent 39px,rgba(0,0,0,.045) 40px)}
+  html.light .hero h1 .l1{background:linear-gradient(180deg,#0d0d0d,#5a5a5a);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  html.light .hero h1 .l2{background:linear-gradient(90deg,#c87618,#e8a050);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  html.light .hero .sub{color:rgba(0,0,0,.7)}
+  html.light .hero .sub b{color:#0d0d0d}
+  html.light .hero-left .badge{color:#c87618;border-color:rgba(200,118,24,.4);background:rgba(255,255,255,.5)}
+  html.light .hero-left .badge .dot{background:#c87618;box-shadow:0 0 8px #c87618}
+
+  html.light .btn-primary{background:#c87618;color:#fff;border-color:#c87618;box-shadow:0 8px 26px rgba(200,118,24,.25)}
+  html.light .btn-primary:hover{box-shadow:0 14px 36px rgba(200,118,24,.4)}
+  html.light .btn-outline{color:#0d0d0d;border-color:rgba(0,0,0,.4)}
+  html.light .btn-outline:hover{background:#0d0d0d;color:#fff;border-color:#0d0d0d}
+
+  html.light .section-head h2{color:#0d0d0d}
+  html.light .section-head{border-bottom-color:rgba(0,0,0,.12)}
+  html.light .section-head .hint{color:rgba(0,0,0,.5)}
+  html.light .section-head h2 .mono{color:#c87618}
+
+  html.light .stats .stat-card,html.light .feat,html.light .perf,html.light .ftab-wrap,html.light .stepper,html.light .step,html.light .dl-btn,html.light .gap-note{background:#fff;border-color:rgba(0,0,0,.10)}
+  html.light .stats .stat-card:hover,html.light .feat:hover{border-color:rgba(200,118,24,.5)}
+  html.light .stat-card .v{color:#0d0d0d}
+  html.light .stat-card .v .suf{color:#c87618}
+  html.light .stat-card .l{color:rgba(0,0,0,.55)}
+  html.light .feat h3,html.light .perf h3{color:#0d0d0d}
+  html.light .feat p,html.light .perf .desc,html.light .perf-legend{color:rgba(0,0,0,.6)}
+  html.light .feat .demo{border-top-color:rgba(0,0,0,.08)}
+  html.light .feat .icon{background:rgba(232,160,80,.20);color:#c87618}
+
+  html.light .agent-loop .node{border-color:rgba(0,0,0,.12);color:rgba(0,0,0,.7);background:#fff}
+  html.light .agent-loop .node.active{background:rgba(232,160,80,.18);color:#c87618;border-color:#c87618}
+  html.light .agent-loop .arrow{color:rgba(0,0,0,.3)}
+  html.light .model-strip span{background:#fff;border-color:rgba(0,0,0,.10);color:rgba(0,0,0,.7)}
+  html.light .vis-drop{color:#c87618;background:rgba(232,160,80,.06);border-color:rgba(200,118,24,.45)}
+  html.light .plugin-row .p{background:#fff;border-color:rgba(0,0,0,.10);color:rgba(0,0,0,.7)}
+  html.light .plugin-row .p b{color:#0d0d0d}
+  html.light .gitcmd .l1{color:#c87618}
+  html.light .gitcmd .l2{color:#2e8a4e}
+
+  html.light .ftab th{background:#fff;color:rgba(0,0,0,.55);border-bottom-color:rgba(0,0,0,.10)}
+  html.light .ftab th.atom{color:#c87618}
+  html.light .ftab th.claude{color:rgba(0,0,0,.7)}
+  html.light .ftab td{color:rgba(0,0,0,.85);border-bottom-color:rgba(0,0,0,.08)}
+  html.light .ftab tr:hover td{background:rgba(232,160,80,.06)}
+  html.light .ftab td.win{color:#c87618}
+  html.light .ftab td.lose{color:rgba(0,0,0,.45)}
+  html.light .ftab .cat{background:rgba(0,0,0,.04);border-color:rgba(0,0,0,.08);color:rgba(0,0,0,.6)}
+
+  html.light .perf{background:#fff}
+  html.light .perf-bar{background:rgba(0,0,0,.06)}
+  html.light .perf-bar.c .fill{background:rgba(0,0,0,.45)}
+  html.light .perf-bar .lbl{background:rgba(255,255,255,.94);color:#0d0d0d}
+  html.light .perf-row{border-top-color:rgba(0,0,0,.08)}
+  html.light .perf-row .name{color:rgba(0,0,0,.8)}
+  html.light .perf-status.eq{color:#3b9c61}
+  html.light .perf-status.near{color:#4675c4}
+  html.light .perf-status.gap{color:#c87618}
+
+  html.light .gap-note{color:rgba(0,0,0,.72);border-color:rgba(0,0,0,.18);background:rgba(232,160,80,.06)}
+  html.light .gap-note b{color:#c87618}
+
+  html.light .cmp-chip,html.light .term-chip{color:rgba(0,0,0,.65);border-color:rgba(0,0,0,.12);background:rgba(255,255,255,.5)}
+  html.light .cmp-chip:hover,html.light .term-chip:hover{color:#0d0d0d;background:#fff;border-color:rgba(200,118,24,.5)}
+  html.light .cmp-chip.active,html.light .term-chip.active{background:#c87618;color:#fff;border-color:#c87618}
+  html.light .cmp-toggle{color:rgba(0,0,0,.7)}
+  html.light .cmp-toggle .sw{background:rgba(0,0,0,.1);border-color:rgba(0,0,0,.12)}
+  html.light .cmp-toggle.on .sw{background:#c87618;border-color:#c87618}
+
+  html.light .step{border-right-color:rgba(0,0,0,.10)}
+  html.light .step .d,html.light .step .ch{color:rgba(0,0,0,.55)}
+  html.light .step .n{color:#c87618}
+  html.light .step .t{color:#0d0d0d}
+  html.light .step .ch{background:#fff;border-color:rgba(0,0,0,.1)}
+  html.light .dl-btn{color:#0d0d0d;background:rgba(255,255,255,.5)}
+  html.light .dl-btn small{color:rgba(0,0,0,.45)}
+  html.light .dl-btn:hover{border-color:#c87618;color:#c87618}
+
+  html.light .ftr{color:rgba(0,0,0,.55);border-top-color:rgba(0,0,0,.10)}
+  html.light .ftr a:hover{color:#0d0d0d}
+  html.light .ftr-tag{background:#fff;color:#b7410e;border-color:rgba(0,0,0,.1)}
+
+  /* theme button morphs between sun/moon */
+  .theme-icon{display:inline-flex;width:14px;height:14px;align-items:center;justify-content:center}
+
+  /* ---------- responsive ---------- */
+  @media (max-width:1024px){
+    .hero-wrap{grid-template-columns:1fr;gap:40px}
+    .stats-wrap{grid-template-columns:repeat(2,1fr)}
+    .grid-features{grid-template-columns:repeat(2,1fr)}
+    .install-grid{grid-template-columns:1fr}
+  }
+  @media (max-width:768px){
+    .hdr{padding:0 16px;height:52px}
+    .hdr-nav{display:none}
+    .hero{padding:100px 16px 60px}
+    .hero h1{font-size:36px}
+    .stats-wrap,.grid-features{grid-template-columns:1fr}
+    .stat-card .v{font-size:42px}
+    .stepper{grid-template-columns:1fr}
+    .download-row{grid-template-columns:1fr}
+    .section-head h2{font-size:24px}
+  }
+</style>
 </head>
-<body class="antialiased">
+<body>
 
-  <!-- Nav -->
-  <nav class="fixed top-0 w-full z-50 border-b border-white/5">
-    <div class="max-w-6xl mx-auto px-4 md:px-6 h-14 md:h-16 flex items-center justify-between">
-      <!-- Left: Logo -->
-      <div class="flex items-center gap-2 md:gap-3 flex-shrink-0">
-        <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode" class="w-7 h-7 md:w-8 md:h-8 rounded-lg">
-        <span class="text-base md:text-lg font-semibold tracking-tight">AtomCode</span>
-        <span class="text-xs px-1.5 md:px-2 py-0.5 rounded-full bg-brand-600/20 text-brand-400 font-medium">v4.22.2</span>
-      </div>
-      
-      <!-- Center: Navigation Links (Desktop) -->
-      <div class="hidden md:flex flex-1 items-center justify-center gap-6 lg:gap-8 text-sm text-slate-400">
-        <a href="#features" class="hover:text-white transition" data-i18n="nav.features">功能特性</a>
-        <a href="#install" class="hover:text-white transition" data-i18n="nav.install">安装指南</a>
-        <a href="./docs/index.html" class="hover:text-white transition" data-i18n="nav.docs">使用指南</a>
-        <a href="https://ai.atomgit.com/serverless-api" target="_blank" class="hover:text-white transition flex items-center gap-1.5">
-          <span data-i18n="nav.codingplan">CodingPlan</span>
-          <span class="text-[10px] font-semibold leading-none px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 tracking-wider">FREE</span>
-        </a>
-        <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" class="hover:text-white transition flex items-center gap-1.5">
-          <img src="https://cdn-static.gitcode.host/static/images/logo-favicon.png" alt="AtomGit" class="w-4 h-4">
-          <span data-i18n="nav.repo">开源仓库</span>
-        </a>
-      </div>
-      
-      <!-- Right: Settings & Mobile Menu -->
-      <div class="flex items-center gap-2 md:gap-3 flex-shrink-0">
-        <!-- Settings Dropdown (Desktop) -->
-        <div class="relative hidden md:block">
-          <button id="settingsBtn" class="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 transition text-slate-300 hover:text-white text-sm">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
-            </svg>
-            <span data-i18n="nav.settings">设置</span>
-            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
-            </svg>
-          </button>
-          
-          <!-- Dropdown Menu -->
-          <div id="settingsDropdown" class="absolute right-0 mt-2 w-48 glass rounded-xl shadow-xl opacity-0 invisible transition-all duration-200 transform translate-y-[-8px]">
-            <div class="p-3 border-b border-white/5">
-              <div class="text-xs text-slate-500 mb-2" data-i18n="settings.language">语言</div>
-              <div class="flex gap-1">
-                <button class="lang-btn flex-1 py-1.5 rounded-lg text-xs font-medium transition bg-white/5 hover:bg-white/10" data-lang="zh">中文</button>
-                <button class="lang-btn flex-1 py-1.5 rounded-lg text-xs font-medium transition bg-white/5 hover:bg-white/10" data-lang="en">EN</button>
-              </div>
-            </div>
-            <div class="p-3">
-              <div class="text-xs text-slate-500 mb-2" data-i18n="settings.theme">主题</div>
-              <div class="flex gap-2">
-                <button id="lightBtn" class="theme-opt flex-1 py-2 rounded-lg text-xs font-medium transition bg-white/5 hover:bg-white/10 flex items-center justify-center gap-1.5" data-theme-opt="light">
-                  <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/>
-                  </svg>
-                  <span data-i18n="theme.light">日间</span>
-                </button>
-                <button id="darkBtn" class="theme-opt flex-1 py-2 rounded-lg text-xs font-medium transition bg-white/5 hover:bg-white/10 flex items-center justify-center gap-1.5" data-theme-opt="dark">
-                  <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
-                  </svg>
-                  <span data-i18n="theme.dark">夜间</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-        
-        <!-- Mobile Menu Button -->
-        <button id="mobileMenuBtn" class="md:hidden flex items-center justify-center w-10 h-10 rounded-lg bg-white/5 hover:bg-white/10 transition">
-          <svg id="menuIcon" class="w-5 h-5 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
-          </svg>
-          <svg id="closeIcon" class="w-5 h-5 text-slate-300 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
-          </svg>
-        </button>
-      </div>
-    </div>
-    
-    <!-- Mobile Menu -->
-    <div id="mobileMenu" class="md:hidden fixed inset-0 z-40 opacity-0 invisible transition-all duration-300" style="top: 56px;">
-      <!-- Backdrop -->
-      <div class="absolute inset-0 bg-black/60 backdrop-blur-sm"></div>
-      
-      <!-- Menu Content -->
-      <div class="relative bg-surface-950/95 border-t border-white/5 overflow-y-auto" style="max-height: calc(100vh - 56px);">
-        <!-- Navigation Links -->
-        <div class="flex flex-col border-b border-white/5">
-          <a href="#features" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.features">功能特性</a>
-          <a href="#install" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.install">安装指南</a>
-          <a href="./docs/index.html" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5" data-i18n="nav.docs">使用指南</a>
-          <a href="https://ai.atomgit.com/serverless-api" target="_blank" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition border-b border-white/5 flex items-center gap-2">
-            <span data-i18n="nav.codingplan">CodingPlan</span>
-            <span class="text-[10px] font-semibold leading-none px-1.5 py-0.5 rounded-full bg-rose-500/15 text-rose-400 tracking-wider">FREE</span>
-          </a>
-          <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" class="mobile-nav-link px-4 py-3 text-base text-slate-300 hover:text-white hover:bg-white/5 transition flex items-center gap-2">
-            <img src="https://cdn-static.gitcode.host/static/images/logo-favicon.png" alt="AtomGit" class="w-5 h-5">
-            <span data-i18n="nav.repo">开源仓库</span>
-          </a>
-        </div>
-        
-        <!-- Settings -->
-        <div class="p-4">
-          <div class="text-sm text-slate-500 mb-2" data-i18n="settings.language">语言</div>
-          <div class="flex gap-2 mb-4">
-            <button class="lang-btn flex-1 py-2 rounded-lg text-sm font-medium transition bg-white/5 hover:bg-white/10" data-lang="zh">中文</button>
-            <button class="lang-btn flex-1 py-2 rounded-lg text-sm font-medium transition bg-white/5 hover:bg-white/10" data-lang="en">EN</button>
-          </div>
-          
-          <div class="text-sm text-slate-500 mb-2" data-i18n="settings.theme">主题</div>
-          <div class="flex gap-2">
-            <button class="theme-opt flex-1 py-2 rounded-lg text-sm font-medium transition bg-white/5 hover:bg-white/10 flex items-center justify-center gap-2" data-theme-opt="light">
-              <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/>
-              </svg>
-              <span data-i18n="theme.light">日间</span>
-            </button>
-            <button class="theme-opt flex-1 py-2 rounded-lg text-sm font-medium transition bg-white/5 hover:bg-white/10 flex items-center justify-center gap-2" data-theme-opt="dark">
-              <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
-              </svg>
-              <span data-i18n="theme.dark">夜间</span>
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
+<div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+<div class="aurora" id="aurora"></div>
+
+<!-- header -->
+<header class="hdr" id="hdr">
+  <a class="hdr-logo" href="#top">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span data-scramble>AtomCode</span>
+    <span class="ver" id="verBadge" title="当前版本">v4.22.3</span>
+  </a>
+  <nav class="hdr-nav" id="hdrNav">
+    <a href="#features" data-section="features" data-i18n="nav.features">功能</a>
+    <a href="#compare" data-section="compare" data-i18n="nav.compare">对比</a>
+    <a href="#install" data-section="install" data-i18n="nav.install">安装</a>
+    <a href="./docs/index.html" target="_blank" rel="noopener" data-i18n="nav.docs">文档</a>
+    <a class="nav-cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">
+      <span data-i18n="nav.codingplan">CodingPlan</span>
+      <span class="free-badge">FREE</span>
+    </a>
   </nav>
+  <div class="hdr-right">
+    <button class="icon-btn" id="themeBtn" aria-label="主题">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+    <button class="icon-btn" id="langBtn" aria-label="语言">中</button>
+    <a class="btn-pill" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="btn.repo">开源仓库</a>
+    <a class="btn-pill primary" href="#install" data-i18n="btn.start">立即开始</a>
+  </div>
+</header>
 
-  <!-- Hero -->
-  <section class="relative pt-32 pb-20 overflow-hidden">
-    <div class="absolute inset-0" style="background:radial-gradient(ellipse at 50% 0%, rgba(139,92,246,0.12) 0%, transparent 60%)"></div>
-    <div class="max-w-4xl mx-auto px-6 text-center relative z-10">
-      <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-brand-600/10 border border-brand-600/20 text-brand-400 text-sm font-medium mb-8">
-        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-        <span data-i18n="hero.badge">开源 · 多模型支持 · Rust</span>
-      </div>
-      <h1 class="text-5xl md:text-7xl font-extrabold tracking-tight leading-[1.1] mb-6">
-        <span class="gradient-text" data-i18n="hero.title1">AI 编程助手</span><br>
-        <span class="text-white" data-i18n="hero.title2">在你的终端中运行</span>
+<!-- hero -->
+<section class="hero" id="top">
+  <div class="hero-wrap">
+    <div class="hero-left">
+      <div class="badge"><span class="dot"></span><span data-i18n="hero.badge">开源 · 多模型 · 100% AI 生成 · Rust 1.88+</span></div>
+      <h1>
+        <span class="l1" data-i18n="hero.t1">AI 编程助手</span>
+        <span class="l2" data-i18n="hero.t2">在你的终端中运行</span>
       </h1>
-      <p class="text-lg md:text-xl text-slate-400 max-w-2xl mx-auto mb-10 leading-relaxed" data-i18n="hero.desc">
-        Claude Code 的开源替代方案。连接任意大模型，编辑代码，运行命令，自动验证 — 全自动执行。用 Rust 构建，极致性能。
-      </p>
-      <div class="flex items-center justify-center gap-4 mb-16">
-        <a href="#install" class="px-8 py-3.5 rounded-xl bg-brand-600 hover:bg-brand-500 transition text-white font-semibold text-base shadow-lg shadow-brand-600/25" data-i18n="hero.btn.start">立即开始</a>
-        <a href="#comparison" class="px-8 py-3.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 transition text-white font-medium text-base" data-i18n="hero.btn.compare">查看对比</a>
-      </div>
+      <p class="sub" data-i18n-html="hero.sub">Claude Code / Cursor Agent 的<b>开源平替</b>，住在你的终端里。连接任意 OpenAI 兼容大模型，自主读文件、改代码、跑测试、自我验证 —— 用 Rust 构建。本项目<b>100% 由 AI 生成</b>。</p>
 
-      <!-- Terminal Preview -->
-      <div class="code-block rounded-2xl overflow-hidden shadow-2xl shadow-black/50 max-w-3xl mx-auto">
-        <div class="flex items-center gap-2 px-4 py-3 border-b border-white/5">
-          <div class="w-3 h-3 rounded-full bg-red-500/80"></div>
-          <div class="w-3 h-3 rounded-full bg-yellow-500/80"></div>
-          <div class="w-3 h-3 rounded-full bg-green-500/80"></div>
-          <span class="ml-3 text-xs text-slate-500 font-mono">atomcode — ~/project</span>
+      <div class="install-box" id="heroInstall">
+        <div class="install-tabs" id="osTabs">
+          <div class="install-tab" data-os="mac"><span>macOS</span><span class="ind">●</span></div>
+          <div class="install-tab" data-os="linux"><span>Linux</span><span class="ind">●</span></div>
+          <div class="install-tab" data-os="win"><span>Windows</span><span class="ind">●</span></div>
+          <div class="install-tab" data-os="harmony"><span>HarmonyOS</span><span class="ind">●</span></div>
         </div>
-        <pre class="p-6 text-sm font-mono leading-relaxed text-left overflow-x-auto"><span class="text-blue-400 font-bold">&#10095;</span> <span class="text-white" data-i18n="terminal.task">修复登录后 404 的 bug</span>
-
-<span class="text-slate-600">│</span> <span class="text-slate-300" data-i18n="terminal.investigate">我来检查 OAuth 回调处理器。</span>
-<span class="text-slate-600">│</span>
-<span class="text-slate-600">│</span>   <span class="text-blue-400">&#9656; <span data-i18n="terminal.read">读取文件</span></span>  <span class="text-slate-500">src/auth/callback.ts</span>
-<span class="text-slate-600">│</span>   <span class="text-emerald-400">&#10003;</span> <span class="text-slate-500">1| import { redirect } from 'next/navigation' (42 lines)</span>
-<span class="text-slate-600">│</span>   <span class="text-green-400">&#9656; <span data-i18n="terminal.edit">编辑文件</span></span>  <span class="text-slate-500">src/auth/callback.ts (-2 +5)</span>
-<span class="text-slate-600">│</span>   <span class="text-emerald-400">&#10003;</span> <span class="text-slate-500" data-i18n="terminal.edited">已编辑 src/auth/callback.ts</span>
-<span class="text-slate-600">│</span>   <span class="text-yellow-400">$ Bash</span>  <span class="text-slate-500">npm run build</span>
-<span class="text-slate-600">│</span>   <span class="text-emerald-400">&#10003;</span> <span class="text-slate-500" data-i18n="terminal.build">构建成功</span>
-<span class="text-slate-600">│</span>
-<span class="text-slate-600">│</span> <span class="text-slate-300" data-i18n="terminal.fixed">已修复。重定向 URL 缺少基础路径。</span></pre>
-      </div>
-    </div>
-  </section>
-
-  <!-- Stats -->
-  <section class="py-16 border-y border-white/5">
-    <div class="max-w-5xl mx-auto px-6 grid grid-cols-2 md:grid-cols-4 gap-6">
-      <div class="text-center glass rounded-2xl p-6 stat-glow">
-        <div class="text-3xl font-bold text-brand-400 mb-1">21</div>
-        <div class="text-sm text-slate-500" data-i18n="stats.tools">内置工具</div>
-      </div>
-      <div class="text-center glass rounded-2xl p-6 stat-glow">
-        <div class="text-3xl font-bold text-emerald-400 mb-1">8</div>
-        <div class="text-sm text-slate-500" data-i18n="stats.graph">代码图谱工具</div>
-      </div>
-      <div class="text-center glass rounded-2xl p-6 stat-glow">
-        <div class="text-3xl font-bold text-cyan-400 mb-1">8+</div>
-        <div class="text-sm text-slate-500" data-i18n="stats.providers">支持的模型</div>
-      </div>
-      <div class="text-center glass rounded-2xl p-6 stat-glow">
-        <div class="text-3xl font-bold text-amber-400 mb-1">3</div>
-        <div class="text-sm text-slate-500" data-i18n="stats.platforms">支持平台</div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Features -->
-  <section id="features" class="py-24">
-    <div class="max-w-5xl mx-auto px-6">
-      <div class="text-center mb-16">
-        <h2 class="text-3xl md:text-4xl font-bold mb-4" data-i18n="features.title">功能齐全</h2>
-        <p class="text-slate-400 text-lg max-w-xl mx-auto" data-i18n="features.desc">为需要 Claude Code 强大能力但想使用任意大模型的开发者打造。</p>
-      </div>
-      <div class="grid md:grid-cols-3 gap-5">
-        <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-brand-600/15 flex items-center justify-center text-brand-400 text-lg mb-4 group-hover:bg-brand-600/25 transition">&#9881;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.agent.title">智能 Agent 循环</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.agent.desc">自主多步执行：读取、编辑、运行、网络检索、自我验证 —— 循环执行直至任务完成。</p>
-        </div>
-        <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-cyan-600/15 flex items-center justify-center text-cyan-400 text-lg mb-4 group-hover:bg-cyan-600/25 transition">&#9729;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.provider.title">多模型支持</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.provider.desc">Claude、OpenAI、DeepSeek、GLM、Qwen、Ollama —— 任意 OpenAI 兼容 API 皆可接入，国产大模型一视同仁。</p>
-        </div>
-        <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-fuchsia-600/15 flex items-center justify-center text-fuchsia-400 text-lg mb-4 group-hover:bg-fuchsia-600/25 transition">&#128279;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.graph.title">代码图谱</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.graph.desc">符号索引、调用链追踪、引用查找、影响面分析 —— 8 个内置工具让模型真正读懂大型代码库。</p>
-        </div>
-        <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-emerald-600/15 flex items-center justify-center text-emerald-400 text-lg mb-4 group-hover:bg-emerald-600/25 transition">&#128444;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.images.title">图片附件与 VL 预处理</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.images.desc"><code class="text-brand-400">Ctrl+V</code> 粘贴截图、Finder 拖拽、iTerm2 自动识别路径 —— 主模型不支持图片时，自动调用 VL preprocessor 做 OCR + 描述 splice 给主模型。</p>
-        </div>
-        <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-teal-600/15 flex items-center justify-center text-teal-400 text-lg mb-4 group-hover:bg-teal-600/25 transition">&#128274;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.atomgit.title">AtomGit 原生集成</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.atomgit.desc">AtomGit OAuth 一键登录、终端内 <code class="text-brand-400">/issue</code> 创建 Issue、企业微信扫码登录 —— 与 AtomGit 开源生态无缝对接。</p>
-        </div>
-        <div class="glass rounded-2xl p-6 hover:border-brand-600/30 transition group">
-          <div class="w-10 h-10 rounded-xl bg-sky-600/15 flex items-center justify-center text-sky-400 text-lg mb-4 group-hover:bg-sky-600/25 transition">&#129513;</div>
-          <h3 class="text-base font-semibold mb-2" data-i18n="features.ecosystem.title">Skills 与 Plugin 生态</h3>
-          <p class="text-sm text-slate-400 leading-relaxed" data-i18n="features.ecosystem.desc">用 Skills 写自己的斜杠命令；<code class="text-brand-400">/plugin install &lt;git-repo&gt;</code> 一键拿别人写好的命令、hook、skill 套件 —— 与 Claude Code 生态兼容。</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Comparison -->
-  <section id="comparison" class="py-16 md:py-24 border-t border-white/5">
-    <div class="max-w-5xl mx-auto px-4 md:px-6">
-      <div class="text-center mb-12 md:mb-16">
-        <h2 class="text-2xl md:text-3xl lg:text-4xl font-bold mb-3 md:mb-4" data-i18n="comparison.title">AtomCode 与 Claude Code 对比</h2>
-        <p class="text-slate-400 text-base md:text-lg max-w-xl mx-auto" data-i18n="comparison.desc">相同模型基准测试。基于真实编程任务测量。</p>
-      </div>
-
-      <div class="glass rounded-2xl overflow-hidden mb-8 md:mb-12">
-        <div class="px-4 md:px-6 py-3 md:py-4 border-b border-white/5">
-          <h3 class="font-semibold text-sm md:text-base" data-i18n="comparison.performance">任务性能（相同模型）</h3>
-        </div>
-        <div class="table-container">
-          <table class="w-full text-xs md:text-sm">
-          <thead>
-            <tr class="text-slate-500 text-left border-b border-white/5">
-              <th class="px-6 py-3 font-medium" data-i18n="comparison.task">任务类型</th>
-              <th class="px-6 py-3 font-medium text-center">AtomCode</th>
-              <th class="px-6 py-3 font-medium text-center">Claude Code</th>
-              <th class="px-6 py-3 font-medium text-center" data-i18n="comparison.status">状态</th>
-            </tr>
-          </thead>
-          <tbody class="text-slate-300">
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3.5" data-i18n="comparison.task3">启动开发服务器</td>
-              <td class="px-6 py-3.5 text-center font-mono text-brand-400">1 步</td>
-              <td class="px-6 py-3.5 text-center font-mono text-slate-400">1 步</td>
-              <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium" data-i18n="comparison.equal">持平</span></td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3.5" data-i18n="comparison.task1">简单编辑（样式修改）</td>
-              <td class="px-6 py-3.5 text-center font-mono text-brand-400">2-3 步</td>
-              <td class="px-6 py-3.5 text-center font-mono text-slate-400">2-3 步</td>
-              <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium" data-i18n="comparison.equal">持平</span></td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3.5" data-i18n="comparison.task4">Bug 修复</td>
-              <td class="px-6 py-3.5 text-center font-mono text-brand-400">4-6 步</td>
-              <td class="px-6 py-3.5 text-center font-mono text-slate-400">3-5 步</td>
-              <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-sky-500/10 text-sky-400 text-xs font-medium" data-i18n="comparison.close">接近</span></td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3.5" data-i18n="comparison.task2">模块重构</td>
-              <td class="px-6 py-3.5 text-center font-mono text-brand-400">9-10 步</td>
-              <td class="px-6 py-3.5 text-center font-mono text-slate-400">8-10 步</td>
-              <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium" data-i18n="comparison.equal">持平</span></td>
-            </tr>
-            <tr class="table-row">
-              <td class="px-6 py-3.5" data-i18n="comparison.task5">复杂任务（新库+调试）</td>
-<td class="px-6 py-3.5 text-center font-mono text-brand-400">20-25 步</td>
-              <td class="px-6 py-3.5 text-center font-mono text-slate-400">12-18 步</td>
-              <td class="px-6 py-3.5 text-center"><span class="px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-400 text-xs font-medium" data-i18n="comparison.gap">差距 ~30%</span></td>
-            </tr>
-          </tbody>
-        </table>
-        </div>
-      </div>
-
-      <div class="glass rounded-2xl overflow-hidden">
-        <div class="px-4 md:px-6 py-3 md:py-4 border-b border-white/5">
-          <h3 class="font-semibold text-sm md:text-base" data-i18n="comparison.features">功能对比</h3>
-        </div>
-        <div class="table-container">
-          <table class="w-full text-xs md:text-sm">
-          <thead>
-            <tr class="text-slate-500 text-left border-b border-white/5">
-              <th class="px-6 py-3 font-medium" data-i18n="comparison.feature">功能</th>
-              <th class="px-6 py-3 font-medium text-center">AtomCode</th>
-              <th class="px-6 py-3 font-medium text-center">Claude Code</th>
-            </tr>
-          </thead>
-          <tbody class="text-slate-300">
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.f1">开源协议</td>
-              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.mit">&#10003; MIT 开源</td>
-              <td class="px-6 py-3 text-center text-slate-500" data-i18n="comp.closed">闭源</td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.f2">模型接入</td>
-              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.any">&#10003; 任意 OpenAI 兼容</td>
-              <td class="px-6 py-3 text-center text-slate-500" data-i18n="comp.claudeonly">仅 Claude</td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.f3">本地模型 (Ollama)</td>
-              <td class="px-6 py-3 text-center text-emerald-400">&#10003;</td>
-              <td class="px-6 py-3 text-center text-slate-600">&#10007;</td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.fgraph">代码图谱工具</td>
-              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.graph8">&#10003; 8 个内置</td>
-              <td class="px-6 py-3 text-center text-slate-500" data-i18n="comp.basic">基础文本检索</td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.fundo"><code class="text-brand-400">/undo</code> 一键回滚</td>
-              <td class="px-6 py-3 text-center text-emerald-400">&#10003;</td>
-              <td class="px-6 py-3 text-center text-slate-500" data-i18n="comp.viagit">手动 git</td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.fatomgit">AtomGit 原生集成</td>
-              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.oauthissue">&#10003; OAuth + /issue</td>
-              <td class="px-6 py-3 text-center text-slate-600">&#10007;</td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.f6">MCP 支持</td>
-              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.supported">&#10003; 已支持</td>
-              <td class="px-6 py-3 text-center text-emerald-400">&#10003;</td>
-            </tr>
-            <tr class="table-row border-b border-white/5">
-              <td class="px-6 py-3" data-i18n="comp.f7">视觉 / 截图</td>
-              <td class="px-6 py-3 text-center text-emerald-400" data-i18n="comp.supported">&#10003; 已支持</td>
-              <td class="px-6 py-3 text-center text-emerald-400">&#10003;</td>
-            </tr>
-            <tr class="table-row">
-              <td class="px-4 md:px-6 py-2 md:py-3" data-i18n="comp.f8">费用</td>
-              <td class="px-4 md:px-6 py-2 md:py-3 text-center text-emerald-400" data-i18n="comp.yourcost">CodingPlan 限免</td>
-              <td class="px-4 md:px-6 py-2 md:py-3 text-center text-slate-400" data-i18n="comp.sub">订阅 + API</td>
-            </tr>
-          </tbody>
-        </table>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Install -->
-  <section id="install" class="py-24 border-t border-white/5">
-    <div class="max-w-3xl mx-auto px-6">
-      <div class="text-center mb-12">
-        <h2 class="text-3xl md:text-4xl font-bold mb-4" data-i18n="install.title">30 秒快速开始</h2>
-        <p class="text-slate-400 text-lg" data-i18n="install.desc">克隆、构建、运行。就是这么简单。</p>
-      </div>
-      <div class="space-y-4">
-        <div class="code-block rounded-xl p-5">
-          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.oneclick">一键安装（macOS / Linux / HarmonyOS PC）</div>
-          <pre class="font-mono text-sm text-emerald-400 whitespace-pre-wrap break-all">curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.22.2/install.sh | sh</pre>
-        </div>
-        <div class="code-block rounded-xl p-5">
-          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.oneclick.win">一键安装（Windows · PowerShell）</div>
-          <pre class="font-mono text-sm text-emerald-400 whitespace-pre-wrap break-all">irm https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.22.2/install.ps1 | iex</pre>
-        </div>
-        <div class="code-block rounded-xl p-5">
-          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.build">从源码构建</div>
-          <pre class="font-mono text-sm text-emerald-400">git clone https://atomgit.com/atomgit_atomcode/atomcode.git
-cd atomcode
-cargo build --release
-cp target/release/atomcode ~/.local/bin/</pre>
-        </div>
-        <div class="code-block rounded-xl p-5">
-          <div class="text-xs text-slate-500 mb-3 font-medium" data-i18n="install.wizard">首次运行 — 3 步启动向导</div>
-          <pre class="font-mono text-sm"><span class="text-slate-400">$</span> <span class="text-emerald-400">atomcode</span>
-
-<span class="text-slate-500" data-i18n="install.step1">第 1/3 步 · 欢迎</span>
-<span class="text-slate-300">AtomCode</span>
-<span class="text-slate-500" data-i18n="install.tagline">在终端里运行的 AI 编程代理</span>
-
-<span class="text-slate-500" data-i18n="install.step2">第 2/3 步 · 语言</span>
-  <span class="text-brand-400">&#9656;</span> <span class="text-white">自动检测 / English / 简体中文</span>
-
-<span class="text-slate-500" data-i18n="install.step3">第 3/3 步 · 配置</span>
-  <span class="text-brand-400">&#9656;</span> <span class="text-white font-semibold">CodingPlan</span>     <span class="text-slate-500" data-i18n="install.codingplan">免费额度 · 推荐</span>
-    <span class="text-slate-300">手动配置</span>       <span class="text-slate-500" data-i18n="install.apikey">API Key</span>
-    <span class="text-slate-300">跳过</span>           <span class="text-slate-500" data-i18n="install.skip">先看看再说</span></pre>
-        </div>
-        <!-- 下载预编译二进制 -->
-        <div class="code-block rounded-xl p-5">
-          <div class="text-xs text-slate-500 mb-3 font-medium flex items-center gap-1.5">
-            <span data-i18n="install.download">下载预编译二进制文件</span>
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-            </svg>
-          </div>
-          <div class="grid grid-cols-2 md:grid-cols-5 gap-3 text-center">
-            <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.22.2/atomcode-v4.22.2-darwin-arm64" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
-              <div class="flex items-center justify-center gap-2">
-                <span class="text-white font-medium group-hover:text-brand-400 transition">macOS ARM</span>
-                <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                </svg>
-              </div>
-              <div class="text-xs text-slate-500 mt-0.5" data-i18n="install.apple">Apple Silicon</div>
-            </a>
-            <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.22.2/atomcode-v4.22.2-darwin-x64" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
-              <div class="flex items-center justify-center gap-2">
-                <span class="text-white font-medium group-hover:text-brand-400 transition">macOS Intel</span>
-                <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                </svg>
-              </div>
-              <div class="text-xs text-slate-500 mt-0.5">x86_64</div>
-            </a>
-            <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.22.2/atomcode-v4.22.2-linux-x64" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
-              <div class="flex items-center justify-center gap-2">
-                <span class="text-white font-medium group-hover:text-brand-400 transition">Linux</span>
-                <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                </svg>
-              </div>
-              <div class="text-xs text-slate-500 mt-0.5">x64</div>
-            </a>
-            <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.22.2/atomcode-v4.22.2-ohos-arm64" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
-              <div class="flex items-center justify-center gap-2">
-                <span class="text-white font-medium group-hover:text-brand-400 transition">HarmonyOS PC</span>
-                <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                </svg>
-              </div>
-              <div class="text-xs text-slate-500 mt-0.5">aarch64</div>
-            </a>
-            <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.22.2/atomcode-v4.22.2-windows-x64.exe" class="relative px-4 py-3 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 hover:border-brand-500/50 transition text-sm group">
-              <div class="flex items-center justify-center gap-2">
-                <span class="text-white font-medium group-hover:text-brand-400 transition">Windows</span>
-                <svg class="w-4 h-4 text-brand-400 opacity-0 group-hover:opacity-100 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
-                </svg>
-              </div>
-              <div class="text-xs text-slate-500 mt-0.5">x64</div>
-            </a>
+        <div class="install-body">
+          <pre class="install-cmd" id="osCmd"></pre>
+          <div class="install-actions">
+            <div class="left">
+              <span id="osHint">自动检测 · 已选 macOS</span>
+            </div>
+            <button class="cp-btn" id="copyInstall" data-magnetic data-i18n="install.copy">📋 复制命令</button>
           </div>
         </div>
       </div>
-    </div>
-  </section>
 
-  <!-- Footer -->
-  <footer class="py-12 border-t border-white/5">
-    <div class="max-w-5xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode" class="w-6 h-6 rounded">
-        <span class="text-sm text-slate-500" data-i18n="footer.tagline">AtomCode · 开源终端 AI 编码助手</span>
-      </div>
-      <div class="flex items-center gap-6 text-sm text-slate-500">
-        <a href="https://atomgit.com/atomgit_atomcode/atomcode" class="hover:text-white transition">AtomGit</a>
-        <span data-i18n="footer.license">MIT 许可证</span>
-        <span data-i18n="footer.rust">用 Rust 构建</span>
+      <div class="hero-cta">
+        <a href="#install" class="btn btn-primary" data-i18n="btn.start.arrow">立即开始 →</a>
+        <a href="#compare" class="btn btn-outline" data-i18n="btn.viewcompare">查看对比</a>
       </div>
     </div>
-  </footer>
 
-  <script>
-    // i18n translations
-    const i18n = {
-      zh: {
-        'nav.features': '功能特性', 'nav.install': '安装指南', 'nav.docs': '使用指南', 'nav.codingplan': 'CodingPlan', 'nav.repo': '开源仓库', 'nav.settings': '设置',
-        'settings.language': '语言', 'settings.theme': '主题', 'theme.light': '日间', 'theme.dark': '夜间',
-        'hero.badge': '开源 · 多模型支持 · Rust', 'hero.title1': 'AI 编程助手', 'hero.title2': '在你的终端中运行',
-        'hero.desc': 'Claude Code 的开源替代方案。连接任意大模型，编辑代码，运行命令，自动验证 — 全自动执行。用 Rust 构建，极致性能。',
-        'hero.btn.start': '立即开始', 'hero.btn.compare': '查看对比',
-        'terminal.task': '修复登录后 404 的 bug', 'terminal.investigate': '我来检查 OAuth 回调处理器。',
-        'terminal.read': '读取文件', 'terminal.edit': '编辑文件', 'terminal.edited': '已编辑 src/auth/callback.ts',
-        'terminal.build': '构建成功', 'terminal.fixed': '已修复。重定向 URL 缺少基础路径。',
-        'stats.tools': '内置工具', 'stats.graph': '代码图谱工具', 'stats.providers': '支持的模型', 'stats.platforms': '支持平台',
-        'features.title': '功能齐全', 'features.desc': '为需要 Claude Code 强大能力但想使用任意大模型的开发者打造。',
-        'features.agent.title': '智能 Agent 循环', 'features.agent.desc': '自主多步执行：读取、编辑、运行、网络检索、自我验证 —— 循环执行直至任务完成。',
-        'features.provider.title': '多模型支持', 'features.provider.desc': 'Claude、OpenAI、DeepSeek、GLM、Qwen、Ollama —— 任意 OpenAI 兼容 API 皆可接入，国产大模型一视同仁。',
-        'features.graph.title': '代码图谱', 'features.graph.desc': '符号索引、调用链追踪、引用查找、影响面分析 —— 8 个内置工具让模型真正读懂大型代码库。',
-        'features.images.title': '图片附件与 VL 预处理', 'features.images.desc': 'Ctrl+V 粘贴截图、Finder 拖拽、iTerm2 自动识别路径 —— 主模型不支持图片时，自动调用 VL preprocessor 做 OCR + 描述 splice 给主模型。',
-        'features.atomgit.title': 'AtomGit 原生集成', 'features.atomgit.desc': 'AtomGit OAuth 一键登录、终端内 /issue 创建 Issue、企业微信扫码登录 —— 与 AtomGit 开源生态无缝对接。',
-        'features.ecosystem.title': 'Skills 与 Plugin 生态', 'features.ecosystem.desc': '用 Skills 写自己的斜杠命令；/plugin install <git-repo> 一键拿别人写好的命令、hook、skill 套件 —— 与 Claude Code 生态兼容。',
-        'comparison.title': 'AtomCode 与 Claude Code 对比', 'comparison.desc': '相同模型基准测试。基于真实编程任务测量。',
-        'comparison.performance': '任务性能（相同模型）', 'comparison.task': '任务类型', 'comparison.status': '状态', 'comparison.features': '功能对比', 'comparison.feature': '功能',
-        'comparison.task1': '简单编辑（样式修改）', 'comparison.task2': '模块重构', 'comparison.task3': '启动开发服务器',
-        'comparison.task4': 'Bug 修复', 'comparison.task5': '复杂任务（新库+调试）',
-'comparison.equal': '持平', 'comparison.close': '接近', 'comparison.gap': '差距 ~30%',
-        'comp.f1': '开源协议', 'comp.f2': '模型接入', 'comp.f3': '本地模型 (Ollama)',
-        'comp.fgraph': '代码图谱工具', 'comp.fundo': '/undo 一键回滚',
-        'comp.fatomgit': 'AtomGit 原生集成',
-        'comp.f6': 'MCP 支持', 'comp.f7': '视觉 / 截图', 'comp.f8': '费用',
-        'comp.mit': '✓ MIT 开源', 'comp.closed': '闭源',
-        'comp.any': '✓ 任意 OpenAI 兼容', 'comp.claudeonly': '仅 Claude',
-        'comp.graph8': '✓ 8 个内置', 'comp.basic': '基础文本检索',
-        'comp.viagit': '手动 git',
-        'comp.oauthissue': '✓ OAuth + /issue',
-        'comp.supported': '✓ 已支持', 'comp.yourcost': 'CodingPlan 限免', 'comp.sub': '订阅 + API',
-        'install.title': '30 秒快速开始', 'install.desc': '一条命令完成安装，就是这么简单！',
-        'install.oneclick': '一键安装（macOS / Linux / HarmonyOS PC）',
-        'install.oneclick.win': '一键安装（Windows · PowerShell）',
-        'install.build': '从源码构建', 'install.wizard': '首次运行 — 3 步启动向导',
-        'install.step1': '第 1/3 步 · 欢迎', 'install.step2': '第 2/3 步 · 语言', 'install.step3': '第 3/3 步 · 配置',
-        'install.tagline': '在终端里运行的 AI 编程代理',
-        'install.codingplan': '免费额度 · 推荐', 'install.apikey': 'API Key', 'install.skip': '先看看再说',
-        'install.download': '或下载预编译二进制文件', 'install.apple': 'Apple Silicon',
-        'footer.tagline': 'AtomCode · 开源终端 AI 编码助手', 'footer.license': 'MIT 许可证', 'footer.rust': '用 Rust 构建'
-      },
-      en: {
-        'nav.features': 'Features', 'nav.install': 'Install', 'nav.docs': 'Docs', 'nav.codingplan': 'CodingPlan', 'nav.repo': 'Repository', 'nav.settings': 'Settings',
-        'settings.language': 'Language', 'settings.theme': 'Theme', 'theme.light': 'Light', 'theme.dark': 'Dark',
-        'hero.badge': 'Open Source · Multi-Provider · Rust', 'hero.title1': 'AI Coding Agent', 'hero.title2': 'in Your Terminal',
-        'hero.desc': "An open-source alternative to Claude Code. Connect any LLM, edit code, run commands, and verify changes — autonomously. Built in Rust for speed.",
-        'hero.btn.start': 'Get Started', 'hero.btn.compare': 'See Comparison',
-        'terminal.task': 'Fix the login bug where users get 404 after OAuth', 'terminal.investigate': "I'll investigate the OAuth callback handler.",
-        'terminal.read': 'Read File', 'terminal.edit': 'Edit File', 'terminal.edited': 'Edited src/auth/callback.ts',
-        'terminal.build': 'Build succeeded', 'terminal.fixed': 'Fixed. The redirect URL was missing the base path.',
-        'stats.tools': 'Built-in Tools', 'stats.graph': 'Code Graph Tools', 'stats.providers': 'LLM Providers', 'stats.platforms': 'Platforms',
-        'features.title': 'Everything You Need', 'features.desc': "Built for developers who want Claude Code's power with any LLM provider.",
-        'features.agent.title': 'Agent Loop', 'features.agent.desc': 'Autonomous multi-step execution: read, edit, run, web-search, self-verify — looping until the task is done.',
-        'features.provider.title': 'Multi-Provider', 'features.provider.desc': 'Claude, OpenAI, DeepSeek, GLM, Qwen, Ollama — connect any OpenAI-compatible API, with first-class support for Chinese models.',
-        'features.graph.title': 'Code Graph', 'features.graph.desc': 'Symbol index, call-chain tracing, reference lookup, blast-radius analysis — 8 built-in tools so the model truly understands large codebases.',
-        'features.images.title': 'Image Attach & VL Preprocessor', 'features.images.desc': 'Ctrl+V paste screenshots, Finder drag-and-drop, iTerm2 path-paste — when the active model can\'t see images, the VL preprocessor OCRs them and splices the result back into the prompt.',
-        'features.atomgit.title': 'Native AtomGit Integration', 'features.atomgit.desc': 'AtomGit OAuth login, create issues via /issue from the terminal, WeCom QR login — seamlessly integrated with the AtomGit ecosystem.',
-        'features.ecosystem.title': 'Skills & Plugin Ecosystem', 'features.ecosystem.desc': 'Write your own slash commands as Skills; install whole packs of commands, hooks and skills from any git repo with /plugin install <git-repo> — Claude Code ecosystem compatible.',
-        'comparison.title': 'AtomCode vs Claude Code', 'comparison.desc': 'Same-model benchmarks. Measured on real-world coding tasks.',
-        'comparison.performance': 'Task Performance (Same Model)', 'comparison.task': 'Task Type', 'comparison.status': 'Status', 'comparison.features': 'Feature Comparison', 'comparison.feature': 'Feature',
-        'comparison.task1': 'Simple edit (style change)', 'comparison.task2': 'Module refactor', 'comparison.task3': 'Dev server launch',
-        'comparison.task4': 'Bug fix', 'comparison.task5': 'Complex (new lib + debug)',
-'comparison.equal': 'Equal', 'comparison.close': 'Close', 'comparison.gap': 'Gap ~30%',
-        'comp.f1': 'License', 'comp.f2': 'Model access', 'comp.f3': 'Local model (Ollama)',
-        'comp.fgraph': 'Code graph tools', 'comp.fundo': '/undo rollback',
-        'comp.fatomgit': 'Native AtomGit integration',
-        'comp.f6': 'MCP support', 'comp.f7': 'Vision / screenshots', 'comp.f8': 'Cost',
-        'comp.mit': '✓ MIT open source', 'comp.closed': 'Closed source',
-        'comp.any': '✓ Any OpenAI-compatible', 'comp.claudeonly': 'Claude only',
-        'comp.graph8': '✓ 8 built-in', 'comp.basic': 'Basic text search',
-        'comp.viagit': 'Manual git',
-        'comp.oauthissue': '✓ OAuth + /issue',
-        'comp.supported': '✓ Supported', 'comp.yourcost': 'Free with CodingPlan', 'comp.sub': 'Subscription + API',
-        'install.title': 'Get Started in 30 Seconds', 'install.desc': "One command to install. That's it.",
-        'install.oneclick': 'One-click install (macOS / Linux / HarmonyOS PC)',
-        'install.oneclick.win': 'One-click install (Windows · PowerShell)',
-        'install.build': 'Build from source', 'install.wizard': 'First run — 3-step onboarding',
-        'install.step1': 'Step 1/3 · Welcome', 'install.step2': 'Step 2/3 · Language', 'install.step3': 'Step 3/3 · Setup',
-        'install.tagline': 'AI coding agent in your terminal',
-        'install.codingplan': 'Free tokens · recommended', 'install.apikey': 'API Key', 'install.skip': 'explore first',
-        'install.download': 'Or download a pre-built binary', 'install.apple': 'Apple Silicon',
-        'footer.tagline': 'AtomCode · Open source terminal AI coding agent', 'footer.license': 'MIT License', 'footer.rust': 'Built with Rust'
-      }
-    };
+    <!-- live terminal demo -->
+    <div class="terminal" id="terminal">
+      <div class="term-head">
+        <div class="term-dots"><span></span><span></span><span></span></div>
+        <div class="term-title">atomcode · ~/repo</div>
+        <div class="term-tag">LIVE DEMO</div>
+      </div>
+      <div class="term-chips" id="termChips">
+        <button class="term-chip active" data-flow="bug" data-i18n="flow.bug">修复登录 bug</button>
+        <button class="term-chip" data-flow="refactor" data-i18n="flow.refactor">模块重构</button>
+        <button class="term-chip" data-flow="devserver" data-i18n="flow.devserver">启动 Dev Server</button>
+      </div>
+      <div class="term-body" id="termBody"></div>
+    </div>
+  </div>
+</section>
 
-    // Apply language
-    function applyLanguage(lang) {
-      document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
-      document.title = lang === 'zh' ? 'AtomCode — 开源终端 AI 编码助手' : 'AtomCode — Open Source Terminal AI Coding Agent';
-      document.querySelectorAll('[data-i18n]').forEach(el => {
-        const key = el.getAttribute('data-i18n');
-        if (i18n[lang] && i18n[lang][key]) el.textContent = i18n[lang][key];
-      });
-      document.querySelectorAll('.lang-btn').forEach(btn => {
-        btn.classList.toggle('active', btn.getAttribute('data-lang') === lang);
-      });
-      localStorage.setItem('atomcode-lang', lang);
-    }
+<!-- stats -->
+<section class="stats">
+  <div class="stats-wrap">
+    <div class="stat-card"><div class="v"><span data-count="21">0</span></div><div class="l" data-i18n="stats.tools">内置工具</div>
+      <div class="pop" data-i18n-html="stats.tools.pop"><b>read_file · write_file · edit_file · search_replace · bash · grep · glob · list_dir · cd · web_search · web_fetch · auto_fix · use_skill</b> + 8 个代码图谱工具 = 21 个</div>
+    </div>
+    <div class="stat-card"><div class="v"><span data-count="8">0</span></div><div class="l" data-i18n="stats.graph">代码图谱工具</div>
+      <div class="pop" data-i18n-html="stats.graph.pop"><b>list_symbols · read_symbol · find_references · trace_callers · trace_callees · trace_chain · file_deps · blast_radius</b></div>
+    </div>
+    <div class="stat-card"><div class="v"><span data-count="8">0</span><span class="suf">+</span></div><div class="l" data-i18n="stats.providers">支持的模型</div>
+      <div class="pop" data-i18n-html="stats.providers.pop">Claude (Sonnet 4.5/4.6, Opus 4.6) · OpenAI (GPT-4o/4.1) · DeepSeek (V3/R1) · GLM (4/5) · Qwen (Plus/Max) · SiliconFlow · Ollama · 任意 <b>OpenAI 兼容 API</b></div>
+    </div>
+    <div class="stat-card"><div class="v"><span data-count="6">0</span></div><div class="l" data-i18n="stats.platforms">支持平台</div>
+      <div class="pop" data-i18n-html="stats.platforms.pop">macOS (Apple Silicon · Intel) · Linux (x64 + arm64) · HarmonyOS PC · Windows · 共 6 个二进制变体</div>
+    </div>
+  </div>
+</section>
 
-    // Theme functions
-    function getThemeByTime() {
-      const hour = new Date().getHours();
-      return (hour >= 6 && hour < 18) ? 'light' : 'dark';
-    }
+<!-- features -->
+<section class="features" id="features">
+  <div class="section-head">
+    <h2><span class="mono" data-i18n="sec.cap.tag">// 01 · 能力</span><span data-i18n="sec.cap.title">为开发者而生的能力组合</span></h2>
+    <div class="hint" data-i18n="sec.cap.hint">为需要 Claude Code 强大能力但想用任意大模型的开发者打造</div>
+  </div>
+  <div class="grid-features">
 
-    function applyTheme(theme) {
-      document.documentElement.setAttribute('data-theme', theme);
-      // Update theme buttons active state
-      document.querySelectorAll('[data-theme-opt]').forEach(btn => {
-        btn.classList.toggle('active', btn.getAttribute('data-theme-opt') === theme);
-      });
-      localStorage.setItem('atomcode-theme', theme);
-    }
+    <article class="feat">
+      <div class="icon">⟳</div>
+      <h3 data-i18n="feat.agent.t">智能 Agent 循环</h3>
+      <p data-i18n="feat.agent.d">自主多步执行：读取、编辑、运行、网络检索、自我验证 —— 循环执行直至任务完成。</p>
+      <div class="demo">
+        <div class="agent-loop" id="agentLoop">
+          <span class="node" data-i18n="loop.read">读取</span><span class="arrow">→</span>
+          <span class="node" data-i18n="loop.edit">编辑</span><span class="arrow">→</span>
+          <span class="node" data-i18n="loop.run">运行</span><span class="arrow">→</span>
+          <span class="node" data-i18n="loop.verify">验证</span>
+        </div>
+      </div>
+    </article>
 
-    // Initialize
-    document.addEventListener('DOMContentLoaded', () => {
-      // Language
-      const savedLang = localStorage.getItem('atomcode-lang') || 'zh';
-      applyLanguage(savedLang);
+    <article class="feat">
+      <div class="icon">⊕</div>
+      <h3 data-i18n="feat.prov.t">多模型支持</h3>
+      <p data-i18n="feat.prov.d">Claude、OpenAI、DeepSeek、GLM、Qwen、Ollama —— 任意 OpenAI 兼容 API 皆可接入，国产大模型一视同仁。</p>
+      <div class="demo" style="overflow:hidden">
+        <div class="model-strip">
+          <span>Claude Sonnet 4.6</span><span>Opus 4.6</span><span>GPT-4o</span><span>GPT-4.1</span><span>DeepSeek V3</span><span>DeepSeek R1</span><span>GLM-5</span><span>Qwen-Max</span><span>SiliconFlow</span><span>Ollama</span>
+          <span>Claude Sonnet 4.6</span><span>Opus 4.6</span><span>GPT-4o</span><span>GPT-4.1</span><span>DeepSeek V3</span><span>DeepSeek R1</span><span>GLM-5</span><span>Qwen-Max</span><span>SiliconFlow</span><span>Ollama</span>
+        </div>
+      </div>
+    </article>
 
-      // Theme: check user preference, then time-based
-      const savedTheme = localStorage.getItem('atomcode-theme');
-      if (savedTheme) {
-        applyTheme(savedTheme);
-      } else {
-        applyTheme(getThemeByTime());
-      }
+    <article class="feat">
+      <div class="icon">⌘</div>
+      <h3 data-i18n="feat.graph.t">代码图谱</h3>
+      <p data-i18n="feat.graph.d">符号索引、调用链追踪、引用查找、影响面分析 —— 8 个内置工具让模型真正读懂大型代码库。</p>
+      <div class="demo">
+        <svg class="graph-mini" viewBox="0 0 240 80">
+          <g stroke="rgba(232,160,80,.4)" stroke-width="1" fill="none">
+            <line x1="40" y1="40" x2="100" y2="20" class="ln"/>
+            <line x1="40" y1="40" x2="100" y2="60" class="ln"/>
+            <line x1="100" y1="20" x2="160" y2="10" class="ln"/>
+            <line x1="100" y1="20" x2="160" y2="40" class="ln"/>
+            <line x1="100" y1="60" x2="160" y2="60" class="ln"/>
+            <line x1="160" y1="40" x2="200" y2="40" class="ln"/>
+          </g>
+          <g fill="#e8a050">
+            <circle cx="40" cy="40" r="5"/>
+            <circle cx="100" cy="20" r="4"/>
+            <circle cx="100" cy="60" r="4"/>
+            <circle cx="160" cy="10" r="3"/>
+            <circle cx="160" cy="40" r="3"/>
+            <circle cx="160" cy="60" r="3"/>
+            <circle cx="200" cy="40" r="3" opacity=".5"/>
+          </g>
+        </svg>
+      </div>
+    </article>
 
-      // Mobile menu toggle
-      const mobileMenuBtn = document.getElementById('mobileMenuBtn');
-      const mobileMenu = document.getElementById('mobileMenu');
-      const menuIcon = document.getElementById('menuIcon');
-      const closeIcon = document.getElementById('closeIcon');
-      
-      function toggleMobileMenu(open) {
-        if (open) {
-          mobileMenu.style.opacity = '1';
-          mobileMenu.style.visibility = 'visible';
-          menuIcon.classList.add('hidden');
-          closeIcon.classList.remove('hidden');
-          document.body.style.overflow = 'hidden';
-        } else {
-          mobileMenu.style.opacity = '0';
-          mobileMenu.style.visibility = 'hidden';
-          menuIcon.classList.remove('hidden');
-          closeIcon.classList.add('hidden');
-          document.body.style.overflow = '';
-        }
-      }
-      
-      mobileMenuBtn.addEventListener('click', () => {
-        const isOpen = mobileMenu.style.opacity === '1';
-        toggleMobileMenu(!isOpen);
-      });
-      
-      // Close mobile menu when clicking backdrop
-      mobileMenu.addEventListener('click', (e) => {
-        if (e.target === mobileMenu || e.target.classList.contains('backdrop-blur-sm')) {
-          toggleMobileMenu(false);
-        }
-      });
-      
-      // Close mobile menu when clicking nav links
-      document.querySelectorAll('.mobile-nav-link').forEach(link => {
-        link.addEventListener('click', () => toggleMobileMenu(false));
-      });
+    <article class="feat">
+      <div class="icon">▣</div>
+      <h3 data-i18n="feat.images.t">图片附件与 VL 预处理</h3>
+      <p data-i18n="feat.images.d">Ctrl+V 粘贴截图、Finder 拖拽、iTerm2 路径自动识别 —— 主模型不支持图片时，自动 VL 预处理 OCR 给主模型。</p>
+      <div class="demo">
+        <div class="vis-drop" data-i18n-html="feat.images.demo">📎 <b>Ctrl + V</b> 粘贴截图  ·  或拖入图片</div>
+      </div>
+    </article>
 
-      // Settings dropdown toggle
-      const settingsBtn = document.getElementById('settingsBtn');
-      const settingsDropdown = document.getElementById('settingsDropdown');
-      
-      if (settingsBtn) {
-        settingsBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          settingsDropdown.classList.toggle('show');
-          if (settingsDropdown.classList.contains('show')) {
-            settingsDropdown.style.opacity = '1';
-            settingsDropdown.style.visibility = 'visible';
-            settingsDropdown.style.transform = 'translateY(0)';
-          } else {
-            settingsDropdown.style.opacity = '0';
-            settingsDropdown.style.visibility = 'hidden';
-            settingsDropdown.style.transform = 'translateY(-8px)';
-          }
-        });
+    <article class="feat">
+      <div class="icon">⎇</div>
+      <h3 data-i18n="feat.atomgit.t">AtomGit 原生集成</h3>
+      <p data-i18n="feat.atomgit.d">AtomGit OAuth 一键登录、终端内 /issue 创建 Issue、企业微信扫码登录 —— 与开源生态无缝对接。</p>
+      <div class="demo">
+        <div class="gitcmd">
+          <div class="l1">› /issue create "auth callback 404"</div>
+          <div class="l2">✓ atomgit.com/.../atomcode/issues/124</div>
+        </div>
+      </div>
+    </article>
 
-        // Close dropdown when clicking outside
-        document.addEventListener('click', () => {
-          settingsDropdown.classList.remove('show');
-          settingsDropdown.style.opacity = '0';
-          settingsDropdown.style.visibility = 'hidden';
-          settingsDropdown.style.transform = 'translateY(-8px)';
-        });
-      }
+    <article class="feat">
+      <div class="icon">⊞</div>
+      <h3 data-i18n="feat.eco.t">Skills 与 Plugin 生态</h3>
+      <p data-i18n="feat.eco.d">Skills 写你自己的斜杠命令；/plugin install &lt;git-repo&gt; 一键拿别人的命令、hook、skill —— 与 Claude Code 生态兼容。</p>
+      <div class="demo">
+        <div class="plugin-row">
+          <div class="p"><b>/review</b><span data-i18n="plugin.review">代码审阅</span></div>
+          <div class="p"><b>/test</b><span data-i18n="plugin.test">跑测试</span></div>
+          <div class="p"><b>/security</b><span data-i18n="plugin.security">安全审查</span></div>
+        </div>
+      </div>
+    </article>
 
-      // Language toggle
-      document.querySelectorAll('.lang-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          applyLanguage(btn.getAttribute('data-lang'));
-          // Close mobile menu or desktop dropdown after selection
-          if (window.innerWidth < 768) {
-            toggleMobileMenu(false);
-          } else if (settingsDropdown) {
-            settingsDropdown.classList.remove('show');
-            settingsDropdown.style.opacity = '0';
-            settingsDropdown.style.visibility = 'hidden';
-            settingsDropdown.style.transform = 'translateY(-8px)';
-          }
-        });
-      });
+  </div>
+</section>
 
-      // Theme toggle buttons
-      document.querySelectorAll('[data-theme-opt]').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          applyTheme(btn.getAttribute('data-theme-opt'));
-          // Close mobile menu or desktop dropdown after selection
-          if (window.innerWidth < 768) {
-            toggleMobileMenu(false);
-          } else if (settingsDropdown) {
-            settingsDropdown.classList.remove('show');
-            settingsDropdown.style.opacity = '0';
-            settingsDropdown.style.visibility = 'hidden';
-            settingsDropdown.style.transform = 'translateY(-8px)';
-          }
-        });
-      });
+<!-- comparison -->
+<section class="compare" id="compare">
+  <div class="section-head">
+    <h2><span class="mono" data-i18n="sec.cmp.tag">// 02 · 对比</span><span data-i18n="sec.cmp.title">AtomCode 与 Claude Code 对比</span></h2>
+    <div class="hint" data-i18n="sec.cmp.hint">相同模型基准测试 · 基于真实编程任务测量</div>
+  </div>
+
+  <div class="cmp-wrap">
+
+    <!-- performance bars -->
+    <div class="perf">
+      <h3 data-i18n="perf.title">任务性能（相同模型）</h3>
+      <div class="desc" data-i18n="perf.desc">越短越好 · 完成同一任务平均步骤数</div>
+      <div class="perf-legend">
+        <span><span class="sw a"></span>AtomCode</span>
+        <span><span class="sw c"></span>Claude Code</span>
+      </div>
+      <div id="perfList"></div>
+    </div>
+
+    <!-- feature table -->
+    <div class="cmp-controls">
+      <div class="cmp-chips" id="cmpChips">
+        <button class="cmp-chip active" data-cat="all" data-i18n="cmp.all">全部</button>
+        <button class="cmp-chip" data-cat="price" data-i18n="cmp.price">价格</button>
+        <button class="cmp-chip" data-cat="model" data-i18n="cmp.model">模型</button>
+        <button class="cmp-chip" data-cat="tools" data-i18n="cmp.tools">工具</button>
+        <button class="cmp-chip" data-cat="integration" data-i18n="cmp.integration">集成</button>
+      </div>
+      <div class="cmp-toggle" id="diffToggle">
+        <div class="sw"></div>
+        <span data-i18n="cmp.diffonly">只看差异</span>
+      </div>
+    </div>
+
+    <div class="ftab-wrap">
+      <table class="ftab" id="ftab">
+        <thead>
+          <tr>
+            <th style="width:42%" data-i18n="ftab.feature">功能</th>
+            <th class="atom" style="width:29%">AtomCode</th>
+            <th class="claude" style="width:29%">Claude Code</th>
+          </tr>
+        </thead>
+        <tbody id="ftabBody"></tbody>
+      </table>
+    </div>
+
+    <div class="gap-note" data-i18n-html="gap.body">
+      <b>关于"复杂任务多 30% 步骤"</b><br>
+      AtomCode 更倾向"小步快跑 + 自我验证"：每个动作可单独 <b>/undo</b>，对话上下文更细更易干预；Claude Code 在复杂场景偏好"大刀阔斧"一步到位。
+      —— 两种工程哲学，并非孰优孰劣。需要稳健与可干预，选 AtomCode；需要速度与一气呵成，选 Claude Code。
+    </div>
+
+  </div>
+</section>
+
+<!-- install full -->
+<section class="install" id="install">
+  <div class="section-head">
+    <h2><span class="mono" data-i18n="sec.inst.tag">// 03 · 安装</span><span data-i18n="sec.inst.title">30 秒快速开始</span></h2>
+    <div class="hint" data-i18n="sec.inst.hint">一条命令完成安装 · 就这么简单</div>
+  </div>
+
+  <div class="install-wrap">
+    <div class="install-grid">
+
+      <!-- left: install command tabs -->
+      <div>
+        <div class="install-block">
+          <div class="install-tabs">
+            <div class="install-tab active" data-method="oneclick"><span data-i18n="inst.oneclick">一键脚本</span></div>
+            <div class="install-tab" data-method="source"><span data-i18n="inst.source">从源码构建</span></div>
+            <div class="install-tab" data-method="binary"><span data-i18n="inst.binary">下载二进制</span></div>
+          </div>
+          <div class="install-body">
+            <pre class="install-cmd" id="methodCmd"></pre>
+            <div class="install-actions">
+              <div class="left">
+                <span id="methodHint">macOS / Linux / HarmonyOS PC</span>
+              </div>
+              <button class="cp-btn" id="copyMethod" data-magnetic data-i18n="install.copy.short">📋 复制</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="stepper" id="stepper">
+          <div class="step">
+            <div class="ch">›</div>
+            <div class="n">01</div>
+            <div class="t" data-i18n="step1.t">运行命令</div>
+            <div class="d" data-i18n="step1.d">脚本自动下载并安装到 /usr/local/bin</div>
+          </div>
+          <div class="step">
+            <div class="ch">›</div>
+            <div class="n">02</div>
+            <div class="t" data-i18n="step2.t">配置 API Key</div>
+            <div class="d" data-i18n="step2.d">OpenAI / Claude / CodingPlan 任一即可</div>
+          </div>
+          <div class="step">
+            <div class="n">03</div>
+            <div class="t" data-i18n="step3.t">cd 进项目跑 atomcode</div>
+            <div class="d" data-i18n="step3.d">第一次会进 3 步启动向导</div>
+          </div>
+        </div>
+
+        <div class="download-row" id="downloadRow"></div>
+      </div>
+
+      <!-- right: 3-step wizard -->
+      <div>
+        <div class="wiz" id="wiz">
+          <div class="wiz-head">
+            <span>●●●</span>&nbsp;<span data-i18n="wiz.head">atomcode · 首次运行 — 3 步启动向导</span>
+          </div>
+          <div class="wiz-body">
+            <div class="wiz-step active" data-step="1">
+              <div class="tt" data-i18n="wiz.s1.tt">第 1/3 步 · 欢迎</div>
+              <div class="qq" data-i18n="wiz.s1.qq">版本 v4.22.3 · 在终端里运行的 AI 编程代理</div>
+              <ul class="intro-list">
+                <li data-i18n="wiz.s1.b1">多步骤 agent loop · 内置代码图工具</li>
+                <li data-i18n="wiz.s1.b2">兼容所有 OpenAI 风格 API</li>
+                <li data-i18n="wiz.s1.b3">通过 CodingPlan 获取免费额度</li>
+              </ul>
+              <div class="intro-hint" data-i18n="wiz.s1.hint">按 Enter 继续 · Ctrl+C 可随时退出</div>
+            </div>
+            <div class="wiz-step" data-step="2">
+              <div class="tt" data-i18n="wiz.s2.tt">第 2/3 步 · 语言</div>
+              <div class="qq" data-i18n="wiz.s2.qq">Choose your language / 选择语言</div>
+              <div class="intro-hint inline" data-i18n="wiz.s2.prompt">选择界面语言。任何时候都可以用 /language 修改。</div>
+              <div class="opt"><span data-i18n="wiz.s2.o1">自动检测 (LC_ALL / LANG)</span> <small>1</small></div>
+              <div class="opt sel"><span data-i18n="wiz.s2.o2">简体中文 (Simplified Chinese)</span> <small>2</small></div>
+              <div class="opt"><span data-i18n="wiz.s2.o3">English</span> <small>3</small></div>
+            </div>
+            <div class="wiz-step" data-step="3">
+              <div class="tt" data-i18n="wiz.s3.tt">第 3/3 步 · 配置</div>
+              <div class="qq" data-i18n="wiz.s3.qq">想怎么开始？</div>
+              <div class="opt sel"><span data-i18n="wiz.s3.o1">配置 CodingPlan</span> <small data-i18n="wiz.s3.o1.hint">免费额度 · 推荐</small></div>
+              <div class="opt"><span data-i18n="wiz.s3.o2">手动配置</span> <small data-i18n="wiz.s3.o2.hint">使用 API key</small></div>
+              <div class="opt"><span data-i18n="wiz.s3.o3">暂时跳过</span> <small data-i18n="wiz.s3.o3.hint">稍后再说</small></div>
+            </div>
+            <div class="wiz-nav-hint" data-i18n="wiz.nav">1-3 选择 · Enter 确认 · ← 返回 · Esc 跳过</div>
+            <div class="wiz-nav">
+              <button id="wizPrev" data-i18n="wiz.prev">← 上一步</button>
+              <div class="wiz-dots" id="wizDots"><span class="on"></span><span></span><span></span></div>
+              <button id="wizNext" data-i18n="wiz.next">下一步 →</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- footer -->
+<footer class="ftr">
+  <div class="ftr-row" data-i18n-html="ftr.links">
+    <a href="#top">官网</a> · <a href="./docs/index.html" target="_blank" rel="noopener">文档</a> · <a href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">CodingPlan</a> · <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener">开源仓库</a> · <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener">Issue</a>
+  </div>
+  <div data-i18n="ftr.copy">© 2026 AtomCode · MIT 许可证</div>
+  <div class="ftr-tag" data-i18n="ftr.rust">⚙ 用 Rust 构建</div>
+</footer>
+
+<div class="toast" id="toast">✓ 已复制</div>
+
+<script>
+/* ========== i18n ========== */
+var LANG='zh';
+try{
+  const s=localStorage.getItem('atomcode_lang');
+  if(s==='zh'||s==='en') LANG=s;
+  else LANG=(navigator.language||'').toLowerCase().startsWith('zh')?'zh':'en';
+}catch(e){}
+
+const VERSION='v4.22.3';
+
+const T={
+  'nav.features':{zh:'功能',en:'Features'},
+  'nav.compare':{zh:'对比',en:'Compare'},
+  'nav.install':{zh:'安装',en:'Install'},
+  'nav.docs':{zh:'文档',en:'Docs'},
+  'nav.codingplan':{zh:'CodingPlan',en:'CodingPlan'},
+  'btn.repo':{zh:'开源仓库',en:'Repository'},
+  'btn.start':{zh:'立即开始',en:'Get Started'},
+  'btn.start.arrow':{zh:'立即开始 →',en:'Get Started →'},
+  'btn.viewcompare':{zh:'查看对比',en:'View Comparison'},
+  'hero.badge':{zh:'开源 · 多模型 · 100% AI 生成 · Rust 1.88+',en:'Open Source · Multi-Provider · 100% AI-generated · Rust 1.88+'},
+  'hero.t1':{zh:'AI 编程助手',en:'AI Coding Agent'},
+  'hero.t2':{zh:'在你的终端中运行',en:'in Your Terminal'},
+  'hero.sub':{zh:'Claude Code / Cursor Agent 的<b>开源平替</b>，住在你的终端里。连接任意 OpenAI 兼容大模型，自主读文件、改代码、跑测试、自我验证 —— 用 Rust 构建。本项目<b>100% 由 AI 生成</b>。',
+              en:"<b>Open-source alternative</b> to Claude Code / Cursor Agent, living in your terminal. Connect any OpenAI-compatible LLM, autonomously read, edit, test, self-verify — built with Rust. <b>100% AI-generated codebase.</b>"},
+  'install.copy':{zh:'📋 复制命令',en:'📋 Copy command'},
+  'install.copy.short':{zh:'📋 复制',en:'📋 Copy'},
+  'flow.bug':{zh:'修复登录 bug',en:'Fix login bug'},
+  'flow.refactor':{zh:'模块重构',en:'Module refactor'},
+  'flow.devserver':{zh:'启动 Dev Server',en:'Start dev server'},
+  'loop.read':{zh:'读取',en:'Read'},
+  'loop.edit':{zh:'编辑',en:'Edit'},
+  'loop.run':{zh:'运行',en:'Run'},
+  'loop.verify':{zh:'验证',en:'Verify'},
+  'stats.tools':{zh:'内置工具',en:'Built-in Tools'},
+  'stats.graph':{zh:'代码图谱工具',en:'Code Graph Tools'},
+  'stats.providers':{zh:'支持的模型',en:'LLM Providers'},
+  'stats.platforms':{zh:'支持平台',en:'Platforms'},
+  'stats.tools.pop':{zh:'<b>read_file · write_file · edit_file · search_replace · bash · grep · glob · list_dir · cd · web_search · web_fetch · auto_fix · use_skill</b> + 8 个代码图谱工具 = 21 个',
+                      en:'<b>read_file · write_file · edit_file · search_replace · bash · grep · glob · list_dir · cd · web_search · web_fetch · auto_fix · use_skill</b> + 8 code graph tools = 21 total'},
+  'stats.graph.pop':{zh:'<b>list_symbols · read_symbol · find_references · trace_callers · trace_callees · trace_chain · file_deps · blast_radius</b>',
+                      en:'<b>list_symbols · read_symbol · find_references · trace_callers · trace_callees · trace_chain · file_deps · blast_radius</b>'},
+  'stats.providers.pop':{zh:'Claude (Sonnet 4.5/4.6, Opus 4.6) · OpenAI (GPT-4o/4.1) · DeepSeek (V3/R1) · GLM (4/5) · Qwen (Plus/Max) · SiliconFlow · Ollama · 任意 <b>OpenAI 兼容 API</b>',
+                          en:'Claude (Sonnet 4.5/4.6, Opus 4.6) · OpenAI (GPT-4o/4.1) · DeepSeek (V3/R1) · GLM (4/5) · Qwen (Plus/Max) · SiliconFlow · Ollama · any <b>OpenAI-compatible API</b>'},
+  'stats.platforms.pop':{zh:'macOS (Apple Silicon · Intel) · Linux (x64 + arm64) · HarmonyOS PC · Windows · 共 6 个二进制变体',
+                          en:'macOS (Apple Silicon · Intel) · Linux (x64 + arm64) · HarmonyOS PC · Windows · 6 binary variants total'},
+  'sec.cap.tag':{zh:'// 01 · 能力',en:'// 01 · Capabilities'},
+  'sec.cap.title':{zh:'为开发者而生的能力组合',en:'Capabilities built for developers'},
+  'sec.cap.hint':{zh:'为需要 Claude Code 强大能力但想用任意大模型的开发者打造',en:'For developers who want Claude Code-level capability with any LLM'},
+  'sec.cmp.tag':{zh:'// 02 · 对比',en:'// 02 · Compare'},
+  'sec.cmp.title':{zh:'AtomCode 与 Claude Code 对比',en:'AtomCode vs Claude Code'},
+  'sec.cmp.hint':{zh:'相同模型基准测试 · 基于真实编程任务测量',en:'Same-model benchmarks · measured on real coding tasks'},
+  'sec.inst.tag':{zh:'// 03 · 安装',en:'// 03 · Install'},
+  'sec.inst.title':{zh:'30 秒快速开始',en:'30-second quickstart'},
+  'sec.inst.hint':{zh:'一条命令完成安装 · 就这么简单',en:'One command. That simple.'},
+  'feat.agent.t':{zh:'智能 Agent 循环',en:'Smart Agent Loop'},
+  'feat.agent.d':{zh:'自主多步执行：读取、编辑、运行、网络检索、自我验证 —— 循环执行直至任务完成。',
+                  en:'Autonomous multi-step execution: read, edit, run, web fetch, self-verify — loops until done.'},
+  'feat.prov.t':{zh:'多模型支持',en:'Multi-Provider Support'},
+  'feat.prov.d':{zh:'Claude、OpenAI、DeepSeek、GLM、Qwen、Ollama —— 任意 OpenAI 兼容 API 皆可接入，国产大模型一视同仁。',
+                 en:'Claude, OpenAI, DeepSeek, GLM, Qwen, Ollama — any OpenAI-compatible API. Chinese LLMs first-class.'},
+  'feat.graph.t':{zh:'代码图谱',en:'Code Graph'},
+  'feat.graph.d':{zh:'符号索引、调用链追踪、引用查找、影响面分析 —— 8 个内置工具让模型真正读懂大型代码库。',
+                  en:'Symbol index, call-graph, ref-find, impact analysis — 8 built-in tools so the model really understands large codebases.'},
+  'feat.images.t':{zh:'图片附件与 VL 预处理',en:'Image Attachment & VL Preprocess'},
+  'feat.images.d':{zh:'Ctrl+V 粘贴截图、Finder 拖拽、iTerm2 路径自动识别 —— 主模型不支持图片时，自动 VL 预处理 OCR 给主模型。',
+                   en:'Ctrl+V paste, Finder drag, iTerm2 path auto-detect — when the main model lacks vision, falls back to VL preprocessor (OCR + describe).'},
+  'feat.images.demo':{zh:'📎 <b>Ctrl + V</b> 粘贴截图  ·  或拖入图片',en:'📎 <b>Ctrl + V</b> paste screenshot · or drop an image'},
+  'feat.atomgit.t':{zh:'AtomGit 原生集成',en:'AtomGit Native Integration'},
+  'feat.atomgit.d':{zh:'AtomGit OAuth 一键登录、终端内 /issue 创建 Issue、企业微信扫码登录 —— 与开源生态无缝对接。',
+                    en:'AtomGit OAuth login, terminal /issue, WeCom QR login — seamless with the open-source ecosystem.'},
+  'feat.eco.t':{zh:'Skills + Plugin 生态',en:'Skills + Plugin Ecosystem'},
+  'feat.eco.d':{zh:'Skills 写你自己的斜杠命令；/plugin install <git-repo> 一键拿别人的命令、hook、skill —— 与 Claude Code 生态兼容。',
+                en:'Write your own slash commands as Skills; /plugin install <git-repo> grabs packs of commands, hooks, skills — Claude Code ecosystem compatible.'},
+  'plugin.review':{zh:'代码审阅',en:'Code review'},
+  'plugin.test':{zh:'跑测试',en:'Run tests'},
+  'plugin.security':{zh:'安全审查',en:'Security audit'},
+  'perf.title':{zh:'任务性能（相同模型）',en:'Task Performance (Same Model)'},
+  'perf.desc':{zh:'越短越好 · 完成同一任务平均步骤数',en:'Lower is better · avg steps to complete a task'},
+  'cmp.all':{zh:'全部',en:'All'},
+  'cmp.price':{zh:'价格',en:'Price'},
+  'cmp.model':{zh:'模型',en:'Model'},
+  'cmp.tools':{zh:'工具',en:'Tools'},
+  'cmp.integration':{zh:'集成',en:'Integration'},
+  'cmp.diffonly':{zh:'只看差异',en:'Diff only'},
+  'ftab.feature':{zh:'功能',en:'Feature'},
+  'gap.body':{zh:'<b>关于"复杂任务多 30% 步骤"</b><br>AtomCode 更倾向"小步快跑 + 自我验证"：每个动作可单独 <b>/undo</b>，对话上下文更细更易干预；Claude Code 在复杂场景偏好"大刀阔斧"一步到位。 —— 两种工程哲学，并非孰优孰劣。需要稳健与可干预，选 AtomCode；需要速度与一气呵成，选 Claude Code。',
+              en:'<b>About the "30% more steps on complex tasks"</b><br>AtomCode favors "small steps + self-verify": each action is independently <b>/undo</b>-able and context is fine-grained, easy to steer mid-flight. Claude Code prefers "one bold sweep" on complex jobs. — Two engineering philosophies, neither inherently better. Want safety and intervention? AtomCode. Want speed and one-shot? Claude Code.'},
+  'inst.oneclick':{zh:'一键脚本',en:'One-click script'},
+  'inst.source':{zh:'从源码构建',en:'From source'},
+  'inst.binary':{zh:'下载二进制',en:'Binary download'},
+  'step1.t':{zh:'运行命令',en:'Run command'},
+  'step1.d':{zh:'脚本自动下载到 /usr/local/bin 或 ~/.local/bin',en:'Script installs to /usr/local/bin or ~/.local/bin'},
+  'step2.t':{zh:'配置 provider',en:'Configure provider'},
+  'step2.d':{zh:'Claude / OpenAI / DeepSeek / GLM / Qwen / Ollama 任一 · 或 /login 走 AtomGit OAuth',en:'Pick any provider · Claude / OpenAI / DeepSeek / GLM / Qwen / Ollama · or /login via AtomGit OAuth'},
+  'step3.t':{zh:'cd 进项目跑 atomcode',en:'cd into project, run atomcode'},
+  'step3.d':{zh:'第一次会进 3 步启动向导 · 配置存 ~/.atomcode/config.toml',en:'First run launches a 3-step wizard · config at ~/.atomcode/config.toml'},
+  'wiz.head':{zh:'atomcode · 首次运行 — 3 步启动向导',en:'atomcode · First run — 3-step wizard'},
+  'wiz.s1.tt':{zh:'第 1/3 步 · 欢迎',en:'Step 1/3 · Welcome'},
+  'wiz.s1.qq':{zh:`版本 ${VERSION}  ·  在终端里运行的 AI 编程代理`,en:`Version ${VERSION}  ·  AI coding agent in your terminal`},
+  'wiz.s1.b1':{zh:'多步骤 agent loop · 内置代码图工具',en:'Multi-step agent loop · built-in code-graph tools'},
+  'wiz.s1.b2':{zh:'兼容所有 OpenAI 风格 API',en:'Connects to any OpenAI-compatible API'},
+  'wiz.s1.b3':{zh:'通过 CodingPlan 获取免费额度',en:'Free tokens via CodingPlan'},
+  'wiz.s1.hint':{zh:'按 Enter 继续 · Ctrl+C 可随时退出',en:'Press Enter to continue · Ctrl+C exits at any point'},
+  'wiz.s2.tt':{zh:'第 2/3 步 · 语言',en:'Step 2/3 · Language'},
+  'wiz.s2.qq':{zh:'Choose your language / 选择语言',en:'Choose your language / 选择语言'},
+  'wiz.s2.prompt':{zh:'选择界面语言。任何时候都可以用 /language 修改。',en:'Pick the UI language. You can change it any time with /language.'},
+  'wiz.s2.o1':{zh:'自动检测 (LC_ALL / LANG)',en:'Auto-detect (LC_ALL / LANG)'},
+  'wiz.s2.o2':{zh:'简体中文 (Simplified Chinese)',en:'简体中文 (Simplified Chinese)'},
+  'wiz.s2.o3':{zh:'English',en:'English'},
+  'wiz.s3.tt':{zh:'第 3/3 步 · 配置',en:'Step 3/3 · Setup'},
+  'wiz.s3.qq':{zh:'想怎么开始？',en:'How would you like to set up?'},
+  'wiz.s3.o1':{zh:'配置 CodingPlan',en:'Set up CodingPlan'},
+  'wiz.s3.o1.hint':{zh:'免费额度 · 推荐',en:'Free tokens · recommended'},
+  'wiz.s3.o2':{zh:'手动配置',en:'Configure manually'},
+  'wiz.s3.o2.hint':{zh:'使用 API key',en:'API key'},
+  'wiz.s3.o3':{zh:'暂时跳过',en:'Skip for now'},
+  'wiz.s3.o3.hint':{zh:'稍后再说',en:'explore first'},
+  'wiz.nav':{zh:'1-3 选择 · Enter 确认 · ← 返回 · Esc 跳过',en:'1-3 select · Enter confirm · ← back · Esc skip'},
+  'wiz.prev':{zh:'← 上一步',en:'← Back'},
+  'wiz.next':{zh:'下一步 →',en:'Next →'},
+  'wiz.done':{zh:'✓ 完成',en:'✓ Done'},
+  'ftr.links':{zh:'<a href="#top">官网</a> · <a href="./docs/index.html" target="_blank" rel="noopener">文档</a> · <a href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">CodingPlan</a> · <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener">开源仓库</a> · <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener">Issue</a>',
+                en:'<a href="#top">Website</a> · <a href="./docs/index.html" target="_blank" rel="noopener">Docs</a> · <a href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">CodingPlan</a> · <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener">Repository</a> · <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener">Issues</a>'},
+  'ftr.copy':{zh:'© 2026 AtomCode · MIT 许可证',en:'© 2026 AtomCode · MIT License'},
+  'ftr.rust':{zh:'⚙ 用 Rust 构建',en:'⚙ Built with Rust'},
+  'toast.install.copied':{zh:'✓ 安装命令已复制 · 粘贴到终端运行',en:'✓ Install command copied · paste into your terminal'},
+  'toast.copied':{zh:'✓ 已复制 · 粘贴到终端运行',en:'✓ Copied · paste into your terminal'},
+  'toast.theme.light':{zh:'☀ 已切换到 Light',en:'☀ Switched to Light'},
+  'toast.theme.dark':{zh:'☾ 已切换到 Dark',en:'☾ Switched to Dark'},
+  'toast.lang.zh':{zh:'已切换到 简体中文',en:'Switched to 简体中文'},
+  'toast.lang.en':{zh:'已切换到 English',en:'Switched to English'},
+  'meta.title':{zh:'AtomCode · 在你的终端中运行的 AI 编程助手',en:'AtomCode · AI Coding Agent in Your Terminal'},
+  'meta.desc':{zh:'AtomCode — Claude Code 的开源平替。连接任意大模型，自主多步执行，30 秒上手。',en:'AtomCode — open-source alternative to Claude Code. Connect any LLM, autonomous multi-step execution, 30-second setup.'},
+  'aria.theme':{zh:'切换主题',en:'Toggle theme'},
+  'aria.lang':{zh:'切换语言',en:'Toggle language'},
+  'tip.ver':{zh:'当前版本',en:'Current version'},
+  'os.mac':{zh:'macOS · Intel / Apple Silicon',en:'macOS · Intel / Apple Silicon'},
+  'os.linux':{zh:'Linux · x86_64 / arm64',en:'Linux · x86_64 / arm64'},
+  'os.win':{zh:'Windows · PowerShell',en:'Windows · PowerShell'},
+  'os.harmony':{zh:'HarmonyOS PC · arm64',en:'HarmonyOS PC · arm64'},
+  'os.auto':{zh:'✓ 自动检测 · ',en:'✓ Auto-detected · '},
+  'method.oneclick':{zh:'macOS / Linux / HarmonyOS PC + Windows · 自动选 PATH',en:'macOS / Linux / HarmonyOS PC + Windows · auto PATH'},
+  'method.source':{zh:'需要 Rust 1.88+ · cargo install 到 ~/.cargo/bin/atomcode',en:'Rust 1.88+ required · cargo install to ~/.cargo/bin/atomcode'},
+  'method.binary':{zh:'6 个平台 · 预编译 · 单文件运行',en:'6 platforms · prebuilt · single-file run'},
+};
+function t(k){const v=T[k];if(!v)return k;return v[LANG]||v.zh||k;}
+function tx(x){if(typeof x==='string')return x;if(x&&typeof x==='object'&&x[LANG]!==undefined)return x[LANG];return String(x);}
+function applyI18n(){
+  document.documentElement.lang=LANG==='zh'?'zh-CN':'en';
+  document.title=t('meta.title');
+  const md=document.querySelector('meta[name="description"]'); if(md) md.setAttribute('content',t('meta.desc'));
+  const vb=document.getElementById('verBadge'); if(vb) vb.title=t('tip.ver');
+  const tb=document.getElementById('themeBtn'); if(tb) tb.setAttribute('aria-label',t('aria.theme'));
+  const lb=document.getElementById('langBtn'); if(lb) lb.setAttribute('aria-label',t('aria.lang'));
+  document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n);});
+  document.querySelectorAll('[data-i18n-html]').forEach(el=>{el.innerHTML=t(el.dataset.i18nHtml);});
+}
+
+/* ========== data ========== */
+const RELEASE_BASE='https://atomgit.com/atomgit_atomcode/atomcode/releases/download/'+VERSION;
+const OS_CMDS={
+  mac:`curl -fsSL ${RELEASE_BASE}/install.sh | sh`,
+  linux:`curl -fsSL ${RELEASE_BASE}/install.sh | sh`,
+  win:`irm ${RELEASE_BASE}/install.ps1 | iex`,
+  harmony:`curl -fsSL ${RELEASE_BASE}/install.sh | sh`,
+};
+function osHint(os){return t('os.'+os);}
+const METHOD_CMDS={
+  oneclick:{zh:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${RELEASE_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${RELEASE_BASE}/install.ps1 | iex`,
+            en:`# macOS / Linux / HarmonyOS PC\ncurl -fsSL ${RELEASE_BASE}/install.sh | sh\n\n# Windows · PowerShell\nirm ${RELEASE_BASE}/install.ps1 | iex`},
+  source:{zh:`# 需要 Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # 验证安装`,
+          en:`# Requires Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # verify install`},
+  binary:{zh:`# 从 Releases 页面下载\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# 或直接 curl 取对应平台\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`,
+          en:`# Download from Releases page\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# Or curl for your platform\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`},
+};
+function methodHint(m){return t('method.'+m);}
+const DOWNLOADS=[
+  {os:'macOS · Apple Silicon',arch:'darwin-arm64',file:`atomcode-${VERSION}-darwin-arm64`},
+  {os:'macOS · Intel',arch:'darwin-x64',file:`atomcode-${VERSION}-darwin-x64`},
+  {os:'Linux x64',arch:'linux-x64',file:`atomcode-${VERSION}-linux-x64`},
+  {os:'Linux arm64',arch:'linux-arm64',file:`atomcode-${VERSION}-linux-arm64`},
+  {os:'HarmonyOS PC',arch:'ohos-arm64',file:`atomcode-${VERSION}-ohos-arm64`},
+  {os:'Windows',arch:'windows-x64',file:`atomcode-${VERSION}-windows-x64.exe`},
+];
+
+const FLOWS={
+  bug:[
+    [80,'user',{zh:'修复登录后 404 的 bug',en:'Fix the login bug where users get 404 after OAuth'}],
+    [500,'thinking',{zh:'我来检查 OAuth 回调处理器。',en:"I'll investigate the OAuth callback handler."}],
+    [700,'tool',{zh:'read_file src/auth/callback.ts',en:'read_file src/auth/callback.ts'}],
+    [900,'output','export async function callback(req) {\n  const code = req.query.code;\n  return redirect(`/dashboard`);\n}'],
+    [600,'tool',{zh:'find_references baseUrl (3 处)',en:'find_references baseUrl (3 hits)'}],
+    [600,'tool',{zh:'edit_file src/auth/callback.ts',en:'edit_file src/auth/callback.ts'}],
+    [400,'diff-add','+ const base = process.env.BASE_URL ?? "";'],
+    [120,'diff-add','+ return redirect(`${base}/dashboard`);'],
+    [120,'diff-del','- return redirect(`/dashboard`);'],
+    [500,'output',{zh:'已编辑 src/auth/callback.ts (+2 -1) · file_history 已快照',en:'Edited src/auth/callback.ts (+2 -1) · file_history snapshot saved'}],
+    [600,'tool','auto_fix · cargo build'],
+    [900,'success',{zh:'构建成功 · 0 warnings',en:'Build succeeded · 0 warnings'}],
+    [500,'tool',{zh:'bash · cargo test auth::callback',en:'bash · cargo test auth::callback'}],
+    [800,'success',{zh:'3 passed · 0 failed',en:'3 passed · 0 failed'}],
+    [400,'assistant',{zh:'已修复。重定向 URL 缺少基础路径。/undo 可回滚本轮编辑，/diff 查看变更。',en:'Fixed. The redirect URL was missing the base path. /undo to roll back this turn, /diff to view the change.'}],
+  ],
+  refactor:[
+    [80,'user',{zh:'把 src/services/user.ts 按职责拆分',en:'Split src/services/user.ts by responsibility'}],
+    [400,'thinking',{zh:'我先用代码图谱看 user.ts 的依赖关系。',en:'Let me inspect user.ts dependencies via the code graph.'}],
+    [600,'tool','list_symbols src/services/user.ts'],
+    [600,'output',{zh:'UserService · 14 methods · 3 关注点',en:'UserService · 14 methods · 3 concerns'}],
+    [500,'tool','trace_callers UserService.* · blast_radius'],
+    [800,'output','authentication ← 4 methods\nprofile        ← 5 methods\nbilling        ← 5 methods'],
+    [400,'tool',{zh:'write_file src/services/user/auth.ts',en:'write_file src/services/user/auth.ts'}],
+    [200,'tool',{zh:'write_file src/services/user/profile.ts',en:'write_file src/services/user/profile.ts'}],
+    [200,'tool',{zh:'write_file src/services/user/billing.ts',en:'write_file src/services/user/billing.ts'}],
+    [400,'tool',{zh:'search_replace · 迁移 8 处引用',en:'search_replace · migrate 8 references'}],
+    [700,'success',{zh:'重构完成 · 14 methods 拆为 3 模块',en:'Refactor done · 14 methods split into 3 modules'}],
+    [400,'tool','auto_fix · cargo build · cargo test'],
+    [600,'success',{zh:'build ok · 47 passed',en:'build ok · 47 passed'}],
+    [400,'assistant',{zh:'已按 auth / profile / billing 拆分。/undo 通过 git stash checkpoint 一键回滚本轮。',en:'Split into auth / profile / billing. /undo restores via git stash checkpoint.'}],
+  ],
+  devserver:[
+    [80,'user',{zh:'启动 dev server',en:'Start the dev server'}],
+    [400,'thinking',{zh:'我先看 package.json 找启动脚本。',en:"Let me check package.json for the start script."}],
+    [500,'tool',{zh:'read_file package.json',en:'read_file package.json'}],
+    [600,'output','{ "scripts": { "dev": "vite", "build": "vite build" } }'],
+    [400,'tool',{zh:'bash · 检查端口 3000',en:'bash · check port 3000'}],
+    [400,'output',{zh:'端口 3000 空闲',en:'Port 3000 is free'}],
+    [500,'tool',{zh:'bash · npm run dev（自动 nohup 包装）',en:'bash · npm run dev (auto-nohup wrap)'}],
+    [1200,'output','VITE v5.4.0  ready in 312 ms'],
+    [100,'output','  ➜  Local:   http://localhost:3000/'],
+    [100,'output','  ➜  Network: http://192.168.1.5:3000/'],
+    [400,'success',{zh:'Dev server 已就绪 · devserver 自动检测器已识别',en:'Dev server ready · auto-detected by devserver module'}],
+    [400,'assistant',{zh:'已启动 vite。访问 http://localhost:3000/ 即可。',en:'Vite started. Visit http://localhost:3000/.'}],
+  ],
+};
+
+const PERF=[
+  {task:{zh:'简单编辑（样式修改）',en:'Simple edit (style change)'},a:3,c:3,s:{zh:'持平',en:'Same'},k:'eq'},
+  {task:{zh:'模块重构',en:'Module refactor'},a:7,c:6,s:{zh:'接近',en:'Close'},k:'near'},
+  {task:{zh:'启动开发服务器',en:'Dev server launch'},a:4,c:4,s:{zh:'持平',en:'Same'},k:'eq'},
+  {task:{zh:'Bug 修复',en:'Bug fix'},a:5,c:5,s:{zh:'持平',en:'Same'},k:'eq'},
+  {task:{zh:'复杂任务（新库+调试）',en:'Complex (new lib + debug)'},a:13,c:10,s:{zh:'差距 ~30%',en:'~30% gap'},k:'gap'},
+];
+
+const FEAT=[
+  {cat:'price',     catL:{zh:'价格',en:'Price'},   f:{zh:'开源协议',en:'License'},          a:{zh:'✓ MIT 开源',en:'✓ MIT'},                c:{zh:'闭源',en:'Closed source'},    win:'a'},
+  {cat:'model',     catL:{zh:'模型',en:'Model'},   f:{zh:'模型接入',en:'Provider access'},  a:{zh:'✓ 任意 OpenAI 兼容',en:'✓ Any OpenAI-compatible'}, c:{zh:'仅 Claude',en:'Claude only'}, win:'a'},
+  {cat:'model',     catL:{zh:'模型',en:'Model'},   f:{zh:'本地模型 (Ollama)',en:'Local model (Ollama)'},  a:{zh:'✓ 已支持',en:'✓ Supported'},   c:{zh:'✗ 不支持',en:'✗ Not supported'}, win:'a'},
+  {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'代码图谱工具',en:'Code graph tools'}, a:{zh:'✓ 8 个内置',en:'✓ 8 built-in'},   c:{zh:'基础文本检索',en:'Basic text search'}, win:'a'},
+  {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'/undo 一键回滚',en:'/undo one-click rollback'}, a:{zh:'✓ 已支持',en:'✓ Supported'}, c:{zh:'手动 git',en:'Manual git'}, win:'a'},
+  {cat:'integration',catL:{zh:'集成',en:'Integration'}, f:{zh:'AtomGit 原生集成',en:'AtomGit native integration'}, a:{zh:'✓ OAuth + /issue',en:'✓ OAuth + /issue'}, c:{zh:'✗ 不支持',en:'✗ Not supported'}, win:'a'},
+  {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'MCP 支持',en:'MCP support'},      a:{zh:'✓ 已支持',en:'✓ Supported'},     c:{zh:'✓ 已支持',en:'✓ Supported'},  win:'='},
+  {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'视觉 / 截图',en:'Vision / screenshot'}, a:{zh:'✓ 已支持',en:'✓ Supported'},  c:{zh:'✓ 已支持',en:'✓ Supported'},  win:'='},
+  {cat:'price',     catL:{zh:'价格',en:'Price'},   f:{zh:'费用',en:'Pricing'},              a:{zh:'CodingPlan 限免 · 自带 API',en:'CodingPlan free tier · BYO API'}, c:{zh:'订阅 + API',en:'Subscription + API'}, win:'a'},
+];
+
+/* ========== hero install — auto-detect OS ========== */
+let HERO_AUTO=true,HERO_OS='mac';
+(function(){
+  const tabs=document.getElementById('osTabs');
+  const cmd=document.getElementById('osCmd');
+  const hint=document.getElementById('osHint');
+  const toast=document.getElementById('toast');
+  function detect(){
+    const ua=navigator.userAgent||'';
+    if(/Win/.test(ua)) return 'win';
+    if(/Mac/.test(ua)) return 'mac';
+    if(/Harmony|OpenHarmony/i.test(ua)) return 'harmony';
+    return 'linux';
+  }
+  function highlight(text){
+    const stash=[];
+    text=text.replace(/(https?:\/\/\S+)/g,(m)=>{stash.push(['str',m]);return '\x00'+(stash.length-1)+'\x00';});
+    text=text.replace(/\b(curl|irm|iex|bash|wget|git|cd|cargo|npm|export)\b/g,'<span class="accent">$1</span>');
+    return text.replace(/\x00(\d+)\x00/g,(_,i)=>`<span class="${stash[i][0]}">${stash[i][1]}</span>`);
+  }
+  window.applyHeroInstall=function(){
+    tabs.querySelectorAll('.install-tab').forEach(t=>t.classList.toggle('active',t.dataset.os===HERO_OS));
+    cmd.innerHTML=highlight(OS_CMDS[HERO_OS]);
+    hint.textContent=(HERO_AUTO?t('os.auto'):'')+osHint(HERO_OS);
+  };
+  HERO_OS=detect();HERO_AUTO=true;applyHeroInstall();
+  tabs.addEventListener('click',e=>{const tb=e.target.closest('.install-tab');if(!tb)return;HERO_OS=tb.dataset.os;HERO_AUTO=false;applyHeroInstall();});
+  document.getElementById('copyInstall').addEventListener('click',()=>{
+    navigator.clipboard&&navigator.clipboard.writeText(OS_CMDS[HERO_OS]).catch(()=>{});
+    const btn=document.getElementById('copyInstall');btn.classList.add('copied');btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
+    toast.textContent=t('toast.install.copied');toast.classList.add('show');
+    setTimeout(()=>{toast.classList.remove('show')},1800);
+    setTimeout(()=>{btn.classList.remove('copied');btn.textContent=t('install.copy')},1800);
+  });
+})();
+
+/* ========== terminal demo ========== */
+let CUR_FLOW='bug';
+window.playTerminal=null;
+(function(){
+  const chips=document.getElementById('termChips');
+  const body=document.getElementById('termBody');
+  let timers=[];
+  function clear(){timers.forEach(clearTimeout);timers=[];body.innerHTML='';}
+  function appendCaret(){
+    const c=document.createElement('span');c.className='caret';c.id='termCaret';body.appendChild(c);
+    body.scrollTop=body.scrollHeight;
+  }
+  function play(flow){
+    CUR_FLOW=flow;
+    clear();
+    let acc=0;
+    FLOWS[flow].forEach(([d,kind,text])=>{
+      acc+=d;
+      timers.push(setTimeout(()=>{
+        const ex=document.getElementById('termCaret');if(ex)ex.remove();
+        const ln=document.createElement('span');
+        ln.className='tl '+kind;
+        ln.textContent=tx(text);
+        body.appendChild(ln);
+        appendCaret();
+      },acc));
     });
-  </script>
+    timers.push(setTimeout(()=>{
+      const ex=document.getElementById('termCaret');if(ex)ex.remove();
+    },acc+1200));
+  }
+  window.playTerminal=play;
+  chips.addEventListener('click',e=>{
+    const b=e.target.closest('.term-chip');if(!b)return;
+    chips.querySelectorAll('.term-chip').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    play(b.dataset.flow);
+  });
+  play('bug');
+})();
 
+/* ========== count-up ========== */
+(function(){
+  const io=new IntersectionObserver(entries=>{
+    entries.forEach(en=>{
+      if(en.isIntersecting&&!en.target._done){
+        en.target._done=true;
+        const tgt=parseInt(en.target.dataset.count,10);
+        const dur=1200,t0=performance.now();
+        const step=t=>{
+          const k=Math.min(1,(t-t0)/dur),e=1-Math.pow(1-k,3);
+          en.target.textContent=Math.floor(tgt*e);
+          if(k<1) requestAnimationFrame(step);else en.target.textContent=tgt;
+        };
+        requestAnimationFrame(step);
+      }
+    });
+  },{threshold:.4});
+  document.querySelectorAll('[data-count]').forEach(el=>io.observe(el));
+})();
+
+/* ========== agent loop animation ========== */
+(function(){
+  const nodes=document.querySelectorAll('#agentLoop .node');
+  let i=0;
+  setInterval(()=>{nodes.forEach((n,k)=>n.classList.toggle('active',k===i));i=(i+1)%nodes.length;},800);
+})();
+
+/* ========== feature card cursor highlight (gradient only, no tilt) ========== */
+document.body.addEventListener('mousemove',e=>{
+  const card=e.target.closest('.feat');if(!card) return;
+  const r=card.getBoundingClientRect();
+  card.style.setProperty('--mx',((e.clientX-r.left)/r.width*100)+'%');
+  card.style.setProperty('--my',((e.clientY-r.top)/r.height*100)+'%');
+});
+
+/* ========== perf bars ========== */
+window.renderPerf=null;
+(function(){
+  const list=document.getElementById('perfList');
+  const max=Math.max(...PERF.flatMap(p=>[p.a,p.c]));
+  function render(animate){
+    list.innerHTML='';
+    const stepWord=LANG==='zh'?'步':' steps';
+    PERF.forEach(p=>{
+      const row=document.createElement('div');
+      row.className='perf-row';
+      row.innerHTML=`
+        <div class="name">${tx(p.task)}</div>
+        <div class="perf-bars">
+          <div class="perf-bar a"><div class="fill" data-w="${p.a/max*100}" style="width:0"></div><span class="lbl">A: ${p.a}${stepWord}</span></div>
+          <div class="perf-bar c"><div class="fill" data-w="${p.c/max*100}" style="width:0"></div><span class="lbl">C: ${p.c}${stepWord}</span></div>
+        </div>
+        <div class="perf-status ${p.k}">${tx(p.s)}</div>`;
+      list.appendChild(row);
+    });
+    if(animate){
+      list.querySelectorAll('.perf-bar .fill').forEach((f,i)=>{
+        setTimeout(()=>{f.style.width=f.dataset.w+'%'},80+i*60);
+      });
+    } else {
+      list.querySelectorAll('.perf-bar .fill').forEach(f=>{f.style.transition='none';f.style.width=f.dataset.w+'%';requestAnimationFrame(()=>{f.style.transition=''})});
+    }
+  }
+  window.renderPerf=render;
+  render(false);
+  const io=new IntersectionObserver(entries=>{
+    entries.forEach(en=>{
+      if(en.isIntersecting){
+        list.querySelectorAll('.perf-bar .fill').forEach(f=>{f.style.width='0'});
+        requestAnimationFrame(()=>{
+          list.querySelectorAll('.perf-bar .fill').forEach((f,i)=>{setTimeout(()=>{f.style.width=f.dataset.w+'%'},80+i*60);});
+        });
+        io.disconnect();
+      }
+    });
+  },{threshold:.3});
+  io.observe(list);
+})();
+
+/* ========== feature table ========== */
+window.renderFtab=null;
+(function(){
+  const tbody=document.getElementById('ftabBody');
+  let activeCat='all',onlyDiff=false;
+  function render(){
+    tbody.innerHTML=FEAT.map(f=>`
+      <tr data-cat="${f.cat}" data-win="${f.win}">
+        <td><span class="cat">${tx(f.catL)}</span>${tx(f.f)}</td>
+        <td class="${f.win==='a'?'win':''}">${tx(f.a)}</td>
+        <td class="${f.win==='a'?'lose':''}">${tx(f.c)}</td>
+      </tr>`).join('');
+    apply();
+  }
+  function apply(){
+    tbody.querySelectorAll('tr').forEach(tr=>{
+      const ok=(activeCat==='all'||tr.dataset.cat===activeCat)&&(!onlyDiff||tr.dataset.win==='a');
+      tr.classList.toggle('hidden',!ok);
+    });
+  }
+  window.renderFtab=render;
+  render();
+  document.getElementById('cmpChips').addEventListener('click',e=>{
+    const b=e.target.closest('.cmp-chip');if(!b)return;
+    document.querySelectorAll('.cmp-chip').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');activeCat=b.dataset.cat;apply();
+  });
+  document.getElementById('diffToggle').addEventListener('click',e=>{
+    const el=e.currentTarget;el.classList.toggle('on');onlyDiff=el.classList.contains('on');apply();
+  });
+})();
+
+/* ========== install method tabs + downloads + wizard ========== */
+let CUR_METHOD='oneclick',CUR_WIZ_STEP=1;
+window.applyMethod=null;
+window.applyWizardNav=null;
+(function(){
+  const tabs=document.querySelector('#install .install-tabs');
+  const cmd=document.getElementById('methodCmd');
+  const hint=document.getElementById('methodHint');
+  const toast=document.getElementById('toast');
+  function highlight(text){
+    const stash=[];
+    text=text.replace(/(#[^\n]*)/g,(m)=>{stash.push(['com',m]);return '\x00'+(stash.length-1)+'\x00';});
+    text=text.replace(/(https?:\/\/\S+)/g,(m)=>{stash.push(['str',m]);return '\x00'+(stash.length-1)+'\x00';});
+    text=text.replace(/\b(curl|irm|iex|bash|wget|git|cd|cargo|npm|export|chmod|mv)\b/g,'<span class="accent">$1</span>');
+    return text.replace(/\x00(\d+)\x00/g,(_,i)=>`<span class="${stash[i][0]}">${stash[i][1]}</span>`);
+  }
+  function show(m){
+    CUR_METHOD=m;
+    tabs.querySelectorAll('.install-tab').forEach(tb=>tb.classList.toggle('active',tb.dataset.method===m));
+    cmd.innerHTML=highlight(tx(METHOD_CMDS[m]));
+    hint.textContent=methodHint(m);
+  }
+  window.applyMethod=()=>show(CUR_METHOD);
+  show('oneclick');
+  tabs.addEventListener('click',e=>{const tb=e.target.closest('.install-tab');if(!tb)return;show(tb.dataset.method);});
+  document.getElementById('copyMethod').addEventListener('click',()=>{
+    navigator.clipboard&&navigator.clipboard.writeText(tx(METHOD_CMDS[CUR_METHOD])).catch(()=>{});
+    const btn=document.getElementById('copyMethod');btn.classList.add('copied');btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
+    toast.textContent=t('toast.copied');toast.classList.add('show');
+    setTimeout(()=>{toast.classList.remove('show')},1600);
+    setTimeout(()=>{btn.classList.remove('copied');btn.textContent=t('install.copy.short')},1600);
+  });
+
+  // downloads — actual release URLs
+  document.getElementById('downloadRow').innerHTML=DOWNLOADS.map(d=>`
+    <a class="dl-btn" href="${RELEASE_BASE}/${d.file}" target="_blank" rel="noopener"><span>↓ ${d.os}</span><small>${d.arch}</small></a>`).join('');
+
+  // wizard
+  const next=document.getElementById('wizNext'),prev=document.getElementById('wizPrev');
+  function go(){
+    document.querySelectorAll('.wiz-step').forEach(s=>s.classList.toggle('active',+s.dataset.step===CUR_WIZ_STEP));
+    document.querySelectorAll('#wizDots span').forEach((d,i)=>d.classList.toggle('on',i<CUR_WIZ_STEP));
+    prev.disabled=(CUR_WIZ_STEP===1);next.textContent=CUR_WIZ_STEP===3?t('wiz.done'):t('wiz.next');
+  }
+  window.applyWizardNav=go;
+  next.addEventListener('click',()=>{CUR_WIZ_STEP=CUR_WIZ_STEP<3?CUR_WIZ_STEP+1:1;go();});
+  prev.addEventListener('click',()=>{if(CUR_WIZ_STEP>1){CUR_WIZ_STEP--;go();}});
+  document.querySelectorAll('.wiz-step .opt').forEach(o=>{
+    o.addEventListener('click',()=>{
+      o.parentNode.querySelectorAll('.opt').forEach(x=>x.classList.remove('sel'));
+      o.classList.add('sel');
+    });
+  });
+})();
+
+/* ========== aurora + ripple ========== */
+(function(){
+  const aurora=document.getElementById('aurora');
+  let tx=-300,ty=-300,x=tx,y=ty;
+  addEventListener('mousemove',e=>{tx=e.clientX;ty=e.clientY});
+  (function tick(){x+=(tx-x)*.18;y+=(ty-y)*.18;aurora.style.setProperty('--mx',x+'px');aurora.style.setProperty('--my',y+'px');requestAnimationFrame(tick);})();
+  addEventListener('click',e=>{
+    if(e.target.closest('input,textarea,select')) return;
+    const r=document.createElement('div');r.className='ripple';
+    r.style.left=e.clientX+'px';r.style.top=e.clientY+'px';
+    document.body.appendChild(r);setTimeout(()=>r.remove(),700);
+  });
+})();
+
+/* ========== scroll progress + header scrolled + active nav ========== */
+(function(){
+  const bar=document.getElementById('progressBar'),hdr=document.getElementById('hdr');
+  const sections=['features','compare','install'];
+  function tick(){
+    const max=Math.max(1,document.documentElement.scrollHeight-innerHeight);
+    bar.style.width=(scrollY/max*100).toFixed(2)+'%';
+    hdr.classList.toggle('scrolled',scrollY>40);
+    let cur=null;
+    for(const id of sections){const el=document.getElementById(id);if(!el)continue;const r=el.getBoundingClientRect();if(r.top<=innerHeight*0.35) cur=id;}
+    document.querySelectorAll('.hdr-nav a').forEach(a=>a.classList.toggle('active',a.dataset.section===cur));
+  }
+  tick();addEventListener('scroll',tick,{passive:true});
+})();
+
+/* ========== magnetic ========== */
+(function(){
+  const els=Array.from(document.querySelectorAll('[data-magnetic]')).map(el=>({el,tx:0,ty:0,x:0,y:0}));
+  let mx=-9999,my=-9999;
+  addEventListener('mousemove',e=>{mx=e.clientX;my=e.clientY});
+  function loop(){
+    for(const it of els){
+      const r=it.el.getBoundingClientRect();
+      if(r.bottom<0||r.top>innerHeight){it.tx=it.ty=0}
+      else{
+        const cx=r.left+r.width/2,cy=r.top+r.height/2;
+        const dx=mx-cx,dy=my-cy,d=Math.hypot(dx,dy);
+        const R=Math.max(r.width,r.height)*1.3+30;
+        if(d<R){const k=(1-d/R)*.3;it.tx=dx*k;it.ty=dy*k}else{it.tx=0;it.ty=0}
+      }
+      it.x+=(it.tx-it.x)*.22;it.y+=(it.ty-it.y)*.22;
+      it.el.style.transform=(Math.abs(it.x)<.1&&Math.abs(it.y)<.1)?'':`translate(${it.x.toFixed(1)}px,${it.y.toFixed(1)}px)`;
+    }
+    requestAnimationFrame(loop);
+  }
+  loop();
+})();
+
+/* ========== scramble ========== */
+(function(){
+  const A='!<>-_\\/[]{}—=+*^?#@$%&|~01',C='零壹贰叁肆伍陆柒捌玖原码原子计算激励';
+  function scramble(el){
+    if(el._busy)return;
+    const orig=el.dataset._t||el.textContent;el.dataset._t=orig;
+    const chars=Array.from(orig);const total=Math.max(18,chars.length*2+10);let f=0;el._busy=true;
+    (function step(){
+      let out='';for(let i=0;i<chars.length;i++){
+        const ch=chars[i];const s=(i/chars.length)*total*.55,e=s+total*.35;
+        if(f>=e||/[\s,.·—:;\/\(\)\[\]\/]/.test(ch)){out+=ch;continue}
+        if(f<s){out+=ch;continue}
+        const p=/[A-Za-z0-9]/.test(ch)?A:/[一-龥]/.test(ch)?C:A;
+        out+=p[(Math.random()*p.length)|0];
+      }
+      el.textContent=out;f++;if(f<total) requestAnimationFrame(step);else{el.textContent=orig;el._busy=false}
+    })();
+  }
+  document.querySelectorAll('[data-scramble]').forEach(el=>{el.dataset._t=el.textContent;el.addEventListener('mouseenter',()=>scramble(el))});
+})();
+
+/* ========== theme toggle (real · persists) ========== */
+(function(){
+  const btn=document.getElementById('themeBtn');
+  const html=document.documentElement;
+  const toastEl=document.getElementById('toast');
+  const SUN='<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+  const MOON='<svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+  function apply(theme,announce){
+    const light=theme==='light';
+    html.classList.toggle('light',light);
+    btn.innerHTML=light?SUN:MOON;
+    btn.setAttribute('aria-label',light?'Switch to dark':'Switch to light');
+    try{localStorage.setItem('atomcode_theme',theme)}catch(e){}
+    if(announce){
+      toastEl.textContent=t(light?'toast.theme.light':'toast.theme.dark');
+      toastEl.classList.add('show');setTimeout(()=>toastEl.classList.remove('show'),1200);
+    }
+  }
+  let saved='dark';
+  try{saved=localStorage.getItem('atomcode_theme')||(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark')}catch(e){}
+  apply(saved,false);
+  btn.addEventListener('click',()=>{apply(html.classList.contains('light')?'dark':'light',true);});
+})();
+
+/* ========== language toggle (real · persists · re-renders dynamic content) ========== */
+(function(){
+  const btn=document.getElementById('langBtn');
+  const toastEl=document.getElementById('toast');
+  function syncBtn(){btn.textContent=LANG==='zh'?'EN':'中';btn.setAttribute('aria-label',LANG==='zh'?'Switch to English':'切换到 中文');}
+  function applyAll(){
+    applyI18n();
+    syncBtn();
+    if(window.renderPerf) window.renderPerf(false);
+    if(window.renderFtab) window.renderFtab();
+    if(window.applyMethod) window.applyMethod();
+    if(window.applyHeroInstall) window.applyHeroInstall();
+    if(window.applyWizardNav) window.applyWizardNav();
+    if(window.playTerminal) window.playTerminal(CUR_FLOW);
+  }
+  applyAll();
+  btn.addEventListener('click',()=>{
+    LANG=LANG==='zh'?'en':'zh';
+    try{localStorage.setItem('atomcode_lang',LANG)}catch(e){}
+    applyAll();
+    toastEl.textContent=t('toast.lang.'+LANG);
+    toastEl.classList.add('show');setTimeout(()=>toastEl.classList.remove('show'),1200);
+  });
+})();
+</script>
 </body>
 </html>

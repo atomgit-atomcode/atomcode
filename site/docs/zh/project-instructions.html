@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>项目指令文件 · AtomCode 文档</title>
+<meta name="description" content="项目指令文件 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="project-instructions">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.22.3</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>项目指令文件</h1>
+      <p class="lede">在项目根目录放一个 <code>.atomcode.md</code>,可以把项目的技术栈、约定和偏好固化下来,AtomCode 启动时会自动把它注入系统提示,避免每次对话都要重复说一遍规则。</p>
+
+      <h2>为什么需要它</h2>
+      <p>设想这个常见场景:你的团队统一使用 Composition API,禁止 Options API。每次让 AtomCode 写新组件,你都得提醒一句"用 Composition API"。有了 <code>.atomcode.md</code>,这类偏好会自动带进每一次对话。</p>
+
+      <h2>文件位置</h2>
+      <ul>
+        <li>默认路径:项目根目录下的 <code>.atomcode.md</code></li>
+        <li>AtomCode 从当前工作目录向上逐级查找,直到找到或到达 <code>$HOME</code></li>
+        <li>如果该文件不存在,系统提示中自然不会出现相关内容</li>
+      </ul>
+
+      <h2>示例</h2>
+      <pre><code># Project Instructions
+
+这是一个 Vue 3 + TypeScript 项目,使用 Pinia 做状态管理、
+Tailwind 做样式、Vitest 做单元测试。
+
+## 约定
+
+- 组件一律使用 `&lt;script setup lang="ts"&gt;` 风格的 Composition API
+- 样式只写 Tailwind,不写内联 style 和单独的 .css 文件
+- 所有 API 调用走 `src/services/*`,不在组件里直接 fetch
+- 状态统一放进 Pinia store,组件内部不保留派生的全局状态
+
+## 常用命令
+
+- 启动开发:`pnpm dev`
+- 类型检查:`pnpm typecheck`
+- 测试:`pnpm test`
+- 构建:`pnpm build`
+
+## 注意事项
+
+- 不要修改 `src/generated/*`,那是从 OpenAPI 自动生成的
+- 测试覆盖率要求在 80% 以上,新增模块必须带单元测试</code></pre>
+
+      <h2>写好 .atomcode.md 的几条经验</h2>
+      <ul>
+        <li><strong>只写"和一般情况不一样"的部分</strong> —— 通用最佳实践模型自己懂,不用在这里重复。</li>
+        <li><strong>给出命令,而不是描述</strong> —— "跑测试用 <code>pnpm test</code>",而不是"请运行单元测试"。</li>
+        <li><strong>用祈使句</strong> —— "使用 X"、"不要 Y",避免模棱两可的"建议"、"尽量"。</li>
+        <li><strong>列出禁区</strong> —— 哪些文件 / 目录不能动,点名就好。模型的顺从性很高。</li>
+        <li><strong>控制长度</strong> —— 每一行都会吃 token,保持在 30-80 行以内通常就够用了。</li>
+      </ul>
+
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>如果你有很多重复的工作流(比如每次修 bug 都要跑一套相同的命令),与其在 <code>.atomcode.md</code> 里长篇大论,不如写成一个 <a href="./skills.html">Skill</a>,更清晰也更可复用。</p>
+      </div>
+
+      <h2>与 CLAUDE.md / GEMINI.md 的关系</h2>
+      <p>如果你在同一个项目里也用 Claude Code 或 Gemini CLI,它们各自有自己的指令文件:</p>
+      <ul>
+        <li>Claude Code &rarr; <code>CLAUDE.md</code></li>
+        <li>Gemini CLI &rarr; <code>GEMINI.md</code></li>
+        <li>AtomCode &rarr; <code>.atomcode.md</code></li>
+      </ul>
+      <p>三者互不冲突。你可以分别维护,也可以让 <code>.atomcode.md</code> 通过链接或者简单 include 指向 <code>CLAUDE.md</code> 保持一致。</p>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./skills.html">Skills 扩展</a> —— 把可复用流程进一步抽象成命令</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

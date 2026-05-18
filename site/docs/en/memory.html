@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Persistent Memory · AtomCode Docs</title>
+<meta name="description" content="Use /remember to capture preferences, conventions, and commands that AtomCode injects on every turn.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="memory">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.22.3</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Persistent Memory</h1>
+      <p class="lede">Use <code>/remember</code> to capture stray preferences, conventions, and commands. AtomCode injects them into the system prompt on every turn. It complements <a href="./project-instructions.html"><code>.atomcode.md</code> project instructions</a>: instructions are for full specs; memory is for the "oh, I should tell it about that" facts.</p>
+
+      <h2>Command overview</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Effect</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/remember &lt;content&gt;</code></td><td>Record an entry in <strong>project</strong> memory (default scope, bound to the current working directory)</td></tr>
+          <tr><td><code>/remember --global &lt;content&gt;</code></td><td>Record an entry in <strong>global</strong> memory (shared across all projects)</td></tr>
+          <tr><td><code>/forget &lt;keyword&gt;</code></td><td>Delete every entry in global + project memory matching the keyword (case-insensitive); the output lists what got removed</td></tr>
+          <tr><td><code>/memory</code></td><td>Show all active memory entries, grouped under <code>[Global]</code> / <code>[Project]</code>, with disk paths</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Storage locations</h2>
+      <table>
+        <thead>
+          <tr><th>Scope</th><th>Path</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Global</td><td><code>~/.atomcode/memory.md</code> (or <code>$ATOMCODE_HOME/memory.md</code>)</td></tr>
+          <tr><td>Project</td><td><code>&lt;project_root&gt;/.atomcode/memory.md</code></td></tr>
+        </tbody>
+      </table>
+      <p>The format is plain Markdown — one entry per <code>- </code>-prefixed list item. Use <code>/remember</code> or hand-edit; AtomCode rereads on the next turn. <strong>Lines not starting with <code>- </code> are ignored</strong>, so feel free to add comments, blank lines, or grouping headings without affecting entries.</p>
+
+      <h2>How the model "uses" memory</h2>
+      <p>For every request, AtomCode merges <strong>global + project memory</strong> and injects it into the system prompt (<code>crates/atomcode-core/src/agent/prompt.rs:64</code>), formatted as:</p>
+      <pre><code>=== MEMORY ===
+The user has asked you to remember these facts and preferences:
+
+[Global]
+- Prefers concise answers, no long-winded explanations
+- Reply in Chinese, but write commit messages in English
+
+[Project: atomcode]
+- Test command is cargo test --workspace --no-fail-fast
+- When CI fails, first check .github/workflows/ci.yml lines 78-92</code></pre>
+      <p>The model sees this block on every turn. There is <strong>no "semantic retrieval" or "on-demand recall"</strong> — it's unconditional full injection. The more entries, the more tokens per turn. Prune stale entries to keep this tight.</p>
+
+      <h2>Capacity limits</h2>
+      <table>
+        <thead>
+          <tr><th>Limit</th><th>Value</th><th>What happens at the limit</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Single memory file size</td><td>64 KB</td><td>Only the trailing 64 KB is read (aligned to line boundaries — UTF-8 characters are never split)</td></tr>
+          <tr><td>Total characters in the injected prompt</td><td>4000 chars</td><td>Truncated with a trailing <code>[...truncated, run /memory to review]</code> note</td></tr>
+        </tbody>
+      </table>
+      <p>Once you hit the limit, use <code>/forget</code> to clean up — drop entries that are no longer relevant.</p>
+
+      <h2>Suggested uses</h2>
+
+      <h3>1. Project-specific commands, conventions, footguns (project scope)</h3>
+      <pre><code>&gt; /remember use npm run check for type-checking (not npm run typecheck)
+&gt; /remember when CI fails, check .github/workflows/ci.yml lines 78-92 first
+&gt; /remember never use sed -i in this repo (macOS/Linux behaviour differs)
+&gt; /remember DB migration SQL must run on staging before main</code></pre>
+
+      <h3>2. Global coding preferences, workflows (global)</h3>
+      <pre><code>&gt; /remember --global run tests before committing
+&gt; /remember --global don't git push on your own — let me confirm manually
+&gt; /remember --global reply in Chinese but write commit messages in English
+&gt; /remember --global prefer editing existing files — don't create docs (*.md) on your own</code></pre>
+
+      <h3>3. Personal or team info (global)</h3>
+      <pre><code>&gt; /remember --global my GitHub username is alice
+&gt; /remember --global default timezone Asia/Shanghai
+&gt; /remember --global team standup is Mon/Wed/Fri at 9:30</code></pre>
+
+      <h3>4. Cleaning up stale memories</h3>
+      <pre><code>&gt; /forget npm run check
+  [project] - use npm run check for type-checking (not npm run typecheck)
+  (removed 1 matching entry)
+
+&gt; /memory
+  [Global] (/Users/alice/.atomcode/memory.md)
+    - run tests before committing
+    - don't git push on your own — let me confirm manually
+  [Project] (/Users/alice/code/myrepo/.atomcode/memory.md)
+    - when CI fails, check .github/workflows/ci.yml lines 78-92 first</code></pre>
+
+      <h2>Memory vs project instructions vs session history</h2>
+      <p>AtomCode offers three ways to persist "context", each with a different role:</p>
+      <table>
+        <thead>
+          <tr><th></th><th><code>.atomcode.md</code></th><th>Memory (memory.md)</th><th>Sessions (<code>/resume</code>)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Best for</td><td>Full specs, tech stack, detailed conventions</td><td>Stray facts, personal preferences, command cheats</td><td>Past conversation + tool calls</td></tr>
+          <tr><td>Scope</td><td>Project</td><td>Project + global</td><td>One specific session</td></tr>
+          <tr><td>How to add</td><td>Hand-edit</td><td><code>/remember</code> or hand-edit</td><td>Auto-saved per conversation</td></tr>
+          <tr><td>Injection</td><td>Loaded into system prompt at startup</td><td>Injected into system prompt every turn</td><td>Restored wholesale via <code>/resume</code></td></tr>
+          <tr><td>Token cost</td><td>High (full doc)</td><td>Capped at 4000 chars</td><td>Bounded by the context window</td></tr>
+        </tbody>
+      </table>
+      <p>Typical combinations:</p>
+      <ul>
+        <li><strong>Team conventions</strong> in <code>.atomcode.md</code> (commit it; shared by everyone)</li>
+        <li><strong>Personal preferences</strong> via <code>/remember --global</code> (only on your machine)</li>
+        <li><strong>Project-specific footguns</strong> via <code>/remember</code> (lives in the project's local <code>.atomcode/memory.md</code>; commit or gitignore your call)</li>
+      </ul>
+      <p>Whether to commit <code>.atomcode/memory.md</code>: if the team also uses AtomCode and the memory is project knowledge (footguns, conventions), commit it; if it's personal notes, add it to <code>.gitignore</code>.</p>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li><a href="./project-instructions.html">Project Instructions</a> — the best home for full specs</li>
+        <li><a href="./slash-commands.html">Slash Commands</a> — full command reference</li>
+        <li><a href="./sessions.html">Sessions &amp; Undo</a> — the details of <code>/resume</code></li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

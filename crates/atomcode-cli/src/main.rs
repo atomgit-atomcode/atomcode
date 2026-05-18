@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 mod telemetry_cmd;
 mod uninstall;
 
-use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
+use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop, AgentRuntimeFactory};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
@@ -1257,6 +1257,7 @@ async fn run() -> Result<i32> {
         conversation,
     );
     agent_loop.set_max_turns(cli.max_turns);
+    let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
     // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
@@ -1385,7 +1386,7 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
             Ok(0)
         };
 
@@ -1424,7 +1425,7 @@ async fn run_headless(
     let notifications = agent_loop.config.notifications.clone();
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
-        (handle.cmd_tx, handle.event_rx)
+        (handle.client.cmd_tx, handle.event_rx)
     };
 
     let ctx = atomcode_telemetry::CurrentContext::current();
@@ -1696,6 +1697,9 @@ async fn run_headless(
             // outputs.
             AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
                 eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
+            }
+            AgentEvent::MessagesSync { .. } => {
+                // Only used by TUI for /bg session persistence; ignore in CLI.
             }
         }
     }
@@ -2097,7 +2101,33 @@ fn run_codingplan_core(
         },
     };
 
-    let report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+    // If the stored token is locally valid (file present, expires_in
+    // not yet past) but the server rejects it (revoked, refresh-token
+    // dead, etc.), the orchestrator sets `report.auth_expired = true`.
+    // Run OAuth *once* on that path — same flow `atomcode login` would
+    // use — then re-run setup against the fresh token. Without this
+    // the user sees the report ending in "claim failed — run `atomcode
+    // login` again" and has to do manually what `codingplan` could
+    // do itself.
+    let mut report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+    if report.auth_expired {
+        use atomcode_core::i18n::{t, Msg};
+        print!("{}", t(Msg::CpReauthAfter401));
+        match atomcode_core::auth::login(telemetry)
+            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+        {
+            Ok(_) => {
+                report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+            }
+            Err(e) => {
+                // Re-OAuth itself failed (user pressed Ctrl+C, network
+                // dead, etc.). Print the *original* report so users
+                // still see what triggered the retry, then bail.
+                println!("{}", report.render());
+                anyhow::bail!("re-authentication failed: {:#}", e);
+            }
+        }
+    }
 
     if report.should_persist_config() {
         if let Some(parent) = path.parent() {

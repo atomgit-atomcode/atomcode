@@ -106,7 +106,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **多行输入** —— Shift+Enter 或 `\` + Enter 换行、高度自适应、历史记录
 - **任务完成通知** —— 长任务结束后优先走终端原生通知协议，必要时回退到系统通知
 - **文本选择** —— 鼠标拖选、自动滚动、复制到剪贴板
-- **斜杠命令** —— `/model`、`/provider`、`/resume`、`/diff`、`/undo`、`/cost`、`/clear`、`/compact` 等（完整列表见下）
+- **斜杠命令** —— `/model`、`/provider`、`/resume`、`/bg`、`/diff`、`/undo`、`/cost`、`/clear`、`/compact` 等（完整列表见下）
 - **文件附加** —— 粘贴文件路径即可把内容作为上下文带入
 - **Bracketed paste** —— 长文本粘贴自动折叠为紧凑的指示器
 - **Skills** —— 从 skill 目录加载的用户自定义命令，像普通斜杠命令一样调用
@@ -300,6 +300,8 @@ atomcode --prompt-file task.md
 |---------|--------|
 | `/resume` | 恢复或切换会话 |
 | `/session` | 创建新会话 |
+| `/bg` | 将当前会话放到后台；子命令：`/bg list`、`/bg <N>`、`/bg drop <N>`、`/bg help` |
+| `/background <task>` | 兼容入口：在 `/bg` 槽位中启动一次性后台任务 |
 | `/provider` | 管理 provider |
 | `/model` | 切换模型 / provider |
 | `/login` | 通过 AtomGit OAuth 登录 |

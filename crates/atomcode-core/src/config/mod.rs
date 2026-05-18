@@ -162,6 +162,25 @@ impl Config {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            default_provider: String::new(),
+            default_workdir: None,
+            providers: HashMap::new(),
+            datalog: Default::default(),
+            notifications: Default::default(),
+            auto_update: true,
+            telemetry: Default::default(),
+            lsp: Default::default(),
+            auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: None,
+            language: None,
+        }
+    }
+}
+
 /// Controls the per-turn markdown datalog writer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatalogConfig {
@@ -362,13 +381,19 @@ fn render_instructions_section() -> String {
     out.push_str("# AtomCode loads instructions from three levels (low → high priority):\n");
     out.push_str("#\n");
     out.push_str("#   1. ~/.atomcode/ATOMCODE.md           (global — your personal defaults)\n");
-    out.push_str("#   2. <project>/.atomcode.md            (project — team-shared, commit to git)\n");
+    out.push_str(
+        "#   2. <project>/.atomcode.md            (project — team-shared, commit to git)\n",
+    );
     out.push_str("#      or <project>/ATOMCODE.md\n");
     out.push_str("#      or <project>/CLAUDE.md / claude.md (Claude Code compat)\n");
-    out.push_str("#   3. <project>/.atomcode.user.md       (user — personal per-project, .gitignore)\n");
+    out.push_str(
+        "#   3. <project>/.atomcode.user.md       (user — personal per-project, .gitignore)\n",
+    );
     out.push_str("#\n");
     out.push_str("# Higher priority files appear later in the prompt (recency effect).\n");
-    out.push_str("# Use /status to see which files are loaded. Use /init to generate a template.\n");
+    out.push_str(
+        "# Use /status to see which files are loaded. Use /init to generate a template.\n",
+    );
     out.push_str("#\n");
     out.push_str("# Example ~/.atomcode/ATOMCODE.md:\n");
     out.push_str("#   ## Global Preferences\n");
@@ -905,7 +930,6 @@ mod tests {
             "unexpected error: {err}"
         );
     }
-
     #[test]
     fn active_provider_falls_back_when_default_points_to_deleted_provider() {
         // Regression test for https://gitcode.com/atomgit_atomcode/atomcode/issues/353

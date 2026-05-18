@@ -169,10 +169,18 @@ Current mappings are:
 |---|---|
 | `read_file` | `Read` |
 | `grep` | `Read` |
+| `find_references` | `Read` |
+| `list_symbols` | `Read` |
+| `read_symbol` | `Read` |
+| `diagnostics` with `file_path` | `Read` |
 | `list_directory` | `Enumerate` |
+| `glob` | `Enumerate` |
 | `cd` | `Enumerate` |
+| `file_dependencies` | `Enumerate` |
+| `blast_radius` | `Enumerate` |
 | `edit_file` | `Write` |
 | `write_file` | `Write` |
+| `search_replace` | `Write` |
 
 This gives AtomCode a single path policy for file tools instead of per-tool ad hoc logic.
 

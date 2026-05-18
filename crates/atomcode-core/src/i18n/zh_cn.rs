@@ -17,6 +17,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── /codingplan ──
         Msg::CodingPlanSetupFailed { error } =>
             format!("CodingPlan 设置失败：{error}").into(),
+        Msg::CpReauthAfter401 =>
+            "  ⚠ 登录凭证已失效 — 正在重新登录...\n".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan 配置：\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
@@ -588,8 +590,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescConfig => "显示配置文件路径".into(),
         Msg::CmdDescReload => "从磁盘重新加载 ~/.atomcode/config.toml".into(),
         Msg::CmdDescCd => "切换工作目录".into(),
-        Msg::CmdDescInit => "从工作目录生成 .atomcode.md 项目指令".into(),
-        Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务（只读工具子集）".into(),
+Msg::CmdDescInit => "从工作目录生成 .atomcode.md 项目指令".into(),
+Msg::CmdDescBg => "后台会话：/bg、/bg list、/bg <N>、/bg drop <N>".into(),
+Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务（只读工具子集）".into(),
         Msg::CmdDescDiff => "显示 git diff".into(),
         Msg::CmdDescClear => "清屏".into(),
         Msg::CmdDescSession => "开始新会话（清除对话）".into(),
@@ -697,5 +700,43 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             所有终端均可用。（Shift / Alt / Ctrl + Enter 在部分终端也支持，\n    \
             取决于该终端的键盘协议 — 可以试试看。）\n\n"
                 .into(),
+
+        // ── /bg（后台会话）──
+        Msg::BgHelp =>
+            "  /bg                 将当前会话放到后台，打开新的前台会话\n  /bg list            列出后台会话\n  /bg <N>             恢复第 N 号后台会话\n  /bg drop <N>        丢弃第 N 号后台会话\n  /bg help            显示此帮助\n".into(),
+        Msg::BgListEmpty => "  没有后台会话。\n".into(),
+        Msg::BgListHeader => "  #   ID        状态       创建时间   摘要\n".into(),
+        Msg::BgListRow { slot, short_id, state, age, summary } =>
+            format!("  {:<3} {:<8}  {:<9}  {:<8}  {}\n", slot, short_id, state, age, summary).into(),
+        Msg::BgStateRunning => "运行中".into(),
+        Msg::BgStateIdle => "空闲".into(),
+        Msg::BgStateDone => "已完成".into(),
+        Msg::BgStateCancelled => "已取消".into(),
+        Msg::BgStateError => "错误".into(),
+        Msg::BgAgeNow => "刚刚".into(),
+        Msg::BgAgeMinutes { n } => format!("{n} 分钟").into(),
+        Msg::BgAgeHours { n } => format!("{n} 小时").into(),
+        Msg::BgAgeDays { n } => format!("{n} 天").into(),
+        Msg::BgSlotLimitReached { max } =>
+            format!("后台槽位已达上限（{max}）").into(),
+        Msg::BgBackgroundCurrent { new_id, slot, old_id, state } =>
+            format!("  新前台会话 [{new_id}]\n  后台：[#{slot}] {old_id}（状态：{state}）\n").into(),
+        Msg::BgInvalidSlot { slot, available } =>
+            format!("无效的后台槽位 {slot}（可用：{available}）").into(),
+        Msg::BgNoRuntimeClient => "后台槽位没有运行时客户端".into(),
+        Msg::BgResumed { slot, short_id } =>
+            format!("  已恢复后台 [#{slot}] {short_id}\n").into(),
+        Msg::BgPreviousForegroundMoved { slot } =>
+            format!("  原前台会话已移至 [#{slot}]\n").into(),
+        Msg::BgDropped { slot, short_id } =>
+            format!("  已丢弃后台 [#{slot}] {short_id}\n").into(),
+        Msg::BgTaskStarted { slot, short_id } =>
+            format!("  后台：[#{slot}] {short_id}（状态：运行中）\n").into(),
+        Msg::BgTaskTimedOut { secs } =>
+            format!("后台任务超时（{secs} 秒）。").into(),
+        Msg::BgTaskError { error } =>
+            format!("错误：{error}").into(),
+        Msg::BgTaskCancelled => "已取消。".into(),
+        Msg::BgTaskNoSummary => "任务完成（无摘要文本）。".into(),
     }
 }

@@ -180,8 +180,8 @@ impl LlmProvider for UnavailableProvider {
 
 // ── auth.toml token loading ──
 
-/// Platform OAuth refresh endpoint
-const PLATFORM_REFRESH_URL: &str = "https://acs.atomgit.com/oauth/refresh";
+// Platform OAuth refresh endpoint — uses the same configurable URL
+// as auth::oauth (reads ATOMCODE_PLATFORM_SERVER env var).
 /// Minimal auth.toml representation.
 #[derive(serde::Deserialize)]
 struct StoredAuth {
@@ -232,7 +232,7 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
     let builder = client
-        .post(PLATFORM_REFRESH_URL)
+        .post(crate::auth::oauth::platform_refresh_url())
         .json(&serde_json::json!({ "refresh_token": refresh_token, "provider": "atomgit" }));
     let policy = crate::provider::retry::RetryPolicy::default_policy();
     let resp = crate::provider::retry::send_with_retry_blocking(builder, &policy)

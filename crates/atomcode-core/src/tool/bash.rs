@@ -7,6 +7,9 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct BashTool;
@@ -334,8 +337,9 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
     #[cfg(target_os = "windows")]
     let mut child = {
         let mut cmd = Command::new("cmd.exe");
-        cmd.args(&["/C", &parsed.command])
-            .current_dir(&wd)
+        cmd.arg("/C");
+        cmd.as_std_mut().raw_arg(&parsed.command);
+        cmd.current_dir(&wd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1357,9 +1361,24 @@ fn check_destructive_command(command: &str) -> Option<String> {
     None
 }
 
-/// Detect if a bash command is (or starts with) a `cd` and extract the target
-/// directory.  Handles: `cd /path`, `cd ~/path`, `cd dir && ...`, `cd dir; ...`.
-/// Returns None for non-cd commands or bare `cd` (go home).
+/// Detect a *persistent* `cd` intent and extract the target directory.
+///
+/// Returns `Some(path)` ONLY for a bare top-level cd (`cd /path`, `cd ~/x`,
+/// `cd subdir`, or bare `cd` → home). Any chained form — `cd X && cmd`,
+/// `cd X; cmd`, `cd X | cmd`, `cd X || cmd` — is treated as a *scoped*
+/// shell cd and returns `None`, leaving the agent's `working_dir`
+/// unchanged.
+///
+/// Rationale: when a model emits `cd /tmp && wget URL` it follows
+/// standard shell semantics — the cd is local to the subshell that
+/// `bash -c` spawns and is forgotten the moment the command exits.
+/// Promoting that to a persistent change strands the agent in /tmp for
+/// every subsequent bash / read_file / edit_file call until something
+/// fails loud enough to notice. Users (correctly) complain that
+/// AtomCode "randomly switches working directory". The dedicated
+/// `change_dir` tool (`tool/cd.rs`) is the one true way to switch
+/// persistently; this auto-detection only honours commands that are
+/// *unambiguously* a top-level cd.
 fn detect_cd_target(cmd: &str) -> Option<String> {
     let trimmed = cmd.trim();
     if !trimmed.starts_with("cd ") && trimmed != "cd" {
@@ -1369,11 +1388,12 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
         // bare `cd` goes to $HOME
         return super::real_home_dir().map(|h| h.to_string_lossy().to_string());
     }
-    // Extract the path after `cd `, stopping at `&&`, `;`, `||`, `|`, or end.
     let after_cd = trimmed[3..].trim_start();
-    let end = after_cd.find(['&', ';', '|'])
-        .unwrap_or(after_cd.len());
-    let path = after_cd[..end].trim().trim_matches('"').trim_matches('\'');
+    // Any chained continuation → scoped cd, do not promote.
+    if after_cd.contains(['&', ';', '|']) {
+        return None;
+    }
+    let path = after_cd.trim().trim_matches('"').trim_matches('\'');
     if path.is_empty() {
         return super::real_home_dir().map(|h| h.to_string_lossy().to_string());
     }
@@ -1659,8 +1679,8 @@ mod exit_code_tests {
 
     #[tokio::test]
     async fn bash_sed_in_place_detected_via_effect() {
-        // The sed -i case old pattern-hardcode targeted — still caught, but
-        // now via effect, not via parsing the command for the literal "sed -i".
+        // The in-place edit case old pattern-hardcode targeted — still caught,
+        // but now via effect, not via parsing a literal tool spelling.
         let (dir, ctx) = git_ctx().await;
         let path = dir.path().join("app.vue");
         std::fs::write(&path, "class=\"active\"\n").unwrap();
@@ -1686,8 +1706,12 @@ mod exit_code_tests {
             .status()
             .await
             .unwrap();
+        let tmp = dir.path().join("app.vue.tmp");
         let cmd = format!(
-            r#"{{"command":"sed -i '' 's/active/is-active/' {}"}}"#,
+            r#"{{"command":"sed 's/active/is-active/' {} > {} && mv {} {}"}}"#,
+            path.display(),
+            tmp.display(),
+            tmp.display(),
             path.display()
         );
         let r = BashTool.execute(&cmd, &ctx).await.unwrap();
@@ -2747,4 +2771,85 @@ fn approval_for_command_paths(
     }
 
     analyze_tokens(&shell_words(command), working_dir)
+}
+
+// ───────────────────────────────────────────────────────────────────
+// detect_cd_target tests
+// ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod detect_cd_target_tests {
+    use super::detect_cd_target;
+
+    #[test]
+    fn bare_absolute_cd_is_persistent() {
+        assert_eq!(detect_cd_target("cd /tmp"), Some("/tmp".to_string()));
+        assert_eq!(
+            detect_cd_target("cd /home/user/proj"),
+            Some("/home/user/proj".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_relative_cd_is_persistent() {
+        assert_eq!(detect_cd_target("cd subdir"), Some("subdir".to_string()));
+        assert_eq!(
+            detect_cd_target("cd ../sibling"),
+            Some("../sibling".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_tilde_cd_is_persistent() {
+        assert_eq!(detect_cd_target("cd ~/proj"), Some("~/proj".to_string()));
+    }
+
+    #[test]
+    fn quoted_path_is_unwrapped() {
+        assert_eq!(
+            detect_cd_target(r#"cd "/tmp/a b""#),
+            Some("/tmp/a b".to_string())
+        );
+        assert_eq!(
+            detect_cd_target("cd '/tmp/a b'"),
+            Some("/tmp/a b".to_string())
+        );
+    }
+
+    #[test]
+    fn non_cd_returns_none() {
+        assert_eq!(detect_cd_target("ls /tmp"), None);
+        assert_eq!(detect_cd_target("cargo build"), None);
+        // Don't match `cdr` or `cdrom` either — must be `cd ` with space.
+        assert_eq!(detect_cd_target("cdr foo"), None);
+    }
+
+    // ── Bug repro: scoped `cd <path> && <rest>` was getting promoted ──
+    // The model emits `cd /tmp && wget X` meaning "this command only".
+    // The OS shell honours that (subshell), but the bash tool used to
+    // capture the cd and mutate ctx.working_dir, leaving the agent
+    // stranded in /tmp for every subsequent call. Treat any `cd` that
+    // has a chained continuation as scoped — only a *bare* `cd <path>`
+    // is a real intent to switch the persistent working directory.
+
+    #[test]
+    fn cd_chained_with_amp_amp_is_scoped() {
+        assert_eq!(detect_cd_target("cd /tmp && wget http://x"), None);
+        assert_eq!(detect_cd_target("cd subdir && cargo test"), None);
+        assert_eq!(detect_cd_target("cd ../sibling && git log"), None);
+    }
+
+    #[test]
+    fn cd_chained_with_semicolon_is_scoped() {
+        assert_eq!(detect_cd_target("cd /tmp; ls -la"), None);
+        assert_eq!(detect_cd_target("cd /tmp ;ls"), None);
+    }
+
+    #[test]
+    fn cd_chained_with_pipe_is_scoped() {
+        // `cd /tmp | tee` is nonsensical but real models do produce it
+        // accidentally; still must not persist.
+        assert_eq!(detect_cd_target("cd /tmp | tee out.log"), None);
+        assert_eq!(detect_cd_target("cd /tmp || echo fail"), None);
+    }
 }

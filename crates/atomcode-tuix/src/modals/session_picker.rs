@@ -228,6 +228,8 @@ impl Modal for SessionPicker {
                             ctx.telemetry.set_session_id(uuid);
                         }
                         ctx.current_session = session;
+                        ctx.bg_manager
+                            .set_foreground_session(ctx.current_session.clone());
                         state.on_turn_complete();
                         Ok(ModalAction::Close)
                     }
@@ -342,8 +344,9 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
     if reset {
         renderer.reset();
     }
+    let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel { name: &session.name }).into_owned();
     renderer.render(UiLine::TurnSeparator {
-        label: crate::i18n::t(crate::i18n::Msg::SessionResumedLabel { name: &session.name }).into_owned(),
+        label: resumed.clone(),
     });
     for m in &session.messages {
         match (&m.role, &m.content) {
@@ -391,6 +394,9 @@ pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, res
         }
     }
     renderer.render(UiLine::TurnComplete);
+    renderer.render(UiLine::TurnSeparator {
+        label: resumed,
+    });
     renderer.flush();
 }
 
