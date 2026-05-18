@@ -1698,6 +1698,9 @@ async fn run_headless(
             AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
                 eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
             }
+            AgentEvent::MessagesSync { .. } => {
+                // Only used by TUI for /bg session persistence; ignore in CLI.
+            }
         }
     }
 

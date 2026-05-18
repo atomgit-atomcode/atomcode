@@ -925,7 +925,7 @@ impl TurnRunner {
             // Dup-in-batch was already short-circuited above (before the
             // ToolCallStarted emit), so by the time we reach here this is
             // a real, non-duplicate call to execute.
-            let result = self.execute_single_tool(call, event_tx, &cancel).await;
+            let result = self.execute_single_tool(call, event_tx, &cancel, &conversation.messages).await;
             if active_batch_id.is_some() && result.success {
                 batch_ok_count += 1;
             }
@@ -1065,6 +1065,7 @@ impl TurnRunner {
         call: &ToolCall,
         event_tx: &mpsc::UnboundedSender<TurnEvent>,
         cancel: &CancellationToken,
+        conversation_messages: &[crate::conversation::message::Message],
     ) -> ToolResult {
         // Auto-fix common tool name aliases (models trained on other agents use different names)
         // Case-insensitive matching: models may output "Run", "Bash", "Edit_File", etc.
@@ -1187,6 +1188,16 @@ impl TurnRunner {
         if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
         | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
         {
+            // Emit an informational event carrying a snapshot of
+            // conversation.messages so the TUI can persist mid-turn
+            // session state (e.g. for `/bg`).
+            let _ = event_tx.send(TurnEvent::ApprovalRequested {
+                tool_name: call.name.clone(),
+                reason: reason.clone(),
+                call: call.clone(),
+                messages: conversation_messages.to_vec(),
+            });
+
             let decision = self.permission.decide(call, reason).await;
             if !matches!(decision, PermissionDecision::Allow) {
                 let output = format!("Tool '{}' was denied by the user.", call.name);

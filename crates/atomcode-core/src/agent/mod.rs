@@ -100,6 +100,12 @@ pub enum AgentCommand {
     /// or other change to plugin state. Cheap (just re-reads JSON files);
     /// does NOT touch provider/model state, unlike ReloadConfig.
     ReloadHooks,
+    /// Request a snapshot of the current conversation messages.
+    /// The agent responds with `AgentEvent::MessagesSync` carrying
+    /// `conversation.messages`. Used by the TUI before `/bg` to ensure
+    /// the session has up-to-date message history even when a turn is
+    /// still in progress (e.g. waiting for tool approval).
+    SyncMessages,
     /// Shutdown the agent.
     Shutdown,
 }
@@ -213,6 +219,11 @@ pub enum AgentEvent {
         tool_name: String,
         reason: String,
         call: ToolCall,
+        /// Snapshot of `conversation.messages` at the time the approval
+        /// request was raised. Lets the TUI persist mid-turn session
+        /// state (e.g. when `/bg` backgrounds a session that is waiting
+        /// for approval).
+        messages: Vec<crate::conversation::message::Message>,
     },
     /// Token usage update.
     TokenUsage(crate::stream::TokenUsage),
@@ -238,6 +249,13 @@ pub enum AgentEvent {
     /// The conversation has been cleaned up - partial messages removed.
     /// Contains the cleaned message list for TUI to sync.
     TurnCancelled {
+        messages: Vec<crate::conversation::message::Message>,
+    },
+    /// Response to `AgentCommand::SyncMessages`. Carries a snapshot of
+    /// `conversation.messages` at the time the agent processed the command.
+    /// Used by the TUI to sync session state before backgrounding a session
+    /// that is mid-turn (e.g. waiting for tool approval).
+    MessagesSync {
         messages: Vec<crate::conversation::message::Message>,
     },
     /// An error occurred.
@@ -1357,6 +1375,10 @@ impl AgentLoop {
                         std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
                     self.turn_runner.hook_executor = self.hook_executor.clone();
                 }
+                AgentCommand::SyncMessages => {
+                    let messages = self.conversation.messages.clone();
+                    let _ = self.event_tx.send(AgentEvent::MessagesSync { messages });
+                }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
                     if self.hook_executor.has_hooks() {
@@ -2071,18 +2093,27 @@ impl AgentLoop {
                                     // when the LLM is just navigating.
                                     let _ = event_tx.send(AgentEvent::WorkingDirChanged(new_dir));
                                 }
+                                TurnEvent::ApprovalRequested { tool_name, reason, call, messages } => {
+                                    // Forward approval request to TUI, including
+                                    // a snapshot of conversation.messages so the
+                                    // TUI can persist mid-turn session state.
+                                    let _ = event_tx.send(AgentEvent::ApprovalNeeded {
+                                        tool_name,
+                                        reason,
+                                        call,
+                                        messages,
+                                    });
+                                    *phase = AgentPhase::WaitingApproval;
+                                    let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
+                                }
                             }
                         }
 
                         Some(req) = approval_req_rx.recv() => {
-                            // Forward approval request to TUI
-                            let _ = event_tx.send(AgentEvent::ApprovalNeeded {
-                                tool_name: req.call.name.clone(),
-                                reason: req.reason.clone(),
-                                call: req.call.clone(),
-                            });
-                            *phase = AgentPhase::WaitingApproval;
-                            let _ = event_tx.send(AgentEvent::PhaseChange(AgentPhase::WaitingApproval));
+                            // The ApprovalNeeded event was already sent from the
+                            // TurnEvent::ApprovalRequested handler above (which
+                            // has access to conversation.messages).  Here we
+                            // only record the request for later approve/deny.
                             *last_approval_request = Some(req);
                         }
 
@@ -2123,6 +2154,9 @@ impl AgentLoop {
                                         *pending_input = Some(text);
                                     }
                                 }
+                                // SyncMessages is handled in the outer loop
+                                // (after turn completes) because `conv` is
+                                // mutably borrowed by `turn_fut` here.
                                 _ => {} // Other commands ignored during turn
                             }
                         }

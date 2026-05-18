@@ -170,6 +170,15 @@ impl BackgroundSlots {
                 bg.summary = session_summary(&bg.session);
                 true
             }
+            AgentEvent::ApprovalNeeded { messages, .. } => {
+                // Persist mid-turn messages so /bg <N> can replay the
+                // conversation even while the turn is still in progress.
+                if !messages.is_empty() {
+                    super::apply_session_messages(&mut bg.session, messages.clone());
+                    bg.summary = session_summary(&bg.session);
+                }
+                false
+            }
             AgentEvent::Error(_) => {
                 bg.state = RuntimeState::Error;
                 false

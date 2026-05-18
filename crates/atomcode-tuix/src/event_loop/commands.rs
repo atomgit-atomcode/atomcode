@@ -51,7 +51,10 @@ fn build_oauth_provider() -> ProviderConfig {
 }
 
 fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
-    if matches!(state.phase, crate::state::UiPhase::Streaming) {
+    if matches!(
+        state.phase,
+        crate::state::UiPhase::Streaming | crate::state::UiPhase::Approval
+    ) {
         bg_runtime::RuntimeState::Running
     } else {
         bg_runtime::RuntimeState::Idle
@@ -70,6 +73,41 @@ fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
     if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
         ctx.telemetry.set_session_id(uuid);
     }
+}
+
+/// Scan session messages for a pending tool approval — an
+/// `AssistantWithToolCalls` message whose tool calls lack corresponding
+/// `ToolResult` entries.  Returns `(display_name, detail)` of the first
+/// unpaired tool call, or `None` if all tool calls have results.
+fn find_pending_approval(session: &Session) -> Option<(String, String)> {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    use crate::event_loop::format_tool_detail;
+
+    // Collect all call_ids that already have a ToolResult.
+    let mut answered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in &session.messages {
+        if let (Role::Tool, MessageContent::ToolResult(r)) = (&m.role, &m.content) {
+            answered_ids.insert(r.call_id.clone());
+        }
+    }
+
+    // Walk messages in reverse to find the most recent unpaired tool call.
+    for m in session.messages.iter().rev() {
+        if let (
+            Role::Assistant,
+            MessageContent::AssistantWithToolCalls { tool_calls, .. },
+        ) = (&m.role, &m.content)
+        {
+            for tc in tool_calls.iter().rev() {
+                if !answered_ids.contains(&tc.id) {
+                    let display = super::display_tool_name(&tc.name);
+                    let detail = format_tool_detail(&tc.name, &tc.arguments);
+                    return Some((display, detail));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn short_task_name(task: &str) -> String {
@@ -95,6 +133,14 @@ fn spawn_runtime(
     (runtime_id, client, session)
 }
 
+/// Synchronise the current foreground session into `BgRuntimeManager`.
+///
+/// Mid-turn session state (including conversations where the agent is
+/// waiting for tool approval) is already persisted to
+/// `ctx.current_session` by `handle_agent_event` when it processes
+/// `AgentEvent::ApprovalNeeded` (which carries a snapshot of
+/// `conversation.messages`).  So by the time `/bg` runs,
+/// `ctx.current_session.messages` should be up-to-date.
 fn sync_bg_foreground(ctx: &mut LoopCtx) {
     ctx.bg_manager.set_foreground_runtime(
         ctx.foreground_runtime_id,
@@ -887,6 +933,18 @@ pub(super) fn execute_slash_command(
                         &ctx.current_session,
                         true,
                     );
+
+                    // If the resumed session was waiting for tool approval,
+                    // re-render the approval prompt so the user can
+                    // continue interacting.  Detect this by looking for
+                    // an AssistantWithToolCalls message whose tool_calls
+                    // lack corresponding ToolResult entries.
+                    let pending_approval = find_pending_approval(&ctx.current_session);
+                    if let Some((tool_name, detail)) = pending_approval {
+                        renderer.render(UiLine::ApprovalPrompt { tool: tool_name, detail });
+                        state.on_approval_needed("");
+                    }
+
                     let mut msg = format!(
                         "  Resumed background [#{}] {}\n",
                         slot,

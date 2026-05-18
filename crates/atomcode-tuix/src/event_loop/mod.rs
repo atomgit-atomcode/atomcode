@@ -4223,6 +4223,14 @@ fn handle_idle_key(
                 }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                } else if matches!(app.state.phase, UiPhase::Approval) {
+                    // After /bg <N> resume into an approval-waiting session,
+                    // redraw the footer with an empty input box. Don't use
+                    // draw_spinner_now because spinner_label was cleared by
+                    // on_turn_complete() — it would show "◓ …" which is
+                    // misleading. The next agent event (ApprovalNeeded /
+                    // TurnComplete) will update the footer naturally.
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 }
                 // Slash commands don't consume pastes (they take a
                 // single short arg, not a pasted body), but the submit
@@ -5282,8 +5290,16 @@ fn handle_agent_event(
             let _ = name;
         }
         AgentEvent::ApprovalNeeded {
-            tool_name, call, ..
+            tool_name, call, messages, ..
         } => {
+            // Persist mid-turn messages to session so /bg can recover
+            // the conversation even when the turn hasn't finished yet.
+            if !messages.is_empty() {
+                apply_session_messages(&mut ctx.current_session, messages);
+                ctx.bg_manager
+                    .set_foreground_session(ctx.current_session.clone());
+            }
+
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
             // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
@@ -5829,6 +5845,16 @@ fn handle_agent_event(
                 renderer.render(UiLine::Error(body));
             }
             renderer.flush();
+        }
+        AgentEvent::MessagesSync { messages } => {
+            // Response to AgentCommand::SyncMessages. Persist the
+            // snapshot to the current session so /bg can recover
+            // the conversation state.
+            if !messages.is_empty() {
+                apply_session_messages(&mut ctx.current_session, messages);
+                ctx.bg_manager
+                    .set_foreground_session(ctx.current_session.clone());
+            }
         }
     }
 }

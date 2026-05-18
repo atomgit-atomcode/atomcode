@@ -2273,6 +2273,11 @@ async fn process_chat_request(
                 // `ctx.working_dir` was already updated in the tool. Clients
                 // that need the cwd can read it from subsequent tool output.
             }
+            TurnEvent::ApprovalRequested { .. } => {
+                // ApprovalRequested is TUI-only (carries conversation.messages
+                // for /bg session persistence). Daemon mode handles approval
+                // via the PermissionDecider channel directly.
+            }
         }
     }
 
