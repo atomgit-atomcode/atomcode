@@ -32,7 +32,7 @@ use super::{LlmProvider, ReasoningPolicy};
 ///
 /// `override_auth` is a test seam: production callers pass `None` and
 /// the function reads `get_stored_auth()`.
-pub(crate) fn build_codingplan_headers(
+fn build_codingplan_headers(
     base_url: &str,
     body_bytes: &[u8],
     override_auth: Option<(&str, &str)>,
@@ -46,10 +46,7 @@ pub(crate) fn build_codingplan_headers(
         Some((uid, tok)) => (uid, tok),
         None => {
             let auth = get_stored_auth().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} (no stored credentials; please run /login)",
-                    t(Msg::CpOfficialBuildRequired)
-                )
+                anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired))
             })?;
             user_id_string = auth.user.id.clone();
             token_string = auth.access_token.clone();
@@ -58,10 +55,7 @@ pub(crate) fn build_codingplan_headers(
     };
 
     if user_id.is_empty() || oauth_token.is_empty() {
-        return Err(anyhow::anyhow!(
-            "{} (incomplete credentials; please re-run /login)",
-            t(Msg::CpOfficialBuildRequired)
-        ));
+        return Err(anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired)));
     }
 
     let path = url::Url::parse(base_url)
