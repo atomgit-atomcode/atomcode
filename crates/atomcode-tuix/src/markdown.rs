@@ -711,35 +711,63 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_block_renders_as_plain_indented_code() {
-        // CC-style: code blocks are plain text with a 2-space
-        // left margin and default foreground colour. No `│` gutter
-        // (turns to mojibake on Windows cmd.exe under non-UTF-8
-        // codepage), no bold+bright white, no truecolor blue. Pin
-        // the shape so a future "let's add a fancy bar" refactor
-        // catches itself in CI.
+    fn fenced_code_block_colors_off_renders_plain_indented() {
+        // With NO_COLOR / non-TTY caps, code blocks remain plain 2-space-indented
+        // text with NO ANSI bytes. Pins the no-color invariant.
         let mut state = MdState::new();
-        let _ = render_line("```", &mut state, caps()); // open fence
-        let inside = render_line("let x = 1;", &mut state, caps()).unwrap_or_default();
+        let _ = render_line("```", &mut state, plain_caps()); // open fence, no lang
+        assert!(render_line("let x = 1;", &mut state, plain_caps()).is_none());
+        let out = render_line("```", &mut state, plain_caps()).unwrap();
         assert!(
-            inside.contains("  let x = 1;"),
-            "fenced code body should appear with 2-space indent: {:?}",
-            inside
+            out.contains("  let x = 1;"),
+            "code body must appear with 2-space indent: {:?}",
+            out
         );
         assert!(
-            !inside.contains('│'),
-            "fenced code block must NOT emit `│` left bar (Windows cmd compat): {:?}",
-            inside
+            !out.contains('\x1b'),
+            "colors-off must emit zero ANSI bytes: {:?}",
+            out
+        );
+        assert!(!out.contains('│'), "no `│` gutter glyph: {:?}", out);
+    }
+
+    #[test]
+    fn fenced_code_block_colors_on_emits_truecolor_for_known_lang() {
+        // With colors enabled and a known language tag, the close-fence
+        // flush must include at least one truecolor SGR (theme color).
+        // We don't assert exact bytes — the palette is intentionally
+        // free to evolve in `highlight::theme`.
+        let mut state = MdState::new();
+        let _ = render_line("```rust", &mut state, caps());
+        assert!(render_line("fn main() {}", &mut state, caps()).is_none());
+        let out = render_line("```", &mut state, caps()).unwrap();
+        assert!(out.contains("  "), "indent preserved: {:?}", out);
+        assert!(
+            out.contains("\x1b[38;2;"),
+            "expected at least one truecolor SGR, got: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_unknown_lang_falls_back_to_plain_indent() {
+        // Unknown lang tag → syntect's find_syntax_by_token returns None
+        // → dispatch falls through to plain indent. No ANSI emitted even
+        // though caps.colors is true. Matches the design's "no fallback
+        // module" decision (syntect's lookup is the gate).
+        let mut state = MdState::new();
+        let _ = render_line("```frobnicate", &mut state, caps());
+        assert!(render_line(r#"x = "hello""#, &mut state, caps()).is_none());
+        let out = render_line("```", &mut state, caps()).unwrap();
+        assert!(
+            out.contains(r#"x = "hello""#),
+            "unknown-lang body must survive verbatim: {:?}",
+            out
         );
         assert!(
-            !inside.contains("\x1b[1;97m"),
-            "fenced code block must NOT bold+bright-white the content: {:?}",
-            inside
-        );
-        assert!(
-            !inside.contains("\x1b[1;38;2;"),
-            "fenced code block must NOT truecolor-blue the content: {:?}",
-            inside
+            !out.contains("\x1b["),
+            "unknown lang must emit zero ANSI: {:?}",
+            out
         );
     }
 
@@ -777,17 +805,34 @@ mod tests {
     }
 
     #[test]
-    fn fence_toggles_state_and_hides() {
+    fn fence_toggles_state_open_close_with_buffering() {
+        // Updated for buffer-and-flush:
+        //   - open fence sets in_code_block, returns None (no body yet)
+        //   - body lines return None and accumulate to code_buf
+        //   - inline markdown inside a buffered line is preserved verbatim
+        //     (we flush as code, not as inline markdown)
+        //   - close fence flushes everything, resets state, returns Some(...)
         let mut st = MdState::new();
-        assert!(render_line("```rust", &mut st, caps()).is_none());
+        assert!(render_line("```rust", &mut st, plain_caps()).is_none());
         assert!(st.in_code_block);
-        let inside = render_line("let x = 1;", &mut st, caps()).unwrap();
-        assert!(inside.contains("let x = 1;"));
-        // Inside code block, inline markdown is NOT parsed
-        let inside2 = render_line("**not bold**", &mut st, caps()).unwrap();
-        assert!(inside2.contains("**not bold**"));
-        assert!(render_line("```", &mut st, caps()).is_none());
+
+        // Body lines are buffered, not emitted.
+        assert!(render_line("let x = 1;", &mut st, plain_caps()).is_none());
+        assert!(render_line("**not bold**", &mut st, plain_caps()).is_none());
+        assert_eq!(st.code_buf.len(), 2);
+
+        // Close fence flushes — final output contains both body lines,
+        // and the **not bold** markdown is preserved literally (not interpreted).
+        // Using plain_caps so substring assertions aren't broken by ANSI interleave.
+        let out = render_line("```", &mut st, plain_caps()).unwrap();
+        assert!(out.contains("let x = 1;"));
+        assert!(
+            out.contains("**not bold**"),
+            "inline markdown inside code must be preserved literally: {:?}",
+            out
+        );
         assert!(!st.in_code_block);
+        assert!(st.code_buf.is_empty());
     }
 
     #[test]

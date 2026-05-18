@@ -2550,29 +2550,38 @@ mod tests {
         drop(r);
     }
 
-    /// Phase 3.5: code fences toggle md_state. A ```fenced``` block
-    /// keeps subsequent lines in code-block mode (no inline markdown
-    /// applied). The fence line itself returns None from render_line
-    /// (no body row pushed for the ```fence``` line) but `body_dirty`
-    /// is still set on subsequent content.
+    /// Phase 3.5 (updated for buffer-and-flush): a ```fenced``` block now
+    /// buffers body lines until close fence. The fence-open line and each
+    /// body line return None (no body row pushed). The close fence flushes
+    /// the whole block as a single body row containing all lines (with
+    /// per-line indent).
     #[test]
     fn fenced_code_block_state_carries_across_streaming_chunks() {
         let mut buf = Vec::new();
         let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+
         r.render(UiLine::AssistantText("```rust\n".into()));
-        // Fence line itself doesn't render — md_state.in_code_block
-        // flips to true, no body row pushed.
+        // Fence-open line doesn't render — md_state.in_code_block flips on,
+        // no body row pushed and no body_dirty for an empty fence.
         assert_eq!(r.body_lines.len(), 0, "fence-open line must not push");
         assert!(r.md_state.in_code_block, "code-block state must flip on");
 
         r.render(UiLine::AssistantText("let x = 1;\n".into()));
-        assert_eq!(r.body_lines.len(), 1, "code line pushed");
-        // Code-block state still on — next line should still be in code.
+        // Buffered — no body row pushed yet, code_buf has 1 entry, state still on.
+        assert_eq!(
+            r.body_lines.len(),
+            0,
+            "body line inside open fence must buffer, not push"
+        );
+        assert_eq!(r.md_state.code_buf.len(), 1, "code_buf must hold the body line");
         assert!(r.md_state.in_code_block);
 
         r.render(UiLine::AssistantText("```\n".into()));
-        // Fence-close, state flips back.
+        // Close fence flushes — state off, code_buf empty, at least one body row
+        // pushed containing the flushed (highlighted-or-plain) block.
         assert!(!r.md_state.in_code_block, "code-block state must flip off");
+        assert!(r.md_state.code_buf.is_empty(), "code_buf must be drained");
+        assert!(r.body_lines.len() >= 1, "close fence must flush at least one body row");
         drop(r);
     }
 
