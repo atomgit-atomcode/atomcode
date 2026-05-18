@@ -13,7 +13,97 @@ use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
 
+use crate::auth::oauth::get_stored_auth;
+use crate::coding_plan::crypto::{self, SignError, SignInput};
+use crate::i18n::{t, Msg};
+
 use super::{LlmProvider, ReasoningPolicy};
+
+/// Compute the signing headers (if any) for an outbound request.
+///
+/// Returns:
+/// - `Ok(vec![])` — host doesn't require signing (the common case for
+///   user-configured providers); caller proceeds unchanged.
+/// - `Ok(non-empty)` — host requires signing; caller merges these
+///   headers onto the request before `.send().await`.
+/// - `Err(_)` — host requires signing but we cannot produce a valid
+///   signature (signer unavailable, no stored auth, etc.). Caller
+///   surfaces the error to the user.
+///
+/// `override_auth` is a test seam: production callers pass `None` and
+/// the function reads `get_stored_auth()`.
+pub(crate) fn build_codingplan_headers(
+    base_url: &str,
+    body_bytes: &[u8],
+    override_auth: Option<(&str, &str)>,
+) -> Result<Vec<(&'static str, String)>> {
+    if !crypto::is_atomgit_gateway(base_url) {
+        return Ok(Vec::new());
+    }
+
+    let (user_id_string, token_string);
+    let (user_id, oauth_token) = match override_auth {
+        Some((uid, tok)) => (uid, tok),
+        None => {
+            let auth = get_stored_auth().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} (no stored credentials; please run /login)",
+                    t(Msg::CpOfficialBuildRequired)
+                )
+            })?;
+            user_id_string = auth.user.id.clone();
+            token_string = auth.access_token.clone();
+            (user_id_string.as_str(), token_string.as_str())
+        }
+    };
+
+    if user_id.is_empty() || oauth_token.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{} (incomplete credentials; please re-run /login)",
+            t(Msg::CpOfficialBuildRequired)
+        ));
+    }
+
+    let path = url::Url::parse(base_url)
+        .ok()
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|| "/v1/chat/completions".to_string());
+    let path = if path.ends_with("/chat/completions") {
+        path
+    } else {
+        format!("{}/chat/completions", path.trim_end_matches('/'))
+    };
+
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|e| anyhow::anyhow!("nonce generation failed: {e}"))?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock before UNIX epoch: {e}"))?
+        .as_secs();
+
+    let input = SignInput {
+        method: "POST",
+        path: &path,
+        body: body_bytes,
+        oauth_token,
+        user_id,
+        timestamp_unix: ts,
+        nonce,
+    };
+
+    match crypto::signer().sign(input) {
+        Ok(out) => Ok(out.headers),
+        Err(SignError::Unavailable) => {
+            Err(anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired)))
+        }
+        Err(SignError::Derive(detail)) => Err(anyhow::anyhow!(
+            "{} (signing-key derivation: {})",
+            t(Msg::CpOfficialBuildRequired),
+            detail
+        )),
+    }
+}
 
 pub struct OpenAiProvider {
     client: Client,
@@ -474,6 +564,7 @@ impl LlmProvider for OpenAiProvider {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let provider_label = self.model.clone();
+        let base_url_for_signing = self.base_url.clone();
 
         tokio::spawn(async move {
             // Mid-stream retry: when the provider opens the stream but the
@@ -489,11 +580,30 @@ impl LlmProvider for OpenAiProvider {
             let mut attempt: u32 = 0;
             'retry: loop {
                 attempt += 1;
-                let request = client
+                let body_bytes = match serde_json::to_vec(&body) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx.send(Ok(StreamEvent::Error(format!(
+                            "Failed to serialize chat request body: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                let extra_headers = match build_codingplan_headers(&base_url_for_signing, &body_bytes, None) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = tx.send(Ok(StreamEvent::Error(format!("{e:#}"))));
+                        return;
+                    }
+                };
+                let mut request = client
                     .post(&url)
                     .header("Authorization", format!("Bearer {}", api_key))
                     .header("Content-Type", "application/json")
-                    .json(&body);
+                    .body(body_bytes);
+                for (name, value) in extra_headers {
+                    request = request.header(name, value);
+                }
 
                 let response = match crate::provider::retry::send_with_retry(request, &policy).await
                 {
@@ -1953,5 +2063,49 @@ mod tests {
             "real truncation must NOT be misclassified as Error: {:?}",
             events
         );
+    }
+}
+
+#[cfg(test)]
+mod codingplan_signing_tests {
+    use super::*;
+
+    #[test]
+    fn build_signed_headers_returns_empty_for_non_atomgit_host() {
+        let headers = build_codingplan_headers(
+            "https://api.openai.com/v1",
+            b"{}",
+            None,
+        )
+        .expect("non-atomgit host must not error");
+        assert!(headers.is_empty(), "got unexpected headers: {:?}", headers);
+    }
+
+    #[test]
+    fn build_signed_headers_errors_when_atomgit_host_in_open_source_build() {
+        // Open-source build: signer() is UnavailableSigner, so an
+        // atomgit-bound request must error with the localised hint.
+        let err = build_codingplan_headers(
+            "https://llm-api.atomgit.com/v1",
+            b"{}",
+            Some(("dummy-user-id", "dummy-token")),
+        )
+        .expect_err("open-source build must error out");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("official") || msg.contains("官方"),
+            "error message should mention the official-build requirement, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn build_signed_headers_errors_when_atomgit_host_with_empty_auth() {
+        let err = build_codingplan_headers(
+            "https://llm-api.atomgit.com/v1",
+            b"{}",
+            Some(("", "")),
+        )
+        .expect_err("empty auth must error");
+        assert!(!format!("{:#}", err).is_empty());
     }
 }
