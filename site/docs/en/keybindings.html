@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Keybindings · AtomCode Docs</title>
+<meta name="description" content="Every TUI keybinding for AtomCode: input, navigation, selection, control.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="keybindings">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.22.3</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Keybindings</h1>
+      <p class="lede">AtomCode's TUI is built on ratatui + crossterm; common keybindings stick close to the conventions of mainstream terminal tools. <code>/help</code> shows the full list at any time.</p>
+
+      <h2>Input editing</h2>
+      <table>
+        <thead>
+          <tr><th>Key</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>Enter</code></td><td>Send the message</td></tr>
+          <tr><td><code>Shift+Enter</code></td><td>Insert newline (requires Kitty keyboard protocol)</td></tr>
+          <tr><td><code>Ctrl+Enter</code></td><td>Insert newline (requires Kitty keyboard protocol)</td></tr>
+          <tr><td><code>Ctrl+J</code></td><td>Insert newline (requires Kitty keyboard protocol)</td></tr>
+          <tr><td><code>Alt+Enter</code></td><td>Insert newline (most terminals; Windows Terminal reserves it by default)</td></tr>
+          <tr><td><code>Esc</code></td><td>Clear current input / interrupt streaming output</td></tr>
+          <tr><td><code>↑ / ↓</code></td><td>Browse input history</td></tr>
+          <tr><td><code>Tab</code></td><td>Accept completion (slash-command menu, file paths, etc.)</td></tr>
+          <tr><td><code>Ctrl+U</code></td><td>Clear entire line</td></tr>
+          <tr><td><code>Ctrl+W</code></td><td>Delete a word</td></tr>
+          <tr><td><code>Ctrl+K</code></td><td>Delete from cursor to end of line</td></tr>
+          <tr><td><code>Ctrl+A</code></td><td>Move cursor to line start</td></tr>
+          <tr><td><code>Ctrl+E</code></td><td>Move cursor to line end</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Browse &amp; scroll</h2>
+      <table>
+        <thead>
+          <tr><th>Key</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>Ctrl+↑ / Ctrl+↓</code></td><td>Scroll the chat area (3 lines)</td></tr>
+          <tr><td><code>PageUp / PageDown</code></td><td>Scroll the chat area (one page)</td></tr>
+          <tr><td><code>Home / End</code></td><td>Jump to top / bottom of the conversation</td></tr>
+          <tr><td><code>Ctrl+L</code></td><td>Clear the current session's messages</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Selection &amp; copy</h2>
+      <table>
+        <thead>
+          <tr><th>Key / action</th><th>Effect</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Mouse drag</td><td>Select text in the chat area (auto-scrolls at selection edges)</td></tr>
+          <tr><td><code>Ctrl+Shift+C</code></td><td>Copy selection to system clipboard</td></tr>
+          <tr><td><code>/copy</code></td><td>Copy the AI's last complete reply</td></tr>
+          <tr><td>Right-click menu</td><td>Some terminals offer direct copy/paste (depends on the terminal, not atomcode)</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Control flow</h2>
+      <table>
+        <thead>
+          <tr><th>Key</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>Esc</code></td><td>Cancel the in-progress tool call or streaming output</td></tr>
+          <tr><td><code>Ctrl+C</code></td><td>First press cancels the current action; second consecutive press exits</td></tr>
+          <tr><td><code>Ctrl+D</code></td><td>Exits when the input box is empty</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Tool permission dialog</h2>
+      <p>When the model is about to execute a dangerous action (destructive bash, writing sensitive files, deleting source code, etc.), AtomCode pops a confirmation dialog:</p>
+      <table>
+        <thead>
+          <tr><th>Key</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>y</code> / <code>Enter</code></td><td>Allow once</td></tr>
+          <tr><td><code>a</code></td><td>Always allow this pattern for the current session</td></tr>
+          <tr><td><code>n</code> / <code>Esc</code></td><td>Deny</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-info">
+        <strong>Don't get greedy</strong>
+        <p>"Always allow" is granted per <em>tool name + argument pattern</em> and only for the current session — it resets next launch. For permanent cross-session exceptions, manage them in config (e.g. allowlists for specific paths).</p>
+      </div>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li><a href="./slash-commands.html">Slash Commands</a> — pair keybindings with command completion</li>
+        <li><a href="./sessions.html">Sessions &amp; Undo</a> — what <code>/undo</code> actually undoes</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

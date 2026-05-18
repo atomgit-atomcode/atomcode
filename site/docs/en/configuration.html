@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Configuration · AtomCode Docs</title>
+<meta name="description" content="AtomCode configuration reference: TOML schema, provider examples, vision preprocessor.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="configuration">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.22.3</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Configuration</h1>
+      <p class="lede">AtomCode's config is TOML, supports any number of providers side by side, and lets you switch on the fly. This page explains every field and shows examples for common providers.</p>
+
+      <h2>Config file location</h2>
+      <p>Default path:</p>
+      <ul>
+        <li>macOS / Linux / HarmonyOS PC: <code>~/.atomcode/config.toml</code></li>
+        <li>Windows: <code>%USERPROFILE%\.atomcode\config.toml</code></li>
+      </ul>
+      <p>You can also use <code>--config /path/to/config.toml</code> to point at any file. On the first run, if the file is missing, the 3-step wizard walks you through initial setup.</p>
+
+      <h2>Minimal example</h2>
+      <pre><code>default_provider = "deepseek"
+
+[providers.deepseek]
+type = "openai"
+api_key = "sk-xxxxxxxxxxxxxxxx"
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+context_window = 64000</code></pre>
+      <p>This config is enough to launch atomcode and start chatting with DeepSeek.</p>
+
+      <h2>Top-level fields</h2>
+      <table>
+        <thead>
+          <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>default_provider</code></td><td>string</td><td>Provider used at launch (must match a key under <code>[providers.*]</code>)</td></tr>
+          <tr><td><code>default_workdir</code></td><td>string?</td><td>Default working directory. <code>/cd</code> writes back here; restored next launch</td></tr>
+          <tr><td><code>providers</code></td><td>table</td><td>Map of provider name to <a href="#provider-config">ProviderConfig</a></td></tr>
+          <tr><td><code>vision_preprocessor_provider</code></td><td>string?</td><td>When the main provider can't see images but the user attaches one, forward it to this provider for OCR / description; the result is spliced back into the prompt as text. See <a href="#vision-preprocessor">Vision preprocessor</a></td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="provider-config">ProviderConfig fields</h2>
+      <p>Fields available under each <code>[providers.xxx]</code> table:</p>
+      <table>
+        <thead>
+          <tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>type</code></td><td>string</td><td>yes</td><td>Provider protocol — currently <code>openai</code>, <code>claude</code>, or <code>ollama</code></td></tr>
+          <tr><td><code>api_key</code></td><td>string?</td><td>conditional</td><td>API key. Optional for <code>ollama</code>. OAuth providers omit this — the token is read from <code>~/.atomcode/auth.toml</code> automatically</td></tr>
+          <tr><td><code>model</code></td><td>string</td><td>yes</td><td>Model name, e.g. <code>deepseek-chat</code>, <code>gpt-4o</code>, <code>claude-sonnet-4-6</code></td></tr>
+          <tr><td><code>base_url</code></td><td>string</td><td>yes</td><td>API base URL, pointing at the actual endpoint. e.g. <code>https://api.deepseek.com/v1</code>, <code>http://localhost:11434</code></td></tr>
+          <tr><td><code>context_window</code></td><td>integer</td><td>no</td><td>Model context window (tokens), default 64000. Default 8000 for <code>ollama</code></td></tr>
+          <tr><td><code>max_tokens</code></td><td>integer?</td><td>no</td><td>Max output tokens per response. Defaults to <code>context_window / 4</code> when unset</td></tr>
+          <tr><td><code>system_prompt</code></td><td>string?</td><td>no</td><td>Override the default system prompt. Rarely needed</td></tr>
+          <tr><td><code>user_agent</code></td><td>string?</td><td>no</td><td>Override the HTTP User-Agent — useful when the upstream blocks the default UA</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-info">
+        <strong>Why default to 64K instead of 128K?</strong>
+        <p>Even when a model advertises 128K+, its effective attention window is usually much smaller. An oversized context triggers "lost in the middle" failures and disables AtomCode's compaction strategy. 64K is empirically the most robust default; bump it yourself if your model is solid at higher values.</p>
+      </div>
+
+      <h2>Common provider examples</h2>
+
+      <h3>Claude (Anthropic)</h3>
+      <pre><code>[providers.claude]
+type = "claude"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-6"
+context_window = 128000</code></pre>
+
+      <h3>OpenAI</h3>
+      <pre><code>[providers.openai]
+type = "openai"
+api_key = "sk-..."
+model = "gpt-4o"
+context_window = 128000</code></pre>
+
+      <h3>DeepSeek</h3>
+      <pre><code>[providers.deepseek]
+type = "openai"
+api_key = "sk-..."
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+context_window = 64000</code></pre>
+
+      <h3>Zhipu GLM</h3>
+      <pre><code>[providers.glm]
+type = "openai"
+api_key = "..."
+model = "glm-4-plus"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+context_window = 128000</code></pre>
+
+      <h3>Tongyi Qianwen (Qwen)</h3>
+      <pre><code>[providers.qwen]
+type = "openai"
+api_key = "sk-..."
+model = "qwen-plus"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+context_window = 128000</code></pre>
+
+      <h3>SiliconFlow</h3>
+      <pre><code>[providers.siliconflow]
+type = "openai"
+api_key = "sk-..."
+model = "Qwen/Qwen2.5-72B-Instruct"
+base_url = "https://api.siliconflow.cn/v1"</code></pre>
+
+      <h3>Ollama (local)</h3>
+      <pre><code>[providers.ollama]
+type = "ollama"
+model = "llama3.2"
+base_url = "http://localhost:11434"
+context_window = 8000</code></pre>
+      <div class="callout callout-warn">
+        <strong>Heads up</strong>
+        <p>Function-calling support varies a lot across Ollama models; weaker local models may not invoke tools reliably. Prefer the Instruct variants of Qwen2.5 / Llama3.2.</p>
+      </div>
+
+      <h2>Multiple providers and quick switching</h2>
+      <p>Config files can host any number of providers in parallel:</p>
+      <pre><code>default_provider = "claude"
+
+[providers.claude]
+type = "claude"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-6"
+
+[providers.deepseek]
+type = "openai"
+api_key = "sk-..."
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+
+[providers.local]
+type = "ollama"
+model = "qwen2.5:14b"
+base_url = "http://localhost:11434"</code></pre>
+      <p>In the TUI, switch between entries with <code>/provider</code>, or switch only the model under the current provider with <code>/model</code>. The CLI also accepts one-shot overrides:</p>
+      <pre><code>atomcode --provider deepseek --model deepseek-reasoner</code></pre>
+
+      <h2 id="vision-preprocessor">Vision preprocessor</h2>
+      <p>When the active provider's model can't read images (text-only models like DeepSeek-V3 / Kimi) and the user <a href="./basic-usage.html#image-attach">attaches an image</a>, AtomCode doesn't refuse — it forwards the image to a separate "vision preprocessor" provider for OCR + description, then splices the resulting text into the user message before sending to the main model.</p>
+      <p>To enable: name an image-capable provider key as <code>vision_preprocessor_provider</code> in the config:</p>
+      <pre><code>default_provider = "deepseek"
+vision_preprocessor_provider = "qwen-vl"
+
+[providers.deepseek]
+type = "openai"
+api_key = "sk-..."
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+
+[providers.qwen-vl]
+type = "openai"
+api_key = "sk-..."
+model = "Qwen/Qwen3-VL-32B-Instruct"
+base_url = "https://api.siliconflow.cn/v1"</code></pre>
+      <ul>
+        <li><code>qwen-vl</code> must be an existing key under <code>[providers.*]</code>, and its model must support vision input (common ones: <code>Qwen3-VL-*</code> / <code>GLM-4V-*</code> / <code>claude-3+</code> / <code>gpt-4o</code> / <code>gemini-*</code>).</li>
+        <li>When the active provider can already see images, the preprocessor is <strong>skipped</strong> — the raw image bytes are sent directly.</li>
+        <li>The <code>/codingplan</code> flow auto-picks a VL/OCR model from the granted model list and writes this field for you (you can override afterwards).</li>
+        <li>VL calls use an <strong>idle timeout</strong>: no total cap as long as the stream keeps producing chunks; the request times out after 30 seconds with no activity. On failure the main model still receives a "vision recognition failed" notice rather than a silent drop.</li>
+      </ul>
+      <p>For usage-level details see <a href="./basic-usage.html#image-attach">Basic Usage · Image attachments / screenshots</a>.</p>
+
+      <h2>Three ways to edit the config</h2>
+      <ul>
+        <li><strong>Hand-edit</strong> — open <code>~/.atomcode/config.toml</code> in your favourite editor.</li>
+        <li><strong><code>/config</code> in the TUI</strong> — atomcode opens the config in your default editor.</li>
+        <li><strong><code>/provider</code> in the TUI</strong> — interactively add / edit / remove providers; changes are written back to disk.</li>
+      </ul>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li><a href="./login.html">Login Methods</a> — skip manual key management with AtomGit OAuth.</li>
+        <li><a href="./basic-usage.html">Basic Usage</a> — see how CLI flags can override config for one run.</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Basic Usage · AtomCode Docs</title>
+<meta name="description" content="CLI flags, how to phrase tasks, file references, multiline input, image attachments.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="basic-usage">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.22.3</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Basic Usage</h1>
+      <p class="lede">Get fluent with CLI flags, how to phrase tasks, how to give the model context, and how to move between several tasks.</p>
+
+      <h2>Launching</h2>
+      <pre><code># Launch the TUI in the current directory
+atomcode
+
+# Specify a working directory
+atomcode -C /path/to/project
+
+# Override provider / model for this run only
+atomcode --provider claude --model claude-sonnet-4-6
+
+# Continue the previous session
+atomcode -c
+atomcode --continue
+
+# Use a specific config file
+atomcode --config ./custom.toml</code></pre>
+
+      <h2>CLI flag reference</h2>
+      <table>
+        <thead>
+          <tr><th>Flag</th><th>Short</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>--dir PATH</code></td><td><code>-C</code></td><td>Working directory; defaults to the current directory</td></tr>
+          <tr><td><code>--continue</code></td><td><code>-c</code></td><td>Continue the previous session instead of starting a new one</td></tr>
+          <tr><td><code>--provider NAME</code></td><td>—</td><td>Override the default provider</td></tr>
+          <tr><td><code>--model NAME</code></td><td>—</td><td>Override the current provider's model</td></tr>
+          <tr><td><code>--config PATH</code></td><td>—</td><td>Use the given config file</td></tr>
+          <tr><td><code>--prompt TEXT</code></td><td><code>-p</code></td><td>Headless mode: one-shot execution, reply to stdout</td></tr>
+          <tr><td><code>--prompt-file PATH</code></td><td>—</td><td>Read prompt from file (useful for long input; mutually exclusive with <code>-p</code>)</td></tr>
+          <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>In headless mode, print tool calls and token usage to stderr</td></tr>
+          <tr><td><code>--max-turns N</code></td><td>—</td><td>Cap the number of agent loop iterations; prevents runaway loops</td></tr>
+          <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>Comma-separated tools to disable, e.g. <code>--disable-tools bash,web_fetch</code></td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p><code>--disable-tools</code> makes disabled tools completely invisible to the model (they don't appear in the schemas), so the model won't keep trying to call them. Useful for sandbox evals, offline environments, and CI without network.</p>
+      </div>
+
+      <h2>How to phrase tasks</h2>
+      <p>AtomCode's agent loop is only as good as the task description you provide. A few rules of thumb:</p>
+      <ul>
+        <li><strong>State goals, not steps</strong> — "Fix the 404 after login", not "Open src/auth/callback.ts, delete line 27, then…". The model has plenty of exploration ability.</li>
+        <li><strong>Name your constraints</strong> — say them out loud: "preserve API compatibility", "don't touch test files", "use TypeScript not JS".</li>
+        <li><strong>Provide a verification method</strong> — "after the fix, run <code>npm test</code> to confirm" lets the model close the self-verification loop.</li>
+        <li><strong>Discuss before editing</strong> — when direction is unclear, first ask it to "analyse this module and propose a refactor plan"; once aligned, let it implement.</li>
+      </ul>
+
+      <h2>Example tasks</h2>
+      <pre><code># Bug fix
+&gt; Fix the bug where users are redirected to 404 after OAuth callback; restore the original path after callback.
+
+# New feature
+&gt; Add a dark mode toggle to the settings page using Tailwind's dark: prefix, persisted in localStorage.
+
+# Refactor
+&gt; Refactor src/db/*.ts to use a connection pool while keeping the public API unchanged; run npm test after.
+
+# Tests
+&gt; Write unit tests for src/payment/processor.ts, covering all exception branches.
+
+# Code understanding
+&gt; Briefly explain this repo's directory layout, build entry point, and the responsibilities of the core modules.</code></pre>
+
+      <h2>Multiline input</h2>
+      <p>In the TUI:</p>
+      <ul>
+        <li><code>Enter</code> sends the message.</li>
+        <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> / <code>Ctrl+J</code> insert a newline (requires Kitty keyboard protocol: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21).</li>
+        <li><code>Alt+Enter</code> inserts a newline (works in most terminals, but Windows Terminal binds it to "toggle fullscreen" by default — unbind in settings).</li>
+        <li>The input area grows with content.</li>
+      </ul>
+
+      <h2 id="at-mention"><code>@</code> file references</h2>
+      <p>Type <code>@</code> in the input (preceded by whitespace or line start) to pop up a menu of files and directories in the project. This is the fastest way to point the model at a specific path — you handle locating, the model decides via <code>read_file</code> what to expand and how much to read.</p>
+
+      <h3>Interaction</h3>
+      <ul>
+        <li><strong>Trigger</strong> — <code>@</code> only triggers when preceded by whitespace or line start. A mid-string <code>@</code> like <code>email@host.com</code> won't pop the menu — avoiding accidental triggers.</li>
+        <li><strong>Filtering</strong> — type to substring-match (case-insensitive). <code>@cra</code> hits <code>crates/</code>; <code>@toml</code> hits every <code>*.toml</code>.</li>
+        <li><strong>Drill in</strong> — type <code>/</code> to enter a directory; the menu scopes to that directory. <code>@crates/</code> → <code>@crates/atomcode-cli/</code> → …</li>
+        <li><strong>Navigation</strong> — <code>↑</code> / <code>↓</code> move; <code>Enter</code> or <code>Tab</code> select; <code>Esc</code> closes without inserting.</li>
+        <li><strong>Insertion form</strong> — on select, the <code>@xxx</code> in the input is replaced with the <code>@full/relative/path</code> (directories get a trailing <code>/</code>) plus a trailing space; the cursor sits after the space, ready for more typing.</li>
+        <li><strong>Backspace to keep picking</strong> — delete the trailing space and the menu re-opens in place, handy for drilling further from the current directory.</li>
+      </ul>
+
+      <h3>Where candidates come from</h3>
+      <ul>
+        <li><strong>All files and directories</strong> under the project root — both files and dirs can be selected; dirs are marked with a trailing <code>/</code>.</li>
+        <li><strong>Honours <code>.gitignore</code></strong> (and global ignore, <code>.git/info/exclude</code>); ignored paths never appear.</li>
+        <li><strong><code>.git/</code> internals are excluded</strong> — almost nobody wants to <code>@</code>-reference git metadata.</li>
+        <li><strong>Dotfiles stay</strong> — <code>.env</code>, <code>.atomcode.md</code>, and other dot-prefixed files are matchable (provided gitignore doesn't suppress them).</li>
+        <li><strong>Cross-level fuzzy matching</strong> — once you start typing a filter, matches reach across directory levels (not just the current scope's direct children). With an empty filter only the current scope's direct children are shown.</li>
+        <li><strong>Ordering</strong>: direct children of the current scope first → directories before files → alphabetical.</li>
+      </ul>
+
+      <h3>What it means for the model</h3>
+      <p>On submit, <code>@crates/atomcode-cli/src/main.rs</code> is sent to the model as <strong>literal text</strong> — AtomCode does <em>not</em> read and inline the file content in the frontend. The model sees the path and decides to call the built-in <code>read_file</code> tool as needed. Benefits:</p>
+      <ul>
+        <li>Large files don't get blindly stuffed into context — the token budget stays predictable.</li>
+        <li>When you reference a directory, the model can <code>list</code> first and then read selectively.</li>
+        <li>Re-referencing the same path doesn't inline the content twice.</li>
+      </ul>
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>If you want to force a file's contents into the conversation directly (e.g. a tight code review where you don't want another <code>read_file</code> round trip), use paste — drop the content into the input. Bracketed paste collapses it to an <em>[paste #N]</em> placeholder and ships the full payload on submit.</p>
+      </div>
+
+      <h3>Limits</h3>
+      <ul>
+        <li>The candidate menu shows at most <strong>30 entries</strong>; typing more filter characters narrows the results.</li>
+        <li><strong>Paths with spaces don't appear in candidates</strong> — the <code>@</code> reference uses whitespace as a terminator.</li>
+        <li>The file index is built <strong>once per session</strong>; files created during the session don't appear until you switch sessions or restart.</li>
+        <li>Symlinks are not followed.</li>
+        <li>No size or type filtering — every non-ignored file shows up.</li>
+      </ul>
+
+      <h2>Pasting long text</h2>
+      <p>AtomCode supports bracketed paste. When you paste a chunky block (e.g. a wall of logs), the TUI collapses it to a compact <em>[paste #N · 132 lines]</em> indicator so the input doesn't blow up. The full payload is sent on submit.</p>
+
+      <h2 id="image-attach">Image attachments / screenshots</h2>
+      <p>Beyond text, you can also drop <strong>images</strong> into the conversation — error screenshots, UI mocks, whiteboard photos. AtomCode offers three entry points:</p>
+      <ul>
+        <li><strong>Ctrl+V</strong> — when the system clipboard holds an image (you just <code>Cmd+Shift+4</code>-captured something, copied an image from a browser, etc.), Ctrl+V attaches it directly. This is the fallback for macOS + iTerm2 where Cmd+V doesn't forward the image to the PTY, and works in any terminal.</li>
+        <li><strong>Cmd+V (macOS / iTerm2, with one-time setup)</strong> — iTerm2 → Settings → Profiles → Keys → Key Mappings, map <code>⌘V</code> to <code>Send Hex Codes: 0x16</code>; from then on Cmd+V == Ctrl+V.</li>
+        <li><strong>Finder drag / iTerm2 path drop</strong> — drag an image onto the terminal window; iTerm2 / WezTerm and friends paste the file path as plaintext. AtomCode recognises an absolute path + <code>.png</code> / <code>.jpg</code> / <code>.jpeg</code> / <code>.gif</code> / <code>.webp</code> extension + existing file + size ≤ 20MB, and attaches it automatically. The raw path string is removed from the input.</li>
+      </ul>
+      <p>On a successful attach, an <code>[Image #N]</code> marker is inserted in the input; the bytes ride along with the message on submit. The status bar also shows <em>Image in clipboard · ctrl+v to paste</em> when an unpasted image is sitting in the clipboard.</p>
+
+      <h3>How non-vision models handle images</h3>
+      <p>When the active provider can't take image input (text-only models like DeepSeek-V3 / Kimi), AtomCode doesn't refuse — it routes the image to a separate <strong>VL preprocessor</strong> (a vision model like Qwen3-VL / GLM-4V) for OCR + description, then splices the result into the user message as text before sending to the main model. So you can "drop a screenshot and ask" regardless of the main model.</p>
+      <ul>
+        <li>Which model does the preprocessor use? Controlled by <code>vision_preprocessor_provider</code> in the config — see <a href="./configuration.html#vision-preprocessor">Configuration · Vision preprocessor</a>.</li>
+        <li>The <code>/codingplan</code> flow auto-picks a VL/OCR model from the granted list and sets the field for you.</li>
+        <li>VL calls use an <strong>idle timeout</strong>: as long as the stream keeps producing chunks there's no total cap; it only times out after 30 seconds of silence. On failure you get a <em>VL preprocess failed</em> warning — image recognition fails but the message still goes through.</li>
+      </ul>
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>If the current model supports vision (Claude 3+ / GPT-4o / Gemini / Qwen-VL, etc.), the raw image bytes are sent directly — the preprocessor is skipped.</p>
+      </div>
+
+      <h2>Switching sessions and directories</h2>
+      <ul>
+        <li><code>/resume</code> — switch between or restore previous sessions</li>
+        <li><code>/session</code> — start a clean session</li>
+        <li><code>/cd</code> or just type <code>cd /path</code> — switch working directory (status bar updates live)</li>
+        <li><code>/clear</code> — clear messages in the current session</li>
+        <li><code>/compact</code> — compact history to free up context budget</li>
+      </ul>
+      <p>Full behaviour at <a href="./sessions.html">Sessions &amp; Undo</a>.</p>
+
+      <h2>Inspecting cost and diff</h2>
+      <ul>
+        <li><code>/cost</code> — token output for this session plus context usage (estimated when the API doesn't report usage)</li>
+        <li><code>/diff</code> — git diff of uncommitted changes in the working directory</li>
+        <li><code>/undo</code> — roll back every file edit from the last turn</li>
+      </ul>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li><a href="./slash-commands.html">Slash Commands</a> — full reference for the 30+ commands</li>
+        <li><a href="./keybindings.html">Keybindings</a> — fluency at the keyboard pays off quickly</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>
