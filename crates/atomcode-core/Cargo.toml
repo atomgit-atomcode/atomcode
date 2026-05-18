@@ -42,6 +42,7 @@ bincode = "1"
 encoding_rs = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
+thiserror = "1"
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 
 # Non-blocking poll on stdin in the OAuth callback path so the stdin
