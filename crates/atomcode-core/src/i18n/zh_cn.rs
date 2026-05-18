@@ -88,12 +88,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpSignStaleClockSkew => Cow::Borrowed(
             "请求被服务端拒绝：签名时间戳已过期。请校准本地系统时间（NTP 同步）后重试。",
         ),
-        Msg::CpSignReplayRetrying => Cow::Borrowed(
-            "请求被识别为重放，正在使用新的 nonce 自动重试\u{2026}",
+        Msg::CpSignReplayPersisted => Cow::Borrowed(
+            "请求多次被识别为重放，请重新运行命令。",
         ),
         Msg::CpSignVersionTooOld => Cow::Borrowed(
-            "当前 AtomCode 版本过旧，签名方案已被服务端弃用。\
-             请升级 AtomCode 后继续使用 CodingPlan。",
+            "当前 AtomCode 版本过旧，已不兼容 CodingPlan。请升级 AtomCode 后继续使用。",
         ),
         Msg::CpUpgradeRequired => Cow::Borrowed(
             "需要升级才能继续使用 CodingPlan，请前往官方发布页安装最新版 AtomCode。",
@@ -777,8 +776,8 @@ mod codingplan_crypto_tests {
     }
 
     #[test]
-    fn zh_replay_retrying_is_non_empty() {
-        let s = zh_cn(Msg::CpSignReplayRetrying);
+    fn zh_replay_persisted_is_non_empty() {
+        let s = zh_cn(Msg::CpSignReplayPersisted);
         assert!(!s.is_empty());
     }
 

@@ -93,12 +93,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Request rejected: signed timestamp outside the accepted window. \
              Please check your system clock (NTP sync) and retry.",
         ),
-        Msg::CpSignReplayRetrying => Cow::Borrowed(
-            "Request was flagged as a replay; retrying with a fresh nonce\u{2026}",
+        Msg::CpSignReplayPersisted => Cow::Borrowed(
+            "Request was repeatedly flagged as a replay. Please try the command again.",
         ),
         Msg::CpSignVersionTooOld => Cow::Borrowed(
-            "AtomCode is outdated for the current signing scheme. \
-             Please upgrade AtomCode to continue using CodingPlan.",
+            "AtomCode is out of date and no longer compatible with CodingPlan. \
+             Please upgrade AtomCode to continue.",
         ),
         Msg::CpUpgradeRequired => Cow::Borrowed(
             "An upgrade is required to continue using CodingPlan. \
@@ -789,8 +789,8 @@ mod codingplan_crypto_tests {
     }
 
     #[test]
-    fn en_replay_retrying_is_non_empty() {
-        let s = en(Msg::CpSignReplayRetrying);
+    fn en_replay_persisted_is_non_empty() {
+        let s = en(Msg::CpSignReplayPersisted);
         assert!(!s.is_empty());
     }
 

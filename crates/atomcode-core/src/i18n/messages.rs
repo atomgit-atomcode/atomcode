@@ -74,10 +74,10 @@ pub enum Msg<'a> {
     /// timestamp is outside the ±5min window the gateway accepts.
     /// Typically caused by an unsynced local clock.
     CpSignStaleClockSkew,
-    /// Server returned `ATOMCODE_SIG_REPLAY` — nonce collided with one
-    /// seen in the last 5 minutes. The client retries once with a
-    /// fresh nonce; this message surfaces only if the retry also fails.
-    CpSignReplayRetrying,
+    /// Server returned `ATOMCODE_SIG_REPLAY` even after the client's
+    /// one automatic retry with a fresh nonce. Surface a "please retry
+    /// the command" hint — usually self-heals on the next attempt.
+    CpSignReplayPersisted,
     /// Server returned `ATOMCODE_SIG_INVALID` AND the alg_version is
     /// no longer in the server's `accepted_versions` set — the client
     /// binary is too old. Force-upgrade hint.
