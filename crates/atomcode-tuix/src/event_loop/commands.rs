@@ -849,10 +849,9 @@ pub(super) fn execute_slash_command(
                 bg_runtime::BgCommand::BackgroundCurrent => {
                     sync_bg_foreground(ctx);
                     if !ctx.bg_manager.has_capacity() {
-                        renderer.render(UiLine::Error(format!(
-                            "background slot limit reached ({})",
-                            bg_runtime::MAX_BACKGROUND_SLOTS
-                        )));
+                        renderer.render(UiLine::Error(
+                            t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                        ));
                         renderer.flush();
                         return Ok(());
                     }
@@ -869,9 +868,9 @@ pub(super) fn execute_slash_command(
                     ) {
                         Ok(slot) => slot,
                         Err(bg_runtime::BgError::SlotLimit { max }) => {
-                            renderer.render(UiLine::Error(format!(
-                                "background slot limit reached ({max})"
-                            )));
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgSlotLimitReached { max }).into_owned(),
+                            ));
                             renderer.flush();
                             return Ok(());
                         }
@@ -885,13 +884,14 @@ pub(super) fn execute_slash_command(
                     state.on_turn_complete();
                     renderer.reset();
                     render_welcome(renderer, ctx);
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  New foreground session [{}]\n  Background: [#{}] {} (state: {})\n",
-                        new_short_id,
-                        slot,
-                        old_short_id,
-                        old_state.as_str()
-                    )));
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::BgBackgroundCurrent {
+                            new_id: &new_short_id,
+                            slot,
+                            old_id: &old_short_id,
+                            state: &old_state.localised(),
+                        }).into_owned(),
+                    ));
                 }
                 bg_runtime::BgCommand::Resume(slot) => {
                     sync_bg_foreground(ctx);
@@ -901,23 +901,23 @@ pub(super) fn execute_slash_command(
                     {
                         Ok(outcome) => outcome,
                         Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
-                            renderer.render(UiLine::Error(format!(
-                                "invalid background slot {slot} (available: {len})"
-                            )));
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                            ));
                             renderer.flush();
                             return Ok(());
                         }
                         Err(bg_runtime::BgError::SlotLimit { max }) => {
-                            renderer.render(UiLine::Error(format!(
-                                "background slot limit reached ({max})"
-                            )));
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgSlotLimitReached { max }).into_owned(),
+                            ));
                             renderer.flush();
                             return Ok(());
                         }
                     };
                     let Some(client) = outcome.resumed_client else {
                         renderer.render(UiLine::Error(
-                            "background slot has no runtime client".to_string(),
+                            t(Msg::BgNoRuntimeClient).into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
@@ -945,16 +945,10 @@ pub(super) fn execute_slash_command(
                         state.on_approval_needed("");
                     }
 
-                    let mut msg = format!(
-                        "  Resumed background [#{}] {}\n",
-                        slot,
-                        ctx.current_session.short_id()
-                    );
+                    let short_id = ctx.current_session.short_id().to_string();
+                    let mut msg = t(Msg::BgResumed { slot, short_id: &short_id }).into_owned();
                     if let Some(previous_slot) = outcome.previous_foreground_slot {
-                        msg.push_str(&format!(
-                            "  Previous foreground moved to [#{}]\n",
-                            previous_slot
-                        ));
+                        msg.push_str(&t(Msg::BgPreviousForegroundMoved { slot: previous_slot }).into_owned());
                     }
                     renderer.render(UiLine::CommandOutput(msg));
                 }
@@ -962,9 +956,9 @@ pub(super) fn execute_slash_command(
                     let dropped = match ctx.bg_manager.drop_slot(slot) {
                         Ok(dropped) => dropped,
                         Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
-                            renderer.render(UiLine::Error(format!(
-                                "invalid background slot {slot} (available: {len})"
-                            )));
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                            ));
                             renderer.flush();
                             return Ok(());
                         }
@@ -978,11 +972,10 @@ pub(super) fn execute_slash_command(
                     if !dropped.session.messages.is_empty() {
                         let _ = ctx.session_manager.save(&dropped.session);
                     }
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  Dropped background [#{}] {}\n",
-                        slot,
-                        dropped.session.short_id()
-                    )));
+                    let short_id = dropped.session.short_id().to_string();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::BgDropped { slot, short_id: &short_id }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -999,10 +992,9 @@ pub(super) fn execute_slash_command(
                 return Ok(());
             }
             if !ctx.bg_manager.has_capacity() {
-                renderer.render(UiLine::Error(format!(
-                    "background slot limit reached ({})",
-                    bg_runtime::MAX_BACKGROUND_SLOTS
-                )));
+                renderer.render(UiLine::Error(
+                    t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                ));
                 renderer.flush();
                 return Ok(());
             }
@@ -1018,9 +1010,9 @@ pub(super) fn execute_slash_command(
             ) {
                 Ok(slot) => slot,
                 Err(bg_runtime::BgError::SlotLimit { max }) => {
-                    renderer.render(UiLine::Error(format!(
-                        "background slot limit reached ({max})"
-                    )));
+                    renderer.render(UiLine::Error(
+                        t(Msg::BgSlotLimitReached { max }).into_owned(),
+                    ));
                     renderer.flush();
                     return Ok(());
                 }
@@ -1030,10 +1022,9 @@ pub(super) fn execute_slash_command(
                 .cmd_tx
                 .send(AgentCommand::SendMessage { text: task.to_string(), images: Vec::new(), image_markers: Vec::new() })
                 .ok();
-            renderer.render(UiLine::CommandOutput(format!(
-                "  Background: [#{}] {} (state: running)\n",
-                slot, short_id
-            )));
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::BgTaskStarted { slot, short_id: &short_id }).into_owned(),
+            ));
             renderer.flush();
         }
         "init" => {

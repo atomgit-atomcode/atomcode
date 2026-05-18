@@ -1,4 +1,5 @@
 use atomcode_core::agent::{AgentClient, AgentEvent};
+use atomcode_core::i18n::{t, Msg};
 use atomcode_core::session::{Session, SessionManager};
 
 pub const MAX_BACKGROUND_SLOTS: usize = 16;
@@ -41,13 +42,14 @@ pub enum RuntimeState {
 }
 
 impl RuntimeState {
-    pub fn as_str(self) -> &'static str {
+    /// Return a localised label for the current runtime state.
+    pub fn localised(self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::Running => "running",
-            Self::Idle => "idle",
-            Self::Done => "done",
-            Self::Cancelled => "cancelled",
-            Self::Error => "error",
+            Self::Running => t(Msg::BgStateRunning),
+            Self::Idle => t(Msg::BgStateIdle),
+            Self::Done => t(Msg::BgStateDone),
+            Self::Cancelled => t(Msg::BgStateCancelled),
+            Self::Error => t(Msg::BgStateError),
         }
     }
 }
@@ -480,23 +482,22 @@ pub fn parse_bg_command(arg: &str) -> BgCommand {
 }
 
 pub fn render_bg_help() -> String {
-    "  /bg                 Send current session to background and open a new foreground\n  /bg list            List background sessions\n  /bg <N>             Resume background slot N\n  /bg drop <N>        Drop background slot N\n  /bg help            Show this help\n".to_string()
+    t(Msg::BgHelp).into_owned()
 }
 
 pub fn render_bg_list(slots: &BackgroundSlots) -> String {
     if slots.is_empty() {
-        return "  No background sessions.\n".to_string();
+        return t(Msg::BgListEmpty).into_owned();
     }
-    let mut out = String::from("  #   ID        State      Created   Summary\n");
+    let mut out = t(Msg::BgListHeader).into_owned();
     for row in slots.list_rows() {
-        out.push_str(&format!(
-            "  {:<3} {:<8}  {:<9}  {:<8}  {}\n",
-            row.slot,
-            row.short_id,
-            row.state.as_str(),
-            humanize_age(row.created_at),
-            row.summary
-        ));
+        out.push_str(&t(Msg::BgListRow {
+            slot: row.slot,
+            short_id: &row.short_id,
+            state: &row.state.localised(),
+            age: &humanize_age(row.created_at),
+            summary: &row.summary,
+        }).into_owned());
     }
     out
 }
@@ -520,13 +521,13 @@ fn humanize_age(ts: u64) -> String {
     let now = current_timestamp();
     let d = now.saturating_sub(ts);
     if d < 60 {
-        "now".into()
+        t(Msg::BgAgeNow).into_owned()
     } else if d < 3600 {
-        format!("{}m", d / 60)
+        t(Msg::BgAgeMinutes { n: d / 60 }).into_owned()
     } else if d < 86400 {
-        format!("{}h", d / 3600)
+        t(Msg::BgAgeHours { n: d / 3600 }).into_owned()
     } else {
-        format!("{}d", d / 86400)
+        t(Msg::BgAgeDays { n: d / 86400 }).into_owned()
     }
 }
 
@@ -593,6 +594,8 @@ mod tests {
 
     #[test]
     fn render_empty_bg_list_mentions_no_background_sessions() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(atomcode_core::locale::Locale::En);
         let slots = BackgroundSlots::new(16);
         assert_eq!(render_bg_list(&slots), "  No background sessions.\n");
     }
