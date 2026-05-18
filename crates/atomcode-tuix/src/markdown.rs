@@ -191,12 +191,38 @@ pub fn finalize_with_width(
     caps: TerminalCaps,
     max_width: usize,
 ) -> Option<String> {
-    if state.table_buf.is_empty() {
-        return None;
+    // Two independent buffers can be open at stream end: a table waiting
+    // for a separator row, or a code block whose close fence never came.
+    // Both must be emitted so the user doesn't lose content.
+    let table_part = if !state.table_buf.is_empty() {
+        let t = flush_aligned_table_with_width(&state.table_buf, caps, max_width);
+        state.table_buf.clear();
+        Some(t)
+    } else {
+        None
+    };
+
+    let code_part = if state.in_code_block && !state.code_buf.is_empty() {
+        let source = state.code_buf.join("\n");
+        let highlighted = crate::highlight::highlight_block(
+            state.code_lang.as_deref(),
+            &source,
+            caps,
+        );
+        state.in_code_block = false;
+        state.code_buf.clear();
+        state.code_lang = None;
+        Some(highlighted)
+    } else {
+        None
+    };
+
+    match (table_part, code_part) {
+        (None, None) => None,
+        (Some(t), None) => Some(t),
+        (None, Some(c)) => Some(c),
+        (Some(t), Some(c)) => Some(format!("{}\n{}", t, c)),
     }
-    let t = flush_aligned_table_with_width(&state.table_buf, caps, max_width);
-    state.table_buf.clear();
-    Some(t)
 }
 
 /// Recognise a pre-drawn Unicode box-drawing table line and return the
@@ -1048,5 +1074,41 @@ mod tests {
         let mut st = MdState::new();
         render_line("```rust  ", &mut st, caps());
         assert_eq!(st.code_lang.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn finalize_emits_unclosed_code_block_as_fallback() {
+        // Stream cuts off before close fence — finalize must still emit
+        // the buffered body, otherwise the user's last few lines vanish.
+        let mut st = MdState::new();
+        render_line("```rust", &mut st, caps());
+        render_line("let x = 1;", &mut st, caps());
+        render_line("let y = 2;", &mut st, caps());
+        // No close fence.
+
+        let out = finalize(&mut st, caps()).expect("unclosed block must emit something");
+        // Use plain caps for substring check: syntect interleaves ANSI between
+        // tokens so "let x = 1;" never appears contiguously in tinted output.
+        // The colored-output path is already covered by Task 6's tests; here we
+        // just verify the body survives at all.
+        let mut st_plain = MdState::new();
+        render_line("```rust", &mut st_plain, plain_caps());
+        render_line("let x = 1;", &mut st_plain, plain_caps());
+        render_line("let y = 2;", &mut st_plain, plain_caps());
+        let out_plain = finalize(&mut st_plain, plain_caps()).expect("unclosed block must emit");
+        assert!(out_plain.contains("let x = 1;"), "got: {:?}", out_plain);
+        assert!(out_plain.contains("let y = 2;"), "got: {:?}", out_plain);
+
+        // Tinted path: at least some output (non-empty) and state cleared.
+        assert!(!out.is_empty());
+        assert!(st.code_buf.is_empty());
+        assert!(!st.in_code_block);
+    }
+
+    #[test]
+    fn finalize_with_no_active_block_returns_none() {
+        // Existing behavior: no buffered table / code → returns None.
+        let mut st = MdState::new();
+        assert!(finalize(&mut st, caps()).is_none());
     }
 }
