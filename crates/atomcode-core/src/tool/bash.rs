@@ -1679,8 +1679,8 @@ mod exit_code_tests {
 
     #[tokio::test]
     async fn bash_sed_in_place_detected_via_effect() {
-        // The sed -i case old pattern-hardcode targeted — still caught, but
-        // now via effect, not via parsing the command for the literal "sed -i".
+        // The in-place edit case old pattern-hardcode targeted — still caught,
+        // but now via effect, not via parsing a literal tool spelling.
         let (dir, ctx) = git_ctx().await;
         let path = dir.path().join("app.vue");
         std::fs::write(&path, "class=\"active\"\n").unwrap();
@@ -1706,8 +1706,12 @@ mod exit_code_tests {
             .status()
             .await
             .unwrap();
+        let tmp = dir.path().join("app.vue.tmp");
         let cmd = format!(
-            r#"{{"command":"sed -i '' 's/active/is-active/' {}"}}"#,
+            r#"{{"command":"sed 's/active/is-active/' {} > {} && mv {} {}"}}"#,
+            path.display(),
+            tmp.display(),
+            tmp.display(),
             path.display()
         );
         let r = BashTool.execute(&cmd, &ctx).await.unwrap();
