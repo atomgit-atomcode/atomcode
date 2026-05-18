@@ -17,6 +17,15 @@ pub struct MdState {
     /// Accumulates consecutive `|…|` rows; flushed as an aligned block
     /// when a non-table line arrives.
     pub table_buf: Vec<String>,
+    /// Lines accumulated between an opening and closing code fence.
+    /// Flushed through `highlight::highlight_block` on close fence so
+    /// the syntax highlighter sees the whole block at once. Code thus
+    /// appears in one chunk at fence close rather than streaming
+    /// line-by-line.
+    pub code_buf: Vec<String>,
+    /// Language tag captured from the opening fence (`"rust"` from
+    /// ```` ```rust ````). `None` for fences with no tag.
+    pub code_lang: Option<String>,
 }
 
 impl MdState {
@@ -26,6 +35,8 @@ impl MdState {
     pub fn reset(&mut self) {
         self.in_code_block = false;
         self.table_buf.clear();
+        self.code_buf.clear();
+        self.code_lang = None;
     }
 }
 
@@ -904,5 +915,24 @@ mod tests {
         // Must render inline (Some), not buffer (None).
         assert!(out.is_some(), "prose with stray junction must not buffer");
         assert!(st.table_buf.is_empty(), "table_buf must stay empty");
+    }
+
+    #[test]
+    fn mdstate_default_has_empty_code_buf_and_no_lang() {
+        let s = MdState::new();
+        assert!(s.code_buf.is_empty(), "code_buf must start empty");
+        assert!(s.code_lang.is_none(), "code_lang must start None");
+    }
+
+    #[test]
+    fn mdstate_reset_clears_code_buf_and_lang() {
+        let mut s = MdState::new();
+        s.code_buf.push("dirty".into());
+        s.code_lang = Some("rust".into());
+        s.in_code_block = true;
+        s.reset();
+        assert!(s.code_buf.is_empty(), "reset must clear code_buf");
+        assert!(s.code_lang.is_none(), "reset must clear code_lang");
+        assert!(!s.in_code_block, "reset must clear in_code_block");
     }
 }
