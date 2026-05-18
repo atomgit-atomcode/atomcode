@@ -506,7 +506,7 @@
     <div class="stat-card"><div class="v"><span data-count="8">0</span><span class="suf">+</span></div><div class="l" data-i18n="stats.providers">支持的模型</div>
       <div class="pop" data-i18n-html="stats.providers.pop">Claude (Sonnet 4.5/4.6, Opus 4.6) · OpenAI (GPT-4o/4.1) · DeepSeek (V3/R1) · GLM (4/5) · Qwen (Plus/Max) · SiliconFlow · Ollama · 任意 <b>OpenAI 兼容 API</b></div>
     </div>
-    <div class="stat-card"><div class="v"><span data-count="5">0</span></div><div class="l" data-i18n="stats.platforms">支持平台</div>
+    <div class="stat-card"><div class="v"><span data-count="6">0</span></div><div class="l" data-i18n="stats.platforms">支持平台</div>
       <div class="pop" data-i18n-html="stats.platforms.pop">macOS (Apple Silicon · Intel) · Linux (x64 + arm64) · HarmonyOS PC · Windows · 共 6 个二进制变体</div>
     </div>
   </div>
@@ -921,7 +921,7 @@ const T={
   'os.auto':{zh:'✓ 自动检测 · ',en:'✓ Auto-detected · '},
   'method.oneclick':{zh:'macOS / Linux / HarmonyOS PC + Windows · 自动选 PATH',en:'macOS / Linux / HarmonyOS PC + Windows · auto PATH'},
   'method.source':{zh:'需要 Rust 1.88+ · cargo install 到 ~/.cargo/bin/atomcode',en:'Rust 1.88+ required · cargo install to ~/.cargo/bin/atomcode'},
-  'method.binary':{zh:'5 个平台 · 6 个二进制变体 · 预编译 · 单文件运行',en:'5 platforms · 6 binary variants · prebuilt · single-file run'},
+  'method.binary':{zh:'6 个平台 · 预编译 · 单文件运行',en:'6 platforms · prebuilt · single-file run'},
 };
 function t(k){const v=T[k];if(!v)return k;return v[LANG]||v.zh||k;}
 function tx(x){if(typeof x==='string')return x;if(x&&typeof x==='object'&&x[LANG]!==undefined)return x[LANG];return String(x);}
@@ -958,6 +958,7 @@ const DOWNLOADS=[
   {os:'macOS · Apple Silicon',arch:'darwin-arm64',file:`atomcode-${VERSION}-darwin-arm64`},
   {os:'macOS · Intel',arch:'darwin-x64',file:`atomcode-${VERSION}-darwin-x64`},
   {os:'Linux x64',arch:'linux-x64',file:`atomcode-${VERSION}-linux-x64`},
+  {os:'Linux arm64',arch:'linux-arm64',file:`atomcode-${VERSION}-linux-arm64`},
   {os:'HarmonyOS PC',arch:'ohos-arm64',file:`atomcode-${VERSION}-ohos-arm64`},
   {os:'Windows',arch:'windows-x64',file:`atomcode-${VERSION}-windows-x64.exe`},
 ];
