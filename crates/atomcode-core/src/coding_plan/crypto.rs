@@ -62,6 +62,22 @@ pub fn signer() -> &'static dyn RequestSigner {
     &UNAVAILABLE_SIGNER
 }
 
+/// True iff the given base URL points at the production AtomGit LLM
+/// gateway. Host-based — does NOT trust provider config keys. Rejects
+/// non-HTTP(S) schemes, subdomain spoofs, and the legacy
+/// `api-ai.gitcode.com` host (still served plaintext until P3 cutover).
+pub fn is_atomgit_gateway(base_url: &str) -> bool {
+    let url = match url::Url::parse(base_url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match url.scheme() {
+        "https" | "http" => {}
+        _ => return false,
+    }
+    matches!(url.host_str(), Some("llm-api.atomgit.com"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +117,39 @@ mod tests {
         };
         let err = signer().sign(input).expect_err("open-source must error");
         assert!(matches!(err, SignError::Unavailable));
+    }
+
+    #[test]
+    fn is_atomgit_gateway_matches_official_host() {
+        assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1"));
+        assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1/chat/completions"));
+    }
+
+    #[test]
+    fn is_atomgit_gateway_rejects_legacy_codingplan_host() {
+        // Pre-cutover host — must NOT be auto-signed; signing logic
+        // is wired up only for the new dedicated host.
+        assert!(!is_atomgit_gateway("https://api-ai.gitcode.com/v1"));
+    }
+
+    #[test]
+    fn is_atomgit_gateway_rejects_third_party_hosts() {
+        assert!(!is_atomgit_gateway("https://api.anthropic.com"));
+        assert!(!is_atomgit_gateway("https://api.openai.com/v1"));
+        assert!(!is_atomgit_gateway("http://localhost:11434"));
+    }
+
+    #[test]
+    fn is_atomgit_gateway_rejects_subdomains_and_lookalikes() {
+        assert!(!is_atomgit_gateway("https://llm-api.atomgit.com.evil.example"));
+        assert!(!is_atomgit_gateway("https://evil.llm-api.atomgit.com"));
+        assert!(!is_atomgit_gateway("https://atomgit.com"));
+    }
+
+    #[test]
+    fn is_atomgit_gateway_rejects_malformed_input() {
+        assert!(!is_atomgit_gateway(""));
+        assert!(!is_atomgit_gateway("not a url"));
+        assert!(!is_atomgit_gateway("ftp://llm-api.atomgit.com"));
     }
 }
