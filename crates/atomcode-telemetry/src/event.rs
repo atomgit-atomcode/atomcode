@@ -131,6 +131,12 @@ pub enum Event {
     /// Final event before user opts out via `atomcode telemetry disable`.
     /// Only fired if telemetry was currently enabled at the time of the command.
     TelemetryDisabled,
+
+    /// Reserved variant. Will be fired (in a future PR) when an
+    /// open-source build of AtomCode attempts to send a request to the
+    /// AtomGit LLM gateway. Locking the wire-format `event_id` here
+    /// keeps the firing-site PR small.
+    CodingplanOfficialBuildRequired,
 }
 
 // ---------- Record (wire format) ----------
@@ -324,6 +330,21 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SessionMode::Ide).unwrap(),
             "\"ide\""
+        );
+    }
+}
+
+#[cfg(test)]
+mod codingplan_required_event_tests {
+    use super::*;
+
+    #[test]
+    fn codingplan_official_build_required_serialises_with_snake_case_event_id() {
+        let e = Event::CodingplanOfficialBuildRequired;
+        let v = serde_json::to_value(&e).expect("serialise");
+        assert_eq!(
+            v["event_id"], "codingplan_official_build_required",
+            "got: {v}"
         );
     }
 }
