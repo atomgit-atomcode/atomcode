@@ -360,11 +360,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             设置 ATOMCODE_PLAIN=1 使用基础输出，或设置 ATOMCODE_RETAIN=1\n    \
             绕过此回退（滚动时可能出现重复内容）。\n\n".into(),
 
-        // ── 会话回放 ──
-        Msg::SessionReplayHint =>
-            "  ⓘ 正在显示上次会话 — 模型上下文从头开始。\n    \
-            使用 /resume 完整恢复对话，包括模型记忆。\n\n".into(),
-
         // ── 后台任务 ──
         Msg::BackgroundComplete { turns } =>
             format!("  后台任务完成（{} 轮）：\n", turns).into(),

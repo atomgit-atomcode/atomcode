@@ -251,9 +251,6 @@ pub enum Msg<'a> {
     JediTermFallback,
     LegacyConhostFallback,
 
-    // ── Session replay ──
-    SessionReplayHint,
-
     // ── Background task ──
     BackgroundComplete { turns: usize },
     BackgroundFailed { turns: usize },

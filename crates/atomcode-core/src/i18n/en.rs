@@ -364,11 +364,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
             bypass this fallback (may show duplicated content on scroll).\n\n".into(),
 
-        // ── Session replay ──
-        Msg::SessionReplayHint =>
-            "  ⓘ Showing previous session — model context starts fresh.\n    \
-            Use /resume to fully restore the conversation including model memory.\n\n".into(),
-
         // ── Background task ──
         Msg::BackgroundComplete { turns } =>
             format!("  Background task complete ({} turn{}):\n",
