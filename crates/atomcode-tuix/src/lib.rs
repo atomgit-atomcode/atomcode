@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod event_loop;
+pub mod highlight;
 pub mod i18n;
 pub mod input;
 pub mod markdown;

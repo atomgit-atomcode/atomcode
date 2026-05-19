@@ -412,4 +412,26 @@ mod tests {
         // "项目" = 4 cols, ".../" = 4 cols, total = 8.
         assert_eq!(truncate_path("~/a/b/项目", 8), ".../项目");
     }
+    #[test]
+    fn wrap_line_to_width_truecolor_sgr_passthrough_zero_width() {
+        // Truecolor open `\x1b[38;2;198;120;221m` is 18 bytes of escape sequence.
+        // If the SGR-passthrough loop ever stops handling it correctly, those
+        // bytes leak into column accounting and downstream wrapping shatters.
+        // Pin the invariant: the visible content `let x = 1;` is 10 cols, so
+        // it must fit in a 10-col budget with no wrap.
+        let tinted = "\x1b[38;2;198;120;221mlet\x1b[23;39m x = 1;";
+        let chunks = wrap_line_to_width(tinted, 10);
+        assert_eq!(chunks.len(), 1, "must not wrap when visible width fits, got: {:?}", chunks);
+        // The tinted line is returned verbatim — escapes still present.
+        assert!(chunks[0].contains("\x1b[38;2;198;120;221m"));
+    }
+
+    #[test]
+    fn wrap_line_to_width_truecolor_with_italic_passthrough() {
+        // `\x1b[3;38;2;124;132;153m` is the COMMENT SGR — 3 (italic) plus
+        // truecolor fg. Same passthrough guarantee.
+        let tinted = "\x1b[3;38;2;124;132;153m// comment\x1b[23;39m";
+        let chunks = wrap_line_to_width(tinted, 10);
+        assert_eq!(chunks.len(), 1);
+    }
 }
