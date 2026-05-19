@@ -577,6 +577,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出插件失败：{error}").into(),
 
         // ── 命令描述 ──
+        Msg::CmdDescSetup =>
+            "扫描项目并安装推荐的 hooks/skills/MCP/commands".into(),
         Msg::CmdDescCodingplan =>
             "领取 CodingPlan 并从计划的模型列表中配置模型".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),

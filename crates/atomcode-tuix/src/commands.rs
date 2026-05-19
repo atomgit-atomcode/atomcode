@@ -70,6 +70,7 @@ impl CommandRegistry {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
+    Command { name: "setup",      desc: "Scan project and install recommended hooks/skills/MCP/commands", needs_args: false },
     Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true },
@@ -129,6 +130,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
 pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
     use crate::i18n::{t, Msg};
     let msg = match name {
+        "setup" => Msg::CmdDescSetup,
         "codingplan" => Msg::CmdDescCodingplan,
         "resume" => Msg::CmdDescResume,
         "rename" => Msg::CmdDescRename,

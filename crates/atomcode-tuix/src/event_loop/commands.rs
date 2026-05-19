@@ -1476,6 +1476,32 @@ pub(super) fn execute_slash_command(
                 }
             }
         }
+        "setup" => {
+            renderer.render(UiLine::CommandOutput(
+                "Running atomcode setup...".to_string(),
+            ));
+            renderer.flush();
+
+            let project_root = ctx.working_dir.clone();
+            let opts = atomcode_core::setup::RunOptions::new(project_root);
+
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(atomcode_core::setup::run(opts))
+            });
+
+            match result {
+                Ok(report) => {
+                    for line in report.render_cli().lines() {
+                        renderer.render(UiLine::CommandOutput(line.to_string()));
+                    }
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("setup error: {e}")));
+                }
+            }
+            renderer.flush();
+        }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,

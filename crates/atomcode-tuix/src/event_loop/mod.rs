@@ -2126,6 +2126,10 @@ pub struct App {
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
+    /// Guards the one-shot `/setup` hint so it fires at most once per
+    /// session. Flipped to `true` after the first render; subsequent
+    /// redraws skip the check entirely.
+    pub setup_hint_shown: bool,
     /// Timestamp of the last Ctrl+C that was consumed by `copy_selection()`
     /// via the Windows OS-level signal handler. On Windows, the OS Ctrl+C
     /// signal fires *before* the keyboard event arrives in the input
@@ -2155,6 +2159,7 @@ impl App {
             fixissue_pending: None,
             fixissue_buffer: String::new(),
             reasoning_buffer: String::new(),
+            setup_hint_shown: false,
             #[cfg(windows)]
             last_ctrl_c_copy: None,
         }
@@ -2351,6 +2356,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         wizard.draw(&app.buf, &app.state, &ctx, renderer);
         app.active_modal = Some(Box::new(wizard));
     } else {
+        // One-shot /setup hint — only on first boot into this project,
+        // gated by preferences + setup-state presence.
+        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
+            renderer.render(UiLine::CommandOutput(
+                "\u{1f4a1} Tip: Run /setup to auto-configure hooks, skills, and MCP for this project.".to_string(),
+            ));
+            app.setup_hint_shown = true;
+        }
         renderer.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -4438,6 +4451,13 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
         return false;
     }
     ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none()
+}
+
+/// True iff startup should show the one-shot `/setup` hint in scrollback.
+/// Returns `true` when setup-state.json doesn't exist (never ran `/setup`).
+fn should_auto_show_setup(ctx: &LoopCtx) -> bool {
+    let state = atomcode_core::setup::state::load_setup_state(&ctx.working_dir);
+    state.is_none() // never ran setup → show hint
 }
 
 /// Extract current + latest version from the `ALREADY_LATEST` error

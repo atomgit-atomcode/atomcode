@@ -583,6 +583,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list plugins: {error}").into(),
 
         // ── Command descriptions ──
+        Msg::CmdDescSetup =>
+            "Scan project and install recommended hooks/skills/MCP/commands".into(),
         Msg::CmdDescCodingplan =>
             "Claim CodingPlan + set up models from the plan's model list".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),

@@ -106,6 +106,8 @@ impl OpenAiProvider {
             || m.starts_with("moonshot")
             || u.contains("moonshot")
             || u.contains("kimi")
+            || u.contains("xiaomimimo")
+            || u.contains("mimo")
         {
             return ReasoningPolicy::Include;
         }

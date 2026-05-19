@@ -2,11 +2,16 @@
 name = "atomcode-core"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+zstd = "0.13"
+tar = "0.4"
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "blocking"], default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -20,6 +25,7 @@ dirs = "6"
 url = "2"
 which = "7"
 uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
 
 # Semantic analysis
 tree-sitter = "0.26"
@@ -42,7 +48,19 @@ bincode = "1"
 encoding_rs = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
+# Project-level advisory file lock (POSIX flock / Windows LockFileEx) for setup.
+fs2 = "0.4"
+# Used by setup::lock for log lines on stale/force lock takeover. The setup
+# module is the first consumer; other crates emit logs via println!.
+thiserror = "1"
+tracing = "0.1"
 atomcode-telemetry = { path = "../atomcode-telemetry" }
+# Embedded setup seeds (rust-best-practices.md, /review command, etc.) are
+# packed into a tar.zst by build.rs and extracted at first run. The same crates
+# are listed under [build-dependencies] for the packer; runtime needs them too
+# (separate dependency trees).
+zstd = "0.13"
+tar = "0.4"
 
 # Non-blocking poll on stdin in the OAuth callback path so the stdin
 # reader thread can exit cleanly when the HTTP listener wins — otherwise
