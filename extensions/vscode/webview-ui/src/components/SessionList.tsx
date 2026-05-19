@@ -112,6 +112,14 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
                 <div className="session-group-label">{label}</div>
                 {items.map((s) => {
                   const isActive = s.id === state.activeSessionId;
+                  let dotClass = '';
+                  if (!isActive) {
+                    if (s.isGenerating) {
+                      dotClass = 'session-item-dot breathing';
+                    } else if (s.hasUnread) {
+                      dotClass = 'session-item-dot';
+                    }
+                  }
                   return (
                     <button
                       key={`${s.project_hash ?? 'current'}:${s.id}`}
@@ -120,6 +128,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
                       onContextMenu={(e) => handleContextMenu(e, s)}
                       title={s.name || s.title || 'Untitled'}
                     >
+                      {dotClass && <span className={dotClass} />}
                       <span className="session-item-name">
                         {s.name || s.title || 'Untitled'}
                       </span>

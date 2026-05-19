@@ -18,15 +18,27 @@ type WebviewMode = 'sidebar' | 'tab';
 type QueuedChatMessage = { text: string; contextPaths?: string[]; clientMessageId?: string };
 const PANEL_READY_TIMEOUT_MS = 5000;
 
+interface SessionRuntime {
+  abortController?: AbortController;
+  isGenerating: boolean;
+  queuedMessages: QueuedChatMessage[];
+  projectHash?: string;
+  errorMessage?: string;
+  hasUnread?: boolean;
+  eventBuffer: Array<{
+    type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'tokens';
+    data: any;
+  }>;
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'atomcode.chatView';
   private _view?: vscode.WebviewView;
   private _panel?: vscode.WebviewPanel;
-  private _currentAbort?: AbortController;
-  private _sessionId?: string;
+  private _activeSessionId?: string;
+  private _loadingSessionId?: string;
   private _loadedMessages?: MessageInfo[];
-  private _isGenerating = false;
-  private _queuedMessages: QueuedChatMessage[] = [];
+  private _sessionRuntimes = new Map<string, SessionRuntime>();
   private _loginId?: string;
   private _loginPoll?: ReturnType<typeof setInterval>;
   private _loginStartedFromCommand = false;
@@ -231,8 +243,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   public async sendEditorCommandMessage(text: string) {
     await this.openForEditorCommand();
-    if (this._isGenerating) {
-      this.stopGeneration();
+    if (this._activeSessionId) {
+      const rt = this._getRuntime(this._activeSessionId);
+      if (rt.isGenerating) {
+        this.stopGeneration();
+      }
     }
     await this._createEditorCommandSession();
     this._postMessage({ type: 'userMessage', text });
@@ -241,14 +256,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   public async newConversation() {
     this.openInTab();
-    this._sessionId = undefined;
+
+    // Keep the previous session's runtime intact — its stream (if any)
+    // continues in the background with events buffered in its eventBuffer.
+    this._activeSessionId = undefined;
     this._loadedMessages = undefined;
-    this._queuedMessages = [];
 
     try {
       const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       const session = await this._client.createSession(undefined, workspaceFolder);
-      this._sessionId = session.id;
+      this._activeSessionId = session.id;
+      this._getRuntime(session.id).projectHash = session.project_hash;
       this._broadcastMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
       await this._refreshSessions();
     } catch {
@@ -260,13 +278,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   public stopGeneration() {
-    this._currentAbort?.abort();
-    this._queuedMessages = [];
-    if (this._sessionId) {
-      void this._client.stopGeneration(this._sessionId).catch(() => undefined);
-    }
-    this._currentAbort = undefined;
-    this._isGenerating = false;
+    if (!this._activeSessionId) return;
+    const rt = this._sessionRuntimes.get(this._activeSessionId);
+    if (!rt?.isGenerating) return;
+
+    rt.abortController?.abort();
+    rt.abortController = undefined;
+    rt.queuedMessages = [];
+    rt.isGenerating = false;
+    rt.eventBuffer = [];
+    void this._client.stopGeneration(this._activeSessionId).catch(() => undefined);
     this._postMessage({ type: 'generationStopped' });
   }
 
@@ -278,12 +299,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   // Private
+  private _getRuntime(sessionId: string): SessionRuntime {
+    let rt = this._sessionRuntimes.get(sessionId);
+    if (!rt) {
+      rt = { isGenerating: false, queuedMessages: [], eventBuffer: [] };
+      this._sessionRuntimes.set(sessionId, rt);
+    }
+    return rt;
+  }
+
   private async _handleSend(text: string, contextPaths?: string[], clientMessageId?: string) {
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    if (this._isGenerating) {
-      this._queuedMessages.push({ text: trimmed, contextPaths, clientMessageId });
+    const sid = this._activeSessionId;
+    if (!sid) return;
+    const rt = this._getRuntime(sid);
+
+    if (rt.isGenerating) {
+      rt.queuedMessages.push({ text: trimmed, contextPaths, clientMessageId });
       return;
     }
 
@@ -295,10 +329,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    this._isGenerating = true;
+    // Ensure a session exists before sending the chat request so it
+    // appears in the session list immediately, not only after completion.
+    await this._ensureSession();
+
+    // Re-fetch runtime in case _ensureSession changed _activeSessionId
+    const activeSid = this._activeSessionId!;
+    const activeRt = this._getRuntime(activeSid);
+
+    activeRt.isGenerating = true;
+    activeRt.eventBuffer = [];  // Start a fresh buffer for this turn
+    activeRt.eventBuffer.push({ type: 'userMessage', data: { text: trimmed } });
     this._postMessage({ type: 'generationStarted' });
 
-    // Build message with file context
     let fullMessage = trimmed;
     if (contextPaths && contextPaths.length > 0) {
       const parts: string[] = [];
@@ -340,16 +383,53 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const request: ChatRequest = {
       message: fullMessage,
       working_dir: workspaceFolder,
-      session_id: this._sessionId,
+      session_id: activeSid,
     };
 
-    this._currentAbort = this._client.streamChat(request, {
-      onText: (content) => this._postMessage({ type: 'text', content }),
-      onToolStart: (id, name, args) => this._postMessage({ type: 'toolStart', id, name, args }),
-      onToolResult: (id, name, output, success, durationMs) =>
-        this._postMessage({ type: 'toolResult', id, name, output, success, durationMs }),
-      onTokens: (prompt, completion, total) =>
-        this._postMessage({ type: 'tokens', prompt, completion, total }),
+    // Capture session ID so callbacks always reference the correct session
+    const streamSessionId = activeSid;
+
+    activeRt.abortController = this._client.streamChat(request, {
+      onText: (content) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'text', data: { content } });
+        if (this._activeSessionId === streamSessionId) {
+          this._postMessage({ type: 'text', content });
+        }
+      },
+      onToolBatch: (calls) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'toolBatchStart' as const, data: { calls } });
+        if (this._activeSessionId === streamSessionId) {
+          this._postMessage({ type: 'toolBatchStart', calls });
+        }
+      },
+      onToolStart: (id, name, args) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'toolStart', data: { id, name, args } });
+        if (this._activeSessionId === streamSessionId) {
+          this._postMessage({ type: 'toolStart', id, name, args });
+        }
+      },
+      onToolResult: (id, name, output, success, durationMs) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'toolResult', data: { id, name, output, success, durationMs } });
+        if (this._activeSessionId === streamSessionId) {
+          this._postMessage({ type: 'toolResult', id, name, output, success, durationMs });
+        }
+      },
+      onTokens: (prompt, completion, total) => {
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.eventBuffer.push({ type: 'tokens', data: { prompt, completion, total } });
+        if (this._activeSessionId === streamSessionId) {
+          this._postMessage({ type: 'tokens', prompt, completion, total });
+        }
+      },
       onArtifactStart: (id, artifactType, language, title) =>
         this._postMessage({ type: 'artifactStart', id, artifactType, language, title }),
       onArtifactContent: (id, content) =>
@@ -357,58 +437,108 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       onArtifactEnd: (id) =>
         this._postMessage({ type: 'artifactEnd', id }),
       onDone: (tokens, toolCalls, sessionId) => {
-        if (sessionId) {
-          this._sessionId = sessionId;
-          this._loadedMessages = undefined;
-          this._broadcastMessage({ type: 'sessionSelected', sessionId });
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.isGenerating = false;
+        srt.eventBuffer = [];
+
+        // If the daemon assigned a different session ID (e.g. first turn
+        // creates a permanent ID), migrate the runtime so the map stays
+        // keyed correctly.
+        if (sessionId && sessionId !== streamSessionId) {
+          this._sessionRuntimes.set(sessionId, srt);
+          this._sessionRuntimes.delete(streamSessionId);
         }
-        this._isGenerating = false;
-        this._postMessage({ type: 'done', tokens, toolCalls, sessionId });
-        void this._refreshSessions();
-        setTimeout(() => void this._sendNextQueuedMessage(), 75);
+
+        if (this._activeSessionId === streamSessionId) {
+          if (sessionId && sessionId !== streamSessionId) {
+            this._activeSessionId = sessionId;
+            this._loadedMessages = undefined;
+            this._broadcastMessage({ type: 'sessionSelected', sessionId });
+          }
+          this._postMessage({ type: 'done', tokens, toolCalls, sessionId });
+          void this._refreshSessions();
+          setTimeout(() => void this._sendNextQueuedMessage(), 75);
+        } else {
+          // Stream completed in background — mark as unread so the session
+          // list shows a solid green dot until the user switches back.
+          srt.hasUnread = true;
+          void this._refreshSessions();
+          // Drain any queued messages via the (possibly migrated) session ID
+          void this._sendNextQueuedMessageForSession(sessionId || streamSessionId);
+        }
       },
       onStopped: () => {
-        this._isGenerating = false;
-        this._queuedMessages = [];
-        this._postMessage({ type: 'stopped' });
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.isGenerating = false;
+        srt.queuedMessages = [];
+        srt.eventBuffer = [];
+
+        if (this._activeSessionId === streamSessionId) {
+          this._postMessage({ type: 'stopped' });
+        }
       },
       onError: (message) => {
-        this._isGenerating = false;
-        this._queuedMessages = [];
-        this._postMessage({ type: 'error', message });
+        const srt = this._sessionRuntimes.get(streamSessionId);
+        if (!srt) return;
+        srt.isGenerating = false;
+        srt.queuedMessages = [];
+        srt.eventBuffer = [];
+
+        if (this._activeSessionId === streamSessionId) {
+          this._postMessage({ type: 'error', message });
+        } else {
+          // Store the error so it can be surfaced when the user switches
+          // back to this session (see _loadSession).
+          srt.errorMessage = message;
+        }
       },
     });
   }
 
   private async _sendNextQueuedMessage() {
-    if (this._isGenerating) return;
+    const sid = this._activeSessionId;
+    if (!sid) return;
+    const rt = this._sessionRuntimes.get(sid);
+    if (!rt || rt.isGenerating) return;
 
-    const next = this._queuedMessages.shift();
+    const next = rt.queuedMessages.shift();
     if (!next) return;
 
     await this._handleSend(next.text, next.contextPaths, next.clientMessageId);
 
-    // A queued local command may complete synchronously without starting a
-    // generation, so keep draining until a real chat turn starts or the queue
-    // is empty.
-    if (!this._isGenerating) {
+    const rt2 = this._sessionRuntimes.get(sid);
+    if (rt2 && !rt2.isGenerating) {
       void this._sendNextQueuedMessage();
     }
   }
 
+  private async _sendNextQueuedMessageForSession(sessionId: string) {
+    // Only drain queued messages for the active session. Background sessions
+    // keep their queued messages until the user switches back, at which point
+    // _loadSession drains them.
+    if (this._activeSessionId !== sessionId) return;
+    await this._sendNextQueuedMessage();
+  }
+
   private async _ensureSession() {
-    if (this._sessionId) return;
+    if (this._activeSessionId) return;
 
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const session = await this._client.createSession(undefined, workspaceFolder);
-    this._sessionId = session.id;
+    this._activeSessionId = session.id;
+    this._getRuntime(session.id).projectHash = session.project_hash;
     this._loadedMessages = undefined;
     this._broadcastMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
     await this._refreshSessions();
   }
 
   private async _createEditorCommandSession() {
-    this._sessionId = undefined;
+    // Keep the previous session's runtime intact — sendEditorCommandMessage
+    // already calls stopGeneration() when needed, which properly stops the
+    // daemon stream and marks isGenerating=false.
+    this._activeSessionId = undefined;
     this._loadedMessages = undefined;
     this._postMessage({ type: 'clearChat' });
     await this._ensureSession();
@@ -440,23 +570,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Send sessions
     try {
       const sessions = await this._client.listSessions();
+      await this._annotateSessionGenerating(sessions as any[]);
       this._postMessage({ type: 'sessions', sessions }, webview);
     } catch {}
 
     // Send editor context
     this._sendEditorContext(webview);
 
-    this._postMessage({
-      type: 'init',
-      generating: this._isGenerating,
-      currentModel: currentModelName,
-      viewMode: mode,
-      activeSessionId: this._sessionId,
-    }, webview);
-
+    // Send session messages FIRST — LOAD_SESSION_MESSAGES sets isGenerating=false
+    // in the reducer, which is then corrected by _replayStreamBuffer below.
     if (this._loadedMessages && mode === 'tab') {
       this._postMessage({ type: 'sessionMessages', messages: this._loadedMessages }, webview);
     }
+
+    // If the active session has a running background stream, replay buffered
+    // events so the webview shows the streaming assistant and live content.
+    if (this._activeSessionId) {
+      const rt = this._sessionRuntimes.get(this._activeSessionId);
+      if (rt) {
+        this._replayStreamBuffer(this._activeSessionId, rt, webview);
+
+        if (rt.errorMessage) {
+          this._postMessage({ type: 'error', message: rt.errorMessage }, webview);
+          rt.errorMessage = undefined;
+        }
+      }
+    }
+
+    // Send init LAST — it confirms the state already established above
+    this._postMessage({
+      type: 'init',
+      generating: this._activeSessionId
+        ? (this._sessionRuntimes.get(this._activeSessionId)?.isGenerating ?? false)
+        : false,
+      currentModel: currentModelName,
+      viewMode: mode,
+      activeSessionId: this._activeSessionId,
+    }, webview);
   }
 
   private async _sendSetupState(webview?: vscode.Webview) {
@@ -701,6 +851,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _loadSession(sessionId: string, projectHash?: string) {
+    // Fix: Skip if already loading this session (prevents duplicate messages
+    // when the user double-clicks a session).
+    if (this._loadingSessionId === sessionId) return;
+
+    // Don't abort the current session's stream — it keeps running in the
+    // background. Its callbacks continue to update its own session runtime
+    // via the streamSessionId captured in _handleSend.
+
+    this._loadingSessionId = sessionId;
     try {
       // If projectHash not provided, search sessions to find it
       let hash = projectHash;
@@ -709,26 +868,110 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const match = (allSessions as Array<{ project_hash?: string; meta?: { id?: string }; id?: string }>)
           .find(s => (s.meta?.id || s.id) === sessionId);
         hash = match?.project_hash;
+        // Fall back to the hash stored in the session runtime — needed for
+        // newly created sessions that the daemon filters out (empty messages).
+        if (!hash) {
+          hash = this._sessionRuntimes.get(sessionId)?.projectHash;
+        }
       }
       if (!hash) {
-        this._postMessage({ type: 'error', message: 'Unable to load session: missing project hash.' });
+        this._broadcastMessage({ type: 'error', message: 'Unable to load session: missing project hash.' });
         return;
       }
 
       const detail = await this._client.getSession(hash, sessionId);
       if (detail && detail.messages) {
-        this._sessionId = sessionId;
+        this._activeSessionId = sessionId;
         this._loadedMessages = detail.messages;
+        this._getRuntime(sessionId).projectHash = hash;
         this.openInTab();
         this._broadcastMessage({ type: 'sessionSelected', sessionId, projectHash: hash });
-        this._postMessage({ type: 'clearChat' });
-        this._postMessage({ type: 'sessionMessages', messages: detail.messages });
+        // Use _broadcastMessage so both sidebar and tab webviews stay in sync
+        this._broadcastMessage({ type: 'clearChat' });
+        this._broadcastMessage({ type: 'sessionMessages', messages: detail.messages });
+
+        const newRt = this._sessionRuntimes.get(sessionId);
+
+        // Clear the unread marker now that the user is viewing this session
+        if (newRt) {
+          newRt.hasUnread = false;
+        }
+
+        // If a background stream errored, surface the error now that the
+        // user switched back.
+        if (newRt?.errorMessage) {
+          this._broadcastMessage({ type: 'error', message: newRt.errorMessage });
+          newRt.errorMessage = undefined;
+        }
+
+        // If this session has an active background stream, replay buffered
+        // events so the webview resumes live streaming display.
+        if (newRt?.isGenerating && newRt.eventBuffer.length > 0) {
+          this._replayStreamBuffer(sessionId, newRt);
+        }
+
+        // If the session is idle but has queued messages left over from
+        // before the user switched away, drain them now.
+        if (newRt && !newRt.isGenerating && newRt.queuedMessages.length > 0) {
+          setTimeout(() => void this._sendNextQueuedMessage(), 75);
+        }
+
+        // Push updated session list so hasUnread / isGenerating reflect
+        // the latest runtime state (e.g. green dots update immediately).
+        await this._refreshSessions();
+
         this.focusInput();
       } else {
-        this._postMessage({ type: 'error', message: 'Unable to load session: empty response.' });
+        this._broadcastMessage({ type: 'error', message: 'Unable to load session: empty response.' });
       }
     } catch (e) {
-      this._postMessage({ type: 'error', message: `Unable to load session: ${this._messageFromError(e)}` });
+      this._broadcastMessage({ type: 'error', message: `Unable to load session: ${this._messageFromError(e)}` });
+    } finally {
+      if (this._loadingSessionId === sessionId) {
+        this._loadingSessionId = undefined;
+      }
+    }
+  }
+
+  // Replay buffered stream events so the webview can resume displaying a
+  // background stream. Snapshot the event buffer to avoid conflicts with new
+  // events arriving during replay (they will be forwarded by callbacks once
+  // _activeSessionId is set).
+  private _replayStreamBuffer(_sessionId: string, rt: SessionRuntime, webview?: vscode.Webview) {
+    if (!rt.isGenerating || rt.eventBuffer.length === 0) return;
+
+    const post = (msg: unknown) => webview
+      ? webview.postMessage(msg)
+      : this._broadcastMessage(msg);
+
+    const snapshot = [...rt.eventBuffer];
+
+    for (const evt of snapshot) {
+      if (evt.type === 'userMessage') {
+        post({ type: 'userMessage', text: evt.data.text });
+      }
+    }
+
+    post({ type: 'resumeStreaming' });
+
+    for (const evt of snapshot) {
+      switch (evt.type) {
+        case 'text':
+          post({ type: 'text', content: evt.data.content });
+          break;
+        case 'toolBatchStart':
+          post({ type: 'toolBatchStart', calls: evt.data.calls });
+          break;
+        case 'toolStart':
+          post({ type: 'toolStart', id: evt.data.id, name: evt.data.name, args: evt.data.args });
+          break;
+        case 'toolResult':
+          post({ type: 'toolResult', id: evt.data.id, name: evt.data.name, output: evt.data.output, success: evt.data.success, durationMs: evt.data.durationMs });
+          break;
+        case 'tokens':
+          post({ type: 'tokens', prompt: evt.data.prompt, completion: evt.data.completion, total: evt.data.total });
+          break;
+      }
     }
   }
 
@@ -772,9 +1015,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (choice !== 'Delete') return;
 
     try {
+      // Stop any daemon-side stream before deleting
+      const rt = this._sessionRuntimes.get(sessionId);
+      if (rt?.isGenerating) {
+        rt.abortController?.abort();
+        void this._client.stopGeneration(sessionId).catch(() => undefined);
+      }
+      this._sessionRuntimes.delete(sessionId);
+
       await this._client.deleteSession(hash, sessionId);
-      if (this._sessionId === sessionId) {
-        this._sessionId = undefined;
+      if (this._activeSessionId === sessionId) {
+        this._activeSessionId = undefined;
         this._loadedMessages = undefined;
         this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
         this._postMessage({ type: 'clearChat' });
@@ -881,13 +1132,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _searchSessions(query: string) {
     try {
       const sessions = await this._client.searchSessions(query);
+      await this._annotateSessionGenerating(sessions as any[]);
       this._broadcastMessage({ type: 'sessions', sessions });
     } catch {}
+  }
+
+  private async _annotateSessionGenerating(sessions: Array<{ id?: string; meta?: { id?: string }; isGenerating?: boolean; hasUnread?: boolean }>) {
+    // Merge daemon truth (survives extension host reload) with local runtime state
+    let activeIds: string[] = [];
+    try {
+      activeIds = await this._client.activeSessions();
+    } catch {}
+
+    for (const s of sessions) {
+      const sid = s.meta?.id || s.id;
+      if (sid) {
+        const rt = this._sessionRuntimes.get(sid);
+        s.isGenerating = activeIds.includes(sid) || (rt?.isGenerating ?? false);
+        s.hasUnread = rt?.hasUnread ?? false;
+      }
+    }
   }
 
   private async _refreshSessions() {
     try {
       const sessions = await this._client.listSessions();
+      await this._annotateSessionGenerating(sessions as any[]);
+      // If we have an active session that the daemon filtered out (e.g. newly
+      // created with no messages yet), prepend a synthetic entry so it appears
+      // in the session list immediately.
+      if (this._activeSessionId && !sessions.some((s: any) => (s.meta?.id || s.id) === this._activeSessionId)) {
+        sessions.unshift({
+          id: this._activeSessionId,
+          name: 'New session',
+          created_at: Date.now(),
+          updated_at: Date.now(),
+          isGenerating: this._sessionRuntimes.get(this._activeSessionId)?.isGenerating ?? false,
+          hasUnread: this._sessionRuntimes.get(this._activeSessionId)?.hasUnread ?? false,
+        } as any);
+      }
       this._broadcastMessage({ type: 'sessions', sessions });
     } catch {}
   }

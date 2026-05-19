@@ -8,6 +8,7 @@ export interface ChatRequest {
 
 export type ChatEvent =
   | { type: 'text'; content: string }
+  | { type: 'tool_batch'; calls: Array<{ id: string; name: string; arguments: string }> }
   | { type: 'tool_start'; id?: string; name: string; arguments: string }
   | { type: 'tool_result'; id?: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
@@ -234,6 +235,7 @@ export interface CreateSessionResponse {
 // Callbacks for SSE streaming
 export interface ChatStreamCallbacks {
   onText: (content: string) => void;
+  onToolBatch: (calls: Array<{ id: string; name: string; arguments: string }>) => void;
   onToolStart: (id: string | undefined, name: string, args: string) => void;
   onToolResult: (id: string | undefined, name: string, output: string, success: boolean, durationMs: number) => void;
   onTokens: (prompt: number, completion: number, total: number) => void;

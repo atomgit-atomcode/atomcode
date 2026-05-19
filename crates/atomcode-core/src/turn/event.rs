@@ -97,7 +97,7 @@ pub enum TurnEvent {
 
 /// One call inside a `ToolBatchStarted` payload. Carries everything the UI
 /// needs to render a child row in the group block (name + abbreviated detail).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolBatchCall {
     pub id: String,
     pub name: String,

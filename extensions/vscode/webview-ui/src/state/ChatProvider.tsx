@@ -68,6 +68,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         case 'text':
           dispatch({ type: 'APPEND_TEXT', content: msg.content });
           break;
+        case 'toolBatchStart':
+          dispatch({ type: 'TOOL_BATCH_START', calls: msg.calls });
+          break;
         case 'toolStart':
           dispatch({
             type: 'TOOL_START',
@@ -114,6 +117,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'clearChat':
           dispatch({ type: 'CLEAR_CHAT' });
+          break;
+        case 'resumeStreaming':
+          dispatch({ type: 'RESUME_STREAMING' });
           break;
         case 'sessions':
           dispatch({ type: 'SET_SESSIONS', sessions: msg.sessions });
