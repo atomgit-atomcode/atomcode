@@ -46,6 +46,8 @@ export interface SessionMeta {
   created_at?: string | number;
   updated_at?: string | number;
   project_hash?: string;
+  isGenerating?: boolean;
+  hasUnread?: boolean;
 }
 
 /** A file or selection attached as context */
@@ -65,7 +67,7 @@ export interface ToolCallData {
   output?: string;
   success?: boolean;
   durationMs?: number;
-  status: 'running' | 'done' | 'error';
+  status: 'queued' | 'running' | 'done' | 'error';
 }
 
 export interface PermissionRequestData {
@@ -125,6 +127,7 @@ export type ChatAction =
   | { type: 'ADD_ASSISTANT_MESSAGE'; text: string }
   | { type: 'START_GENERATION' }
   | { type: 'APPEND_TEXT'; content: string }
+  | { type: 'TOOL_BATCH_START'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'TOOL_START'; id: string; name: string; args: string }
   | { type: 'TOOL_RESULT'; id: string; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'SET_TOKENS'; prompt: number; completion: number; total: number }
@@ -151,6 +154,7 @@ export type ChatAction =
   | { type: 'PERMISSION_RESPOND'; id: string; allowed: boolean }
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
+  | { type: 'RESUME_STREAMING' }
   | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string };
 
 // ─── Messages from the VS Code extension host ──────────────────
@@ -162,6 +166,7 @@ export type ExtensionMessage =
   | { type: 'assistantMessage'; text: string }
   | { type: 'generationStarted' }
   | { type: 'text'; content: string }
+  | { type: 'toolBatchStart'; calls: Array<{ id: string; name: string; args: string }> }
   | { type: 'toolStart'; id?: string; name: string; args: string }
   | { type: 'toolResult'; id?: string; name: string; output: string; success: boolean; durationMs: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
@@ -185,4 +190,5 @@ export type ExtensionMessage =
   | { type: 'codingPlanResult'; result: { success: boolean; report_text: string } }
   | { type: 'setupError'; message: string }
   | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string }
-  | { type: 'permissionRequest'; id: string; toolName: string; args: string; isDestructive: boolean };
+  | { type: 'permissionRequest'; id: string; toolName: string; args: string; isDestructive: boolean }
+  | { type: 'resumeStreaming' };
