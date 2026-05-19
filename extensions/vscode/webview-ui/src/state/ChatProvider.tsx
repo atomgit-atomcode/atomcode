@@ -219,7 +219,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
       } else {
         dispatch({ type: 'ADD_USER_MESSAGE', text, contextFiles });
       }
-      postMessage({ type: 'send', text, context: ctx, clientMessageId: isQueued ? clientMessageId : undefined });
+      postMessage({ type: 'send', text, context: ctx, clientMessageId: isQueued ? clientMessageId : undefined, sessionId: state.activeSessionId });
       // Clear context after sending
       dispatch({ type: 'CLEAR_CONTEXT' });
     },

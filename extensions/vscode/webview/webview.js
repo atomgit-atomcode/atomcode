@@ -74121,7 +74121,7 @@
         } else {
           dispatch({ type: "ADD_USER_MESSAGE", text: text2, contextFiles });
         }
-        postMessage({ type: "send", text: text2, context: ctx, clientMessageId: isQueued ? clientMessageId : void 0 });
+        postMessage({ type: "send", text: text2, context: ctx, clientMessageId: isQueued ? clientMessageId : void 0, sessionId: state2.activeSessionId });
         dispatch({ type: "CLEAR_CONTEXT" });
       },
       []

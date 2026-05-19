@@ -46,6 +46,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _panelReadyPromise?: Promise<void>;
   private _panelReadyResolver?: () => void;
 
+  // 协作互斥锁：串行化所有修改 _activeSessionId 的操作，防止多个 webview
+  // 消息处理器在 await 边界交错修改共享会话状态。
+  private _sessionLock = Promise.resolve();
+
+  private async _acquireSessionLock(): Promise<() => void> {
+    const prev = this._sessionLock;
+    let release: () => void;
+    this._sessionLock = new Promise((r) => { release = r; });
+    await prev;
+    return release!;
+  }
+
   public onModelSelected?: (model: string) => void;
 
   constructor(
@@ -137,6 +149,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             msg.text,
             msg.context?.map((c: { path: string }) => c.path),
             msg.clientMessageId,
+            msg.sessionId,
           );
           break;
         case 'stop':
@@ -259,20 +272,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     // Keep the previous session's runtime intact — its stream (if any)
     // continues in the background with events buffered in its eventBuffer.
-    this._activeSessionId = undefined;
-    this._loadedMessages = undefined;
+    let sessionId: string | undefined;
+    let projectHash: string | undefined;
 
+    const release = await this._acquireSessionLock();
     try {
+      this._activeSessionId = undefined;
+      this._loadedMessages = undefined;
+
       const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       const session = await this._client.createSession(undefined, workspaceFolder);
       this._activeSessionId = session.id;
+      sessionId = session.id;
+      projectHash = session.project_hash;
       this._getRuntime(session.id).projectHash = session.project_hash;
-      this._broadcastMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
-      await this._refreshSessions();
     } catch {
       this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
+      return;
+    } finally {
+      release();
     }
 
+    this._broadcastMessage({ type: 'sessionSelected', sessionId, projectHash });
+    await this._refreshSessions();
     this._postMessage({ type: 'clearChat' });
     this.focusInput();
   }
@@ -308,13 +330,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return rt;
   }
 
-  private async _handleSend(text: string, contextPaths?: string[], clientMessageId?: string) {
+  private async _handleSend(text: string, contextPaths?: string[], clientMessageId?: string, msgSessionId?: string) {
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    // 在任何 await 之前捕获活跃 session ID——另一个 webview 处理器
-    // （如侧边栏 newConversation）可能在微任务边界清除 _activeSessionId。
-    let sid = this._activeSessionId;
+    // 优先使用 webview 消息携带的 sessionId（路由键），避免在 await 边界读取
+    // 共享的 _activeSessionId 时与另一个 webview 处理器产生竞态条件。
+    let sid = msgSessionId ?? this._activeSessionId;
     if (!sid) {
       await this._ensureSession();
       sid = this._activeSessionId;
@@ -521,23 +543,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _ensureSession() {
-    if (this._activeSessionId) return;
+    let newSid: string | undefined;
+    let newHash: string | undefined;
 
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const session = await this._client.createSession(undefined, workspaceFolder);
-    this._activeSessionId = session.id;
-    this._getRuntime(session.id).projectHash = session.project_hash;
-    this._loadedMessages = undefined;
-    this._broadcastMessage({ type: 'sessionSelected', sessionId: session.id, projectHash: session.project_hash });
-    await this._refreshSessions();
+    const release = await this._acquireSessionLock();
+    try {
+      if (this._activeSessionId) {
+        newSid = this._activeSessionId;
+        newHash = this._getRuntime(newSid).projectHash;
+        return;
+      }
+
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const session = await this._client.createSession(undefined, workspaceFolder);
+      this._activeSessionId = session.id;
+      newSid = session.id;
+      newHash = session.project_hash;
+      this._getRuntime(session.id).projectHash = session.project_hash;
+      this._loadedMessages = undefined;
+    } finally {
+      release();
+    }
+
+    if (newSid) {
+      this._broadcastMessage({ type: 'sessionSelected', sessionId: newSid, projectHash: newHash });
+      await this._refreshSessions();
+    }
   }
 
   private async _createEditorCommandSession() {
     // Keep the previous session's runtime intact — sendEditorCommandMessage
     // already calls stopGeneration() when needed, which properly stops the
     // daemon stream and marks isGenerating=false.
-    this._activeSessionId = undefined;
-    this._loadedMessages = undefined;
+    const release = await this._acquireSessionLock();
+    try {
+      this._activeSessionId = undefined;
+      this._loadedMessages = undefined;
+    } finally {
+      release();
+    }
     this._postMessage({ type: 'clearChat' });
     await this._ensureSession();
   }
@@ -879,9 +923,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       const detail = await this._client.getSession(hash, sessionId);
       if (detail && detail.messages) {
-        this._activeSessionId = sessionId;
-        this._loadedMessages = detail.messages;
-        this._getRuntime(sessionId).projectHash = hash;
+        const release = await this._acquireSessionLock();
+        try {
+          this._activeSessionId = sessionId;
+          this._loadedMessages = detail.messages;
+          this._getRuntime(sessionId).projectHash = hash;
+        } finally {
+          release();
+        }
         this.openInTab();
         this._broadcastMessage({ type: 'sessionSelected', sessionId, projectHash: hash });
         // Use _broadcastMessage so both sidebar and tab webviews stay in sync
@@ -1022,9 +1071,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._sessionRuntimes.delete(sessionId);
 
       await this._client.deleteSession(hash, sessionId);
-      if (this._activeSessionId === sessionId) {
-        this._activeSessionId = undefined;
-        this._loadedMessages = undefined;
+      let cleared = false;
+      {
+        const release = await this._acquireSessionLock();
+        try {
+          if (this._activeSessionId === sessionId) {
+            this._activeSessionId = undefined;
+            this._loadedMessages = undefined;
+            cleared = true;
+          }
+        } finally {
+          release();
+        }
+      }
+      if (cleared) {
         this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
         this._postMessage({ type: 'clearChat' });
       }
