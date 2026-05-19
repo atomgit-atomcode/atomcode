@@ -97,6 +97,41 @@
       <pre><code>/session</code></pre>
       <p>Spin up a fresh context without changing the working directory. Good for "the previous task is wrapped — onto something totally unrelated".</p>
 
+      <h2 id="bg">Background sessions (<code>/bg</code>)</h2>
+      <p>Need to juggle multiple tasks without losing the current conversation? <code>/bg</code> parks the current session in the background and opens a fresh foreground — switch back any time. Up to <strong>16 concurrent background slots</strong>.</p>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>What it does</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/bg</code></td><td>Send the current session to the background and open a new foreground</td></tr>
+          <tr><td><code>/bg list</code> (alias <code>/bg ls</code>)</td><td>List all background sessions: slot, ID, state, created, summary</td></tr>
+          <tr><td><code>/bg &lt;N&gt;</code></td><td>Resume slot N as foreground (the current foreground is swapped to background)</td></tr>
+          <tr><td><code>/bg drop &lt;N&gt;</code></td><td>Drop background slot N</td></tr>
+          <tr><td><code>/bg help</code> (aliases <code>-h</code>, <code>--help</code>)</td><td>Show built-in help</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Session states</h3>
+      <p>The <em>state</em> column in <code>/bg list</code> reflects what each background session is doing:</p>
+      <ul>
+        <li><strong>running</strong> — the model loop is still executing; tool calls and output keep advancing in the background</li>
+        <li><strong>idle</strong> — the model turn finished; waiting for your next prompt</li>
+        <li><strong>done</strong> — the session was explicitly ended</li>
+        <li><strong>cancelled / error</strong> — interrupted, or the background run hit an error</li>
+      </ul>
+      <p>So <code>/bg</code> isn't just "suspend" — the model actually keeps working in the background; when you switch back, the result is already there.</p>
+
+      <h3><code>/background &lt;task&gt;</code> — one-shot dispatch</h3>
+      <p>If you don't want to swap foreground/background manually and just want to "have it look something up real quick", use the <code>/background</code> compatibility entry:</p>
+      <pre><code>/background list every unused dependency under src</code></pre>
+      <p>It starts a one-shot task in a <code>/bg</code> slot (configured with a read-only tool subset by default so the main conversation context isn't polluted). When done, check <code>/bg list</code>, use <code>/bg &lt;N&gt;</code> to read the result, <code>/bg drop &lt;N&gt;</code> to discard.</p>
+
+      <div class="callout callout-tip">
+        <strong>Typical pattern</strong>
+        <p>The foreground is debugging module A; the model is editing and running <code>cargo check</code> (slow). You realise you also want to refactor module B — <code>/bg</code> straight to a new foreground for B. The build on A finishes in the background, state flips to <em>done</em>; <code>/bg 1</code> to switch back and read the result.</p>
+      </div>
+
       <h2>Clear vs compact vs new session</h2>
       <table>
         <thead>

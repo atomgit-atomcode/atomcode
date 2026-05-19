@@ -125,8 +125,20 @@
     const sb=document.getElementById('dside');
     const sbToggle=document.getElementById('sbToggle');
     if(sb&&sbToggle){
-      sbToggle.addEventListener('click',()=>sb.classList.toggle('open'));
-      sb.addEventListener('click',e=>{if(e.target.closest('a')) sb.classList.remove('open')});
+      const setOpen=(open)=>{
+        sb.classList.toggle('open',open);
+        sbToggle.textContent=open?'✕':'☰';
+        sbToggle.setAttribute('aria-expanded',open?'true':'false');
+        document.body.style.overflow=open?'hidden':'';
+      };
+      sbToggle.addEventListener('click',e=>{e.stopPropagation();setOpen(!sb.classList.contains('open'))});
+      sb.addEventListener('click',e=>{if(e.target.closest('a')) setOpen(false)});
+      document.addEventListener('click',e=>{
+        if(!sb.classList.contains('open'))return;
+        if(sb.contains(e.target)||sbToggle.contains(e.target))return;
+        setOpen(false);
+      });
+      addEventListener('resize',()=>{if(innerWidth>768&&sb.classList.contains('open'))setOpen(false)});
     }
 
     const page=document.body.getAttribute('data-page');
