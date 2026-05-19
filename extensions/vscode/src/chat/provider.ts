@@ -312,7 +312,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    const sid = this._activeSessionId;
+    // 在任何 await 之前捕获活跃 session ID——另一个 webview 处理器
+    // （如侧边栏 newConversation）可能在微任务边界清除 _activeSessionId。
+    let sid = this._activeSessionId;
+    if (!sid) {
+      await this._ensureSession();
+      sid = this._activeSessionId;
+    }
     if (!sid) return;
     const rt = this._getRuntime(sid);
 
@@ -329,17 +335,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // Ensure a session exists before sending the chat request so it
-    // appears in the session list immediately, not only after completion.
-    await this._ensureSession();
-
-    // Re-fetch runtime in case _ensureSession changed _activeSessionId
-    const activeSid = this._activeSessionId!;
-    const activeRt = this._getRuntime(activeSid);
-
-    activeRt.isGenerating = true;
-    activeRt.eventBuffer = [];  // Start a fresh buffer for this turn
-    activeRt.eventBuffer.push({ type: 'userMessage', data: { text: trimmed } });
+    rt.isGenerating = true;
+    rt.eventBuffer = [];  // Start a fresh buffer for this turn
+    rt.eventBuffer.push({ type: 'userMessage', data: { text: trimmed } });
     this._postMessage({ type: 'generationStarted' });
 
     let fullMessage = trimmed;
@@ -383,13 +381,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const request: ChatRequest = {
       message: fullMessage,
       working_dir: workspaceFolder,
-      session_id: activeSid,
+      session_id: sid,
     };
 
     // Capture session ID so callbacks always reference the correct session
-    const streamSessionId = activeSid;
+    const streamSessionId = sid;
 
-    activeRt.abortController = this._client.streamChat(request, {
+    rt.abortController = this._client.streamChat(request, {
       onText: (content) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
