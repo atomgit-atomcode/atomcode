@@ -224,7 +224,7 @@
   /* feature table */
   .ftab-wrap{border:1px solid var(--line);overflow-x:auto;position:relative}
   .ftab{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px;min-width:600px}
-  .ftab th{position:sticky;top:60px;background:#000;text-align:left;padding:14px 18px;font-size:11px;font-weight:500;letter-spacing:1.5px;color:rgba(255,255,255,.55);text-transform:uppercase;border-bottom:1px solid var(--line);z-index:10}
+  .ftab th{background:#000;text-align:left;padding:14px 18px;font-size:11px;font-weight:500;letter-spacing:1.5px;color:rgba(255,255,255,.55);text-transform:uppercase;border-bottom:1px solid var(--line)}
   .ftab th.atom{color:var(--accent)}
   .ftab th.claude{color:rgba(255,255,255,.7)}
   .ftab td{padding:14px 18px;border-bottom:1px solid var(--line);color:rgba(255,255,255,.8);transition:background .2s}
@@ -464,7 +464,6 @@
     .perf-status{text-align:left}
     .cmp-controls{gap:10px;margin-bottom:18px}
     .cmp-toggle{font-size:11px}
-    .ftab th{position:static;top:auto;z-index:auto}
     .ftab th,.ftab td{padding:10px 12px;font-size:12px}
     .gap-note{padding:14px;font-size:11.5px;margin-top:20px}
     .stepper{grid-template-columns:1fr;margin-top:18px}
@@ -760,6 +759,7 @@
       <div class="cmp-chips" id="cmpChips">
         <button class="cmp-chip active" data-cat="all" data-i18n="cmp.all">全部</button>
         <button class="cmp-chip" data-cat="price" data-i18n="cmp.price">价格</button>
+        <button class="cmp-chip" data-cat="license" data-i18n="cmp.license">协议</button>
         <button class="cmp-chip" data-cat="model" data-i18n="cmp.model">模型</button>
         <button class="cmp-chip" data-cat="tools" data-i18n="cmp.tools">工具</button>
         <button class="cmp-chip" data-cat="integration" data-i18n="cmp.integration">集成</button>
@@ -983,6 +983,7 @@ const T={
   'perf.desc':{zh:'越短越好 · 完成同一任务平均步骤数',en:'Lower is better · avg steps to complete a task'},
   'cmp.all':{zh:'全部',en:'All'},
   'cmp.price':{zh:'价格',en:'Price'},
+  'cmp.license':{zh:'协议',en:'License'},
   'cmp.model':{zh:'模型',en:'Model'},
   'cmp.tools':{zh:'工具',en:'Tools'},
   'cmp.integration':{zh:'集成',en:'Integration'},
@@ -1147,7 +1148,7 @@ const PERF=[
 ];
 
 const FEAT=[
-  {cat:'price',     catL:{zh:'价格',en:'Price'},   f:{zh:'开源协议',en:'License'},          a:{zh:'✓ MIT 开源',en:'✓ MIT'},                c:{zh:'闭源',en:'Closed source'},    win:'a'},
+  {cat:'license',   catL:{zh:'协议',en:'License'}, f:{zh:'开源协议',en:'License'},          a:{zh:'✓ MIT 开源',en:'✓ MIT'},                c:{zh:'闭源',en:'Closed source'},    win:'a'},
   {cat:'model',     catL:{zh:'模型',en:'Model'},   f:{zh:'模型接入',en:'Provider access'},  a:{zh:'✓ 任意 OpenAI 兼容',en:'✓ Any OpenAI-compatible'}, c:{zh:'仅 Claude',en:'Claude only'}, win:'a'},
   {cat:'model',     catL:{zh:'模型',en:'Model'},   f:{zh:'本地模型 (Ollama)',en:'Local model (Ollama)'},  a:{zh:'✓ 已支持',en:'✓ Supported'},   c:{zh:'✗ 不支持',en:'✗ Not supported'}, win:'a'},
   {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'代码图谱工具',en:'Code graph tools'}, a:{zh:'✓ 8 个内置',en:'✓ 8 built-in'},   c:{zh:'基础文本检索',en:'Basic text search'}, win:'a'},
