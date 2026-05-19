@@ -235,7 +235,7 @@ export interface CreateSessionResponse {
 // Callbacks for SSE streaming
 export interface ChatStreamCallbacks {
   onText: (content: string) => void;
-  onToolBatch: (calls: Array<{ id: string; name: string; arguments: string }>) => void;
+  onToolBatch: (calls: Array<{ id: string; name: string; args: string }>) => void;
   onToolStart: (id: string | undefined, name: string, args: string) => void;
   onToolResult: (id: string | undefined, name: string, output: string, success: boolean, durationMs: number) => void;
   onTokens: (prompt: number, completion: number, total: number) => void;

@@ -384,7 +384,9 @@ export class DaemonClient {
         callbacks.onText(event.content);
         break;
       case 'tool_batch':
-        callbacks.onToolBatch(event.calls);
+        callbacks.onToolBatch(
+          event.calls.map((c) => ({ id: c.id, name: c.name, args: c.arguments })),
+        );
         break;
       case 'tool_start':
         callbacks.onToolStart(event.id, event.name, event.arguments);

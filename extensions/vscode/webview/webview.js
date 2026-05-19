@@ -73681,7 +73681,7 @@
           const existingIndex = assistant.toolCalls?.findIndex((t) => t.id === action.id);
           if (existingIndex !== void 0 && existingIndex >= 0) {
             const updated = assistant.toolCalls.map(
-              (t, i) => i === existingIndex ? { ...t, status: "running" } : t
+              (t, i) => i === existingIndex ? { ...t, args: action.args, status: "running" } : t
             );
             msgs[assistantIndex] = { ...assistant, toolCalls: updated };
           } else {

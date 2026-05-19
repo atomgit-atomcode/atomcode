@@ -198,7 +198,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         if (existingIndex !== undefined && existingIndex >= 0) {
           // Tool was already announced via TOOL_BATCH_START — transition to running
           const updated = assistant.toolCalls!.map((t, i) =>
-            i === existingIndex ? { ...t, status: 'running' as const } : t,
+            i === existingIndex ? { ...t, args: action.args, status: 'running' as const } : t,
           );
           msgs[assistantIndex] = { ...assistant, toolCalls: updated };
         } else {
