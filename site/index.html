@@ -70,6 +70,7 @@
     repeating-linear-gradient(transparent 0,transparent 39px,rgba(255,255,255,.025) 40px);
     pointer-events:none}
   .hero-wrap{width:min(1180px,100%);margin:0 auto;display:grid;grid-template-columns:1.1fr 1fr;gap:60px;align-items:center;position:relative}
+  .hero-wrap > *{min-width:0}
   .hero-left .badge{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;letter-spacing:2.5px;color:var(--accent);text-transform:uppercase;padding:6px 12px;border:1px solid rgba(232,160,80,.35);border-radius:999px;margin-bottom:22px}
   .hero-left .badge .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);animation:dotPulse 2s ease-in-out infinite}
   @keyframes dotPulse{0%,50%{opacity:1}25%{opacity:.3}}
@@ -241,6 +242,7 @@
   .install{padding:60px 30px 100px}
   .install-wrap{width:min(1180px,100%);margin:0 auto}
   .install-grid{display:grid;grid-template-columns:1.1fr 1fr;gap:32px;align-items:flex-start}
+  .install-grid > *{min-width:0}
   .install-block{background:#000;border:1px solid var(--line);border-radius:10px;overflow:hidden}
   .stepper{display:grid;grid-template-columns:repeat(3,1fr);gap:0;font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.6);letter-spacing:1px;margin-top:24px;border:1px solid var(--line)}
   .step{padding:18px 20px;border-right:1px solid var(--line);position:relative}
@@ -390,6 +392,10 @@
   /* theme button morphs between sun/moon */
   .theme-icon{display:inline-flex;width:14px;height:14px;align-items:center;justify-content:center}
 
+  /* ---------- mobile drawer ---------- */
+  .mb-toggle{display:none}
+  .mb-drawer{display:none}
+
   /* ---------- responsive ---------- */
   @media (max-width:1024px){
     .hero-wrap{grid-template-columns:1fr;gap:40px}
@@ -398,15 +404,118 @@
     .install-grid{grid-template-columns:1fr}
   }
   @media (max-width:768px){
-    .hdr{padding:0 16px;height:52px}
+    .hdr{padding:0 14px;height:52px}
     .hdr-nav{display:none}
+    .hdr-right{gap:6px}
+    .hdr-right .btn-pill{display:none}
+    .ver{display:none}
+    .mb-toggle{display:inline-flex}
     .hero{padding:100px 16px 60px}
-    .hero h1{font-size:36px}
+    .hero-wrap{gap:32px}
+    .hero h1{font-size:36px;letter-spacing:-1px}
+    .hero .sub{font-size:15px;margin-bottom:24px}
+    .hero-left{min-width:0;max-width:100%}
+    .hero-left .badge{
+      display:flex;align-items:flex-start;flex-wrap:nowrap;
+      width:fit-content;max-width:100%;
+      font-size:10px;letter-spacing:1px;padding:6px 12px;line-height:1.5;
+    }
+    .hero-left .badge .dot{margin-top:5px;flex-shrink:0}
+    .hero-left .badge > span:last-child{white-space:normal}
+    .install-box{width:100%;max-width:100%}
+    .install-body{min-width:0;padding:14px 14px 12px}
+    .install-cmd{min-width:0;font-size:12px}
+    .install-actions{flex-wrap:wrap;gap:8px;font-size:10.5px;margin-top:12px}
+    .install-actions .left{min-width:0;flex:1}
+    .cp-btn{white-space:nowrap;padding:6px 12px;font-size:10.5px;letter-spacing:1px}
+    .terminal{min-width:0;max-width:100%}
+    .hero-cta{margin-top:18px;gap:10px}
+    .hero-cta .btn{padding:12px 18px;font-size:11px;letter-spacing:1.4px;flex:1;justify-content:center}
+    .install-tabs{flex-wrap:wrap}
+    .install-tab{flex:1;min-width:50%;justify-content:center;border-bottom:1px solid var(--line)}
+    .install-tab:nth-child(2n){border-right:none}
+    .install-tab:nth-last-child(-n+2){border-bottom:none}
+    .terminal{margin-top:8px}
+    .term-body{padding:12px 14px;min-height:300px;max-height:300px;font-size:12px}
+    .term-chips{flex-wrap:wrap;padding:8px 10px}
+    .term-chip{font-size:10px;padding:4px 8px;letter-spacing:.3px}
+    .stats{padding:48px 16px 24px}
     .stats-wrap,.grid-features{grid-template-columns:1fr}
+    .stats-wrap{gap:10px}
+    .stat-card{padding:22px 18px}
     .stat-card .v{font-size:42px}
-    .stepper{grid-template-columns:1fr}
-    .download-row{grid-template-columns:1fr}
-    .section-head h2{font-size:24px}
+    .stat-card .v .suf{font-size:18px}
+    .stat-card .l{font-size:11px;letter-spacing:1.2px}
+    .stat-card .pop{display:none}
+    .features{padding:40px 16px 60px}
+    .compare{padding:40px 16px 60px}
+    .install{padding:40px 16px 80px}
+    .section-head{padding:0 4px;padding-bottom:14px;margin-bottom:28px;gap:10px}
+    .section-head h2{font-size:22px;letter-spacing:-.5px}
+    .section-head h2 .mono{font-size:11px;letter-spacing:2px;margin-bottom:6px}
+    .section-head .hint{font-size:11px;letter-spacing:.5px}
+    .feat{padding:22px 20px 18px;min-height:0}
+    .feat h3{font-size:16px}
+    .feat p{font-size:12.5px}
+    .feat .demo{margin-top:12px;padding-top:12px;min-height:60px}
+    .perf{padding:18px}
+    .perf h3{font-size:16px}
+    .perf-row{grid-template-columns:1fr;gap:6px;padding:12px 0}
+    .perf-status{text-align:left}
+    .cmp-controls{gap:10px;margin-bottom:18px}
+    .cmp-toggle{font-size:11px}
+    .ftab th,.ftab td{padding:10px 12px;font-size:12px}
+    .gap-note{padding:14px;font-size:11.5px;margin-top:20px}
+    .stepper{grid-template-columns:1fr;margin-top:18px}
+    .step{padding:14px 18px;border-right:none;border-bottom:1px solid var(--line)}
+    .step:last-child{border-bottom:none}
+    .step .ch{display:none}
+    .step:last-child .ch{display:none}
+    .download-row{grid-template-columns:1fr 1fr}
+    .wiz-body{padding:14px}
+    .wiz-step .qq{font-size:13px}
+    .ftr{padding:36px 16px calc(48px + env(safe-area-inset-bottom,0px))}
+    .ftr-row a{display:inline-block;padding:4px 0}
+    /* drawer */
+    .mb-drawer{display:flex;flex-direction:column;position:fixed;top:52px;left:0;right:0;
+      z-index:999;background:rgba(10,10,10,.96);backdrop-filter:blur(16px);
+      -webkit-backdrop-filter:blur(16px);
+      border-bottom:1px solid var(--line);
+      transform:translateY(-110%);transition:transform .28s ease;
+      visibility:hidden;
+      padding:6px 16px 18px;
+      max-height:calc(100vh - 52px);overflow-y:auto;
+    }
+    .mb-drawer.open{transform:translateY(0);visibility:visible}
+    .mb-drawer a{padding:14px 6px;font-family:var(--mono);font-size:13px;letter-spacing:1.5px;
+      color:rgba(255,255,255,.78);border-bottom:1px solid var(--line);
+      text-transform:uppercase;display:flex;align-items:center;gap:8px;
+    }
+    .mb-drawer a:hover,.mb-drawer a:active{color:var(--accent)}
+    .mb-drawer a.cp{color:var(--accent)}
+    .mb-drawer a .free-badge{padding:1px 6px;font-size:9px;font-weight:600;letter-spacing:1px;
+      background:rgba(232,160,80,.18);color:var(--accent);
+      border:1px solid rgba(232,160,80,.4);border-radius:3px;text-transform:uppercase;
+    }
+    .mb-drawer a.cta{
+      margin-top:10px;background:var(--accent);color:#000;font-weight:600;
+      border:1px solid var(--accent);justify-content:center;border-bottom:none;
+      font-size:12px;letter-spacing:1.6px;
+    }
+    .mb-drawer a.cta:hover,.mb-drawer a.cta:active{color:#000;background:#ffd194}
+    html.light .mb-drawer{background:rgba(246,243,236,.96)}
+    html.light .mb-drawer a{color:rgba(0,0,0,.78);border-bottom-color:rgba(0,0,0,.10)}
+    html.light .mb-drawer a:hover,html.light .mb-drawer a:active{color:#c87618}
+    html.light .mb-drawer a.cp{color:#c87618}
+    html.light .mb-drawer a.cta{background:#c87618;color:#fff;border-color:#c87618}
+    html.light .mb-drawer a.cta:hover,html.light .mb-drawer a.cta:active{background:#0d0d0d;color:#fff}
+  }
+  @media (max-width:380px){
+    .install-tabs{flex-direction:column}
+    .install-tab{min-width:100%;border-right:none;border-bottom:1px solid var(--line)}
+    .install-tab:last-child{border-bottom:none}
+    .hero-cta{flex-direction:column}
+    .hero-cta .btn{width:100%}
   }
 </style>
 </head>
@@ -439,8 +548,23 @@
     <button class="icon-btn" id="langBtn" aria-label="语言">中</button>
     <a class="btn-pill" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="btn.repo">开源仓库</a>
     <a class="btn-pill primary" href="#install" data-i18n="btn.start">立即开始</a>
+    <button class="icon-btn mb-toggle" id="mbToggle" aria-label="菜单" aria-expanded="false">☰</button>
   </div>
 </header>
+
+<!-- mobile drawer -->
+<nav class="mb-drawer" id="mbDrawer" aria-label="移动端导航">
+  <a href="#features" data-i18n="nav.features">功能</a>
+  <a href="#compare" data-i18n="nav.compare">对比</a>
+  <a href="#install" data-i18n="nav.install">安装</a>
+  <a href="./docs/index.html" target="_blank" rel="noopener" data-i18n="nav.docs">文档</a>
+  <a class="cp" href="https://ai.atomgit.com/serverless-api" target="_blank" rel="noopener">
+    <span data-i18n="nav.codingplan">CodingPlan</span>
+    <span class="free-badge">FREE</span>
+  </a>
+  <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="btn.repo">开源仓库</a>
+  <a class="cta" href="#install" data-i18n="btn.start.arrow">立即开始 →</a>
+</nav>
 
 <!-- hero -->
 <section class="hero" id="top">
@@ -506,7 +630,7 @@
     <div class="stat-card"><div class="v"><span data-count="8">0</span><span class="suf">+</span></div><div class="l" data-i18n="stats.providers">支持的模型</div>
       <div class="pop" data-i18n-html="stats.providers.pop">Claude (Sonnet 4.5/4.6, Opus 4.6) · OpenAI (GPT-4o/4.1) · DeepSeek (V3/R1) · GLM (4/5) · Qwen (Plus/Max) · SiliconFlow · Ollama · 任意 <b>OpenAI 兼容 API</b></div>
     </div>
-    <div class="stat-card"><div class="v"><span data-count="5">0</span></div><div class="l" data-i18n="stats.platforms">支持平台</div>
+    <div class="stat-card"><div class="v"><span data-count="6">0</span></div><div class="l" data-i18n="stats.platforms">支持平台</div>
       <div class="pop" data-i18n-html="stats.platforms.pop">macOS (Apple Silicon · Intel) · Linux (x64 + arm64) · HarmonyOS PC · Windows · 共 6 个二进制变体</div>
     </div>
   </div>
@@ -921,7 +1045,7 @@ const T={
   'os.auto':{zh:'✓ 自动检测 · ',en:'✓ Auto-detected · '},
   'method.oneclick':{zh:'macOS / Linux / HarmonyOS PC + Windows · 自动选 PATH',en:'macOS / Linux / HarmonyOS PC + Windows · auto PATH'},
   'method.source':{zh:'需要 Rust 1.88+ · cargo install 到 ~/.cargo/bin/atomcode',en:'Rust 1.88+ required · cargo install to ~/.cargo/bin/atomcode'},
-  'method.binary':{zh:'5 个平台 · 6 个二进制变体 · 预编译 · 单文件运行',en:'5 platforms · 6 binary variants · prebuilt · single-file run'},
+  'method.binary':{zh:'6 个平台 · 预编译 · 单文件运行',en:'6 platforms · prebuilt · single-file run'},
 };
 function t(k){const v=T[k];if(!v)return k;return v[LANG]||v.zh||k;}
 function tx(x){if(typeof x==='string')return x;if(x&&typeof x==='object'&&x[LANG]!==undefined)return x[LANG];return String(x);}
@@ -958,6 +1082,7 @@ const DOWNLOADS=[
   {os:'macOS · Apple Silicon',arch:'darwin-arm64',file:`atomcode-${VERSION}-darwin-arm64`},
   {os:'macOS · Intel',arch:'darwin-x64',file:`atomcode-${VERSION}-darwin-x64`},
   {os:'Linux x64',arch:'linux-x64',file:`atomcode-${VERSION}-linux-x64`},
+  {os:'Linux arm64',arch:'linux-arm64',file:`atomcode-${VERSION}-linux-arm64`},
   {os:'HarmonyOS PC',arch:'ohos-arm64',file:`atomcode-${VERSION}-ohos-arm64`},
   {os:'Windows',arch:'windows-x64',file:`atomcode-${VERSION}-windows-x64.exe`},
 ];
@@ -1395,6 +1520,23 @@ window.applyWizardNav=null;
     toastEl.textContent=t('toast.lang.'+LANG);
     toastEl.classList.add('show');setTimeout(()=>toastEl.classList.remove('show'),1200);
   });
+})();
+
+/* ========== mobile drawer ========== */
+(function(){
+  const tog=document.getElementById('mbToggle');
+  const drawer=document.getElementById('mbDrawer');
+  if(!tog||!drawer) return;
+  function close(){drawer.classList.remove('open');tog.setAttribute('aria-expanded','false');tog.textContent='☰';document.body.style.overflow=''}
+  function open(){drawer.classList.add('open');tog.setAttribute('aria-expanded','true');tog.textContent='✕';document.body.style.overflow='hidden'}
+  tog.addEventListener('click',e=>{e.stopPropagation();drawer.classList.contains('open')?close():open()});
+  drawer.querySelectorAll('a').forEach(a=>a.addEventListener('click',close));
+  document.addEventListener('click',e=>{
+    if(!drawer.classList.contains('open'))return;
+    if(drawer.contains(e.target)||tog.contains(e.target))return;
+    close();
+  });
+  window.addEventListener('resize',()=>{if(window.innerWidth>768)close()});
 })();
 </script>
 </body>

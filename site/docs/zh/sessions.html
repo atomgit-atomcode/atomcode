@@ -97,6 +97,41 @@
       <pre><code>/session</code></pre>
       <p>在不切换工作目录的前提下开启全新的上下文。适合"刚刚那个任务已经收尾,我要开始完全不相关的另一件事"。</p>
 
+      <h2 id="bg">后台会话(<code>/bg</code>)</h2>
+      <p>需要同时跟进多条任务、又不想丢失当前对话上下文?<code>/bg</code> 把当前会话挪到后台、打开一个全新前台,随时可以切回去。最多 <strong>16 个并行后台槽位</strong>。</p>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/bg</code></td><td>把当前会话送到后台,打开新的前台</td></tr>
+          <tr><td><code>/bg list</code>(别名 <code>/bg ls</code>)</td><td>列出所有后台会话:编号、ID、状态、创建时间、摘要</td></tr>
+          <tr><td><code>/bg &lt;N&gt;</code></td><td>恢复第 N 号后台为前台(当前前台会被换下到后台)</td></tr>
+          <tr><td><code>/bg drop &lt;N&gt;</code></td><td>丢弃第 N 号后台会话</td></tr>
+          <tr><td><code>/bg help</code>(别名 <code>-h</code>、<code>--help</code>)</td><td>显示内置帮助</td></tr>
+        </tbody>
+      </table>
+
+      <h3>会话状态</h3>
+      <p><code>/bg list</code> 的"状态"列对应会话在后台时的运行情况:</p>
+      <ul>
+        <li><strong>运行中</strong> —— 模型还在执行,工具调用 / 输出在后台继续推进</li>
+        <li><strong>空闲</strong> —— 模型轮次跑完,等你的下一条 prompt</li>
+        <li><strong>已完成</strong> —— 会话已经显式结束</li>
+        <li><strong>已取消 / 错误</strong> —— 被中断或后台运行时出错</li>
+      </ul>
+      <p>所以 <code>/bg</code> 后台并不只是"挂起"——模型真的会在后台继续干活,切回来时直接拿到结果。</p>
+
+      <h3><code>/background &lt;任务&gt;</code> —— 一次性后台派发</h3>
+      <p>如果你不想专门切换前后台、只是"顺手让它跑一下查个东西",用 <code>/background</code> 兼容入口:</p>
+      <pre><code>/background 列出 src 下未使用的依赖</code></pre>
+      <p>会在一个 <code>/bg</code> 槽位里启动一次性任务(默认配置为只读工具子集,不污染主对话上下文)。跑完后用 <code>/bg list</code> 看状态,<code>/bg &lt;N&gt;</code> 切过去读结果,<code>/bg drop &lt;N&gt;</code> 丢弃。</p>
+
+      <div class="callout callout-tip">
+        <strong>典型场景</strong>
+        <p>主前台正在调试 A 模块,模型一边改一边跑 <code>cargo check</code>(耗时)。这时想到要顺便重构 B 模块——直接 <code>/bg</code> 切到新前台开始 B;A 那边的 build 在后台跑完状态切到"已完成",<code>/bg 1</code> 切回去拿结果。</p>
+      </div>
+
       <h2>清空 vs 压缩 vs 新建</h2>
       <table>
         <thead>
