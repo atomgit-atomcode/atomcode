@@ -615,9 +615,10 @@ impl LlmProvider for OpenAiProvider {
                     let status = response.status();
                     let resp_url = response.url().to_string();
                     let body = response.text().await.unwrap_or_default();
+                    let msg = super::extract_error_message(&body);
                     let _ = tx.send(Ok(StreamEvent::Error(format!(
                         "API error ({}) at `{}`:\n{}",
-                        status, resp_url, body
+                        status, resp_url, msg
                     ))));
                     return;
                 }

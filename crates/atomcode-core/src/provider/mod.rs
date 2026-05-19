@@ -100,6 +100,38 @@ pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Distill an upstream HTTP error body down to a human-readable message.
+///
+/// Gateways wrap the real message in JSON envelopes: AtomCode returns
+/// `{"detail":{"code":"X","message":"Y"}}`, FastAPI defaults to
+/// `{"detail":"Y"}`, OpenAI/Anthropic use `{"error":{"message":"Y",...}}`.
+/// Surfacing the raw body shows users the envelope instead of `Y`. Try the
+/// known shapes; fall back to the original body when nothing matches.
+pub(super) fn extract_error_message(body: &str) -> String {
+    let trimmed = body.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(detail) = v.get("detail") {
+            if let Some(msg) = detail.get("message").and_then(|m| m.as_str()) {
+                return msg.to_string();
+            }
+            if let Some(s) = detail.as_str() {
+                return s.to_string();
+            }
+        }
+        if let Some(msg) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return msg.to_string();
+        }
+        if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 /// Factory: create the right provider from config.
 /// If `api_key` is `None`, automatically loads from `~/.atomcode/auth.toml`
 /// (with token refresh if expired).
