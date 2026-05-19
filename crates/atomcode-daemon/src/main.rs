@@ -1111,7 +1111,7 @@ async fn change_dir(
         }
 
         let hash = hash_path(&new_path);
-        state.telemetry.track(Event::UseCommand { type_: "cd".into() });
+        state.telemetry.track(Event::UseCommand { type_: "cd".into(), success: Some(true), error_kind: None, error_data: None });
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
@@ -1339,7 +1339,7 @@ async fn delete_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match delete_session_file(&hash, &id) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into() });
+                state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into(), success: Some(true), error_kind: None, error_data: None });
                 let msg = format!("Session {} deleted successfully", id);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -1398,7 +1398,7 @@ async fn rename_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match rename_session_file(&hash, &id, &req.name) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "rename".into() });
+                state_clone.telemetry.track(Event::UseCommand { type_: "rename".into(), success: Some(true), error_kind: None, error_data: None });
                 let msg = format!("Session {} renamed to '{}'", id, req.name);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -2499,7 +2499,7 @@ async fn stop_chat(
         // Cancel the chat task if it exists
         if let Some(cancel_token) = state_clone.chat_tasks.read().await.get(&req.session_id) {
             cancel_token.cancel();
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into() });
+            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2509,7 +2509,7 @@ async fn stop_chat(
             )
         } else {
             // Session wasn't running, but we marked it as stopped
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into() });
+            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2653,6 +2653,13 @@ fn install_panic_hook(telemetry: Arc<Telemetry>) {
             message_head: scrubbed_msg,
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
+            error_kind: Some("panic".to_string()),
+            error_data: Some(serde_json::json!({
+                "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                "turns_completed": null,
+                "last_tool_name": null,
+                "last_event": null,
+            }).to_string()),
         });
         default_hook(info); // R9.4: preserve stderr output
     }));

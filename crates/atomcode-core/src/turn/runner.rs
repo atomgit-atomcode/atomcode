@@ -4,7 +4,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use atomcode_telemetry::{CurrentContext, Event as TelemetryEvent};
+use atomcode_telemetry::{CurrentContext, Event as TelemetryEvent, LlmErrorKind, ToolErrorKind};
 
 use crate::config::Config;
 use crate::conversation::Conversation;
@@ -317,6 +317,30 @@ impl TurnRunner {
                     ))
                     .map(|m| m.estimate_tokens() as u32)
                     .sum();
+                let (error_kind, error_data) = if result.is_failed() {
+                    let reason = match &result {
+                        TurnResult::Failed(r) => r.clone(),
+                        _ => String::new(),
+                    };
+                    let kind = classify_llm_error(&reason);
+                    let error_data = build_llm_error_data(
+                        kind,
+                        &reason,
+                        turn_started.elapsed().as_millis() as u32,
+                        scope_ctx.provider.as_deref(),
+                        scope_ctx.provider_host.as_deref(),
+                        scope_ctx.model.as_deref(),
+                        context_window as u32,
+                        system_tokens,
+                        tool_def_tokens,
+                        tool_result_tokens,
+                        message_tokens,
+                        messages_count,
+                    );
+                    (Some(kind), error_data)
+                } else {
+                    (None, None)
+                };
                 let event = TelemetryEvent::LlmChat {
                     duration_ms: turn_started.elapsed().as_millis() as u32,
                     tool_calls_count: $tool_count as u32,
@@ -330,6 +354,8 @@ impl TurnRunner {
                     tool_result_tokens,
                     message_tokens,
                     messages_count,
+                    error_kind,
+                    error_data,
                 };
                 let tel = self.context.telemetry.clone();
                 let emit_ctx = scope_ctx.clone();
@@ -1119,6 +1145,19 @@ impl TurnRunner {
                     success: false,
                     duration: std::time::Duration::ZERO,
                 });
+                self.context.telemetry.track(TelemetryEvent::ToolCall {
+                    name: corrected_name.clone(),
+                    success: false,
+                    duration_ms: 0,
+                    error_kind: Some(ToolErrorKind::NotFound),
+                    error_data: Some(serde_json::json!({
+                        "tool_name": call.name,
+                        "duration_ms": 0,
+                        "original_name": if call.name != corrected_name { Some(call.name.as_str()) } else { None },
+                        "available_tools": available,
+                        "reason": format!("Tool '{}' not found", call.name),
+                    }).to_string()),
+                });
                 return ToolResult {
                     call_id: call.id.clone(),
                     output,
@@ -1169,6 +1208,17 @@ impl TurnRunner {
                 success: false,
                 duration: std::time::Duration::ZERO,
             });
+            self.context.telemetry.track(TelemetryEvent::ToolCall {
+                name: corrected_name.clone(),
+                success: false,
+                duration_ms: 0,
+                error_kind: Some(ToolErrorKind::InvalidArgs),
+                error_data: Some(serde_json::json!({
+                    "tool_name": corrected_name,
+                    "reason": reason,
+                    "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                }).to_string()),
+            });
             return ToolResult {
                 call_id: call.id.clone(),
                 output: msg,
@@ -1208,6 +1258,19 @@ impl TurnRunner {
                     success: false,
                     duration: std::time::Duration::ZERO,
                 });
+            self.context.telemetry.track(TelemetryEvent::ToolCall {
+                name: corrected_name.clone(),
+                success: false,
+                duration_ms: 0,
+                error_kind: Some(ToolErrorKind::DeniedByUser),
+                error_data: Some(serde_json::json!({
+                    "tool_name": corrected_name,
+                    "duration_ms": 0,
+                    "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                    "approval_reason": reason,
+                    "reason": "User denied tool execution",
+                }).to_string()),
+            });
                 return ToolResult {
                     call_id: call.id.clone(),
                     output,
@@ -1235,6 +1298,19 @@ impl TurnRunner {
                         output: output.clone(),
                         success: false,
                         duration: std::time::Duration::ZERO,
+                    });
+                    self.context.telemetry.track(TelemetryEvent::ToolCall {
+                        name: corrected_name.clone(),
+                        success: false,
+                        duration_ms: 0,
+                        error_kind: Some(ToolErrorKind::BlockedByHook),
+                        error_data: Some(serde_json::json!({
+                            "tool_name": corrected_name,
+                            "duration_ms": 0,
+                            "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                            "hook_reason": reason,
+                            "reason": "Tool call blocked by PreToolUse hook",
+                        }).to_string()),
                     });
                     return ToolResult {
                         call_id: call.id.clone(),
@@ -1282,6 +1358,19 @@ impl TurnRunner {
                     output: output.clone(),
                     success: false,
                     duration,
+                });
+                self.context.telemetry.track(TelemetryEvent::ToolCall {
+                    name: corrected_name.clone(),
+                    success: false,
+                    duration_ms: duration.as_millis() as u32,
+                    error_kind: Some(ToolErrorKind::ExecutionFailed),
+                    error_data: Some(serde_json::json!({
+                        "tool_name": corrected_name,
+                        "duration_ms": duration.as_millis() as u32,
+                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                        "output_tail": "[Cancelled by user]",
+                        "reason": "Tool execution cancelled by user",
+                    }).to_string()),
                 });
                 return ToolResult {
                     call_id: call.id.clone(),
@@ -1336,6 +1425,46 @@ impl TurnRunner {
             output: tool_result.output.clone(),
             success: tool_result.success,
             duration,
+        });
+
+        // Emit ToolCall telemetry event for both success and failure.
+        let output_tail = atomcode_telemetry::scrub::truncate_head(
+            &atomcode_telemetry::scrub::scrub_path(
+                &tool_result.output,
+                None,
+                Some(&self.context.working_dir.read().await.clone()),
+            ),
+            200,
+        );
+        // Detect warning: exit 0 (success) but stderr present.
+        let has_stderr = tool_result.output.contains("STDERR:")
+            || tool_result.output.contains("[stderr]");
+        let (error_kind, error_data) = if !tool_result.success {
+            (Some(ToolErrorKind::ExecutionFailed), Some(serde_json::json!({
+                "tool_name": corrected_name,
+                "duration_ms": duration.as_millis() as u32,
+                "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                "output_tail": output_tail,
+                "reason": "Tool execution returned an error",
+            }).to_string()))
+        } else if has_stderr {
+            (Some(ToolErrorKind::Warning), Some(serde_json::json!({
+                "tool_name": corrected_name,
+                "duration_ms": duration.as_millis() as u32,
+                "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                "output_tail": output_tail,
+                "reason": "Command succeeded (exit 0) but produced stderr output",
+                "resolution": "Review stderr for potential issues; the command may not have had the intended effect",
+            }).to_string()))
+        } else {
+            (None, None)
+        };
+        self.context.telemetry.track(TelemetryEvent::ToolCall {
+            name: corrected_name.clone(),
+            success: tool_result.success,
+            duration_ms: duration.as_millis() as u32,
+            error_kind,
+            error_data,
         });
 
         tool_result
@@ -2268,4 +2397,212 @@ mod tool_call_text_rescue_tests {
         visible.push_str(&f.flush());
         assert_eq!(visible, "中文 hello 世界");
     }
+}
+
+/// Build a structured `error_data` JSON for LLM errors, following the
+/// telemetry design doc (section 3.5 — `llm_chat` event).
+///
+/// Extracts `status_code` from the raw error string (patterns like "401",
+/// "403", "429", "500", "502", "503") and scrubs the message via
+/// `scrub::scrub_path` + `scrub::truncate_head(_, 200)`.
+pub(crate) fn build_llm_error_data(
+    kind: LlmErrorKind,
+    reason: &str,
+    duration_ms: u32,
+    provider: Option<&str>,
+    provider_host: Option<&str>,
+    model: Option<&str>,
+    context_window: u32,
+    system_tokens: u32,
+    tool_def_tokens: u32,
+    tool_result_tokens: u32,
+    message_tokens: u32,
+    messages_count: u32,
+) -> Option<String> {
+    use atomcode_telemetry::scrub;
+
+    // ── Extract status code from the raw error string ──────────────
+    let status_code: Option<u16> = extract_status_code(reason);
+
+    // ── Build a concise, scrubbed error message ───────────────────
+    // Strip the raw JSON body that some providers append after a colon.
+    let home = std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h));
+    let cwd = std::env::var("PWD").ok().map(|c| std::path::PathBuf::from(c));
+    let message_raw = scrub::scrub_path(
+        reason,
+        home.as_deref(),
+        cwd.as_deref(),
+    );
+    let message = scrub::truncate_head(&message_raw, 200);
+
+    let base = || -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        m.insert("duration_ms".into(), serde_json::json!(duration_ms));
+        if let Some(p) = provider {
+            m.insert("provider".into(), serde_json::json!(p));
+        }
+        if let Some(h) = provider_host {
+            m.insert("provider_host".into(), serde_json::json!(h));
+        }
+        if let Some(mdl) = model {
+            m.insert("model".into(), serde_json::json!(mdl));
+        }
+        serde_json::Value::Object(m)
+    };
+
+    let map = match kind {
+        LlmErrorKind::AuthError => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            if let Some(sc) = status_code {
+                obj.insert("status_code".into(), serde_json::json!(sc));
+            }
+            obj.insert("message".into(), serde_json::json!(message));
+            m
+        }
+        LlmErrorKind::RateLimited => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            if let Some(sc) = status_code {
+                obj.insert("status_code".into(), serde_json::json!(sc));
+            }
+            obj.insert("message".into(), serde_json::json!(message));
+            // retry_after_secs: could be parsed from Retry-After header,
+            // but we don't have that info here. Leave as null.
+            obj.insert("retry_after_secs".into(), serde_json::Value::Null);
+            m
+        }
+        LlmErrorKind::ServerError => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            if let Some(sc) = status_code {
+                obj.insert("status_code".into(), serde_json::json!(sc));
+            }
+            obj.insert("message".into(), serde_json::json!(message));
+            m
+        }
+        LlmErrorKind::NetworkError => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("message".into(), serde_json::json!(message));
+            obj.insert("attempt_duration_ms".into(), serde_json::json!(duration_ms));
+            obj.insert("is_retry".into(), serde_json::json!(false));
+            m
+        }
+        LlmErrorKind::StreamTimeout => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("timeout_secs".into(), serde_json::json!(duration_ms / 1000));
+            // Phase heuristic: if no tokens were received → "first_token",
+            // otherwise "subsequent". We don't have per-event token counts
+            // at this layer, so default to "first_token".
+            obj.insert("phase".into(), serde_json::json!("first_token"));
+            obj.insert("tokens_received".into(), serde_json::json!(0));
+            m
+        }
+        LlmErrorKind::StreamInterrupted => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("message".into(), serde_json::json!(message));
+            obj.insert("bytes_received".into(), serde_json::Value::Null);
+            obj.insert("tokens_received".into(), serde_json::Value::Null);
+            obj.insert("finish_reason".into(), serde_json::Value::Null);
+            m
+        }
+        LlmErrorKind::ContextOverflow => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            let sent_tokens = system_tokens
+                .saturating_add(tool_def_tokens)
+                .saturating_add(tool_result_tokens)
+                .saturating_add(message_tokens);
+            obj.insert("context_window".into(), serde_json::json!(context_window));
+            obj.insert("sent_tokens".into(), serde_json::json!(sent_tokens));
+            obj.insert("system_tokens".into(), serde_json::json!(system_tokens));
+            obj.insert("tool_def_tokens".into(), serde_json::json!(tool_def_tokens));
+            obj.insert("tool_result_tokens".into(), serde_json::json!(tool_result_tokens));
+            obj.insert("message_tokens".into(), serde_json::json!(message_tokens));
+            obj.insert("messages_count".into(), serde_json::json!(messages_count));
+            m
+        }
+        LlmErrorKind::Other => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("message".into(), serde_json::json!(message));
+            m
+        }
+    };
+
+    Some(map.to_string())
+}
+
+/// Extract an HTTP status code from a raw error string.
+/// Looks for patterns like "401", "403", "429", "500", "502", "503"
+/// that appear as standalone numbers (not part of a larger number).
+fn extract_status_code(reason: &str) -> Option<u16> {
+    // Common HTTP error status codes to look for
+    let codes = [401u16, 403, 429, 500, 502, 503];
+    let lower = reason.to_lowercase();
+    for code in codes {
+        // Check if the code appears as a standalone number
+        // Match patterns like "401", "(401)", "error 401", "HTTP 401"
+        let code_str = code.to_string();
+        if lower.contains(&code_str) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+/// Classify an LLM error reason string into a telemetry `LlmErrorKind`.
+pub(crate) fn classify_llm_error(reason: &str) -> LlmErrorKind {
+    let r = reason.to_lowercase();
+    if r.contains("401") || r.contains("403") || r.contains("unauthorized") || r.contains("auth") {
+        LlmErrorKind::AuthError
+    } else if r.contains("429") || r.contains("rate") || r.contains("throttl") {
+        LlmErrorKind::RateLimited
+    } else if r.contains("500") || r.contains("502") || r.contains("503") {
+        LlmErrorKind::ServerError
+    } else if r.contains("stream timeout") || r.contains("no event for") {
+        LlmErrorKind::StreamTimeout
+    } else if r.contains("decode") || r.contains("mid-flight") || r.contains("terminated") {
+        LlmErrorKind::StreamInterrupted
+    } else if r.contains("context") || r.contains("max_tokens") || r.contains("token limit") {
+        LlmErrorKind::ContextOverflow
+    } else if r.contains("connect") || r.contains("dns") || r.contains("network") || r.contains("timeout") {
+        LlmErrorKind::NetworkError
+    } else {
+        LlmErrorKind::Other
+    }
+}
+
+/// Build a concise summary of tool call arguments for telemetry.
+/// Extracts top-level JSON keys and truncates values to avoid leaking sensitive data.
+pub(crate) fn build_args_summary(tool_name: &str, args: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+        if let Some(obj) = v.as_object() {
+            let pairs: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| {
+                    let val_str = match v {
+                        serde_json::Value::String(s) => {
+                            atomcode_telemetry::scrub::truncate_head(s, 50)
+                        }
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Null => "null".to_string(),
+                        _ => format!("<{}>", match v {
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::Object(_) => "object",
+                            _ => "value",
+                        }),
+                    };
+                    format!("{}={}", k, val_str)
+                })
+                .collect();
+            return format!("{}({})", tool_name, pairs.join(", "));
+        }
+    }
+    // Fallback: truncate raw args
+    format!("{}({})", tool_name, atomcode_telemetry::scrub::truncate_head(args, 100))
 }

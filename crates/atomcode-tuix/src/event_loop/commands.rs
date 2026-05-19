@@ -252,7 +252,7 @@ pub(super) fn execute_slash_command(
     {
         use atomcode_telemetry::Event;
         let cmd_name = cmd.trim_start_matches('/').to_string();
-        ctx.telemetry.track(Event::UseCommand { type_: cmd_name });
+        ctx.telemetry.track(Event::UseCommand { type_: cmd_name, success: Some(true), error_kind: None, error_data: None });
     }
 
     match cmd {
@@ -1494,6 +1494,27 @@ pub(super) fn execute_slash_command(
                     .ok();
                 state.on_submit();
             } else {
+                // Unknown command — emit failure telemetry
+                let available_commands: Vec<&str> = vec![
+                    "help", "quit", "exit", "clear", "compact", "reload", "config",
+                    "plan", "build", "session", "model", "language", "resume",
+                    "rename", "provider", "status", "diff", "undo", "cost",
+                    "context", "remember", "forget", "memory", "login", "logout",
+                    "whoami", "upgrade", "issue", "cd", "bg", "codingplan",
+                ];
+                ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
+                    type_: other.to_string(),
+                    success: Some(false),
+                    error_kind: Some(atomcode_telemetry::UseCommandErrorKind::NotFound),
+                    error_data: Some(serde_json::json!({
+                        "command": other,
+                        "duration_ms": 0,
+                        "message": format!("Unknown command: {}", other),
+                        "reason": "用户输入了不存在的斜杠命令",
+                        "resolution": "使用 /help 查看所有可用命令",
+                        "available_commands": available_commands,
+                    }).to_string()),
+                });
                 renderer.render(UiLine::Error(
                     t(Msg::CmdUnknownCommand { name: other }).into_owned(),
                 ));

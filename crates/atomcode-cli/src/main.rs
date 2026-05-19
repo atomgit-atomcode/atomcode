@@ -2183,6 +2183,13 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
             message_head: scrubbed_msg,
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
+            error_kind: Some("panic".to_string()),
+            error_data: Some(serde_json::json!({
+                "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                "turns_completed": null,
+                "last_tool_name": null,
+                "last_event": null,
+            }).to_string()),
         });
         default_hook(info);
     }));
