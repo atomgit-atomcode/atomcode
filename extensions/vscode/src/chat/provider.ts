@@ -328,13 +328,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.openInTab();
           break;
         case 'attachFile': {
-          const uris = await vscode.window.showOpenDialog({
-            canSelectFiles: true,
-            canSelectMany: false,
-            openLabel: 'Attach to AtomCode',
-          });
-          if (uris && uris.length > 0) {
-            const filePath = uris[0].fsPath;
+          if (msg.path) {
+            // File already selected from the webview file picker — just attach it
+            const filePath = msg.path;
             const fileName = path.basename(filePath);
             this._postMessage({
               type: 'context',
@@ -343,6 +339,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               language: '',
             });
           }
+          break;
+        }
+        case 'searchWorkspaceFiles': {
+          const query = String(msg.query || '').trim();
+          const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+          if (!workspaceFolder) {
+            this._postMessage({ type: 'workspaceFiles', files: [], query });
+            break;
+          }
+          // Build glob: if user typed "foo", match "**/*foo*" across the workspace,
+          // excluding common noise directories.
+          const pattern = query ? `**/*${query}*` : '**/*';
+          const excludePattern = '{**/node_modules/**,**/.git/**,**/target/**,**/dist/**,**/build/**,**/__pycache__/**,**/*.d.ts,**/*.map}';
+          const uris = await vscode.workspace.findFiles(pattern, excludePattern, 30);
+          const files = uris.map((uri) => {
+            const relativePath = path.relative(workspaceFolder.uri.fsPath, uri.fsPath);
+            return {
+              path: uri.fsPath,
+              fileName: path.basename(uri.fsPath),
+              relativePath,
+            };
+          });
+          this._postMessage({ type: 'workspaceFiles', files, query });
           break;
         }
       }

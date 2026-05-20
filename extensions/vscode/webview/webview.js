@@ -78083,9 +78083,13 @@ ${content}</tr>
     const [text2, setText] = (0, import_react13.useState)("");
     const [showSlash, setShowSlash] = (0, import_react13.useState)(false);
     const [slashFilter, setSlashFilter] = (0, import_react13.useState)("");
+    const [showFilePicker, setShowFilePicker] = (0, import_react13.useState)(false);
+    const [fileQuery, setFileQuery] = (0, import_react13.useState)("");
+    const [workspaceFiles, setWorkspaceFiles] = (0, import_react13.useState)([]);
     const inputBoxRef = (0, import_react13.useRef)(null);
     const containerRef = (0, import_react13.useRef)(null);
     const textareaRef = (0, import_react13.useRef)(null);
+    const fileSearchRef = (0, import_react13.useRef)(null);
     (0, import_react13.useEffect)(() => {
       const el = textareaRef.current;
       if (!el) return;
@@ -78095,6 +78099,9 @@ ${content}</tr>
     (0, import_react13.useEffect)(() => {
       function handleMessage(e) {
         if (e.data?.type === "focusInput") textareaRef.current?.focus();
+        if (e.data?.type === "workspaceFiles") {
+          setWorkspaceFiles(e.data.files || []);
+        }
       }
       window.addEventListener("message", handleMessage);
       return () => window.removeEventListener("message", handleMessage);
@@ -78117,6 +78124,18 @@ ${content}</tr>
         sessionBody.style.removeProperty("--input-inset");
       };
     }, []);
+    (0, import_react13.useEffect)(() => {
+      if (!showFilePicker) return void 0;
+      requestAnimationFrame(() => fileSearchRef.current?.focus());
+      function handlePointerDown(e) {
+        if (inputBoxRef.current && !inputBoxRef.current.contains(e.target)) {
+          setShowFilePicker(false);
+          setFileQuery("");
+        }
+      }
+      document.addEventListener("mousedown", handlePointerDown);
+      return () => document.removeEventListener("mousedown", handlePointerDown);
+    }, [showFilePicker]);
     (0, import_react13.useEffect)(() => {
       if (!showSlash) return void 0;
       function handlePointerDown(e) {
@@ -78166,9 +78185,60 @@ ${content}</tr>
       setShowSlash((open) => !open);
       textareaRef.current?.focus();
     }, []);
+    const handleAttachClick = (0, import_react13.useCallback)(() => {
+      setShowFilePicker((prev) => {
+        const next = !prev;
+        if (next) {
+          setShowSlash(false);
+          postMessage({ type: "searchWorkspaceFiles", query: "" });
+        } else {
+          setFileQuery("");
+        }
+        return next;
+      });
+    }, []);
+    const handleFileSearch = (0, import_react13.useCallback)((query) => {
+      setFileQuery(query);
+      postMessage({ type: "searchWorkspaceFiles", query });
+    }, []);
+    const handleFileSelect = (0, import_react13.useCallback)((f) => {
+      postMessage({ type: "attachFile", path: f.path });
+      setShowFilePicker(false);
+      setFileQuery("");
+      textareaRef.current?.focus();
+    }, []);
     const hasText = Boolean(text2.trim());
     return /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "input-container", ref: containerRef, children: /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "input-box", ref: inputBoxRef, children: [
       showSlash && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(SlashPicker, { filter: slashFilter, onSelect: handleSlashSelect, onClose: () => setShowSlash(false) }),
+      showFilePicker && /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "file-picker", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(
+          "input",
+          {
+            ref: fileSearchRef,
+            className: "file-picker-search",
+            type: "text",
+            placeholder: "Search project files...",
+            value: fileQuery,
+            onChange: (e) => handleFileSearch(e.target.value)
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "file-picker-list", children: workspaceFiles.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "file-picker-empty", children: fileQuery ? "No matching files" : "Type to search workspace files" }) : workspaceFiles.map((f) => /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)(
+          "button",
+          {
+            type: "button",
+            className: "file-picker-item",
+            onClick: () => handleFileSelect(f),
+            children: [
+              /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "file-picker-item-icon", children: "\u{1F4C4}" }),
+              /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("span", { className: "file-picker-item-body", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "file-picker-item-name", children: f.fileName }),
+                /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "file-picker-item-path", children: f.relativePath })
+              ] })
+            ]
+          },
+          f.path
+        )) })
+      ] }),
       state.contextFiles.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "attached-files", children: state.contextFiles.map((f) => /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("span", { className: "attached-file-pill", title: f.path, children: [
         f.type === "selection" ? "\u{1F4CB}" : "\u{1F4C4}",
         " ",
@@ -78189,6 +78259,7 @@ ${content}</tr>
       ),
       /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "input-footer", children: [
         /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "footer-slash-btn", onClick: handleSlashButton, title: "Commands", children: "/" }),
+        /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "footer-attach-btn", onClick: handleAttachClick, title: "Attach file", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("svg", { width: "14", height: "14", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("path", { d: "M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" }) }) }),
         /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "footer-spacer" }),
         state.tokenCount && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "footer-tokens", children: formatTokenCount(state.tokenCount.total) }),
         /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(ModelSelector, { placement: "up", onOpen: () => setShowSlash(false) }),
