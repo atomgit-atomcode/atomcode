@@ -77,3 +77,4 @@ docs/superpowers
 .plan_docs
 extensions/vscode/resources/bin/
 .kiro
+crates/atomcode-codingplan-crypto/
