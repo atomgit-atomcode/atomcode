@@ -10,9 +10,7 @@ const SEND_WITH_CTRL_ENTER_DEFAULT = false;
 const FONT_SIZE_DEFAULT = 13;
 const SHOW_INLINE_HINTS_DEFAULT = true;
 
-const MAX_TABS_DEFAULT = 5;
-
-export { DEFAULT_PORT, MAX_TABS_DEFAULT };
+export { DEFAULT_PORT };
 
 export function getConfig() {
   const config = vscode.workspace.getConfiguration('atomcode');
@@ -25,7 +23,6 @@ export function getConfig() {
     sendWithCtrlEnter: config.get<boolean>('sendWithCtrlEnter', SEND_WITH_CTRL_ENTER_DEFAULT),
     fontSize: config.get<number>('fontSize', FONT_SIZE_DEFAULT),
     showInlineHints: config.get<boolean>('showInlineHints', SHOW_INLINE_HINTS_DEFAULT),
-    maxTabs: config.get<number>('maxTabs', MAX_TABS_DEFAULT),
   };
 }
 
