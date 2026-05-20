@@ -299,6 +299,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'deleteSession':
           await this._deleteSession(msg.sessionId, msg.projectHash, msg.name);
           break;
+        case 'openSidebar':
+          await this.openInSidebar();
+          break;
         case 'openSettings':
           vscode.commands.executeCommand('workbench.action.openSettings', 'atomcode');
           break;

@@ -13,6 +13,7 @@ interface ChatContextValue {
   newConversation: () => void;
   selectModel: (provider: string, model?: string) => void;
   loadSession: (sessionId: string, projectHash?: string) => void;
+  openSidebar: () => void;
   openSessionInTab: (sessionId?: string, projectHash?: string) => void;
   renameSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
   deleteSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
@@ -245,6 +246,10 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     postMessage({ type: 'loadSession', sessionId, projectHash });
   }, []);
 
+  const openSidebar = useCallback(() => {
+    postMessage({ type: 'openSidebar' });
+  }, []);
+
   const openSessionInTab = useCallback((sessionId?: string, projectHash?: string) => {
     postMessage({ type: 'openSessionInTab', sessionId, projectHash });
   }, []);
@@ -292,6 +297,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     dispatch,
     send,
     stop,
+    openSidebar,
     newConversation,
     selectModel,
     loadSession,

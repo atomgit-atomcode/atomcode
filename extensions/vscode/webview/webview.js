@@ -74142,6 +74142,9 @@
     const loadSession = (0, import_react.useCallback)((sessionId, projectHash) => {
       postMessage({ type: "loadSession", sessionId, projectHash });
     }, []);
+    const openSidebar = (0, import_react.useCallback)(() => {
+      postMessage({ type: "openSidebar" });
+    }, []);
     const openSessionInTab = (0, import_react.useCallback)((sessionId, projectHash) => {
       postMessage({ type: "openSessionInTab", sessionId, projectHash });
     }, []);
@@ -74181,6 +74184,7 @@
       dispatch,
       send,
       stop,
+      openSidebar,
       newConversation,
       selectModel,
       loadSession,
@@ -74199,9 +74203,9 @@
   // src/components/Header.tsx
   var import_jsx_runtime2 = __toESM(require_jsx_runtime());
   function Header() {
-    const { dispatch, openSessionInTab } = useChatContext();
+    const { dispatch, openSidebar, openSessionInTab } = useChatContext();
     return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("header", { className: "header", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), title: "History", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: openSidebar, title: "Open sessions sidebar", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: [
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("rect", { x: "2", y: "3", width: "12", height: "1.5", rx: "0.5" }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("rect", { x: "2", y: "7.25", width: "12", height: "1.5", rx: "0.5" }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("rect", { x: "2", y: "11.5", width: "12", height: "1.5", rx: "0.5" })
