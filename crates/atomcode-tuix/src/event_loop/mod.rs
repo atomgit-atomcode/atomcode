@@ -6106,6 +6106,20 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         Some(snap) => (snap.sent_tokens, snap.ctx_window),
         None => (0, 0),
     };
+    // Session-name badge: surfaced only when the user has explicitly
+    // renamed the conversation. Auto-named sessions (default /
+    // session-* / first-message-derived) intentionally stay badge-less
+    // so the chrome stays quiet on fresh conversations.
+    let session_name = if ctx.current_session.user_renamed {
+        let name = ctx.current_session.name.trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    } else {
+        None
+    };
     crate::render::StatusLine {
         model,
         cwd,
@@ -6113,6 +6127,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         ctx_window,
         hint,
         mode_indicator,
+        session_name,
     }
 }
 

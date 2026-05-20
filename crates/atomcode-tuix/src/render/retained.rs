@@ -599,6 +599,77 @@ impl<W: Write + Send> RetainedRenderer<W> {
         row
     }
 
+    /// Top-rule variant that may overlay a session-name pill on the
+    /// right side. Mirrors the alt-screen renderer's top-rule overlay
+    /// so both render paths show CC-style per-conversation badge. The
+    /// bot_rule keeps using `build_rule_row` (no badge there).
+    ///
+    /// Budget mirrors `alt_screen::paint_footer`:
+    ///   right_margin  = 2 cells
+    ///   pill_padding  = 2 cells (one space each side of the name)
+    ///   min_rule_left = 8 cells (keep some ─ on the left so the box
+    ///                  still reads as bordered)
+    /// Name truncated with `…` when display_width exceeds budget; if
+    /// the rule is too narrow for chrome + 1 cell, the badge is
+    /// skipped entirely and a plain rule is returned.
+    fn build_top_rule_with_badge(
+        &self,
+        rule_width: usize,
+        session_name: Option<&str>,
+    ) -> Vec<Cell> {
+        let mut row = self.build_rule_row(rule_width);
+        let Some(name) = session_name else {
+            return row;
+        };
+        if name.is_empty() {
+            return row;
+        }
+        const RIGHT_MARGIN: usize = 2;
+        const PILL_PADDING: usize = 2;
+        const MIN_RULE_LEFT: usize = 8;
+        let chrome = RIGHT_MARGIN + PILL_PADDING + MIN_RULE_LEFT;
+        if rule_width <= chrome {
+            return row;
+        }
+        let max_name_w = rule_width - chrome;
+        let name_w = crate::width::display_width(name);
+        let name_for_pill = if name_w <= max_name_w {
+            name.to_string()
+        } else if max_name_w <= 1 {
+            "…".to_string()
+        } else {
+            let truncated = crate::width::truncate_to_width(name, max_name_w - 1);
+            format!("{}…", truncated)
+        };
+        let pill_text = format!(" {} ", name_for_pill);
+        let pill_w = crate::width::display_width(&pill_text);
+        // Pill ends RIGHT_MARGIN cells from the right edge. Pill
+        // start cell index (0-indexed) = rule_width - RIGHT_MARGIN -
+        // pill_w. Saturating sub guards against arithmetic underflow
+        // if a future budget tweak shrinks the chrome below right_margin.
+        let pill_start = rule_width.saturating_sub(RIGHT_MARGIN + pill_w);
+        let pill_style = CellStyle {
+            fg: role(self.caps, Role::Border),
+            bold: false,
+            reverse: true,
+            faint: false,
+        };
+        let mut overlay_cells = Vec::new();
+        push_str_cells(&mut overlay_cells, &pill_text, &pill_style);
+        // Splice into `row` starting at pill_start. push_str_cells
+        // emits continuation cells (width 0) for wide glyphs so the
+        // overlay length already matches `pill_w` terminal columns;
+        // a straight overwrite preserves cell_index == column.
+        for (i, cell) in overlay_cells.into_iter().enumerate() {
+            let idx = pill_start + i;
+            if idx >= row.len() {
+                break;
+            }
+            row[idx] = cell;
+        }
+        row
+    }
+
     fn build_middle_row(&self, line: &str, is_first: bool) -> Vec<Cell> {
         let mut row = Vec::new();
         let pad = CellStyle::default();
@@ -894,7 +965,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let footer_top = h.saturating_sub(total_rows);
 
         // Pre-build every row vector (immutable borrows of self).
-        let top_rule = self.build_rule_row(input_rule_width);
+        let top_rule = self.build_top_rule_with_badge(
+            input_rule_width,
+            self.status.session_name.as_deref(),
+        );
         let middle_cells: Vec<Vec<Cell>> = lines
             .iter()
             .enumerate()
@@ -3137,6 +3211,7 @@ mod tests {
                 ctx_window: 0,
             hint: None,
             mode_indicator: None,
+            session_name: None,
         }
     }
 
@@ -3158,6 +3233,7 @@ mod tests {
                 ctx_window: 0,
             hint: None,
             mode_indicator: Some("PLAN".into()),
+            session_name: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
@@ -3189,6 +3265,78 @@ mod tests {
         assert!(
             !visible.contains("PLAN"),
             "no mode indicator should produce no PLAN badge; got: {:?}",
+            visible
+        );
+    }
+
+    /// Session-name pill: the top rule must overlay ` {name} ` in
+    /// reverse-cyan cells on the right side. Mirrors CC's per-
+    /// conversation badge so the user sees which session they're
+    /// typing into without opening the picker.
+    #[test]
+    fn build_top_rule_with_badge_renders_session_name_in_reverse_cyan() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let row = r.build_top_rule_with_badge(60, Some("atomcode加解密"));
+        // Skip continuation cells (width 0 placeholders that follow a
+        // wide glyph) — they carry `ch = ' '` and would break a naive
+        // substring check on a CJK name.
+        let visible: String = row.iter().filter(|c| c.width > 0).map(|c| c.ch).collect();
+        assert!(
+            visible.contains("atomcode加解密"),
+            "session name must appear in the top rule cells. got: {:?}",
+            visible
+        );
+        let any_reverse = row.iter().any(|c| c.style.reverse);
+        assert!(
+            any_reverse,
+            "at least one cell of the pill must carry reverse-video style"
+        );
+    }
+
+    /// `None` session_name keeps the top rule pristine — no reverse
+    /// cells, no text overlay. Guards against the badge leaking onto
+    /// auto-named or default sessions.
+    #[test]
+    fn build_top_rule_with_badge_none_emits_plain_rule() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let row = r.build_top_rule_with_badge(60, None);
+        assert_eq!(row.len(), 60, "rule width must be preserved");
+        assert!(
+            row.iter().all(|c| c.ch == '─'),
+            "without a session name every cell must be a bare ─"
+        );
+        assert!(
+            row.iter().all(|c| !c.style.reverse),
+            "no reverse-video cells allowed when session_name is None"
+        );
+    }
+
+    /// Overlong names get truncated with `…` so the rule width is
+    /// preserved and at least a minimum stretch of ─ stays visible on
+    /// the left as a visual anchor for the input box border.
+    #[test]
+    fn build_top_rule_with_badge_truncates_long_name() {
+        let (mut r, _counter) = new_counting(40, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let long = "这是一个非常非常非常非常长的会话名字应当被截断省略";
+        let row = r.build_top_rule_with_badge(40, Some(long));
+        // Same continuation-cell filter rationale as the badge-render
+        // test above: width-0 cells carry ' ' and would obscure the
+        // substring assertions on CJK names.
+        let visible: String = row.iter().filter(|c| c.width > 0).map(|c| c.ch).collect();
+        assert!(
+            visible.contains('…'),
+            "overlong name must be ellipsised. got: {:?}",
+            visible
+        );
+        assert!(
+            !visible.contains(long),
+            "full overlong name must NOT appear verbatim. got: {:?}",
             visible
         );
     }

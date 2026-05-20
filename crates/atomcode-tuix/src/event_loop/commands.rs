@@ -193,6 +193,7 @@ pub fn perform_session_rename(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(session.updated_at),
+        user_renamed: true,
         ..session
     };
     session_manager
