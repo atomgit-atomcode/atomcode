@@ -55,7 +55,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _findAtomCodeTabGroup(): vscode.ViewColumn | undefined {
     for (const group of vscode.window.tabGroups.all) {
       if (group.tabs.some(t => t.input instanceof vscode.TabInputWebview
-            && (t.input as vscode.TabInputWebview).viewType === 'atomcode.chatTab')) {
+            && (t.input as vscode.TabInputWebview).viewType.includes('atomcode.chatTab'))) {
         return group.viewColumn;
       }
     }
