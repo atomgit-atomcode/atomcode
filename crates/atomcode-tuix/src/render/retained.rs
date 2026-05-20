@@ -205,6 +205,12 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
             Some(27) => style.reverse = false,
             Some(39) => style.fg = None,
             Some(90) => style.fg = Some(Color::DarkGrey),
+            Some(91) => style.fg = Some(Color::Red),
+            Some(92) => style.fg = Some(Color::Green),
+            Some(93) => style.fg = Some(Color::Yellow),
+            Some(94) => style.fg = Some(Color::Blue),
+            Some(95) => style.fg = Some(Color::Magenta),
+            Some(96) => style.fg = Some(Color::Cyan),
             Some(97) => style.fg = Some(Color::White),
             // 38;2;R;G;B — truecolor foreground. Markdown emits this
             // for inline code / code blocks / headings so the colour
@@ -5510,11 +5516,11 @@ mod tests {
             cell,
             vterm.dump()
         );
-        // Inline code: bold ONLY (no fg color). Markdown crate dropped
-        // both the `\x1b[1;97m` (bright white) and the later truecolor
-        // blue-500 attempts to stop the colour load from competing
-        // with code blocks for the eye's anchor in long mixed outputs.
-        // Inline code stays distinguishable via the bold weight alone.
+        // Inline code: bold + bright cyan (SGR 96). The markdown crate
+        // now colours inline code the same as headings and code-block
+        // chrome, using the 16-colour SGR palette so the terminal theme
+        // remaps the actual shade. In CellStyle this arrives as
+        // `Color::Cyan` (crossterm's name for SGR 96 / bright cyan).
         let code_pos = row_text
             .find("code")
             .expect("expected 'code' in rendered text");
@@ -5525,8 +5531,9 @@ mod tests {
             code_cell
         );
         assert_eq!(
-            code_cell.fg, None,
-            "inline code cell must NOT carry any fg colour: {:?}",
+            code_cell.fg,
+            Some(Color::Cyan),
+            "inline code cell must carry bright cyan fg: {:?}",
             code_cell
         );
     }

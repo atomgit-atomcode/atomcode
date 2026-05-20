@@ -8,6 +8,7 @@
 //   --- horizontal rules
 // Tables are passed through as raw text (pipes show literally).
 
+use crate::highlight::theme;
 use crate::terminal::TerminalCaps;
 
 /// Parser state maintained across lines of a streamed response.
@@ -162,17 +163,29 @@ pub fn render_line_with_width(
             format!("{} {}", "#".repeat(level as usize), inner)
         } else {
             match level {
-                1 | 2 | 3 => format!("\x1b[1;96m{}\x1b[22;39m", inner),
-                _ => format!("\x1b[3m{}\x1b[23m", inner),
+                1 | 2 | 3 => format!("{}{}{}", theme::MD_HEADING_OPEN, inner, theme::MD_HEADING_CLOSE),
+                _ => format!("{}{}{}", theme::MD_ITALIC_OPEN, inner, theme::MD_ITALIC_CLOSE),
             }
         };
         return Some(prepend(body));
     }
 
-    // Unordered list: `- text` / `* text`
-    if let Some((indent, rest)) = parse_list_item(line) {
-        let inner = render_inline(rest, caps);
-        return Some(prepend(format!("{}• {}", " ".repeat(indent), inner)));
+    // List (unordered or ordered): `- text` / `* text` / `1. text`
+    // Marker (• / 1.) rendered in muted gray so it sits quietly next to
+    // the default-fg body text — visually distinct without adding another
+    // bright colour tier. The space after the marker keeps readability.
+    if let Some(item) = parse_list_item(line) {
+        let inner = render_inline(&item.rest, caps);
+        let indent = " ".repeat(item.indent);
+        let body = if caps.colors {
+            format!(
+                "{}{}{}{}{}",
+                indent, theme::MD_MUTED_OPEN, item.marker, theme::MD_MUTED_CLOSE, inner
+            )
+        } else {
+            format!("{}{} {}", indent, item.marker, inner)
+        };
+        return Some(prepend(body));
     }
 
     // Default: inline-only
@@ -343,8 +356,8 @@ pub fn flush_aligned_table_with_width(
     // box separator and the inline-code colour, collapsing the
     // visual hierarchy. Gray reads as quiet structure and lets
     // header text + cell content carry the visual weight.
-    let border_on = if caps.colors { "\x1b[90m" } else { "" };
-    let border_off = if caps.colors { "\x1b[39m" } else { "" };
+    let border_on = if caps.colors { theme::MD_MUTED_OPEN } else { "" };
+    let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
 
     // Draw a horizontal rule row with given connector characters.
     let rule = |left: char, mid: char, right: char| -> String {
@@ -503,9 +516,9 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                         }
                     }
                     if closed && !inner.is_empty() {
-                        out.push_str("\x1b[1m");
+                        out.push_str(theme::MD_BOLD_OPEN);
                         out.push_str(&inner);
-                        out.push_str("\x1b[22m");
+                        out.push_str(theme::MD_BOLD_CLOSE);
                     } else {
                         out.push_str("**");
                         out.push_str(&inner);
@@ -522,9 +535,9 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                         inner.push(p);
                     }
                     if closed && !inner.is_empty() {
-                        out.push_str("\x1b[3m");
+                        out.push_str(theme::MD_ITALIC_OPEN);
                         out.push_str(&inner);
-                        out.push_str("\x1b[23m");
+                        out.push_str(theme::MD_ITALIC_CLOSE);
                     } else {
                         out.push('*');
                         out.push_str(&inner);
@@ -543,20 +556,23 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     inner.push(p);
                 }
                 if closed && !inner.is_empty() {
-                    // Bold only (no fg colour). Earlier iterations used
-                    // `\x1b[1;97m` (bright white) and then truecolor
-                    // blue-500 (`\x1b[1;38;2;59;130;246m`) to dodge
-                    // terminal palette remap. In long mixed output
-                    // (markdown headings + code fences + many backtick
-                    // spans) the cumulative colour load competed with
-                    // code blocks for the eye's anchor — every
-                    // `path/to/foo.rs` shouted as loud as a 30-line
-                    // code fence. Bold alone keeps inline code
-                    // distinguishable from prose without painting half
-                    // the screen.
-                    out.push_str("\x1b[1m");
+                    // Bold + bright cyan (SGR 1;96). Earlier iterations
+                    // used bold-only (`\x1b[1m`), bright-white
+                    // (`\x1b[1;97m`), and truecolor blue-500
+                    // (`\x1b[1;38;2;59;130;246m`). Bold-only was too
+                    // subtle — in long mixed output, inline code
+                    // `path/to/foo.rs` was visually indistinguishable
+                    // from **bold** prose. Bright cyan (96) matches the
+                    // heading and code-block accent colour; it's a 16-colour
+                    // SGR interpreted by the terminal's own theme palette,
+                    // so it adapts to both light and dark backgrounds
+                    // (same reason `Palette::CODE` uses SGR 96). The
+                    // close sequence `\x1b[22;39m` resets both bold
+                    // (SGR 22) and fg (SGR 39) so neither bleeds into
+                    // the next span.
+                    out.push_str(theme::MD_INLINE_CODE_OPEN);
                     out.push_str(&inner);
-                    out.push_str("\x1b[22m");
+                    out.push_str(theme::MD_INLINE_CODE_CLOSE);
                 } else {
                     out.push('`');
                     out.push_str(&inner);
@@ -638,19 +654,48 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
     None
 }
 
-fn parse_list_item(line: &str) -> Option<(usize, &str)> {
+/// Parsed list item: indent level, the marker string (e.g. "•", "1."),
+/// and the remaining text after the marker.
+struct ParsedListItem {
+    indent: usize,
+    marker: String,
+    rest: String,
+}
+
+fn parse_list_item(line: &str) -> Option<ParsedListItem> {
     let indent = line.chars().take_while(|c| *c == ' ').count();
     let rest = &line[indent..];
+
+    // Unordered: "- text" / "* text"
     if let Some(r) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
-        Some((indent, r))
-    } else {
-        None
+        return Some(ParsedListItem {
+            indent,
+            marker: "•".to_string(),
+            rest: r.to_string(),
+        });
     }
+
+    // Ordered: "1. text" / "12. text" — one or more digits followed by ". "
+    let digits_end = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits_end > 0 {
+        let after_digits = &rest[digits_end..];
+        if let Some(r) = after_digits.strip_prefix(". ") {
+            let marker = &rest[..digits_end]; // "1", "12", etc.
+            return Some(ParsedListItem {
+                indent,
+                marker: format!("{}.", marker),
+                rest: r.to_string(),
+            });
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::highlight::theme;
     use crate::terminal::{EnvView, TerminalCaps};
 
     fn caps() -> TerminalCaps {
@@ -676,26 +721,29 @@ mod tests {
     fn inline_bold() {
         assert_eq!(
             render_inline_line("**bold**", caps()),
-            "\x1b[1mbold\x1b[22m"
+            format!("{}bold{}", theme::MD_BOLD_OPEN, theme::MD_BOLD_CLOSE)
         );
     }
 
     #[test]
     fn inline_italic() {
-        assert_eq!(render_inline_line("*em*", caps()), "\x1b[3mem\x1b[23m");
+        assert_eq!(render_inline_line("*em*", caps()), format!("{}em{}", theme::MD_ITALIC_OPEN, theme::MD_ITALIC_CLOSE));
     }
 
     #[test]
     fn inline_code() {
-        // Inline code uses bold ONLY (no fg colour). Earlier
-        // iterations tried bright-white and truecolor blue-500;
-        // both painted too many backtick spans on screen. Bold alone
-        // keeps inline code distinguishable from prose without
-        // competing with code-block emphasis.
+        // Inline code uses bold + bright cyan. This matches
+        // the heading and code-block accent colour. The close sequence
+        // resets both bold and fg.
         let rendered = render_inline_line("`x`", caps());
         assert!(
-            rendered.contains("\x1b[1mx"),
-            "inline code must open bold (SGR 1) without fg colour: {}",
+            rendered.contains(theme::MD_INLINE_CODE_OPEN),
+            "inline code must open with MD_INLINE_CODE_OPEN: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains(theme::MD_INLINE_CODE_CLOSE),
+            "inline code must close with MD_INLINE_CODE_CLOSE: {}",
             rendered
         );
         assert!(
@@ -705,7 +753,7 @@ mod tests {
         );
         assert!(
             !rendered.contains("\x1b[1;38;2;"),
-            "inline code must NOT include truecolor RGB anymore: {}",
+            "inline code must NOT include truecolor RGB: {}",
             rendered
         );
     }
@@ -781,9 +829,9 @@ mod tests {
         let mut st = MdState::new();
         let out = render_line("## Hello", &mut st, caps()).unwrap();
         assert!(out.contains("Hello"));
-        // H1-H3 use bold + bright cyan (`\x1b[1;96m`) so headings sit
-        // on a separate colour layer from default-colour body text.
-        assert!(out.contains("\x1b[1;96m"), "H2 should be bold + bright cyan, got: {:?}", out);
+        // H1-H3 use the heading colour so they sit on a separate
+        // colour layer from default-colour body text.
+        assert!(out.contains(theme::MD_HEADING_OPEN), "H2 should use MD_HEADING_OPEN, got: {:?}", out);
     }
 
     #[test]
@@ -793,8 +841,8 @@ mod tests {
         assert!(out.contains("Sub-deep"));
         // H4+ keeps italic-only — distinct from coloured H1-H3 without
         // adding a third colour tier.
-        assert!(out.contains("\x1b[3m"), "H4 should be italic, got: {:?}", out);
-        assert!(!out.contains("\x1b[1;96m"), "H4 must not pick up the H1-H3 cyan");
+        assert!(out.contains(theme::MD_ITALIC_OPEN), "H4 should use MD_ITALIC_OPEN, got: {:?}", out);
+        assert!(!out.contains(theme::MD_HEADING_OPEN), "H4 must not pick up the H1-H3 heading colour");
     }
 
     #[test]
@@ -849,21 +897,88 @@ mod tests {
     fn list_bullets() {
         let mut st = MdState::new();
         let out = render_line("- item", &mut st, caps()).unwrap();
-        assert!(out.starts_with("• "));
+        // Bullet marker rendered in muted colour.
+        assert!(
+            out.contains(&format!("{}•{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)),
+            "bullet must use MD_MUTED colour: {:?}",
+            out
+        );
+        assert!(out.contains("item"));
+    }
+
+    #[test]
+    fn list_bullets_plain_caps_no_ansi() {
+        let mut st = MdState::new();
+        let out = render_line("- item", &mut st, plain_caps()).unwrap();
+        // No colour → plain "• item" without any SGR.
+        assert_eq!(out, "• item");
     }
 
     #[test]
     fn list_nested_indent() {
         let mut st = MdState::new();
         let out = render_line("  - nested", &mut st, caps()).unwrap();
-        assert!(out.starts_with("  • "));
+        assert!(out.starts_with(&format!("  {}•{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)), "nested bullet with indent: {:?}", out);
+    }
+
+    #[test]
+    fn ordered_list_single_digit() {
+        let mut st = MdState::new();
+        let out = render_line("1. first item", &mut st, caps()).unwrap();
+        assert!(
+            out.contains(&format!("{}1.{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)),
+            "ordered marker must use MD_MUTED colour: {:?}",
+            out
+        );
+        assert!(out.contains("first item"));
+    }
+
+    #[test]
+    fn ordered_list_double_digit() {
+        let mut st = MdState::new();
+        let out = render_line("12. twelfth item", &mut st, caps()).unwrap();
+        assert!(
+            out.contains(&format!("{}12.{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)),
+            "double-digit marker must use MD_MUTED colour: {:?}",
+            out
+        );
+        assert!(out.contains("twelfth item"));
+    }
+
+    #[test]
+    fn ordered_list_plain_caps_no_ansi() {
+        let mut st = MdState::new();
+        let out = render_line("3. third", &mut st, plain_caps()).unwrap();
+        // No colour → plain "3. third" without any SGR.
+        assert_eq!(out, "3. third");
+    }
+
+    #[test]
+    fn ordered_list_nested() {
+        let mut st = MdState::new();
+        let out = render_line("  5. nested ordered", &mut st, caps()).unwrap();
+        assert!(
+            out.starts_with(&format!("  {}5.{}", theme::MD_MUTED_OPEN, theme::MD_MUTED_CLOSE)),
+            "nested ordered with indent: {:?}",
+            out
+        );
+        assert!(out.contains("nested ordered"));
+    }
+
+    #[test]
+    fn number_dot_without_space_is_not_list() {
+        // "3.text" (no space after dot) should NOT be parsed as a list item.
+        let mut st = MdState::new();
+        let out = render_line("3.text", &mut st, caps()).unwrap();
+        assert!(!out.contains(theme::MD_MUTED_OPEN), "no muted marker: {:?}", out);
+        assert!(out.contains("3.text"));
     }
 
     #[test]
     fn cjk_bold() {
         assert_eq!(
             render_inline_line("**你好**", caps()),
-            "\x1b[1m你好\x1b[22m"
+            format!("{}你好{}", theme::MD_BOLD_OPEN, theme::MD_BOLD_CLOSE)
         );
     }
 
