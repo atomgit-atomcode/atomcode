@@ -49,6 +49,7 @@ export const initialState: ChatState = {
   messages: [],
   queuedMessages: [],
   isGenerating: false,
+  isSessionList: document.body.dataset.viewMode === 'sidebar',
   viewMode: document.body.dataset.viewMode === 'sidebar' ? 'sidebar' : 'tab',
   currentModel: 'default',
   currentProvider: '',
@@ -489,6 +490,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         currentModel: action.currentModel ?? state.currentModel,
         viewMode: action.viewMode ?? state.viewMode,
         activeSessionId: action.activeSessionId ?? state.activeSessionId,
+        isSessionList: action.isSessionList ?? state.isSessionList,
       };
 
     default:

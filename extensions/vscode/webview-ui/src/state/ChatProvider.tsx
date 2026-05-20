@@ -13,6 +13,7 @@ interface ChatContextValue {
   newConversation: () => void;
   selectModel: (provider: string, model?: string) => void;
   loadSession: (sessionId: string, projectHash?: string) => void;
+  openSessionInTab: (sessionId?: string, projectHash?: string) => void;
   renameSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
   deleteSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
   startLogin: () => void;
@@ -51,6 +52,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             currentModel: msg.currentModel,
             viewMode: msg.viewMode,
             activeSessionId: msg.activeSessionId,
+            isSessionList: msg.isSessionList,
           });
           break;
         case 'userMessage':
@@ -243,6 +245,10 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     postMessage({ type: 'loadSession', sessionId, projectHash });
   }, []);
 
+  const openSessionInTab = useCallback((sessionId?: string, projectHash?: string) => {
+    postMessage({ type: 'openSessionInTab', sessionId, projectHash });
+  }, []);
+
   const renameSession = useCallback((session: { id: string; project_hash?: string; name?: string; title?: string }) => {
     postMessage({
       type: 'renameSession',
@@ -289,6 +295,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     newConversation,
     selectModel,
     loadSession,
+    openSessionInTab,
     renameSession,
     deleteSession,
     startLogin,

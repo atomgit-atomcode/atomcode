@@ -10,7 +10,7 @@ interface SessionListProps {
 }
 
 export function SessionList({ variant = 'overlay' }: SessionListProps) {
-  const { state, dispatch, loadSession, newConversation, renameSession, deleteSession } = useChatContext();
+  const { state, dispatch, openSessionInTab, renameSession, deleteSession } = useChatContext();
   const [search, setSearch] = useState('');
   const [menu, setMenu] = useState<{ session: SessionMeta; x: number; y: number } | null>(null);
   const isOverlay = variant === 'overlay';
@@ -29,7 +29,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
 
   function handleSelect(session: SessionMeta) {
     setMenu(null);
-    loadSession(session.id, session.project_hash);
+    openSessionInTab(session.id, session.project_hash);
     if (isOverlay) {
       dispatch({ type: 'TOGGLE_HISTORY' });
     }
@@ -37,7 +37,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
 
   function handleNewSession() {
     setMenu(null);
-    newConversation();
+    openSessionInTab();
     if (isOverlay) {
       dispatch({ type: 'TOGGLE_HISTORY' });
     }

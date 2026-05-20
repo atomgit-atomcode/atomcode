@@ -96,6 +96,7 @@ export interface ChatState {
   messages: ChatMessage[];
   queuedMessages: ChatMessage[];
   isGenerating: boolean;
+  isSessionList: boolean;
   viewMode: 'sidebar' | 'tab';
   currentModel: string;
   currentProvider: string;
@@ -155,12 +156,12 @@ export type ChatAction =
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
   | { type: 'RESUME_STREAMING' }
-  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string };
+  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; isSessionList?: boolean };
 
 // ─── Messages from the VS Code extension host ──────────────────
 
 export type ExtensionMessage =
-  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string }
+  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; isSessionList?: boolean }
   | { type: 'userMessage'; text: string }
   | { type: 'queuedMessageSent'; id: string }
   | { type: 'assistantMessage'; text: string }
