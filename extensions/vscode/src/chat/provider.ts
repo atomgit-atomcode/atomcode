@@ -153,6 +153,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 
+  public setupPanelForRestore(panel: vscode.WebviewPanel, sessionId?: string, projectHash?: string) {
+    panel.webview.options = {
+      enableScripts: true,
+      retainContextWhenHidden: true,
+      localResourceRoots: [
+        vscode.Uri.joinPath(this._extensionUri, 'webview'),
+        vscode.Uri.joinPath(this._extensionUri, 'node_modules', 'highlight.js'),
+      ],
+    };
+    panel.webview.html = this._getHtml(panel.webview, 'tab');
+    this._setupWebviewMessageHandler(panel.webview, 'tab');
+
+    if (sessionId && projectHash) {
+      this._panelSessions.set(sessionId, { sessionId, projectHash });
+      // Async: load messages from daemon when ready
+      this._client.getSession(projectHash, sessionId).then(detail => {
+        const info = this._panelSessions.get(sessionId);
+        if (info && detail?.messages) {
+          info.messages = detail.messages;
+        }
+      }).catch(() => { /* session may not exist yet */ });
+    }
+
+    panel.onDidDispose(() => {
+      const disposedSid = this._findSessionIdByPanel(panel);
+      if (disposedSid) {
+        this._panels.delete(disposedSid);
+        this._panelReady.delete(disposedSid);
+        this._panelSessions.delete(disposedSid);
+        if (this._focusedPanelId === disposedSid) {
+          this._focusedPanelId = undefined;
+        }
+      }
+    });
+  }
+
   resolveWebviewView(webviewView: vscode.WebviewView) {
     this._view = webviewView;
     webviewView.webview.options = {
