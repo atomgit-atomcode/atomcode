@@ -24,7 +24,6 @@ interface SessionRuntime {
   queuedMessages: QueuedChatMessage[];
   projectHash?: string;
   errorMessage?: string;
-  hasUnread?: boolean;
   eventBuffer: Array<{
     type: 'userMessage' | 'text' | 'toolBatchStart' | 'toolStart' | 'toolResult' | 'tokens';
     data: any;
@@ -457,41 +456,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
         srt.eventBuffer.push({ type: 'text', data: { content } });
-        if (this._activeSessionId === streamSessionId) {
-          this._postMessage({ type: 'text', content });
-        }
+        this._postMessageToPanel(streamSessionId, { type: 'text', content });
       },
       onToolBatch: (calls) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
         srt.eventBuffer.push({ type: 'toolBatchStart' as const, data: { calls } });
-        if (this._activeSessionId === streamSessionId) {
-          this._postMessage({ type: 'toolBatchStart', calls });
-        }
+        this._postMessageToPanel(streamSessionId, { type: 'toolBatchStart', calls });
       },
       onToolStart: (id, name, args) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
         srt.eventBuffer.push({ type: 'toolStart', data: { id, name, args } });
-        if (this._activeSessionId === streamSessionId) {
-          this._postMessage({ type: 'toolStart', id, name, args });
-        }
+        this._postMessageToPanel(streamSessionId, { type: 'toolStart', id, name, args });
       },
       onToolResult: (id, name, output, success, durationMs) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
         srt.eventBuffer.push({ type: 'toolResult', data: { id, name, output, success, durationMs } });
-        if (this._activeSessionId === streamSessionId) {
-          this._postMessage({ type: 'toolResult', id, name, output, success, durationMs });
-        }
+        this._postMessageToPanel(streamSessionId, { type: 'toolResult', id, name, output, success, durationMs });
       },
       onTokens: (prompt, completion, total) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
         if (!srt) return;
         srt.eventBuffer.push({ type: 'tokens', data: { prompt, completion, total } });
-        if (this._activeSessionId === streamSessionId) {
-          this._postMessage({ type: 'tokens', prompt, completion, total });
-        }
+        this._postMessageToPanel(streamSessionId, { type: 'tokens', prompt, completion, total });
       },
       onArtifactStart: (id, artifactType, language, title) =>
         this._postMessage({ type: 'artifactStart', id, artifactType, language, title }),
@@ -505,31 +494,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.isGenerating = false;
         srt.eventBuffer = [];
 
-        // If the daemon assigned a different session ID (e.g. first turn
-        // creates a permanent ID), migrate the runtime so the map stays
-        // keyed correctly.
         if (sessionId && sessionId !== streamSessionId) {
           this._sessionRuntimes.set(sessionId, srt);
           this._sessionRuntimes.delete(streamSessionId);
+          // Update panel bindings
+          this._panels.set(sessionId, this._panels.get(streamSessionId)!);
+          this._panels.delete(streamSessionId);
+          const info = this._panelSessions.get(streamSessionId);
+          if (info) {
+            info.sessionId = sessionId;
+            this._panelSessions.set(sessionId, info);
+            this._panelSessions.delete(streamSessionId);
+          }
+          if (this._focusedPanelId === streamSessionId) {
+            this._focusedPanelId = sessionId;
+          }
         }
 
-        if (this._activeSessionId === streamSessionId) {
-          if (sessionId && sessionId !== streamSessionId) {
-            this._activeSessionId = sessionId;
-            this._loadedMessages = undefined;
-            this._broadcastMessage({ type: 'sessionSelected', sessionId });
-          }
-          this._postMessage({ type: 'done', tokens, toolCalls, sessionId });
-          void this._refreshSessions();
-          setTimeout(() => void this._sendNextQueuedMessage(), 75);
-        } else {
-          // Stream completed in background — mark as unread so the session
-          // list shows a solid green dot until the user switches back.
-          srt.hasUnread = true;
-          void this._refreshSessions();
-          // Drain any queued messages via the (possibly migrated) session ID
-          void this._sendNextQueuedMessageForSession(sessionId || streamSessionId);
-        }
+        this._postMessageToPanel(sessionId || streamSessionId, { type: 'done', tokens, toolCalls, sessionId });
+        void this._refreshSessions();
+        setTimeout(() => void this._sendNextQueuedMessage(), 75);
       },
       onStopped: () => {
         const srt = this._sessionRuntimes.get(streamSessionId);
@@ -537,10 +521,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.isGenerating = false;
         srt.queuedMessages = [];
         srt.eventBuffer = [];
-
-        if (this._activeSessionId === streamSessionId) {
-          this._postMessage({ type: 'stopped' });
-        }
+        this._postMessageToPanel(streamSessionId, { type: 'stopped' });
       },
       onError: (message) => {
         const srt = this._sessionRuntimes.get(streamSessionId);
@@ -548,14 +529,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.isGenerating = false;
         srt.queuedMessages = [];
         srt.eventBuffer = [];
-
-        if (this._activeSessionId === streamSessionId) {
-          this._postMessage({ type: 'error', message });
-        } else {
-          // Store the error so it can be surfaced when the user switches
-          // back to this session (see _loadSession).
-          srt.errorMessage = message;
-        }
+        this._postMessageToPanel(streamSessionId, { type: 'error', message });
       },
     });
   }
@@ -982,11 +956,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         const newRt = this._sessionRuntimes.get(sessionId);
 
-        // Clear the unread marker now that the user is viewing this session
-        if (newRt) {
-          newRt.hasUnread = false;
-        }
-
         // If a background stream errored, surface the error now that the
         // user switched back.
         if (newRt?.errorMessage) {
@@ -1250,7 +1219,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (sid) {
         const rt = this._sessionRuntimes.get(sid);
         s.isGenerating = activeIds.includes(sid) || (rt?.isGenerating ?? false);
-        s.hasUnread = rt?.hasUnread ?? false;
+        s.hasUnread = false;
       }
     }
   }
@@ -1269,7 +1238,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           created_at: Date.now(),
           updated_at: Date.now(),
           isGenerating: this._sessionRuntimes.get(this._activeSessionId)?.isGenerating ?? false,
-          hasUnread: this._sessionRuntimes.get(this._activeSessionId)?.hasUnread ?? false,
+          hasUnread: false,
         } as any);
       }
       this._broadcastMessage({ type: 'sessions', sessions });
