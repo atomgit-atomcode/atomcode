@@ -34,20 +34,17 @@ interface SessionRuntime {
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'atomcode.chatView';
   private _view?: vscode.WebviewView;
-  private _panel?: vscode.WebviewPanel;
+  private _panels = new Map<string, vscode.WebviewPanel>();
+  private _panelSessions = new Map<string, { sessionId: string; projectHash?: string; messages?: MessageInfo[] }>();
+  private _panelReady = new Map<string, boolean>();
   private _activeSessionId?: string;
+  private _focusedPanelId?: string;
   private _loadingSessionId?: string;
   private _loadedMessages?: MessageInfo[];
   private _sessionRuntimes = new Map<string, SessionRuntime>();
   private _loginId?: string;
   private _loginPoll?: ReturnType<typeof setInterval>;
   private _loginStartedFromCommand = false;
-  private _panelReady = false;
-  private _panelReadyPromise?: Promise<void>;
-  private _panelReadyResolver?: () => void;
-
-  // 协作互斥锁：串行化所有修改 _activeSessionId 的操作，防止多个 webview
-  // 消息处理器在 await 边界交错修改共享会话状态。
   private _sessionLock = Promise.resolve();
 
   private async _acquireSessionLock(): Promise<() => void> {
