@@ -722,14 +722,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._cancelLogin();
       const login = await this._client.startLogin(true);
       this._loginId = login.login_id;
-      this._postMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
+      this._broadcastMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
 
       this._loginPoll = setInterval(() => {
         void this._pollLogin();
       }, 2000);
       await this._pollLogin();
     } catch (e) {
-      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
     }
   }
 
@@ -738,12 +738,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       const result = await this._client.pollLogin(this._loginId);
       if (result.status === 'pending') {
-        this._postMessage({ type: 'loginPending' });
+        this._broadcastMessage({ type: 'loginPending' });
         return;
       }
       this._clearLoginPoll();
       this._loginId = undefined;
-      this._postMessage({ type: 'loginAuthorized', user: result.user });
+      this._broadcastMessage({ type: 'loginAuthorized', user: result.user });
       if (this._loginStartedFromCommand) {
         this._postMessage({
           type: 'assistantMessage',
@@ -754,7 +754,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._sendSetupState();
     } catch (e) {
       this._clearLoginPoll();
-      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
       if (this._loginStartedFromCommand) {
         this._postMessage({ type: 'error', message: this._messageFromError(e) });
         this._loginStartedFromCommand = false;
@@ -791,23 +791,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           text: 'Opening AtomGit sign-in in your browser. Complete authorization there, then return to VS Code.',
         });
       }
-      this._postMessage({ type: 'setupWorking', message: 'Waiting for AtomGit sign-in...' });
+      this._broadcastMessage({ type: 'setupWorking', message: 'Waiting for AtomGit sign-in...' });
 
       await this._cancelLogin();
       const login = await this._client.startLogin(true);
       this._loginId = login.login_id;
-      this._postMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
+      this._broadcastMessage({ type: 'loginStarted', loginId: login.login_id, url: login.url });
 
       while (this._loginId === login.login_id) {
         const result = await this._client.pollLogin(login.login_id);
         if (result.status === 'pending') {
-          this._postMessage({ type: 'loginPending' });
+          this._broadcastMessage({ type: 'loginPending' });
           await delay(2000);
           continue;
         }
 
         this._loginId = undefined;
-        this._postMessage({ type: 'loginAuthorized', user: result.user });
+        this._broadcastMessage({ type: 'loginAuthorized', user: result.user });
         if (announceInChat) {
           this._postMessage({
             type: 'assistantMessage',
@@ -823,7 +823,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._clearLoginPoll();
       this._loginId = undefined;
       const message = this._messageFromError(e);
-      this._postMessage({ type: 'setupError', message });
+      this._broadcastMessage({ type: 'setupError', message });
       if (announceInChat) {
         this._postMessage({ type: 'error', message });
       }
@@ -848,13 +848,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           text: 'Syncing CodingPlan models...',
         });
       }
-      this._postMessage({ type: 'setupWorking', message: 'Syncing CodingPlan models...' });
+      this._broadcastMessage({ type: 'setupWorking', message: 'Syncing CodingPlan models...' });
       const result: CodingPlanSetupResponse = await this._client.setupCodingPlan(this._loginId);
-      this._postMessage({ type: 'codingPlanResult', result });
+      this._broadcastMessage({ type: 'codingPlanResult', result });
       await this._sendSetupState();
       return result;
     } catch (e) {
-      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
       return undefined;
     }
   }
@@ -864,7 +864,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._client.createProvider(provider);
       await this._sendSetupState();
     } catch (e) {
-      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
     }
   }
 
@@ -873,7 +873,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._client.deleteProvider(name);
       await this._sendSetupState();
     } catch (e) {
-      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
     }
   }
 
@@ -885,7 +885,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.onModelSelected?.(provider?.model || config.default_provider);
       await this._sendSetupState();
     } catch (e) {
-      this._postMessage({ type: 'setupError', message: this._messageFromError(e) });
+      this._broadcastMessage({ type: 'setupError', message: this._messageFromError(e) });
     }
   }
 
