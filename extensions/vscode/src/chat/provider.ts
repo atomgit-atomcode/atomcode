@@ -391,6 +391,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   public async newConversation() {
+    // Check tab limit before creating session — avoids orphaned sessions
+    const maxTabs = vscode.workspace.getConfiguration('atomcode').get<number>('maxTabs', 5);
+    if (this._panels.size >= maxTabs) {
+      vscode.window.showWarningMessage(
+        `AtomCode: Maximum ${maxTabs} tabs open. Close a tab before opening a new one.`
+      );
+      return;
+    }
+
     let sessionId: string | undefined;
     let projectHash: string | undefined;
 
