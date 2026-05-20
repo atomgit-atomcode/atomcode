@@ -1,4 +1,4 @@
-/* src/styles/variables.css */
+/* webview-ui/src/styles/variables.css */
 html {
   --app-brand: #7c3aed;
   --app-brand-button: #6d28d9;
@@ -58,7 +58,7 @@ html {
   --app-spinner-foreground: var(--app-brand-button);
 }
 
-/* src/styles/index.css */
+/* webview-ui/src/styles/index.css */
 *,
 *::before,
 *::after {
@@ -149,7 +149,7 @@ body {
   }
 }
 
-/* src/styles/components.css */
+/* webview-ui/src/styles/components.css */
 .header {
   display: flex;
   align-items: center;
@@ -745,7 +745,7 @@ body {
   font-size: 10px;
 }
 
-/* src/styles/messages.css */
+/* webview-ui/src/styles/messages.css */
 .messages-container {
   display: flex;
   flex-direction: column;
@@ -1298,7 +1298,7 @@ body {
   background: color-mix(in srgb, var(--app-brand), transparent 60%);
 }
 
-/* src/styles/input.css */
+/* webview-ui/src/styles/input.css */
 .input-container {
   position: absolute;
   z-index: 20;
@@ -1515,7 +1515,7 @@ body {
   color: var(--app-secondary-foreground);
 }
 
-/* src/styles/highlight.css */
+/* webview-ui/src/styles/highlight.css */
 .hljs {
   color: #d4d4d4;
 }

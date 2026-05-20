@@ -1,4 +1,4 @@
-import { ChatState, ChatAction, ChatMessage, ToolCallData } from './types';
+import { ChatState, ChatAction, ChatMessage, ToolCallData, ContextFile } from './types';
 
 let _msgCounter = 0;
 function nextId(): string {
@@ -43,6 +43,36 @@ function textFromContent(content: unknown): string {
   }
 
   return '';
+}
+
+// Matches the prefix emitted in provider.ts _handleSend when context files are attached.
+const ATTACHED_FILES_PREFIX = 'The user has attached the following file(s) for context.';
+
+function parseAttachedMessage(rawText: string): { displayText: string; contextFiles: ContextFile[] } {
+  if (!rawText.startsWith(ATTACHED_FILES_PREFIX)) {
+    return { displayText: rawText, contextFiles: [] };
+  }
+
+  const questionMarker = '\n\nUser question: ';
+  const questionIdx = rawText.lastIndexOf(questionMarker);
+  const userQuestion = questionIdx >= 0 ? rawText.slice(questionIdx + questionMarker.length).trim() : rawText;
+
+  // Extract file names from ```<ext> fenced blocks.
+  const contextFiles: ContextFile[] = [];
+  const filePattern = /^File: (\S+)$/gm;
+  let match: RegExpExecArray | null;
+  while ((match = filePattern.exec(rawText)) !== null) {
+    const fileName = match[1];
+    if (!contextFiles.some((f) => f.fileName === fileName)) {
+      contextFiles.push({
+        path: fileName,
+        fileName,
+        type: 'file',
+      });
+    }
+  }
+
+  return { displayText: userQuestion, contextFiles };
 }
 
 export const initialState: ChatState = {
@@ -431,11 +461,21 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           status: 'done',
         }));
 
+        const rawText = textFromContent(m.content);
+
+        // User messages may contain inline file content from the send path.
+        // Parse it out into contextFiles so the UI shows attachment pills
+        // instead of dumping the file body into the message bubble.
+        const { displayText, contextFiles } = role === 'user'
+          ? parseAttachedMessage(rawText)
+          : { displayText: rawText, contextFiles: [] as ContextFile[] };
+
         messages.push({
           id: nextId(),
           role,
-          text: textFromContent(m.content),
+          text: displayText,
           toolCalls,
+          contextFiles: contextFiles.length > 0 ? contextFiles : undefined,
           streaming: false,
           timestamp: Date.now(),
         });
