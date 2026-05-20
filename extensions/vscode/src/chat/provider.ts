@@ -99,6 +99,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
 
+    panel.iconPath = vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg');
     panel.webview.html = this._getHtml(panel.webview, 'tab');
     this._setupWebviewMessageHandler(panel.webview, 'tab');
 
@@ -179,6 +180,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ],
     };
     panel.webview.html = this._getHtml(panel.webview, 'tab');
+    panel.iconPath = vscode.Uri.joinPath(this._extensionUri, 'resources', 'icon.svg');
     this._setupWebviewMessageHandler(panel.webview, 'tab');
 
     // Track the panel
