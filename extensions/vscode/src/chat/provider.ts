@@ -1247,6 +1247,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
       this._broadcastMessage({ type: 'sessions', sessions });
+
+      // Update panel tab titles to reflect session names
+      const nameById = new Map<string, string>();
+      for (const s of sessions as any[]) {
+        const sid = s.meta?.id || s.id;
+        const label = s.name || s.title;
+        if (sid && label) nameById.set(sid, label);
+      }
+      for (const [sid, panel] of this._panels) {
+        const label = nameById.get(sid);
+        if (label && panel.title !== label) {
+          panel.title = label;
+        }
+      }
     } catch {}
   }
 
