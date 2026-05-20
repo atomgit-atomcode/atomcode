@@ -1,4 +1,4 @@
-/* webview-ui/src/styles/variables.css */
+/* src/styles/variables.css */
 html {
   --app-brand: #7c3aed;
   --app-brand-button: #6d28d9;
@@ -58,7 +58,7 @@ html {
   --app-spinner-foreground: var(--app-brand-button);
 }
 
-/* webview-ui/src/styles/index.css */
+/* src/styles/index.css */
 *,
 *::before,
 *::after {
@@ -149,7 +149,7 @@ body {
   }
 }
 
-/* webview-ui/src/styles/components.css */
+/* src/styles/components.css */
 .header {
   display: flex;
   align-items: center;
@@ -301,7 +301,6 @@ body {
 .model-default-badge {
   font-size: 10px;
   opacity: 0.6;
-  background: var(--app-input-background);
   border-radius: 3px;
   padding: 1px 4px;
   flex-shrink: 0;
@@ -746,7 +745,7 @@ body {
   font-size: 10px;
 }
 
-/* webview-ui/src/styles/messages.css */
+/* src/styles/messages.css */
 .messages-container {
   display: flex;
   flex-direction: column;
@@ -1299,7 +1298,7 @@ body {
   background: color-mix(in srgb, var(--app-brand), transparent 60%);
 }
 
-/* webview-ui/src/styles/input.css */
+/* src/styles/input.css */
 .input-container {
   position: absolute;
   z-index: 20;
@@ -1516,7 +1515,7 @@ body {
   color: var(--app-secondary-foreground);
 }
 
-/* webview-ui/src/styles/highlight.css */
+/* src/styles/highlight.css */
 .hljs {
   color: #d4d4d4;
 }

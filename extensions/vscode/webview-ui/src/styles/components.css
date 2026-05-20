@@ -156,7 +156,6 @@
 .model-default-badge {
   font-size: 10px;
   opacity: 0.6;
-  background: var(--app-input-background);
   border-radius: 3px;
   padding: 1px 4px;
   flex-shrink: 0;
