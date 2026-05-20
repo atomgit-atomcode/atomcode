@@ -1345,6 +1345,14 @@ async fn malformed_write_file_args_short_circuit_without_approval() {
         ) -> crate::tool::PermissionDecision {
             panic!("validate_args gate must short-circuit before approval is requested");
         }
+
+        fn will_auto_approve(
+            &self,
+            _call: &crate::tool::ToolCall,
+            _approval: &crate::tool::ApprovalRequirement,
+        ) -> bool {
+            false
+        }
     }
     let mut runner = make_runner(provider, tools, Box::new(PanicOnApproval));
     let mut conv = Conversation::new();

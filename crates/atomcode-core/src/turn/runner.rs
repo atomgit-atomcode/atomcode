@@ -1240,15 +1240,27 @@ impl TurnRunner {
         if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
         | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
         {
-            // Emit an informational event carrying a snapshot of
-            // conversation.messages so the TUI can persist mid-turn
-            // session state (e.g. for `/bg`).
-            let _ = event_tx.send(TurnEvent::ApprovalRequested {
-                tool_name: call.name.clone(),
-                reason: reason.clone(),
-                call: call.clone(),
-                messages: conversation_messages.to_vec(),
-            });
+            // Only emit the ApprovalRequested event (which triggers the
+            // TUI approval prompt) when the decider actually needs user
+            // input.  If the PermissionStore already has a session grant
+            // or override (e.g. the user pressed [A] on a prior call of
+            // the same tool in this batch), `will_auto_approve` returns
+            // true and we skip the event — the subsequent `decide()` call
+            // will return Allow without blocking.  Without this guard,
+            // parallel MCP calls show N redundant "Waiting for approval"
+            // prompts even though all but the first are auto-resolved.
+            let needs_prompt = !self.permission.will_auto_approve(call, &approval);
+            if needs_prompt {
+                // Emit an informational event carrying a snapshot of
+                // conversation.messages so the TUI can persist mid-turn
+                // session state (e.g. for `/bg`).
+                let _ = event_tx.send(TurnEvent::ApprovalRequested {
+                    tool_name: call.name.clone(),
+                    reason: reason.clone(),
+                    call: call.clone(),
+                    messages: conversation_messages.to_vec(),
+                });
+            }
 
             let decision = self.permission.decide(call, reason).await;
             if !matches!(decision, PermissionDecision::Allow) {
