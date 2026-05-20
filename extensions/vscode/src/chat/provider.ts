@@ -66,21 +66,44 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._clearLoginPoll();
   }
 
-  public openInTab() {
-    if (this._panel) {
-      this._panel.reveal();
+  private _findAtomCodeTabGroup(): vscode.ViewColumn | undefined {
+    for (const group of vscode.window.tabGroups.all) {
+      if (group.tabs.length > 0 &&
+          group.tabs.every(t => t.input instanceof vscode.TabInputWebview
+            && (t.input as vscode.TabInputWebview).viewType === 'atomcode.chatTab')) {
+        return group.viewColumn;
+      }
+    }
+    return undefined;
+  }
+
+  public openInTab(sessionId?: string) {
+    // If session is already open in a panel, reveal it
+    if (sessionId) {
+      const existing = this._panels.get(sessionId);
+      if (existing) {
+        existing.reveal();
+        this._focusedPanelId = sessionId;
+        return;
+      }
+    }
+
+    const config = vscode.workspace.getConfiguration('atomcode');
+    const maxTabs = config.get<number>('maxTabs', 5);
+
+    if (this._panels.size >= maxTabs) {
+      vscode.window.showWarningMessage(
+        `AtomCode: Maximum ${maxTabs} tabs open. Close a tab before opening a new one.`
+      );
       return;
     }
 
-    this._panelReady = false;
-    this._panelReadyPromise = new Promise((resolve) => {
-      this._panelReadyResolver = resolve;
-    });
+    const column = this._findAtomCodeTabGroup() ?? vscode.ViewColumn.Beside;
 
-    this._panel = vscode.window.createWebviewPanel(
+    const panel = vscode.window.createWebviewPanel(
       'atomcode.chatTab',
       'AtomCode',
-      vscode.ViewColumn.One,
+      column,
       {
         enableScripts: true,
         retainContextWhenHidden: true,
@@ -91,15 +114,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
 
-    this._panel.webview.html = this._getHtml(this._panel.webview, 'tab');
-    this._setupWebviewMessageHandler(this._panel.webview, 'tab');
+    panel.webview.html = this._getHtml(panel.webview, 'tab');
+    this._setupWebviewMessageHandler(panel.webview, 'tab');
 
-    this._panel.onDidDispose(() => {
-      this._panel = undefined;
-      this._panelReady = false;
-      this._panelReadyResolver = undefined;
-      this._panelReadyPromise = undefined;
+    panel.onDidDispose(() => {
+      const disposedSid = this._findSessionIdByPanel(panel);
+      if (disposedSid) {
+        this._panels.delete(disposedSid);
+        this._panelReady.delete(disposedSid);
+        this._panelSessions.delete(disposedSid);
+        if (this._focusedPanelId === disposedSid) {
+          this._focusedPanelId = undefined;
+        }
+        // Only clean up runtime if no other panel uses this session
+        const stillInUse = Array.from(this._panelSessions.values())
+          .some(s => s.sessionId === disposedSid);
+        if (!stillInUse) {
+          const rt = this._sessionRuntimes.get(disposedSid);
+          if (rt?.isGenerating) {
+            rt.abortController?.abort();
+            void this._client.stopGeneration(disposedSid).catch(() => undefined);
+          }
+        }
+      }
     });
+  }
+
+  private _findSessionIdByPanel(panel: vscode.WebviewPanel): string | undefined {
+    for (const [sid, p] of this._panels) {
+      if (p === panel) return sid;
+    }
+    return undefined;
   }
 
   public async openInSidebar() {
@@ -116,9 +161,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  public async openForEditorCommand() {
-    this.openInTab();
-    await this._waitForPanelReady(PANEL_READY_TIMEOUT_MS);
+  public async openForEditorCommand(sessionId?: string) {
+    this.openInTab(sessionId);
+    // Wait briefly for the panel to be ready
+    await new Promise(resolve => setTimeout(resolve, 500));
   }
 
   resolveWebviewView(webviewView: vscode.WebviewView) {
