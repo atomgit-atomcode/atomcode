@@ -597,40 +597,42 @@ impl TurnRunner {
                                         if text_buf.trim().is_empty()
                                             && tool_calls_buf.is_empty()
                                             && !rescued_tools
-                                            && !reasoning_buf.trim().is_empty()
-                                            && reasoning_buf.trim()
-                                                != crate::provider::REASONING_PLACEHOLDER
+                                            && !is_only_placeholder_filler(&reasoning_buf)
                                         {
                                             // Skip-promotion guard: when the reasoning
-                                            // channel carries ONLY our own outbound
-                                            // placeholder (`(no reasoning recorded)`),
-                                            // don't promote it to the assistant text
-                                            // channel. Some gateways echo back the
-                                            // placeholder as the response's
-                                            // reasoning_content (or the model mimics
-                                            // the pattern from a context full of
-                                            // historical placeholder copies — DeepSeek
-                                            // V4 thinking-mode requires non-empty
-                                            // reasoning_content on every historical
-                                            // assistant tool_call message, so a
-                                            // 17-round session has 17 copies of the
-                                            // placeholder in context). Promoting it
+                                            // channel carries nothing besides copies of
+                                            // our own outbound placeholder
+                                            // (`(no reasoning recorded)`), don't promote
+                                            // it to the assistant text channel. Some
+                                            // gateways echo back the placeholder as the
+                                            // response's reasoning_content; more often
+                                            // the model mimics the pattern from a
+                                            // context full of historical placeholder
+                                            // copies — DeepSeek V4 thinking-mode
+                                            // requires non-empty reasoning_content on
+                                            // every historical assistant tool_call
+                                            // message, so a 17-round session has 17
+                                            // copies of the placeholder in context, and
+                                            // the response often comes back as 3+
+                                            // copies concatenated. `is_only_placeholder_filler`
+                                            // handles any N (≥1) copies plus
+                                            // interleaved whitespace. Promoting that
                                             // would commit a meaningless string to
                                             // history AND present `Responded { text:
-                                            // "(no reasoning recorded)" }` to the
+                                            // "(no reasoning recorded)..." }` to the
                                             // agent loop, which then calls
-                                            // finish_turn(Natural) and the user sees
-                                            // a silent "Nailed it" mid-task stop
-                                            // (user-reported on DeepSeek V4 Flash,
-                                            // 17 rounds 20 tools, screenshot showed
-                                            // the placeholder as the only assistant
-                                            // text before TurnComplete fired). With
-                                            // the guard: text_buf stays empty, falls
+                                            // finish_turn(Natural) and the user sees a
+                                            // silent "Nailed it" mid-task stop
+                                            // (user-reported on DeepSeek V4 Flash, 17
+                                            // rounds 20 tools, screenshot showed the
+                                            // placeholder as the only assistant text
+                                            // before TurnComplete fired). With the
+                                            // guard: text_buf stays empty, falls
                                             // through to the empty-response Failed
                                             // branch below, the agent loop's existing
-                                            // 3-retry-with-backoff path takes over
-                                            // and surfaces the issue to the user
-                                            // instead of burying it as success.
+                                            // 3-retry-with-backoff path takes over and
+                                            // surfaces the issue to the user instead of
+                                            // burying it as success.
                                             let promoted = std::mem::take(&mut reasoning_buf);
                                             conversation.push_delta(&promoted);
                                             text_buf.push_str(&promoted);
@@ -1512,6 +1514,23 @@ impl TurnRunner {
 /// (free-form text, garbage from broken streams) round-trip through the
 /// fallback unchanged so we don't regress free-form tools or accidentally
 /// merge two genuinely different malformed payloads.
+/// True iff `reasoning` contains nothing besides one or more copies
+/// of the outbound placeholder (`REASONING_PLACEHOLDER`) interleaved
+/// with whitespace — including the all-empty / all-whitespace case.
+///
+/// The Done-event skip-promotion guard uses this to detect not just
+/// the trivial single-copy echo but also the multi-copy mimicry seen
+/// on DeepSeek V4 thinking-mode (a long session has many historical
+/// copies of the placeholder in context, and the model regenerates the
+/// pattern in its own response — observed 3+ copies concatenated in a
+/// single reasoning_content stream).
+fn is_only_placeholder_filler(reasoning: &str) -> bool {
+    reasoning
+        .replace(crate::provider::REASONING_PLACEHOLDER, "")
+        .trim()
+        .is_empty()
+}
+
 fn normalize_tool_args(args: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| args.to_string()),
@@ -1964,6 +1983,63 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     removed_ids
 }
 
+
+#[cfg(test)]
+mod is_only_placeholder_filler_tests {
+    use super::is_only_placeholder_filler;
+    use crate::provider::REASONING_PLACEHOLDER;
+
+    #[test]
+    fn empty_and_whitespace_are_filler() {
+        assert!(is_only_placeholder_filler(""));
+        assert!(is_only_placeholder_filler("   "));
+        assert!(is_only_placeholder_filler("\n\t  \n"));
+    }
+
+    #[test]
+    fn single_placeholder_is_filler() {
+        // The original strict-equality guard already caught this; pin
+        // it so a refactor doesn't regress.
+        assert!(is_only_placeholder_filler(REASONING_PLACEHOLDER));
+    }
+
+    #[test]
+    fn multiple_concatenated_placeholders_are_filler() {
+        // The bug: DeepSeek V4 Flash 17-round session screenshot
+        // showed the response's reasoning_content as 3 copies of the
+        // placeholder concatenated with no separator. The old
+        // `!= REASONING_PLACEHOLDER` check missed this and promoted
+        // the meaningless string into the assistant text channel.
+        let three = REASONING_PLACEHOLDER.repeat(3);
+        assert!(is_only_placeholder_filler(&three));
+        let five = REASONING_PLACEHOLDER.repeat(5);
+        assert!(is_only_placeholder_filler(&five));
+    }
+
+    #[test]
+    fn placeholders_with_whitespace_are_filler() {
+        // Some gateways insert chunk delimiters (newlines, spaces)
+        // between repeated placeholder echoes. Filler regardless.
+        let mixed = format!("{}\n{}  {}", REASONING_PLACEHOLDER, REASONING_PLACEHOLDER, REASONING_PLACEHOLDER);
+        assert!(is_only_placeholder_filler(&mixed));
+    }
+
+    #[test]
+    fn real_reasoning_is_not_filler() {
+        assert!(!is_only_placeholder_filler(
+            "Let me think about this — first, the user wants..."
+        ));
+    }
+
+    #[test]
+    fn placeholder_plus_real_content_is_not_filler() {
+        // If the model emits the placeholder AND some substantive
+        // text, we still want promotion — the substantive text is
+        // the real reasoning we'd want to keep.
+        let mixed = format!("{} but actually I see now that...", REASONING_PLACEHOLDER);
+        assert!(!is_only_placeholder_filler(&mixed));
+    }
+}
 
 #[cfg(test)]
 mod normalize_tool_args_tests {
