@@ -1288,22 +1288,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private _postMessage(msg: unknown, webview?: vscode.Webview) {
+  private _postMessage(msg: any, webview?: vscode.Webview) {
     if (webview) {
       webview.postMessage(msg);
       return;
     }
-    // Chat events should land in one active chat surface to avoid duplicate messages.
-    if (this._panel) {
-      this._panel.webview.postMessage(msg);
-    } else {
-      this._view?.webview.postMessage(msg);
+    // Route to focused panel, fallback to first panel, then sidebar
+    if (this._focusedPanelId) {
+      const panel = this._panels.get(this._focusedPanelId);
+      if (panel) { panel.webview.postMessage(msg); return; }
+    }
+    // Fallback to any open panel
+    const firstPanel = this._panels.values().next().value;
+    if (firstPanel) { firstPanel.webview.postMessage(msg); return; }
+    // Last resort: sidebar
+    this._view?.webview.postMessage(msg);
+  }
+
+  private _postMessageToPanel(sessionId: string, msg: any) {
+    const panel = this._panels.get(sessionId);
+    if (panel) {
+      panel.webview.postMessage(msg);
     }
   }
 
-  private _broadcastMessage(msg: unknown) {
+  private _broadcastToPanels(msg: any) {
+    for (const panel of this._panels.values()) {
+      panel.webview.postMessage(msg);
+    }
+  }
+
+  private _broadcastMessage(msg: any) {
     this._view?.webview.postMessage(msg);
-    this._panel?.webview.postMessage(msg);
+    this._broadcastToPanels(msg);
   }
 
   private _markPanelReady(webview: vscode.Webview) {
