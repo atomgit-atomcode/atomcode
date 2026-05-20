@@ -108,6 +108,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._focusedPanelId = sessionId;
     }
 
+    // When user switches to this tab in VS Code, sync sidebar selection
+    panel.onDidChangeViewState((e) => {
+      if (e.webviewPanel.active) {
+        const activeSid = this._findSessionIdByPanel(panel);
+        if (activeSid) {
+          this._focusedPanelId = activeSid;
+          const info = this._panelSessions.get(activeSid);
+          this._broadcastMessage({ type: 'sessionSelected', sessionId: activeSid, projectHash: info?.projectHash });
+        }
+      }
+    });
+
     panel.onDidDispose(() => {
       const disposedSid = this._findSessionIdByPanel(panel);
       if (disposedSid) {
@@ -184,6 +196,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
       }).catch(() => { /* session may not exist yet */ });
     }
+
+    // When user switches to this tab in VS Code, sync sidebar selection
+    panel.onDidChangeViewState((e) => {
+      if (e.webviewPanel.active) {
+        const activeSid = this._findSessionIdByPanel(panel);
+        if (activeSid) {
+          this._focusedPanelId = activeSid;
+          const info = this._panelSessions.get(activeSid);
+          this._broadcastMessage({ type: 'sessionSelected', sessionId: activeSid, projectHash: info?.projectHash });
+        }
+      }
+    });
 
     panel.onDidDispose(() => {
       const disposedSid = this._findSessionIdByPanel(panel);
@@ -375,7 +399,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._panelSessions.set(sessionId, { sessionId, projectHash });
     this.openInTab(sessionId);
 
-    // Broadcast session list update to all
+    // Notify all panels + sidebar about the new active session
+    this._broadcastMessage({ type: 'sessionSelected', sessionId, projectHash });
     await this._refreshSessions();
   }
 
