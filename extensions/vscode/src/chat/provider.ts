@@ -102,6 +102,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     panel.webview.html = this._getHtml(panel.webview, 'tab');
     this._setupWebviewMessageHandler(panel.webview, 'tab');
 
+    // Track the panel — required for message routing, size check, and lookup
+    if (sessionId) {
+      this._panels.set(sessionId, panel);
+      this._focusedPanelId = sessionId;
+    }
+
     panel.onDidDispose(() => {
       const disposedSid = this._findSessionIdByPanel(panel);
       if (disposedSid) {
@@ -162,6 +168,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
     panel.webview.html = this._getHtml(panel.webview, 'tab');
     this._setupWebviewMessageHandler(panel.webview, 'tab');
+
+    // Track the panel
+    if (sessionId) {
+      this._panels.set(sessionId, panel);
+    }
 
     if (sessionId && projectHash) {
       this._panelSessions.set(sessionId, { sessionId, projectHash });
