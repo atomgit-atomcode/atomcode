@@ -490,6 +490,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         currentModel: action.currentModel ?? state.currentModel,
         viewMode: action.viewMode ?? state.viewMode,
         activeSessionId: action.activeSessionId ?? state.activeSessionId,
+        activeProjectHash: action.projectHash ?? state.activeProjectHash,
         isSessionList: action.isSessionList ?? state.isSessionList,
       };
 

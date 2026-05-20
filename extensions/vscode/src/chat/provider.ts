@@ -707,12 +707,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    const projectHash = sid ? (this._panelSessions.get(sid)?.projectHash ?? this._sessionRuntimes.get(sid)?.projectHash) : undefined;
+
     this._postMessage({
       type: 'init',
       generating: sid ? (this._sessionRuntimes.get(sid)?.isGenerating ?? false) : false,
       currentModel: currentModelName,
       viewMode: mode,
       activeSessionId: sid,
+      projectHash,
       isSessionList: mode === 'sidebar',
     }, webview);
   }

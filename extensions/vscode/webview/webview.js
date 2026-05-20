@@ -73923,6 +73923,7 @@
           currentModel: action.currentModel ?? state.currentModel,
           viewMode: action.viewMode ?? state.viewMode,
           activeSessionId: action.activeSessionId ?? state.activeSessionId,
+          activeProjectHash: action.projectHash ?? state.activeProjectHash,
           isSessionList: action.isSessionList ?? state.isSessionList
         };
       default:
@@ -73966,8 +73967,12 @@
               currentModel: msg.currentModel,
               viewMode: msg.viewMode,
               activeSessionId: msg.activeSessionId,
+              projectHash: msg.projectHash,
               isSessionList: msg.isSessionList
             });
+            if (msg.activeSessionId) {
+              getVSCodeApi().setState({ sessionId: msg.activeSessionId, projectHash: msg.projectHash });
+            }
             break;
           case "userMessage":
             dispatch({ type: "ADD_USER_MESSAGE", text: msg.text });

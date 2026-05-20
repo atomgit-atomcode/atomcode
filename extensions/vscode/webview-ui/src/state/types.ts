@@ -156,12 +156,12 @@ export type ChatAction =
   | { type: 'SET_SEARCH_QUERY'; query: string }
   | { type: 'TOGGLE_SEARCH' }
   | { type: 'RESUME_STREAMING' }
-  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; isSessionList?: boolean };
+  | { type: 'INIT'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean };
 
 // ─── Messages from the VS Code extension host ──────────────────
 
 export type ExtensionMessage =
-  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; isSessionList?: boolean }
+  | { type: 'init'; generating: boolean; currentModel?: string; viewMode?: 'sidebar' | 'tab'; activeSessionId?: string; projectHash?: string; isSessionList?: boolean }
   | { type: 'userMessage'; text: string }
   | { type: 'queuedMessageSent'; id: string }
   | { type: 'assistantMessage'; text: string }

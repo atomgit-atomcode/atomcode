@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useReducer, useEffect, useCallback, useRef } from 'react';
 import { ChatState, ChatAction, ExtensionMessage } from './types';
 import { chatReducer, initialState } from './reducer';
-import { postMessage } from '../vscode';
+import { postMessage, getVSCodeApi } from '../vscode';
 
 // ─── Context ────────────────────────────────────────────────────
 
@@ -53,8 +53,13 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             currentModel: msg.currentModel,
             viewMode: msg.viewMode,
             activeSessionId: msg.activeSessionId,
+            projectHash: msg.projectHash,
             isSessionList: msg.isSessionList,
           });
+          // Persist session binding so tabs survive VS Code restart
+          if (msg.activeSessionId) {
+            getVSCodeApi().setState({ sessionId: msg.activeSessionId, projectHash: msg.projectHash });
+          }
           break;
         case 'userMessage':
           dispatch({ type: 'ADD_USER_MESSAGE', text: msg.text });
