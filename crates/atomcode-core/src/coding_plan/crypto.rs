@@ -1,9 +1,19 @@
 // Public interface for per-request signing of AtomGit LLM gateway calls.
 //
-// Open-source repo: signer() always returns UnavailableSigner, so any
-// AtomGit-bound request fails-fast with a localised "official build
-// required" hint. The official build pipeline patches this file at CI
-// time to delegate signer() to the real implementation.
+// Open-source build (`codingplan-crypto` feature off — the default):
+// `signer()` returns `UnavailableSigner`, so any AtomGit-bound request
+// fails-fast with a localised "official build required" hint.
+//
+// Official build (`codingplan-crypto` feature on): `signer()` returns
+// `RealSigner`, a thin pass-through to `atomcode_codingplan_crypto::sign_v1`.
+// The closed-source crate owns all wire-format details (body hashing,
+// header names, hex encoding, canonical-message construction, master
+// secret, HMAC primitive); the wrapper here only marshals trait inputs
+// into primitive-typed arguments and returns the resulting headers
+// unchanged. The public source tree carries a stub crate at
+// `crates/atomcode-codingplan-crypto/` with the same API surface; the
+// official build pipeline replaces that directory with the private
+// overlay before turning the feature on.
 
 use thiserror::Error;
 
@@ -53,13 +63,54 @@ impl RequestSigner for UnavailableSigner {
     }
 }
 
+#[cfg(not(feature = "codingplan-crypto"))]
 static UNAVAILABLE_SIGNER: UnavailableSigner = UnavailableSigner;
 
-/// Accessor used by every caller. Always returns `UnavailableSigner`
-/// in the public-repo source. The official build pipeline patches this
-/// function to delegate to a real implementation.
+/// Accessor used by every caller. Returns `UnavailableSigner` in the
+/// open-source build; with `codingplan-crypto` on, returns `RealSigner`
+/// which forwards into the closed-source `atomcode-codingplan-crypto`
+/// crate.
+#[cfg(not(feature = "codingplan-crypto"))]
 pub fn signer() -> &'static dyn RequestSigner {
     &UNAVAILABLE_SIGNER
+}
+
+#[cfg(feature = "codingplan-crypto")]
+struct RealSigner;
+
+#[cfg(feature = "codingplan-crypto")]
+impl RequestSigner for RealSigner {
+    fn sign(&self, req: SignInput<'_>) -> Result<SignOutput, SignError> {
+        // env!() expands at compile time to atomcode-core's package
+        // version (which inherits version.workspace = true, so it
+        // equals the atomcode binary's version). Threading it in here
+        // — rather than through SignInput — keeps the call sites in
+        // provider/openai.rs unaware of the version-binding mechanism.
+        Ok(SignOutput {
+            headers: atomcode_codingplan_crypto::sign_v1(
+                req.method,
+                req.path,
+                req.body,
+                req.oauth_token,
+                req.user_id,
+                req.timestamp_unix,
+                &req.nonce,
+                env!("CARGO_PKG_VERSION"),
+            ),
+        })
+    }
+
+    fn algorithm_version(&self) -> u8 {
+        atomcode_codingplan_crypto::ALGORITHM_VERSION
+    }
+}
+
+#[cfg(feature = "codingplan-crypto")]
+static REAL_SIGNER: RealSigner = RealSigner;
+
+#[cfg(feature = "codingplan-crypto")]
+pub fn signer() -> &'static dyn RequestSigner {
+    &REAL_SIGNER
 }
 
 /// True iff the given base URL points at the production AtomGit LLM
@@ -104,6 +155,7 @@ mod tests {
         assert_eq!(s.algorithm_version(), 0);
     }
 
+    #[cfg(not(feature = "codingplan-crypto"))]
     #[test]
     fn default_signer_in_open_source_build_is_unavailable() {
         let input = SignInput {

@@ -1,0 +1,10 @@
+[package]
+name = "atomcode-codingplan-crypto"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Open-source stub for the closed-source AtomCode request-signing crate. The official build pipeline replaces this whole directory with the real crate before building with feature `atomcode-core/codingplan-crypto`."
+publish = false
+
+[lib]
+path = "src/lib.rs"

@@ -46,6 +46,17 @@ getrandom = "0.2"
 thiserror = "1"
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 
+# AtomCode request-signing crate. Stub in the open-source tree; the
+# official build pipeline replaces `crates/atomcode-codingplan-crypto/`
+# with the closed-source overlay and turns the feature on. Off by
+# default — the stub crate is linked only when this feature is enabled,
+# never in standard `cargo build`.
+atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional = true }
+
+[features]
+default = []
+codingplan-crypto = ["dep:atomcode-codingplan-crypto"]
+
 # Non-blocking poll on stdin in the OAuth callback path so the stdin
 # reader thread can exit cleanly when the HTTP listener wins — otherwise
 # it stays blocked in read_line() and steals the user's first keystroke
