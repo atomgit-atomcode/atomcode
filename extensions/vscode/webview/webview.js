@@ -34,9 +34,9 @@
   var __privateAdd = (obj, member, value) => member.has(obj) ? __typeError("Cannot add the same private member more than once") : member instanceof WeakSet ? member.add(obj) : member.set(obj, value);
   var __privateMethod = (obj, member, method) => (__accessCheck(obj, member, "access private method"), method);
 
-  // node_modules/scheduler/cjs/scheduler.development.js
+  // ../node_modules/scheduler/cjs/scheduler.development.js
   var require_scheduler_development = __commonJS({
-    "node_modules/scheduler/cjs/scheduler.development.js"(exports) {
+    "../node_modules/scheduler/cjs/scheduler.development.js"(exports) {
       "use strict";
       (function() {
         function performWorkUntilDeadline() {
@@ -293,9 +293,9 @@
     }
   });
 
-  // node_modules/scheduler/index.js
+  // ../node_modules/scheduler/index.js
   var require_scheduler = __commonJS({
-    "node_modules/scheduler/index.js"(exports, module) {
+    "../node_modules/scheduler/index.js"(exports, module) {
       "use strict";
       if (false) {
         module.exports = null;
@@ -305,9 +305,9 @@
     }
   });
 
-  // node_modules/react/cjs/react.development.js
+  // ../node_modules/react/cjs/react.development.js
   var require_react_development = __commonJS({
-    "node_modules/react/cjs/react.development.js"(exports, module) {
+    "../node_modules/react/cjs/react.development.js"(exports, module) {
       "use strict";
       (function() {
         function defineDeprecationWarning(methodName, info) {
@@ -1277,9 +1277,9 @@
     }
   });
 
-  // node_modules/react/index.js
+  // ../node_modules/react/index.js
   var require_react = __commonJS({
-    "node_modules/react/index.js"(exports, module) {
+    "../node_modules/react/index.js"(exports, module) {
       "use strict";
       if (false) {
         module.exports = null;
@@ -1289,9 +1289,9 @@
     }
   });
 
-  // node_modules/react-dom/cjs/react-dom.development.js
+  // ../node_modules/react-dom/cjs/react-dom.development.js
   var require_react_dom_development = __commonJS({
-    "node_modules/react-dom/cjs/react-dom.development.js"(exports) {
+    "../node_modules/react-dom/cjs/react-dom.development.js"(exports) {
       "use strict";
       (function() {
         function noop() {
@@ -1533,9 +1533,9 @@
     }
   });
 
-  // node_modules/react-dom/index.js
+  // ../node_modules/react-dom/index.js
   var require_react_dom = __commonJS({
-    "node_modules/react-dom/index.js"(exports, module) {
+    "../node_modules/react-dom/index.js"(exports, module) {
       "use strict";
       if (false) {
         checkDCE();
@@ -1546,9 +1546,9 @@
     }
   });
 
-  // node_modules/react-dom/cjs/react-dom-client.development.js
+  // ../node_modules/react-dom/cjs/react-dom-client.development.js
   var require_react_dom_client_development = __commonJS({
-    "node_modules/react-dom/cjs/react-dom-client.development.js"(exports) {
+    "../node_modules/react-dom/cjs/react-dom-client.development.js"(exports) {
       "use strict";
       (function() {
         function findHook(fiber, id) {
@@ -21445,9 +21445,9 @@
     }
   });
 
-  // node_modules/react-dom/client.js
+  // ../node_modules/react-dom/client.js
   var require_client = __commonJS({
-    "node_modules/react-dom/client.js"(exports, module) {
+    "../node_modules/react-dom/client.js"(exports, module) {
       "use strict";
       if (false) {
         checkDCE();
@@ -21458,9 +21458,9 @@
     }
   });
 
-  // node_modules/react/cjs/react-jsx-runtime.development.js
+  // ../node_modules/react/cjs/react-jsx-runtime.development.js
   var require_react_jsx_runtime_development = __commonJS({
-    "node_modules/react/cjs/react-jsx-runtime.development.js"(exports) {
+    "../node_modules/react/cjs/react-jsx-runtime.development.js"(exports) {
       "use strict";
       (function() {
         function getComponentNameFromType(type) {
@@ -21715,9 +21715,9 @@
     }
   });
 
-  // node_modules/react/jsx-runtime.js
+  // ../node_modules/react/jsx-runtime.js
   var require_jsx_runtime = __commonJS({
-    "node_modules/react/jsx-runtime.js"(exports, module) {
+    "../node_modules/react/jsx-runtime.js"(exports, module) {
       "use strict";
       if (false) {
         module.exports = null;
@@ -21727,9 +21727,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/core.js
+  // ../node_modules/highlight.js/lib/core.js
   var require_core = __commonJS({
-    "node_modules/highlight.js/lib/core.js"(exports, module) {
+    "../node_modules/highlight.js/lib/core.js"(exports, module) {
       function deepFreeze(obj) {
         if (obj instanceof Map) {
           obj.clear = obj.delete = obj.set = function() {
@@ -23265,9 +23265,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/1c.js
+  // ../node_modules/highlight.js/lib/languages/1c.js
   var require_c = __commonJS({
-    "node_modules/highlight.js/lib/languages/1c.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/1c.js"(exports, module) {
       function _1c(hljs) {
         const UNDERSCORE_IDENT_RE = "[A-Za-z\u0410-\u042F\u0430-\u044F\u0451\u0401_][A-Za-z\u0410-\u042F\u0430-\u044F\u0451\u0401_0-9]+";
         const v7_keywords = "\u0434\u0430\u043B\u0435\u0435 ";
@@ -23418,9 +23418,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/abnf.js
+  // ../node_modules/highlight.js/lib/languages/abnf.js
   var require_abnf = __commonJS({
-    "node_modules/highlight.js/lib/languages/abnf.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/abnf.js"(exports, module) {
       function abnf(hljs) {
         const regex = hljs.regex;
         const IDENT = /^[a-zA-Z][a-zA-Z0-9-]*/;
@@ -23488,9 +23488,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/accesslog.js
+  // ../node_modules/highlight.js/lib/languages/accesslog.js
   var require_accesslog = __commonJS({
-    "node_modules/highlight.js/lib/languages/accesslog.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/accesslog.js"(exports, module) {
       function accesslog(hljs) {
         const regex = hljs.regex;
         const HTTP_VERBS = [
@@ -23574,9 +23574,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/actionscript.js
+  // ../node_modules/highlight.js/lib/languages/actionscript.js
   var require_actionscript = __commonJS({
-    "node_modules/highlight.js/lib/languages/actionscript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/actionscript.js"(exports, module) {
       function actionscript(hljs) {
         const regex = hljs.regex;
         const IDENT_RE = /[a-zA-Z_$][a-zA-Z0-9_$]*/;
@@ -23721,9 +23721,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/ada.js
+  // ../node_modules/highlight.js/lib/languages/ada.js
   var require_ada = __commonJS({
-    "node_modules/highlight.js/lib/languages/ada.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/ada.js"(exports, module) {
       function ada(hljs) {
         const INTEGER_RE = "\\d(_|\\d)*";
         const EXPONENT_RE = "[eE][-+]?" + INTEGER_RE;
@@ -23948,9 +23948,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/angelscript.js
+  // ../node_modules/highlight.js/lib/languages/angelscript.js
   var require_angelscript = __commonJS({
-    "node_modules/highlight.js/lib/languages/angelscript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/angelscript.js"(exports, module) {
       function angelscript(hljs) {
         const builtInTypeMode = {
           className: "built_in",
@@ -24119,9 +24119,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/apache.js
+  // ../node_modules/highlight.js/lib/languages/apache.js
   var require_apache = __commonJS({
-    "node_modules/highlight.js/lib/languages/apache.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/apache.js"(exports, module) {
       function apache(hljs) {
         const NUMBER_REF = {
           className: "number",
@@ -24218,9 +24218,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/applescript.js
+  // ../node_modules/highlight.js/lib/languages/applescript.js
   var require_applescript = __commonJS({
-    "node_modules/highlight.js/lib/languages/applescript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/applescript.js"(exports, module) {
       function applescript(hljs) {
         const regex = hljs.regex;
         const STRING = hljs.inherit(
@@ -24344,9 +24344,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/arcade.js
+  // ../node_modules/highlight.js/lib/languages/arcade.js
   var require_arcade = __commonJS({
-    "node_modules/highlight.js/lib/languages/arcade.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/arcade.js"(exports, module) {
       function arcade(hljs) {
         const regex = hljs.regex;
         const IDENT_RE = "[A-Za-z_][0-9A-Za-z_]*";
@@ -24771,9 +24771,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/arduino.js
+  // ../node_modules/highlight.js/lib/languages/arduino.js
   var require_arduino = __commonJS({
-    "node_modules/highlight.js/lib/languages/arduino.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/arduino.js"(exports, module) {
       function cPlusPlus(hljs) {
         const regex = hljs.regex;
         const C_LINE_COMMENT_MODE = hljs.COMMENT("//", "$", { contains: [{ begin: /\\\n/ }] });
@@ -25709,9 +25709,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/armasm.js
+  // ../node_modules/highlight.js/lib/languages/armasm.js
   var require_armasm = __commonJS({
-    "node_modules/highlight.js/lib/languages/armasm.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/armasm.js"(exports, module) {
       function armasm(hljs) {
         const COMMENT = { variants: [
           hljs.COMMENT("^[ \\t]*(?=#)", "$", {
@@ -25802,9 +25802,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/xml.js
+  // ../node_modules/highlight.js/lib/languages/xml.js
   var require_xml = __commonJS({
-    "node_modules/highlight.js/lib/languages/xml.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/xml.js"(exports, module) {
       function xml2(hljs) {
         const regex = hljs.regex;
         const TAG_NAME_RE = regex.concat(/[\p{L}_]/u, regex.optional(/[\p{L}0-9_.-]*:/u), /[\p{L}0-9_.-]*/u);
@@ -26033,9 +26033,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/asciidoc.js
+  // ../node_modules/highlight.js/lib/languages/asciidoc.js
   var require_asciidoc = __commonJS({
-    "node_modules/highlight.js/lib/languages/asciidoc.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/asciidoc.js"(exports, module) {
       function asciidoc(hljs) {
         const regex = hljs.regex;
         const HORIZONTAL_RULE = {
@@ -26286,9 +26286,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/aspectj.js
+  // ../node_modules/highlight.js/lib/languages/aspectj.js
   var require_aspectj = __commonJS({
-    "node_modules/highlight.js/lib/languages/aspectj.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/aspectj.js"(exports, module) {
       function aspectj(hljs) {
         const regex = hljs.regex;
         const KEYWORDS = [
@@ -26511,9 +26511,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/autohotkey.js
+  // ../node_modules/highlight.js/lib/languages/autohotkey.js
   var require_autohotkey = __commonJS({
-    "node_modules/highlight.js/lib/languages/autohotkey.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/autohotkey.js"(exports, module) {
       function autohotkey(hljs) {
         const BACKTICK_ESCAPE = { begin: "`[\\s\\S]" };
         return {
@@ -26583,9 +26583,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/autoit.js
+  // ../node_modules/highlight.js/lib/languages/autoit.js
   var require_autoit = __commonJS({
-    "node_modules/highlight.js/lib/languages/autoit.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/autoit.js"(exports, module) {
       function autoit(hljs) {
         const KEYWORDS = "ByRef Case Const ContinueCase ContinueLoop Dim Do Else ElseIf EndFunc EndIf EndSelect EndSwitch EndWith Enum Exit ExitLoop For Func Global If In Local Next ReDim Return Select Static Step Switch Then To Until Volatile WEnd While With";
         const DIRECTIVES = [
@@ -26742,9 +26742,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/avrasm.js
+  // ../node_modules/highlight.js/lib/languages/avrasm.js
   var require_avrasm = __commonJS({
-    "node_modules/highlight.js/lib/languages/avrasm.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/avrasm.js"(exports, module) {
       function avrasm(hljs) {
         return {
           name: "AVR Assembly",
@@ -26805,9 +26805,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/awk.js
+  // ../node_modules/highlight.js/lib/languages/awk.js
   var require_awk = __commonJS({
-    "node_modules/highlight.js/lib/languages/awk.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/awk.js"(exports, module) {
       function awk(hljs) {
         const VARIABLE = {
           className: "variable",
@@ -26869,9 +26869,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/axapta.js
+  // ../node_modules/highlight.js/lib/languages/axapta.js
   var require_axapta = __commonJS({
-    "node_modules/highlight.js/lib/languages/axapta.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/axapta.js"(exports, module) {
       function axapta(hljs) {
         const IDENT_RE = hljs.UNDERSCORE_IDENT_RE;
         const BUILT_IN_KEYWORDS = [
@@ -27048,9 +27048,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/bash.js
+  // ../node_modules/highlight.js/lib/languages/bash.js
   var require_bash = __commonJS({
-    "node_modules/highlight.js/lib/languages/bash.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/bash.js"(exports, module) {
       function bash(hljs) {
         const regex = hljs.regex;
         const VAR = {};
@@ -27447,9 +27447,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/basic.js
+  // ../node_modules/highlight.js/lib/languages/basic.js
   var require_basic = __commonJS({
-    "node_modules/highlight.js/lib/languages/basic.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/basic.js"(exports, module) {
       function basic(hljs) {
         const KEYWORDS = [
           "ABS",
@@ -27678,9 +27678,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/bnf.js
+  // ../node_modules/highlight.js/lib/languages/bnf.js
   var require_bnf = __commonJS({
-    "node_modules/highlight.js/lib/languages/bnf.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/bnf.js"(exports, module) {
       function bnf(hljs) {
         return {
           name: "Backus\u2013Naur Form",
@@ -27714,9 +27714,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/brainfuck.js
+  // ../node_modules/highlight.js/lib/languages/brainfuck.js
   var require_brainfuck = __commonJS({
-    "node_modules/highlight.js/lib/languages/brainfuck.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/brainfuck.js"(exports, module) {
       function brainfuck(hljs) {
         const LITERAL = {
           className: "literal",
@@ -27766,9 +27766,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/c.js
+  // ../node_modules/highlight.js/lib/languages/c.js
   var require_c2 = __commonJS({
-    "node_modules/highlight.js/lib/languages/c.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/c.js"(exports, module) {
       function c(hljs) {
         const regex = hljs.regex;
         const C_LINE_COMMENT_MODE = hljs.COMMENT("//", "$", { contains: [{ begin: /\\\n/ }] });
@@ -28065,9 +28065,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/cal.js
+  // ../node_modules/highlight.js/lib/languages/cal.js
   var require_cal = __commonJS({
-    "node_modules/highlight.js/lib/languages/cal.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/cal.js"(exports, module) {
       function cal(hljs) {
         const regex = hljs.regex;
         const KEYWORDS = [
@@ -28218,9 +28218,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/capnproto.js
+  // ../node_modules/highlight.js/lib/languages/capnproto.js
   var require_capnproto = __commonJS({
-    "node_modules/highlight.js/lib/languages/capnproto.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/capnproto.js"(exports, module) {
       function capnproto(hljs) {
         const KEYWORDS = [
           "struct",
@@ -28313,9 +28313,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/ceylon.js
+  // ../node_modules/highlight.js/lib/languages/ceylon.js
   var require_ceylon = __commonJS({
-    "node_modules/highlight.js/lib/languages/ceylon.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/ceylon.js"(exports, module) {
       function ceylon(hljs) {
         const KEYWORDS = [
           "assembly",
@@ -28446,9 +28446,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/clean.js
+  // ../node_modules/highlight.js/lib/languages/clean.js
   var require_clean = __commonJS({
-    "node_modules/highlight.js/lib/languages/clean.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/clean.js"(exports, module) {
       function clean(hljs) {
         const KEYWORDS = [
           "if",
@@ -28510,9 +28510,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/clojure.js
+  // ../node_modules/highlight.js/lib/languages/clojure.js
   var require_clojure = __commonJS({
-    "node_modules/highlight.js/lib/languages/clojure.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/clojure.js"(exports, module) {
       function clojure(hljs) {
         const SYMBOLSTART = "a-zA-Z_\\-!.?+*=<>&'";
         const SYMBOL_RE = "[#]?[" + SYMBOLSTART + "][" + SYMBOLSTART + "0-9/;:$#]*";
@@ -28670,9 +28670,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/clojure-repl.js
+  // ../node_modules/highlight.js/lib/languages/clojure-repl.js
   var require_clojure_repl = __commonJS({
-    "node_modules/highlight.js/lib/languages/clojure-repl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/clojure-repl.js"(exports, module) {
       function clojureRepl(hljs) {
         return {
           name: "Clojure REPL",
@@ -28692,9 +28692,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/cmake.js
+  // ../node_modules/highlight.js/lib/languages/cmake.js
   var require_cmake = __commonJS({
-    "node_modules/highlight.js/lib/languages/cmake.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/cmake.js"(exports, module) {
       function cmake(hljs) {
         return {
           name: "CMake",
@@ -28721,9 +28721,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/coffeescript.js
+  // ../node_modules/highlight.js/lib/languages/coffeescript.js
   var require_coffeescript = __commonJS({
-    "node_modules/highlight.js/lib/languages/coffeescript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/coffeescript.js"(exports, module) {
       var KEYWORDS = [
         "as",
         // for exports
@@ -29076,9 +29076,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/coq.js
+  // ../node_modules/highlight.js/lib/languages/coq.js
   var require_coq = __commonJS({
-    "node_modules/highlight.js/lib/languages/coq.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/coq.js"(exports, module) {
       function coq(hljs) {
         const KEYWORDS = [
           "_|0",
@@ -29520,9 +29520,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/cos.js
+  // ../node_modules/highlight.js/lib/languages/cos.js
   var require_cos = __commonJS({
-    "node_modules/highlight.js/lib/languages/cos.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/cos.js"(exports, module) {
       function cos(hljs) {
         const STRINGS = {
           className: "string",
@@ -29616,9 +29616,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/cpp.js
+  // ../node_modules/highlight.js/lib/languages/cpp.js
   var require_cpp = __commonJS({
-    "node_modules/highlight.js/lib/languages/cpp.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/cpp.js"(exports, module) {
       function cpp(hljs) {
         const regex = hljs.regex;
         const C_LINE_COMMENT_MODE = hljs.COMMENT("//", "$", { contains: [{ begin: /\\\n/ }] });
@@ -30164,9 +30164,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/crmsh.js
+  // ../node_modules/highlight.js/lib/languages/crmsh.js
   var require_crmsh = __commonJS({
-    "node_modules/highlight.js/lib/languages/crmsh.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/crmsh.js"(exports, module) {
       function crmsh(hljs) {
         const RESOURCES = "primitive rsc_template";
         const COMMANDS = "group clone ms master location colocation order fencing_topology rsc_ticket acl_target acl_group user role tag xml";
@@ -30255,9 +30255,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/crystal.js
+  // ../node_modules/highlight.js/lib/languages/crystal.js
   var require_crystal = __commonJS({
-    "node_modules/highlight.js/lib/languages/crystal.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/crystal.js"(exports, module) {
       function crystal(hljs) {
         const INT_SUFFIX = "(_?[ui](8|16|32|64|128))?";
         const FLOAT_SUFFIX = "(_?f(32|64))?";
@@ -30558,9 +30558,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/csharp.js
+  // ../node_modules/highlight.js/lib/languages/csharp.js
   var require_csharp = __commonJS({
-    "node_modules/highlight.js/lib/languages/csharp.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/csharp.js"(exports, module) {
       function csharp(hljs) {
         const BUILT_IN_KEYWORDS = [
           "bool",
@@ -30963,9 +30963,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/csp.js
+  // ../node_modules/highlight.js/lib/languages/csp.js
   var require_csp = __commonJS({
-    "node_modules/highlight.js/lib/languages/csp.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/csp.js"(exports, module) {
       function csp(hljs) {
         const KEYWORDS = [
           "base-uri",
@@ -31015,9 +31015,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/css.js
+  // ../node_modules/highlight.js/lib/languages/css.js
   var require_css = __commonJS({
-    "node_modules/highlight.js/lib/languages/css.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/css.js"(exports, module) {
       var MODES = (hljs) => {
         return {
           IMPORTANT: {
@@ -31957,9 +31957,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/d.js
+  // ../node_modules/highlight.js/lib/languages/d.js
   var require_d = __commonJS({
-    "node_modules/highlight.js/lib/languages/d.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/d.js"(exports, module) {
       function d(hljs) {
         const D_KEYWORDS = {
           $pattern: hljs.UNDERSCORE_IDENT_RE,
@@ -32074,9 +32074,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/markdown.js
+  // ../node_modules/highlight.js/lib/languages/markdown.js
   var require_markdown = __commonJS({
-    "node_modules/highlight.js/lib/languages/markdown.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/markdown.js"(exports, module) {
       function markdown(hljs) {
         const regex = hljs.regex;
         const INLINE_HTML = {
@@ -32311,9 +32311,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/dart.js
+  // ../node_modules/highlight.js/lib/languages/dart.js
   var require_dart = __commonJS({
-    "node_modules/highlight.js/lib/languages/dart.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/dart.js"(exports, module) {
       function dart(hljs) {
         const SUBST = {
           className: "subst",
@@ -32570,9 +32570,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/delphi.js
+  // ../node_modules/highlight.js/lib/languages/delphi.js
   var require_delphi = __commonJS({
-    "node_modules/highlight.js/lib/languages/delphi.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/delphi.js"(exports, module) {
       function delphi(hljs) {
         const KEYWORDS = [
           "exports",
@@ -32820,9 +32820,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/diff.js
+  // ../node_modules/highlight.js/lib/languages/diff.js
   var require_diff = __commonJS({
-    "node_modules/highlight.js/lib/languages/diff.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/diff.js"(exports, module) {
       function diff(hljs) {
         const regex = hljs.regex;
         return {
@@ -32878,9 +32878,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/django.js
+  // ../node_modules/highlight.js/lib/languages/django.js
   var require_django = __commonJS({
-    "node_modules/highlight.js/lib/languages/django.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/django.js"(exports, module) {
       function django(hljs) {
         const FILTER = {
           begin: /\|[A-Za-z]+:?/,
@@ -32929,9 +32929,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/dns.js
+  // ../node_modules/highlight.js/lib/languages/dns.js
   var require_dns = __commonJS({
-    "node_modules/highlight.js/lib/languages/dns.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/dns.js"(exports, module) {
       function dns(hljs) {
         const KEYWORDS = [
           "IN",
@@ -33004,9 +33004,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/dockerfile.js
+  // ../node_modules/highlight.js/lib/languages/dockerfile.js
   var require_dockerfile = __commonJS({
-    "node_modules/highlight.js/lib/languages/dockerfile.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/dockerfile.js"(exports, module) {
       function dockerfile(hljs) {
         const KEYWORDS = [
           "from",
@@ -33043,9 +33043,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/dos.js
+  // ../node_modules/highlight.js/lib/languages/dos.js
   var require_dos = __commonJS({
-    "node_modules/highlight.js/lib/languages/dos.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/dos.js"(exports, module) {
       function dos(hljs) {
         const COMMENT = hljs.COMMENT(
           /^\s*@?rem\b/,
@@ -33207,9 +33207,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/dsconfig.js
+  // ../node_modules/highlight.js/lib/languages/dsconfig.js
   var require_dsconfig = __commonJS({
-    "node_modules/highlight.js/lib/languages/dsconfig.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/dsconfig.js"(exports, module) {
       function dsconfig(hljs) {
         const QUOTED_PROPERTY = {
           className: "string",
@@ -33269,9 +33269,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/dts.js
+  // ../node_modules/highlight.js/lib/languages/dts.js
   var require_dts = __commonJS({
-    "node_modules/highlight.js/lib/languages/dts.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/dts.js"(exports, module) {
       function dts(hljs) {
         const STRINGS = {
           className: "string",
@@ -33409,9 +33409,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/dust.js
+  // ../node_modules/highlight.js/lib/languages/dust.js
   var require_dust = __commonJS({
-    "node_modules/highlight.js/lib/languages/dust.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/dust.js"(exports, module) {
       function dust(hljs) {
         const EXPRESSION_KEYWORDS = "if eq ne lt lte gt gte select default math sep";
         return {
@@ -33451,9 +33451,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/ebnf.js
+  // ../node_modules/highlight.js/lib/languages/ebnf.js
   var require_ebnf = __commonJS({
-    "node_modules/highlight.js/lib/languages/ebnf.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/ebnf.js"(exports, module) {
       function ebnf(hljs) {
         const commentMode = hljs.COMMENT(/\(\*/, /\*\)/);
         const nonTerminalMode = {
@@ -33498,9 +33498,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/elixir.js
+  // ../node_modules/highlight.js/lib/languages/elixir.js
   var require_elixir = __commonJS({
-    "node_modules/highlight.js/lib/languages/elixir.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/elixir.js"(exports, module) {
       function elixir(hljs) {
         const regex = hljs.regex;
         const ELIXIR_IDENT_RE = "[a-zA-Z_][a-zA-Z0-9_.]*(!|\\?)?";
@@ -33775,9 +33775,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/elm.js
+  // ../node_modules/highlight.js/lib/languages/elm.js
   var require_elm = __commonJS({
-    "node_modules/highlight.js/lib/languages/elm.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/elm.js"(exports, module) {
       function elm(hljs) {
         const COMMENT = { variants: [
           hljs.COMMENT("--", "$"),
@@ -33908,9 +33908,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/ruby.js
+  // ../node_modules/highlight.js/lib/languages/ruby.js
   var require_ruby = __commonJS({
-    "node_modules/highlight.js/lib/languages/ruby.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/ruby.js"(exports, module) {
       function ruby(hljs) {
         const regex = hljs.regex;
         const RUBY_METHOD_RE = "([a-zA-Z_]\\w*[!?=]?|[-+~]@|<<|>>|=~|===?|<=>|[<>]=?|\\*\\*|[-/+%^&*~`|]|\\[\\]=?)";
@@ -34326,9 +34326,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/erb.js
+  // ../node_modules/highlight.js/lib/languages/erb.js
   var require_erb = __commonJS({
-    "node_modules/highlight.js/lib/languages/erb.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/erb.js"(exports, module) {
       function erb(hljs) {
         return {
           name: "ERB",
@@ -34349,9 +34349,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/erlang-repl.js
+  // ../node_modules/highlight.js/lib/languages/erlang-repl.js
   var require_erlang_repl = __commonJS({
-    "node_modules/highlight.js/lib/languages/erlang-repl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/erlang-repl.js"(exports, module) {
       function erlangRepl(hljs) {
         const regex = hljs.regex;
         return {
@@ -34399,9 +34399,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/erlang.js
+  // ../node_modules/highlight.js/lib/languages/erlang.js
   var require_erlang = __commonJS({
-    "node_modules/highlight.js/lib/languages/erlang.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/erlang.js"(exports, module) {
       function erlang(hljs) {
         const BASIC_ATOM_RE = "[a-z'][a-zA-Z0-9_']*";
         const FUNCTION_NAME_RE = "(" + BASIC_ATOM_RE + ":" + BASIC_ATOM_RE + "|" + BASIC_ATOM_RE + ")";
@@ -34621,9 +34621,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/excel.js
+  // ../node_modules/highlight.js/lib/languages/excel.js
   var require_excel = __commonJS({
-    "node_modules/highlight.js/lib/languages/excel.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/excel.js"(exports, module) {
       function excel(hljs) {
         const BUILT_INS = [
           "ABS",
@@ -35200,9 +35200,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/fix.js
+  // ../node_modules/highlight.js/lib/languages/fix.js
   var require_fix = __commonJS({
-    "node_modules/highlight.js/lib/languages/fix.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/fix.js"(exports, module) {
       function fix(hljs) {
         return {
           name: "FIX",
@@ -35238,9 +35238,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/flix.js
+  // ../node_modules/highlight.js/lib/languages/flix.js
   var require_flix = __commonJS({
-    "node_modules/highlight.js/lib/languages/flix.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/flix.js"(exports, module) {
       function flix(hljs) {
         const CHAR = {
           className: "string",
@@ -35310,9 +35310,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/fortran.js
+  // ../node_modules/highlight.js/lib/languages/fortran.js
   var require_fortran = __commonJS({
-    "node_modules/highlight.js/lib/languages/fortran.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/fortran.js"(exports, module) {
       function fortran(hljs) {
         const regex = hljs.regex;
         const PARAMS = {
@@ -35875,9 +35875,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/fsharp.js
+  // ../node_modules/highlight.js/lib/languages/fsharp.js
   var require_fsharp = __commonJS({
-    "node_modules/highlight.js/lib/languages/fsharp.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/fsharp.js"(exports, module) {
       function escape2(value) {
         return new RegExp(value.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&"), "m");
       }
@@ -36446,9 +36446,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/gams.js
+  // ../node_modules/highlight.js/lib/languages/gams.js
   var require_gams = __commonJS({
-    "node_modules/highlight.js/lib/languages/gams.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/gams.js"(exports, module) {
       function gams(hljs) {
         const regex = hljs.regex;
         const KEYWORDS = {
@@ -36604,9 +36604,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/gauss.js
+  // ../node_modules/highlight.js/lib/languages/gauss.js
   var require_gauss = __commonJS({
-    "node_modules/highlight.js/lib/languages/gauss.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/gauss.js"(exports, module) {
       function gauss(hljs) {
         const KEYWORDS = {
           keyword: "bool break call callexe checkinterrupt clear clearg closeall cls comlog compile continue create debug declare delete disable dlibrary dllcall do dos ed edit else elseif enable end endfor endif endp endo errorlog errorlogat expr external fn for format goto gosub graph if keyword let lib library line load loadarray loadexe loadf loadk loadm loadp loads loadx local locate loopnextindex lprint lpwidth lshow matrix msym ndpclex new open output outwidth plot plotsym pop prcsn print printdos proc push retp return rndcon rndmod rndmult rndseed run save saveall screen scroll setarray show sparse stop string struct system trace trap threadfor threadendfor threadbegin threadjoin threadstat threadend until use while winprint ne ge le gt lt and xor or not eq eqv",
@@ -36796,9 +36796,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/gcode.js
+  // ../node_modules/highlight.js/lib/languages/gcode.js
   var require_gcode = __commonJS({
-    "node_modules/highlight.js/lib/languages/gcode.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/gcode.js"(exports, module) {
       function gcode(hljs) {
         const regex = hljs.regex;
         const GCODE_KEYWORDS = {
@@ -36963,9 +36963,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/gherkin.js
+  // ../node_modules/highlight.js/lib/languages/gherkin.js
   var require_gherkin = __commonJS({
-    "node_modules/highlight.js/lib/languages/gherkin.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/gherkin.js"(exports, module) {
       function gherkin(hljs) {
         return {
           name: "Gherkin",
@@ -37010,9 +37010,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/glsl.js
+  // ../node_modules/highlight.js/lib/languages/glsl.js
   var require_glsl = __commonJS({
-    "node_modules/highlight.js/lib/languages/glsl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/glsl.js"(exports, module) {
       function glsl(hljs) {
         return {
           name: "GLSL",
@@ -37045,9 +37045,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/gml.js
+  // ../node_modules/highlight.js/lib/languages/gml.js
   var require_gml = __commonJS({
-    "node_modules/highlight.js/lib/languages/gml.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/gml.js"(exports, module) {
       function gml(hljs) {
         const KEYWORDS = [
           "#endregion",
@@ -40173,9 +40173,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/go.js
+  // ../node_modules/highlight.js/lib/languages/go.js
   var require_go = __commonJS({
-    "node_modules/highlight.js/lib/languages/go.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/go.js"(exports, module) {
       function go(hljs) {
         const LITERALS = [
           "true",
@@ -40332,9 +40332,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/golo.js
+  // ../node_modules/highlight.js/lib/languages/golo.js
   var require_golo = __commonJS({
-    "node_modules/highlight.js/lib/languages/golo.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/golo.js"(exports, module) {
       function golo(hljs) {
         const KEYWORDS = [
           "println",
@@ -40409,9 +40409,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/gradle.js
+  // ../node_modules/highlight.js/lib/languages/gradle.js
   var require_gradle = __commonJS({
-    "node_modules/highlight.js/lib/languages/gradle.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/gradle.js"(exports, module) {
       function gradle(hljs) {
         const KEYWORDS = [
           "task",
@@ -40595,9 +40595,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/graphql.js
+  // ../node_modules/highlight.js/lib/languages/graphql.js
   var require_graphql = __commonJS({
-    "node_modules/highlight.js/lib/languages/graphql.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/graphql.js"(exports, module) {
       function graphql(hljs) {
         const regex = hljs.regex;
         const GQL_NAME = /[_A-Za-z][_0-9A-Za-z]*/;
@@ -40670,9 +40670,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/groovy.js
+  // ../node_modules/highlight.js/lib/languages/groovy.js
   var require_groovy = __commonJS({
-    "node_modules/highlight.js/lib/languages/groovy.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/groovy.js"(exports, module) {
       function variants(variants2, obj = {}) {
         obj.variants = variants2;
         return obj;
@@ -40855,9 +40855,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/haml.js
+  // ../node_modules/highlight.js/lib/languages/haml.js
   var require_haml = __commonJS({
-    "node_modules/highlight.js/lib/languages/haml.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/haml.js"(exports, module) {
       function haml(hljs) {
         return {
           name: "HAML",
@@ -40964,9 +40964,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/handlebars.js
+  // ../node_modules/highlight.js/lib/languages/handlebars.js
   var require_handlebars = __commonJS({
-    "node_modules/highlight.js/lib/languages/handlebars.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/handlebars.js"(exports, module) {
       function handlebars(hljs) {
         const regex = hljs.regex;
         const BUILT_INS = {
@@ -41199,9 +41199,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/haskell.js
+  // ../node_modules/highlight.js/lib/languages/haskell.js
   var require_haskell = __commonJS({
-    "node_modules/highlight.js/lib/languages/haskell.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/haskell.js"(exports, module) {
       function haskell(hljs) {
         const decimalDigits = "([0-9]_*)+";
         const hexDigits = "([0-9a-fA-F]_*)+";
@@ -41394,9 +41394,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/haxe.js
+  // ../node_modules/highlight.js/lib/languages/haxe.js
   var require_haxe = __commonJS({
-    "node_modules/highlight.js/lib/languages/haxe.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/haxe.js"(exports, module) {
       function haxe(hljs) {
         const IDENT_RE = "[a-zA-Z_$][a-zA-Z0-9_$]*";
         const HAXE_NUMBER_RE = /(-?)(\b0[xX][a-fA-F0-9_]+|(\b\d+(\.[\d_]*)?|\.[\d_]+)(([eE][-+]?\d+)|i32|u32|i64|f64)?)/;
@@ -41559,9 +41559,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/hsp.js
+  // ../node_modules/highlight.js/lib/languages/hsp.js
   var require_hsp = __commonJS({
-    "node_modules/highlight.js/lib/languages/hsp.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/hsp.js"(exports, module) {
       function hsp(hljs) {
         return {
           name: "HSP",
@@ -41611,9 +41611,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/http.js
+  // ../node_modules/highlight.js/lib/languages/http.js
   var require_http = __commonJS({
-    "node_modules/highlight.js/lib/languages/http.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/http.js"(exports, module) {
       function http(hljs) {
         const regex = hljs.regex;
         const VERSION = "HTTP/([32]|1\\.[01])";
@@ -41704,9 +41704,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/hy.js
+  // ../node_modules/highlight.js/lib/languages/hy.js
   var require_hy = __commonJS({
-    "node_modules/highlight.js/lib/languages/hy.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/hy.js"(exports, module) {
       function hy(hljs) {
         const SYMBOLSTART = "a-zA-Z_\\-!.?+*=<>&#'";
         const SYMBOL_RE = "[" + SYMBOLSTART + "][" + SYMBOLSTART + "0-9/;:]*";
@@ -41807,9 +41807,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/inform7.js
+  // ../node_modules/highlight.js/lib/languages/inform7.js
   var require_inform7 = __commonJS({
-    "node_modules/highlight.js/lib/languages/inform7.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/inform7.js"(exports, module) {
       function inform7(hljs) {
         const START_BRACKET = "\\[";
         const END_BRACKET = "\\]";
@@ -41869,9 +41869,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/ini.js
+  // ../node_modules/highlight.js/lib/languages/ini.js
   var require_ini = __commonJS({
-    "node_modules/highlight.js/lib/languages/ini.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/ini.js"(exports, module) {
       function ini(hljs) {
         const regex = hljs.regex;
         const NUMBERS = {
@@ -41990,9 +41990,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/irpf90.js
+  // ../node_modules/highlight.js/lib/languages/irpf90.js
   var require_irpf90 = __commonJS({
-    "node_modules/highlight.js/lib/languages/irpf90.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/irpf90.js"(exports, module) {
       function irpf90(hljs) {
         const regex = hljs.regex;
         const PARAMS = {
@@ -42049,9 +42049,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/isbl.js
+  // ../node_modules/highlight.js/lib/languages/isbl.js
   var require_isbl = __commonJS({
-    "node_modules/highlight.js/lib/languages/isbl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/isbl.js"(exports, module) {
       function isbl(hljs) {
         const UNDERSCORE_IDENT_RE = "[A-Za-z\u0410-\u042F\u0430-\u044F\u0451\u0401_!][A-Za-z\u0410-\u042F\u0430-\u044F\u0451\u0401_0-9]*";
         const FUNCTION_NAME_IDENT_RE = "[A-Za-z\u0410-\u042F\u0430-\u044F\u0451\u0401_][A-Za-z\u0410-\u042F\u0430-\u044F\u0451\u0401_0-9]*";
@@ -42311,9 +42311,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/java.js
+  // ../node_modules/highlight.js/lib/languages/java.js
   var require_java = __commonJS({
-    "node_modules/highlight.js/lib/languages/java.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/java.js"(exports, module) {
       var decimalDigits = "[0-9](_*[0-9])*";
       var frac = `\\.(${decimalDigits})`;
       var hexDigits = "[0-9a-fA-F](_*[0-9a-fA-F])*";
@@ -42570,9 +42570,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/javascript.js
+  // ../node_modules/highlight.js/lib/languages/javascript.js
   var require_javascript = __commonJS({
-    "node_modules/highlight.js/lib/languages/javascript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/javascript.js"(exports, module) {
       var IDENT_RE = "[A-Za-z$_][0-9A-Za-z$_]*";
       var KEYWORDS = [
         "as",
@@ -43276,9 +43276,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/jboss-cli.js
+  // ../node_modules/highlight.js/lib/languages/jboss-cli.js
   var require_jboss_cli = __commonJS({
-    "node_modules/highlight.js/lib/languages/jboss-cli.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/jboss-cli.js"(exports, module) {
       function jbossCli(hljs) {
         const PARAM = {
           begin: /[\w-]+ *=/,
@@ -43334,9 +43334,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/json.js
+  // ../node_modules/highlight.js/lib/languages/json.js
   var require_json = __commonJS({
-    "node_modules/highlight.js/lib/languages/json.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/json.js"(exports, module) {
       function json(hljs) {
         const ATTRIBUTE = {
           className: "attr",
@@ -43379,9 +43379,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/julia.js
+  // ../node_modules/highlight.js/lib/languages/julia.js
   var require_julia = __commonJS({
-    "node_modules/highlight.js/lib/languages/julia.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/julia.js"(exports, module) {
       function julia(hljs) {
         const VARIABLE_NAME_RE = "[A-Za-z_\\u00A1-\\uFFFF][A-Za-z_0-9\\u00A1-\\uFFFF]*";
         const KEYWORD_LIST = [
@@ -43753,9 +43753,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/julia-repl.js
+  // ../node_modules/highlight.js/lib/languages/julia-repl.js
   var require_julia_repl = __commonJS({
-    "node_modules/highlight.js/lib/languages/julia-repl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/julia-repl.js"(exports, module) {
       function juliaRepl(hljs) {
         return {
           name: "Julia REPL",
@@ -43784,9 +43784,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/kotlin.js
+  // ../node_modules/highlight.js/lib/languages/kotlin.js
   var require_kotlin = __commonJS({
-    "node_modules/highlight.js/lib/languages/kotlin.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/kotlin.js"(exports, module) {
       var decimalDigits = "[0-9](_*[0-9])*";
       var frac = `\\.(${decimalDigits})`;
       var hexDigits = "[0-9a-fA-F](_*[0-9a-fA-F])*";
@@ -44044,9 +44044,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/lasso.js
+  // ../node_modules/highlight.js/lib/languages/lasso.js
   var require_lasso = __commonJS({
-    "node_modules/highlight.js/lib/languages/lasso.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/lasso.js"(exports, module) {
       function lasso(hljs) {
         const LASSO_IDENT_RE = "[a-zA-Z_][\\w.]*";
         const LASSO_ANGLE_RE = "<\\?(lasso(script)?|=)";
@@ -44194,9 +44194,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/latex.js
+  // ../node_modules/highlight.js/lib/languages/latex.js
   var require_latex = __commonJS({
-    "node_modules/highlight.js/lib/languages/latex.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/latex.js"(exports, module) {
       function latex(hljs) {
         const regex = hljs.regex;
         const KNOWN_CONTROL_WORDS = regex.either(...[
@@ -44470,9 +44470,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/ldif.js
+  // ../node_modules/highlight.js/lib/languages/ldif.js
   var require_ldif = __commonJS({
-    "node_modules/highlight.js/lib/languages/ldif.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/ldif.js"(exports, module) {
       function ldif(hljs) {
         return {
           name: "LDIF",
@@ -44498,9 +44498,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/leaf.js
+  // ../node_modules/highlight.js/lib/languages/leaf.js
   var require_leaf = __commonJS({
-    "node_modules/highlight.js/lib/languages/leaf.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/leaf.js"(exports, module) {
       function leaf(hljs) {
         const IDENT = /([A-Za-z_][A-Za-z_0-9]*)?/;
         const LITERALS = [
@@ -44593,9 +44593,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/less.js
+  // ../node_modules/highlight.js/lib/languages/less.js
   var require_less = __commonJS({
-    "node_modules/highlight.js/lib/languages/less.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/less.js"(exports, module) {
       var MODES = (hljs) => {
         return {
           IMPORTANT: {
@@ -45616,9 +45616,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/lisp.js
+  // ../node_modules/highlight.js/lib/languages/lisp.js
   var require_lisp = __commonJS({
-    "node_modules/highlight.js/lib/languages/lisp.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/lisp.js"(exports, module) {
       function lisp(hljs) {
         const LISP_IDENT_RE = "[a-zA-Z_\\-+\\*\\/<=>&#][a-zA-Z0-9_\\-+*\\/<=>&#!]*";
         const MEC_RE = "\\|[^]*?\\|";
@@ -45753,9 +45753,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/livecodeserver.js
+  // ../node_modules/highlight.js/lib/languages/livecodeserver.js
   var require_livecodeserver = __commonJS({
-    "node_modules/highlight.js/lib/languages/livecodeserver.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/livecodeserver.js"(exports, module) {
       function livecodeserver(hljs) {
         const VARIABLE = {
           className: "variable",
@@ -45852,9 +45852,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/livescript.js
+  // ../node_modules/highlight.js/lib/languages/livescript.js
   var require_livescript = __commonJS({
-    "node_modules/highlight.js/lib/languages/livescript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/livescript.js"(exports, module) {
       var KEYWORDS = [
         "as",
         // for exports
@@ -46218,9 +46218,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/llvm.js
+  // ../node_modules/highlight.js/lib/languages/llvm.js
   var require_llvm = __commonJS({
-    "node_modules/highlight.js/lib/languages/llvm.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/llvm.js"(exports, module) {
       function llvm(hljs) {
         const regex = hljs.regex;
         const IDENT_RE = /([-a-zA-Z$._][\w$.-]*)/;
@@ -46312,9 +46312,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/lsl.js
+  // ../node_modules/highlight.js/lib/languages/lsl.js
   var require_lsl = __commonJS({
-    "node_modules/highlight.js/lib/languages/lsl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/lsl.js"(exports, module) {
       function lsl(hljs) {
         const LSL_STRING_ESCAPE_CHARS = {
           className: "subst",
@@ -46380,9 +46380,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/lua.js
+  // ../node_modules/highlight.js/lib/languages/lua.js
   var require_lua = __commonJS({
-    "node_modules/highlight.js/lib/languages/lua.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/lua.js"(exports, module) {
       function lua(hljs) {
         const OPENING_LONG_BRACKET = "\\[=*\\[";
         const CLOSING_LONG_BRACKET = "\\]=*\\]";
@@ -46446,9 +46446,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/makefile.js
+  // ../node_modules/highlight.js/lib/languages/makefile.js
   var require_makefile = __commonJS({
-    "node_modules/highlight.js/lib/languages/makefile.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/makefile.js"(exports, module) {
       function makefile(hljs) {
         const VARIABLE = {
           className: "variable",
@@ -46522,9 +46522,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/mathematica.js
+  // ../node_modules/highlight.js/lib/languages/mathematica.js
   var require_mathematica = __commonJS({
-    "node_modules/highlight.js/lib/languages/mathematica.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/mathematica.js"(exports, module) {
       var SYSTEM_SYMBOLS = [
         "AASTriangle",
         "AbelianGroup",
@@ -53859,9 +53859,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/matlab.js
+  // ../node_modules/highlight.js/lib/languages/matlab.js
   var require_matlab = __commonJS({
-    "node_modules/highlight.js/lib/languages/matlab.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/matlab.js"(exports, module) {
       function matlab(hljs) {
         const TRANSPOSE_RE = "('|\\.')+";
         const TRANSPOSE = {
@@ -53940,9 +53940,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/maxima.js
+  // ../node_modules/highlight.js/lib/languages/maxima.js
   var require_maxima = __commonJS({
-    "node_modules/highlight.js/lib/languages/maxima.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/maxima.js"(exports, module) {
       function maxima(hljs) {
         const KEYWORDS = "if then else elseif for thru do while unless step in and or not";
         const LITERALS = "true false unknown inf minf ind und %e %i %pi %phi %gamma";
@@ -53999,9 +53999,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/mel.js
+  // ../node_modules/highlight.js/lib/languages/mel.js
   var require_mel = __commonJS({
-    "node_modules/highlight.js/lib/languages/mel.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/mel.js"(exports, module) {
       function mel(hljs) {
         return {
           name: "MEL",
@@ -54030,9 +54030,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/mercury.js
+  // ../node_modules/highlight.js/lib/languages/mercury.js
   var require_mercury = __commonJS({
-    "node_modules/highlight.js/lib/languages/mercury.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/mercury.js"(exports, module) {
       function mercury(hljs) {
         const KEYWORDS = {
           keyword: "module use_module import_module include_module end_module initialise mutable initialize finalize finalise interface implementation pred mode func type inst solver any_pred any_func is semidet det nondet multi erroneous failure cc_nondet cc_multi typeclass instance where pragma promise external trace atomic or_else require_complete_switch require_det require_semidet require_multi require_nondet require_cc_multi require_cc_nondet require_erroneous require_failure",
@@ -54113,9 +54113,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/mipsasm.js
+  // ../node_modules/highlight.js/lib/languages/mipsasm.js
   var require_mipsasm = __commonJS({
-    "node_modules/highlight.js/lib/languages/mipsasm.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/mipsasm.js"(exports, module) {
       function mipsasm(hljs) {
         return {
           name: "MIPS Assembly",
@@ -54194,9 +54194,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/mizar.js
+  // ../node_modules/highlight.js/lib/languages/mizar.js
   var require_mizar = __commonJS({
-    "node_modules/highlight.js/lib/languages/mizar.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/mizar.js"(exports, module) {
       function mizar(hljs) {
         return {
           name: "Mizar",
@@ -54208,9 +54208,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/perl.js
+  // ../node_modules/highlight.js/lib/languages/perl.js
   var require_perl = __commonJS({
-    "node_modules/highlight.js/lib/languages/perl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/perl.js"(exports, module) {
       function perl(hljs) {
         const regex = hljs.regex;
         const KEYWORDS = [
@@ -54698,9 +54698,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/mojolicious.js
+  // ../node_modules/highlight.js/lib/languages/mojolicious.js
   var require_mojolicious = __commonJS({
-    "node_modules/highlight.js/lib/languages/mojolicious.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/mojolicious.js"(exports, module) {
       function mojolicious(hljs) {
         return {
           name: "Mojolicious",
@@ -54731,9 +54731,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/monkey.js
+  // ../node_modules/highlight.js/lib/languages/monkey.js
   var require_monkey = __commonJS({
-    "node_modules/highlight.js/lib/languages/monkey.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/monkey.js"(exports, module) {
       function monkey(hljs) {
         const NUMBER = {
           className: "number",
@@ -54911,9 +54911,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/moonscript.js
+  // ../node_modules/highlight.js/lib/languages/moonscript.js
   var require_moonscript = __commonJS({
-    "node_modules/highlight.js/lib/languages/moonscript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/moonscript.js"(exports, module) {
       function moonscript(hljs) {
         const KEYWORDS = {
           keyword: (
@@ -55051,9 +55051,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/n1ql.js
+  // ../node_modules/highlight.js/lib/languages/n1ql.js
   var require_n1ql = __commonJS({
-    "node_modules/highlight.js/lib/languages/n1ql.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/n1ql.js"(exports, module) {
       function n1ql(hljs) {
         const KEYWORDS = [
           "all",
@@ -55407,9 +55407,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/nestedtext.js
+  // ../node_modules/highlight.js/lib/languages/nestedtext.js
   var require_nestedtext = __commonJS({
-    "node_modules/highlight.js/lib/languages/nestedtext.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/nestedtext.js"(exports, module) {
       function nestedtext(hljs) {
         const NESTED = {
           match: [
@@ -55488,9 +55488,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/nginx.js
+  // ../node_modules/highlight.js/lib/languages/nginx.js
   var require_nginx = __commonJS({
-    "node_modules/highlight.js/lib/languages/nginx.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/nginx.js"(exports, module) {
       function nginx(hljs) {
         const regex = hljs.regex;
         const VAR = {
@@ -55636,9 +55636,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/nim.js
+  // ../node_modules/highlight.js/lib/languages/nim.js
   var require_nim = __commonJS({
-    "node_modules/highlight.js/lib/languages/nim.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/nim.js"(exports, module) {
       function nim(hljs) {
         const TYPES = [
           "int",
@@ -55822,9 +55822,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/nix.js
+  // ../node_modules/highlight.js/lib/languages/nix.js
   var require_nix = __commonJS({
-    "node_modules/highlight.js/lib/languages/nix.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/nix.js"(exports, module) {
       function nix(hljs) {
         const regex = hljs.regex;
         const KEYWORDS = {
@@ -56174,9 +56174,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/node-repl.js
+  // ../node_modules/highlight.js/lib/languages/node-repl.js
   var require_node_repl = __commonJS({
-    "node_modules/highlight.js/lib/languages/node-repl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/node-repl.js"(exports, module) {
       function nodeRepl(hljs) {
         return {
           name: "Node REPL",
@@ -56204,9 +56204,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/nsis.js
+  // ../node_modules/highlight.js/lib/languages/nsis.js
   var require_nsis = __commonJS({
-    "node_modules/highlight.js/lib/languages/nsis.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/nsis.js"(exports, module) {
       function nsis(hljs) {
         const regex = hljs.regex;
         const LANGUAGE_CONSTANTS = [
@@ -56739,9 +56739,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/objectivec.js
+  // ../node_modules/highlight.js/lib/languages/objectivec.js
   var require_objectivec = __commonJS({
-    "node_modules/highlight.js/lib/languages/objectivec.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/objectivec.js"(exports, module) {
       function objectivec(hljs) {
         const API_CLASS = {
           className: "built_in",
@@ -56987,9 +56987,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/ocaml.js
+  // ../node_modules/highlight.js/lib/languages/ocaml.js
   var require_ocaml = __commonJS({
-    "node_modules/highlight.js/lib/languages/ocaml.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/ocaml.js"(exports, module) {
       function ocaml(hljs) {
         return {
           name: "OCaml",
@@ -57058,9 +57058,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/openscad.js
+  // ../node_modules/highlight.js/lib/languages/openscad.js
   var require_openscad = __commonJS({
-    "node_modules/highlight.js/lib/languages/openscad.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/openscad.js"(exports, module) {
       function openscad(hljs) {
         const SPECIAL_VARS = {
           className: "keyword",
@@ -57132,9 +57132,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/oxygene.js
+  // ../node_modules/highlight.js/lib/languages/oxygene.js
   var require_oxygene = __commonJS({
-    "node_modules/highlight.js/lib/languages/oxygene.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/oxygene.js"(exports, module) {
       function oxygene(hljs) {
         const OXYGENE_KEYWORDS = {
           $pattern: /\.?\w+/,
@@ -57206,9 +57206,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/parser3.js
+  // ../node_modules/highlight.js/lib/languages/parser3.js
   var require_parser3 = __commonJS({
-    "node_modules/highlight.js/lib/languages/parser3.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/parser3.js"(exports, module) {
       function parser3(hljs) {
         const CURLY_SUBCOMMENT = hljs.COMMENT(
           /\{/,
@@ -57258,9 +57258,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/pf.js
+  // ../node_modules/highlight.js/lib/languages/pf.js
   var require_pf = __commonJS({
-    "node_modules/highlight.js/lib/languages/pf.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/pf.js"(exports, module) {
       function pf(hljs) {
         const MACRO = {
           className: "variable",
@@ -57299,9 +57299,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/pgsql.js
+  // ../node_modules/highlight.js/lib/languages/pgsql.js
   var require_pgsql = __commonJS({
-    "node_modules/highlight.js/lib/languages/pgsql.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/pgsql.js"(exports, module) {
       function pgsql(hljs) {
         const COMMENT_MODE = hljs.COMMENT("--", "$");
         const UNQUOTED_IDENT = "[a-zA-Z_][a-zA-Z_0-9$]*";
@@ -57584,9 +57584,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/php.js
+  // ../node_modules/highlight.js/lib/languages/php.js
   var require_php = __commonJS({
-    "node_modules/highlight.js/lib/languages/php.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/php.js"(exports, module) {
       function php(hljs) {
         const regex = hljs.regex;
         const NOT_PERL_ETC = /(?![A-Za-z0-9])(?![$])/;
@@ -58190,9 +58190,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/php-template.js
+  // ../node_modules/highlight.js/lib/languages/php-template.js
   var require_php_template = __commonJS({
-    "node_modules/highlight.js/lib/languages/php-template.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/php-template.js"(exports, module) {
       function phpTemplate(hljs) {
         return {
           name: "PHP template",
@@ -58241,9 +58241,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/plaintext.js
+  // ../node_modules/highlight.js/lib/languages/plaintext.js
   var require_plaintext = __commonJS({
-    "node_modules/highlight.js/lib/languages/plaintext.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/plaintext.js"(exports, module) {
       function plaintext(hljs) {
         return {
           name: "Plain text",
@@ -58258,9 +58258,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/pony.js
+  // ../node_modules/highlight.js/lib/languages/pony.js
   var require_pony = __commonJS({
-    "node_modules/highlight.js/lib/languages/pony.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/pony.js"(exports, module) {
       function pony(hljs) {
         const KEYWORDS = {
           keyword: "actor addressof and as be break class compile_error compile_intrinsic consume continue delegate digestof do else elseif embed end error for fun if ifdef in interface is isnt lambda let match new not object or primitive recover repeat return struct then trait try type until use var where while with xor",
@@ -58319,9 +58319,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/powershell.js
+  // ../node_modules/highlight.js/lib/languages/powershell.js
   var require_powershell = __commonJS({
-    "node_modules/highlight.js/lib/languages/powershell.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/powershell.js"(exports, module) {
       function powershell(hljs) {
         const TYPES = [
           "string",
@@ -58580,9 +58580,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/processing.js
+  // ../node_modules/highlight.js/lib/languages/processing.js
   var require_processing = __commonJS({
-    "node_modules/highlight.js/lib/languages/processing.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/processing.js"(exports, module) {
       function processing(hljs) {
         const regex = hljs.regex;
         const BUILT_INS = [
@@ -59011,9 +59011,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/profile.js
+  // ../node_modules/highlight.js/lib/languages/profile.js
   var require_profile = __commonJS({
-    "node_modules/highlight.js/lib/languages/profile.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/profile.js"(exports, module) {
       function profile(hljs) {
         return {
           name: "Python profiler",
@@ -59053,9 +59053,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/prolog.js
+  // ../node_modules/highlight.js/lib/languages/prolog.js
   var require_prolog = __commonJS({
-    "node_modules/highlight.js/lib/languages/prolog.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/prolog.js"(exports, module) {
       function prolog(hljs) {
         const ATOM = {
           begin: /[a-z][A-Za-z0-9_]*/,
@@ -59135,9 +59135,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/properties.js
+  // ../node_modules/highlight.js/lib/languages/properties.js
   var require_properties = __commonJS({
-    "node_modules/highlight.js/lib/languages/properties.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/properties.js"(exports, module) {
       function properties(hljs) {
         const WS0 = "[ \\t\\f]*";
         const WS1 = "[ \\t\\f]+";
@@ -59196,9 +59196,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/protobuf.js
+  // ../node_modules/highlight.js/lib/languages/protobuf.js
   var require_protobuf = __commonJS({
-    "node_modules/highlight.js/lib/languages/protobuf.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/protobuf.js"(exports, module) {
       function protobuf(hljs) {
         const KEYWORDS = [
           "package",
@@ -59273,9 +59273,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/puppet.js
+  // ../node_modules/highlight.js/lib/languages/puppet.js
   var require_puppet = __commonJS({
-    "node_modules/highlight.js/lib/languages/puppet.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/puppet.js"(exports, module) {
       function puppet(hljs) {
         const PUPPET_KEYWORDS = {
           keyword: (
@@ -59389,9 +59389,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/purebasic.js
+  // ../node_modules/highlight.js/lib/languages/purebasic.js
   var require_purebasic = __commonJS({
-    "node_modules/highlight.js/lib/languages/purebasic.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/purebasic.js"(exports, module) {
       function purebasic(hljs) {
         const STRINGS = {
           // PB IDE color: #0080FF (Azure Radiance)
@@ -59453,9 +59453,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/python.js
+  // ../node_modules/highlight.js/lib/languages/python.js
   var require_python = __commonJS({
-    "node_modules/highlight.js/lib/languages/python.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/python.js"(exports, module) {
       function python(hljs) {
         const regex = hljs.regex;
         const IDENT_RE = /[\p{XID_Start}_]\p{XID_Continue}*/u;
@@ -59873,9 +59873,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/python-repl.js
+  // ../node_modules/highlight.js/lib/languages/python-repl.js
   var require_python_repl = __commonJS({
-    "node_modules/highlight.js/lib/languages/python-repl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/python-repl.js"(exports, module) {
       function pythonRepl(hljs) {
         return {
           aliases: ["pycon"],
@@ -59903,9 +59903,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/q.js
+  // ../node_modules/highlight.js/lib/languages/q.js
   var require_q = __commonJS({
-    "node_modules/highlight.js/lib/languages/q.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/q.js"(exports, module) {
       function q(hljs) {
         const KEYWORDS = {
           $pattern: /(`?)[A-Za-z0-9_]+\b/,
@@ -59932,9 +59932,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/qml.js
+  // ../node_modules/highlight.js/lib/languages/qml.js
   var require_qml = __commonJS({
-    "node_modules/highlight.js/lib/languages/qml.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/qml.js"(exports, module) {
       function qml(hljs) {
         const regex = hljs.regex;
         const KEYWORDS = {
@@ -60085,9 +60085,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/r.js
+  // ../node_modules/highlight.js/lib/languages/r.js
   var require_r = __commonJS({
-    "node_modules/highlight.js/lib/languages/r.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/r.js"(exports, module) {
       function r(hljs) {
         const regex = hljs.regex;
         const IDENT_RE = /(?:(?:[a-zA-Z]|\.[._a-zA-Z])[._a-zA-Z0-9]*)|\.(?!\d)/;
@@ -60300,9 +60300,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/reasonml.js
+  // ../node_modules/highlight.js/lib/languages/reasonml.js
   var require_reasonml = __commonJS({
-    "node_modules/highlight.js/lib/languages/reasonml.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/reasonml.js"(exports, module) {
       function reasonml(hljs) {
         const BUILT_IN_TYPES = [
           "array",
@@ -60444,9 +60444,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/rib.js
+  // ../node_modules/highlight.js/lib/languages/rib.js
   var require_rib = __commonJS({
-    "node_modules/highlight.js/lib/languages/rib.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/rib.js"(exports, module) {
       function rib(hljs) {
         return {
           name: "RenderMan RIB",
@@ -60464,9 +60464,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/roboconf.js
+  // ../node_modules/highlight.js/lib/languages/roboconf.js
   var require_roboconf = __commonJS({
-    "node_modules/highlight.js/lib/languages/roboconf.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/roboconf.js"(exports, module) {
       function roboconf(hljs) {
         const IDENTIFIER = "[a-zA-Z-_][^\\n{]+\\{";
         const PROPERTY = {
@@ -60538,9 +60538,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/routeros.js
+  // ../node_modules/highlight.js/lib/languages/routeros.js
   var require_routeros = __commonJS({
-    "node_modules/highlight.js/lib/languages/routeros.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/routeros.js"(exports, module) {
       function routeros(hljs) {
         const STATEMENTS = "foreach do while for if from to step else on-error and or not in";
         const GLOBAL_COMMANDS = "global local beep delay put len typeof pick log time set find environment terminal error execute parse resolve toarray tobool toid toip toip6 tonum tostr totime";
@@ -60689,9 +60689,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/rsl.js
+  // ../node_modules/highlight.js/lib/languages/rsl.js
   var require_rsl = __commonJS({
-    "node_modules/highlight.js/lib/languages/rsl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/rsl.js"(exports, module) {
       function rsl(hljs) {
         const BUILT_INS = [
           "abs",
@@ -60831,9 +60831,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/ruleslanguage.js
+  // ../node_modules/highlight.js/lib/languages/ruleslanguage.js
   var require_ruleslanguage = __commonJS({
-    "node_modules/highlight.js/lib/languages/ruleslanguage.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/ruleslanguage.js"(exports, module) {
       function ruleslanguage(hljs) {
         return {
           name: "Oracle Rules Language",
@@ -60865,9 +60865,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/rust.js
+  // ../node_modules/highlight.js/lib/languages/rust.js
   var require_rust = __commonJS({
-    "node_modules/highlight.js/lib/languages/rust.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/rust.js"(exports, module) {
       function rust(hljs) {
         const regex = hljs.regex;
         const RAW_IDENTIFIER = /(r#)?/;
@@ -61183,9 +61183,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/sas.js
+  // ../node_modules/highlight.js/lib/languages/sas.js
   var require_sas = __commonJS({
-    "node_modules/highlight.js/lib/languages/sas.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/sas.js"(exports, module) {
       function sas(hljs) {
         const regex = hljs.regex;
         const SAS_KEYWORDS = [
@@ -61731,9 +61731,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/scala.js
+  // ../node_modules/highlight.js/lib/languages/scala.js
   var require_scala = __commonJS({
-    "node_modules/highlight.js/lib/languages/scala.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/scala.js"(exports, module) {
       function scala(hljs) {
         const regex = hljs.regex;
         const ANNOTATION = {
@@ -61927,9 +61927,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/scheme.js
+  // ../node_modules/highlight.js/lib/languages/scheme.js
   var require_scheme = __commonJS({
-    "node_modules/highlight.js/lib/languages/scheme.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/scheme.js"(exports, module) {
       function scheme(hljs) {
         const SCHEME_IDENT_RE = "[^\\(\\)\\[\\]\\{\\}\",'`;#|\\\\\\s]+";
         const SCHEME_SIMPLE_NUMBER_RE = "(-|\\+)?\\d+([./]\\d+)?";
@@ -62071,9 +62071,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/scilab.js
+  // ../node_modules/highlight.js/lib/languages/scilab.js
   var require_scilab = __commonJS({
-    "node_modules/highlight.js/lib/languages/scilab.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/scilab.js"(exports, module) {
       function scilab(hljs) {
         const COMMON_CONTAINS = [
           hljs.C_NUMBER_MODE,
@@ -62134,9 +62134,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/scss.js
+  // ../node_modules/highlight.js/lib/languages/scss.js
   var require_scss = __commonJS({
-    "node_modules/highlight.js/lib/languages/scss.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/scss.js"(exports, module) {
       var MODES = (hljs) => {
         return {
           IMPORTANT: {
@@ -63061,9 +63061,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/shell.js
+  // ../node_modules/highlight.js/lib/languages/shell.js
   var require_shell = __commonJS({
-    "node_modules/highlight.js/lib/languages/shell.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/shell.js"(exports, module) {
       function shell(hljs) {
         return {
           name: "Shell Session",
@@ -63090,9 +63090,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/smali.js
+  // ../node_modules/highlight.js/lib/languages/smali.js
   var require_smali = __commonJS({
-    "node_modules/highlight.js/lib/languages/smali.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/smali.js"(exports, module) {
       function smali(hljs) {
         const smali_instr_low_prio = [
           "add",
@@ -63213,9 +63213,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/smalltalk.js
+  // ../node_modules/highlight.js/lib/languages/smalltalk.js
   var require_smalltalk = __commonJS({
-    "node_modules/highlight.js/lib/languages/smalltalk.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/smalltalk.js"(exports, module) {
       function smalltalk(hljs) {
         const VAR_IDENT_RE = "[a-z][a-zA-Z0-9_]*";
         const CHAR = {
@@ -63279,9 +63279,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/sml.js
+  // ../node_modules/highlight.js/lib/languages/sml.js
   var require_sml = __commonJS({
-    "node_modules/highlight.js/lib/languages/sml.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/sml.js"(exports, module) {
       function sml(hljs) {
         return {
           name: "SML (Standard ML)",
@@ -63352,9 +63352,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/sqf.js
+  // ../node_modules/highlight.js/lib/languages/sqf.js
   var require_sqf = __commonJS({
-    "node_modules/highlight.js/lib/languages/sqf.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/sqf.js"(exports, module) {
       function sqf(hljs) {
         const VARIABLE = {
           className: "variable",
@@ -65967,9 +65967,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/sql.js
+  // ../node_modules/highlight.js/lib/languages/sql.js
   var require_sql = __commonJS({
-    "node_modules/highlight.js/lib/languages/sql.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/sql.js"(exports, module) {
       function sql(hljs) {
         const regex = hljs.regex;
         const COMMENT_MODE = hljs.COMMENT("--", "$");
@@ -66615,9 +66615,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/stan.js
+  // ../node_modules/highlight.js/lib/languages/stan.js
   var require_stan = __commonJS({
-    "node_modules/highlight.js/lib/languages/stan.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/stan.js"(exports, module) {
       function stan(hljs) {
         const regex = hljs.regex;
         const BLOCKS = [
@@ -67115,9 +67115,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/stata.js
+  // ../node_modules/highlight.js/lib/languages/stata.js
   var require_stata = __commonJS({
-    "node_modules/highlight.js/lib/languages/stata.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/stata.js"(exports, module) {
       function stata(hljs) {
         return {
           name: "Stata",
@@ -67158,9 +67158,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/step21.js
+  // ../node_modules/highlight.js/lib/languages/step21.js
   var require_step21 = __commonJS({
-    "node_modules/highlight.js/lib/languages/step21.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/step21.js"(exports, module) {
       function step21(hljs) {
         const STEP21_IDENT_RE = "[A-Z_][A-Z0-9_.]*";
         const STEP21_KEYWORDS = {
@@ -67222,9 +67222,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/stylus.js
+  // ../node_modules/highlight.js/lib/languages/stylus.js
   var require_stylus = __commonJS({
-    "node_modules/highlight.js/lib/languages/stylus.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/stylus.js"(exports, module) {
       var MODES = (hljs) => {
         return {
           IMPORTANT: {
@@ -68198,9 +68198,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/subunit.js
+  // ../node_modules/highlight.js/lib/languages/subunit.js
   var require_subunit = __commonJS({
-    "node_modules/highlight.js/lib/languages/subunit.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/subunit.js"(exports, module) {
       function subunit(hljs) {
         const DETAILS = {
           className: "string",
@@ -68240,9 +68240,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/swift.js
+  // ../node_modules/highlight.js/lib/languages/swift.js
   var require_swift = __commonJS({
-    "node_modules/highlight.js/lib/languages/swift.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/swift.js"(exports, module) {
       function source(re) {
         if (!re) return null;
         if (typeof re === "string") return re;
@@ -69120,9 +69120,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/taggerscript.js
+  // ../node_modules/highlight.js/lib/languages/taggerscript.js
   var require_taggerscript = __commonJS({
-    "node_modules/highlight.js/lib/languages/taggerscript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/taggerscript.js"(exports, module) {
       function taggerscript(hljs) {
         const NOOP = {
           className: "comment",
@@ -69172,9 +69172,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/yaml.js
+  // ../node_modules/highlight.js/lib/languages/yaml.js
   var require_yaml = __commonJS({
-    "node_modules/highlight.js/lib/languages/yaml.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/yaml.js"(exports, module) {
       function yaml(hljs) {
         const LITERALS = "true false yes no null";
         const URI_CHARACTERS = "[\\w#;/?:@&=+$,.~*'()[\\]]+";
@@ -69378,9 +69378,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/tap.js
+  // ../node_modules/highlight.js/lib/languages/tap.js
   var require_tap = __commonJS({
-    "node_modules/highlight.js/lib/languages/tap.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/tap.js"(exports, module) {
       function tap(hljs) {
         return {
           name: "Test Anything Protocol",
@@ -69422,9 +69422,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/tcl.js
+  // ../node_modules/highlight.js/lib/languages/tcl.js
   var require_tcl = __commonJS({
-    "node_modules/highlight.js/lib/languages/tcl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/tcl.js"(exports, module) {
       function tcl(hljs) {
         const regex = hljs.regex;
         const TCL_IDENT = /[a-zA-Z_][a-zA-Z0-9_]*/;
@@ -69607,9 +69607,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/thrift.js
+  // ../node_modules/highlight.js/lib/languages/thrift.js
   var require_thrift = __commonJS({
-    "node_modules/highlight.js/lib/languages/thrift.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/thrift.js"(exports, module) {
       function thrift(hljs) {
         const TYPES = [
           "bool",
@@ -69682,9 +69682,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/tp.js
+  // ../node_modules/highlight.js/lib/languages/tp.js
   var require_tp = __commonJS({
-    "node_modules/highlight.js/lib/languages/tp.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/tp.js"(exports, module) {
       function tp(hljs) {
         const TPID = {
           className: "number",
@@ -69851,9 +69851,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/twig.js
+  // ../node_modules/highlight.js/lib/languages/twig.js
   var require_twig = __commonJS({
-    "node_modules/highlight.js/lib/languages/twig.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/twig.js"(exports, module) {
       function twig(hljs) {
         const regex = hljs.regex;
         const FUNCTION_NAMES = [
@@ -70095,9 +70095,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/typescript.js
+  // ../node_modules/highlight.js/lib/languages/typescript.js
   var require_typescript = __commonJS({
-    "node_modules/highlight.js/lib/languages/typescript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/typescript.js"(exports, module) {
       var IDENT_RE = "[A-Za-z$_][0-9A-Za-z$_]*";
       var KEYWORDS = [
         "as",
@@ -70914,9 +70914,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/vala.js
+  // ../node_modules/highlight.js/lib/languages/vala.js
   var require_vala = __commonJS({
-    "node_modules/highlight.js/lib/languages/vala.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/vala.js"(exports, module) {
       function vala(hljs) {
         return {
           name: "Vala",
@@ -70960,9 +70960,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/vbnet.js
+  // ../node_modules/highlight.js/lib/languages/vbnet.js
   var require_vbnet = __commonJS({
-    "node_modules/highlight.js/lib/languages/vbnet.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/vbnet.js"(exports, module) {
       function vbnet(hljs) {
         const regex = hljs.regex;
         const CHARACTER = {
@@ -71098,9 +71098,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/vbscript.js
+  // ../node_modules/highlight.js/lib/languages/vbscript.js
   var require_vbscript = __commonJS({
-    "node_modules/highlight.js/lib/languages/vbscript.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/vbscript.js"(exports, module) {
       function vbscript(hljs) {
         const regex = hljs.regex;
         const BUILT_IN_FUNCTIONS = [
@@ -71309,9 +71309,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/vbscript-html.js
+  // ../node_modules/highlight.js/lib/languages/vbscript-html.js
   var require_vbscript_html = __commonJS({
-    "node_modules/highlight.js/lib/languages/vbscript-html.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/vbscript-html.js"(exports, module) {
       function vbscriptHtml(hljs) {
         return {
           name: "VBScript in HTML",
@@ -71329,9 +71329,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/verilog.js
+  // ../node_modules/highlight.js/lib/languages/verilog.js
   var require_verilog = __commonJS({
-    "node_modules/highlight.js/lib/languages/verilog.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/verilog.js"(exports, module) {
       function verilog(hljs) {
         const regex = hljs.regex;
         const KEYWORDS = {
@@ -71875,9 +71875,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/vhdl.js
+  // ../node_modules/highlight.js/lib/languages/vhdl.js
   var require_vhdl = __commonJS({
-    "node_modules/highlight.js/lib/languages/vhdl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/vhdl.js"(exports, module) {
       function vhdl(hljs) {
         const INTEGER_RE = "\\d(_|\\d)*";
         const EXPONENT_RE = "[eE][-+]?" + INTEGER_RE;
@@ -72081,9 +72081,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/vim.js
+  // ../node_modules/highlight.js/lib/languages/vim.js
   var require_vim = __commonJS({
-    "node_modules/highlight.js/lib/languages/vim.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/vim.js"(exports, module) {
       function vim(hljs) {
         return {
           name: "Vim Script",
@@ -72157,9 +72157,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/wasm.js
+  // ../node_modules/highlight.js/lib/languages/wasm.js
   var require_wasm = __commonJS({
-    "node_modules/highlight.js/lib/languages/wasm.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/wasm.js"(exports, module) {
       function wasm(hljs) {
         hljs.regex;
         const BLOCK_COMMENT = hljs.COMMENT(/\(;/, /;\)/);
@@ -72283,9 +72283,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/wren.js
+  // ../node_modules/highlight.js/lib/languages/wren.js
   var require_wren = __commonJS({
-    "node_modules/highlight.js/lib/languages/wren.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/wren.js"(exports, module) {
       function wren(hljs) {
         const regex = hljs.regex;
         const IDENT_RE = /[a-zA-Z]\w*/;
@@ -72567,9 +72567,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/x86asm.js
+  // ../node_modules/highlight.js/lib/languages/x86asm.js
   var require_x86asm = __commonJS({
-    "node_modules/highlight.js/lib/languages/x86asm.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/x86asm.js"(exports, module) {
       function x86asm(hljs) {
         return {
           name: "Intel x86 Assembly",
@@ -72659,9 +72659,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/xl.js
+  // ../node_modules/highlight.js/lib/languages/xl.js
   var require_xl = __commonJS({
-    "node_modules/highlight.js/lib/languages/xl.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/xl.js"(exports, module) {
       function xl(hljs) {
         const KWS = [
           "if",
@@ -72861,9 +72861,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/xquery.js
+  // ../node_modules/highlight.js/lib/languages/xquery.js
   var require_xquery = __commonJS({
-    "node_modules/highlight.js/lib/languages/xquery.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/xquery.js"(exports, module) {
       function xquery(_hljs) {
         const KEYWORDS = [
           "module",
@@ -73193,9 +73193,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/languages/zephir.js
+  // ../node_modules/highlight.js/lib/languages/zephir.js
   var require_zephir = __commonJS({
-    "node_modules/highlight.js/lib/languages/zephir.js"(exports, module) {
+    "../node_modules/highlight.js/lib/languages/zephir.js"(exports, module) {
       function zephir(hljs) {
         const STRING = {
           className: "string",
@@ -73297,9 +73297,9 @@
     }
   });
 
-  // node_modules/highlight.js/lib/index.js
+  // ../node_modules/highlight.js/lib/index.js
   var require_lib = __commonJS({
-    "node_modules/highlight.js/lib/index.js"(exports, module) {
+    "../node_modules/highlight.js/lib/index.js"(exports, module) {
       var hljs = require_core();
       hljs.registerLanguage("1c", require_c());
       hljs.registerLanguage("abnf", require_abnf());
@@ -73499,13 +73499,13 @@
     }
   });
 
-  // webview-ui/src/index.tsx
+  // src/index.tsx
   var import_client = __toESM(require_client());
 
-  // webview-ui/src/state/ChatProvider.tsx
+  // src/state/ChatProvider.tsx
   var import_react = __toESM(require_react());
 
-  // webview-ui/src/state/reducer.ts
+  // src/state/reducer.ts
   var _msgCounter = 0;
   function nextId() {
     return `msg-${Date.now()}-${++_msgCounter}`;
@@ -73543,6 +73543,7 @@
     messages: [],
     queuedMessages: [],
     isGenerating: false,
+    isSessionList: document.body.dataset.viewMode === "sidebar",
     viewMode: document.body.dataset.viewMode === "sidebar" ? "sidebar" : "tab",
     currentModel: "default",
     currentProvider: "",
@@ -73921,14 +73922,15 @@
           isGenerating: action.generating,
           currentModel: action.currentModel ?? state.currentModel,
           viewMode: action.viewMode ?? state.viewMode,
-          activeSessionId: action.activeSessionId ?? state.activeSessionId
+          activeSessionId: action.activeSessionId ?? state.activeSessionId,
+          isSessionList: action.isSessionList ?? state.isSessionList
         };
       default:
         return state;
     }
   }
 
-  // webview-ui/src/vscode.ts
+  // src/vscode.ts
   var api;
   function getVSCodeApi() {
     if (!api) {
@@ -73940,7 +73942,7 @@
     getVSCodeApi().postMessage(message);
   }
 
-  // webview-ui/src/state/ChatProvider.tsx
+  // src/state/ChatProvider.tsx
   var import_jsx_runtime = __toESM(require_jsx_runtime());
   var ChatContext = (0, import_react.createContext)(null);
   function useChatContext() {
@@ -73963,7 +73965,8 @@
               generating: msg.generating,
               currentModel: msg.currentModel,
               viewMode: msg.viewMode,
-              activeSessionId: msg.activeSessionId
+              activeSessionId: msg.activeSessionId,
+              isSessionList: msg.isSessionList
             });
             break;
           case "userMessage":
@@ -74139,6 +74142,9 @@
     const loadSession = (0, import_react.useCallback)((sessionId, projectHash) => {
       postMessage({ type: "loadSession", sessionId, projectHash });
     }, []);
+    const openSessionInTab = (0, import_react.useCallback)((sessionId, projectHash) => {
+      postMessage({ type: "openSessionInTab", sessionId, projectHash });
+    }, []);
     const renameSession = (0, import_react.useCallback)((session) => {
       postMessage({
         type: "renameSession",
@@ -74178,6 +74184,7 @@
       newConversation,
       selectModel,
       loadSession,
+      openSessionInTab,
       renameSession,
       deleteSession,
       startLogin,
@@ -74189,10 +74196,10 @@
     return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ChatContext.Provider, { value, children });
   }
 
-  // webview-ui/src/components/Header.tsx
+  // src/components/Header.tsx
   var import_jsx_runtime2 = __toESM(require_jsx_runtime());
   function Header() {
-    const { dispatch, newConversation } = useChatContext();
+    const { dispatch, openSessionInTab } = useChatContext();
     return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("header", { className: "header", children: [
       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), title: "History", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: [
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("rect", { x: "2", y: "3", width: "12", height: "1.5", rx: "0.5" }),
@@ -74200,7 +74207,7 @@
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("rect", { x: "2", y: "11.5", width: "12", height: "1.5", rx: "0.5" })
       ] }) }),
       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "header-spacer" }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: () => newConversation(), title: "New conversation", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("path", { d: "M8 1.5a.75.75 0 01.75.75v5h5a.75.75 0 010 1.5h-5v5a.75.75 0 01-1.5 0v-5h-5a.75.75 0 010-1.5h5v-5A.75.75 0 018 1.5z" }) }) }),
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: () => openSessionInTab(), title: "New conversation", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("path", { d: "M8 1.5a.75.75 0 01.75.75v5h5a.75.75 0 010 1.5h-5v5a.75.75 0 01-1.5 0v-5h-5a.75.75 0 010-1.5h5v-5A.75.75 0 018 1.5z" }) }) }),
       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: () => dispatch({ type: "TOGGLE_SEARCH" }), title: "Search", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("svg", { width: "16", height: "16", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2.5", children: [
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("circle", { cx: "11", cy: "11", r: "7" }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("line", { x1: "21", y1: "21", x2: "16.65", y2: "16.65" })
@@ -74208,7 +74215,7 @@
     ] });
   }
 
-  // webview-ui/src/components/WelcomeScreen.tsx
+  // src/components/WelcomeScreen.tsx
   var import_react2 = __toESM(require_react());
   var import_jsx_runtime3 = __toESM(require_jsx_runtime());
   var quickActions = [
@@ -74313,10 +74320,10 @@
     ] }) });
   }
 
-  // webview-ui/src/components/MessageList.tsx
+  // src/components/MessageList.tsx
   var import_react10 = __toESM(require_react());
 
-  // webview-ui/src/components/UserMessage.tsx
+  // src/components/UserMessage.tsx
   var import_react3 = __toESM(require_react());
   var import_jsx_runtime4 = __toESM(require_jsx_runtime());
   function UserMessage({ message, className = "" }) {
@@ -74344,13 +74351,13 @@
     ] }) });
   }
 
-  // webview-ui/src/components/AssistantMessage.tsx
+  // src/components/AssistantMessage.tsx
   var import_react8 = __toESM(require_react());
 
-  // webview-ui/src/components/Markdown.tsx
+  // src/components/Markdown.tsx
   var import_react4 = __toESM(require_react());
 
-  // node_modules/marked/lib/marked.esm.js
+  // ../node_modules/marked/lib/marked.esm.js
   function _getDefaults() {
     return {
       async: false,
@@ -76362,11 +76369,11 @@ ${content}</tr>
   var parser = _Parser.parse;
   var lexer = _Lexer.lex;
 
-  // node_modules/highlight.js/es/index.js
+  // ../node_modules/highlight.js/es/index.js
   var import_lib = __toESM(require_lib(), 1);
   var es_default = import_lib.default;
 
-  // node_modules/dompurify/dist/purify.es.mjs
+  // ../node_modules/dompurify/dist/purify.es.mjs
   var {
     entries,
     setPrototypeOf,
@@ -77446,7 +77453,7 @@ ${content}</tr>
   }
   var purify = createDOMPurify();
 
-  // webview-ui/src/components/Markdown.tsx
+  // src/components/Markdown.tsx
   var import_jsx_runtime5 = __toESM(require_jsx_runtime());
   marked.setOptions({
     gfm: true,
@@ -77502,10 +77509,10 @@ ${content}</tr>
     return /* @__PURE__ */ (0, import_jsx_runtime5.jsx)("div", { ref: containerRef, className: "markdown-root", dangerouslySetInnerHTML: { __html: html3 } });
   }
 
-  // webview-ui/src/components/ToolCall.tsx
+  // src/components/ToolCall.tsx
   var import_react6 = __toESM(require_react());
 
-  // webview-ui/src/utils/format.ts
+  // src/utils/format.ts
   function formatTokenCount(total) {
     if (total < 1e3) return `${total} tokens`;
     return `${(total / 1e3).toFixed(1)}k tokens`;
@@ -77563,7 +77570,7 @@ ${content}</tr>
     }
   }
 
-  // webview-ui/src/components/DiffView.tsx
+  // src/components/DiffView.tsx
   var import_react5 = __toESM(require_react());
   var import_jsx_runtime6 = __toESM(require_jsx_runtime());
   function parseDiff(raw) {
@@ -77621,7 +77628,7 @@ ${content}</tr>
     ] }, i)) }) });
   }
 
-  // webview-ui/src/components/ToolCall.tsx
+  // src/components/ToolCall.tsx
   var import_jsx_runtime7 = __toESM(require_jsx_runtime());
   function isDiffContent(output) {
     return output.includes("@@") && (output.includes("+") || output.includes("-"));
@@ -77671,7 +77678,7 @@ ${content}</tr>
     ] });
   }
 
-  // webview-ui/src/components/PermissionRequest.tsx
+  // src/components/PermissionRequest.tsx
   var import_react7 = __toESM(require_react());
   var import_jsx_runtime8 = __toESM(require_jsx_runtime());
   function PermissionRequest({ request }) {
@@ -77744,7 +77751,7 @@ ${content}</tr>
     );
   }
 
-  // webview-ui/src/components/AssistantMessage.tsx
+  // src/components/AssistantMessage.tsx
   var import_jsx_runtime9 = __toESM(require_jsx_runtime());
   function AssistantMessage({ message, className = "" }) {
     const hasError = message.toolCalls?.some((t) => t.status === "error");
@@ -77769,7 +77776,7 @@ ${content}</tr>
     ] }) });
   }
 
-  // webview-ui/src/components/SearchBar.tsx
+  // src/components/SearchBar.tsx
   var import_react9 = __toESM(require_react());
   var import_jsx_runtime10 = __toESM(require_jsx_runtime());
   function SearchBar() {
@@ -77837,7 +77844,7 @@ ${content}</tr>
     ] });
   }
 
-  // webview-ui/src/components/MessageList.tsx
+  // src/components/MessageList.tsx
   var import_jsx_runtime11 = __toESM(require_jsx_runtime());
   function MessageList() {
     const { state } = useChatContext();
@@ -77904,10 +77911,10 @@ ${content}</tr>
     ] });
   }
 
-  // webview-ui/src/components/InputArea.tsx
+  // src/components/InputArea.tsx
   var import_react13 = __toESM(require_react());
 
-  // webview-ui/src/components/SlashPicker.tsx
+  // src/components/SlashPicker.tsx
   var import_react11 = __toESM(require_react());
   var import_jsx_runtime12 = __toESM(require_jsx_runtime());
   var slashCommands = [
@@ -77968,7 +77975,7 @@ ${content}</tr>
     )) });
   }
 
-  // webview-ui/src/components/ModelSelector.tsx
+  // src/components/ModelSelector.tsx
   var import_react12 = __toESM(require_react());
   var import_jsx_runtime13 = __toESM(require_jsx_runtime());
   function ModelSelector({ placement = "down", onOpen }) {
@@ -78034,7 +78041,7 @@ ${content}</tr>
     ] });
   }
 
-  // webview-ui/src/components/InputArea.tsx
+  // src/components/InputArea.tsx
   var import_jsx_runtime14 = __toESM(require_jsx_runtime());
   function InputArea() {
     const { state, send, stop, dispatch } = useChatContext();
@@ -78164,12 +78171,12 @@ ${content}</tr>
     ] }) });
   }
 
-  // webview-ui/src/components/SessionList.tsx
+  // src/components/SessionList.tsx
   var import_react14 = __toESM(require_react());
   var import_jsx_runtime15 = __toESM(require_jsx_runtime());
   var DATE_ORDER = ["Today", "Yesterday", "This Week", "Older"];
   function SessionList({ variant = "overlay" }) {
-    const { state, dispatch, loadSession, newConversation, renameSession, deleteSession } = useChatContext();
+    const { state, dispatch, openSessionInTab, renameSession, deleteSession } = useChatContext();
     const [search, setSearch] = (0, import_react14.useState)("");
     const [menu, setMenu] = (0, import_react14.useState)(null);
     const isOverlay = variant === "overlay";
@@ -78183,14 +78190,14 @@ ${content}</tr>
     const groups = (0, import_react14.useMemo)(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
     function handleSelect(session) {
       setMenu(null);
-      loadSession(session.id, session.project_hash);
+      openSessionInTab(session.id, session.project_hash);
       if (isOverlay) {
         dispatch({ type: "TOGGLE_HISTORY" });
       }
     }
     function handleNewSession() {
       setMenu(null);
-      newConversation();
+      openSessionInTab();
       if (isOverlay) {
         dispatch({ type: "TOGGLE_HISTORY" });
       }
@@ -78317,12 +78324,12 @@ ${content}</tr>
     return isOverlay ? /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-overlay", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), children: content }) : content;
   }
 
-  // webview-ui/src/App.tsx
+  // src/App.tsx
   var import_jsx_runtime16 = __toESM(require_jsx_runtime());
   function ChatApp() {
     const { state } = useChatContext();
     const hasMessages = state.messages.length > 0 || state.isGenerating;
-    if (state.viewMode === "sidebar") {
+    if (state.isSessionList) {
       return /* @__PURE__ */ (0, import_jsx_runtime16.jsx)("div", { className: "app app-sidebar", children: /* @__PURE__ */ (0, import_jsx_runtime16.jsx)(SessionList, { variant: "sidebar" }) });
     }
     return /* @__PURE__ */ (0, import_jsx_runtime16.jsxs)("div", { className: "app", children: [
@@ -78338,7 +78345,7 @@ ${content}</tr>
     return /* @__PURE__ */ (0, import_jsx_runtime16.jsx)(ChatProvider, { children: /* @__PURE__ */ (0, import_jsx_runtime16.jsx)(ChatApp, {}) });
   }
 
-  // webview-ui/src/index.tsx
+  // src/index.tsx
   var import_jsx_runtime17 = __toESM(require_jsx_runtime());
   (function detectTheme() {
     const bg = getComputedStyle(document.body).getPropertyValue("--vscode-editor-background").trim();

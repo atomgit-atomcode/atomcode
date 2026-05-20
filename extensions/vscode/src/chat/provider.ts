@@ -156,7 +156,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   public setupPanelForRestore(panel: vscode.WebviewPanel, sessionId?: string, projectHash?: string) {
     panel.webview.options = {
       enableScripts: true,
-      retainContextWhenHidden: true,
       localResourceRoots: [
         vscode.Uri.joinPath(this._extensionUri, 'webview'),
         vscode.Uri.joinPath(this._extensionUri, 'node_modules', 'highlight.js'),
