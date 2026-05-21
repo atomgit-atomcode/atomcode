@@ -85,10 +85,22 @@ pub fn spawn_oauth_poll(
         let event = match poll_outcome {
             Ok(()) => {
                 // finish() consumes session → exchanges state for
-                // token → writes auth.toml. Telemetry handle is
-                // optional so test paths can pass None.
+                // token → returns AuthInfo. NOTE: finish does NOT
+                // write auth.toml — the caller is responsible. The
+                // existing CLI `login()` driver pairs finish + save;
+                // we have to mirror it here or downstream
+                // `is_logged_in()` returns false and the subsequent
+                // /codingplan flow re-runs login, popping a second
+                // QR + asking the user to scan AGAIN.
                 match session.finish(tel.as_ref()) {
-                    Ok(_auth_info) => OauthEvent::Authorized,
+                    Ok(auth_info) => {
+                        match atomcode_core::auth::save_auth(&auth_info) {
+                            Ok(()) => OauthEvent::Authorized,
+                            Err(e) => OauthEvent::Failed(format!(
+                                "auth.toml write failed: {e:#}"
+                            )),
+                        }
+                    }
                     Err(e) => OauthEvent::Failed(format!("{e:#}")),
                 }
             }
