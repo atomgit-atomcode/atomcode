@@ -4454,10 +4454,20 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
 }
 
 /// True iff startup should show the one-shot `/setup` hint in scrollback.
-/// Returns `true` when setup-state.json doesn't exist (never ran `/setup`).
+/// Returns `true` when either:
+///   - `setup-state.json` doesn't exist (never ran `/setup`), OR
+///   - the recommender skill directory is missing (user deleted it after setup).
 fn should_auto_show_setup(ctx: &LoopCtx) -> bool {
     let state = atomcode_core::setup::state::load_setup_state(&ctx.working_dir);
-    state.is_none() // never ran setup → show hint
+    if state.is_none() {
+        return true; // never ran setup → show hint
+    }
+
+    // setup-state.json exists but the skill may have been deleted manually.
+    let skill_dir = atomcode_core::config::Config::config_dir()
+        .join("skills")
+        .join("atomcode-automation-recommender");
+    !skill_dir.exists()
 }
 
 /// Extract current + latest version from the `ALREADY_LATEST` error

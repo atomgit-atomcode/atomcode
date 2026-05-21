@@ -35,7 +35,10 @@ use crate::setup::install::{InstalledSummary, ReloadDirective};
 use crate::setup::seeds::ensure_seeds_extracted;
 
 /// Simplified pipeline: lock → scan → install all embedded seeds → setup-state → report.
-pub async fn run(opts: RunOptions) -> SetupResult<SetupReport> {
+///
+/// This is a synchronous function — all operations (lock, scan, install, state write)
+/// are blocking. If called from an async context, use `tokio::task::spawn_blocking`.
+pub fn run(opts: RunOptions) -> SetupResult<SetupReport> {
     let started = std::time::Instant::now();
 
     // 1. Lock — RAII; released on function exit / panic.
@@ -64,7 +67,7 @@ pub async fn run(opts: RunOptions) -> SetupResult<SetupReport> {
     let mut summary = InstalledSummary::default();
 
     // Install directory-style skills (e.g., atomcode-automation-recommender/).
-    install_directory_skills_from_seeds(&cache_dir, &mut summary);
+    install_directory_skills_from_seeds(&cache_dir, &mut summary, opts.force);
 
     // Append .gitignore marker for .atomcode/local/.
     if let Err(e) = txn.append_gitignore(&opts.project_root) {
@@ -100,9 +103,13 @@ pub async fn run(opts: RunOptions) -> SetupResult<SetupReport> {
 
 /// Copy directory-style skills from seeds-cache to ~/.atomcode/skills/.
 /// E.g., `atomcode-automation-recommender/SKILL.md` + `references/`.
+///
+/// When `force` is true, skills are reinstalled even if the content hash matches
+/// (i.e., `--force` forces a clean reinstall, not just a lock bypass).
 fn install_directory_skills_from_seeds(
     cache_dir: &std::path::Path,
     summary: &mut InstalledSummary,
+    force: bool,
 ) {
     let seeds_skills = cache_dir.join("skills");
     let target_skills = crate::config::Config::config_dir().join("skills");
@@ -125,15 +132,19 @@ fn install_directory_skills_from_seeds(
             if dest.exists() {
                 // Version check: compare content hash.
                 let installed_hash = read_seed_hash(&dest);
-                if installed_hash.as_deref() == Some(src_hash.as_str()) {
+                if !force && installed_hash.as_deref() == Some(src_hash.as_str()) {
                     summary.skipped.push((
                         RecId::new(RecKind::Skill, &name),
                         install::SkipReason::AlreadyInstalled,
                     ));
                     continue;
                 }
-                // Hash differs → update (remove old, install new).
-                tracing::info!(skill = %name, "seed skill updated — reinstalling");
+                // Hash differs or --force → remove old and reinstall.
+                if force {
+                    tracing::info!(skill = %name, "forced reinstall of seed skill");
+                } else {
+                    tracing::info!(skill = %name, "seed skill updated — reinstalling");
+                }
                 let _ = std::fs::remove_dir_all(&dest);
             }
 

@@ -32,11 +32,7 @@ where
     let mut opts = RunOptions::new(proj.path().to_path_buf());
     mutate_opts(&mut opts);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let result = rt.block_on(setup::run(opts));
+    let result = setup::run(opts);
 
     match old {
         Some(v) => std::env::set_var("ATOMCODE_HOME", v),
@@ -81,12 +77,8 @@ fn second_run_skips_already_installed() {
         RunOptions::new(proj.path().to_path_buf())
     };
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let report1 = rt.block_on(setup::run(make_opts())).unwrap();
-    let report2 = rt.block_on(setup::run(make_opts())).unwrap();
+    let report1 = setup::run(make_opts()).unwrap();
+    let report2 = setup::run(make_opts()).unwrap();
 
     match old {
         Some(v) => std::env::set_var("ATOMCODE_HOME", v),
@@ -137,28 +129,24 @@ fn concurrent_runs_second_fails_lock() {
     let proj_a = proj.path().to_path_buf();
     let proj_b = proj.path().to_path_buf();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-
-    let (r1, r2) = rt.block_on(async move {
-        let t1 = tokio::spawn(async move {
+    // `setup::run` is synchronous. Use std::thread to run two concurrent
+    // invocations — the lock must prevent both from succeeding simultaneously.
+    let (r1, r2) = std::thread::scope(|s| {
+        let t1 = s.spawn(|| {
             let o = atomcode_core::setup::RunOptions::new(proj_a);
-            atomcode_core::setup::run(o).await
+            atomcode_core::setup::run(o)
         });
 
         // Give t1 a head start so it grabs the lock first.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        std::thread::sleep(std::time::Duration::from_millis(20));
 
-        let t2 = tokio::spawn(async move {
+        let t2 = s.spawn(|| {
             let o = atomcode_core::setup::RunOptions::new(proj_b);
-            atomcode_core::setup::run(o).await
+            atomcode_core::setup::run(o)
         });
 
-        let r1 = t1.await.unwrap();
-        let r2 = t2.await.unwrap();
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
         (r1, r2)
     });
 

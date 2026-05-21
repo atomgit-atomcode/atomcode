@@ -511,7 +511,7 @@ enum Commands {
     },
     /// Install seed files (skills/commands/hooks/MCP) to `~/.atomcode/`.
     Setup {
-        /// Take over a stale lock owned by a dead process.
+        /// Take over a stale lock AND force reinstall even if seeds are already present.
         #[arg(long)]
         force: bool,
     },
@@ -934,7 +934,7 @@ async fn run() -> Result<i32> {
             }
             Commands::Setup { force } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let exit_code = run_setup_command(force).await;
+                let exit_code = run_setup_command(force);
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
                     .await;
@@ -1726,9 +1726,10 @@ async fn run_headless(
     Ok((exit_code, captured))
 }
 
-/// Drive `atomcode_core::setup::run` end-to-end with a HeadlessUi and return
-/// the CLI exit code (0 on success, 1 on any setup error).
-async fn run_setup_command(force: bool) -> i32 {
+/// Drive `atomcode_core::setup::run` end-to-end and return the CLI exit code
+/// (0 on success, 1 on any setup error). `setup::run` is synchronous; we
+/// run it directly since `Commands::Setup` already runs outside the TUI loop.
+fn run_setup_command(force: bool) -> i32 {
     use atomcode_core::setup;
 
     let project_root = match std::env::current_dir() {
@@ -1741,7 +1742,7 @@ async fn run_setup_command(force: bool) -> i32 {
     let mut opts = setup::RunOptions::new(project_root);
     opts.force = force;
 
-    match setup::run(opts).await {
+    match setup::run(opts) {
         Ok(report) => {
             println!("{}", report.render_cli());
             0
