@@ -282,6 +282,17 @@ pub enum Step {
     Intro,
     Language,
     Setup,
+    /// One-shot CodingPlan fast path entered on first-launch only
+    /// (NOT from `/welcome`). Renders a QR for the AtomGit OAuth
+    /// short link + the raw URL fallback. Enter → close with
+    /// `pending_run_codingplan = true` so the existing `/codingplan`
+    /// driver picks up the just-completed login + claim flow.
+    /// Esc bails to the welcome banner with no auth changes.
+    ///
+    /// PR 1a (this commit): user manually presses Enter after
+    /// scanning. PR 1b will spawn a polling task that closes the
+    /// modal automatically the moment AtomGit reports authorisation.
+    QrLogin,
 }
 
 pub struct OnboardingWizard {
@@ -296,16 +307,31 @@ pub struct OnboardingWizard {
     /// redraw to avoid double-painting).
     #[allow(dead_code)] // consumed in Task 8 (/welcome slash command)
     pub(super) needs_confirm: bool,
+    /// Populated by `new_qr_fast_path` after a successful
+    /// `start_login()` round-trip. `None` for every other constructor.
+    /// Shown verbatim under the QR as the paste-into-browser fallback.
+    pub(super) qr_login_url: Option<String>,
+    /// Populated by `new_qr_fast_path` when `start_login()` itself
+    /// fails (network down, broker 5xx). Surfaced in place of the QR
+    /// so the user can read what went wrong instead of staring at a
+    /// blank panel; Esc bails, Enter retries by re-running
+    /// `start_login()` in `handle_key_pure`'s `Retry` outcome.
+    pub(super) qr_login_error: Option<String>,
 }
 
 impl OnboardingWizard {
-    /// Standard constructor — first-run or `/welcome` with empty body.
+    /// Standard constructor — `/welcome` with empty body. The historic
+    /// 3-step (Intro → Language → Setup) flow stays here intact for
+    /// `/welcome` re-runs; first-launch onboarding now goes through
+    /// [`Self::new_qr_fast_path`] instead.
     pub fn new() -> Self {
         Self {
             step: Step::Intro,
             language_idx: 0,
             setup_idx: 0,
             needs_confirm: false,
+            qr_login_url: None,
+            qr_login_error: None,
         }
     }
 
@@ -318,6 +344,37 @@ impl OnboardingWizard {
             language_idx: 0,
             setup_idx: 0,
             needs_confirm: true,
+            qr_login_url: None,
+            qr_login_error: None,
+        }
+    }
+
+    /// First-launch fast path. Skips the old 3-step Intro / Language /
+    /// Setup flow and goes straight to a single QR screen for the
+    /// AtomGit OAuth short link — scan, log in, hit Enter to fall
+    /// through into the existing `/codingplan` driver which claims
+    /// the plan and writes the model providers. Language defaults to
+    /// auto-detect from `$LC_ALL` / `$LANG` (i18n step gone); user
+    /// can switch later via `/language`.
+    ///
+    /// Synchronously calls [`atomcode_core::auth::oauth::start_login`]
+    /// up front so the QR is paintable the moment the modal opens.
+    /// On network failure the error is stashed on the wizard and
+    /// rendered in place of the QR — Esc bails, Enter retries
+    /// (handled in `handle_key_pure`).
+    pub fn new_qr_fast_path() -> Self {
+        let (qr_login_url, qr_login_error) =
+            match atomcode_core::auth::oauth::start_login() {
+                Ok(session) => (Some(session.url().to_string()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            };
+        Self {
+            step: Step::QrLogin,
+            language_idx: 0,
+            setup_idx: 0,
+            needs_confirm: false,
+            qr_login_url,
+            qr_login_error,
         }
     }
 
@@ -436,6 +493,19 @@ impl OnboardingWizard {
                 PureOutcome::ClearAndRedraw
             }
             (Setup, KeyCode::Esc) => PureOutcome::Close,
+
+            // QrLogin (fast path, first-launch only).
+            // - start_login failed → Enter retries, Esc bails
+            // - start_login ok → Enter confirms scan-complete and
+            //   hands off to /codingplan; Esc closes without auth
+            (QrLogin, KeyCode::Enter) => {
+                if self.qr_login_error.is_some() {
+                    PureOutcome::RetryQrLogin
+                } else {
+                    PureOutcome::ApplyQrLoginThenClose
+                }
+            }
+            (QrLogin, KeyCode::Esc) => PureOutcome::Close,
 
             _ => PureOutcome::Noop,
         }
@@ -650,6 +720,107 @@ impl OnboardingWizard {
         ));
         ascii_fallback_step(out, unicode_symbols)
     }
+
+    /// QR fast-path (single-page first-launch onboarding).
+    ///
+    /// Layout (when `start_login` succeeded):
+    /// ```text
+    /// Step 1/1 · 扫码登录
+    /// ┌─ AtomCode ──────────────────────────────────┐
+    /// │   扫码登录,自动领取 CodingPlan 免费额度    │
+    /// │                                              │
+    /// │              <QR block>                      │
+    /// │                                              │
+    /// │   手机扫码,或在浏览器打开:                   │
+    /// │   https://acs.atomgit.com/s/AbC123          │
+    /// │                                              │
+    /// │   扫码完成后按 Enter 继续                    │
+    /// │                                              │
+    /// │   Esc 跳过 · /codingplan 重试 · /provider … │
+    /// └─ Step 1/1 ─────────────────────────────────┘
+    /// ```
+    ///
+    /// Failure layout (`start_login` errored at construction time):
+    /// the QR block is replaced with the error message, and the
+    /// instruction line below reads "按 Enter 重试" — handled by
+    /// `RetryQrLogin` in `handle_key_pure`.
+    ///
+    /// ASCII-only terminals (`unicode_symbols == false`): QR is
+    /// omitted entirely; URL is shown as the only login affordance
+    /// so the user can paste it into a browser on a different machine.
+    /// QR glyphs render as `□` tofu on Windows legacy conhost / `LANG=C`
+    /// and a tofu QR is silently unscannable — better to show nothing.
+    pub(super) fn draw_qr_login_lines(
+        &self,
+        term_cols: u16,
+        unicode_symbols: bool,
+    ) -> Vec<String> {
+        let panel_width = (term_cols as usize).min(80);
+        let inner_width = panel_width.saturating_sub(4);
+        // Cells available for content inside the panel's `│ <2sp> ... <2sp> │`
+        // padding. Centring is leading-space prefix; draw_panel adds the
+        // trailing pad to inner_width-2.
+        let cell_w = inner_width.saturating_sub(2);
+        let center = |s: &str| -> String {
+            let w = UnicodeWidthStr::width(s);
+            let pad = cell_w.saturating_sub(w) / 2;
+            format!("{}{}", " ".repeat(pad), s)
+        };
+
+        let mut content: Vec<String> = Vec::new();
+        content.push(String::new());
+        content.push(center("扫码登录,自动领取 CodingPlan 免费额度"));
+        content.push(String::new());
+
+        if let Some(reason) = &self.qr_login_error {
+            // start_login failed at construction. Surface the cause
+            // so the user knows whether to check network, broker, or
+            // their own clock; offer Enter-to-retry below.
+            content.push(center("✗ 无法生成登录链接"));
+            content.push(String::new());
+            // Error reason may be long; just left-align with indent
+            // rather than centre — easier to scan.
+            content.push(format!("    {}", reason));
+            content.push(String::new());
+            content.push(center("按 Enter 重试 · Esc 跳过"));
+        } else if let Some(url) = &self.qr_login_url {
+            // Render QR block (Unicode mode) or skip it (ASCII).
+            if let Some(qr_rows) = super::qr::render_for_terminal(url, unicode_symbols) {
+                for row in qr_rows {
+                    content.push(center(&row));
+                }
+                content.push(String::new());
+            }
+            content.push(center(if unicode_symbols {
+                "手机扫码,或在浏览器打开:"
+            } else {
+                "无法显示二维码 — 请在浏览器打开:"
+            }));
+            content.push(center(url));
+            content.push(String::new());
+            content.push(center("扫码完成后按 Enter 继续"));
+        } else {
+            // Shouldn't happen — `new_qr_fast_path` always populates
+            // exactly one of url / error. Defensive fallback so a
+            // broken constructor doesn't paint a blank panel.
+            content.push(center("(状态未初始化)"));
+        }
+        content.push(String::new());
+        content.push(center("Esc 跳过 · /codingplan 重试 · /provider 手动配置"));
+        content.push(String::new());
+
+        let mut out = Vec::new();
+        out.push("第 1/1 步 · 扫码登录".to_string());
+        out.push(String::new());
+        out.extend(draw_panel(
+            "AtomCode",
+            &content,
+            "Step 1/1",
+            panel_width,
+            unicode_symbols,
+        ));
+        ascii_fallback_step(out, unicode_symbols)
+    }
 }
 
 /// Trailing pass over a step's full output (header + box + footer
@@ -711,6 +882,37 @@ impl crate::modals::Modal for OnboardingWizard {
                     ));
                 }
                 self.step = Step::Setup;
+                renderer.clear_screen();
+                self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            PureOutcome::ApplyQrLoginThenClose => {
+                // User pressed Enter after scanning the QR. Hand off
+                // to the existing /codingplan driver which detects the
+                // freshly-written auth.toml (from the broker exchange
+                // they completed in the browser) and claims the plan.
+                // If they actually pressed Enter without scanning,
+                // /codingplan will run its own login() and re-prompt
+                // — same behaviour as today's /codingplan slash cmd.
+                ctx.pending_run_codingplan = true;
+                renderer.clear_screen();
+                Ok(ModalAction::Close)
+            }
+            PureOutcome::RetryQrLogin => {
+                // Re-run start_login() in-place so the user can recover
+                // from a transient network blip without restarting
+                // atomcode. Mirrors the constructor — synchronous
+                // round-trip, store either url or error.
+                match atomcode_core::auth::oauth::start_login() {
+                    Ok(session) => {
+                        self.qr_login_url = Some(session.url().to_string());
+                        self.qr_login_error = None;
+                    }
+                    Err(e) => {
+                        self.qr_login_url = None;
+                        self.qr_login_error = Some(format!("{e:#}"));
+                    }
+                }
                 renderer.clear_screen();
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
@@ -783,6 +985,7 @@ impl crate::modals::Modal for OnboardingWizard {
             Step::Intro => center_lines(self.draw_intro_lines(cols, rows, unicode), panel_width, cols, rows),
             Step::Language => center_lines(self.draw_language_lines(cols, unicode), panel_width, cols, rows),
             Step::Setup => center_lines(self.draw_setup_lines(cols, unicode), panel_width, cols, rows),
+            Step::QrLogin => center_lines(self.draw_qr_login_lines(cols, unicode), panel_width, cols, rows),
         };
         for line in lines {
             // No trailing `\n` — the retained renderer's
@@ -833,6 +1036,15 @@ pub(super) enum PureOutcome {
     /// Set the appropriate `pending_*` flag based on `setup_idx`, then
     /// close.
     ApplySetupThenClose,
+    /// User confirmed QR-fast-path login; flip
+    /// `pending_run_codingplan` and close so the existing
+    /// `/codingplan` driver picks up the freshly-authorised state.
+    ApplyQrLoginThenClose,
+    /// QR step's `start_login()` previously errored; user pressed
+    /// Enter to retry. Wrapper re-runs `start_login()` and resets
+    /// the wizard's `qr_login_url` / `qr_login_error` fields, then
+    /// ClearAndRedraw.
+    RetryQrLogin,
     /// Close modal, no side effect.
     Close,
     /// Ignore the key.
@@ -1620,5 +1832,127 @@ mod tests {
             "panel rows have different visible widths — right border would zig-zag: {:?}",
             bordered
         );
+    }
+
+    // ── QrLogin (PR 1a) state-machine + draw tests ──────────────────
+    //
+    // start_login() is a real network call so these tests can't drive
+    // it end-to-end. Instead we manually construct an OnboardingWizard
+    // pinned to Step::QrLogin with synthetic url / error state, then
+    // exercise the keystroke transitions + draw output.
+
+    fn qr_wizard_with_url(url: &str) -> OnboardingWizard {
+        OnboardingWizard {
+            step: Step::QrLogin,
+            language_idx: 0,
+            setup_idx: 0,
+            needs_confirm: false,
+            qr_login_url: Some(url.to_string()),
+            qr_login_error: None,
+        }
+    }
+
+    fn qr_wizard_with_error(msg: &str) -> OnboardingWizard {
+        OnboardingWizard {
+            step: Step::QrLogin,
+            language_idx: 0,
+            setup_idx: 0,
+            needs_confirm: false,
+            qr_login_url: None,
+            qr_login_error: Some(msg.to_string()),
+        }
+    }
+
+    #[test]
+    fn qr_login_enter_when_url_present_dispatches_to_codingplan() {
+        let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let outcome = w.handle_key_pure(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(outcome, PureOutcome::ApplyQrLoginThenClose);
+    }
+
+    #[test]
+    fn qr_login_enter_when_in_error_state_retries() {
+        // start_login failed at construction. Enter re-runs it —
+        // wrapper handles ctx mutations, the pure outcome just signals
+        // intent.
+        let mut w = qr_wizard_with_error("transport: connection refused");
+        let outcome = w.handle_key_pure(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(outcome, PureOutcome::RetryQrLogin);
+    }
+
+    #[test]
+    fn qr_login_esc_closes_without_codingplan_flag() {
+        // Esc bails to the welcome banner — no pending_run_codingplan,
+        // no setup_idx mutation. Pin against accidental future drift
+        // into the Setup-step's ApplySetupThenClose flag-setting path.
+        let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let outcome = w.handle_key_pure(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(outcome, PureOutcome::Close);
+
+        let mut w = qr_wizard_with_error("any");
+        let outcome = w.handle_key_pure(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(outcome, PureOutcome::Close);
+    }
+
+    #[test]
+    fn qr_login_random_keys_are_noop() {
+        // Arrow keys / 1-3 / letters do nothing on QrLogin — pin so a
+        // future copy-paste from the Setup-step arms doesn't acquire
+        // unintended menu-navigation semantics on this single-page
+        // screen.
+        let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Left,
+                     KeyCode::Char('1'), KeyCode::Char('a')] {
+            assert_eq!(
+                w.handle_key_pure(code, KeyModifiers::NONE),
+                PureOutcome::Noop,
+                "{:?} should be Noop on QrLogin",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn qr_login_draw_with_url_includes_url_in_output() {
+        let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let lines = w.draw_qr_login_lines(80, true);
+        let blob = lines.join("\n");
+        assert!(
+            blob.contains("https://acs.atomgit.com/s/AbC123"),
+            "URL must be in render output as fallback for users who can't \
+             scan: {:?}",
+            blob
+        );
+        assert!(
+            blob.contains("扫码登录"),
+            "expected Chinese onboarding header text"
+        );
+    }
+
+    #[test]
+    fn qr_login_draw_with_error_surfaces_reason() {
+        let w = qr_wizard_with_error("transport: timeout after 10s");
+        let lines = w.draw_qr_login_lines(80, true);
+        let blob = lines.join("\n");
+        assert!(blob.contains("无法生成登录链接"));
+        assert!(blob.contains("transport: timeout after 10s"));
+        assert!(blob.contains("按 Enter 重试"));
+    }
+
+    #[test]
+    fn qr_login_draw_ascii_fallback_drops_qr_keeps_url() {
+        // Half-block glyphs render as tofu on ASCII-only terminals,
+        // so the QR is dropped entirely and we tell the user to use
+        // the URL instead. URL itself MUST stay — otherwise the
+        // screen has nothing actionable.
+        let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let lines = w.draw_qr_login_lines(80, false);
+        let blob = lines.join("\n");
+        assert!(blob.contains("https://acs.atomgit.com/s/AbC123"));
+        assert!(blob.contains("无法显示二维码"));
+        // Half-block glyphs must NOT leak through the ASCII fallback.
+        assert!(!blob.contains('▀'));
+        assert!(!blob.contains('▄'));
+        assert!(!blob.contains('█'));
     }
 }

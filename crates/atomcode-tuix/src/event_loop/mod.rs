@@ -2465,8 +2465,17 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         // OnboardingWizard's Modal impl owns the per-step box drawing.
         use crate::modals::Modal;
         renderer.clear_screen();
-        let wizard = crate::modals::OnboardingWizard::new()
-            .with_initial_language(ctx.config.language);
+        // First-launch fast path: single-page QR + URL, hands off to
+        // /codingplan on Enter (PR 1a). The legacy 3-step Intro /
+        // Language / Setup wizard stays intact for `/welcome` —
+        // `new_qr_fast_path` is ONLY used here at first-launch
+        // (where the modal is auto-opened by `should_auto_show_onboarding`).
+        // /welcome's command arm still uses `new()` / `new_with_confirm()`
+        // so users who explicitly re-run the wizard see the familiar
+        // language + setup path. PR 1b will spawn a polling task here
+        // that closes the modal automatically the moment AtomGit
+        // reports authorisation, removing the manual Enter step.
+        let wizard = crate::modals::OnboardingWizard::new_qr_fast_path();
         wizard.draw(&app.buf, &app.state, &ctx, renderer);
         app.active_modal = Some(Box::new(wizard));
     } else {
