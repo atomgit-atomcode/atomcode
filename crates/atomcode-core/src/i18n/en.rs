@@ -168,8 +168,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── Input ──
     Enter                            Send message
-    Alt+Enter / Ctrl+J / Shift+Enter Insert newline
-    \ then Enter                     Insert newline (fallback)
+    Ctrl+J                           Insert newline (universal)
+    \ then Enter                     Insert newline (atomcode fallback, universal)
+    Alt+Enter                        Insert newline *
+    Shift+Enter                      Insert newline **
     /                                Open slash command menu
     Tab                              Autocomplete
     Backspace / Ctrl+H               Delete previous char
@@ -197,6 +199,16 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Enter                            Confirm
     Esc                              Cancel / close modal
     Tab                              Insert highlighted command
+
+  * Alt+Enter works in most terminals; macOS Apple Terminal users
+    must enable "Use Option as Meta key" under Settings → Profiles
+    → Keyboard for the keystroke to register as a newline.
+  ** Shift+Enter requires a terminal that disambiguates the modifier.
+     Known-supported: Kitty / WezTerm / iTerm2 (with Report Modifiers
+     enabled) / Windows Terminal / Ghostty / Warp. Other terminals
+     (macOS Apple Terminal, default xterm, GNOME Terminal, VS Code's
+     integrated terminal) collapse Shift+Enter into plain Enter —
+     use Ctrl+J or \ + Enter instead.
 
   Tip: run /help for the full slash command list.
 "#.into(),

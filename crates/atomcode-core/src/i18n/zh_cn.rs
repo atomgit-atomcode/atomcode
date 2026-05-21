@@ -160,8 +160,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── 输入 ──
     Enter                            发送消息
-    Alt+Enter / Ctrl+J / Shift+Enter 插入换行
-    \ 后接 Enter                     插入换行（兜底）
+    Ctrl+J                           插入换行（所有终端通用）
+    \ 后接 Enter                     插入换行（atomcode 兜底，所有终端通用）
+    Alt+Enter                        插入换行 *
+    Shift+Enter                      插入换行 **
     /                                打开斜杠命令菜单
     Tab                              自动补全
     Backspace / Ctrl+H               删除上一个字符
@@ -189,6 +191,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Enter                            确认
     Esc                              取消 / 关闭弹层
     Tab                              插入当前高亮命令
+
+  * Alt+Enter 在多数终端可用；macOS Apple Terminal 需在
+    Settings → Profiles → Keyboard 启用 "Use Option as Meta key"
+    才会发送换行。
+  ** Shift+Enter 需要终端区分该按键，目前已知支持的有：
+     Kitty / WezTerm / iTerm2（启用 Report Modifiers）/
+     Windows Terminal / Ghostty / Warp。其他终端（包括 macOS
+     Apple Terminal、默认 xterm、GNOME Terminal、VS Code 集成
+     终端）不区分 Shift+Enter 与 Enter，请用 Ctrl+J 或 \ + Enter。
 
   提示：输入 /help 查看完整斜杠命令列表。
 "#.into(),
