@@ -408,6 +408,9 @@ pub enum Msg<'a> {
     SetupSkippedRow { kind: &'a str, slug: &'a str, reason: &'a str },
     /// Per-item failed row: "  ✗ mcp:xyz — error message"
     SetupFailedRow { kind: &'a str, slug: &'a str, error: &'a str },
+    /// "💡 Tip: Run /setup …" — first-run hint shown above the prompt
+    /// when the project has no setup state yet.
+    CmdSetupTip,
     /// "Running atomcode setup..." — shown while setup is in progress.
     CmdSetupRunning,
     /// "Skills reloaded — N available" — after setup completes and skills are reloaded.

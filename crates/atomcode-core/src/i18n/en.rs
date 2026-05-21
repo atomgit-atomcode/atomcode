@@ -627,6 +627,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
         Msg::SetupFailedRow { kind, slug, error } =>
             format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+        Msg::CmdSetupTip =>
+            "\u{1f4a1} Tip: Run /setup to auto-configure hooks, skills, and MCP for this project.".into(),
         Msg::CmdSetupRunning =>
             "Running atomcode setup...".into(),
         Msg::CmdSetupSkillsReloaded { count } =>

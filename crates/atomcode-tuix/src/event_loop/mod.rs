@@ -2474,7 +2474,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         // gated by preferences + setup-state presence.
         if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
             renderer.render(UiLine::CommandOutput(
-                "\u{1f4a1} Tip: Run /setup to auto-configure hooks, skills, and MCP for this project.".to_string(),
+                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
             ));
             app.setup_hint_shown = true;
         }

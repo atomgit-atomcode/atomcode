@@ -616,6 +616,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
         Msg::SetupFailedRow { kind, slug, error } =>
             format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+        Msg::CmdSetupTip =>
+            "\u{1f4a1} 提示：运行 /setup 可自动为该项目配置 hooks、skills 和 MCP。".into(),
         Msg::CmdSetupRunning =>
             "正在运行 atomcode setup...".into(),
         Msg::CmdSetupSkillsReloaded { count } =>
