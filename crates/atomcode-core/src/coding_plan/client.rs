@@ -15,11 +15,30 @@ use anyhow::{anyhow, Context, Result};
 use super::types::{ClaimResponse, ModelEntry, PlanType, StatusResponse};
 use crate::auth;
 
-/// Prod API base. v2 rollout (tier-based claim/models/status) has
-/// landed on `api.gitcode.com`; the previous `pre-api.gitcode.com`
-/// staging endpoint is no longer needed. Single edit here flips
-/// every claim-v2 / models-v2 / status-v2 call.
-pub const API_BASE: &str = "https://api.gitcode.com/api/v5";
+/// Default CodingPlan REST API base URL.
+/// Override with the `ATOMCODE_CODINGPLAN_API_BASE` environment variable.
+const DEFAULT_API_BASE: &str = "https://api.gitcode.com/api/v5";
+
+/// Return the CodingPlan REST API base URL, reading
+/// `ATOMCODE_CODINGPLAN_API_BASE` once at first call and caching the
+/// result for the process lifetime.
+///
+/// Read order:
+///   1. `ATOMCODE_CODINGPLAN_API_BASE` env var (trimmed, trailing `/`
+///      stripped, empty value treated as unset).
+///   2. [`DEFAULT_API_BASE`].
+pub fn api_base_url() -> String {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<String> = OnceLock::new();
+    BASE.get_or_init(|| {
+        std::env::var("ATOMCODE_CODINGPLAN_API_BASE")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
+    })
+    .clone()
+}
 
 /// Typed error surfaced when the API rejects the bearer token (401/403).
 ///
@@ -115,7 +134,7 @@ impl Client {
     /// asked us to start at Max and walk down, so the orchestrator
     /// (`step_claim`) calls this in `PlanType::CASCADE_ORDER`.
     pub fn claim_v2(&self, plan_type: PlanType) -> Result<ClaimResponse> {
-        let url = format!("{}/coding-plan/claim-v2", API_BASE);
+        let url = format!("{}/coding-plan/claim-v2", api_base_url());
         let body_str = format!(r#"{{"plan_type":"{}"}}"#, plan_type.as_str());
         let resp = self
             .http
@@ -153,7 +172,7 @@ impl Client {
     pub fn list_models_v2(&self, plan_type: PlanType) -> Result<Vec<ModelEntry>> {
         let url = format!(
             "{}/coding-plan/models-v2?plan_type={}",
-            API_BASE,
+            api_base_url(),
             plan_type.as_str()
         );
         let resp = self
@@ -185,7 +204,7 @@ impl Client {
     /// response envelope as v1; only the path changed under the v2
     /// rollout, so the parser type stays put.
     pub fn status_v2(&self) -> Result<StatusResponse> {
-        let url = format!("{}/coding-plan/status-v2", API_BASE);
+        let url = format!("{}/coding-plan/status-v2", api_base_url());
         let resp = self
             .http
             .get(&url)
