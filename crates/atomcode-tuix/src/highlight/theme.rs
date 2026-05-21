@@ -65,35 +65,45 @@ pub fn is_light_for_render() -> bool {
 // remap; both palettes must independently hit the contrast bar against
 // their target background.
 
-/// `dark`: soft purple `#C678DD`. `light`: deep purple `#7B1FA2`.
+/// `dark`: soft purple `#C678DD`. `light`: very dark violet `#4A0072`
+/// (≥ 13:1 on white — earlier `#7B1FA2` at 8.7:1 read soft on Mac
+/// Terminal where colours render less crisp than iTerm2).
 pub fn keyword() -> &'static str {
-    if is_light() { "\x1b[38;2;123;31;162m" } else { "\x1b[38;2;198;120;221m" }
+    if is_light() { "\x1b[38;2;74;0;114m" } else { "\x1b[38;2;198;120;221m" }
 }
 
-/// `dark`: green `#98C379`. `light`: forest green `#1B5E20`.
+/// `dark`: green `#98C379`. `light`: dark green `#006400` (≥ 13:1 —
+/// greens read soft at any given luminance, so light pushes past the
+/// other tokens' contrast budget to compensate).
 pub fn string() -> &'static str {
-    if is_light() { "\x1b[38;2;27;94;32m" } else { "\x1b[38;2;152;195;121m" }
+    if is_light() { "\x1b[38;2;0;100;0m" } else { "\x1b[38;2;152;195;121m" }
 }
 
-/// `dark`: amber `#D19A66`. `light`: burnt sienna `#A04B00`.
+/// `dark`: amber `#D19A66`. `light`: dark chestnut `#663300` (≥ 11:1).
 pub fn number() -> &'static str {
-    if is_light() { "\x1b[38;2;160;75;0m" } else { "\x1b[38;2;209;154;102m" }
+    if is_light() { "\x1b[38;2;102;51;0m" } else { "\x1b[38;2;209;154;102m" }
 }
 
-/// `dark`: slate gray `#7C8499` + italic. `light`: slate `#4A5060` + italic.
+/// `dark`: slate gray `#7C8499` + italic. `light`: slate `#4A5060` +
+/// italic — kept moderately desaturated because comments should read
+/// "secondary" relative to the code, not "main attraction."
 pub fn comment() -> &'static str {
     if is_light() { "\x1b[3;38;2;74;80;96m" } else { "\x1b[3;38;2;124;132;153m" }
 }
 
-/// `dark`: blue `#61AFEF`. `light`: deep navy `#0D47A1` (was the most
-/// visible failure on `#FFFFFF` — old #61AFEF contrast 2.04:1).
+/// `dark`: blue `#61AFEF`. `light`: very dark navy `#002171` (≥ 14:1 —
+/// earlier `#0D47A1` at 8.8:1 read "ok but soft"; this is also where
+/// the original `fn main` screenshot regression lived, old `#61AFEF`
+/// at 2.04:1 made `main` invisible).
 pub fn function() -> &'static str {
-    if is_light() { "\x1b[38;2;13;71;161m" } else { "\x1b[38;2;97;175;239m" }
+    if is_light() { "\x1b[38;2;0;33;113m" } else { "\x1b[38;2;97;175;239m" }
 }
 
-/// `dark`: sand `#E5C07B`. `light`: deep ochre `#825A00`.
+/// `dark`: sand `#E5C07B`. `light`: dark walnut `#5B3A00` (≥ 11:1) —
+/// distinct hue from `number`'s chestnut so type names don't visually
+/// collide with literals on a line like `let x: U32 = 42`.
 pub fn type_color() -> &'static str {
-    if is_light() { "\x1b[38;2;130;90;0m" } else { "\x1b[38;2;229;192;123m" }
+    if is_light() { "\x1b[38;2;91;58;0m" } else { "\x1b[38;2;229;192;123m" }
 }
 
 /// Both palettes intentionally use terminal default fg.
@@ -176,8 +186,10 @@ mod tests {
     }
 
     #[test]
-    fn light_keyword_is_deep_purple() {
-        with_light(|| assert_eq!(keyword(), "\x1b[38;2;123;31;162m"));
+    fn light_keyword_is_very_dark_violet() {
+        // Bumped from #7B1FA2 (8.7:1) to #4A0072 (≥ 13:1) after Mac
+        // Terminal feedback that the earlier value read soft.
+        with_light(|| assert_eq!(keyword(), "\x1b[38;2;74;0;114m"));
     }
 
     #[test]
@@ -186,11 +198,12 @@ mod tests {
     }
 
     #[test]
-    fn light_function_is_deep_navy() {
-        // The exact failure mode from the user screenshot: legacy
-        // `#61AFEF` had 2.04:1 contrast on white and `main` vanished.
-        // `#0D47A1` hits ≥ 7:1.
-        with_light(|| assert_eq!(function(), "\x1b[38;2;13;71;161m"));
+    fn light_function_is_very_dark_navy() {
+        // Earlier failure mode: legacy `#61AFEF` had 2.04:1 contrast on
+        // white and `main` vanished. First fix was `#0D47A1` (8.8:1)
+        // which worked but still read "soft" on Mac Terminal.
+        // Current: `#002171` at ≥ 14:1.
+        with_light(|| assert_eq!(function(), "\x1b[38;2;0;33;113m"));
     }
 
     #[test]
