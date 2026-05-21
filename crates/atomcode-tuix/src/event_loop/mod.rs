@@ -2328,10 +2328,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
             ctx.current_session = session;
             app.state.on_turn_complete();
-            renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::SessionReplayHint).into_owned(),
-            ));
-            renderer.flush();
         }
     }
 
