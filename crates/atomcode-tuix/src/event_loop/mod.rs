@@ -5198,8 +5198,13 @@ fn handle_agent_event(
             // line. Still record into `pending_tools` so the matching
             // ToolCallResult knows the display name + detail and skips
             // its own ▸ render too.
+            // Preserve any existing entry (from ToolBatchStarted) which
+            // carries the disambiguated detail — don't overwrite with
+            // the raw basename (issue #439).
             if state.call_id_to_batch.contains_key(&id) {
-                pending_tools.insert(id, (display.clone(), detail, true));
+                pending_tools
+                    .entry(id)
+                    .or_insert((display.clone(), detail, true));
                 state.on_tool_call_started(&display);
                 return;
             }
@@ -5417,7 +5422,15 @@ fn handle_agent_event(
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
             // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
-            let detail = format_tool_detail(&tool_name, &call.arguments);
+            // Prefer the disambiguated detail from `pending_tools` (populated
+            // by ToolBatchStarted for parallel batches) over the raw basename
+            // from format_tool_detail. Without this, parallel batch approvals
+            // show "ReadFile(SKILL.md)" for every call, making it impossible
+            // to tell which file is being approved (issue #439).
+            let detail = pending_tools
+                .get(&call.id)
+                .map(|(_, det, _)| det.clone())
+                .unwrap_or_else(|| format_tool_detail(&tool_name, &call.arguments));
 
             // Check if ToolCallStarted already rendered this tool call as a
             // dynamic ToolCallInFlight spinner. If so, we need to freeze it
@@ -5844,6 +5857,18 @@ fn handle_agent_event(
                 state
                     .call_id_to_batch
                     .insert(cid.clone(), batch_id.clone());
+            }
+            // Pre-populate `pending_tools` with the disambiguated detail
+            // so that subsequent ToolCallStarted / ApprovalNeeded events
+            // use the disambiguated path (e.g. "a/SKILL.md") instead of
+            // the raw basename ("SKILL.md"). Without this, parallel batch
+            // approvals show identical "ReadFile(SKILL.md)" prompts and
+            // the user can't tell which file they're approving (issue #439).
+            for (c, detail) in calls.iter().zip(disambiguated.iter()) {
+                pending_tools.insert(
+                    c.id.clone(),
+                    (display_tool_name_short(&c.name).clone(), detail.clone(), true),
+                );
             }
             state.active_tool_batches.insert(
                 batch_id.clone(),
