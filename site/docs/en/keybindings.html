@@ -71,7 +71,7 @@
 
   <main class="dmain prose-docs">
 <h1>Keybindings</h1>
-      <p class="lede">AtomCode's TUI is built on ratatui + crossterm; common keybindings stick close to the conventions of mainstream terminal tools. <code>/help</code> shows the full list at any time.</p>
+      <p class="lede">AtomCode's TUI is built on ratatui + crossterm; common keybindings stick close to the conventions of mainstream terminal tools. Run <code>/keys</code> in a session to dump this table into the current scrollback, or <code>/help</code> for the slash-command list.</p>
 
       <h2>Input editing</h2>
       <table>
@@ -80,10 +80,11 @@
         </thead>
         <tbody>
           <tr><td><code>Enter</code></td><td>Send the message</td></tr>
-          <tr><td><code>Shift+Enter</code></td><td>Insert newline (requires Kitty keyboard protocol)</td></tr>
-          <tr><td><code>Ctrl+Enter</code></td><td>Insert newline (requires Kitty keyboard protocol)</td></tr>
-          <tr><td><code>Ctrl+J</code></td><td>Insert newline (requires Kitty keyboard protocol)</td></tr>
-          <tr><td><code>Alt+Enter</code></td><td>Insert newline (most terminals; Windows Terminal reserves it by default)</td></tr>
+          <tr><td><code>Ctrl+J</code></td><td>Insert newline (universal — sends a literal LF byte that every terminal accepts)</td></tr>
+          <tr><td><code>\ </code> then <code>Enter</code></td><td>Insert newline (atomcode fallback — a trailing backslash makes the line a continuation, works in every terminal)</td></tr>
+          <tr><td><code>Alt+Enter</code></td><td>Insert newline (most terminals; macOS Apple Terminal needs "Use Option as Meta key" enabled under Settings → Profiles → Keyboard; Windows Terminal reserves it by default — release in settings)</td></tr>
+          <tr><td><code>Shift+Enter</code></td><td>Insert newline (only terminals that disambiguate the modifier: Kitty / WezTerm / iTerm2 with Report Modifiers / Windows Terminal / Ghostty / Warp. Apple Terminal, xterm, GNOME Terminal, VS Code integrated terminal all collapse it to Enter — use <code>Ctrl+J</code> or <code>\</code> + <code>Enter</code> instead)</td></tr>
+          <tr><td><code>Ctrl+Enter</code></td><td>Insert newline (requires a Kitty-keyboard-protocol terminal such as Kitty or WezTerm)</td></tr>
           <tr><td><code>Esc</code></td><td>Clear current input / interrupt streaming output</td></tr>
           <tr><td><code>↑ / ↓</code></td><td>Browse input history</td></tr>
           <tr><td><code>Tab</code></td><td>Accept completion (slash-command menu, file paths, etc.)</td></tr>
