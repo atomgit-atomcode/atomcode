@@ -850,10 +850,16 @@ impl OnboardingWizard {
         content.push(String::new());
 
         let mut out = Vec::new();
-        out.push("第 1/1 步 · 扫码登录".to_string());
+        out.push("扫码登录 · 领取CodingPlan".to_string());
         out.push(String::new());
+        // Panel title carries the running atomcode version so users
+        // reporting a screenshot tell us the build their bug landed
+        // in without having to /status first. CARGO_PKG_VERSION is
+        // workspace-bound (e.g. "4.23.0") — matches the convention
+        // used by the Step::Intro version line above.
+        let panel_title = format!("AtomCode · v{}", env!("CARGO_PKG_VERSION"));
         out.extend(draw_panel(
-            "AtomCode",
+            &panel_title,
             &content,
             "Step 1/1",
             panel_width,
