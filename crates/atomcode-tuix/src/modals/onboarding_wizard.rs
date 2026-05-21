@@ -317,6 +317,15 @@ pub struct OnboardingWizard {
     /// blank panel; Esc bails, Enter retries by re-running
     /// `start_login()` in `handle_key_pure`'s `Retry` outcome.
     pub(super) qr_login_error: Option<String>,
+    /// Live `LoginSession` produced by the most recent `start_login()`
+    /// call. The event loop pulls this out via `take_pending_session`
+    /// right after constructing the wizard so a background poll
+    /// thread (see `event_loop::oauth_poll`) can watch for the user
+    /// completing the in-browser consent and auto-close the modal —
+    /// no manual Enter required. `None` after a take, after an Esc,
+    /// or when `start_login()` itself errored at construction.
+    pub(super) pending_session:
+        Option<atomcode_core::auth::oauth::LoginSession>,
 }
 
 impl OnboardingWizard {
@@ -332,6 +341,7 @@ impl OnboardingWizard {
             needs_confirm: false,
             qr_login_url: None,
             qr_login_error: None,
+            pending_session: None,
         }
     }
 
@@ -346,27 +356,34 @@ impl OnboardingWizard {
             needs_confirm: true,
             qr_login_url: None,
             qr_login_error: None,
+            pending_session: None,
         }
     }
 
     /// First-launch fast path. Skips the old 3-step Intro / Language /
     /// Setup flow and goes straight to a single QR screen for the
-    /// AtomGit OAuth short link — scan, log in, hit Enter to fall
-    /// through into the existing `/codingplan` driver which claims
-    /// the plan and writes the model providers. Language defaults to
-    /// auto-detect from `$LC_ALL` / `$LANG` (i18n step gone); user
-    /// can switch later via `/language`.
+    /// AtomGit OAuth short link — scan, log in, the background poll
+    /// thread auto-closes the modal and hands off to `/codingplan`
+    /// for the claim. Language defaults to auto-detect from `$LC_ALL`
+    /// / `$LANG` (i18n step gone); user can switch later via
+    /// `/language`.
     ///
     /// Synchronously calls [`atomcode_core::auth::oauth::start_login`]
     /// up front so the QR is paintable the moment the modal opens.
     /// On network failure the error is stashed on the wizard and
-    /// rendered in place of the QR — Esc bails, Enter retries
-    /// (handled in `handle_key_pure`).
+    /// rendered in place of the QR — Esc bails, Enter retries via
+    /// `handle_key_pure`'s `RetryQrLogin` outcome.
+    ///
+    /// The successful `LoginSession` is held on `pending_session` so
+    /// the event loop can pull it out (see `take_pending_session`)
+    /// and hand it to a background poll thread. The wizard itself
+    /// doesn't know about polling — that plumbing stays in the event
+    /// loop.
     pub fn new_qr_fast_path() -> Self {
-        let (qr_login_url, qr_login_error) =
+        let (qr_login_url, qr_login_error, pending_session) =
             match atomcode_core::auth::oauth::start_login() {
-                Ok(session) => (Some(session.url().to_string()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
+                Ok(session) => (Some(session.url().to_string()), None, Some(session)),
+                Err(e) => (None, Some(format!("{e:#}")), None),
             };
         Self {
             step: Step::QrLogin,
@@ -375,8 +392,27 @@ impl OnboardingWizard {
             needs_confirm: false,
             qr_login_url,
             qr_login_error,
+            pending_session,
         }
     }
+
+    /// Pull the freshly-constructed `LoginSession` out so the event
+    /// loop can spawn a background poll thread against it. Returns
+    /// `None` if there is no session to take (Esc was hit, or
+    /// `start_login` errored at construction, or another caller
+    /// already took it). Called exactly once per QR session by
+    /// `event_loop::run_loop`'s first-launch setup; subsequent calls
+    /// return None and are harmless.
+    pub fn take_pending_session(
+        &mut self,
+    ) -> Option<atomcode_core::auth::oauth::LoginSession> {
+        self.pending_session.take()
+    }
+
+    // (set_qr_login_error removed — the event-loop's Failed handler
+    // closes the modal instead of injecting state, so this is unused.
+    // Re-add if PR 1c lands a Modal trait extension + downcast path
+    // that keeps the wizard open on poll failure.)
 
     /// Pre-select the language idx based on existing config. Used by
     /// `/welcome` so a user who already picked ZhCn lands on row 3 of
@@ -798,7 +834,11 @@ impl OnboardingWizard {
             }));
             content.push(center(url));
             content.push(String::new());
-            content.push(center("扫码完成后按 Enter 继续"));
+            // Polling thread auto-closes the modal the moment AtomGit
+            // reports authorisation; Enter is kept as an explicit
+            // force-continue for users who'd rather not wait for the
+            // 2s poll tick.
+            content.push(center("扫码后自动继续 · Enter 立即继续"));
         } else {
             // Shouldn't happen — `new_qr_fast_path` always populates
             // exactly one of url / error. Defensive fallback so a
@@ -902,11 +942,22 @@ impl crate::modals::Modal for OnboardingWizard {
                 // Re-run start_login() in-place so the user can recover
                 // from a transient network blip without restarting
                 // atomcode. Mirrors the constructor — synchronous
-                // round-trip, store either url or error.
+                // round-trip, store either url or error, AND on success
+                // spawn a fresh background poll thread so the new
+                // session auto-completes the way the original did.
                 match atomcode_core::auth::oauth::start_login() {
                     Ok(session) => {
                         self.qr_login_url = Some(session.url().to_string());
                         self.qr_login_error = None;
+                        // session is consumed by `spawn_oauth_poll`;
+                        // `pending_session` stays None because the
+                        // task owns it now.
+                        crate::event_loop::oauth_poll::spawn_oauth_poll(
+                            session,
+                            Some(std::sync::Arc::clone(&ctx.telemetry)),
+                            ctx.oauth_event_tx.clone(),
+                            ctx.wake_tx.clone(),
+                        );
                     }
                     Err(e) => {
                         self.qr_login_url = None;
@@ -1849,6 +1900,7 @@ mod tests {
             needs_confirm: false,
             qr_login_url: Some(url.to_string()),
             qr_login_error: None,
+            pending_session: None,
         }
     }
 
@@ -1860,6 +1912,7 @@ mod tests {
             needs_confirm: false,
             qr_login_url: None,
             qr_login_error: Some(msg.to_string()),
+            pending_session: None,
         }
     }
 

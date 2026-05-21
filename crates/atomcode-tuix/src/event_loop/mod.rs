@@ -17,6 +17,7 @@ pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod file_index;
 pub(crate) mod monitor;
+pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
 use commands::execute_slash_command;
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
@@ -722,6 +723,15 @@ pub struct LoopCtx {
     /// so `/model` switches, pre-turn triggers, and the like can wake
     /// the event loop after updating `monitor_warning`.
     pub wake_tx: mpsc::Sender<()>,
+    /// Receiver for `OauthEvent`s emitted by the QR-fast-path onboarding
+    /// poll thread (see `event_loop::oauth_poll`). One event arrives
+    /// per spawned poll task (Authorized or Failed). The `tokio::select!`
+    /// arm that reads this channel closes the wizard modal + flips
+    /// `pending_run_codingplan` on Authorized, or surfaces the failure
+    /// reason in scrollback on Failed.
+    pub oauth_event_rx: mpsc::UnboundedReceiver<oauth_poll::OauthEvent>,
+    /// Sender cloned into each spawned poll task.
+    pub oauth_event_tx: mpsc::UnboundedSender<oauth_poll::OauthEvent>,
     /// Control handle for the crossterm reader thread — `Some` in raw-mode
     /// TTY sessions, `None` in pipe mode. Used by child-process handoffs
     /// (OAuth login, future `/shell`) to pause+resume event consumption
@@ -2465,17 +2475,29 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         // OnboardingWizard's Modal impl owns the per-step box drawing.
         use crate::modals::Modal;
         renderer.clear_screen();
-        // First-launch fast path: single-page QR + URL, hands off to
-        // /codingplan on Enter (PR 1a). The legacy 3-step Intro /
-        // Language / Setup wizard stays intact for `/welcome` —
-        // `new_qr_fast_path` is ONLY used here at first-launch
-        // (where the modal is auto-opened by `should_auto_show_onboarding`).
-        // /welcome's command arm still uses `new()` / `new_with_confirm()`
-        // so users who explicitly re-run the wizard see the familiar
-        // language + setup path. PR 1b will spawn a polling task here
-        // that closes the modal automatically the moment AtomGit
-        // reports authorisation, removing the manual Enter step.
-        let wizard = crate::modals::OnboardingWizard::new_qr_fast_path();
+        // First-launch fast path: single-page QR + URL. Background
+        // poll thread (PR 1b) watches `/auth/check` and auto-closes
+        // the modal the moment AtomGit reports authorisation, then
+        // the `OauthEvent::Authorized` branch in the main `select!`
+        // flips `pending_run_codingplan` so `/codingplan` claims
+        // immediately — zero keystrokes after the user finishes the
+        // browser flow. The legacy 3-step Intro / Language / Setup
+        // wizard stays intact for `/welcome` — `new_qr_fast_path` is
+        // ONLY used here. /welcome's command arm still uses `new()`
+        // / `new_with_confirm()` so users who explicitly re-run the
+        // wizard see the familiar language + setup path.
+        let mut wizard = crate::modals::OnboardingWizard::new_qr_fast_path();
+        // Pull the LoginSession out of the wizard before boxing — the
+        // background poll thread owns it from here. wizard.draw still
+        // has access to `qr_login_url` so the QR keeps rendering.
+        if let Some(session) = wizard.take_pending_session() {
+            oauth_poll::spawn_oauth_poll(
+                session,
+                Some(std::sync::Arc::clone(&ctx.telemetry)),
+                ctx.oauth_event_tx.clone(),
+                ctx.wake_tx.clone(),
+            );
+        }
         wizard.draw(&app.buf, &app.state, &ctx, renderer);
         app.active_modal = Some(Box::new(wizard));
     } else {
@@ -2659,6 +2681,42 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // redraws frequently enough that the hint picks up naturally.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            }
+
+            // ── OAuth poll thread results ──
+            // Emitted by `event_loop::oauth_poll::spawn_oauth_poll`
+            // once per QR-fast-path session. Authorized → close the
+            // wizard + flip `pending_run_codingplan` so the existing
+            // /codingplan driver picks up the just-written auth.toml
+            // and claims the plan. Failed → close the wizard too and
+            // surface the reason in scrollback with a retry hint;
+            // leaving the modal open would require a Modal trait
+            // extension (as_any_mut + downcast) we don't yet have.
+            Some(ev) = ctx.oauth_event_rx.recv() => {
+                use oauth_poll::OauthEvent;
+                let was_modal_open = app.active_modal.is_some();
+                if was_modal_open {
+                    app.active_modal = None;
+                    renderer.clear_screen();
+                }
+                match ev {
+                    OauthEvent::Authorized => {
+                        ctx.pending_run_codingplan = true;
+                        // /codingplan driver paints its own UI, so
+                        // we don't need a welcome banner here. If the
+                        // user already Esc'd the modal the auth was
+                        // still saved silently — next /codingplan run
+                        // picks it up.
+                    }
+                    OauthEvent::Failed(reason) => {
+                        renderer.render(crate::render::UiLine::Error(
+                            format!(
+                                "登录失败: {reason}。运行 /codingplan 可重试。",
+                            ),
+                        ));
+                        renderer.flush();
+                    }
+                }
             }
 
             // ── MCP connection events ──
@@ -2964,6 +3022,42 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── Version-check wake ──
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            }
+
+            // ── OAuth poll thread results ──
+            // Emitted by `event_loop::oauth_poll::spawn_oauth_poll`
+            // once per QR-fast-path session. Authorized → close the
+            // wizard + flip `pending_run_codingplan` so the existing
+            // /codingplan driver picks up the just-written auth.toml
+            // and claims the plan. Failed → close the wizard too and
+            // surface the reason in scrollback with a retry hint;
+            // leaving the modal open would require a Modal trait
+            // extension (as_any_mut + downcast) we don't yet have.
+            Some(ev) = ctx.oauth_event_rx.recv() => {
+                use oauth_poll::OauthEvent;
+                let was_modal_open = app.active_modal.is_some();
+                if was_modal_open {
+                    app.active_modal = None;
+                    renderer.clear_screen();
+                }
+                match ev {
+                    OauthEvent::Authorized => {
+                        ctx.pending_run_codingplan = true;
+                        // /codingplan driver paints its own UI, so
+                        // we don't need a welcome banner here. If the
+                        // user already Esc'd the modal the auth was
+                        // still saved silently — next /codingplan run
+                        // picks it up.
+                    }
+                    OauthEvent::Failed(reason) => {
+                        renderer.render(crate::render::UiLine::Error(
+                            format!(
+                                "登录失败: {reason}。运行 /codingplan 可重试。",
+                            ),
+                        ));
+                        renderer.flush();
+                    }
+                }
             }
 
             // ── MCP connection events ──
