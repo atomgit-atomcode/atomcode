@@ -77601,15 +77601,22 @@ ${content}</tr>
     });
     return groups;
   }
-  function formatToolArgs(name, argsJson) {
+  var DISPLAY_FIELDS = ["command", "file_path", "pattern", "query", "url", "search", "path", "name"];
+  function formatToolArgs(_name, argsJson) {
     try {
       const args = JSON.parse(argsJson);
-      if (name === "read_file" || name === "Read") return args.file_path ?? args.path ?? "";
-      if (name === "write_file" || name === "Write") return args.file_path ?? args.path ?? "";
-      if (name === "edit_file" || name === "Edit") return args.file_path ?? args.path ?? "";
-      if (name === "bash" || name === "Bash") return (args.command ?? "").substring(0, 80);
-      if (name === "grep" || name === "Grep") return `${args.pattern ?? ""} in ${args.path ?? "."}`;
-      if (name === "list_dir") return args.path ?? ".";
+      if (!args || typeof args !== "object") return "";
+      for (const field of DISPLAY_FIELDS) {
+        const val = args[field];
+        if (typeof val === "string" && val.length > 0) {
+          return val.length > 80 ? val.substring(0, 77) + "..." : val;
+        }
+      }
+      for (const [, val] of Object.entries(args)) {
+        if (typeof val === "string" && val.length > 0) {
+          return val.length > 80 ? val.substring(0, 77) + "..." : val;
+        }
+      }
       return "";
     } catch {
       return "";
