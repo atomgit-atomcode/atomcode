@@ -295,6 +295,16 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "keys" => {
+            // Dump the full keyboard-shortcut reference into scrollback.
+            // i18n string owns column alignment so translators can adjust
+            // per locale without touching this arm. /help complements
+            // this with the slash-command list.
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::KeybindingsHelp).into_owned(),
+            ));
+            renderer.flush();
+        }
         "plan" => {
             state.agent_mode = AgentMode::Plan;
             ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();

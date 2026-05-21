@@ -104,6 +104,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
+    Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
     Command { name: "language", desc: "Switch display language", needs_args: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
@@ -164,6 +165,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "build" => Msg::CmdDescBuild,
         "think" => Msg::CmdDescThink,
         "help" => Msg::CmdDescHelp,
+        "keys" => Msg::CmdDescKeys,
         "language" => Msg::CmdDescLanguage,
         "welcome" => Msg::CmdWelcomeDescription,
         "quit" => Msg::CmdDescQuit,
@@ -275,6 +277,49 @@ mod tests {
         let reg = CommandRegistry::builtin();
         let matches = reg.matching_prefix("h");
         assert!(matches.iter().any(|c| c.name == "help"));
+    }
+
+    #[test]
+    fn keys_command_is_registered_with_i18n_description_in_both_locales() {
+        // `/keys` should appear in the built-in completion list and
+        // resolve a non-empty description in every shipped locale —
+        // if a translator misses one, the slash menu shows the bare
+        // English fallback (CmdDescKeys default) and we want that to
+        // be a test failure, not a UI regression.
+        use crate::i18n::{Locale, Msg};
+        let reg = CommandRegistry::builtin();
+        let keys_cmd = reg
+            .matching_prefix("keys")
+            .into_iter()
+            .find(|c| c.name == "keys")
+            .expect("/keys must be a built-in command");
+        assert!(!keys_cmd.needs_args);
+
+        // i18n round-trip per locale: both the slash-menu description
+        // and the KeybindingsHelp body must produce non-empty text
+        // and carry the canonical keystroke labels. Snapshot the
+        // current locale up front and restore at the end so we don't
+        // poison parallel tests / future tests by leaving a side
+        // effect behind. `set_locale` is process-global.
+        let prev = crate::i18n::current_locale();
+        for locale in [Locale::En, Locale::ZhCn] {
+            crate::i18n::set_locale(locale);
+            let desc = cmd_desc_i18n("keys").expect("CmdDescKeys translation");
+            assert!(
+                !desc.trim().is_empty(),
+                "CmdDescKeys ({locale:?}) must not be empty"
+            );
+            let body = crate::i18n::t(Msg::KeybindingsHelp);
+            assert!(
+                body.contains("Ctrl+C"),
+                "KeybindingsHelp ({locale:?}) must list Ctrl+C — got:\n{body}"
+            );
+            assert!(
+                body.contains("Enter"),
+                "KeybindingsHelp ({locale:?}) must list Enter — got:\n{body}"
+            );
+        }
+        crate::i18n::set_locale(prev);
     }
 
     #[test]

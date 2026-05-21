@@ -164,6 +164,42 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── Help ──
         Msg::HelpAvailableCommands =>
             "  Available commands:\n".into(),
+        Msg::KeybindingsHelp => r#"  Keyboard shortcuts
+
+  ── Input ──
+    Enter                            Send message
+    Alt+Enter / Ctrl+J / Shift+Enter Insert newline
+    \ then Enter                     Insert newline (fallback)
+    /                                Open slash command menu
+    Tab                              Autocomplete
+    Backspace / Ctrl+H               Delete previous char
+    Delete / Ctrl+?                  Delete next char
+    Ctrl+W                           Delete word backward
+    Ctrl+U                           Clear current line
+    Ctrl+K                           Delete to end of line
+    Ctrl+A / Home                    Jump to line start
+    Ctrl+E / End                     Jump to line end
+    Left / Right                     Move cursor
+
+  ── History ──
+    Up                               Previous input
+    Down                             Next input
+
+  ── Session ──
+    Ctrl+C                           Cancel current turn / dismiss modal
+    Ctrl+D                           Exit AtomCode
+    Ctrl+L                           Clear screen
+    Ctrl+O                           Toggle tool real-time output
+    Ctrl+V                           Paste (text + image)
+
+  ── Slash menu / modal navigation ──
+    Up / Down                        Move selection
+    Enter                            Confirm
+    Esc                              Cancel / close modal
+    Tab                              Insert highlighted command
+
+  Tip: run /help for the full slash command list.
+"#.into(),
 
         // ── Provider wizard ──
         Msg::ProviderWizardHeader =>
@@ -637,6 +673,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
         Msg::CmdDescHelp => "Show this help".into(),
+        Msg::CmdDescKeys => "Show keyboard shortcuts".into(),
         Msg::CmdDescLanguage => "Switch display language".into(),
         Msg::CmdDescQuit => "Exit AtomCode".into(),
         Msg::CmdDescSkills => "Browse loaded skills".into(),

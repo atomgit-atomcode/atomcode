@@ -156,6 +156,42 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 帮助 ──
         Msg::HelpAvailableCommands =>
             "  可用命令：\n".into(),
+        Msg::KeybindingsHelp => r#"  键盘快捷键
+
+  ── 输入 ──
+    Enter                            发送消息
+    Alt+Enter / Ctrl+J / Shift+Enter 插入换行
+    \ 后接 Enter                     插入换行（兜底）
+    /                                打开斜杠命令菜单
+    Tab                              自动补全
+    Backspace / Ctrl+H               删除上一个字符
+    Delete / Ctrl+?                  删除下一个字符
+    Ctrl+W                           删除前一个单词
+    Ctrl+U                           清空当前行
+    Ctrl+K                           删除到行尾
+    Ctrl+A / Home                    跳到行首
+    Ctrl+E / End                     跳到行尾
+    Left / Right                     光标左右移动
+
+  ── 历史 ──
+    Up                               上一条输入
+    Down                             下一条输入
+
+  ── 会话 ──
+    Ctrl+C                           取消当前轮 / 关闭弹层
+    Ctrl+D                           退出 atomcode
+    Ctrl+L                           清屏
+    Ctrl+O                           切换工具实时输出
+    Ctrl+V                           粘贴（文本 + 图片）
+
+  ── 斜杠菜单 / 弹层导航 ──
+    Up / Down                        移动选择
+    Enter                            确认
+    Esc                              取消 / 关闭弹层
+    Tab                              插入当前高亮命令
+
+  提示：输入 /help 查看完整斜杠命令列表。
+"#.into(),
 
         // ── Provider 向导 ──
         Msg::ProviderWizardHeader =>
@@ -627,6 +663,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
         Msg::CmdDescHelp => "显示帮助".into(),
+        Msg::CmdDescKeys => "显示键盘快捷键".into(),
         Msg::CmdDescLanguage => "切换显示语言".into(),
         Msg::CmdDescQuit => "退出 AtomCode".into(),
         Msg::CmdDescSkills => "浏览已加载的技能".into(),

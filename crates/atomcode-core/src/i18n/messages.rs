@@ -134,6 +134,11 @@ pub enum Msg<'a> {
 
     // ── Help / commands ──
     HelpAvailableCommands,
+    /// Full keyboard-shortcuts reference dumped to scrollback by the
+    /// `/keys` slash command. Carries every line of the panel as a
+    /// single multi-line string so translators can adjust column
+    /// alignment per locale without rebuilding rows in Rust.
+    KeybindingsHelp,
 
     // ── Provider wizard ──
     ProviderWizardHeader,
@@ -442,6 +447,7 @@ pub enum Msg<'a> {
     CmdDescBuild,
     CmdDescThink,
     CmdDescHelp,
+    CmdDescKeys,
     CmdDescLanguage,
     CmdDescQuit,
     CmdDescSkills,
