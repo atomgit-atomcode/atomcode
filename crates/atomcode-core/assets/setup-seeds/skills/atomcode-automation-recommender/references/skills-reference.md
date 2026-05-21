@@ -42,6 +42,16 @@ Some pre-built skills are available through the setup installer (`atomcode setup
 
 ---
 
+## Plugin Skills
+
+Skills distributed as plugins — install with `/plugin marketplace add <url>` then `/plugin install <name>`.
+
+| Skill | Plugin | Install | Best For |
+|-------|--------|---------|----------|
+| **ask** | atomcode | `/plugin marketplace add https://atomgit.com/atomgit_atomcode/atomcode-skills` then `/plugin install atomcode@atomcode-skills` | AtomCode usage & docs Q&A — installation, config, slash commands, troubleshooting |
+
+---
+
 ## Custom Project Skills
 
 Create project-specific skills in `.atomcode/skills/<name>/SKILL.md`.

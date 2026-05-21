@@ -8,6 +8,12 @@ Plugins are installable collections of skills, commands, agents, and hooks. Atom
 
 ## Core Plugins
 
+### AtomCode Official
+
+| Plugin | Best For | Key Features |
+|--------|----------|--------------|
+| **atomcode** | AtomCode usage & documentation Q&A | Offline docs index, install/config/troubleshooting answers, `/skills ask` command |
+
 ### Development & Code Quality
 
 | Plugin | Best For | Key Features |
@@ -61,6 +67,7 @@ Plugins are installable collections of skills, commands, agents, and hooks. Atom
 
 | Codebase Signal | Recommended Plugin |
 |-----------------|-------------------|
+| Any project (first-time setup) | atomcode |
 | Building plugins | plugin-dev |
 | PR-based workflow | pr-review-toolkit |
 | Git commits | commit-commands |

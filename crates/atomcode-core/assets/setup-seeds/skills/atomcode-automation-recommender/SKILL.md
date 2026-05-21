@@ -22,6 +22,7 @@ Analyze codebase patterns to recommend tailored AtomCode automations, then **off
 | Type | Best For | How to Install |
 |------|----------|----------------|
 | **Skills** | Packaged expertise, workflows, repeatable tasks | `npx skills add <pkg>` or create `.atomcode/skills/<name>/SKILL.md` |
+| **Plugins** | Collections of skills, commands, agents, hooks | `/plugin marketplace add <url>` then `/plugin install <name>` |
 | **MCP Servers** | External tool integrations (databases, APIs, docs) | Write to `.atomcode/mcp.json` or `~/.atomcode/mcp.json` |
 | **Hooks** | Automatic actions on tool events (format, lint, block) | Write to `.atomcode/settings.json` |
 | **Subagents** | Specialized reviewers (security, performance, a11y) | Create `.atomcode/skills/<name>/SKILL.md` with reviewer prompt |
@@ -120,6 +121,12 @@ Combine online search results + local reference knowledge to generate recommenda
 
 **From reference files** (always available):
 See [references/skills-reference.md](references/skills-reference.md) for built-in patterns.
+
+**Plugin skills to recommend installing:**
+
+| Codebase Signal | Skill | Install Command | Invocation |
+|-----------------|-------|-----------------|------------|
+| Any project (AtomCode Q&A) | **ask** | `/plugin marketplace add https://atomgit.com/atomgit_atomcode/atomcode-skills` then `/plugin install atomcode@atomcode-skills` | Both |
 
 **Custom skills to suggest creating:**
 

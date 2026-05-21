@@ -1498,6 +1498,15 @@ pub(super) fn execute_slash_command(
                     for line in report.render_cli().lines() {
                         renderer.render(UiLine::CommandOutput(line.to_string()));
                     }
+
+                    // Reload skills/commands so newly-installed seeds are
+                    // visible immediately — without this the user would need
+                    // to restart AtomCode to see them in /skills.
+                    let (skills_loaded, _) = super::reload_plugins(ctx);
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  🔄 Skills reloaded — {} available",
+                        skills_loaded,
+                    )));
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(format!("setup error: {e}")));
