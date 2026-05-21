@@ -612,6 +612,28 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HelpSourceGlobal => "global".into(),
         Msg::HelpSourceProject => "project".into(),
 
+        // ── /setup ──
+        Msg::SetupHeader { installed, skipped, failed, duration_ms } =>
+            format!("\n✅ Setup complete — {} installed, {} skipped, {} failed  · {}ms\n\n", installed, skipped, failed, duration_ms).into(),
+        Msg::SetupInstalledLabel =>
+            "Installed:\n".into(),
+        Msg::SetupSkippedLabel =>
+            "\nSkipped:\n".into(),
+        Msg::SetupFailedLabel =>
+            "\nFailed:\n".into(),
+        Msg::SetupInstalledRow { kind, slug, path } =>
+            format!("  ✓ {}:{} → {}\n", kind, slug, path).into(),
+        Msg::SetupSkippedRow { kind, slug, reason } =>
+            format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
+        Msg::SetupFailedRow { kind, slug, error } =>
+            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+        Msg::CmdSetupRunning =>
+            "Running atomcode setup...".into(),
+        Msg::CmdSetupSkillsReloaded { count } =>
+            format!("  🔄 Skills reloaded — {} available", count).into(),
+        Msg::CmdSetupError { error } =>
+            format!("setup error: {error}").into(),
+
         // ── /plugin ──
         Msg::PluginUsage =>
             "usage: /plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),

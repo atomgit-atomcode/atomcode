@@ -601,6 +601,28 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HelpSourceGlobal => "全局".into(),
         Msg::HelpSourceProject => "项目".into(),
 
+        // ── /setup ──
+        Msg::SetupHeader { installed, skipped, failed, duration_ms } =>
+            format!("\n✅ Setup 完成 — {} 装好, {} 跳过, {} 失败  · 耗时 {}ms\n\n", installed, skipped, failed, duration_ms).into(),
+        Msg::SetupInstalledLabel =>
+            "已安装:\n".into(),
+        Msg::SetupSkippedLabel =>
+            "\n跳过:\n".into(),
+        Msg::SetupFailedLabel =>
+            "\n失败:\n".into(),
+        Msg::SetupInstalledRow { kind, slug, path } =>
+            format!("  ✓ {}:{} → {}\n", kind, slug, path).into(),
+        Msg::SetupSkippedRow { kind, slug, reason } =>
+            format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
+        Msg::SetupFailedRow { kind, slug, error } =>
+            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+        Msg::CmdSetupRunning =>
+            "正在运行 atomcode setup...".into(),
+        Msg::CmdSetupSkillsReloaded { count } =>
+            format!("  🔄 Skills 已重载 — {} 个可用", count).into(),
+        Msg::CmdSetupError { error } =>
+            format!("setup 错误：{error}").into(),
+
         // ── /plugin ──
         Msg::PluginUsage =>
             "用法：/plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),

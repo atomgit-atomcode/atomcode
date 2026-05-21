@@ -393,6 +393,28 @@ pub enum Msg<'a> {
     HelpSourceGlobal,
     HelpSourceProject,
 
+    // ── /setup ──
+    /// Header line: "✅ Setup complete — 3 installed, 1 skipped, 0 failed · 120ms"
+    SetupHeader { installed: usize, skipped: usize, failed: usize, duration_ms: u64 },
+    /// "Installed:" section label in setup report.
+    SetupInstalledLabel,
+    /// "Skipped:" section label in setup report.
+    SetupSkippedLabel,
+    /// "Failed:" section label in setup report.
+    SetupFailedLabel,
+    /// Per-item installed row: "  ✓ skill:atomcode-automation-recommender → /path"
+    SetupInstalledRow { kind: &'a str, slug: &'a str, path: &'a str },
+    /// Per-item skipped row: "  - skill:xyz (hash match)"
+    SetupSkippedRow { kind: &'a str, slug: &'a str, reason: &'a str },
+    /// Per-item failed row: "  ✗ mcp:xyz — error message"
+    SetupFailedRow { kind: &'a str, slug: &'a str, error: &'a str },
+    /// "Running atomcode setup..." — shown while setup is in progress.
+    CmdSetupRunning,
+    /// "Skills reloaded — N available" — after setup completes and skills are reloaded.
+    CmdSetupSkillsReloaded { count: usize },
+    /// "setup error: {e}" — when setup::run returns an error.
+    CmdSetupError { error: &'a str },
+
     // ── /plugin ──
     PluginUsage,
     PluginMarketplaceUsage,

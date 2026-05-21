@@ -1498,7 +1498,7 @@ pub(super) fn execute_slash_command(
         }
         "setup" => {
             renderer.render(UiLine::CommandOutput(
-                "Running atomcode setup...".to_string(),
+                t(Msg::CmdSetupRunning).into_owned(),
             ));
             renderer.flush();
 
@@ -1522,13 +1522,14 @@ pub(super) fn execute_slash_command(
                     // visible immediately — without this the user would need
                     // to restart AtomCode to see them in /skills.
                     let (skills_loaded, _) = super::reload_plugins(ctx);
-                    renderer.render(UiLine::CommandOutput(format!(
-                        "  🔄 Skills reloaded — {} available",
-                        skills_loaded,
-                    )));
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::CmdSetupSkillsReloaded { count: skills_loaded }).into_owned(),
+                    ));
                 }
                 Err(e) => {
-                    renderer.render(UiLine::Error(format!("setup error: {e}")));
+                    renderer.render(UiLine::Error(
+                        t(Msg::CmdSetupError { error: &e.to_string() }).into_owned(),
+                    ));
                 }
             }
             renderer.flush();

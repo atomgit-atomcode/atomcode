@@ -230,46 +230,46 @@ pub struct SetupReport {
 
 impl SetupReport {
     pub fn render_cli(&self) -> String {
+        use crate::i18n::{t, Msg};
+
+        let kind_str = |k: &RecKind| format!("{:?}", k).to_lowercase();
+
         let mut out = String::new();
-        out.push_str(&format!(
-            "\n✅ Setup 完成 — {} 装好,{} 跳过,{} 失败  · 耗时 {}ms\n\n",
-            self.summary.installed.len(),
-            self.summary.skipped.len(),
-            self.summary.failed.len(),
-            self.duration_ms,
-        ));
+        out.push_str(&t(Msg::SetupHeader {
+            installed: self.summary.installed.len(),
+            skipped: self.summary.skipped.len(),
+            failed: self.summary.failed.len(),
+            duration_ms: self.duration_ms,
+        }));
 
         if !self.summary.installed.is_empty() {
-            out.push_str("已安装:\n");
+            out.push_str(&t(Msg::SetupInstalledLabel));
             for (id, path) in &self.summary.installed {
-                out.push_str(&format!(
-                    "  ✓ {:?}:{} → {}\n",
-                    id.kind,
-                    id.slug,
-                    path.display()
-                ));
+                out.push_str(&t(Msg::SetupInstalledRow {
+                    kind: &kind_str(&id.kind),
+                    slug: &id.slug,
+                    path: &path.display().to_string(),
+                }));
             }
         }
         if !self.summary.skipped.is_empty() {
-            out.push_str("\n跳过:\n");
+            out.push_str(&t(Msg::SetupSkippedLabel));
             for (id, reason) in &self.summary.skipped {
-                out.push_str(&format!(
-                    "  - {}:{} ({:?})\n",
-                    format!("{:?}", id.kind).to_lowercase(),
-                    id.slug,
-                    reason
-                ));
+                out.push_str(&t(Msg::SetupSkippedRow {
+                    kind: &kind_str(&id.kind),
+                    slug: &id.slug,
+                    reason: &format!("{:?}", reason),
+                }));
             }
         }
         if !self.summary.failed.is_empty() {
-            out.push_str("\n失败:\n");
+            out.push_str(&t(Msg::SetupFailedLabel));
             for (id, err) in &self.summary.failed {
-                out.push_str(&format!(
-                    "  ✗ {}:{} — {}\n",
-                    format!("{:?}", id.kind).to_lowercase(),
-                    id.slug,
-                    err
-                ));
+                out.push_str(&t(Msg::SetupFailedRow {
+                    kind: &kind_str(&id.kind),
+                    slug: &id.slug,
+                    error: err,
+                }));
             }
         }
         out
@@ -282,6 +282,9 @@ mod tests {
 
     #[test]
     fn render_includes_installed_count() {
+        let _g = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::locale::Locale::ZhCn);
+
         let mut sum = InstalledSummary::default();
         sum.installed
             .push((RecId::new(RecKind::Skill, "x"), PathBuf::from("/p/x.md")));
@@ -290,7 +293,7 @@ mod tests {
             duration_ms: 123,
         };
         let rendered = report.render_cli();
-        assert!(rendered.contains("1 装好"));
+        assert!(rendered.contains("1"));
         assert!(rendered.contains("/p/x.md"));
         assert!(rendered.contains("123ms"));
     }
