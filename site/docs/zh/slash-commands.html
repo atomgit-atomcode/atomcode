@@ -144,7 +144,7 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/setup</code></td><td>扫描当前项目并把 atomcode 内置的推荐 seed(skills / slash commands / hooks / MCP 模板)解压到 <code>~/.atomcode/</code> 与 <code>.atomcode/</code>,完成后自动 reload 让新装的 skills 立刻出现在 <code>/skills</code> 菜单里。会获取项目级锁防止并发执行,写完会落一份 <code>setup-state.json</code> 记录已安装项 + 当前 atomcode 版本;同一项目重跑会跳过已装的,需要重装请加 <code>--force</code>。第一次拿到一个项目跑一次最划算</td></tr>
+          <tr><td><code>/setup</code></td><td>第一次执行时,把内置的 <code>atomcode-automation-recommender</code> skill 解压到 <code>~/.atomcode/skills/</code>,在项目 <code>.gitignore</code> 追加 <code>.atomcode/local/</code>,并写 <code>.atomcode/setup-state.json</code>(signals 哈希 + atomcode 版本 + 已安装列表),全程持项目级锁。然后自动调用 recommender skill — 它会扫描项目(语言、框架、已有 hook 等)、联网检索并推荐适合该代码库的其他 atomcode skill 安装。后续执行会跳过 seed 安装、直接重跑 skill。命令后跟的文字会作为 steering 传给 skill,例如 <code>/setup 重点关注测试</code>。CLI 形式 <code>atomcode setup --force</code> 会按内容哈希强制重装 seed 文件</td></tr>
           <tr><td><code>/skills</code></td><td>浏览当前已加载的 skills(项目级 + 用户级)。每个 skill 也会以独立的斜杠命令形式出现在补全菜单里,可以直接 <code>/&lt;skill-name&gt;</code> 触发</td></tr>
           <tr><td><code>/plugin marketplace</code></td><td>打开插件市场浏览器,从已注册的 marketplace 中挑选并安装</td></tr>
           <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>从指定 marketplace 安装插件</td></tr>
