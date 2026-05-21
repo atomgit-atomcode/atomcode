@@ -445,6 +445,7 @@ mod validate_args_tests {
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
+            plugin: Default::default(),
         }
     }
 

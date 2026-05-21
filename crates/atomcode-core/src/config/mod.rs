@@ -142,6 +142,48 @@ pub struct Config {
     /// configs → defaults to `dark` (legacy behaviour).
     #[serde(default)]
     pub ui: UiConfig,
+    /// Plugin marketplace bootstrap + auto-update behaviour. Missing
+    /// from older configs → both knobs default to `true`, matching the
+    /// "ship batteries included" UX: first-startup auto-installs the
+    /// default `atomcode-skills` marketplace, and an in-place version
+    /// upgrade silently `git pull`s every installed marketplace so
+    /// skills track the binary.
+    #[serde(default)]
+    pub plugin: PluginConfig,
+}
+
+/// Plugin / marketplace bootstrap configuration. Persisted as the
+/// `[plugin]` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfig {
+    /// First-startup behaviour: when true (default), atomcode runs a
+    /// one-time `git clone` of the default `atomcode-skills`
+    /// marketplace into `~/.atomcode/plugins/marketplaces/`. A marker
+    /// file (`~/.atomcode/.plugin_bootstrap_v1`) is touched after the
+    /// first attempt — set or unset — so the install fires exactly
+    /// once per user. A subsequent `/plugin uninstall` is respected;
+    /// the marker stays in place and the directory is NOT recreated.
+    /// To force a re-bootstrap, delete the marker.
+    #[serde(default = "default_true")]
+    pub auto_install_default_skills: bool,
+    /// Self-update follow-up: when true (default), after
+    /// `apply_pending_upgrade` actually applies a new atomcode binary
+    /// (`ATOMCODE_UPGRADED_FROM` env var set on re-exec), the new
+    /// session runs `git pull --ff-only` on every installed marketplace
+    /// so skills stay in lockstep with the binary. Failures (no
+    /// network, fast-forward conflict from local edits) are warned
+    /// and ignored — never block startup.
+    #[serde(default = "default_true")]
+    pub auto_update_marketplaces: bool,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            auto_install_default_skills: true,
+            auto_update_marketplaces: true,
+        }
+    }
 }
 
 /// UI section of the config — currently just the theme switch driving
@@ -213,6 +255,7 @@ impl Default for Config {
             vision_preprocessor_provider: None,
             language: None,
             ui: UiConfig::default(),
+            plugin: PluginConfig::default(),
         }
     }
 }
@@ -690,6 +733,7 @@ mod tests {
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
+            plugin: Default::default(),
         }
     }
 
@@ -853,6 +897,7 @@ mod tests {
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
+            plugin: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1065,6 +1110,7 @@ mod tests {
             vision_preprocessor_provider: None,
             language: Some(crate::locale::Locale::ZhCn),
             ui: Default::default(),
+            plugin: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1165,6 +1211,7 @@ mod tests {
             vision_preprocessor_provider: preprocessor_key.map(|s| s.to_string()),
             language: None,
             ui: Default::default(),
+            plugin: Default::default(),
         }
     }
 

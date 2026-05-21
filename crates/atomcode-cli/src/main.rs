@@ -961,6 +961,7 @@ async fn run() -> Result<i32> {
                 vision_preprocessor_provider: None,
                 language: None,
                 ui: Default::default(),
+            plugin: Default::default(),
             }
         })
     } else {
@@ -979,6 +980,7 @@ async fn run() -> Result<i32> {
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
+            plugin: Default::default(),
         }
     };
 
@@ -988,6 +990,26 @@ async fn run() -> Result<i32> {
         config.language,
     );
     atomcode_tuix::i18n::set_locale(locale);
+
+    // ── Plugin marketplace bootstrap + post-upgrade refresh ──
+    //
+    // Two best-effort hooks fire here (after config load, before any
+    // network-bound LLM activity):
+    //
+    //   1. First-startup auto-install of the default skills
+    //      marketplace. One-shot, marker-file gated; respects later
+    //      `/plugin uninstall`. Config: `plugin.auto_install_default_skills`.
+    //   2. Post-self-upgrade `git pull` of every installed
+    //      marketplace. Gated on `ATOMCODE_UPGRADED_FROM` being set
+    //      (which `self_update::re_exec_self` does on success), so a
+    //      plain `cargo build` invocation never triggers it. Config:
+    //      `plugin.auto_update_marketplaces`.
+    //
+    // Both are non-blocking from a UX standpoint (worst case ~1-3 s
+    // of `git` subprocess time on a warm path; longer for the first
+    // clone). Failures are logged to stderr and swallowed — the user
+    // gets a usable atomcode either way.
+    atomcode_core::plugin::bootstrap::run_startup_hooks(&config);
 
     let unavailable_reason = if config.providers.is_empty() {
         Some(atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::CmdNoActiveProvider).into_owned())
@@ -2105,6 +2127,7 @@ fn run_codingplan_core(
             vision_preprocessor_provider: None,
             language: None,
             ui: Default::default(),
+            plugin: Default::default(),
         },
     };
 

@@ -40,6 +40,7 @@ fn empty_config() -> Config {
         vision_preprocessor_provider: None,
         language: None,
         ui: Default::default(),
+            plugin: Default::default(),
     }
 }
 
