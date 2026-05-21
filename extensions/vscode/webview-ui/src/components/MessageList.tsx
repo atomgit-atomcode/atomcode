@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useCallback } from 'react';
+import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useChatContext } from '../state/ChatProvider';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
@@ -8,20 +8,24 @@ export function MessageList() {
   const { state } = useChatContext();
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const isUserScrolledUp = useRef(false);
+  const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
+
+  const scrollToBottom = useCallback(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    setIsUserScrolledUp(false);
+  }, []);
 
   // Detect whether the user has scrolled away from the bottom
   const handleScroll = useCallback(() => {
     const el = containerRef.current;
     if (!el) return;
-    // Consider "at bottom" if within 80px of the bottom edge
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    isUserScrolledUp.current = !atBottom;
+    setIsUserScrolledUp(!atBottom);
   }, []);
 
   // Only auto-scroll if the user hasn't scrolled up
   useEffect(() => {
-    if (!isUserScrolledUp.current) {
+    if (!isUserScrolledUp) {
       bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
   }, [state.messages, state.queuedMessages, state.isGenerating]);
@@ -59,6 +63,18 @@ export function MessageList() {
           return <UserMessage key={msg.id} message={msg} className={highlightClass} />;
         })}
         <div ref={bottomRef} />
+        {isUserScrolledUp && (
+          <button
+            className="scroll-to-bottom-btn"
+            onClick={scrollToBottom}
+            aria-label="Scroll to latest"
+            title="Scroll to latest"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <path d="M4 6L8 10L12 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        )}
       </div>
       <div className="message-gradient" />
     </>

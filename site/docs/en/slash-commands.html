@@ -83,6 +83,8 @@
           <tr><td><code>/login</code></td><td>Only performs AtomGit OAuth identity auth, <strong>does not change provider config</strong> (for users who already have an API key but want AtomGit integrations like <code>/issue</code>)</td></tr>
           <tr><td><code>/resume</code></td><td>Open the session picker to restore any previously persisted session (messages, directory, and model state)</td></tr>
           <tr><td><code>/session</code></td><td>Start a fresh, clean session</td></tr>
+          <tr><td><code>/bg</code></td><td>Send the current session to the background and open a new foreground; subcommands: <code>/bg list</code>, <code>/bg &lt;N&gt;</code>, <code>/bg drop &lt;N&gt;</code>, <code>/bg help</code>. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
+          <tr><td><code>/background &lt;task&gt;</code></td><td>Compatibility entry: start a one-shot task in a <code>/bg</code> slot (<a href="./sessions.html#bg">details</a>)</td></tr>
           <tr><td><code>/rename &lt;new-name&gt;</code></td><td>Rename the current session (changes the display name in the <code>/resume</code> picker)</td></tr>
           <tr><td><code>/provider</code></td><td>Open the provider manager: add / edit / remove / switch</td></tr>
           <tr><td><code>/model</code></td><td>Switch models within the current provider, or jump across providers</td></tr>
@@ -103,7 +105,7 @@
           <tr><td><code>/compact</code></td><td>Compact history: summarise earlier messages to free up context budget</td></tr>
           <tr><td><code>/clear</code></td><td>Clear the current session's messages (working directory and model are kept)</td></tr>
           <tr><td><code>/init</code></td><td>Scan the working directory and generate / refresh the <code>.atomcode.md</code> project instructions file — covering build / test commands, tech-stack summary, layout, etc.; injected as system prompt on subsequent launches</td></tr>
-          <tr><td><code>/background &lt;task&gt;</code></td><td>Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for "go check X on the side" sort of light exploration</td></tr>
+          <tr><td><code>/background &lt;task&gt;</code></td><td>Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for "go check X on the side" sort of light exploration. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
           <tr><td><code>/worktree &lt;subcommand&gt;</code></td><td>Git worktree isolation: <code>create</code> a new branch with its own worktree, <code>list</code> existing worktrees, <code>done</code> squash worktree changes back to the main branch, <code>cleanup</code> remove finished worktrees</td></tr>
           <tr><td><code>/issue</code></td><td>Interactive wizard: file a new issue against the AtomGit repository for the current git repo (requires OAuth login; cwd must be a clone of an atomgit.com repository)</td></tr>
         </tbody>

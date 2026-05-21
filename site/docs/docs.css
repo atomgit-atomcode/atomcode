@@ -363,16 +363,66 @@ html.light .dftr a:hover,html[data-theme="light"] .dftr a:hover{color:#0d0d0d}
     border-bottom:1px solid var(--line);
   }
   html.light .dside,html[data-theme="light"] .dside{border-bottom-color:rgba(0,0,0,.10)}
-  .dmain{max-width:100%}
+  .dmain{max-width:100%;min-width:0}
 }
 @media (max-width:768px){
   .dhdr{padding:0 14px;height:52px}
   .dhdr-link{display:none}
-  .dlayout{padding:64px 14px 60px}
-  .prose-docs h1{font-size:28px}
-  .prose-docs h2{font-size:19px}
-  .doc-grid{grid-template-columns:1fr}
+  .dhdr-right{gap:6px}
+  .dlayout{padding:64px 14px calc(72px + env(safe-area-inset-bottom,0px))}
+  /* sidebar collapses into a top-anchored drawer; hamburger in header opens it */
+  .sb-toggle{display:inline-flex !important}
+  .dside{
+    position:fixed;top:52px;left:0;right:0;
+    max-height:calc(100vh - 52px);z-index:999;
+    background:rgba(10,10,10,.97);
+    backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+    border:none;border-bottom:1px solid var(--line);
+    padding:14px 18px calc(28px + env(safe-area-inset-bottom,0px));
+    overflow-y:auto;
+    transform:translateY(-110%);transition:transform .28s ease;
+    visibility:hidden;
+    width:auto;align-self:initial;
+  }
+  .dside.open{transform:translateY(0);visibility:visible}
+  html.light .dside,html[data-theme="light"] .dside{
+    background:rgba(246,243,236,.97);border-bottom-color:rgba(0,0,0,.10);
+  }
+  /* allow long inline code (e.g. 100-char install commands) and URLs to wrap */
+  .prose-docs :not(pre) > code{white-space:normal;word-break:break-word;overflow-wrap:anywhere}
+  .prose-docs a{word-break:break-word;overflow-wrap:anywhere}
+  .prose-docs p,.prose-docs li{overflow-wrap:anywhere}
+  .prose-docs h1{font-size:28px;overflow-wrap:anywhere}
+  .prose-docs h2{font-size:19px;margin:32px 0 12px;padding-top:18px;gap:10px;overflow-wrap:anywhere}
+  .prose-docs h2::before{font-size:11px;padding:3px 6px}
+  .prose-docs h3{font-size:15.5px;margin:22px 0 8px;overflow-wrap:anywhere}
+  .prose-docs{font-size:14.5px;line-height:1.7}
+  .prose-docs pre{padding:12px 14px;font-size:12px;margin:12px 0 18px}
+  .prose-docs table{font-size:12.5px}
+  .prose-docs th,.prose-docs td{padding:8px 10px}
+  .dmain{min-width:0;overflow-wrap:break-word}
+  .doc-hero{margin:4px 0 24px;padding-bottom:18px}
+  .doc-hero .eyebrow{font-size:10px;margin-bottom:12px}
+  .doc-hero .lede{font-size:14.5px;margin-bottom:16px}
+  .doc-hero .tag{font-size:10px;padding:4px 8px}
+  .callout{padding:12px 14px;font-size:13px}
+  .doc-grid{grid-template-columns:1fr;gap:10px}
+  .doc-card{padding:14px 16px}
+  .doc-card h3{font-size:14px !important}
+  .doc-card p{font-size:12.5px}
+  /* shrink search trigger to icon only — text+kbd would overflow */
+  .search-trigger{padding:0;width:32px;height:32px;justify-content:center}
+  .search-trigger span{display:none}
+  /* hide secondary identity chips that crowd the small-screen header */
+  .dhdr-badge{display:none}
+  .dhdr-logo{font-size:14px;gap:8px}
+  .dhdr-logo span:not(.dhdr-ver):not(.dhdr-badge){letter-spacing:0}
+}
+@media (max-width:380px){
+  .dhdr-ver{display:none}
+  .dlayout{padding:60px 12px calc(60px + env(safe-area-inset-bottom,0px))}
+  .prose-docs h1{font-size:24px}
 }
 
-/* sidebar toggle button is no longer used — drawer pattern removed */
-.sb-toggle{display:none !important}
+/* hamburger only appears on mobile (≤768) — see media query above */
+.sb-toggle{display:none}

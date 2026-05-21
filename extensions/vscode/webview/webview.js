@@ -1338,7 +1338,7 @@
           return dispatcher;
         }
         "undefined" !== typeof __REACT_DEVTOOLS_GLOBAL_HOOK__ && "function" === typeof __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart && __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart(Error());
-        var React14 = require_react(), Internals = {
+        var React15 = require_react(), Internals = {
           d: {
             f: noop,
             r: function() {
@@ -1356,7 +1356,7 @@
           },
           p: 0,
           findDOMNode: null
-        }, REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), ReactSharedInternals = React14.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+        }, REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), ReactSharedInternals = React15.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
         "function" === typeof Map && null != Map.prototype && "function" === typeof Map.prototype.forEach && "function" === typeof Set && null != Set.prototype && "function" === typeof Set.prototype.clear && "function" === typeof Set.prototype.forEach || console.error(
           "React depends on Map and Set built-in types. Make sure that you load a polyfill in older browsers. https://reactjs.org/link/react-polyfills"
         );
@@ -2891,7 +2891,7 @@
           "number" === type && getActiveElement(node.ownerDocument) === node || node.defaultValue === "" + value || (node.defaultValue = "" + value);
         }
         function validateOptionProps(element, props) {
-          null == props.value && ("object" === typeof props.children && null !== props.children ? React14.Children.forEach(props.children, function(child) {
+          null == props.value && ("object" === typeof props.children && null !== props.children ? React15.Children.forEach(props.children, function(child) {
             null == child || "string" === typeof child || "number" === typeof child || "bigint" === typeof child || didWarnInvalidChild || (didWarnInvalidChild = true, console.error(
               "Cannot infer the option value of complex children. Pass a `value` prop or use a plain string as children to <option>."
             ));
@@ -18523,14 +18523,14 @@
           ));
         }
         "undefined" !== typeof __REACT_DEVTOOLS_GLOBAL_HOOK__ && "function" === typeof __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart && __REACT_DEVTOOLS_GLOBAL_HOOK__.registerInternalModuleStart(Error());
-        var Scheduler = require_scheduler(), React14 = require_react(), ReactDOM = require_react_dom(), assign = Object.assign, REACT_LEGACY_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.element"), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy");
+        var Scheduler = require_scheduler(), React15 = require_react(), ReactDOM = require_react_dom(), assign = Object.assign, REACT_LEGACY_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.element"), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy");
         /* @__PURE__ */ Symbol.for("react.scope");
         var REACT_ACTIVITY_TYPE = /* @__PURE__ */ Symbol.for("react.activity");
         /* @__PURE__ */ Symbol.for("react.legacy_hidden");
         /* @__PURE__ */ Symbol.for("react.tracing_marker");
         var REACT_MEMO_CACHE_SENTINEL = /* @__PURE__ */ Symbol.for("react.memo_cache_sentinel");
         /* @__PURE__ */ Symbol.for("react.view_transition");
-        var MAYBE_ITERATOR_SYMBOL = Symbol.iterator, REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), isArrayImpl = Array.isArray, ReactSharedInternals = React14.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, ReactDOMSharedInternals = ReactDOM.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, NotPending = Object.freeze({
+        var MAYBE_ITERATOR_SYMBOL = Symbol.iterator, REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), isArrayImpl = Array.isArray, ReactSharedInternals = React15.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, ReactDOMSharedInternals = ReactDOM.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, NotPending = Object.freeze({
           pending: false,
           data: null,
           method: null,
@@ -21318,7 +21318,7 @@
           }
         };
         (function() {
-          var isomorphicReactPackageVersion = React14.version;
+          var isomorphicReactPackageVersion = React15.version;
           if ("19.2.5" !== isomorphicReactPackageVersion)
             throw Error(
               'Incompatible React versions: The "react" and "react-dom" packages must have the exact same version. Instead got:\n  - react:      ' + (isomorphicReactPackageVersion + "\n  - react-dom:  19.2.5\nLearn more: https://react.dev/warnings/version-mismatch")
@@ -21672,18 +21672,18 @@
         function isValidElement(object) {
           return "object" === typeof object && null !== object && object.$$typeof === REACT_ELEMENT_TYPE;
         }
-        var React14 = require_react(), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy"), REACT_ACTIVITY_TYPE = /* @__PURE__ */ Symbol.for("react.activity"), REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), ReactSharedInternals = React14.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, hasOwnProperty = Object.prototype.hasOwnProperty, isArrayImpl = Array.isArray, createTask = console.createTask ? console.createTask : function() {
+        var React15 = require_react(), REACT_ELEMENT_TYPE = /* @__PURE__ */ Symbol.for("react.transitional.element"), REACT_PORTAL_TYPE = /* @__PURE__ */ Symbol.for("react.portal"), REACT_FRAGMENT_TYPE = /* @__PURE__ */ Symbol.for("react.fragment"), REACT_STRICT_MODE_TYPE = /* @__PURE__ */ Symbol.for("react.strict_mode"), REACT_PROFILER_TYPE = /* @__PURE__ */ Symbol.for("react.profiler"), REACT_CONSUMER_TYPE = /* @__PURE__ */ Symbol.for("react.consumer"), REACT_CONTEXT_TYPE = /* @__PURE__ */ Symbol.for("react.context"), REACT_FORWARD_REF_TYPE = /* @__PURE__ */ Symbol.for("react.forward_ref"), REACT_SUSPENSE_TYPE = /* @__PURE__ */ Symbol.for("react.suspense"), REACT_SUSPENSE_LIST_TYPE = /* @__PURE__ */ Symbol.for("react.suspense_list"), REACT_MEMO_TYPE = /* @__PURE__ */ Symbol.for("react.memo"), REACT_LAZY_TYPE = /* @__PURE__ */ Symbol.for("react.lazy"), REACT_ACTIVITY_TYPE = /* @__PURE__ */ Symbol.for("react.activity"), REACT_CLIENT_REFERENCE = /* @__PURE__ */ Symbol.for("react.client.reference"), ReactSharedInternals = React15.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, hasOwnProperty = Object.prototype.hasOwnProperty, isArrayImpl = Array.isArray, createTask = console.createTask ? console.createTask : function() {
           return null;
         };
-        React14 = {
+        React15 = {
           react_stack_bottom_frame: function(callStackForError) {
             return callStackForError();
           }
         };
         var specialPropKeyWarningShown;
         var didWarnAboutElementRef = {};
-        var unknownOwnerDebugStack = React14.react_stack_bottom_frame.bind(
-          React14,
+        var unknownOwnerDebugStack = React15.react_stack_bottom_frame.bind(
+          React15,
           UnknownOwner
         )();
         var unknownOwnerDebugTask = createTask(getTaskName(UnknownOwner));
@@ -73539,10 +73539,34 @@
     }
     return "";
   }
+  var ATTACHED_FILES_PREFIX = "The user has attached the following file(s) for context.";
+  function parseAttachedMessage(rawText) {
+    if (!rawText.startsWith(ATTACHED_FILES_PREFIX)) {
+      return { displayText: rawText, contextFiles: [] };
+    }
+    const questionMarker = "\n\nUser question: ";
+    const questionIdx = rawText.lastIndexOf(questionMarker);
+    const userQuestion = questionIdx >= 0 ? rawText.slice(questionIdx + questionMarker.length).trim() : rawText;
+    const contextFiles = [];
+    const filePattern = /^File: (\S+)$/gm;
+    let match;
+    while ((match = filePattern.exec(rawText)) !== null) {
+      const fileName = match[1];
+      if (!contextFiles.some((f) => f.fileName === fileName)) {
+        contextFiles.push({
+          path: fileName,
+          fileName,
+          type: "file"
+        });
+      }
+    }
+    return { displayText: userQuestion, contextFiles };
+  }
   var initialState = {
     messages: [],
     queuedMessages: [],
     isGenerating: false,
+    isSessionList: document.body.dataset.viewMode === "sidebar",
     viewMode: document.body.dataset.viewMode === "sidebar" ? "sidebar" : "tab",
     currentModel: "default",
     currentProvider: "",
@@ -73628,6 +73652,24 @@
           messages: [...state.messages, assistant]
         };
       }
+      // Resume a session that has an active background stream. Same as
+      // START_GENERATION: create a fresh streaming assistant message that
+      // subsequent text/toolStart events will append to.
+      case "RESUME_STREAMING": {
+        const assistant = {
+          id: nextId(),
+          role: "assistant",
+          text: "",
+          toolCalls: [],
+          streaming: true,
+          timestamp: Date.now()
+        };
+        return {
+          ...state,
+          isGenerating: true,
+          messages: [...state.messages, assistant]
+        };
+      }
       case "APPEND_TEXT": {
         const msgs = [...state.messages];
         const assistantIndex = lastAssistantIndex(msgs);
@@ -73637,21 +73679,47 @@
         }
         return { ...state, messages: msgs };
       }
+      case "TOOL_BATCH_START": {
+        const msgs = [...state.messages];
+        const assistantIndex = lastAssistantIndex(msgs);
+        const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : void 0;
+        if (assistant) {
+          const tools = action.calls.map((c) => ({
+            id: c.id,
+            name: c.name,
+            args: c.args,
+            status: "queued"
+          }));
+          msgs[assistantIndex] = {
+            ...assistant,
+            toolCalls: [...assistant.toolCalls ?? [], ...tools]
+          };
+        }
+        return { ...state, messages: msgs };
+      }
       case "TOOL_START": {
         const msgs = [...state.messages];
         const assistantIndex = lastAssistantIndex(msgs);
         const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : void 0;
         if (assistant) {
-          const tool = {
-            id: action.id,
-            name: action.name,
-            args: action.args,
-            status: "running"
-          };
-          msgs[assistantIndex] = {
-            ...assistant,
-            toolCalls: [...assistant.toolCalls ?? [], tool]
-          };
+          const existingIndex = assistant.toolCalls?.findIndex((t) => t.id === action.id);
+          if (existingIndex !== void 0 && existingIndex >= 0) {
+            const updated = assistant.toolCalls.map(
+              (t, i) => i === existingIndex ? { ...t, args: action.args, status: "running" } : t
+            );
+            msgs[assistantIndex] = { ...assistant, toolCalls: updated };
+          } else {
+            const tool = {
+              id: action.id,
+              name: action.name,
+              args: action.args,
+              status: "running"
+            };
+            msgs[assistantIndex] = {
+              ...assistant,
+              toolCalls: [...assistant.toolCalls ?? [], tool]
+            };
+          }
         }
         return { ...state, messages: msgs };
       }
@@ -73713,7 +73781,7 @@
       }
       // ─── Session management ─────────────────────────
       case "CLEAR_CHAT":
-        return { ...state, messages: [], queuedMessages: [], tokenCount: void 0, contextFiles: [] };
+        return { ...state, messages: [], queuedMessages: [], tokenCount: void 0, contextFiles: [], isGenerating: false };
       case "SET_MODELS":
         return { ...state, models: action.models };
       case "SET_PROVIDERS": {
@@ -73824,16 +73892,19 @@
             success: true,
             status: "done"
           }));
+          const rawText = textFromContent(m.content);
+          const { displayText, contextFiles } = role === "user" ? parseAttachedMessage(rawText) : { displayText: rawText, contextFiles: [] };
           messages.push({
             id: nextId(),
             role,
-            text: textFromContent(m.content),
+            text: displayText,
             toolCalls,
+            contextFiles: contextFiles.length > 0 ? contextFiles : void 0,
             streaming: false,
             timestamp: Date.now()
           });
         }
-        return { ...state, messages };
+        return { ...state, messages, isGenerating: false };
       }
       case "SET_SEARCH_QUERY":
         return { ...state, searchQuery: action.query };
@@ -73877,7 +73948,9 @@
           isGenerating: action.generating,
           currentModel: action.currentModel ?? state.currentModel,
           viewMode: action.viewMode ?? state.viewMode,
-          activeSessionId: action.activeSessionId ?? state.activeSessionId
+          activeSessionId: action.activeSessionId ?? state.activeSessionId,
+          activeProjectHash: action.projectHash ?? state.activeProjectHash,
+          isSessionList: action.isSessionList ?? state.isSessionList
         };
       default:
         return state;
@@ -73919,8 +73992,13 @@
               generating: msg.generating,
               currentModel: msg.currentModel,
               viewMode: msg.viewMode,
-              activeSessionId: msg.activeSessionId
+              activeSessionId: msg.activeSessionId,
+              projectHash: msg.projectHash,
+              isSessionList: msg.isSessionList
             });
+            if (msg.activeSessionId) {
+              getVSCodeApi().setState({ sessionId: msg.activeSessionId, projectHash: msg.projectHash });
+            }
             break;
           case "userMessage":
             dispatch({ type: "ADD_USER_MESSAGE", text: msg.text });
@@ -73936,6 +74014,9 @@
             break;
           case "text":
             dispatch({ type: "APPEND_TEXT", content: msg.content });
+            break;
+          case "toolBatchStart":
+            dispatch({ type: "TOOL_BATCH_START", calls: msg.calls });
             break;
           case "toolStart":
             dispatch({
@@ -73980,6 +74061,9 @@
             break;
           case "clearChat":
             dispatch({ type: "CLEAR_CHAT" });
+            break;
+          case "resumeStreaming":
+            dispatch({ type: "RESUME_STREAMING" });
             break;
           case "sessions":
             dispatch({ type: "SET_SESSIONS", sessions: msg.sessions });
@@ -74071,7 +74155,7 @@
         } else {
           dispatch({ type: "ADD_USER_MESSAGE", text: text2, contextFiles });
         }
-        postMessage({ type: "send", text: text2, context: ctx, clientMessageId: isQueued ? clientMessageId : void 0 });
+        postMessage({ type: "send", text: text2, context: ctx, clientMessageId: isQueued ? clientMessageId : void 0, sessionId: state2.activeSessionId });
         dispatch({ type: "CLEAR_CONTEXT" });
       },
       []
@@ -74088,6 +74172,12 @@
     }, []);
     const loadSession = (0, import_react.useCallback)((sessionId, projectHash) => {
       postMessage({ type: "loadSession", sessionId, projectHash });
+    }, []);
+    const openSidebar = (0, import_react.useCallback)(() => {
+      postMessage({ type: "openSidebar" });
+    }, []);
+    const openSessionInTab = (0, import_react.useCallback)((sessionId, projectHash) => {
+      postMessage({ type: "openSessionInTab", sessionId, projectHash });
     }, []);
     const renameSession = (0, import_react.useCallback)((session) => {
       postMessage({
@@ -74125,9 +74215,11 @@
       dispatch,
       send,
       stop,
+      openSidebar,
       newConversation,
       selectModel,
       loadSession,
+      openSessionInTab,
       renameSession,
       deleteSession,
       startLogin,
@@ -74142,15 +74234,15 @@
   // webview-ui/src/components/Header.tsx
   var import_jsx_runtime2 = __toESM(require_jsx_runtime());
   function Header() {
-    const { dispatch, newConversation } = useChatContext();
+    const { dispatch, openSidebar, openSessionInTab } = useChatContext();
     return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("header", { className: "header", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), title: "History", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: openSidebar, title: "Open sessions sidebar", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: [
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("rect", { x: "2", y: "3", width: "12", height: "1.5", rx: "0.5" }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("rect", { x: "2", y: "7.25", width: "12", height: "1.5", rx: "0.5" }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("rect", { x: "2", y: "11.5", width: "12", height: "1.5", rx: "0.5" })
       ] }) }),
       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "header-spacer" }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: () => newConversation(), title: "New conversation", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("path", { d: "M8 1.5a.75.75 0 01.75.75v5h5a.75.75 0 010 1.5h-5v5a.75.75 0 01-1.5 0v-5h-5a.75.75 0 010-1.5h5v-5A.75.75 0 018 1.5z" }) }) }),
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: () => openSessionInTab(), title: "New conversation", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("path", { d: "M8 1.5a.75.75 0 01.75.75v5h5a.75.75 0 010 1.5h-5v5a.75.75 0 01-1.5 0v-5h-5a.75.75 0 010-1.5h5v-5A.75.75 0 018 1.5z" }) }) }),
       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ghost-btn", onClick: () => dispatch({ type: "TOGGLE_SEARCH" }), title: "Search", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("svg", { width: "16", height: "16", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2.5", children: [
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("circle", { cx: "11", cy: "11", r: "7" }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("line", { x1: "21", y1: "21", x2: "16.65", y2: "16.65" })
@@ -74264,7 +74356,7 @@
   }
 
   // webview-ui/src/components/MessageList.tsx
-  var import_react9 = __toESM(require_react());
+  var import_react10 = __toESM(require_react());
 
   // webview-ui/src/components/UserMessage.tsx
   var import_react3 = __toESM(require_react());
@@ -74293,6 +74385,9 @@
       )
     ] }) });
   }
+
+  // webview-ui/src/components/AssistantMessage.tsx
+  var import_react8 = __toESM(require_react());
 
   // webview-ui/src/components/Markdown.tsx
   var import_react4 = __toESM(require_react());
@@ -77573,13 +77668,24 @@ ${content}</tr>
   function isDiffContent(output) {
     return output.includes("@@") && (output.includes("+") || output.includes("-"));
   }
+  function CopyButton({ text: text2, label }) {
+    const [copied, setCopied] = (0, import_react6.useState)(false);
+    const handleCopy = (0, import_react6.useCallback)((e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(text2).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2e3);
+      });
+    }, [text2]);
+    return /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("button", { className: "tool-body-row-copy", onClick: handleCopy, title: copied ? "Copied!" : `Copy ${label || ""}`, children: copied ? "\u2713" : "\u{1F4CB}" });
+  }
   function ToolCall({ tool }) {
     const [expanded, setExpanded] = (0, import_react6.useState)(false);
     const secondary = formatToolArgs(tool.name, tool.args);
     const isEditTool = /edit|write/i.test(tool.name);
     const showDiff = isEditTool && tool.output && isDiffContent(tool.output);
-    const annotationClass = tool.status === "error" ? "error" : tool.status === "done" ? "success" : "";
-    const annotationText = tool.status === "running" ? void 0 : tool.status === "error" ? "error" : isEditTool && tool.status === "done" ? "applied" : tool.durationMs !== void 0 ? `${(tool.durationMs / 1e3).toFixed(1)}s` : "done";
+    const annotationClass = tool.status === "error" ? "error" : tool.status === "done" ? "success" : tool.status === "queued" ? "queued" : "";
+    const annotationText = tool.status === "queued" ? "waiting" : tool.status === "running" ? void 0 : tool.status === "error" ? "error" : isEditTool && tool.status === "done" ? "applied" : tool.durationMs !== void 0 ? `${(tool.durationMs / 1e3).toFixed(1)}s` : "done";
     return /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "tool-body", children: [
       /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "tool-header", onClick: () => setExpanded(!expanded), children: [
         /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tool-name", children: tool.name }),
@@ -77590,11 +77696,17 @@ ${content}</tr>
       ] }),
       expanded && /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "tool-body-grid", children: [
         /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "tool-body-row", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "tool-body-row-label", children: "IN" }),
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "tool-body-row-label-row", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tool-body-row-label", children: "IN" }),
+            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(CopyButton, { text: tool.args, label: "input" })
+          ] }),
           /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "tool-body-row-content clipped", children: tool.args })
         ] }),
         tool.output !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "tool-body-row", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "tool-body-row-label", children: "OUT" }),
+          /* @__PURE__ */ (0, import_jsx_runtime7.jsxs)("div", { className: "tool-body-row-label-row", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("span", { className: "tool-body-row-label", children: "OUT" }),
+            /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(CopyButton, { text: tool.output, label: "output" })
+          ] }),
           /* @__PURE__ */ (0, import_jsx_runtime7.jsx)("div", { className: "tool-body-row-content", style: showDiff ? { maxHeight: "none" } : void 0, children: showDiff ? /* @__PURE__ */ (0, import_jsx_runtime7.jsx)(DiffView, { content: tool.output }) : tool.output })
         ] })
       ] })
@@ -77681,22 +77793,31 @@ ${content}</tr>
     const isStreaming = message.streaming;
     const dotClass = isStreaming ? "dot-brand dot-blink" : hasError ? "dot-error" : "dot-success";
     const toolCalls = message.toolCalls ?? [];
+    const [copied, setCopied] = (0, import_react8.useState)(false);
+    const handleCopy = (0, import_react8.useCallback)(() => {
+      navigator.clipboard.writeText(message.text).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2e3);
+      });
+    }, [message.text]);
+    const hasContent = toolCalls.length > 0 || message.text;
     return /* @__PURE__ */ (0, import_jsx_runtime9.jsx)("div", { className: `timeline-message ${dotClass}${className}`, children: /* @__PURE__ */ (0, import_jsx_runtime9.jsxs)("div", { className: "assistant-message-content", children: [
       toolCalls.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime9.jsx)("div", { className: "tool-list", children: toolCalls.map((tool) => /* @__PURE__ */ (0, import_jsx_runtime9.jsx)(ToolCall, { tool }, tool.id)) }),
       message.text && /* @__PURE__ */ (0, import_jsx_runtime9.jsx)(Markdown, { content: message.text }),
       isStreaming && !message.text && /* @__PURE__ */ (0, import_jsx_runtime9.jsx)("span", { className: "streaming-cursor" }),
       message.permissionRequest && message.permissionRequest.status === "pending" && /* @__PURE__ */ (0, import_jsx_runtime9.jsx)(PermissionRequest, { request: message.permissionRequest }),
-      isStreaming && message.text && /* @__PURE__ */ (0, import_jsx_runtime9.jsx)("span", { className: "streaming-cursor" })
+      isStreaming && message.text && /* @__PURE__ */ (0, import_jsx_runtime9.jsx)("span", { className: "streaming-cursor" }),
+      hasContent && !isStreaming && /* @__PURE__ */ (0, import_jsx_runtime9.jsx)("button", { className: "msg-copy-btn", onClick: handleCopy, children: copied ? "\u2713 Copied" : "Copy" })
     ] }) });
   }
 
   // webview-ui/src/components/SearchBar.tsx
-  var import_react8 = __toESM(require_react());
+  var import_react9 = __toESM(require_react());
   var import_jsx_runtime10 = __toESM(require_jsx_runtime());
   function SearchBar() {
     const { state, dispatch } = useChatContext();
-    const inputRef = (0, import_react8.useRef)(null);
-    (0, import_react8.useEffect)(() => {
+    const inputRef = (0, import_react9.useRef)(null);
+    (0, import_react9.useEffect)(() => {
       inputRef.current?.focus();
     }, []);
     if (!state.searchOpen) return null;
@@ -77762,17 +77883,21 @@ ${content}</tr>
   var import_jsx_runtime11 = __toESM(require_jsx_runtime());
   function MessageList() {
     const { state } = useChatContext();
-    const bottomRef = (0, import_react9.useRef)(null);
-    const containerRef = (0, import_react9.useRef)(null);
-    const isUserScrolledUp = (0, import_react9.useRef)(false);
-    const handleScroll = (0, import_react9.useCallback)(() => {
+    const bottomRef = (0, import_react10.useRef)(null);
+    const containerRef = (0, import_react10.useRef)(null);
+    const [isUserScrolledUp, setIsUserScrolledUp] = (0, import_react10.useState)(false);
+    const scrollToBottom = (0, import_react10.useCallback)(() => {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      setIsUserScrolledUp(false);
+    }, []);
+    const handleScroll = (0, import_react10.useCallback)(() => {
       const el = containerRef.current;
       if (!el) return;
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-      isUserScrolledUp.current = !atBottom;
+      setIsUserScrolledUp(!atBottom);
     }, []);
-    (0, import_react9.useEffect)(() => {
-      if (!isUserScrolledUp.current) {
+    (0, import_react10.useEffect)(() => {
+      if (!isUserScrolledUp) {
         bottomRef.current?.scrollIntoView({ behavior: "smooth" });
       }
     }, [state.messages, state.queuedMessages, state.isGenerating]);
@@ -77803,7 +77928,17 @@ ${content}</tr>
               const highlightClass = matches ? " highlighted" : "";
               return /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(UserMessage, { message: msg, className: highlightClass }, msg.id);
             }),
-            /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { ref: bottomRef })
+            /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("div", { ref: bottomRef }),
+            isUserScrolledUp && /* @__PURE__ */ (0, import_jsx_runtime11.jsx)(
+              "button",
+              {
+                className: "scroll-to-bottom-btn",
+                onClick: scrollToBottom,
+                "aria-label": "Scroll to latest",
+                title: "Scroll to latest",
+                children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "none", children: /* @__PURE__ */ (0, import_jsx_runtime11.jsx)("path", { d: "M4 6L8 10L12 6", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", strokeLinejoin: "round" }) })
+              }
+            )
           ]
         }
       ),
@@ -77812,10 +77947,10 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/InputArea.tsx
-  var import_react12 = __toESM(require_react());
+  var import_react13 = __toESM(require_react());
 
   // webview-ui/src/components/SlashPicker.tsx
-  var import_react10 = __toESM(require_react());
+  var import_react11 = __toESM(require_react());
   var import_jsx_runtime12 = __toESM(require_jsx_runtime());
   var slashCommands = [
     { name: "login", label: "/login", description: "Sign in with AtomGit" },
@@ -77829,14 +77964,14 @@ ${content}</tr>
     { name: "optimize", label: "/optimize", description: "Optimize performance" }
   ];
   function SlashPicker({ filter, onSelect, onClose }) {
-    const [activeIndex, setActiveIndex] = (0, import_react10.useState)(0);
+    const [activeIndex, setActiveIndex] = (0, import_react11.useState)(0);
     const filtered = slashCommands.filter(
       (cmd) => cmd.name.startsWith(filter.toLowerCase())
     );
-    (0, import_react10.useEffect)(() => {
+    (0, import_react11.useEffect)(() => {
       setActiveIndex(0);
     }, [filter]);
-    const handleKeyDown = (0, import_react10.useCallback)(
+    const handleKeyDown = (0, import_react11.useCallback)(
       (e) => {
         if (filtered.length === 0) return;
         if (e.key === "ArrowDown") {
@@ -77855,7 +77990,7 @@ ${content}</tr>
       },
       [filtered, activeIndex, onSelect, onClose]
     );
-    (0, import_react10.useEffect)(() => {
+    (0, import_react11.useEffect)(() => {
       document.addEventListener("keydown", handleKeyDown);
       return () => document.removeEventListener("keydown", handleKeyDown);
     }, [handleKeyDown]);
@@ -77876,13 +78011,13 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/ModelSelector.tsx
-  var import_react11 = __toESM(require_react());
+  var import_react12 = __toESM(require_react());
   var import_jsx_runtime13 = __toESM(require_jsx_runtime());
   function ModelSelector({ placement = "down", onOpen }) {
     const { state, selectModel } = useChatContext();
-    const [open, setOpen] = (0, import_react11.useState)(false);
-    const containerRef = (0, import_react11.useRef)(null);
-    (0, import_react11.useEffect)(() => {
+    const [open, setOpen] = (0, import_react12.useState)(false);
+    const containerRef = (0, import_react12.useRef)(null);
+    (0, import_react12.useEffect)(() => {
       function handleClickOutside(e) {
         if (containerRef.current && !containerRef.current.contains(e.target)) {
           setOpen(false);
@@ -77945,26 +78080,33 @@ ${content}</tr>
   var import_jsx_runtime14 = __toESM(require_jsx_runtime());
   function InputArea() {
     const { state, send, stop, dispatch } = useChatContext();
-    const [text2, setText] = (0, import_react12.useState)("");
-    const [showSlash, setShowSlash] = (0, import_react12.useState)(false);
-    const [slashFilter, setSlashFilter] = (0, import_react12.useState)("");
-    const inputBoxRef = (0, import_react12.useRef)(null);
-    const containerRef = (0, import_react12.useRef)(null);
-    const textareaRef = (0, import_react12.useRef)(null);
-    (0, import_react12.useEffect)(() => {
+    const [text2, setText] = (0, import_react13.useState)("");
+    const [showSlash, setShowSlash] = (0, import_react13.useState)(false);
+    const [slashFilter, setSlashFilter] = (0, import_react13.useState)("");
+    const [showFilePicker, setShowFilePicker] = (0, import_react13.useState)(false);
+    const [fileQuery, setFileQuery] = (0, import_react13.useState)("");
+    const [workspaceFiles, setWorkspaceFiles] = (0, import_react13.useState)([]);
+    const inputBoxRef = (0, import_react13.useRef)(null);
+    const containerRef = (0, import_react13.useRef)(null);
+    const textareaRef = (0, import_react13.useRef)(null);
+    const fileSearchRef = (0, import_react13.useRef)(null);
+    (0, import_react13.useEffect)(() => {
       const el = textareaRef.current;
       if (!el) return;
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
     }, [text2]);
-    (0, import_react12.useEffect)(() => {
+    (0, import_react13.useEffect)(() => {
       function handleMessage(e) {
         if (e.data?.type === "focusInput") textareaRef.current?.focus();
+        if (e.data?.type === "workspaceFiles") {
+          setWorkspaceFiles(e.data.files || []);
+        }
       }
       window.addEventListener("message", handleMessage);
       return () => window.removeEventListener("message", handleMessage);
     }, []);
-    (0, import_react12.useEffect)(() => {
+    (0, import_react13.useEffect)(() => {
       const container = containerRef.current;
       if (!container) return;
       const sessionBody = container.closest(".session-body");
@@ -77982,7 +78124,19 @@ ${content}</tr>
         sessionBody.style.removeProperty("--input-inset");
       };
     }, []);
-    (0, import_react12.useEffect)(() => {
+    (0, import_react13.useEffect)(() => {
+      if (!showFilePicker) return void 0;
+      requestAnimationFrame(() => fileSearchRef.current?.focus());
+      function handlePointerDown(e) {
+        if (inputBoxRef.current && !inputBoxRef.current.contains(e.target)) {
+          setShowFilePicker(false);
+          setFileQuery("");
+        }
+      }
+      document.addEventListener("mousedown", handlePointerDown);
+      return () => document.removeEventListener("mousedown", handlePointerDown);
+    }, [showFilePicker]);
+    (0, import_react13.useEffect)(() => {
       if (!showSlash) return void 0;
       function handlePointerDown(e) {
         if (inputBoxRef.current && !inputBoxRef.current.contains(e.target)) {
@@ -77992,7 +78146,7 @@ ${content}</tr>
       document.addEventListener("mousedown", handlePointerDown);
       return () => document.removeEventListener("mousedown", handlePointerDown);
     }, [showSlash]);
-    const handleChange = (0, import_react12.useCallback)((e) => {
+    const handleChange = (0, import_react13.useCallback)((e) => {
       const val = e.target.value;
       setText(val);
       if (/^\/\S*$/.test(val)) {
@@ -78002,14 +78156,14 @@ ${content}</tr>
         setShowSlash(false);
       }
     }, []);
-    const handleSend = (0, import_react12.useCallback)(() => {
+    const handleSend = (0, import_react13.useCallback)(() => {
       const trimmed = text2.trim();
       if (!trimmed) return;
       send(trimmed);
       setText("");
       setShowSlash(false);
     }, [text2, send]);
-    const handleKeyDown = (0, import_react12.useCallback)(
+    const handleKeyDown = (0, import_react13.useCallback)(
       (e) => {
         if (showSlash) return;
         if (e.nativeEvent.isComposing || e.keyCode === 229) return;
@@ -78020,20 +78174,71 @@ ${content}</tr>
       },
       [handleSend, showSlash]
     );
-    const handleSlashSelect = (0, import_react12.useCallback)((command) => {
+    const handleSlashSelect = (0, import_react13.useCallback)((command) => {
       setText(command + " ");
       setShowSlash(false);
       textareaRef.current?.focus();
     }, []);
-    const handleSlashButton = (0, import_react12.useCallback)(() => {
+    const handleSlashButton = (0, import_react13.useCallback)(() => {
       setText("/");
       setSlashFilter("");
       setShowSlash((open) => !open);
       textareaRef.current?.focus();
     }, []);
+    const handleAttachClick = (0, import_react13.useCallback)(() => {
+      setShowFilePicker((prev) => {
+        const next = !prev;
+        if (next) {
+          setShowSlash(false);
+          postMessage({ type: "searchWorkspaceFiles", query: "" });
+        } else {
+          setFileQuery("");
+        }
+        return next;
+      });
+    }, []);
+    const handleFileSearch = (0, import_react13.useCallback)((query) => {
+      setFileQuery(query);
+      postMessage({ type: "searchWorkspaceFiles", query });
+    }, []);
+    const handleFileSelect = (0, import_react13.useCallback)((f) => {
+      postMessage({ type: "attachFile", path: f.path });
+      setShowFilePicker(false);
+      setFileQuery("");
+      textareaRef.current?.focus();
+    }, []);
     const hasText = Boolean(text2.trim());
     return /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "input-container", ref: containerRef, children: /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "input-box", ref: inputBoxRef, children: [
       showSlash && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(SlashPicker, { filter: slashFilter, onSelect: handleSlashSelect, onClose: () => setShowSlash(false) }),
+      showFilePicker && /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "file-picker", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(
+          "input",
+          {
+            ref: fileSearchRef,
+            className: "file-picker-search",
+            type: "text",
+            placeholder: "Search project files...",
+            value: fileQuery,
+            onChange: (e) => handleFileSearch(e.target.value)
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "file-picker-list", children: workspaceFiles.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "file-picker-empty", children: fileQuery ? "No matching files" : "Type to search workspace files" }) : workspaceFiles.map((f) => /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)(
+          "button",
+          {
+            type: "button",
+            className: "file-picker-item",
+            onClick: () => handleFileSelect(f),
+            children: [
+              /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "file-picker-item-icon", children: "\u{1F4C4}" }),
+              /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("span", { className: "file-picker-item-body", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "file-picker-item-name", children: f.fileName }),
+                /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "file-picker-item-path", children: f.relativePath })
+              ] })
+            ]
+          },
+          f.path
+        )) })
+      ] }),
       state.contextFiles.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "attached-files", children: state.contextFiles.map((f) => /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("span", { className: "attached-file-pill", title: f.path, children: [
         f.type === "selection" ? "\u{1F4CB}" : "\u{1F4C4}",
         " ",
@@ -78054,6 +78259,7 @@ ${content}</tr>
       ),
       /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("div", { className: "input-footer", children: [
         /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "footer-slash-btn", onClick: handleSlashButton, title: "Commands", children: "/" }),
+        /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "footer-attach-btn", onClick: handleAttachClick, title: "Attach file", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("svg", { width: "14", height: "14", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round", children: /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("path", { d: "M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" }) }) }),
         /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "footer-spacer" }),
         state.tokenCount && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "footer-tokens", children: formatTokenCount(state.tokenCount.total) }),
         /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(ModelSelector, { placement: "up", onOpen: () => setShowSlash(false) }),
@@ -78072,32 +78278,32 @@ ${content}</tr>
   }
 
   // webview-ui/src/components/SessionList.tsx
-  var import_react13 = __toESM(require_react());
+  var import_react14 = __toESM(require_react());
   var import_jsx_runtime15 = __toESM(require_jsx_runtime());
   var DATE_ORDER = ["Today", "Yesterday", "This Week", "Older"];
   function SessionList({ variant = "overlay" }) {
-    const { state, dispatch, loadSession, newConversation, renameSession, deleteSession } = useChatContext();
-    const [search, setSearch] = (0, import_react13.useState)("");
-    const [menu, setMenu] = (0, import_react13.useState)(null);
+    const { state, dispatch, openSessionInTab, renameSession, deleteSession } = useChatContext();
+    const [search, setSearch] = (0, import_react14.useState)("");
+    const [menu, setMenu] = (0, import_react14.useState)(null);
     const isOverlay = variant === "overlay";
-    const filteredSessions = (0, import_react13.useMemo)(() => {
+    const filteredSessions = (0, import_react14.useMemo)(() => {
       if (!search.trim()) return state.sessions;
       const q = search.toLowerCase();
       return state.sessions.filter(
         (s) => (s.name ?? "").toLowerCase().includes(q) || (s.title ?? "").toLowerCase().includes(q)
       );
     }, [state.sessions, search]);
-    const groups = (0, import_react13.useMemo)(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
+    const groups = (0, import_react14.useMemo)(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
     function handleSelect(session) {
       setMenu(null);
-      loadSession(session.id, session.project_hash);
+      openSessionInTab(session.id, session.project_hash);
       if (isOverlay) {
         dispatch({ type: "TOGGLE_HISTORY" });
       }
     }
     function handleNewSession() {
       setMenu(null);
-      newConversation();
+      openSessionInTab();
       if (isOverlay) {
         dispatch({ type: "TOGGLE_HISTORY" });
       }
@@ -78113,7 +78319,7 @@ ${content}</tr>
         y: Math.min(e.clientY, window.innerHeight - menuHeight - 8)
       });
     }
-    (0, import_react13.useEffect)(() => {
+    (0, import_react14.useEffect)(() => {
       if (!menu) return void 0;
       function close() {
         setMenu(null);
@@ -78159,6 +78365,14 @@ ${content}</tr>
           /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-group-label", children: label }),
           items.map((s) => {
             const isActive = s.id === state.activeSessionId;
+            let dotClass = "";
+            if (!isActive) {
+              if (s.isGenerating) {
+                dotClass = "session-item-dot breathing";
+              } else if (s.hasUnread) {
+                dotClass = "session-item-dot";
+              }
+            }
             return /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)(
               "button",
               {
@@ -78167,6 +78381,7 @@ ${content}</tr>
                 onContextMenu: (e) => handleContextMenu(e, s),
                 title: s.name || s.title || "Untitled",
                 children: [
+                  dotClass && /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: dotClass }),
                   /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-item-name", children: s.name || s.title || "Untitled" }),
                   /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-item-time", children: formatTimeAgo(s.updated_at ?? s.created_at) })
                 ]
@@ -78220,7 +78435,7 @@ ${content}</tr>
   function ChatApp() {
     const { state } = useChatContext();
     const hasMessages = state.messages.length > 0 || state.isGenerating;
-    if (state.viewMode === "sidebar") {
+    if (state.isSessionList) {
       return /* @__PURE__ */ (0, import_jsx_runtime16.jsx)("div", { className: "app app-sidebar", children: /* @__PURE__ */ (0, import_jsx_runtime16.jsx)(SessionList, { variant: "sidebar" }) });
     }
     return /* @__PURE__ */ (0, import_jsx_runtime16.jsxs)("div", { className: "app", children: [
@@ -78238,6 +78453,17 @@ ${content}</tr>
 
   // webview-ui/src/index.tsx
   var import_jsx_runtime17 = __toESM(require_jsx_runtime());
+  (function detectTheme() {
+    const bg = getComputedStyle(document.body).getPropertyValue("--vscode-editor-background").trim();
+    if (!bg) return;
+    const m = bg.match(/[\d.]+/g);
+    if (!m || m.length < 3) return;
+    const [r, g, b] = m.map(Number);
+    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    if (lum > 160) {
+      document.body.classList.add("vscode-light");
+    }
+  })();
   var root = document.getElementById("root");
   if (root) {
     (0, import_client.createRoot)(root).render(/* @__PURE__ */ (0, import_jsx_runtime17.jsx)(App, {}));

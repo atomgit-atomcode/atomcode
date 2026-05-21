@@ -1111,7 +1111,7 @@ async fn change_dir(
         }
 
         let hash = hash_path(&new_path);
-        state.telemetry.track(Event::UseCommand { type_: "cd".into() });
+        state.telemetry.track(Event::UseCommand { type_: "cd".into(), success: Some(true), error_kind: None, error_data: None });
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
@@ -1339,7 +1339,7 @@ async fn delete_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match delete_session_file(&hash, &id) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into() });
+                state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into(), success: Some(true), error_kind: None, error_data: None });
                 let msg = format!("Session {} deleted successfully", id);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -1398,7 +1398,7 @@ async fn rename_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match rename_session_file(&hash, &id, &req.name) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "rename".into() });
+                state_clone.telemetry.track(Event::UseCommand { type_: "rename".into(), success: Some(true), error_kind: None, error_data: None });
                 let msg = format!("Session {} renamed to '{}'", id, req.name);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -1474,6 +1474,11 @@ pub struct ChatRequest {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum ChatEvent {
+    /// Tool batch started (all tools in this assistant turn)
+    #[serde(rename = "tool_batch")]
+    ToolBatchStarted {
+        calls: Vec<atomcode_core::turn::event::ToolBatchCall>,
+    },
     /// LLM text delta
     #[serde(rename = "text")]
     TextDelta { content: String },
@@ -2085,8 +2090,9 @@ async fn process_chat_request(
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
-    // Check if session was stopped before we started
-    // If so, clear the stopped marker and return - allows next chat to proceed normally
+    // Check if session was stopped before we started the turn loop.
+    // If so, save the current conversation (session messages + user message)
+    // and return so the user can resume from this point later.
     let session_id_str = req.session_id.clone().unwrap_or_default();
     if stopped_sessions
         .write()
@@ -2094,6 +2100,17 @@ async fn process_chat_request(
         .take(&session_id_str)
         .is_some()
     {
+        // Save what we have — align with TUI behaviour: a stopped
+        // conversation should still be resumable via /resume.
+        {
+            let conv = conversation.lock().await;
+            session.messages = conv.messages.clone();
+            session.auto_name_from_messages();
+            session.touch();
+            if let Err(e) = session_manager.save(&session) {
+                eprintln!("Warning: Failed to save session after early stop: {}", e);
+            }
+        }
         let _ = event_tx.send(ChatEvent::Stopped);
         let _ = event_tx.send(ChatEvent::Done {
             tokens: 0,
@@ -2263,7 +2280,10 @@ async fn process_chat_request(
                 // Daemon/HTTP mode doesn't surface the "tool name streaming" phase —
                 // API clients receive the complete ToolCallStarted event when args are ready.
             }
-            TurnEvent::ToolBatchStarted { .. } | TurnEvent::ToolBatchCompleted { .. } => {
+            TurnEvent::ToolBatchStarted { calls, .. } => {
+                let _ = event_tx.send(ChatEvent::ToolBatchStarted { calls });
+            }
+            TurnEvent::ToolBatchCompleted { .. } => {
                 // Batch events are TUI-only display optimisations. The
                 // per-call ToolCallStarted/Result events still fire and
                 // carry the full payload that HTTP clients consume.
@@ -2286,21 +2306,24 @@ async fn process_chat_request(
         let _ = event_tx.send(event);
     }
 
-    // Save session after conversation completes (unless stopped)
+    // Save session after conversation completes.
+    // If the session was stopped mid-turn, clean up the partial conversation
+    // and save it so the user can /resume from this point — same behaviour as
+    // the TUI (persist_current_session on TurnCancelled).
     let session_id_str = req.session_id.clone().unwrap_or_default();
     let was_stopped = stopped_sessions.read().await.contains(&session_id_str);
 
-    if was_stopped {
-        // Session was stopped, don't save the messages
-        eprintln!("Session {} was stopped, skipping save", session_id_str);
-    } else {
-        let conv = conversation.lock().await;
-        session.messages = conv.messages.clone();
-        session.auto_name_from_messages();
-        session.touch();
-        if let Err(e) = session_manager.save(&session) {
-            eprintln!("Warning: Failed to save session: {}", e);
+    {
+        let mut conv = conversation.lock().await;
+        if was_stopped {
+            conv.cancel_current_turn();
         }
+        session.messages = conv.messages.clone();
+    }
+    session.auto_name_from_messages();
+    session.touch();
+    if let Err(e) = session_manager.save(&session) {
+        eprintln!("Warning: Failed to save session: {}", e);
     }
 
     // Clean up stopped sessions marker if present
@@ -2476,7 +2499,7 @@ async fn stop_chat(
         // Cancel the chat task if it exists
         if let Some(cancel_token) = state_clone.chat_tasks.read().await.get(&req.session_id) {
             cancel_token.cancel();
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into() });
+            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2486,7 +2509,7 @@ async fn stop_chat(
             )
         } else {
             // Session wasn't running, but we marked it as stopped
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into() });
+            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2500,6 +2523,14 @@ async fn stop_chat(
         }
     })
     .await
+}
+
+/// GET /chat/active - Return list of session IDs currently generating
+async fn active_chat_sessions(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let sessions: Vec<String> = state.chat_tasks.read().await.keys().cloned().collect();
+    Json(sessions)
 }
 
 // --- MCP API handlers ---
@@ -2622,6 +2653,13 @@ fn install_panic_hook(telemetry: Arc<Telemetry>) {
             message_head: scrubbed_msg,
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
+            error_kind: Some("panic".to_string()),
+            error_data: Some(serde_json::json!({
+                "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                "turns_completed": null,
+                "last_tool_name": null,
+                "last_event": null,
+            }).to_string()),
         });
         default_hook(info); // R9.4: preserve stderr output
     }));
@@ -2861,6 +2899,7 @@ async fn main() {
         // Chat API
         .route("/chat", post(chat_stream))
         .route("/chat/stop", post(stop_chat))
+        .route("/chat/active", get(active_chat_sessions))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))

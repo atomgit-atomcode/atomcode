@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { ToolCallData } from '../state/types';
 import { formatToolArgs } from '../utils/format';
 import { DiffView } from './DiffView';
@@ -11,6 +11,24 @@ function isDiffContent(output: string): boolean {
   return output.includes('@@') && (output.includes('+') || output.includes('-'));
 }
 
+function CopyButton({ text, label }: { text: string; label?: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }, [text]);
+
+  return (
+    <button className="tool-body-row-copy" onClick={handleCopy} title={copied ? 'Copied!' : `Copy ${label || ''}`}>
+      {copied ? '✓' : '📋'}
+    </button>
+  );
+}
+
 export function ToolCall({ tool }: ToolCallProps) {
   const [expanded, setExpanded] = useState(false);
   const secondary = formatToolArgs(tool.name, tool.args);
@@ -20,9 +38,11 @@ export function ToolCall({ tool }: ToolCallProps) {
 
   const annotationClass =
     tool.status === 'error' ? 'error' :
-    tool.status === 'done' ? 'success' : '';
+    tool.status === 'done' ? 'success' :
+    tool.status === 'queued' ? 'queued' : '';
 
   const annotationText =
+    tool.status === 'queued' ? 'waiting' :
     tool.status === 'running' ? undefined :
     tool.status === 'error' ? 'error' :
     isEditTool && tool.status === 'done' ? 'applied' :
@@ -46,12 +66,18 @@ export function ToolCall({ tool }: ToolCallProps) {
       {expanded && (
         <div className="tool-body-grid">
           <div className="tool-body-row">
-            <div className="tool-body-row-label">IN</div>
+            <div className="tool-body-row-label-row">
+              <span className="tool-body-row-label">IN</span>
+              <CopyButton text={tool.args} label="input" />
+            </div>
             <div className="tool-body-row-content clipped">{tool.args}</div>
           </div>
           {tool.output !== undefined && (
             <div className="tool-body-row">
-              <div className="tool-body-row-label">OUT</div>
+              <div className="tool-body-row-label-row">
+                <span className="tool-body-row-label">OUT</span>
+                <CopyButton text={tool.output} label="output" />
+              </div>
               <div className="tool-body-row-content" style={showDiff ? { maxHeight: 'none' } : undefined}>
                 {showDiff ? <DiffView content={tool.output} /> : tool.output}
               </div>

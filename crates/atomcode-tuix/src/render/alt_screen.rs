@@ -1046,6 +1046,70 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let _ = self.out.write_all(rule.as_bytes());
         }
 
+        // Session-name pill overlay: ` {name} ` painted in reverse +
+        // cyan (cyan bg, terminal default fg) over the right end of
+        // the top rule. Mirrors CC's per-conversation badge so the
+        // user can tell which session they're typing into at a
+        // glance. Only emitted when `session_name` is Some — populated
+        // by build_status iff `Session::user_renamed`, so auto-named
+        // sessions stay badge-less.
+        //
+        // Layout budget:
+        //   right_margin   = 2 cells (don't hug the rightmost column —
+        //                    legacy conhost wraps when writing into the
+        //                    last cell of a row)
+        //   pill_padding   = 2 cells (one space each side of the name)
+        //   min_rule_left  = 8 cells (keep enough ━ on the left so the
+        //                    box still reads as bordered; without this
+        //                    a very long name eats the entire rule and
+        //                    the input box loses its visual anchor)
+        // Available for the name: width - right_margin - pill_padding
+        //                         - min_rule_left = width - 12.
+        // If the terminal is too narrow for even 1 cell of name + the
+        // surrounding chrome, skip the badge entirely.
+        if let Some(name_raw) = self.pending_status.session_name.as_ref() {
+            let name_scrubbed = scrub_controls(name_raw);
+            const RIGHT_MARGIN: usize = 2;
+            const PILL_PADDING: usize = 2;
+            const MIN_RULE_LEFT: usize = 8;
+            let total_w = self.width as usize;
+            let chrome = RIGHT_MARGIN + PILL_PADDING + MIN_RULE_LEFT;
+            if total_w > chrome {
+                let max_name_w = total_w - chrome;
+                let name_w = crate::width::display_width(&name_scrubbed);
+                // Truncate with `…` when over budget. `…` is one cell;
+                // `truncate_to_width(name, max_name_w - 1) + "…"` keeps
+                // the total under max_name_w. If max_name_w == 1, just
+                // emit a single `…` (no room for any name char).
+                let name_for_pill = if name_w <= max_name_w {
+                    name_scrubbed
+                } else if max_name_w <= 1 {
+                    "…".to_string()
+                } else {
+                    let truncated = crate::width::truncate_to_width(&name_scrubbed, max_name_w - 1);
+                    format!("{}…", truncated)
+                };
+                let pill_content_w = crate::width::display_width(&name_for_pill) + PILL_PADDING;
+                // Start column (1-indexed) so the pill ends RIGHT_MARGIN
+                // cells from the rightmost column. e.g. width=80,
+                // pill_content_w=12, margin=2 → start col = 80-2-12+1 = 67.
+                let start_col = total_w.saturating_sub(RIGHT_MARGIN + pill_content_w) + 1;
+                let cup = format!("\x1b[{};{}H", top_rule_row, start_col);
+                let _ = self.out.write_all(cup.as_bytes());
+                if self.caps.colors {
+                    let _ = write!(
+                        self.out,
+                        "\x1b[7;96m {} \x1b[0m",
+                        name_for_pill
+                    );
+                } else {
+                    // No colors: surround with spaces so the name stays
+                    // legible against the ━ rule on either side.
+                    let _ = write!(self.out, " {} ", name_for_pill);
+                }
+            }
+        }
+
         // Input row: `❯ {buf}` flush-left at col 0. matches retained's
         // `build_middle_row`.
         let cup = format!("\x1b[{};1H\x1b[K", input_row);
@@ -2581,29 +2645,38 @@ mod tests {
         drop(r);
     }
 
-    /// Phase 3.5: code fences toggle md_state. A ```fenced``` block
-    /// keeps subsequent lines in code-block mode (no inline markdown
-    /// applied). The fence line itself returns None from render_line
-    /// (no body row pushed for the ```fence``` line) but `body_dirty`
-    /// is still set on subsequent content.
+    /// Phase 3.5 (updated for buffer-and-flush): a ```fenced``` block now
+    /// buffers body lines until close fence. The fence-open line and each
+    /// body line return None (no body row pushed). The close fence flushes
+    /// the whole block as a single body row containing all lines (with
+    /// per-line indent).
     #[test]
     fn fenced_code_block_state_carries_across_streaming_chunks() {
         let mut buf = Vec::new();
         let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+
         r.render(UiLine::AssistantText("```rust\n".into()));
-        // Fence line itself doesn't render — md_state.in_code_block
-        // flips to true, no body row pushed.
+        // Fence-open line doesn't render — md_state.in_code_block flips on,
+        // no body row pushed and no body_dirty for an empty fence.
         assert_eq!(r.body_lines.len(), 0, "fence-open line must not push");
         assert!(r.md_state.in_code_block, "code-block state must flip on");
 
         r.render(UiLine::AssistantText("let x = 1;\n".into()));
-        assert_eq!(r.body_lines.len(), 1, "code line pushed");
-        // Code-block state still on — next line should still be in code.
+        // Buffered — no body row pushed yet, code_buf has 1 entry, state still on.
+        assert_eq!(
+            r.body_lines.len(),
+            0,
+            "body line inside open fence must buffer, not push"
+        );
+        assert_eq!(r.md_state.code_buf.len(), 1, "code_buf must hold the body line");
         assert!(r.md_state.in_code_block);
 
         r.render(UiLine::AssistantText("```\n".into()));
-        // Fence-close, state flips back.
+        // Close fence flushes — state off, code_buf empty, at least one body row
+        // pushed containing the flushed (highlighted-or-plain) block.
         assert!(!r.md_state.in_code_block, "code-block state must flip off");
+        assert!(r.md_state.code_buf.is_empty(), "code_buf must be drained");
+        assert!(r.body_lines.len() >= 1, "close fence must flush at least one body row");
         drop(r);
     }
 
@@ -3052,6 +3125,7 @@ mod tests {
                 ctx_window: 0,
                 hint: None,
                 mode_indicator: Some("PLAN".into()),
+                session_name: None,
             },
             attachments: Vec::new(),
         });
@@ -3085,6 +3159,131 @@ mod tests {
         );
     }
 
+    /// After the user runs `/rename`, the conversation name should
+    /// appear as a right-aligned cyan-bg pill overlaid on the top
+    /// rule of the input box. Mirrors CC's per-conversation badge so
+    /// users can confirm which session they're typing into without
+    /// running `/status`.
+    #[test]
+    fn paint_footer_renders_session_name_badge_in_reverse_cyan() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                ctx_used: 0,
+                ctx_window: 0,
+                hint: None,
+                mode_indicator: None,
+                session_name: Some("atomcode加解密".into()),
+            },
+            attachments: Vec::new(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("atomcode加解密"),
+            "session name literal must appear in the rendered footer. got: {:?}",
+            s
+        );
+        // Pill style: SGR_REVERSE (7m) combined with SGR_CYAN (96m) to
+        // paint a cyan-filled chip. The exact concatenation order isn't
+        // load-bearing — only that both attributes are emitted somewhere
+        // in the same byte stream.
+        assert!(
+            s.contains("\x1b[7m") || s.contains("\x1b[7;"),
+            "session-name pill must emit reverse-video SGR (7m). got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[96m") || s.contains(";96m"),
+            "session-name pill must emit cyan SGR (96m). got: {:?}",
+            s
+        );
+    }
+
+    /// When `session_name = None` (auto-named / fresh session) the
+    /// footer must NOT emit the reverse-cyan pill on the top rule —
+    /// guards against the badge leaking onto sessions the user hasn't
+    /// explicitly renamed. We check for the exact `\x1b[7;96m` /
+    /// `\x1b[96;7m` SGR combo rather than a bare `\x1b[7;` prefix
+    /// because the buffer is full of CUP escapes like `\x1b[7;1H`
+    /// (cursor to row 7) which share that prefix but aren't SGR.
+    #[test]
+    fn paint_footer_no_session_name_emits_no_pill() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                ctx_used: 0,
+                ctx_window: 0,
+                hint: None,
+                mode_indicator: None,
+                session_name: None,
+            },
+            attachments: Vec::new(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            !s.contains("\x1b[7;96m") && !s.contains("\x1b[96;7m") && !s.contains("\x1b[7m"),
+            "no session_name must produce no reverse-cyan pill SGR. got: {:?}",
+            s
+        );
+    }
+
+    /// A name wider than the available budget gets ellipsised — the
+    /// alternative is either overflowing the terminal width (visible
+    /// wrap glitch) or swallowing the entire top rule (badge eats the
+    /// border, the input box loses its visual anchor). Budget leaves
+    /// at least 8 cells of `━` rule to the left so the box still
+    /// reads as bordered.
+    #[test]
+    fn paint_footer_truncates_overlong_session_name() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 40, 24);
+        let very_long = "这是一个非常非常非常长的会话名字应该被截断省略";
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                ctx_used: 0,
+                ctx_window: 0,
+                hint: None,
+                mode_indicator: None,
+                session_name: Some(very_long.into()),
+            },
+            attachments: Vec::new(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains('…'),
+            "overlong session name must be truncated with ellipsis. got: {:?}",
+            s
+        );
+        assert!(
+            !s.contains(very_long),
+            "full overlong name must NOT appear verbatim (it'd overflow the rule). got: {:?}",
+            s
+        );
+    }
+
     /// Default Build mode (`mode_indicator = None`) emits no PLAN
     /// literal — protects against accidental "PLAN" leak when the
     /// status line is rendered for a non-plan session. Mirrors the
@@ -3104,6 +3303,7 @@ mod tests {
                 ctx_window: 0,
                 hint: None,
                 mode_indicator: None,
+                session_name: None,
             },
             attachments: Vec::new(),
         });

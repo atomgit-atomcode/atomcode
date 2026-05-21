@@ -90,7 +90,16 @@ pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
     let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(300))
+        // Total request timeout. Long edit_file / write_file generations
+        // on self-hosted GLM/Qwen NPU clusters can stream for 5-15 min on
+        // 100+ line file rewrites (decode 24-30 tok/s × 5K-10K tokens).
+        // The previous 300 s ceiling killed Turn 6 of the 5/12 atomgr
+        // session mid-flight ("Endpoint terminated the response stream").
+        // 1800 s (30 min) is wide enough for any plausible single
+        // generation while still bounding truly-stuck connections;
+        // SSE-level idle timeout (openai.rs, 120 s) catches dead streams
+        // before the request-level timeout.
+        .timeout(std::time::Duration::from_secs(1800))
         .user_agent(ua);
 
     if skip_tls_verify {
@@ -98,6 +107,38 @@ pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool
     }
 
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Distill an upstream HTTP error body down to a human-readable message.
+///
+/// Gateways wrap the real message in JSON envelopes: AtomCode returns
+/// `{"detail":{"code":"X","message":"Y"}}`, FastAPI defaults to
+/// `{"detail":"Y"}`, OpenAI/Anthropic use `{"error":{"message":"Y",...}}`.
+/// Surfacing the raw body shows users the envelope instead of `Y`. Try the
+/// known shapes; fall back to the original body when nothing matches.
+pub(super) fn extract_error_message(body: &str) -> String {
+    let trimmed = body.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(detail) = v.get("detail") {
+            if let Some(msg) = detail.get("message").and_then(|m| m.as_str()) {
+                return msg.to_string();
+            }
+            if let Some(s) = detail.as_str() {
+                return s.to_string();
+            }
+        }
+        if let Some(msg) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return msg.to_string();
+        }
+        if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Factory: create the right provider from config.

@@ -126,6 +126,16 @@ body {
     opacity: 0;
   }
 }
+@keyframes breathe {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 4px rgba(76, 175, 80, 0.5);
+  }
+  50% {
+    opacity: 0.35;
+    box-shadow: 0 0 10px rgba(76, 175, 80, 0.8);
+  }
+}
 @keyframes selectionConfirm {
   0% {
     background-color: var(--app-input-secondary-background);
@@ -291,7 +301,6 @@ body {
 .model-default-badge {
   font-size: 10px;
   opacity: 0.6;
-  background: var(--app-input-background);
   border-radius: 3px;
   padding: 1px 4px;
   flex-shrink: 0;
@@ -608,6 +617,17 @@ body {
   color: var(--app-secondary-foreground);
   flex-shrink: 0;
 }
+.session-item-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #4caf50;
+  flex-shrink: 0;
+  box-shadow: 0 0 4px rgba(76, 175, 80, 0.5);
+}
+.session-item-dot.breathing {
+  animation: breathe 1.5s ease-in-out infinite;
+}
 .session-empty {
   padding: 20px;
   text-align: center;
@@ -736,6 +756,31 @@ body {
   gap: 0;
   min-width: 0;
   background-color: var(--app-primary-background);
+  position: relative;
+}
+.scroll-to-bottom-btn {
+  position: sticky;
+  bottom: 8px;
+  align-self: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid var(--app-input-border);
+  background: var(--app-primary-background);
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  z-index: 10;
+  margin-top: -40px;
+  animation: fadeIn 0.15s ease-out;
+  transition: background 0.15s, color 0.15s;
+}
+.scroll-to-bottom-btn:hover {
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
 }
 .message-gradient {
   position: absolute;
@@ -931,6 +976,32 @@ body {
   width: 100%;
   min-width: 0;
 }
+.msg-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 0.15s,
+    background 0.15s,
+    color 0.15s;
+}
+.timeline-message:hover .msg-copy-btn {
+  opacity: 0.65;
+}
+.msg-copy-btn:hover {
+  opacity: 1 !important;
+  color: var(--app-primary-foreground);
+  background: var(--app-ghost-button-hover-background);
+}
 .error-message-content {
   color: var(--app-error-foreground);
   font-size: 13px;
@@ -1015,48 +1086,58 @@ body {
   font-family: var(--app-monospace-font-family);
   word-break: break-word;
   border-radius: 3px;
-  padding: 2px 4px;
+  padding: 1px 5px;
   font-size: 0.9em;
+  background: color-mix(in srgb, var(--app-secondary-background), transparent 40%);
+  color: var(--app-primary-foreground);
 }
 .markdown-root pre code {
   padding: 0;
 }
 .code-block-wrapper {
   position: relative;
-  margin: 8px 0;
+  margin: 10px 0;
 }
 .code-block-wrapper pre {
   overflow-x: auto;
   white-space: pre;
-  border-radius: var(--corner-radius-small);
-  padding: 8px;
+  border-radius: 6px;
+  padding: 14px 16px;
   max-width: 100%;
   margin: 0;
   font-family: var(--app-monospace-font-family);
   font-size: var(--app-monospace-font-size);
-  line-height: 1.5;
-  background: var(--app-tool-background);
+  line-height: 1.65;
+  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+  border: 1px solid var(--app-input-border);
+}
+.code-block-wrapper pre *::selection,
+.code-block-wrapper pre *::-moz-selection {
+  background: var(--vscode-editor-selectionBackground, color-mix(in srgb, var(--app-brand), transparent 70%));
+}
+.code-block-wrapper pre *::selection {
+  background: var(--vscode-editor-selectionBackground, color-mix(in srgb, var(--app-brand), transparent 70%));
 }
 .copy-button {
   position: absolute;
-  top: 4px;
-  right: 4px;
-  opacity: 0;
+  top: 6px;
+  right: 6px;
+  opacity: 0.55;
   transition: opacity 0.15s, background 0.15s;
   background: var(--app-secondary-background);
   border: 1px solid var(--app-input-border);
   border-radius: var(--corner-radius-small);
-  padding: 4px;
+  padding: 4px 6px;
   cursor: pointer;
   color: var(--app-secondary-foreground);
   display: flex;
   align-items: center;
   justify-content: center;
-}
-.code-block-wrapper:hover .copy-button {
-  opacity: 1;
+  gap: 4px;
+  font-size: 11px;
 }
 .copy-button:hover {
+  opacity: 1;
   background: var(--app-ghost-button-hover-background);
   color: var(--app-primary-foreground);
 }
@@ -1119,6 +1200,10 @@ body {
   color: #c74e39;
   background-color: #c74e3933;
 }
+.tool-annotation.queued {
+  color: var(--app-secondary-foreground);
+  background-color: color-mix(in srgb, var(--app-secondary-foreground), transparent 85%);
+}
 .tool-chevron {
   font-size: 10px;
   color: var(--app-secondary-foreground);
@@ -1154,7 +1239,31 @@ body {
   font-size: 0.85em;
   padding: 8px 10px;
   user-select: none;
+}
+.tool-body-row-label-row {
+  grid-column: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 35%);
+}
+.tool-body-row-copy {
+  border: none;
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.tool-body-row:hover .tool-body-row-copy {
+  opacity: 0.6;
+}
+.tool-body-row-copy:hover {
+  opacity: 1;
+  background: var(--app-ghost-button-hover-background);
 }
 .tool-body-row-content {
   padding: 8px 10px;
@@ -1404,5 +1513,232 @@ body {
 }
 .slash-item-desc {
   color: var(--app-secondary-foreground);
+}
+.file-picker {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: 4px;
+  background: var(--app-menu-background);
+  border: 1px solid var(--app-menu-border);
+  border-radius: var(--corner-radius-medium);
+  box-shadow: 0 4px 12px #0000004d;
+  overflow: hidden;
+  z-index: 30;
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+}
+.file-picker-search {
+  flex-shrink: 0;
+  margin: 8px 8px 0;
+  padding: 6px 10px;
+  background: var(--app-input-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  color: var(--app-input-foreground);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+}
+.file-picker-search:focus {
+  border-color: var(--app-brand);
+}
+.file-picker-search::placeholder {
+  color: var(--app-input-placeholder-foreground);
+}
+.file-picker-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 0;
+}
+.file-picker-empty {
+  padding: 16px 12px;
+  text-align: center;
+  color: var(--app-secondary-foreground);
+  font-size: 12px;
+}
+.file-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 12px;
+  border: none;
+  background: transparent;
+  color: var(--app-menu-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+}
+.file-picker-item:hover {
+  background: var(--app-menu-selection-background);
+}
+.file-picker-item-icon {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.file-picker-item-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+.file-picker-item-name {
+  font-weight: 500;
+  color: var(--app-primary-foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-picker-item-path {
+  color: var(--app-secondary-foreground);
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* webview-ui/src/styles/highlight.css */
+.hljs {
+  color: #d4d4d4;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-section,
+.hljs-link {
+  color: #569cd6;
+}
+.hljs-function .hljs-keyword,
+.hljs-subst {
+  color: #569cd6;
+}
+.hljs-string,
+.hljs-title,
+.hljs-name,
+.hljs-type,
+.hljs-attribute,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-addition,
+.hljs-variable,
+.hljs-template-tag,
+.hljs-template-variable {
+  color: #ce9178;
+}
+.hljs-comment,
+.hljs-quote,
+.hljs-deletion,
+.hljs-meta {
+  color: #6a9955;
+}
+.hljs-number,
+.hljs-regexp,
+.hljs-selector-class,
+.hljs-selector-attr,
+.hljs-selector-pseudo {
+  color: #b5cea8;
+}
+.hljs-built_in,
+.hljs-class .hljs-title,
+.hljs-title.class_ {
+  color: #dcdcaa;
+}
+.hljs-attr,
+.hljs-params {
+  color: #9cdcfe;
+}
+.hljs-tag {
+  color: #569cd6;
+}
+.hljs-tag .hljs-name {
+  color: #569cd6;
+}
+.hljs-tag .hljs-attr {
+  color: #9cdcfe;
+}
+.hljs-property,
+.hljs-doctag,
+.hljs-formula {
+  color: #dcdcaa;
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 600;
+}
+.hljs-punctuation,
+.hljs-operator {
+  color: #d4d4d4;
+}
+body.vscode-light .hljs {
+  color: #24292f;
+}
+body.vscode-light .hljs-keyword,
+body.vscode-light .hljs-selector-tag,
+body.vscode-light .hljs-literal,
+body.vscode-light .hljs-section,
+body.vscode-light .hljs-link {
+  color: #d73a49;
+}
+body.vscode-light .hljs-function .hljs-keyword,
+body.vscode-light .hljs-subst {
+  color: #d73a49;
+}
+body.vscode-light .hljs-string,
+body.vscode-light .hljs-title,
+body.vscode-light .hljs-name,
+body.vscode-light .hljs-type,
+body.vscode-light .hljs-attribute,
+body.vscode-light .hljs-symbol,
+body.vscode-light .hljs-bullet,
+body.vscode-light .hljs-addition,
+body.vscode-light .hljs-variable,
+body.vscode-light .hljs-template-tag,
+body.vscode-light .hljs-template-variable {
+  color: #032f62;
+}
+body.vscode-light .hljs-comment,
+body.vscode-light .hljs-quote,
+body.vscode-light .hljs-deletion,
+body.vscode-light .hljs-meta {
+  color: #6a737d;
+}
+body.vscode-light .hljs-number,
+body.vscode-light .hljs-regexp,
+body.vscode-light .hljs-selector-class,
+body.vscode-light .hljs-selector-attr,
+body.vscode-light .hljs-selector-pseudo {
+  color: #005cc5;
+}
+body.vscode-light .hljs-built_in,
+body.vscode-light .hljs-class .hljs-title,
+body.vscode-light .hljs-title.class_ {
+  color: #6f42c1;
+}
+body.vscode-light .hljs-attr,
+body.vscode-light .hljs-params {
+  color: #1d232b;
+}
+body.vscode-light .hljs-tag {
+  color: #198754;
+}
+body.vscode-light .hljs-tag .hljs-name {
+  color: #198754;
+}
+body.vscode-light .hljs-tag .hljs-attr {
+  color: #1d232b;
+}
+body.vscode-light .hljs-property,
+body.vscode-light .hljs-doctag,
+body.vscode-light .hljs-formula {
+  color: #6f42c1;
+}
+body.vscode-light .hljs-punctuation,
+body.vscode-light .hljs-operator {
+  color: #24292f;
 }
 /*# sourceMappingURL=webview.css.map */

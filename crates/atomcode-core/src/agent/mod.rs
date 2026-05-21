@@ -2381,8 +2381,22 @@ impl AgentLoop {
                     // retry branch which slept and re-sent the same oversized
                     // request — guaranteed to fail again.
                     let is_context_overflow = is_context_overflow_error(&e);
+                    // Open-source build attempted a CodingPlan-signed request.
+                    // The signing module isn't compiled in; retrying is
+                    // guaranteed to fail again. Fail-fast skips the otherwise-
+                    // useless 3-shot retry (3+6+9s of wasted time + 3 spurious
+                    // "[API error 请求失败]" lines hardcoded in Chinese that
+                    // would also display to English-locale users).
+                    let is_official_build_required = is_codingplan_unavailable_error(&e);
 
-                    if (is_messages_illegal || is_context_overflow) && self.retry_count < 2 {
+                    if is_official_build_required {
+                        self.datalog.log_error(&e);
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::Error(public_error_message(&e)));
+                        self.finish_turn(TurnStopReason::Error);
+                        return;
+                    } else if (is_messages_illegal || is_context_overflow) && self.retry_count < 2 {
                         self.retry_count += 1;
                         let sys_prompt = self.build_system_prompt();
                         // Auto-discover the proxy's actually-enforced limit
@@ -3265,6 +3279,22 @@ fn is_auth_error(e: &str) -> bool {
         || e.contains("incorrect_api_key")
 }
 
+/// True when the error came from `build_codingplan_headers` failing
+/// with `SignError::Unavailable` — i.e. an open-source AtomCode build
+/// tried to issue a request that requires the closed-source signing
+/// module. This is **terminal**: no amount of retry will produce a
+/// valid signature in this binary; the user must install the official
+/// release. The retry classifier short-circuits to fail-fast on this
+/// to avoid the otherwise pointless 3-shot retry cycle.
+///
+/// Match on the official releases URL substring — both the English
+/// (`Msg::CpOfficialBuildRequired`) and Chinese variants embed it
+/// verbatim, and the URL is not localised, so a single substring
+/// match handles both locales without coupling to translation strings.
+fn is_codingplan_unavailable_error(e: &str) -> bool {
+    e.contains("atomgit_atomcode/atomcode/releases")
+}
+
 fn should_show_raw_api_error() -> bool {
     !matches!(
         std::env::var("ATOMCODE_SHOW_RAW_API_ERROR").as_deref(),
@@ -3469,9 +3499,9 @@ mod agent_handle_tests {
 #[cfg(test)]
 mod classifier_tests {
     use super::{
-        extract_provider_ctx_limit, is_auth_error, is_context_overflow_error,
-        is_rate_limited_error, public_error_message, public_error_reason,
-        reload_should_clear_conversation,
+        extract_provider_ctx_limit, is_auth_error, is_codingplan_unavailable_error,
+        is_context_overflow_error, is_rate_limited_error, public_error_message,
+        public_error_reason, reload_should_clear_conversation,
     };
 
     // ── reload_should_clear_conversation ──
@@ -3826,6 +3856,38 @@ mod classifier_tests {
         assert!(is_auth_error(
             "API error (401 Unauthorized): invalid_api_key"
         ));
+    }
+
+    /// CpOfficialBuildRequired (English variant) — surfaces from
+    /// build_codingplan_headers in open-source builds when an
+    /// AtomGit-bound request is attempted.
+    #[test]
+    fn codingplan_unavailable_detected_in_english_message() {
+        let en = "This feature requires the official AtomCode build. \
+                  Download it from https://atomgit.com/atomgit_atomcode/atomcode/releases.";
+        assert!(is_codingplan_unavailable_error(en));
+    }
+
+    /// Same error, Chinese locale. The Releases URL is the substring
+    /// match — it's not localised, so the same classifier handles
+    /// both en and zh-CN without coupling to translation text.
+    #[test]
+    fn codingplan_unavailable_detected_in_chinese_message() {
+        let zh = "此功能需要官方 AtomCode 构建，请前往 \
+                  https://atomgit.com/atomgit_atomcode/atomcode/releases 下载安装。";
+        assert!(is_codingplan_unavailable_error(zh));
+    }
+
+    /// Negative: an unrelated network error must NOT trip the
+    /// classifier. Verifies the URL anchor is narrow enough to avoid
+    /// false positives.
+    #[test]
+    fn codingplan_unavailable_does_not_match_unrelated_errors() {
+        assert!(!is_codingplan_unavailable_error(
+            "API error (500 Internal Server Error) at `https://api.openai.com/v1/chat/completions`"
+        ));
+        assert!(!is_codingplan_unavailable_error("Stream timeout: no event for 300s"));
+        assert!(!is_codingplan_unavailable_error(""));
     }
 
     #[test]

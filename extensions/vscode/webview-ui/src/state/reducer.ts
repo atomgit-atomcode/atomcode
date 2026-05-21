@@ -1,4 +1,4 @@
-import { ChatState, ChatAction, ChatMessage, ToolCallData } from './types';
+import { ChatState, ChatAction, ChatMessage, ToolCallData, ContextFile } from './types';
 
 let _msgCounter = 0;
 function nextId(): string {
@@ -45,10 +45,41 @@ function textFromContent(content: unknown): string {
   return '';
 }
 
+// Matches the prefix emitted in provider.ts _handleSend when context files are attached.
+const ATTACHED_FILES_PREFIX = 'The user has attached the following file(s) for context.';
+
+function parseAttachedMessage(rawText: string): { displayText: string; contextFiles: ContextFile[] } {
+  if (!rawText.startsWith(ATTACHED_FILES_PREFIX)) {
+    return { displayText: rawText, contextFiles: [] };
+  }
+
+  const questionMarker = '\n\nUser question: ';
+  const questionIdx = rawText.lastIndexOf(questionMarker);
+  const userQuestion = questionIdx >= 0 ? rawText.slice(questionIdx + questionMarker.length).trim() : rawText;
+
+  // Extract file names from ```<ext> fenced blocks.
+  const contextFiles: ContextFile[] = [];
+  const filePattern = /^File: (\S+)$/gm;
+  let match: RegExpExecArray | null;
+  while ((match = filePattern.exec(rawText)) !== null) {
+    const fileName = match[1];
+    if (!contextFiles.some((f) => f.fileName === fileName)) {
+      contextFiles.push({
+        path: fileName,
+        fileName,
+        type: 'file',
+      });
+    }
+  }
+
+  return { displayText: userQuestion, contextFiles };
+}
+
 export const initialState: ChatState = {
   messages: [],
   queuedMessages: [],
   isGenerating: false,
+  isSessionList: document.body.dataset.viewMode === 'sidebar',
   viewMode: document.body.dataset.viewMode === 'sidebar' ? 'sidebar' : 'tab',
   currentModel: 'default',
   currentProvider: '',
@@ -141,6 +172,25 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       };
     }
 
+    // Resume a session that has an active background stream. Same as
+    // START_GENERATION: create a fresh streaming assistant message that
+    // subsequent text/toolStart events will append to.
+    case 'RESUME_STREAMING': {
+      const assistant: ChatMessage = {
+        id: nextId(),
+        role: 'assistant',
+        text: '',
+        toolCalls: [],
+        streaming: true,
+        timestamp: Date.now(),
+      };
+      return {
+        ...state,
+        isGenerating: true,
+        messages: [...state.messages, assistant],
+      };
+    }
+
     case 'APPEND_TEXT': {
       const msgs = [...state.messages];
       const assistantIndex = lastAssistantIndex(msgs);
@@ -151,21 +201,50 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return { ...state, messages: msgs };
     }
 
+    case 'TOOL_BATCH_START': {
+      const msgs = [...state.messages];
+      const assistantIndex = lastAssistantIndex(msgs);
+      const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
+      if (assistant) {
+        const tools: ToolCallData[] = action.calls.map((c) => ({
+          id: c.id,
+          name: c.name,
+          args: c.args,
+          status: 'queued' as const,
+        }));
+        msgs[assistantIndex] = {
+          ...assistant,
+          toolCalls: [...(assistant.toolCalls ?? []), ...tools],
+        };
+      }
+      return { ...state, messages: msgs };
+    }
+
     case 'TOOL_START': {
       const msgs = [...state.messages];
       const assistantIndex = lastAssistantIndex(msgs);
       const assistant = assistantIndex >= 0 ? msgs[assistantIndex] : undefined;
       if (assistant) {
-        const tool: ToolCallData = {
-          id: action.id,
-          name: action.name,
-          args: action.args,
-          status: 'running',
-        };
-        msgs[assistantIndex] = {
-          ...assistant,
-          toolCalls: [...(assistant.toolCalls ?? []), tool],
-        };
+        const existingIndex = assistant.toolCalls?.findIndex((t) => t.id === action.id);
+        if (existingIndex !== undefined && existingIndex >= 0) {
+          // Tool was already announced via TOOL_BATCH_START — transition to running
+          const updated = assistant.toolCalls!.map((t, i) =>
+            i === existingIndex ? { ...t, args: action.args, status: 'running' as const } : t,
+          );
+          msgs[assistantIndex] = { ...assistant, toolCalls: updated };
+        } else {
+          // Legacy path: tool wasn't in a batch, add it directly as running
+          const tool: ToolCallData = {
+            id: action.id,
+            name: action.name,
+            args: action.args,
+            status: 'running',
+          };
+          msgs[assistantIndex] = {
+            ...assistant,
+            toolCalls: [...(assistant.toolCalls ?? []), tool],
+          };
+        }
       }
       return { ...state, messages: msgs };
     }
@@ -238,7 +317,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     // ─── Session management ─────────────────────────
     case 'CLEAR_CHAT':
-      return { ...state, messages: [], queuedMessages: [], tokenCount: undefined, contextFiles: [] };
+      return { ...state, messages: [], queuedMessages: [], tokenCount: undefined, contextFiles: [], isGenerating: false };
 
     case 'SET_MODELS':
       return { ...state, models: action.models };
@@ -382,16 +461,26 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           status: 'done',
         }));
 
+        const rawText = textFromContent(m.content);
+
+        // User messages may contain inline file content from the send path.
+        // Parse it out into contextFiles so the UI shows attachment pills
+        // instead of dumping the file body into the message bubble.
+        const { displayText, contextFiles } = role === 'user'
+          ? parseAttachedMessage(rawText)
+          : { displayText: rawText, contextFiles: [] as ContextFile[] };
+
         messages.push({
           id: nextId(),
           role,
-          text: textFromContent(m.content),
+          text: displayText,
           toolCalls,
+          contextFiles: contextFiles.length > 0 ? contextFiles : undefined,
           streaming: false,
           timestamp: Date.now(),
         });
       }
-      return { ...state, messages };
+      return { ...state, messages, isGenerating: false };
     }
 
     case 'SET_SEARCH_QUERY':
@@ -441,6 +530,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         currentModel: action.currentModel ?? state.currentModel,
         viewMode: action.viewMode ?? state.viewMode,
         activeSessionId: action.activeSessionId ?? state.activeSessionId,
+        activeProjectHash: action.projectHash ?? state.activeProjectHash,
+        isSessionList: action.isSessionList ?? state.isSessionList,
       };
 
     default:

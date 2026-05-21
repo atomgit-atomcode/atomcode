@@ -13,11 +13,13 @@
 // API gateway sees a consistent `atomcode/<ver>` identifier.
 
 pub mod client;
+pub mod crypto;
 pub mod setup;
 pub mod sync_marker;
 pub mod types;
 
 pub use client::{is_auth_expired, AuthExpired, Client, API_BASE};
+pub use crypto::{signer, RequestSigner, SignError, SignInput, SignOutput};
 pub use setup::{run, SetupReport, StepResult};
 pub use sync_marker::{read_last_sync, write_last_sync_now};
 pub use types::{ClaimResponse, ModelEntry, PlanInfo, PlanType, StatusResponse, UsageInfo};

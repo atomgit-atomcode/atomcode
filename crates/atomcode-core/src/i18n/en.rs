@@ -85,6 +85,25 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ⚠ Status fetch skipped — {}\n", reason).into(),
         Msg::CpStatusFetchFailed { error } =>
             format!("  ⚠ Status fetch failed (non-fatal) — {}\n", error).into(),
+        Msg::CpOfficialBuildRequired => Cow::Borrowed(
+            "This feature requires the official AtomCode build. Download it from \
+             https://atomgit.com/atomgit_atomcode/atomcode/releases.",
+        ),
+        Msg::CpSignStaleClockSkew => Cow::Borrowed(
+            "Request rejected: signed timestamp outside the accepted window. \
+             Please check your system clock (NTP sync) and retry.",
+        ),
+        Msg::CpSignReplayPersisted => Cow::Borrowed(
+            "Request was repeatedly flagged as a replay. Please try the command again.",
+        ),
+        Msg::CpSignVersionTooOld => Cow::Borrowed(
+            "AtomCode is out of date and no longer compatible with CodingPlan. \
+             Please upgrade AtomCode to continue.",
+        ),
+        Msg::CpUpgradeRequired => Cow::Borrowed(
+            "An upgrade is required to continue using CodingPlan. \
+             Please install the latest AtomCode from the official releases.",
+        ),
 
         Msg::ErrUnsupportedLocale { input } =>
             format!("unsupported locale: {input}").into(),
@@ -750,5 +769,42 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("Error: {error}").into(),
         Msg::BgTaskCancelled => "Cancelled.".into(),
         Msg::BgTaskNoSummary => "Task completed (no summary text).".into(),
+    }
+}
+
+#[cfg(test)]
+mod codingplan_crypto_tests {
+    use super::*;
+    use crate::i18n::Msg;
+
+    #[test]
+    fn en_official_build_required_mentions_releases() {
+        let s = en(Msg::CpOfficialBuildRequired);
+        assert!(s.contains("official"));
+        assert!(s.contains("releases"));
+    }
+
+    #[test]
+    fn en_stale_clock_mentions_system_time() {
+        let s = en(Msg::CpSignStaleClockSkew);
+        assert!(s.to_lowercase().contains("clock") || s.to_lowercase().contains("time"));
+    }
+
+    #[test]
+    fn en_replay_persisted_is_non_empty() {
+        let s = en(Msg::CpSignReplayPersisted);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn en_version_too_old_mentions_upgrade() {
+        let s = en(Msg::CpSignVersionTooOld);
+        assert!(s.to_lowercase().contains("upgrade") || s.to_lowercase().contains("update"));
+    }
+
+    #[test]
+    fn en_upgrade_required_is_non_empty() {
+        let s = en(Msg::CpUpgradeRequired);
+        assert!(!s.is_empty());
     }
 }

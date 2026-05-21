@@ -4,7 +4,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use atomcode_telemetry::{CurrentContext, Event as TelemetryEvent};
+use atomcode_telemetry::{CurrentContext, Event as TelemetryEvent, LlmErrorKind, ToolErrorKind};
 
 use crate::config::Config;
 use crate::conversation::Conversation;
@@ -317,6 +317,30 @@ impl TurnRunner {
                     ))
                     .map(|m| m.estimate_tokens() as u32)
                     .sum();
+                let (error_kind, error_data) = if result.is_failed() {
+                    let reason = match &result {
+                        TurnResult::Failed(r) => r.clone(),
+                        _ => String::new(),
+                    };
+                    let kind = classify_llm_error(&reason);
+                    let error_data = build_llm_error_data(
+                        kind,
+                        &reason,
+                        turn_started.elapsed().as_millis() as u32,
+                        scope_ctx.provider.as_deref(),
+                        scope_ctx.provider_host.as_deref(),
+                        scope_ctx.model.as_deref(),
+                        context_window as u32,
+                        system_tokens,
+                        tool_def_tokens,
+                        tool_result_tokens,
+                        message_tokens,
+                        messages_count,
+                    );
+                    (Some(kind), error_data)
+                } else {
+                    (None, None)
+                };
                 let event = TelemetryEvent::LlmChat {
                     duration_ms: turn_started.elapsed().as_millis() as u32,
                     tool_calls_count: $tool_count as u32,
@@ -330,6 +354,8 @@ impl TurnRunner {
                     tool_result_tokens,
                     message_tokens,
                     messages_count,
+                    error_kind,
+                    error_data,
                 };
                 let tel = self.context.telemetry.clone();
                 let emit_ctx = scope_ctx.clone();
@@ -571,40 +597,42 @@ impl TurnRunner {
                                         if text_buf.trim().is_empty()
                                             && tool_calls_buf.is_empty()
                                             && !rescued_tools
-                                            && !reasoning_buf.trim().is_empty()
-                                            && reasoning_buf.trim()
-                                                != crate::provider::REASONING_PLACEHOLDER
+                                            && !is_only_placeholder_filler(&reasoning_buf)
                                         {
                                             // Skip-promotion guard: when the reasoning
-                                            // channel carries ONLY our own outbound
-                                            // placeholder (`(no reasoning recorded)`),
-                                            // don't promote it to the assistant text
-                                            // channel. Some gateways echo back the
-                                            // placeholder as the response's
-                                            // reasoning_content (or the model mimics
-                                            // the pattern from a context full of
-                                            // historical placeholder copies — DeepSeek
-                                            // V4 thinking-mode requires non-empty
-                                            // reasoning_content on every historical
-                                            // assistant tool_call message, so a
-                                            // 17-round session has 17 copies of the
-                                            // placeholder in context). Promoting it
+                                            // channel carries nothing besides copies of
+                                            // our own outbound placeholder
+                                            // (`(no reasoning recorded)`), don't promote
+                                            // it to the assistant text channel. Some
+                                            // gateways echo back the placeholder as the
+                                            // response's reasoning_content; more often
+                                            // the model mimics the pattern from a
+                                            // context full of historical placeholder
+                                            // copies — DeepSeek V4 thinking-mode
+                                            // requires non-empty reasoning_content on
+                                            // every historical assistant tool_call
+                                            // message, so a 17-round session has 17
+                                            // copies of the placeholder in context, and
+                                            // the response often comes back as 3+
+                                            // copies concatenated. `is_only_placeholder_filler`
+                                            // handles any N (≥1) copies plus
+                                            // interleaved whitespace. Promoting that
                                             // would commit a meaningless string to
                                             // history AND present `Responded { text:
-                                            // "(no reasoning recorded)" }` to the
+                                            // "(no reasoning recorded)..." }` to the
                                             // agent loop, which then calls
-                                            // finish_turn(Natural) and the user sees
-                                            // a silent "Nailed it" mid-task stop
-                                            // (user-reported on DeepSeek V4 Flash,
-                                            // 17 rounds 20 tools, screenshot showed
-                                            // the placeholder as the only assistant
-                                            // text before TurnComplete fired). With
-                                            // the guard: text_buf stays empty, falls
+                                            // finish_turn(Natural) and the user sees a
+                                            // silent "Nailed it" mid-task stop
+                                            // (user-reported on DeepSeek V4 Flash, 17
+                                            // rounds 20 tools, screenshot showed the
+                                            // placeholder as the only assistant text
+                                            // before TurnComplete fired). With the
+                                            // guard: text_buf stays empty, falls
                                             // through to the empty-response Failed
                                             // branch below, the agent loop's existing
-                                            // 3-retry-with-backoff path takes over
-                                            // and surfaces the issue to the user
-                                            // instead of burying it as success.
+                                            // 3-retry-with-backoff path takes over and
+                                            // surfaces the issue to the user instead of
+                                            // burying it as success.
                                             let promoted = std::mem::take(&mut reasoning_buf);
                                             conversation.push_delta(&promoted);
                                             text_buf.push_str(&promoted);
@@ -1119,6 +1147,19 @@ impl TurnRunner {
                     success: false,
                     duration: std::time::Duration::ZERO,
                 });
+                self.context.telemetry.track(TelemetryEvent::ToolCall {
+                    name: corrected_name.clone(),
+                    success: false,
+                    duration_ms: 0,
+                    error_kind: Some(ToolErrorKind::NotFound),
+                    error_data: Some(serde_json::json!({
+                        "tool_name": call.name,
+                        "duration_ms": 0,
+                        "original_name": if call.name != corrected_name { Some(call.name.as_str()) } else { None },
+                        "available_tools": available,
+                        "reason": format!("Tool '{}' not found", call.name),
+                    }).to_string()),
+                });
                 return ToolResult {
                     call_id: call.id.clone(),
                     output,
@@ -1169,6 +1210,17 @@ impl TurnRunner {
                 success: false,
                 duration: std::time::Duration::ZERO,
             });
+            self.context.telemetry.track(TelemetryEvent::ToolCall {
+                name: corrected_name.clone(),
+                success: false,
+                duration_ms: 0,
+                error_kind: Some(ToolErrorKind::InvalidArgs),
+                error_data: Some(serde_json::json!({
+                    "tool_name": corrected_name,
+                    "reason": reason,
+                    "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                }).to_string()),
+            });
             return ToolResult {
                 call_id: call.id.clone(),
                 output: msg,
@@ -1188,15 +1240,27 @@ impl TurnRunner {
         if let crate::tool::ApprovalRequirement::RequireApproval(ref reason)
         | crate::tool::ApprovalRequirement::RequireApprovalAlways(ref reason) = approval
         {
-            // Emit an informational event carrying a snapshot of
-            // conversation.messages so the TUI can persist mid-turn
-            // session state (e.g. for `/bg`).
-            let _ = event_tx.send(TurnEvent::ApprovalRequested {
-                tool_name: call.name.clone(),
-                reason: reason.clone(),
-                call: call.clone(),
-                messages: conversation_messages.to_vec(),
-            });
+            // Only emit the ApprovalRequested event (which triggers the
+            // TUI approval prompt) when the decider actually needs user
+            // input.  If the PermissionStore already has a session grant
+            // or override (e.g. the user pressed [A] on a prior call of
+            // the same tool in this batch), `will_auto_approve` returns
+            // true and we skip the event — the subsequent `decide()` call
+            // will return Allow without blocking.  Without this guard,
+            // parallel MCP calls show N redundant "Waiting for approval"
+            // prompts even though all but the first are auto-resolved.
+            let needs_prompt = !self.permission.will_auto_approve(call, &approval);
+            if needs_prompt {
+                // Emit an informational event carrying a snapshot of
+                // conversation.messages so the TUI can persist mid-turn
+                // session state (e.g. for `/bg`).
+                let _ = event_tx.send(TurnEvent::ApprovalRequested {
+                    tool_name: call.name.clone(),
+                    reason: reason.clone(),
+                    call: call.clone(),
+                    messages: conversation_messages.to_vec(),
+                });
+            }
 
             let decision = self.permission.decide(call, reason).await;
             if !matches!(decision, PermissionDecision::Allow) {
@@ -1208,6 +1272,19 @@ impl TurnRunner {
                     success: false,
                     duration: std::time::Duration::ZERO,
                 });
+            self.context.telemetry.track(TelemetryEvent::ToolCall {
+                name: corrected_name.clone(),
+                success: false,
+                duration_ms: 0,
+                error_kind: Some(ToolErrorKind::DeniedByUser),
+                error_data: Some(serde_json::json!({
+                    "tool_name": corrected_name,
+                    "duration_ms": 0,
+                    "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                    "approval_reason": reason,
+                    "reason": "User denied tool execution",
+                }).to_string()),
+            });
                 return ToolResult {
                     call_id: call.id.clone(),
                     output,
@@ -1235,6 +1312,19 @@ impl TurnRunner {
                         output: output.clone(),
                         success: false,
                         duration: std::time::Duration::ZERO,
+                    });
+                    self.context.telemetry.track(TelemetryEvent::ToolCall {
+                        name: corrected_name.clone(),
+                        success: false,
+                        duration_ms: 0,
+                        error_kind: Some(ToolErrorKind::BlockedByHook),
+                        error_data: Some(serde_json::json!({
+                            "tool_name": corrected_name,
+                            "duration_ms": 0,
+                            "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                            "hook_reason": reason,
+                            "reason": "Tool call blocked by PreToolUse hook",
+                        }).to_string()),
                     });
                     return ToolResult {
                         call_id: call.id.clone(),
@@ -1282,6 +1372,19 @@ impl TurnRunner {
                     output: output.clone(),
                     success: false,
                     duration,
+                });
+                self.context.telemetry.track(TelemetryEvent::ToolCall {
+                    name: corrected_name.clone(),
+                    success: false,
+                    duration_ms: duration.as_millis() as u32,
+                    error_kind: Some(ToolErrorKind::ExecutionFailed),
+                    error_data: Some(serde_json::json!({
+                        "tool_name": corrected_name,
+                        "duration_ms": duration.as_millis() as u32,
+                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                        "output_tail": "[Cancelled by user]",
+                        "reason": "Tool execution cancelled by user",
+                    }).to_string()),
                 });
                 return ToolResult {
                     call_id: call.id.clone(),
@@ -1338,6 +1441,46 @@ impl TurnRunner {
             duration,
         });
 
+        // Emit ToolCall telemetry event for both success and failure.
+        let output_tail = atomcode_telemetry::scrub::truncate_head(
+            &atomcode_telemetry::scrub::scrub_path(
+                &tool_result.output,
+                None,
+                Some(&self.context.working_dir.read().await.clone()),
+            ),
+            200,
+        );
+        // Detect warning: exit 0 (success) but stderr present.
+        let has_stderr = tool_result.output.contains("STDERR:")
+            || tool_result.output.contains("[stderr]");
+        let (error_kind, error_data) = if !tool_result.success {
+            (Some(ToolErrorKind::ExecutionFailed), Some(serde_json::json!({
+                "tool_name": corrected_name,
+                "duration_ms": duration.as_millis() as u32,
+                "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                "output_tail": output_tail,
+                "reason": "Tool execution returned an error",
+            }).to_string()))
+        } else if has_stderr {
+            (Some(ToolErrorKind::Warning), Some(serde_json::json!({
+                "tool_name": corrected_name,
+                "duration_ms": duration.as_millis() as u32,
+                "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                "output_tail": output_tail,
+                "reason": "Command succeeded (exit 0) but produced stderr output",
+                "resolution": "Review stderr for potential issues; the command may not have had the intended effect",
+            }).to_string()))
+        } else {
+            (None, None)
+        };
+        self.context.telemetry.track(TelemetryEvent::ToolCall {
+            name: corrected_name.clone(),
+            success: tool_result.success,
+            duration_ms: duration.as_millis() as u32,
+            error_kind,
+            error_data,
+        });
+
         tool_result
     }
 
@@ -1383,6 +1526,23 @@ impl TurnRunner {
 /// (free-form text, garbage from broken streams) round-trip through the
 /// fallback unchanged so we don't regress free-form tools or accidentally
 /// merge two genuinely different malformed payloads.
+/// True iff `reasoning` contains nothing besides one or more copies
+/// of the outbound placeholder (`REASONING_PLACEHOLDER`) interleaved
+/// with whitespace — including the all-empty / all-whitespace case.
+///
+/// The Done-event skip-promotion guard uses this to detect not just
+/// the trivial single-copy echo but also the multi-copy mimicry seen
+/// on DeepSeek V4 thinking-mode (a long session has many historical
+/// copies of the placeholder in context, and the model regenerates the
+/// pattern in its own response — observed 3+ copies concatenated in a
+/// single reasoning_content stream).
+fn is_only_placeholder_filler(reasoning: &str) -> bool {
+    reasoning
+        .replace(crate::provider::REASONING_PLACEHOLDER, "")
+        .trim()
+        .is_empty()
+}
+
 fn normalize_tool_args(args: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(args) {
         Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| args.to_string()),
@@ -1837,6 +1997,63 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
 
 
 #[cfg(test)]
+mod is_only_placeholder_filler_tests {
+    use super::is_only_placeholder_filler;
+    use crate::provider::REASONING_PLACEHOLDER;
+
+    #[test]
+    fn empty_and_whitespace_are_filler() {
+        assert!(is_only_placeholder_filler(""));
+        assert!(is_only_placeholder_filler("   "));
+        assert!(is_only_placeholder_filler("\n\t  \n"));
+    }
+
+    #[test]
+    fn single_placeholder_is_filler() {
+        // The original strict-equality guard already caught this; pin
+        // it so a refactor doesn't regress.
+        assert!(is_only_placeholder_filler(REASONING_PLACEHOLDER));
+    }
+
+    #[test]
+    fn multiple_concatenated_placeholders_are_filler() {
+        // The bug: DeepSeek V4 Flash 17-round session screenshot
+        // showed the response's reasoning_content as 3 copies of the
+        // placeholder concatenated with no separator. The old
+        // `!= REASONING_PLACEHOLDER` check missed this and promoted
+        // the meaningless string into the assistant text channel.
+        let three = REASONING_PLACEHOLDER.repeat(3);
+        assert!(is_only_placeholder_filler(&three));
+        let five = REASONING_PLACEHOLDER.repeat(5);
+        assert!(is_only_placeholder_filler(&five));
+    }
+
+    #[test]
+    fn placeholders_with_whitespace_are_filler() {
+        // Some gateways insert chunk delimiters (newlines, spaces)
+        // between repeated placeholder echoes. Filler regardless.
+        let mixed = format!("{}\n{}  {}", REASONING_PLACEHOLDER, REASONING_PLACEHOLDER, REASONING_PLACEHOLDER);
+        assert!(is_only_placeholder_filler(&mixed));
+    }
+
+    #[test]
+    fn real_reasoning_is_not_filler() {
+        assert!(!is_only_placeholder_filler(
+            "Let me think about this — first, the user wants..."
+        ));
+    }
+
+    #[test]
+    fn placeholder_plus_real_content_is_not_filler() {
+        // If the model emits the placeholder AND some substantive
+        // text, we still want promotion — the substantive text is
+        // the real reasoning we'd want to keep.
+        let mixed = format!("{} but actually I see now that...", REASONING_PLACEHOLDER);
+        assert!(!is_only_placeholder_filler(&mixed));
+    }
+}
+
+#[cfg(test)]
 mod normalize_tool_args_tests {
     use super::normalize_tool_args;
 
@@ -2268,4 +2485,212 @@ mod tool_call_text_rescue_tests {
         visible.push_str(&f.flush());
         assert_eq!(visible, "中文 hello 世界");
     }
+}
+
+/// Build a structured `error_data` JSON for LLM errors, following the
+/// telemetry design doc (section 3.5 — `llm_chat` event).
+///
+/// Extracts `status_code` from the raw error string (patterns like "401",
+/// "403", "429", "500", "502", "503") and scrubs the message via
+/// `scrub::scrub_path` + `scrub::truncate_head(_, 200)`.
+pub(crate) fn build_llm_error_data(
+    kind: LlmErrorKind,
+    reason: &str,
+    duration_ms: u32,
+    provider: Option<&str>,
+    provider_host: Option<&str>,
+    model: Option<&str>,
+    context_window: u32,
+    system_tokens: u32,
+    tool_def_tokens: u32,
+    tool_result_tokens: u32,
+    message_tokens: u32,
+    messages_count: u32,
+) -> Option<String> {
+    use atomcode_telemetry::scrub;
+
+    // ── Extract status code from the raw error string ──────────────
+    let status_code: Option<u16> = extract_status_code(reason);
+
+    // ── Build a concise, scrubbed error message ───────────────────
+    // Strip the raw JSON body that some providers append after a colon.
+    let home = std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h));
+    let cwd = std::env::var("PWD").ok().map(|c| std::path::PathBuf::from(c));
+    let message_raw = scrub::scrub_path(
+        reason,
+        home.as_deref(),
+        cwd.as_deref(),
+    );
+    let message = scrub::truncate_head(&message_raw, 200);
+
+    let base = || -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        m.insert("duration_ms".into(), serde_json::json!(duration_ms));
+        if let Some(p) = provider {
+            m.insert("provider".into(), serde_json::json!(p));
+        }
+        if let Some(h) = provider_host {
+            m.insert("provider_host".into(), serde_json::json!(h));
+        }
+        if let Some(mdl) = model {
+            m.insert("model".into(), serde_json::json!(mdl));
+        }
+        serde_json::Value::Object(m)
+    };
+
+    let map = match kind {
+        LlmErrorKind::AuthError => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            if let Some(sc) = status_code {
+                obj.insert("status_code".into(), serde_json::json!(sc));
+            }
+            obj.insert("message".into(), serde_json::json!(message));
+            m
+        }
+        LlmErrorKind::RateLimited => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            if let Some(sc) = status_code {
+                obj.insert("status_code".into(), serde_json::json!(sc));
+            }
+            obj.insert("message".into(), serde_json::json!(message));
+            // retry_after_secs: could be parsed from Retry-After header,
+            // but we don't have that info here. Leave as null.
+            obj.insert("retry_after_secs".into(), serde_json::Value::Null);
+            m
+        }
+        LlmErrorKind::ServerError => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            if let Some(sc) = status_code {
+                obj.insert("status_code".into(), serde_json::json!(sc));
+            }
+            obj.insert("message".into(), serde_json::json!(message));
+            m
+        }
+        LlmErrorKind::NetworkError => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("message".into(), serde_json::json!(message));
+            obj.insert("attempt_duration_ms".into(), serde_json::json!(duration_ms));
+            obj.insert("is_retry".into(), serde_json::json!(false));
+            m
+        }
+        LlmErrorKind::StreamTimeout => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("timeout_secs".into(), serde_json::json!(duration_ms / 1000));
+            // Phase heuristic: if no tokens were received → "first_token",
+            // otherwise "subsequent". We don't have per-event token counts
+            // at this layer, so default to "first_token".
+            obj.insert("phase".into(), serde_json::json!("first_token"));
+            obj.insert("tokens_received".into(), serde_json::json!(0));
+            m
+        }
+        LlmErrorKind::StreamInterrupted => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("message".into(), serde_json::json!(message));
+            obj.insert("bytes_received".into(), serde_json::Value::Null);
+            obj.insert("tokens_received".into(), serde_json::Value::Null);
+            obj.insert("finish_reason".into(), serde_json::Value::Null);
+            m
+        }
+        LlmErrorKind::ContextOverflow => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            let sent_tokens = system_tokens
+                .saturating_add(tool_def_tokens)
+                .saturating_add(tool_result_tokens)
+                .saturating_add(message_tokens);
+            obj.insert("context_window".into(), serde_json::json!(context_window));
+            obj.insert("sent_tokens".into(), serde_json::json!(sent_tokens));
+            obj.insert("system_tokens".into(), serde_json::json!(system_tokens));
+            obj.insert("tool_def_tokens".into(), serde_json::json!(tool_def_tokens));
+            obj.insert("tool_result_tokens".into(), serde_json::json!(tool_result_tokens));
+            obj.insert("message_tokens".into(), serde_json::json!(message_tokens));
+            obj.insert("messages_count".into(), serde_json::json!(messages_count));
+            m
+        }
+        LlmErrorKind::Other => {
+            let mut m = base();
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("message".into(), serde_json::json!(message));
+            m
+        }
+    };
+
+    Some(map.to_string())
+}
+
+/// Extract an HTTP status code from a raw error string.
+/// Looks for patterns like "401", "403", "429", "500", "502", "503"
+/// that appear as standalone numbers (not part of a larger number).
+fn extract_status_code(reason: &str) -> Option<u16> {
+    // Common HTTP error status codes to look for
+    let codes = [401u16, 403, 429, 500, 502, 503];
+    let lower = reason.to_lowercase();
+    for code in codes {
+        // Check if the code appears as a standalone number
+        // Match patterns like "401", "(401)", "error 401", "HTTP 401"
+        let code_str = code.to_string();
+        if lower.contains(&code_str) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+/// Classify an LLM error reason string into a telemetry `LlmErrorKind`.
+pub(crate) fn classify_llm_error(reason: &str) -> LlmErrorKind {
+    let r = reason.to_lowercase();
+    if r.contains("401") || r.contains("403") || r.contains("unauthorized") || r.contains("auth") {
+        LlmErrorKind::AuthError
+    } else if r.contains("429") || r.contains("rate") || r.contains("throttl") {
+        LlmErrorKind::RateLimited
+    } else if r.contains("500") || r.contains("502") || r.contains("503") {
+        LlmErrorKind::ServerError
+    } else if r.contains("stream timeout") || r.contains("no event for") {
+        LlmErrorKind::StreamTimeout
+    } else if r.contains("decode") || r.contains("mid-flight") || r.contains("terminated") {
+        LlmErrorKind::StreamInterrupted
+    } else if r.contains("context") || r.contains("max_tokens") || r.contains("token limit") {
+        LlmErrorKind::ContextOverflow
+    } else if r.contains("connect") || r.contains("dns") || r.contains("network") || r.contains("timeout") {
+        LlmErrorKind::NetworkError
+    } else {
+        LlmErrorKind::Other
+    }
+}
+
+/// Build a concise summary of tool call arguments for telemetry.
+/// Extracts top-level JSON keys and truncates values to avoid leaking sensitive data.
+pub(crate) fn build_args_summary(tool_name: &str, args: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+        if let Some(obj) = v.as_object() {
+            let pairs: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| {
+                    let val_str = match v {
+                        serde_json::Value::String(s) => {
+                            atomcode_telemetry::scrub::truncate_head(s, 50)
+                        }
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Null => "null".to_string(),
+                        _ => format!("<{}>", match v {
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::Object(_) => "object",
+                            _ => "value",
+                        }),
+                    };
+                    format!("{}={}", k, val_str)
+                })
+                .collect();
+            return format!("{}({})", tool_name, pairs.join(", "));
+        }
+    }
+    // Fallback: truncate raw args
+    format!("{}({})", tool_name, atomcode_telemetry::scrub::truncate_head(args, 100))
 }

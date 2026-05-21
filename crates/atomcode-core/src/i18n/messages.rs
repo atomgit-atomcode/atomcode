@@ -65,6 +65,27 @@ pub enum Msg<'a> {
     CpWindowQuotaHint { hint: &'a str },
     CpStatusFetchSkipped { reason: &'a str },
     CpStatusFetchFailed { error: &'a str },
+    /// Open-source build attempted to use a CodingPlan provider. The
+    /// signing capability is not present in this build, so the request
+    /// can't reach the AtomGit LLM gateway. Surface a clear hint
+    /// pointing to the official Releases page.
+    CpOfficialBuildRequired,
+    /// Server returned `ATOMCODE_SIG_STALE` — the request's signed
+    /// timestamp is outside the ±5min window the gateway accepts.
+    /// Typically caused by an unsynced local clock.
+    CpSignStaleClockSkew,
+    /// Server returned `ATOMCODE_SIG_REPLAY` even after the client's
+    /// one automatic retry with a fresh nonce. Surface a "please retry
+    /// the command" hint — usually self-heals on the next attempt.
+    CpSignReplayPersisted,
+    /// Server returned `ATOMCODE_SIG_INVALID` AND the alg_version is
+    /// no longer in the server's `accepted_versions` set — the client
+    /// binary is too old. Force-upgrade hint.
+    CpSignVersionTooOld,
+    /// Server returned `426 Upgrade Required` — emergency rotation
+    /// playbook in progress; this build cannot continue without
+    /// upgrading.
+    CpUpgradeRequired,
 
     // i18n self-errors
     ErrUnsupportedLocale { input: &'a str },

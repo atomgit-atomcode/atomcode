@@ -466,6 +466,11 @@ pub fn run(
         if let Some(t) = tel {
             t.track(atomcode_telemetry::Event::TakeCodingplan {
                 type_: atomcode_telemetry::CodingplanResult::Fail,
+                error_kind: Some(atomcode_telemetry::CodingplanErrorKind::AuthError),
+                error_data: Some(serde_json::json!({
+                    "step": "login",
+                    "message": "Not logged in",
+                }).to_string()),
             });
         }
         // Use the cascade sentinel so format() suppresses the three
@@ -521,6 +526,11 @@ pub fn run(
         if let Some(t) = tel {
             t.track(atomcode_telemetry::Event::TakeCodingplan {
                 type_: atomcode_telemetry::CodingplanResult::Fail,
+                error_kind: Some(atomcode_telemetry::CodingplanErrorKind::NetworkError),
+                error_data: Some(serde_json::json!({
+                    "step": "models",
+                    "message": "Failed to fetch model list",
+                }).to_string()),
             });
         }
         // Same cascade pattern: the models-failure line above is the
@@ -545,6 +555,10 @@ pub fn run(
     if let Some(t) = tel {
         t.track(atomcode_telemetry::Event::TakeCodingplan {
             type_: atomcode_telemetry::CodingplanResult::Success,
+            error_kind: None,
+            error_data: Some(serde_json::json!({
+                "step": null,
+            }).to_string()),
         });
     }
 

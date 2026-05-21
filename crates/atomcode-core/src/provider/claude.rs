@@ -337,9 +337,10 @@ impl LlmProvider for ClaudeProvider {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
+                let msg = super::extract_error_message(&body);
                 let _ = tx.send(Ok(StreamEvent::Error(format!(
                     "Claude API error ({}): {}",
-                    status, body
+                    status, msg
                 ))));
                 return;
             }

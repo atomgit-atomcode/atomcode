@@ -10,7 +10,7 @@ interface SessionListProps {
 }
 
 export function SessionList({ variant = 'overlay' }: SessionListProps) {
-  const { state, dispatch, loadSession, newConversation, renameSession, deleteSession } = useChatContext();
+  const { state, dispatch, openSessionInTab, renameSession, deleteSession } = useChatContext();
   const [search, setSearch] = useState('');
   const [menu, setMenu] = useState<{ session: SessionMeta; x: number; y: number } | null>(null);
   const isOverlay = variant === 'overlay';
@@ -29,7 +29,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
 
   function handleSelect(session: SessionMeta) {
     setMenu(null);
-    loadSession(session.id, session.project_hash);
+    openSessionInTab(session.id, session.project_hash);
     if (isOverlay) {
       dispatch({ type: 'TOGGLE_HISTORY' });
     }
@@ -37,7 +37,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
 
   function handleNewSession() {
     setMenu(null);
-    newConversation();
+    openSessionInTab();
     if (isOverlay) {
       dispatch({ type: 'TOGGLE_HISTORY' });
     }
@@ -112,6 +112,14 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
                 <div className="session-group-label">{label}</div>
                 {items.map((s) => {
                   const isActive = s.id === state.activeSessionId;
+                  let dotClass = '';
+                  if (!isActive) {
+                    if (s.isGenerating) {
+                      dotClass = 'session-item-dot breathing';
+                    } else if (s.hasUnread) {
+                      dotClass = 'session-item-dot';
+                    }
+                  }
                   return (
                     <button
                       key={`${s.project_hash ?? 'current'}:${s.id}`}
@@ -120,6 +128,7 @@ export function SessionList({ variant = 'overlay' }: SessionListProps) {
                       onContextMenu={(e) => handleContextMenu(e, s)}
                       title={s.name || s.title || 'Untitled'}
                     >
+                      {dotClass && <span className={dotClass} />}
                       <span className="session-item-name">
                         {s.name || s.title || 'Untitled'}
                       </span>

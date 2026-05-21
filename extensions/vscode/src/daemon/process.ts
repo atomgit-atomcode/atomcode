@@ -283,12 +283,26 @@ export class DaemonProcess {
       path.join(home, '.atomcode', 'bin', 'atomcode-daemon'),
       path.join(home, '.cargo', 'bin', 'atomcode-daemon'),
       '/usr/local/bin/atomcode-daemon',
-      // Developer build outputs — these paths are expected to fail in production
-      path.join(workspaceRoot, 'target', 'release', 'atomcode-daemon'),
-      path.join(workspaceRoot, 'target', 'debug', 'atomcode-daemon'),
     ];
     for (const p of daemonPaths) {
       if (fs.existsSync(p)) {
+        return { path: p, args: portArgs };
+      }
+    }
+
+    // Developer build outputs — only meaningful when running from source.
+    // Warn the user so they know a dev build is being used instead of the
+    // bundled daemon that should have shipped with the extension.
+    const devPaths = [
+      path.join(workspaceRoot, 'target', 'release', 'atomcode-daemon'),
+      path.join(workspaceRoot, 'target', 'debug', 'atomcode-daemon'),
+    ];
+    for (const p of devPaths) {
+      if (fs.existsSync(p)) {
+        console.warn(`[AtomCode] Using dev build daemon: ${p}. The bundled daemon was not found — the extension package may be missing resources/bin/<platform>/atomcode-daemon.`);
+        vscode.window.showWarningMessage(
+          `AtomCode is using a development build of the daemon (${p}). The bundled daemon was not found. Reinstall the extension or set atomcode.daemon.binaryPath in settings.`
+        );
         return { path: p, args: portArgs };
       }
     }

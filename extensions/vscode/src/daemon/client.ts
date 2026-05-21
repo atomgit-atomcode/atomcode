@@ -383,6 +383,11 @@ export class DaemonClient {
       case 'text':
         callbacks.onText(event.content);
         break;
+      case 'tool_batch':
+        callbacks.onToolBatch(
+          event.calls.map((c) => ({ id: c.id, name: c.name, args: c.arguments })),
+        );
+        break;
       case 'tool_start':
         callbacks.onToolStart(event.id, event.name, event.arguments);
         break;
@@ -417,5 +422,9 @@ export class DaemonClient {
 
   stopGeneration(sessionId: string): Promise<{ success: boolean; message: string }> {
     return this.post<{ success: boolean; message: string }>('/chat/stop', { session_id: sessionId });
+  }
+
+  activeSessions(): Promise<string[]> {
+    return this.get<string[]>('/chat/active');
   }
 }

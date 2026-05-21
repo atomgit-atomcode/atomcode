@@ -347,6 +347,12 @@ pub struct StatusLine {
     /// the eye — switching modes changes whether file edits and shell
     /// run, so the user wants this prominent.
     pub mode_indicator: Option<String>,
+    /// Current session display name, shown as a right-aligned cyan
+    /// pill overlaid on the input box's top rule. `Some` only after
+    /// the user has explicitly run `/rename` (Session::user_renamed) —
+    /// auto-named / default sessions leave this `None` to keep the
+    /// chrome quiet on fresh conversations.
+    pub session_name: Option<String>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.
