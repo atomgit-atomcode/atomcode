@@ -331,6 +331,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "添加自定义模型".into(),
         Msg::IdleHintProviderFull =>
             "使用 /provider 添加自定义模型".into(),
+        Msg::IdleHintCodingplan => "/codingplan".into(),
+        Msg::IdleHintCodingplanSuffix =>
+            "领取免费 Token 额度".into(),
+        Msg::IdleHintCodingplanFull =>
+            "使用 /codingplan 领取免费 Token 额度".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>

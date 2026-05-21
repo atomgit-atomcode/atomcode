@@ -235,6 +235,12 @@ pub enum Msg<'a> {
     IdleHintProviderSuffix,
     /// Complete plain-text version: "/provider  to add a custom model"
     IdleHintProviderFull,
+    /// "/codingplan" command label
+    IdleHintCodingplan,
+    /// "to claim a free token quota" (text after /codingplan)
+    IdleHintCodingplanSuffix,
+    /// Complete plain-text version: "/codingplan  to claim a free token quota"
+    IdleHintCodingplanFull,
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,

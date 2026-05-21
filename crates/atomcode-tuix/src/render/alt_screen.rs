@@ -1642,6 +1642,25 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             t(Msg::IdleHintProviderFull).into_owned()
         };
         self.push_body_row(hint_b);
+        // Third hint mirrors hint_b's slash/cyan + suffix/dim layout —
+        // points at /codingplan as the path to a free token quota.
+        // Surfaced here (rather than only on the QR fast path) so a
+        // user who already had a config but no provider can still find
+        // the free-quota route from the idle banner.
+        let hint_c = if self.caps.colors {
+            format!(
+                "{}{}{}  {}{}{}",
+                SGR_CYAN,
+                t(Msg::IdleHintCodingplan),
+                SGR_RESET,
+                SGR_DIM,
+                t(Msg::IdleHintCodingplanSuffix),
+                SGR_RESET
+            )
+        } else {
+            t(Msg::IdleHintCodingplanFull).into_owned()
+        };
+        self.push_body_row(hint_c);
         self.push_body_row(String::new());
     }
 

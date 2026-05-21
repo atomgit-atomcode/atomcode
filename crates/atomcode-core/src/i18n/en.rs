@@ -340,6 +340,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "to add a custom model".into(),
         Msg::IdleHintProviderFull =>
             "/provider  to add a custom model".into(),
+        Msg::IdleHintCodingplan => "/codingplan".into(),
+        Msg::IdleHintCodingplanSuffix =>
+            "to claim a free token quota".into(),
+        Msg::IdleHintCodingplanFull =>
+            "/codingplan  to claim a free token quota".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
