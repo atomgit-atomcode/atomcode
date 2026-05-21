@@ -113,10 +113,19 @@ pub fn signer() -> &'static dyn RequestSigner {
     &REAL_SIGNER
 }
 
-/// True iff the given base URL points at the production AtomGit LLM
-/// gateway. Host-based — does NOT trust provider config keys. Rejects
-/// non-HTTP(S) schemes, subdomain spoofs, and the legacy
-/// `api-ai.gitcode.com` host (still served plaintext until P3 cutover).
+/// True iff the given base URL points at an AtomGit-operated LLM
+/// gateway that REQUIRES per-request signing.
+///
+/// Host-based — does NOT trust provider config keys. Rejects non-
+/// HTTP(S) schemes and subdomain spoofs.
+///
+/// Both production hostnames sign:
+///   * `llm-api.atomgit.com` — current dedicated host.
+///   * `api-ai.gitcode.com`  — pre-P3 host. Kept signing-enforced
+///     so any legacy provider config silently upgraded to signing
+///     after the P3 cutover; users with `api-ai.gitcode.com` in their
+///     config get the same protection as `llm-api.atomgit.com` users
+///     and don't need to edit their config to migrate.
 pub(crate) fn is_atomgit_gateway(base_url: &str) -> bool {
     let url = match url::Url::parse(base_url) {
         Ok(u) => u,
@@ -126,7 +135,10 @@ pub(crate) fn is_atomgit_gateway(base_url: &str) -> bool {
         "https" | "http" => {}
         _ => return false,
     }
-    matches!(url.host_str(), Some("llm-api.atomgit.com"))
+    matches!(
+        url.host_str(),
+        Some("llm-api.atomgit.com") | Some("api-ai.gitcode.com")
+    )
 }
 
 #[cfg(test)]
@@ -178,10 +190,13 @@ mod tests {
     }
 
     #[test]
-    fn is_atomgit_gateway_rejects_legacy_codingplan_host() {
-        // Pre-cutover host — must NOT be auto-signed; signing logic
-        // is wired up only for the new dedicated host.
-        assert!(!is_atomgit_gateway("https://api-ai.gitcode.com/v1"));
+    fn is_atomgit_gateway_matches_legacy_codingplan_host() {
+        // Post-P3 cutover: `api-ai.gitcode.com` is now also a signing-
+        // enforced gateway. Previously this test asserted the opposite
+        // (legacy host plaintext until P3) — the inversion is the
+        // contract change.
+        assert!(is_atomgit_gateway("https://api-ai.gitcode.com/v1"));
+        assert!(is_atomgit_gateway("https://api-ai.gitcode.com/v1/chat/completions"));
     }
 
     #[test]

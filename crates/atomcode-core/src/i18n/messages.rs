@@ -70,6 +70,13 @@ pub enum Msg<'a> {
     /// can't reach the AtomGit LLM gateway. Surface a clear hint
     /// pointing to the official Releases page.
     CpOfficialBuildRequired,
+    /// Official build, but no stored auth (or auth has empty
+    /// `user.id` / `access_token`). The signing path needs these
+    /// fields to derive a per-user key; without them the request
+    /// can't be signed. Surface a "please run `/codingplan` to log
+    /// in" hint instead of the misleading "official build required"
+    /// message — the user IS on an official build.
+    CpAuthRequired,
     /// Server returned `ATOMCODE_SIG_STALE` — the request's signed
     /// timestamp is outside the ±5min window the gateway accepts.
     /// Typically caused by an unsynced local clock.

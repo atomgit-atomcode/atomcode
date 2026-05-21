@@ -41,13 +41,19 @@ fn build_codingplan_headers(
         return Ok(Vec::new());
     }
 
+    // `CpAuthRequired` (no stored auth, or empty user.id /
+    // access_token) is a separate failure mode from
+    // `CpOfficialBuildRequired` (open-source build / unavailable
+    // signer). Users on an official build with no `~/.atomcode/auth.toml`
+    // would otherwise see the misleading "need official build"
+    // message — the build IS official, they just haven't logged in
+    // yet. Steer them to `/codingplan` instead.
     let (user_id_string, token_string);
     let (user_id, oauth_token) = match override_auth {
         Some((uid, tok)) => (uid, tok),
         None => {
-            let auth = get_stored_auth().ok_or_else(|| {
-                anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired))
-            })?;
+            let auth = get_stored_auth()
+                .ok_or_else(|| anyhow::anyhow!("{}", t(Msg::CpAuthRequired)))?;
             user_id_string = auth.user.id.clone();
             token_string = auth.access_token.clone();
             (user_id_string.as_str(), token_string.as_str())
@@ -55,7 +61,7 @@ fn build_codingplan_headers(
     };
 
     if user_id.is_empty() || oauth_token.is_empty() {
-        return Err(anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired)));
+        return Err(anyhow::anyhow!("{}", t(Msg::CpAuthRequired)));
     }
 
     let path = url::Url::parse(base_url)

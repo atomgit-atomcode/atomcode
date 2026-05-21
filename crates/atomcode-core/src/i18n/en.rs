@@ -89,6 +89,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "This feature requires the official AtomCode build. Download it from \
              https://atomgit.com/atomgit_atomcode/atomcode/releases.",
         ),
+        Msg::CpAuthRequired => Cow::Borrowed(
+            "Not signed in to AtomCode CodingPlan. Run /codingplan to log in \
+             before sending a request.",
+        ),
         Msg::CpSignStaleClockSkew => Cow::Borrowed(
             "Request rejected: signed timestamp outside the accepted window. \
              Please check your system clock (NTP sync) and retry.",

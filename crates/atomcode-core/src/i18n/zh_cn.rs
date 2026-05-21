@@ -85,6 +85,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "此功能需要官方 AtomCode 构建，请前往 \
              https://atomgit.com/atomgit_atomcode/atomcode/releases 下载安装。",
         ),
+        Msg::CpAuthRequired => Cow::Borrowed(
+            "未登录 AtomCode CodingPlan。请运行 /codingplan 完成登录后再发送请求。",
+        ),
         Msg::CpSignStaleClockSkew => Cow::Borrowed(
             "请求被服务端拒绝：签名时间戳已过期。请校准本地系统时间（NTP 同步）后重试。",
         ),
