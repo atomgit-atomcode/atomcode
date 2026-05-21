@@ -2701,12 +2701,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 }
                 match ev {
                     OauthEvent::Authorized => {
-                        ctx.pending_run_codingplan = true;
-                        // /codingplan driver paints its own UI, so
-                        // we don't need a welcome banner here. If the
-                        // user already Esc'd the modal the auth was
-                        // still saved silently — next /codingplan run
-                        // picks it up.
+                        // `pending_run_codingplan` is only drained by the
+                        // keystroke-handler path (handle_input → modal
+                        // close → drain flag). The OAuth poll path doesn't
+                        // route through there, so just call the codingplan
+                        // driver directly — same effect, runs in this
+                        // select! arm's scope where renderer + ctx are
+                        // already mutable.
+                        if let Err(e) = crate::event_loop::commands::run_codingplan_flow(renderer, &mut ctx) {
+                            renderer.render(crate::render::UiLine::Error(
+                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /codingplan 手动重试。"),
+                            ));
+                            renderer.flush();
+                        }
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
@@ -3042,12 +3049,19 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 }
                 match ev {
                     OauthEvent::Authorized => {
-                        ctx.pending_run_codingplan = true;
-                        // /codingplan driver paints its own UI, so
-                        // we don't need a welcome banner here. If the
-                        // user already Esc'd the modal the auth was
-                        // still saved silently — next /codingplan run
-                        // picks it up.
+                        // `pending_run_codingplan` is only drained by the
+                        // keystroke-handler path (handle_input → modal
+                        // close → drain flag). The OAuth poll path doesn't
+                        // route through there, so just call the codingplan
+                        // driver directly — same effect, runs in this
+                        // select! arm's scope where renderer + ctx are
+                        // already mutable.
+                        if let Err(e) = crate::event_loop::commands::run_codingplan_flow(renderer, &mut ctx) {
+                            renderer.render(crate::render::UiLine::Error(
+                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /codingplan 手动重试。"),
+                            ));
+                            renderer.flush();
+                        }
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
