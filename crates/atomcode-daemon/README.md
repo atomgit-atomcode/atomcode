@@ -61,7 +61,7 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
 ```json
 {
   "status": "ok",
-  "version": "4.22.2",
+  "version": "4.23.0",
   "service": "atomcode-daemon"
 }
 ```
