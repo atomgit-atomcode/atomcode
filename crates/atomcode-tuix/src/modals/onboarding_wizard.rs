@@ -532,13 +532,21 @@ impl OnboardingWizard {
 
             // QrLogin (fast path, first-launch only).
             // - start_login failed → Enter retries, Esc bails
-            // - start_login ok → Enter confirms scan-complete and
-            //   hands off to /codingplan; Esc closes without auth
+            // - start_login ok → Enter is a no-op. The background
+            //   poll thread auto-closes the modal the moment AtomGit
+            //   reports authorisation, so a manual Enter would only
+            //   race that — and an impatient Enter before the poll
+            //   completes ran run_codingplan_flow against an empty
+            //   auth.toml, which then re-ran start_login under the
+            //   covers and painted a SECOND duplicate QR + URL block
+            //   into scrollback (bug report screenshot). Letting Enter
+            //   be a no-op eliminates the race entirely; users
+            //   waiting on a stuck poll can Esc and rerun /codingplan.
             (QrLogin, KeyCode::Enter) => {
                 if self.qr_login_error.is_some() {
                     PureOutcome::RetryQrLogin
                 } else {
-                    PureOutcome::ApplyQrLoginThenClose
+                    PureOutcome::Noop
                 }
             }
             (QrLogin, KeyCode::Esc) => PureOutcome::Close,
@@ -835,10 +843,10 @@ impl OnboardingWizard {
             content.push(center(url));
             content.push(String::new());
             // Polling thread auto-closes the modal the moment AtomGit
-            // reports authorisation; Enter is kept as an explicit
-            // force-continue for users who'd rather not wait for the
-            // 2s poll tick.
-            content.push(center("扫码后自动继续 · Enter 立即继续"));
+            // reports authorisation. Enter is deliberately NOT shown
+            // as a force-continue path — see handle_key_pure's
+            // QrLogin Enter arm for the duplicate-QR bug it caused.
+            content.push(center("扫码完成后自动跳转"));
         } else {
             // Shouldn't happen — `new_qr_fast_path` always populates
             // exactly one of url / error. Defensive fallback so a
@@ -1923,10 +1931,18 @@ mod tests {
     }
 
     #[test]
-    fn qr_login_enter_when_url_present_dispatches_to_codingplan() {
+    fn qr_login_enter_when_url_present_is_noop() {
+        // Was ApplyQrLoginThenClose before the manual-Enter handoff
+        // was removed — a forced /codingplan invocation BEFORE the
+        // background poll thread finished writing auth.toml caused
+        // a second start_login round-trip + duplicate QR in
+        // scrollback. Polling auto-closes the modal the instant
+        // AtomGit reports authorisation, so Enter is intentionally
+        // inert in the normal state; users on a stuck poll can Esc
+        // and rerun /codingplan.
         let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
         let outcome = w.handle_key_pure(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(outcome, PureOutcome::ApplyQrLoginThenClose);
+        assert_eq!(outcome, PureOutcome::Noop);
     }
 
     #[test]
