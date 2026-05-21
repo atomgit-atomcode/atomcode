@@ -1199,6 +1199,68 @@ impl Buffer {
             Action::ToggleToolOutput => BufferResult::NoOp,
         }
     }
+
+    /// Try to move the cursor up one logical line, preserving the
+    /// column (measured in display cells so CJK lines up). Returns
+    /// `false` if the cursor was already on the first line — caller
+    /// can then fall through to history navigation. Designed for the
+    /// `Up` keystroke in multi-line composition: pressing Up walks
+    /// the cursor through the buffer's lines first; only when there
+    /// are no more lines above does it surface history.
+    pub fn cursor_line_up(&mut self) -> bool {
+        let cur_line_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if cur_line_start == 0 {
+            return false;
+        }
+        let target_col = crate::width::display_width(&self.text[cur_line_start..self.cursor]);
+        let prev_line_end = cur_line_start - 1;
+        let prev_line_start = self.text[..prev_line_end]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.cursor =
+            prev_line_start + byte_offset_at_col(&self.text[prev_line_start..prev_line_end], target_col);
+        true
+    }
+
+    /// Mirror of [`cursor_line_up`] for `Down`. Returns `false` if the
+    /// cursor was already on the last logical line.
+    pub fn cursor_line_down(&mut self) -> bool {
+        let Some(rel_end) = self.text[self.cursor..].find('\n') else {
+            return false;
+        };
+        let cur_line_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let target_col = crate::width::display_width(&self.text[cur_line_start..self.cursor]);
+        let next_line_start = self.cursor + rel_end + 1;
+        let next_line_end = self.text[next_line_start..]
+            .find('\n')
+            .map(|i| next_line_start + i)
+            .unwrap_or(self.text.len());
+        self.cursor =
+            next_line_start + byte_offset_at_col(&self.text[next_line_start..next_line_end], target_col);
+        true
+    }
+}
+
+/// Find the byte offset within `line` at the first character whose
+/// cumulative display width meets or exceeds `target_col`. If the line
+/// is shorter than `target_col` cells, returns `line.len()` — the
+/// caller clamps the cursor to the end of that shorter line.
+fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
+    let mut acc = 0usize;
+    for (i, ch) in line.char_indices() {
+        if acc >= target_col {
+            return i;
+        }
+        acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    line.len()
 }
 
 #[cfg(test)]
@@ -1590,6 +1652,70 @@ mod menu_tests {
         assert_eq!(buf.text, "/session foo");
         assert_eq!(buf.cursor, 0, "cursor must park at 0 to suppress menu");
         assert!(buf.is_in_history(), "buffer must report history mode");
+    }
+
+    #[test]
+    fn cursor_line_up_walks_lines_then_signals_history_at_top() {
+        // "1\n2\n3" with cursor after the trailing "3". Up should
+        // walk: end-of-3 → end-of-2 → end-of-1. Once we're on line
+        // 1, another Up returns false so the caller switches to
+        // history navigation.
+        let mut buf = Buffer::new();
+        buf.text = "1\n2\n3".into();
+        buf.cursor = buf.text.len();
+
+        assert!(buf.cursor_line_up(), "first Up moves up from line 3");
+        assert_eq!(&buf.text[..buf.cursor], "1\n2");
+        assert!(buf.cursor_line_up(), "second Up moves up from line 2");
+        assert_eq!(&buf.text[..buf.cursor], "1");
+        assert!(
+            !buf.cursor_line_up(),
+            "on the first line cursor_line_up returns false → caller falls through to HistoryPrev"
+        );
+        assert_eq!(&buf.text[..buf.cursor], "1");
+    }
+
+    #[test]
+    fn cursor_line_down_walks_lines_then_signals_history_at_bottom() {
+        let mut buf = Buffer::new();
+        buf.text = "1\n2\n3".into();
+        buf.cursor = 0;
+
+        assert!(buf.cursor_line_down(), "Down from line 1 → line 2");
+        assert_eq!(&buf.text[..buf.cursor], "1\n");
+        assert!(buf.cursor_line_down(), "Down from line 2 → line 3");
+        assert_eq!(&buf.text[..buf.cursor], "1\n2\n");
+        assert!(
+            !buf.cursor_line_down(),
+            "on the last line cursor_line_down returns false"
+        );
+    }
+
+    #[test]
+    fn cursor_line_up_clamps_to_shorter_line() {
+        // Column-preservation: cursor at col 5 on line 2 ("hello"),
+        // line 1 is only "ab" — Up clamps to end of "ab".
+        let mut buf = Buffer::new();
+        buf.text = "ab\nhello".into();
+        buf.cursor = buf.text.len(); // after final 'o'
+
+        assert!(buf.cursor_line_up());
+        assert_eq!(buf.cursor, 2, "cursor clamps to end of shorter prev line");
+    }
+
+    #[test]
+    fn cursor_line_up_handles_cjk_width() {
+        // 你好 = 2 chars but 4 display cells. Target column on line
+        // 2 lands inside line 1's CJK run — should pick a char
+        // boundary (no panic) and preserve visual column.
+        let mut buf = Buffer::new();
+        buf.text = "你好world\nabcd".into();
+        // Move cursor to end of line 2 (col 4 → display width 4 →
+        // lands at "你好" exactly on line 1).
+        buf.cursor = buf.text.len();
+        assert!(buf.cursor_line_up());
+        // "你好" is the first 6 bytes (3 bytes per CJK char in UTF-8).
+        assert_eq!(buf.cursor, 6);
     }
 
     #[test]
@@ -4434,6 +4560,26 @@ fn handle_idle_key(
         // (the `v` char will be inserted as a regular character via classify).
     }
 
+    // Multi-line cursor nav (idle path). Mirror of the streaming-mode
+    // handler: in a buffer with embedded newlines, plain Up/Down walks
+    // through the lines first; only when the cursor is already on the
+    // first/last line does it surface as HistoryPrev/Next. Gated to
+    // "no modifiers" so Shift+Up (body scroll) and other compound keys
+    // still classify normally.
+    if modifiers.is_empty() {
+        match code {
+            KeyCode::Up if app.buf.cursor_line_up() => {
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            KeyCode::Down if app.buf.cursor_line_down() => {
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     let action = classify(code, modifiers);
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
@@ -5002,6 +5148,42 @@ fn handle_streaming_key(
                 return Ok(());
             }
             _ => {} // fall through to buffer edits
+        }
+    }
+
+    // Multi-line cursor nav: in a buffer with embedded newlines, plain
+    // Up/Down should walk through the lines first; only when the
+    // cursor is already on the first/last line does it surface as
+    // HistoryPrev/Next. Matches the convention from fish / Cursor /
+    // Claude Code — losing a multi-line draft to "I was just trying
+    // to fix line 2" is far worse than the historical single-line
+    // shortcut.  Gated to "no modifiers" so Shift+Up (selection in
+    // some terminals) and other compound keys still classify normally.
+    if modifiers.is_empty() {
+        match code {
+            KeyCode::Up if app.buf.cursor_line_up() => {
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
+                return Ok(());
+            }
+            KeyCode::Down if app.buf.cursor_line_down() => {
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
+                return Ok(());
+            }
+            _ => {}
         }
     }
 
