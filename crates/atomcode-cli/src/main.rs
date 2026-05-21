@@ -959,6 +959,7 @@ async fn run() -> Result<i32> {
                 subagent: Default::default(),
                 vision_preprocessor_provider: None,
                 language: None,
+                ui: Default::default(),
             }
         })
     } else {
@@ -976,6 +977,7 @@ async fn run() -> Result<i32> {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
         }
     };
 
@@ -1586,9 +1588,9 @@ async fn run_headless(
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
-            AgentEvent::Error(e) => {
+            AgentEvent::Error { error, messages: _ } => {
                 // Always shown — errors are not noise.
-                eprintln!("[error] {}", e);
+                eprintln!("[error] {}", error);
                 exit_code = 1;
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
@@ -2098,6 +2100,7 @@ fn run_codingplan_core(
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
         },
     };
 

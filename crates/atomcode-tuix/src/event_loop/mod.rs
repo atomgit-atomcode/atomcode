@@ -5407,7 +5407,7 @@ fn handle_agent_event(
 
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
-            persist_current_session(ctx, messages);
+            persist_current_session(ctx, messages, renderer);
 
             // CodingPlan usage refresh — fire after each completed turn
             // (with cooldown) so the right-aligned hint reflects the
@@ -5499,10 +5499,10 @@ fn handle_agent_event(
             think.reset();
             // Save what we did have — a user who Ctrl+C'd mid-stream
             // should still be able to /resume the cleaned conversation.
-            persist_current_session(ctx, messages);
+            persist_current_session(ctx, messages, renderer);
         }
-        AgentEvent::Error(e) => {
-            renderer.render(UiLine::Error(e));
+        AgentEvent::Error { error, messages } => {
+            renderer.render(UiLine::Error(error));
             renderer.flush();
             fixissue_pending.take();
             fixissue_buffer.clear();
@@ -5510,6 +5510,14 @@ fn handle_agent_event(
             // Same reset rationale as TurnComplete / TurnCancelled — an
             // aborted turn is another way to leave `<think>` half-open.
             think.reset();
+            // Persist on Error too — without this, a first-turn LLM
+            // failure (auth, rate limit, gateway 5xx, our own 5-min
+            // total-request timeout, etc.) silently drops the user's
+            // typed message from disk so the next `/resume` shows
+            // nothing for that conversation. Empty `messages` from
+            // the streaming-error forwarder is treated as a no-op
+            // by persist_current_session.
+            persist_current_session(ctx, messages, renderer);
         }
         AgentEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn
@@ -5867,6 +5875,7 @@ fn handle_agent_event(
 fn persist_current_session(
     ctx: &mut LoopCtx,
     messages: Vec<atomcode_core::conversation::message::Message>,
+    renderer: &mut dyn Renderer,
 ) {
     if messages.is_empty() {
         return;
@@ -5874,7 +5883,18 @@ fn persist_current_session(
     apply_session_messages(&mut ctx.current_session, messages);
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
-    let _ = ctx.session_manager.save(&ctx.current_session);
+    // Surface save failures instead of silently swallowing them.
+    // Previously this was `let _ = session_manager.save(...)`, which
+    // hid disk-full / permission / read-only / invalid-path errors —
+    // users would `/resume` on the next launch, see nothing, and
+    // assume "the session was lost" with no idea anything went wrong.
+    if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed { error: &e.to_string() })
+                .into_owned(),
+        ));
+        renderer.flush();
+    }
 }
 
 pub(crate) fn apply_session_messages(

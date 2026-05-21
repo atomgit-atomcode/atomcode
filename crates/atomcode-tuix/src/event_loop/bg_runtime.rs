@@ -181,9 +181,20 @@ impl BackgroundSlots {
                 }
                 false
             }
-            AgentEvent::Error(_) => {
+            AgentEvent::Error { messages, .. } => {
+                // Persist whatever conversation state we have at error
+                // time so a background session that died mid-turn can
+                // still be `/resume`d to inspect the partial transcript.
+                // Empty `messages` from the streaming-error forwarder
+                // skips the snapshot (no fresh state to commit). Return
+                // `true` so `apply_background_event` flushes to disk.
+                let did_snapshot = !messages.is_empty();
+                if did_snapshot {
+                    super::apply_session_messages(&mut bg.session, messages.clone());
+                    bg.summary = session_summary(&bg.session);
+                }
                 bg.state = RuntimeState::Error;
-                false
+                did_snapshot
             }
             AgentEvent::TextDelta(_)
             | AgentEvent::ReasoningDelta(_)

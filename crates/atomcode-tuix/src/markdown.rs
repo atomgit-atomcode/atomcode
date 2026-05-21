@@ -163,7 +163,7 @@ pub fn render_line_with_width(
             format!("{} {}", "#".repeat(level as usize), inner)
         } else {
             match level {
-                1 | 2 | 3 => format!("{}{}{}", theme::MD_HEADING_OPEN, inner, theme::MD_HEADING_CLOSE),
+                1 | 2 | 3 => format!("{}{}{}", theme::md_heading_open(), inner, theme::MD_HEADING_CLOSE),
                 _ => format!("{}{}{}", theme::MD_ITALIC_OPEN, inner, theme::MD_ITALIC_CLOSE),
             }
         };
@@ -570,7 +570,7 @@ fn render_inline(line: &str, caps: TerminalCaps) -> String {
                     // close sequence `\x1b[22;39m` resets both bold
                     // (SGR 22) and fg (SGR 39) so neither bleeds into
                     // the next span.
-                    out.push_str(theme::MD_INLINE_CODE_OPEN);
+                    out.push_str(theme::md_inline_code_open());
                     out.push_str(&inner);
                     out.push_str(theme::MD_INLINE_CODE_CLOSE);
                 } else {
@@ -737,7 +737,7 @@ mod tests {
         // resets both bold and fg.
         let rendered = render_inline_line("`x`", caps());
         assert!(
-            rendered.contains(theme::MD_INLINE_CODE_OPEN),
+            rendered.contains(theme::md_inline_code_open()),
             "inline code must open with MD_INLINE_CODE_OPEN: {}",
             rendered
         );
@@ -831,7 +831,7 @@ mod tests {
         assert!(out.contains("Hello"));
         // H1-H3 use the heading colour so they sit on a separate
         // colour layer from default-colour body text.
-        assert!(out.contains(theme::MD_HEADING_OPEN), "H2 should use MD_HEADING_OPEN, got: {:?}", out);
+        assert!(out.contains(theme::md_heading_open()), "H2 should use MD_HEADING_OPEN, got: {:?}", out);
     }
 
     #[test]
@@ -842,7 +842,7 @@ mod tests {
         // H4+ keeps italic-only — distinct from coloured H1-H3 without
         // adding a third colour tier.
         assert!(out.contains(theme::MD_ITALIC_OPEN), "H4 should use MD_ITALIC_OPEN, got: {:?}", out);
-        assert!(!out.contains(theme::MD_HEADING_OPEN), "H4 must not pick up the H1-H3 heading colour");
+        assert!(!out.contains(theme::md_heading_open()), "H4 must not pick up the H1-H3 heading colour");
     }
 
     #[test]

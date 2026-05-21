@@ -258,8 +258,19 @@ pub enum AgentEvent {
     MessagesSync {
         messages: Vec<crate::conversation::message::Message>,
     },
-    /// An error occurred.
-    Error(String),
+    /// An error occurred. Carries a snapshot of `conversation.messages`
+    /// so the TUI can persist mid-turn state even when the turn dies
+    /// before TurnComplete/TurnCancelled fire — without this, a
+    /// first-turn LLM failure silently drops the user's typed message
+    /// from disk and `/resume` shows nothing for that conversation.
+    /// Producers that don't hold the conversation (the inline
+    /// streaming-error forwarder in `run_turn_loop`) send `messages:
+    /// Vec::new()`; the terminal error path captured at
+    /// `handle_send_message` provides the full snapshot.
+    Error {
+        error: String,
+        messages: Vec<crate::conversation::message::Message>,
+    },
     /// Non-fatal advisory from a provider or other subsystem. UI renders
     /// this as a one-line yellow banner; does not abort the turn.
     /// Currently sourced from the OpenAI provider's truncation detector
@@ -1288,10 +1299,11 @@ impl AgentLoop {
                     // AcqRel: pair with the spawned task's Release store on
                     // completion so the next dispatcher sees the cleared flag.
                     if self.background_running.swap(true, Ordering::AcqRel) {
-                        let _ = self.event_tx.send(AgentEvent::Error(
-                            "A background task is already running. Wait for it to finish."
+                        let _ = self.event_tx.send(AgentEvent::Error {
+                            error: "A background task is already running. Wait for it to finish."
                                 .to_string(),
-                        ));
+                            messages: self.conversation.messages.clone(),
+                        });
                     } else {
                         let provider = self.turn_runner.provider.clone();
                         let tools = self.turn_runner.tools.clone();
@@ -1421,7 +1433,10 @@ impl AgentLoop {
         self.current_task = content.clone();
 
         if let Some(reason) = self.turn_runner.provider.availability_error() {
-            let _ = self.event_tx.send(AgentEvent::Error(reason.to_string()));
+            let _ = self.event_tx.send(AgentEvent::Error {
+                error: reason.to_string(),
+                messages: self.conversation.messages.clone(),
+            });
             self.finish_turn(TurnStopReason::Error);
             return;
         }
@@ -1453,9 +1468,10 @@ impl AgentLoop {
                     content.push_str(&extra);
                 }
                 crate::hook::UserPromptHookResult::Block(reason) => {
-                    let _ = self
-                        .event_tx
-                        .send(AgentEvent::Error(format!("hook blocked: {}", reason)));
+                    let _ = self.event_tx.send(AgentEvent::Error {
+                        error: format!("hook blocked: {}", reason),
+                        messages: self.conversation.messages.clone(),
+                    });
                     self.finish_turn(TurnStopReason::Error);
                     return;
                 }
@@ -2077,7 +2093,15 @@ impl AgentLoop {
                                     let _ = event_tx.send(AgentEvent::ToolCallStreaming { name, hint });
                                 }
                                 TurnEvent::Error(e) => {
-                                    let _ = event_tx.send(AgentEvent::Error(e));
+                                    // Streaming-error forwarder: `conv` is borrowed
+                                    // by the in-flight `turn_fut`, so we can't snapshot
+                                    // `conv.messages` from here. The terminal-error
+                                    // branches in `handle_send_message` fire after
+                                    // turn_fut completes with the proper snapshot.
+                                    let _ = event_tx.send(AgentEvent::Error {
+                                        error: e,
+                                        messages: Vec::new(),
+                                    });
                                 }
                                 TurnEvent::Warning(w) => {
                                     datalog.log_warning(&w);
@@ -2391,9 +2415,10 @@ impl AgentLoop {
 
                     if is_official_build_required {
                         self.datalog.log_error(&e);
-                        let _ = self
-                            .event_tx
-                            .send(AgentEvent::Error(public_error_message(&e)));
+                        let _ = self.event_tx.send(AgentEvent::Error {
+                            error: public_error_message(&e),
+                            messages: self.conversation.messages.clone(),
+                        });
                         self.finish_turn(TurnStopReason::Error);
                         return;
                     } else if (is_messages_illegal || is_context_overflow) && self.retry_count < 2 {
@@ -2436,9 +2461,10 @@ impl AgentLoop {
                         continue;
                     } else if is_auth_error {
                         self.datalog.log_error(&e);
-                        let _ = self
-                            .event_tx
-                            .send(AgentEvent::Error(public_error_message(&e)));
+                        let _ = self.event_tx.send(AgentEvent::Error {
+                            error: public_error_message(&e),
+                            messages: self.conversation.messages.clone(),
+                        });
                         self.finish_turn(TurnStopReason::Error);
                         return;
                     } else if self.retry_count < 3 {
@@ -2453,9 +2479,10 @@ impl AgentLoop {
                         continue;
                     } else {
                         self.datalog.log_error(&e);
-                        let _ = self
-                            .event_tx
-                            .send(AgentEvent::Error(public_error_message(&e)));
+                        let _ = self.event_tx.send(AgentEvent::Error {
+                            error: public_error_message(&e),
+                            messages: self.conversation.messages.clone(),
+                        });
                         self.finish_turn(TurnStopReason::Error);
                         return;
                     }
