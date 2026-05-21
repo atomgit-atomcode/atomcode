@@ -1073,6 +1073,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
         }
     }
 

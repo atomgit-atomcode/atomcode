@@ -689,6 +689,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
         }
     }
 
@@ -851,6 +852,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1062,6 +1064,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: Some(crate::locale::Locale::ZhCn),
+            ui: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1161,6 +1164,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: preprocessor_key.map(|s| s.to_string()),
             language: None,
+            ui: Default::default(),
         }
     }
 

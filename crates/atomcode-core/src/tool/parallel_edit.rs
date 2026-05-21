@@ -444,6 +444,7 @@ mod validate_args_tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
         }
     }
 
