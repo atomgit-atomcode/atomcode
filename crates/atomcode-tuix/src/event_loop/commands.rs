@@ -1486,6 +1486,43 @@ pub(super) fn execute_slash_command(
                 }
             }
         }
+        "setup" => {
+            renderer.render(UiLine::CommandOutput(
+                "Running atomcode setup...".to_string(),
+            ));
+            renderer.flush();
+
+            let project_root = ctx.working_dir.clone();
+            let opts = atomcode_core::setup::RunOptions::new(project_root);
+
+            // `setup::run` is synchronous (file I/O only). Run it on the
+            // current thread via `block_in_place` to avoid blocking the
+            // tokio runtime — no `block_on` needed since it's not async.
+            let result = tokio::task::block_in_place(|| {
+                atomcode_core::setup::run(opts)
+            });
+
+            match result {
+                Ok(report) => {
+                    for line in report.render_cli().lines() {
+                        renderer.render(UiLine::CommandOutput(line.to_string()));
+                    }
+
+                    // Reload skills/commands so newly-installed seeds are
+                    // visible immediately — without this the user would need
+                    // to restart AtomCode to see them in /skills.
+                    let (skills_loaded, _) = super::reload_plugins(ctx);
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "  🔄 Skills reloaded — {} available",
+                        skills_loaded,
+                    )));
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("setup error: {e}")));
+                }
+            }
+            renderer.flush();
+        }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,

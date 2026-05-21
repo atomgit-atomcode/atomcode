@@ -77,6 +77,8 @@ docs/superpowers
 .plan_docs
 extensions/vscode/resources/bin/
 .kiro
+# AtomCode local-scope configs (machine-specific)
+.atomcode/local/
 crates/atomcode-codingplan-crypto/
 scripts/build-official.sh
 build-official.sh

@@ -510,6 +510,12 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Install seed files (skills/commands/hooks/MCP) to `~/.atomcode/`.
+    Setup {
+        /// Take over a stale lock AND force reinstall even if seeds are already present.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -926,6 +932,14 @@ async fn run() -> Result<i32> {
                     TelemetryAction::Clear => telemetry_cmd::clear(&atomcode_dir)?,
                 }
                 return Ok(0);
+            }
+            Commands::Setup { force } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let exit_code = run_setup_command(force);
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return Ok(exit_code);
             }
             other => {
                 let result = handle_command(other, &telemetry).await.map(|_| 0);
@@ -1740,6 +1754,34 @@ async fn run_headless(
     Ok((exit_code, captured))
 }
 
+/// Drive `atomcode_core::setup::run` end-to-end and return the CLI exit code
+/// (0 on success, 1 on any setup error). `setup::run` is synchronous; we
+/// run it directly since `Commands::Setup` already runs outside the TUI loop.
+fn run_setup_command(force: bool) -> i32 {
+    use atomcode_core::setup;
+
+    let project_root = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("setup error: cannot read current directory: {e}");
+            return 1;
+        }
+    };
+    let mut opts = setup::RunOptions::new(project_root);
+    opts.force = force;
+
+    match setup::run(opts) {
+        Ok(report) => {
+            println!("{}", report.render_cli());
+            0
+        }
+        Err(e) => {
+            eprintln!("setup error: {e}");
+            1
+        }
+    }
+}
+
 /// Handle subcommands (login, logout, status)
 async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) -> Result<()> {
     // Subcommands never enter TUI, so tell the panic hook to skip terminal
@@ -1808,6 +1850,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")
+        }
+        Commands::Setup { .. } => {
+            unreachable!("Setup is handled inline in run() before handle_command")
         }
         Commands::Plugin(sub) => handle_plugin_cli(sub),
         Commands::Mcp(McpCli::Add {

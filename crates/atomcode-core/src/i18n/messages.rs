@@ -408,6 +408,7 @@ pub enum Msg<'a> {
     PluginListFailed { error: &'a str },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
+    CmdDescSetup,
     CmdDescCodingplan,
     CmdDescResume,
     CmdDescRename,
