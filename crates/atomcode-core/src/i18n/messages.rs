@@ -417,6 +417,10 @@ pub enum Msg<'a> {
     CmdSetupSkillsReloaded { count: usize },
     /// "setup error: {e}" — when setup::run returns an error.
     CmdSetupError { error: &'a str },
+    /// "Running setup skill..." — after seeds installed and skill is auto-invoked.
+    CmdSetupRunningSkill,
+    /// "Setup skill not found..." — when the setup skill cannot be resolved or expanded.
+    CmdSetupSkillMissing,
 
     // ── /plugin ──
     PluginUsage,

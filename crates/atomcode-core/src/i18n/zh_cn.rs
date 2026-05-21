@@ -624,6 +624,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  🔄 Skills 已重载 — {} 个可用", count).into(),
         Msg::CmdSetupError { error } =>
             format!("setup 错误：{error}").into(),
+        Msg::CmdSetupRunningSkill =>
+            "  🚀 正在运行 setup skill — 分析项目并生成推荐...".into(),
+        Msg::CmdSetupSkillMissing =>
+            "setup skill 未找到 — 请重新运行 /setup 以重新安装".into(),
 
         // ── /plugin ──
         Msg::PluginUsage =>
@@ -662,8 +666,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出插件失败：{error}").into(),
 
         // ── 命令描述 ──
-        Msg::CmdDescSetup =>
-            "扫描项目并安装推荐的 hooks/skills/MCP/commands".into(),
+Msg::CmdDescSetup =>
+"扫描项目、安装种子文件并运行 setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescCodingplan =>
             "领取 CodingPlan 并从计划的模型列表中配置模型".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),

@@ -635,6 +635,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  🔄 Skills reloaded — {} available", count).into(),
         Msg::CmdSetupError { error } =>
             format!("setup error: {error}").into(),
+        Msg::CmdSetupRunningSkill =>
+            "  🚀 Running setup skill — analyzing project and generating recommendations...".into(),
+        Msg::CmdSetupSkillMissing =>
+            "setup skill not found — try running /setup again to reinstall".into(),
 
         // ── /plugin ──
         Msg::PluginUsage =>
@@ -673,8 +677,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list plugins: {error}").into(),
 
         // ── Command descriptions ──
-        Msg::CmdDescSetup =>
-            "Scan project and install recommended hooks/skills/MCP/commands".into(),
+Msg::CmdDescSetup =>
+"Scan project, install seeds, and run setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescCodingplan =>
             "Claim CodingPlan + set up models from the plan's model list".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),

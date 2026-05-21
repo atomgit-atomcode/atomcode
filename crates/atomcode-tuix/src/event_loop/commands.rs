@@ -1497,42 +1497,102 @@ pub(super) fn execute_slash_command(
             }
         }
         "setup" => {
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdSetupRunning).into_owned(),
-            ));
-            renderer.flush();
+            // Check if the setup skill is already installed. If so, skip
+            // the seed-install step and directly invoke the skill — this
+            // avoids unnecessary file I/O, locking, and reloading every
+            // time the user runs /setup on a project that's already set up.
+            let skill_already_installed = {
+                let reg = ctx.skill_registry.read().ok();
+                reg.as_ref().map_or(false, |r| r.get("setup").is_some())
+            };
 
-            let project_root = ctx.working_dir.clone();
-            let opts = atomcode_core::setup::RunOptions::new(project_root);
-
-            // `setup::run` is synchronous (file I/O only). Run it on the
-            // current thread via `block_in_place` to avoid blocking the
-            // tokio runtime — no `block_on` needed since it's not async.
-            let result = tokio::task::block_in_place(|| {
-                atomcode_core::setup::run(opts)
-            });
-
-            match result {
-                Ok(report) => {
-                    for line in report.render_cli().lines() {
-                        renderer.render(UiLine::CommandOutput(line.to_string()));
-                    }
-
-                    // Reload skills/commands so newly-installed seeds are
-                    // visible immediately — without this the user would need
-                    // to restart AtomCode to see them in /skills.
-                    let (skills_loaded, _) = super::reload_plugins(ctx);
+            if skill_already_installed {
+                // Fast path: skill already present — just invoke it.
+                if let Some(rendered) = expand_skill(ctx, "setup", arg) {
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::CmdSetupSkillsReloaded { count: skills_loaded }).into_owned(),
+                        t(Msg::CmdSetupRunningSkill).into_owned(),
                     ));
-                }
-                Err(e) => {
+                    renderer.flush();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                    state.on_submit();
+                } else {
                     renderer.render(UiLine::Error(
-                        t(Msg::CmdSetupError { error: &e.to_string() }).into_owned(),
+                        t(Msg::CmdSetupSkillMissing).into_owned(),
                     ));
+                    renderer.flush();
                 }
+            } else {
+                // First run: install seeds, reload, then invoke.
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::CmdSetupRunning).into_owned(),
+                ));
+                renderer.flush();
+
+                let project_root = ctx.working_dir.clone();
+                let opts = atomcode_core::setup::RunOptions::new(project_root);
+
+                // `setup::run` is synchronous (file I/O only). Run it on the
+                // current thread via `block_in_place` to avoid blocking the
+                // tokio runtime — no `block_on` needed since it's not async.
+                let result = tokio::task::block_in_place(|| {
+                    atomcode_core::setup::run(opts)
+                });
+
+                match result {
+                    Ok(report) => {
+                        for line in report.render_cli().lines() {
+                            renderer.render(UiLine::CommandOutput(line.to_string()));
+                        }
+
+                        // Reload skills/commands so newly-installed seeds are
+                        // visible immediately — without this the user would need
+                        // to restart AtomCode to see them in /skills.
+                        let (skills_loaded, _) = super::reload_plugins(ctx);
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CmdSetupSkillsReloaded { count: skills_loaded }).into_owned(),
+                        ));
+                        renderer.flush();
+
+                        // After installing seeds and reloading, automatically
+                        // invoke the "setup" skill (atomcode-automation-recommender)
+                        // so the user gets a full project analysis + recommendations
+                        // in one step instead of having to run /skills setup manually.
+                        if let Some(rendered) = expand_skill(ctx, "setup", arg) {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::CmdSetupRunningSkill).into_owned(),
+                            ));
+                            renderer.flush();
+                            ctx.agent
+                                .cmd_tx
+                                .send(AgentCommand::SendMessage {
+                                    text: rendered,
+                                    images: vec![],
+                                    image_markers: vec![],
+                                })
+                                .ok();
+                            state.on_submit();
+                        } else {
+                            renderer.render(UiLine::Error(
+                                t(Msg::CmdSetupSkillMissing).into_owned(),
+                            ));
+                            renderer.flush();
+                        }
+                    }
+                    Err(e) => {
+                        renderer.render(UiLine::Error(
+                            t(Msg::CmdSetupError { error: &e.to_string() }).into_owned(),
+                        ));
+                    }
+                }
+                renderer.flush();
             }
-            renderer.flush();
         }
         other => {
             // Before reporting "unknown", check user-defined custom commands,

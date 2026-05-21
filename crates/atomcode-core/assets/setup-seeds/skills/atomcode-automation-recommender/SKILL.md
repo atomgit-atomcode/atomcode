@@ -1,5 +1,5 @@
 ---
-name: recommend
+name: setup
 description: Analyze a codebase and recommend AtomCode automations (hooks, subagents, skills, plugins, MCP servers). Use when user asks for automation recommendations, wants to optimize their AtomCode setup, mentions improving AtomCode workflows, asks how to first set up AtomCode for a project, or wants to know what AtomCode features they should use.
 user_invocable: true
 argument_hint: "[focus area, e.g. hooks, mcp, skills, all]"
