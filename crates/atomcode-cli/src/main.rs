@@ -816,7 +816,12 @@ async fn run() -> Result<i32> {
                 // Fall through to TUI startup below
             }
             Commands::Codingplan => {
-                // Headless: run the codingplan setup flow and exit.
+                // Run the codingplan setup flow, then fall through to TUI
+                // startup regardless of outcome — mirrors `Commands::Login`.
+                // On success the freshly saved config.toml is picked up by
+                // `Config::load` further down. On failure the TUI opens in
+                // onboarding mode (no providers) so the user can retry via
+                // `/codingplan` or `/login` without re-launching the binary.
                 // Emits open_atomcode (mode=headless) then take_codingplan
                 // (emitted internally by run_codingplan_core via coding_plan::run).
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -829,28 +834,22 @@ async fn run() -> Result<i32> {
                     mode: Some(SessionMode::Headless),
                     ..CurrentContext::current()
                 };
-                let exit_code = CurrentContext::scope(scope_ctx, || async {
+                let outcome = CurrentContext::scope(scope_ctx, || async {
                     telemetry.track(Event::OpenAtomcode);
-                    let result = run_codingplan_core(Some(&telemetry));
-                    match result {
-                        Ok(report) => {
-                            print!("{}", report);
-                            telemetry
-                                .shutdown(std::time::Duration::from_millis(500))
-                                .await;
-                            Ok::<i32, anyhow::Error>(0)
-                        }
-                        Err(e) => {
-                            eprintln!("codingplan failed: {:#}", e);
-                            telemetry
-                                .shutdown(std::time::Duration::from_millis(500))
-                                .await;
-                            Ok(1)
-                        }
-                    }
+                    run_codingplan_core(Some(&telemetry))
                 })
-                .await?;
-                return Ok(exit_code);
+                .await;
+                match outcome {
+                    Ok(report) => {
+                        print!("{}", report);
+                    }
+                    Err(e) => {
+                        eprintln!("codingplan failed: {:#}", e);
+                    }
+                }
+                println!("\n  Starting AtomCode...\n");
+                HEADLESS_MODE.store(false, Ordering::Relaxed);
+                // Fall through to TUI startup below
             }
             Commands::Fixissue { url } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
