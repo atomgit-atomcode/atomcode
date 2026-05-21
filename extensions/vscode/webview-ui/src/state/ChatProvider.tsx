@@ -17,6 +17,7 @@ interface ChatContextValue {
   openSessionInTab: (sessionId?: string, projectHash?: string) => void;
   renameSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
   deleteSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
+  deleteSessions: (sessions: Array<{ id: string; project_hash?: string; name?: string }>) => void;
   startLogin: () => void;
   cancelLogin: () => void;
   setupCodingPlan: () => void;
@@ -277,6 +278,17 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const deleteSessions = useCallback((sessions: Array<{ id: string; project_hash?: string; name?: string }>) => {
+    postMessage({
+      type: 'deleteSessions',
+      sessions: sessions.map((s) => ({
+        sessionId: s.id,
+        projectHash: s.project_hash,
+        name: s.name || '',
+      })),
+    });
+  }, []);
+
   const startLogin = useCallback(() => {
     postMessage({ type: 'authLoginStart' });
   }, []);
@@ -309,6 +321,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     openSessionInTab,
     renameSession,
     deleteSession,
+    deleteSessions,
     startLogin,
     cancelLogin,
     setupCodingPlan,

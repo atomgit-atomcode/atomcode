@@ -387,10 +387,33 @@
   min-height: 28px;
 }
 
+.session-title-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .session-list-header h3 {
   font-size: 11px;
   font-weight: 700;
   color: var(--app-secondary-foreground);
+}
+
+.select-mode-toggle {
+  height: 22px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.select-mode-toggle:hover {
+  background: var(--app-list-hover-background);
+  color: var(--app-primary-foreground);
 }
 
 .session-new-btn {
@@ -475,6 +498,99 @@
 .session-item.active .session-item-time {
   color: var(--app-list-active-foreground);
   opacity: 0.8;
+}
+
+/* ── Batch selection ────────────────────────── */
+.session-list-selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid var(--app-input-border);
+  font-size: 12px;
+}
+
+.session-list-selection-bar .selection-count {
+  flex: 1;
+  color: var(--app-secondary-foreground);
+  font-size: 11px;
+}
+
+.selection-bar-btn {
+  height: 24px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-primary-foreground);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.selection-bar-btn:hover {
+  background: var(--app-list-hover-background);
+}
+
+.selection-bar-btn.danger {
+  color: var(--app-diff-deletion-foreground);
+}
+
+.selection-bar-btn.danger:hover {
+  background: var(--app-diff-deletion-foreground);
+  color: #fff;
+}
+
+.session-item-checkbox {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1.5px solid var(--app-secondary-foreground);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+/* In select mode: checkboxes visible on all rows */
+.session-list.has-selection .session-item-checkbox {
+  opacity: 1;
+  transition-delay: 0s;
+}
+
+.session-item-checkbox.checked {
+  opacity: 1;
+  border-color: var(--app-brand);
+  background: var(--app-brand);
+}
+
+/* Selected row highlight */
+.session-list.has-selection .session-item.selected {
+  background: var(--app-list-active-background);
+}
+
+.session-list.has-selection .session-item.selected:hover {
+  background: var(--app-list-active-background);
+}
+
+.session-list.has-selection .session-item.selected.active {
+  background: var(--app-list-active-background);
+  color: var(--app-list-active-foreground);
+}
+
+.session-item-checkbox.checked::after {
+  content: '';
+  display: block;
+  width: 4px;
+  height: 7px;
+  border: solid var(--app-brand-ivory);
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg) translateY(-1px);
 }
 
 .session-item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

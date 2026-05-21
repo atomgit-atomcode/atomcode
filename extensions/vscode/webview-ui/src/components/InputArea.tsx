@@ -64,33 +64,35 @@ export function InputArea() {
     };
   }, []);
 
+  // Close pickers when clicking outside their relevant areas
+  // Capture phase so no child handler can stop this from firing
   useEffect(() => {
-    if (!showFilePicker) return undefined;
-    // Focus the search input when file picker opens
-    requestAnimationFrame(() => fileSearchRef.current?.focus());
-
-    function handlePointerDown(e: MouseEvent) {
-      if (inputBoxRef.current && !inputBoxRef.current.contains(e.target as Node)) {
-        setShowFilePicker(false);
-        setFileQuery('');
-      }
+    if (!showFilePicker && !showSlash) return;
+    if (showFilePicker) {
+      requestAnimationFrame(() => fileSearchRef.current?.focus());
     }
-    document.addEventListener('mousedown', handlePointerDown);
-    return () => document.removeEventListener('mousedown', handlePointerDown);
-  }, [showFilePicker]);
 
-  useEffect(() => {
-    if (!showSlash) return undefined;
-
-    function handlePointerDown(e: MouseEvent) {
-      if (inputBoxRef.current && !inputBoxRef.current.contains(e.target as Node)) {
+    function closePickers(e: MouseEvent) {
+      const target = e.target as Node;
+      if (!document.body.contains(target)) return;
+      // File picker: close when clicking anywhere outside the picker itself
+      // (including the textarea — user is done selecting files)
+      if (showFilePicker) {
+        const insidePicker = (target as HTMLElement).closest?.('.file-picker');
+        if (!insidePicker) {
+          setShowFilePicker(false);
+          setFileQuery('');
+        }
+      }
+      // Slash picker: close when clicking outside input-box
+      // (keep open when clicking textarea so user can keep typing)
+      if (showSlash && inputBoxRef.current && !inputBoxRef.current.contains(target)) {
         setShowSlash(false);
       }
     }
-
-    document.addEventListener('mousedown', handlePointerDown);
-    return () => document.removeEventListener('mousedown', handlePointerDown);
-  }, [showSlash]);
+    document.addEventListener('mousedown', closePickers, true);
+    return () => document.removeEventListener('mousedown', closePickers, true);
+  }, [showFilePicker, showSlash]);
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
@@ -127,9 +129,16 @@ export function InputArea() {
   }, []);
 
   const handleSlashButton = useCallback(() => {
-    setText('/');
-    setSlashFilter('');
-    setShowSlash((open) => !open);
+    setShowFilePicker((fp) => {
+      if (fp) { setFileQuery(''); return false; }
+      return fp;
+    });
+    setShowSlash((open) => {
+      if (open) { setText(''); return false; }
+      setText('/');
+      setSlashFilter('');
+      return true;
+    });
     textareaRef.current?.focus();
   }, []);
 

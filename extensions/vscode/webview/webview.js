@@ -74195,6 +74195,16 @@
         name: session.name || session.title || ""
       });
     }, []);
+    const deleteSessions = (0, import_react.useCallback)((sessions) => {
+      postMessage({
+        type: "deleteSessions",
+        sessions: sessions.map((s) => ({
+          sessionId: s.id,
+          projectHash: s.project_hash,
+          name: s.name || ""
+        }))
+      });
+    }, []);
     const startLogin = (0, import_react.useCallback)(() => {
       postMessage({ type: "authLoginStart" });
     }, []);
@@ -74222,6 +74232,7 @@
       openSessionInTab,
       renameSession,
       deleteSession,
+      deleteSessions,
       startLogin,
       cancelLogin,
       setupCodingPlan,
@@ -77974,6 +77985,7 @@ ${content}</tr>
     const handleKeyDown = (0, import_react11.useCallback)(
       (e) => {
         if (filtered.length === 0) return;
+        if (e.isComposing || e.key === "Process") return;
         if (e.key === "ArrowDown") {
           e.preventDefault();
           setActiveIndex((i) => (i + 1) % filtered.length);
@@ -78125,27 +78137,27 @@ ${content}</tr>
       };
     }, []);
     (0, import_react13.useEffect)(() => {
-      if (!showFilePicker) return void 0;
-      requestAnimationFrame(() => fileSearchRef.current?.focus());
-      function handlePointerDown(e) {
-        if (inputBoxRef.current && !inputBoxRef.current.contains(e.target)) {
-          setShowFilePicker(false);
-          setFileQuery("");
-        }
+      if (!showFilePicker && !showSlash) return;
+      if (showFilePicker) {
+        requestAnimationFrame(() => fileSearchRef.current?.focus());
       }
-      document.addEventListener("mousedown", handlePointerDown);
-      return () => document.removeEventListener("mousedown", handlePointerDown);
-    }, [showFilePicker]);
-    (0, import_react13.useEffect)(() => {
-      if (!showSlash) return void 0;
-      function handlePointerDown(e) {
-        if (inputBoxRef.current && !inputBoxRef.current.contains(e.target)) {
+      function closePickers(e) {
+        const target = e.target;
+        if (!document.body.contains(target)) return;
+        if (showFilePicker) {
+          const insidePicker = target.closest?.(".file-picker");
+          if (!insidePicker) {
+            setShowFilePicker(false);
+            setFileQuery("");
+          }
+        }
+        if (showSlash && inputBoxRef.current && !inputBoxRef.current.contains(target)) {
           setShowSlash(false);
         }
       }
-      document.addEventListener("mousedown", handlePointerDown);
-      return () => document.removeEventListener("mousedown", handlePointerDown);
-    }, [showSlash]);
+      document.addEventListener("mousedown", closePickers, true);
+      return () => document.removeEventListener("mousedown", closePickers, true);
+    }, [showFilePicker, showSlash]);
     const handleChange = (0, import_react13.useCallback)((e) => {
       const val = e.target.value;
       setText(val);
@@ -78180,9 +78192,22 @@ ${content}</tr>
       textareaRef.current?.focus();
     }, []);
     const handleSlashButton = (0, import_react13.useCallback)(() => {
-      setText("/");
-      setSlashFilter("");
-      setShowSlash((open) => !open);
+      setShowFilePicker((fp) => {
+        if (fp) {
+          setFileQuery("");
+          return false;
+        }
+        return fp;
+      });
+      setShowSlash((open) => {
+        if (open) {
+          setText("");
+          return false;
+        }
+        setText("/");
+        setSlashFilter("");
+        return true;
+      });
       textareaRef.current?.focus();
     }, []);
     const handleAttachClick = (0, import_react13.useCallback)(() => {
@@ -78282,9 +78307,11 @@ ${content}</tr>
   var import_jsx_runtime15 = __toESM(require_jsx_runtime());
   var DATE_ORDER = ["Today", "Yesterday", "This Week", "Older"];
   function SessionList({ variant = "overlay" }) {
-    const { state, dispatch, openSessionInTab, renameSession, deleteSession } = useChatContext();
+    const { state, dispatch, openSessionInTab, renameSession, deleteSession, deleteSessions } = useChatContext();
     const [search, setSearch] = (0, import_react14.useState)("");
     const [menu, setMenu] = (0, import_react14.useState)(null);
+    const [selectedIds, setSelectedIds] = (0, import_react14.useState)(/* @__PURE__ */ new Set());
+    const [selectMode, setSelectMode] = (0, import_react14.useState)(false);
     const isOverlay = variant === "overlay";
     const filteredSessions = (0, import_react14.useMemo)(() => {
       if (!search.trim()) return state.sessions;
@@ -78294,12 +78321,31 @@ ${content}</tr>
       );
     }, [state.sessions, search]);
     const groups = (0, import_react14.useMemo)(() => groupSessionsByDate(filteredSessions), [filteredSessions]);
+    (0, import_react14.useEffect)(() => {
+      setSelectedIds(/* @__PURE__ */ new Set());
+      setSelectMode(false);
+    }, [state.sessions]);
     function handleSelect(session) {
+      if (selectMode) {
+        toggleSelect(session);
+        return;
+      }
       setMenu(null);
       openSessionInTab(session.id, session.project_hash);
       if (isOverlay) {
         dispatch({ type: "TOGGLE_HISTORY" });
       }
+    }
+    function toggleSelect(session) {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(session.id)) {
+          next.delete(session.id);
+        } else {
+          next.add(session.id);
+        }
+        return next;
+      });
     }
     function handleNewSession() {
       setMenu(null);
@@ -78319,114 +78365,189 @@ ${content}</tr>
         y: Math.min(e.clientY, window.innerHeight - menuHeight - 8)
       });
     }
+    function enterSelectMode() {
+      setSelectMode(true);
+    }
+    function exitSelectMode() {
+      setSelectMode(false);
+      setSelectedIds(/* @__PURE__ */ new Set());
+    }
+    function handleDeleteSelected() {
+      const toDelete = state.sessions.filter((s) => selectedIds.has(s.id));
+      if (toDelete.length === 0) return;
+      deleteSessions(
+        toDelete.map((s) => ({
+          id: s.id,
+          project_hash: s.project_hash,
+          name: s.name || s.title || ""
+        }))
+      );
+      exitSelectMode();
+    }
     (0, import_react14.useEffect)(() => {
-      if (!menu) return void 0;
+      if (!menu && !selectMode) return void 0;
       function close() {
         setMenu(null);
       }
       function handleKeyDown(e) {
-        if (e.key === "Escape") close();
+        if (e.key === "Escape") {
+          if (selectMode) {
+            exitSelectMode();
+          } else {
+            close();
+          }
+        }
       }
-      window.addEventListener("click", close);
+      function handleClickOutside(e) {
+        if (selectMode) {
+          const target = e.target;
+          if (!target.closest(".session-list")) {
+            exitSelectMode();
+          }
+        } else {
+          close();
+        }
+      }
+      window.addEventListener("click", handleClickOutside);
       window.addEventListener("scroll", close, true);
       window.addEventListener("keydown", handleKeyDown);
       return () => {
-        window.removeEventListener("click", close);
+        window.removeEventListener("click", handleClickOutside);
         window.removeEventListener("scroll", close, true);
         window.removeEventListener("keydown", handleKeyDown);
       };
-    }, [menu]);
-    const content = /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: `session-list session-list-${variant}`, onClick: (e) => e.stopPropagation(), children: [
-      /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: "session-list-header", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: "session-title-row", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("h3", { children: "ATOMCODE" }),
-          isOverlay && /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("button", { className: "ghost-btn", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), title: "Close", children: "\xD7" })
-        ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("button", { className: "session-new-btn", onClick: handleNewSession, children: [
-          /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-new-icon", children: "+" }),
-          /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { children: "New session" })
-        ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime15.jsx)(
-          "input",
-          {
-            className: "session-search",
-            type: "text",
-            placeholder: "Search sessions...",
-            value: search,
-            onChange: (e) => setSearch(e.target.value),
-            autoFocus: isOverlay
-          }
-        )
-      ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-list-body", children: filteredSessions.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-empty", children: "No sessions yet" }) : DATE_ORDER.map((label) => {
-        const items = groups[label];
-        if (!items || items.length === 0) return null;
-        return /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { children: [
-          /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-group-label", children: label }),
-          items.map((s) => {
-            const isActive = s.id === state.activeSessionId;
-            let dotClass = "";
-            if (!isActive) {
-              if (s.isGenerating) {
-                dotClass = "session-item-dot breathing";
-              } else if (s.hasUnread) {
-                dotClass = "session-item-dot";
-              }
-            }
-            return /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)(
-              "button",
-              {
-                className: `session-item${isActive ? " active" : ""}`,
-                onClick: () => handleSelect(s),
-                onContextMenu: (e) => handleContextMenu(e, s),
-                title: s.name || s.title || "Untitled",
-                children: [
-                  dotClass && /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: dotClass }),
-                  /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-item-name", children: s.name || s.title || "Untitled" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-item-time", children: formatTimeAgo(s.updated_at ?? s.created_at) })
-                ]
-              },
-              `${s.project_hash ?? "current"}:${s.id}`
-            );
-          })
-        ] }, label);
-      }) }),
-      menu && /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)(
-        "div",
-        {
-          className: "session-context-menu",
-          style: { left: menu.x, top: menu.y },
-          onClick: (e) => e.stopPropagation(),
-          onContextMenu: (e) => e.preventDefault(),
-          children: [
+    }, [menu, selectMode]);
+    const hasSelection = selectMode && selectedIds.size > 0;
+    const selectedCount = selectedIds.size;
+    const content = /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)(
+      "div",
+      {
+        className: `session-list session-list-${variant}${selectMode ? " has-selection" : ""}`,
+        onClick: (e) => e.stopPropagation(),
+        children: [
+          /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: "session-list-header", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: "session-title-row", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("h3", { children: "ATOMCODE" }),
+              /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: "session-title-actions", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime15.jsx)(
+                  "button",
+                  {
+                    className: "select-mode-toggle",
+                    onClick: selectMode ? exitSelectMode : enterSelectMode,
+                    children: selectMode ? "\u5B8C\u6210" : "\u9009\u62E9"
+                  }
+                ),
+                isOverlay && /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("button", { className: "ghost-btn", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), title: "Close", children: "\xD7" })
+              ] })
+            ] }),
+            /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("button", { className: "session-new-btn", onClick: handleNewSession, children: [
+              /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-new-icon", children: "+" }),
+              /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { children: "New session" })
+            ] }),
             /* @__PURE__ */ (0, import_jsx_runtime15.jsx)(
-              "button",
+              "input",
               {
-                type: "button",
-                className: "session-context-item",
-                onClick: () => {
-                  renameSession(menu.session);
-                  setMenu(null);
-                },
-                children: "\u4FEE\u6539\u540D\u79F0"
-              }
-            ),
-            /* @__PURE__ */ (0, import_jsx_runtime15.jsx)(
-              "button",
-              {
-                type: "button",
-                className: "session-context-item danger",
-                onClick: () => {
-                  deleteSession(menu.session);
-                  setMenu(null);
-                },
-                children: "\u5220\u9664\u4F1A\u8BDD"
+                className: "session-search",
+                type: "text",
+                placeholder: "Search sessions...",
+                value: search,
+                onChange: (e) => setSearch(e.target.value),
+                autoFocus: isOverlay
               }
             )
-          ]
-        }
-      )
-    ] });
+          ] }),
+          hasSelection && /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { className: "session-list-selection-bar", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("span", { className: "selection-count", children: [
+              "\u5DF2\u9009 ",
+              selectedCount,
+              " \u9879"
+            ] }),
+            /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("button", { className: "selection-bar-btn danger", onClick: handleDeleteSelected, children: "\u5220\u9664\u6240\u9009" }),
+            /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("button", { className: "selection-bar-btn", onClick: exitSelectMode, children: "\u53D6\u6D88\u9009\u62E9" })
+          ] }),
+          /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-list-body", children: filteredSessions.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-empty", children: "No sessions yet" }) : DATE_ORDER.map((label) => {
+            const items = groups[label];
+            if (!items || items.length === 0) return null;
+            return /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)("div", { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-group-label", children: label }),
+              items.map((s) => {
+                const isActive = s.id === state.activeSessionId;
+                const isChecked = selectedIds.has(s.id);
+                let dotClass = "";
+                if (!isActive) {
+                  if (s.isGenerating) {
+                    dotClass = "session-item-dot breathing";
+                  } else if (s.hasUnread) {
+                    dotClass = "session-item-dot";
+                  }
+                }
+                return /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)(
+                  "button",
+                  {
+                    className: `session-item${isActive ? " active" : ""}${selectMode && isChecked ? " selected" : ""}`,
+                    onClick: () => handleSelect(s),
+                    onContextMenu: (e) => handleContextMenu(e, s),
+                    title: selectMode ? void 0 : s.name || s.title || "Untitled",
+                    children: [
+                      /* @__PURE__ */ (0, import_jsx_runtime15.jsx)(
+                        "span",
+                        {
+                          className: `session-item-checkbox${isChecked ? " checked" : ""}`,
+                          onClick: selectMode ? (e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            toggleSelect(s);
+                          } : void 0
+                        }
+                      ),
+                      dotClass && /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: dotClass }),
+                      /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-item-name", children: s.name || s.title || "Untitled" }),
+                      /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("span", { className: "session-item-time", children: formatTimeAgo(s.updated_at ?? s.created_at) })
+                    ]
+                  },
+                  `${s.project_hash ?? "current"}:${s.id}`
+                );
+              })
+            ] }, label);
+          }) }),
+          menu && /* @__PURE__ */ (0, import_jsx_runtime15.jsxs)(
+            "div",
+            {
+              className: "session-context-menu",
+              style: { left: menu.x, top: menu.y },
+              onClick: (e) => e.stopPropagation(),
+              onContextMenu: (e) => e.preventDefault(),
+              children: [
+                /* @__PURE__ */ (0, import_jsx_runtime15.jsx)(
+                  "button",
+                  {
+                    type: "button",
+                    className: "session-context-item",
+                    onClick: () => {
+                      renameSession(menu.session);
+                      setMenu(null);
+                    },
+                    children: "\u4FEE\u6539\u540D\u79F0"
+                  }
+                ),
+                /* @__PURE__ */ (0, import_jsx_runtime15.jsx)(
+                  "button",
+                  {
+                    type: "button",
+                    className: "session-context-item danger",
+                    onClick: () => {
+                      deleteSession(menu.session);
+                      setMenu(null);
+                    },
+                    children: "\u5220\u9664\u4F1A\u8BDD"
+                  }
+                )
+              ]
+            }
+          )
+        ]
+      }
+    );
     return isOverlay ? /* @__PURE__ */ (0, import_jsx_runtime15.jsx)("div", { className: "session-overlay", onClick: () => dispatch({ type: "TOGGLE_HISTORY" }), children: content }) : content;
   }
 

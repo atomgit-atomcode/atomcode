@@ -38,6 +38,8 @@ export function SlashPicker({ filter, onSelect, onClose }: SlashPickerProps) {
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (filtered.length === 0) return;
+      // Don't intercept keystrokes while IME is composing
+      if (e.isComposing || e.key === 'Process') return;
 
       if (e.key === 'ArrowDown') {
         e.preventDefault();

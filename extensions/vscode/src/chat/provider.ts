@@ -37,6 +37,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _panelReady = new Map<string, boolean>();
   private _activeSessionId?: string;
   private _focusedPanelId?: string;
+  private _groupLocked = false;
   private _sessionRuntimes = new Map<string, SessionRuntime>();
   private _loginId?: string;
   private _loginPoll?: ReturnType<typeof setInterval>;
@@ -60,6 +61,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     return undefined;
+  }
+
+  private _lockGroupOnce() {
+    if (this._groupLocked) return;
+    this._groupLocked = true;
+    vscode.commands.executeCommand('workbench.action.lockEditorGroup');
   }
 
   public openInTab(sessionId?: string) {
@@ -95,6 +102,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
     panel.webview.html = this._getHtml(panel.webview, 'tab');
     this._setupWebviewMessageHandler(panel.webview, 'tab');
+
+    // Lock the editor group on first panel creation
+    this._lockGroupOnce();
 
     // Track the panel — required for message routing, size check, and lookup
     if (sessionId) {
@@ -296,6 +306,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'deleteSession':
           await this._deleteSession(msg.sessionId, msg.projectHash, msg.name);
+          break;
+        case 'deleteSessions':
+          await this._deleteSessions(msg.sessions, webview);
           break;
         case 'openSidebar':
           await this.openInSidebar();
@@ -1096,35 +1109,122 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (choice !== 'Delete') return;
 
     try {
-      // Stop any daemon-side stream before deleting
-      const rt = this._sessionRuntimes.get(sessionId);
-      if (rt?.isGenerating) {
-        rt.abortController?.abort();
-        void this._client.stopGeneration(sessionId).catch(() => undefined);
-      }
-      this._sessionRuntimes.delete(sessionId);
-
-      await this._client.deleteSession(hash, sessionId);
-
-      // Clear any panels bound to this session
-      let cleared = false;
-      for (const [pid, info] of [...this._panelSessions]) {
-        if (info.sessionId === sessionId) {
-          this._panelSessions.delete(pid);
-          if (this._focusedPanelId === pid) {
-            this._focusedPanelId = undefined;
-          }
-          cleared = true;
-        }
-      }
-      if (cleared) {
-        this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
-        this._broadcastMessage({ type: 'clearChat' });
-      }
-      await this._refreshSessions();
+      await this._deleteSessionInternal(sessionId, hash);
     } catch (e) {
       this._postMessage({ type: 'error', message: `Unable to delete session: ${this._messageFromError(e)}` });
     }
+  }
+
+  private async _deleteSessionInternal(sessionId: string, hash: string) {
+    // Stop any daemon-side stream before deleting
+    const rt = this._sessionRuntimes.get(sessionId);
+    if (rt?.isGenerating) {
+      rt.abortController?.abort();
+      void this._client.stopGeneration(sessionId).catch(() => undefined);
+    }
+    this._sessionRuntimes.delete(sessionId);
+
+    await this._client.deleteSession(hash, sessionId);
+
+    // Clear any panels bound to this session
+    let cleared = false;
+    for (const [pid, info] of [...this._panelSessions]) {
+      if (info.sessionId === sessionId) {
+        this._panelSessions.delete(pid);
+        if (this._focusedPanelId === pid) {
+          this._focusedPanelId = undefined;
+        }
+        cleared = true;
+      }
+    }
+    // Also close and clear direct panel binding (tab opened via openSessionInTab)
+    const panel = this._panels.get(sessionId);
+    if (panel) {
+      this._panels.delete(sessionId);
+      this._panelReady.delete(sessionId);
+      this._panelSessions.delete(sessionId);
+      if (this._focusedPanelId === sessionId) {
+        this._focusedPanelId = undefined;
+      }
+      cleared = true;
+      panel.dispose();
+    }
+    if (cleared) {
+      this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
+      this._broadcastMessage({ type: 'clearChat' });
+    }
+    await this._refreshSessions();
+  }
+
+  private async _deleteSessions(
+    sessions: Array<{ sessionId: string; projectHash?: string; name?: string }>,
+    sourceWebview?: vscode.Webview,
+  ) {
+    if (!sessions || sessions.length === 0) return;
+
+    const count = sessions.length;
+    const label = count === 1
+      ? `Delete AtomCode session "${sessions[0].name || sessions[0].sessionId}"?`
+      : `确定删除 ${count} 个会话？`;
+
+    const choice = await vscode.window.showWarningMessage(
+      label,
+      { modal: true, detail: '此操作不可撤销，会话将从本地历史中移除。' },
+      'Delete',
+    );
+    if (choice !== 'Delete') return;
+
+    let succeeded = 0;
+    let failed = 0;
+    for (const { sessionId, projectHash, name } of sessions) {
+      const hash = await this._resolveSessionProjectHash(sessionId, projectHash);
+      if (!hash) {
+        // No daemon record — clean up panel bindings locally
+        let cleared = false;
+        for (const [pid, info] of [...this._panelSessions]) {
+          if (info.sessionId === sessionId) {
+            this._panelSessions.delete(pid);
+            if (this._focusedPanelId === pid) {
+              this._focusedPanelId = undefined;
+            }
+            cleared = true;
+          }
+        }
+        const panel = this._panels.get(sessionId);
+        if (panel) {
+          this._panels.delete(sessionId);
+          this._panelReady.delete(sessionId);
+          if (this._focusedPanelId === sessionId) {
+            this._focusedPanelId = undefined;
+          }
+          cleared = true;
+          panel.dispose();
+        }
+        if (cleared) {
+          this._broadcastMessage({ type: 'sessionSelected', sessionId: undefined, projectHash: undefined });
+          this._broadcastMessage({ type: 'clearChat' });
+        }
+        succeeded++;
+        continue;
+      }
+      try {
+        await this._deleteSessionInternal(sessionId, hash);
+        succeeded++;
+      } catch (e) {
+        failed++;
+      }
+    }
+
+    if (failed > 0) {
+      const errMsg = { type: 'error', message: `已删除 ${succeeded}/${count} 个会话，${failed} 个失败` };
+      if (sourceWebview) {
+        this._postMessage(errMsg, sourceWebview);
+      } else {
+        this._postMessage(errMsg);
+      }
+    }
+
+    await this._refreshSessions();
   }
 
   private async _resolveSessionProjectHash(sessionId: string, projectHash?: string): Promise<string | undefined> {
