@@ -234,7 +234,10 @@ impl AgentLoop {
                 });
             }
             TurnEvent::Error(e) => {
-                let _ = self.event_tx.send(AgentEvent::Error(e));
+                let _ = self.event_tx.send(AgentEvent::Error {
+                    error: e,
+                    messages: self.conversation.messages.clone(),
+                });
             }
             TurnEvent::Warning(w) => {
                 self.datalog.log_warning(&w);

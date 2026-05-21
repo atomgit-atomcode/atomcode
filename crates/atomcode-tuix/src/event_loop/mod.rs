@@ -1979,6 +1979,124 @@ mod tool_format_tests {
         assert_eq!(out, "");
     }
 
+    // ── disambiguate_batch_details tests (issue #437) ──
+
+    #[test]
+    fn disambiguate_no_duplicates_returns_as_is() {
+        let names = vec!["read_file", "read_file"];
+        let args = vec![
+            r#"{"file_path":"/a/foo.rs"}"#,
+            r#"{"file_path":"/b/bar.rs"}"#,
+        ];
+        let details = vec!["foo.rs".to_string(), "bar.rs".to_string()];
+        let result = disambiguate_batch_details(&names, &args, &details);
+        assert_eq!(result, vec!["foo.rs", "bar.rs"]);
+    }
+
+    #[test]
+    fn disambiguate_same_basename_adds_parent_dir() {
+        // Issue #437: three SKILL.md files in different directories
+        let names = vec!["read_file", "read_file", "read_file"];
+        let args = vec![
+            r#"{"file_path":"/home/.atomcode/skills/atomcode-automation-recommender/SKILL.md"}"#,
+            r#"{"file_path":"/home/.atomcode/skills/tosshub-skill/SKILL.md"}"#,
+            r#"{"file_path":"/home/.atomcode/skills/zouwu-skill/SKILL.md"}"#,
+        ];
+        let details = vec![
+            "SKILL.md".to_string(),
+            "SKILL.md".to_string(),
+            "SKILL.md".to_string(),
+        ];
+        let result = disambiguate_batch_details(&names, &args, &details);
+        // Each should include its parent directory to disambiguate
+        assert_eq!(
+            result,
+            vec![
+                "atomcode-automation-recommender/SKILL.md",
+                "tosshub-skill/SKILL.md",
+                "zouwu-skill/SKILL.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn disambiguate_partial_duplicates_only_touches_dups() {
+        // Two same-name files + one unique file
+        let names = vec!["read_file", "read_file", "read_file"];
+        let args = vec![
+            r#"{"file_path":"/a/mod.rs"}"#,
+            r#"{"file_path":"/b/mod.rs"}"#,
+            r#"{"file_path":"/c/unique.rs"}"#,
+        ];
+        let details = vec![
+            "mod.rs".to_string(),
+            "mod.rs".to_string(),
+            "unique.rs".to_string(),
+        ];
+        let result = disambiguate_batch_details(&names, &args, &details);
+        // unique.rs is left unchanged
+        assert_eq!(result[2], "unique.rs");
+        // mod.rs entries get parent dir
+        assert_eq!(result[0], "a/mod.rs");
+        assert_eq!(result[1], "b/mod.rs");
+    }
+
+    #[test]
+    fn disambiguate_no_path_uses_hash_suffix() {
+        // Non-file tools that produce duplicate details
+        let names = vec!["bash", "bash"];
+        let args = vec![r#"{"command":"echo hi"}"#, r#"{"command":"echo hi"}"#];
+        let details = vec!["echo hi".to_string(), "echo hi".to_string()];
+        let result = disambiguate_batch_details(&names, &args, &details);
+        // First stays the same, second gets #2 suffix
+        assert_eq!(result[0], "echo hi");
+        assert_eq!(result[1], "echo hi #2");
+    }
+
+    #[test]
+    fn tail_path_basic() {
+        assert_eq!(tail_path("a/b/c/SKILL.md", 0), "SKILL.md");
+        assert_eq!(tail_path("a/b/c/SKILL.md", 1), "c/SKILL.md");
+        assert_eq!(tail_path("a/b/c/SKILL.md", 2), "b/c/SKILL.md");
+        assert_eq!(tail_path("a/b/c/SKILL.md", 3), "a/b/c/SKILL.md");
+        // depth exceeding path depth returns full path
+        assert_eq!(tail_path("a/b/c/SKILL.md", 10), "a/b/c/SKILL.md");
+    }
+
+    #[test]
+    fn tail_path_no_parent() {
+        // File with no directory component
+        assert_eq!(tail_path("foo.rs", 0), "foo.rs");
+        assert_eq!(tail_path("foo.rs", 1), "foo.rs");
+    }
+
+    #[test]
+    fn disambiguate_long_path_is_truncated() {
+        // Very deep duplicate paths should be truncated to 100 display cols
+        let long_seg = "a".repeat(30); // 30 chars each
+        let path1 = format!("/x/{}/{}/mod.rs", long_seg, long_seg);
+        let path2 = format!("/y/{}/{}/mod.rs", long_seg, long_seg);
+        let names = vec!["read_file", "read_file"];
+        let args: Vec<String> = vec![
+            format!(r#"{{"file_path":"{}"}}"#, path1),
+            format!(r#"{{"file_path":"{}"}}"#, path2),
+        ];
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let details = vec!["mod.rs".to_string(), "mod.rs".to_string()];
+        let result = disambiguate_batch_details(&names, &args_refs, &details);
+        // Both entries should be truncated — no entry exceeds 100 display width
+        for entry in &result {
+            assert!(
+                crate::width::display_width(entry) <= 100,
+                "entry too wide ({} cols): {}",
+                crate::width::display_width(entry),
+                entry,
+            );
+        }
+        // And they should still be different from each other
+        assert_ne!(result[0], result[1]);
+    }
+
     #[test]
     fn summarise_single_line_returned_as_is() {
         assert_eq!(summarise("ok", true), "ok");
@@ -2333,10 +2451,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
             ctx.current_session = session;
             app.state.on_turn_complete();
-            renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::SessionReplayHint).into_owned(),
-            ));
-            renderer.flush();
         }
     }
 
@@ -5114,8 +5228,13 @@ fn handle_agent_event(
             // line. Still record into `pending_tools` so the matching
             // ToolCallResult knows the display name + detail and skips
             // its own ▸ render too.
+            // Preserve any existing entry (from ToolBatchStarted) which
+            // carries the disambiguated detail — don't overwrite with
+            // the raw basename (issue #439).
             if state.call_id_to_batch.contains_key(&id) {
-                pending_tools.insert(id, (display.clone(), detail, true));
+                pending_tools
+                    .entry(id)
+                    .or_insert((display.clone(), detail, true));
                 state.on_tool_call_started(&display);
                 return;
             }
@@ -5333,7 +5452,15 @@ fn handle_agent_event(
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
             // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
-            let detail = format_tool_detail(&tool_name, &call.arguments);
+            // Prefer the disambiguated detail from `pending_tools` (populated
+            // by ToolBatchStarted for parallel batches) over the raw basename
+            // from format_tool_detail. Without this, parallel batch approvals
+            // show "ReadFile(SKILL.md)" for every call, making it impossible
+            // to tell which file is being approved (issue #439).
+            let detail = pending_tools
+                .get(&call.id)
+                .map(|(_, det, _)| det.clone())
+                .unwrap_or_else(|| format_tool_detail(&tool_name, &call.arguments));
 
             // Check if ToolCallStarted already rendered this tool call as a
             // dynamic ToolCallInFlight spinner. If so, we need to freeze it
@@ -5437,7 +5564,7 @@ fn handle_agent_event(
 
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
-            persist_current_session(ctx, messages);
+            persist_current_session(ctx, messages, renderer);
 
             // CodingPlan usage refresh — fire after each completed turn
             // (with cooldown) so the right-aligned hint reflects the
@@ -5529,10 +5656,10 @@ fn handle_agent_event(
             think.reset();
             // Save what we did have — a user who Ctrl+C'd mid-stream
             // should still be able to /resume the cleaned conversation.
-            persist_current_session(ctx, messages);
+            persist_current_session(ctx, messages, renderer);
         }
-        AgentEvent::Error(e) => {
-            renderer.render(UiLine::Error(e));
+        AgentEvent::Error { error, messages } => {
+            renderer.render(UiLine::Error(error));
             renderer.flush();
             fixissue_pending.take();
             fixissue_buffer.clear();
@@ -5540,6 +5667,14 @@ fn handle_agent_event(
             // Same reset rationale as TurnComplete / TurnCancelled — an
             // aborted turn is another way to leave `<think>` half-open.
             think.reset();
+            // Persist on Error too — without this, a first-turn LLM
+            // failure (auth, rate limit, gateway 5xx, our own 5-min
+            // total-request timeout, etc.) silently drops the user's
+            // typed message from disk so the next `/resume` shows
+            // nothing for that conversation. Empty `messages` from
+            // the streaming-error forwarder is treated as a no-op
+            // by persist_current_session.
+            persist_current_session(ctx, messages, renderer);
         }
         AgentEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn
@@ -5713,15 +5848,29 @@ fn handle_agent_event(
             // form (Read not ReadFile); detail is wrapped in parens
             // (Tool(arg) reads as a function call, mirroring CC).
             let header_text = format!("{} {}", head_glyph, label);
+            // Build child rows with disambiguation: when multiple calls
+            // produce the same detail (e.g. 3 × Read(SKILL.md) from
+            // different directories), show enough parent path to tell
+            // them apart (issue #437).
+            let raw_details: Vec<String> = calls
+                .iter()
+                .map(|c| format_tool_detail(&c.name, &c.arguments))
+                .collect();
+            let disambiguated = disambiguate_batch_details(
+                &calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                &calls.iter().map(|c| c.arguments.as_str()).collect::<Vec<_>>(),
+                &raw_details,
+            );
             let children: Vec<crate::render::ToolGroupChild> = calls
                 .iter()
-                .map(|c| crate::render::ToolGroupChild {
+                .zip(disambiguated.iter())
+                .map(|(c, detail)| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
                     text: format!(
                         "  {} {}({})",
                         child_glyph,
                         display_tool_name_short(&c.name),
-                        format_tool_detail(&c.name, &c.arguments)
+                        detail
                     ),
                 })
                 .collect();
@@ -5738,6 +5887,18 @@ fn handle_agent_event(
                 state
                     .call_id_to_batch
                     .insert(cid.clone(), batch_id.clone());
+            }
+            // Pre-populate `pending_tools` with the disambiguated detail
+            // so that subsequent ToolCallStarted / ApprovalNeeded events
+            // use the disambiguated path (e.g. "a/SKILL.md") instead of
+            // the raw basename ("SKILL.md"). Without this, parallel batch
+            // approvals show identical "ReadFile(SKILL.md)" prompts and
+            // the user can't tell which file they're approving (issue #439).
+            for (c, detail) in calls.iter().zip(disambiguated.iter()) {
+                pending_tools.insert(
+                    c.id.clone(),
+                    (display_tool_name_short(&c.name).clone(), detail.clone(), true),
+                );
             }
             state.active_tool_batches.insert(
                 batch_id.clone(),
@@ -5897,6 +6058,7 @@ fn handle_agent_event(
 fn persist_current_session(
     ctx: &mut LoopCtx,
     messages: Vec<atomcode_core::conversation::message::Message>,
+    renderer: &mut dyn Renderer,
 ) {
     if messages.is_empty() {
         return;
@@ -5904,7 +6066,18 @@ fn persist_current_session(
     apply_session_messages(&mut ctx.current_session, messages);
     ctx.bg_manager
         .set_foreground_session(ctx.current_session.clone());
-    let _ = ctx.session_manager.save(&ctx.current_session);
+    // Surface save failures instead of silently swallowing them.
+    // Previously this was `let _ = session_manager.save(...)`, which
+    // hid disk-full / permission / read-only / invalid-path errors —
+    // users would `/resume` on the next launch, see nothing, and
+    // assume "the session was lost" with no idea anything went wrong.
+    if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed { error: &e.to_string() })
+                .into_owned(),
+        ));
+        renderer.flush();
+    }
 }
 
 pub(crate) fn apply_session_messages(
@@ -6270,6 +6443,9 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
 
     match name {
         "read_file" | "edit_file" | "write_file" | "create_file" | "list_symbols" => {
+            // Single-call path: basename only (compact). Batch disambiguation
+            // is handled by `disambiguate_batch_details` which runs after
+            // all child details are computed and can compare them.
             get_str("file_path")
                 .map(|p| basename(&p))
                 .unwrap_or_default()
@@ -6307,6 +6483,8 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             get_str("symbol").unwrap_or_default()
         }
         "blast_radius" | "file_dependencies" => {
+            // Same as above: basename for single-call; batch disambiguation
+            // handled by `disambiguate_batch_details`.
             get_str("file").map(|p| basename(&p)).unwrap_or_default()
         }
         "search_replace" => {
@@ -6344,6 +6522,149 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             String::new()
         }
     }
+}
+
+/// Disambiguate parallel-batch child details when multiple calls produce
+/// the same short display (e.g. 3 × `Read(SKILL.md)` from different dirs).
+///
+/// For each child whose `raw_detail` duplicates another, walks up the
+/// path from basename toward the root until all duplicates are unique.
+/// Non-duplicate entries are left unchanged.
+///
+/// Example:
+///   paths: [skills/a/SKILL.md, skills/b/SKILL.md, skills/c/SKILL.md]
+///   raw_details: [SKILL.md, SKILL.md, SKILL.md]
+///   → [a/SKILL.md, b/SKILL.md, c/SKILL.md]
+///
+/// If paths can't be extracted from arguments (non-file tools), falls
+/// back to appending `#2`, `#3` suffixes.
+fn disambiguate_batch_details(
+    names: &[&str],
+    args_jsons: &[&str],
+    raw_details: &[String],
+) -> Vec<String> {
+    // Fast path: no duplicates → return as-is.
+    let mut seen = std::collections::HashMap::<&str, usize>::new();
+    let mut has_dups = false;
+    for d in raw_details {
+        let count = seen.entry(d.as_str()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            has_dups = true;
+        }
+    }
+    if !has_dups {
+        return raw_details.to_vec();
+    }
+
+    // Extract full paths from args where possible.
+    let extract_path = |name: &str, args_json: &str| -> Option<String> {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
+            return None;
+        };
+        let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        match name {
+            "read_file" | "edit_file" | "write_file" | "create_file" | "list_symbols"
+            | "blast_radius" | "file_dependencies" => get_str("file_path").or_else(|| get_str("file")),
+            "search_replace" => get_str("file_path").or_else(|| get_str("file")),
+            "read_symbol" => get_str("file_path"),
+            _ => None,
+        }
+    };
+
+    let full_paths: Vec<Option<String>> = names
+        .iter()
+        .zip(args_jsons.iter())
+        .map(|(n, a)| extract_path(n, a))
+        .collect();
+
+    // For each group of duplicates, progressively add parent path
+    // components until unique within that group.
+    let mut result = raw_details.to_vec();
+
+    // Collect groups of indices that share the same raw_detail.
+    let mut groups: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, d) in raw_details.iter().enumerate() {
+        groups.entry(d.as_str()).or_default().push(i);
+    }
+
+    for (_detail, indices) in groups {
+        if indices.len() < 2 {
+            continue; // unique, no disambiguation needed
+        }
+
+        // Check if we have full paths for all in this group.
+        let all_have_paths = indices.iter().all(|&i| full_paths[i].is_some());
+
+        if all_have_paths {
+            // Strategy: progressively add parent path components until
+            // all entries are unique. Start with 1 parent component
+            // (e.g. `a/SKILL.md`), then 2 (`b/a/SKILL.md`), etc.
+            let paths: Vec<&str> = indices.iter().map(|&i| full_paths[i].as_deref().unwrap()).collect();
+            let mut depth = 1usize;
+            let max_depth = paths.iter().map(|p| p.matches('/').count()).max().unwrap_or(0);
+
+            loop {
+                let candidates: Vec<String> = paths
+                    .iter()
+                    .map(|p| tail_path(p, depth))
+                    .collect();
+
+                let all_unique = {
+                    let mut s = std::collections::HashSet::new();
+                    candidates.iter().all(|c| s.insert(c.as_str()))
+                };
+
+                if all_unique || depth >= max_depth {
+                    for (i, &idx) in indices.iter().enumerate() {
+                        result[idx] = crate::width::truncate_with_ellipsis(
+                            &candidates[i],
+                            100,
+                        );
+                    }
+                    break;
+                }
+                depth += 1;
+            }
+        } else {
+            // Fallback: append #2, #3, … suffixes to disambiguate.
+            for (seq, &idx) in indices.iter().enumerate() {
+                if seq > 0 {
+                    let suffixed = format!("{} #{}", raw_details[idx], seq + 1);
+                    result[idx] = crate::width::truncate_with_ellipsis(&suffixed, 100);
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Return the last `depth + 1` path components of `path`.
+/// E.g. tail_path("a/b/c/SKILL.md", 1) → "c/SKILL.md"
+///      tail_path("a/b/c/SKILL.md", 2) → "b/c/SKILL.md"
+///      tail_path("a/b/c/SKILL.md", 3) → "a/b/c/SKILL.md"
+fn tail_path(path: &str, depth: usize) -> String {
+    if depth == 0 {
+        return path.rsplit('/').next().unwrap_or(path).to_string();
+    }
+    // Walk backwards counting separators. To keep `depth + 1` components,
+    // we need to find the separator that is `depth + 1`-th from the end,
+    // then return everything after it.
+    // For depth=1 in "a/b/c/SKILL.md": we need "c/SKILL.md",
+    // so find the '/' between "b" and "c" (2nd from end), return after it.
+    let mut seen = 0;
+    for (i, ch) in path.char_indices().rev() {
+        if ch == '/' {
+            seen += 1;
+            if seen == depth + 1 {
+                return path[(i + ch.len_utf8())..].to_string();
+            }
+        }
+    }
+    // Fewer than `depth + 1` separators — return the whole path.
+    path.to_string()
 }
 
 /// Render an `elapsed_ms` value as `XmYs` (over 60 s) or `Ts` (under).

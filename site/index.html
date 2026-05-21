@@ -92,6 +92,24 @@
   .install-cmd .accent{color:var(--accent)}
   .install-cmd .str{color:#9ecbff}
   .install-cmd .com{color:rgba(255,255,255,.4)}
+  /* Section list: METHOD_CMDS strings are intentionally separated by
+     blank lines (macOS curl ‖ Windows irm, Releases URL ‖ curl pipe).
+     Each section becomes its own bordered card. The action bar at the
+     top doubles as a section header — leading `#` comment in the
+     METHOD_CMDS string ("# macOS / Linux / HarmonyOS PC", etc.) is
+     pulled out as the bar label, button sits at the right, code below
+     contains only executable lines. Saves the row of vertical space
+     that a separate comment row would have cost, and the comment is
+     never going into the clipboard either way. */
+  .install-cmd-list{display:flex;flex-direction:column;gap:10px}
+  .install-cmd-section{border:1px solid rgba(255,255,255,.06);border-radius:6px;background:rgba(255,255,255,.02);overflow:hidden}
+  .install-cmd-section .cp-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 6px 4px 12px;background:rgba(255,255,255,.025);border-bottom:1px solid rgba(255,255,255,.05)}
+  .install-cmd-section .cp-bar .label{font-family:var(--mono);font-size:10.5px;letter-spacing:.5px;color:rgba(255,255,255,.5);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .install-cmd-section .install-cmd{margin:0;padding:10px 12px}
+  .install-cmd-section .cp-btn{padding:3px 10px;font-size:10px;letter-spacing:1px;background:transparent;border-color:rgba(232,160,80,.28);color:rgba(232,160,80,.85);opacity:.85;transition:background .2s,color .2s,border-color .2s,opacity .15s;flex-shrink:0}
+  .install-cmd-section:hover .cp-btn{opacity:1}
+  .install-cmd-section .cp-btn:hover{background:var(--accent);color:#000;border-color:var(--accent)}
+  .install-cmd-section .cp-btn.copied{opacity:1;background:var(--green);color:#000;border-color:var(--green)}
   .install-actions{margin-top:14px;display:flex;align-items:center;justify-content:space-between;font-size:11px;letter-spacing:.5px;color:rgba(255,255,255,.45)}
   .install-actions .left{display:flex;align-items:center;gap:10px}
   .cp-btn{padding:7px 14px;background:rgba(232,160,80,.18);border:1px solid rgba(232,160,80,.4);color:var(--accent);font-family:var(--mono);font-size:11px;letter-spacing:1.5px;transition:all .2s}
@@ -224,7 +242,7 @@
   /* feature table */
   .ftab-wrap{border:1px solid var(--line);overflow-x:auto;position:relative}
   .ftab{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px;min-width:600px}
-  .ftab th{position:sticky;top:60px;background:#000;text-align:left;padding:14px 18px;font-size:11px;font-weight:500;letter-spacing:1.5px;color:rgba(255,255,255,.55);text-transform:uppercase;border-bottom:1px solid var(--line);z-index:10}
+  .ftab th{background:#000;text-align:left;padding:14px 18px;font-size:11px;font-weight:500;letter-spacing:1.5px;color:rgba(255,255,255,.55);text-transform:uppercase;border-bottom:1px solid var(--line)}
   .ftab th.atom{color:var(--accent)}
   .ftab th.claude{color:rgba(255,255,255,.7)}
   .ftab td{padding:14px 18px;border-bottom:1px solid var(--line);color:rgba(255,255,255,.8);transition:background .2s}
@@ -425,6 +443,10 @@
     .install-box{width:100%;max-width:100%}
     .install-body{min-width:0;padding:14px 14px 12px}
     .install-cmd{min-width:0;font-size:12px}
+    .install-cmd-section .cp-bar{padding:3px 5px 3px 9px}
+    .install-cmd-section .cp-bar .label{font-size:9.5px;letter-spacing:.3px}
+    .install-cmd-section .install-cmd{padding:8px 10px}
+    .install-cmd-section .cp-btn{padding:2px 9px;font-size:9.5px;letter-spacing:.5px;opacity:1}
     .install-actions{flex-wrap:wrap;gap:8px;font-size:10.5px;margin-top:12px}
     .install-actions .left{min-width:0;flex:1}
     .cp-btn{white-space:nowrap;padding:6px 12px;font-size:10.5px;letter-spacing:1px}
@@ -464,7 +486,6 @@
     .perf-status{text-align:left}
     .cmp-controls{gap:10px;margin-bottom:18px}
     .cmp-toggle{font-size:11px}
-    .ftab th{position:static;top:auto;z-index:auto}
     .ftab th,.ftab td{padding:10px 12px;font-size:12px}
     .gap-note{padding:14px;font-size:11.5px;margin-top:20px}
     .stepper{grid-template-columns:1fr;margin-top:18px}
@@ -760,6 +781,7 @@
       <div class="cmp-chips" id="cmpChips">
         <button class="cmp-chip active" data-cat="all" data-i18n="cmp.all">全部</button>
         <button class="cmp-chip" data-cat="price" data-i18n="cmp.price">价格</button>
+        <button class="cmp-chip" data-cat="license" data-i18n="cmp.license">协议</button>
         <button class="cmp-chip" data-cat="model" data-i18n="cmp.model">模型</button>
         <button class="cmp-chip" data-cat="tools" data-i18n="cmp.tools">工具</button>
         <button class="cmp-chip" data-cat="integration" data-i18n="cmp.integration">集成</button>
@@ -811,12 +833,11 @@
             <div class="install-tab" data-method="binary"><span data-i18n="inst.binary">下载二进制</span></div>
           </div>
           <div class="install-body">
-            <pre class="install-cmd" id="methodCmd"></pre>
+            <div class="install-cmd-list" id="methodCmd"></div>
             <div class="install-actions">
               <div class="left">
                 <span id="methodHint">macOS / Linux / HarmonyOS PC</span>
               </div>
-              <button class="cp-btn" id="copyMethod" data-magnetic data-i18n="install.copy.short">📋 复制</button>
             </div>
           </div>
         </div>
@@ -983,6 +1004,7 @@ const T={
   'perf.desc':{zh:'越短越好 · 完成同一任务平均步骤数',en:'Lower is better · avg steps to complete a task'},
   'cmp.all':{zh:'全部',en:'All'},
   'cmp.price':{zh:'价格',en:'Price'},
+  'cmp.license':{zh:'协议',en:'License'},
   'cmp.model':{zh:'模型',en:'Model'},
   'cmp.tools':{zh:'工具',en:'Tools'},
   'cmp.integration':{zh:'集成',en:'Integration'},
@@ -1147,7 +1169,7 @@ const PERF=[
 ];
 
 const FEAT=[
-  {cat:'price',     catL:{zh:'价格',en:'Price'},   f:{zh:'开源协议',en:'License'},          a:{zh:'✓ MIT 开源',en:'✓ MIT'},                c:{zh:'闭源',en:'Closed source'},    win:'a'},
+  {cat:'license',   catL:{zh:'协议',en:'License'}, f:{zh:'开源协议',en:'License'},          a:{zh:'✓ MIT 开源',en:'✓ MIT'},                c:{zh:'闭源',en:'Closed source'},    win:'a'},
   {cat:'model',     catL:{zh:'模型',en:'Model'},   f:{zh:'模型接入',en:'Provider access'},  a:{zh:'✓ 任意 OpenAI 兼容',en:'✓ Any OpenAI-compatible'}, c:{zh:'仅 Claude',en:'Claude only'}, win:'a'},
   {cat:'model',     catL:{zh:'模型',en:'Model'},   f:{zh:'本地模型 (Ollama)',en:'Local model (Ollama)'},  a:{zh:'✓ 已支持',en:'✓ Supported'},   c:{zh:'✗ 不支持',en:'✗ Not supported'}, win:'a'},
   {cat:'tools',     catL:{zh:'工具',en:'Tools'},   f:{zh:'代码图谱工具',en:'Code graph tools'}, a:{zh:'✓ 8 个内置',en:'✓ 8 built-in'},   c:{zh:'基础文本检索',en:'Basic text search'}, win:'a'},
@@ -1362,18 +1384,68 @@ window.applyWizardNav=null;
     text=text.replace(/\b(curl|irm|iex|bash|wget|git|cd|cargo|npm|export|chmod|mv)\b/g,'<span class="accent">$1</span>');
     return text.replace(/\x00(\d+)\x00/g,(_,i)=>`<span class="${stash[i][0]}">${stash[i][1]}</span>`);
   }
+  // Split a section into [label, body]. Leading whole-line `#`
+  // comments are the section's UI label (e.g. "macOS / Linux /
+  // HarmonyOS PC") — they get hoisted into the action bar and dropped
+  // from the rendered code area so the clipboard ends up with only
+  // executable command lines. Inline trailing comments (e.g.
+  // `atomcode --version  # 验证安装`) stay on their command line —
+  // they're context for that specific call, not a section header,
+  // and paste harmlessly into a shell.
+  //
+  // Multiple consecutive leading `#` lines are joined with ` · ` so a
+  // future METHOD_CMDS entry that splits its header across lines
+  // still produces one readable label.
+  function extractLabel(text){
+    const lines=text.split('\n');
+    const labelParts=[];
+    let i=0;
+    while(i<lines.length){
+      if(/^\s*$/.test(lines[i])){i++;continue;}
+      if(/^\s*#/.test(lines[i])){labelParts.push(lines[i].replace(/^\s*#\s*/,'').trim());i++;continue;}
+      break;
+    }
+    const label=labelParts.filter(s=>s.length>0).join(' · ');
+    const body=lines.slice(i).join('\n').replace(/^\n+|\n+$/g,'');
+    return [label,body];
+  }
   function show(m){
     CUR_METHOD=m;
     tabs.querySelectorAll('.install-tab').forEach(tb=>tb.classList.toggle('active',tb.dataset.method===m));
-    cmd.innerHTML=highlight(tx(METHOD_CMDS[m]));
+    const raw=tx(METHOD_CMDS[m]);
+    // Split on blank lines so each `# header + commands` group gets
+    // its own copy button. Trim per-section to drop stray edge
+    // newlines that would render as visible empty lines inside the
+    // <pre>. Empty sections are dropped (defensive — current strings
+    // don't produce any, but a future edit might).
+    const sections=raw.split(/\n[ \t]*\n/).map(s=>s.replace(/^\n+|\n+$/g,'')).filter(s=>s.length>0);
+    const label=t('install.copy.short');
+    // Parse each section once into [label, body]; the label rides in
+    // the action bar (left of the copy button) and the body is what
+    // both the <pre> renders and the button copies.
+    const parsed=sections.map(extractLabel);
+    cmd.innerHTML=parsed.map(([lbl,body])=>
+      `<div class="install-cmd-section">`
+      +`<div class="cp-bar"><span class="label">${lbl}</span>`
+      +`<button class="cp-btn cp-section" type="button">${label}</button></div>`
+      +`<pre class="install-cmd">${highlight(body)}</pre>`
+      +`</div>`).join('');
+    cmd.querySelectorAll('.cp-section').forEach((btn,i)=>{btn.__copy=parsed[i][1]});
     hint.textContent=methodHint(m);
   }
   window.applyMethod=()=>show(CUR_METHOD);
   show('oneclick');
   tabs.addEventListener('click',e=>{const tb=e.target.closest('.install-tab');if(!tb)return;show(tb.dataset.method);});
-  document.getElementById('copyMethod').addEventListener('click',()=>{
-    navigator.clipboard&&navigator.clipboard.writeText(tx(METHOD_CMDS[CUR_METHOD])).catch(()=>{});
-    const btn=document.getElementById('copyMethod');btn.classList.add('copied');btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
+  // Delegated click handler — section buttons are re-rendered on every
+  // tab switch + language toggle, so binding on the container survives
+  // all those rebuilds without re-attaching listeners.
+  cmd.addEventListener('click',e=>{
+    const btn=e.target.closest('.cp-section');
+    if(!btn)return;
+    const text=btn.__copy||'';
+    if(navigator.clipboard)navigator.clipboard.writeText(text).catch(()=>{});
+    btn.classList.add('copied');
+    btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
     toast.textContent=t('toast.copied');toast.classList.add('show');
     setTimeout(()=>{toast.classList.remove('show')},1600);
     setTimeout(()=>{btn.classList.remove('copied');btn.textContent=t('install.copy.short')},1600);

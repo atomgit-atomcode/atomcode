@@ -1097,11 +1097,20 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 let cup = format!("\x1b[{};{}H", top_rule_row, start_col);
                 let _ = self.out.write_all(cup.as_bytes());
                 if self.caps.colors {
-                    let _ = write!(
-                        self.out,
-                        "\x1b[7;96m {} \x1b[0m",
-                        name_for_pill
-                    );
+                    // SGR for the pill differs by theme. Dark: reverse +
+                    // bright cyan (SGR 7;96) — bright cyan as background
+                    // pops against the dark default fg. Light: bold +
+                    // standard magenta (SGR 1;35), no reverse — standard
+                    // magenta maps to a dark, readable shade on light
+                    // profiles, where bright-cyan reverse turned into
+                    // pale-aqua-on-white and the chip vanished into the
+                    // surrounding background.
+                    let sgr = if crate::highlight::theme::is_light_for_render() {
+                        "\x1b[1;35m"
+                    } else {
+                        "\x1b[7;96m"
+                    };
+                    let _ = write!(self.out, "{} {} \x1b[0m", sgr, name_for_pill);
                 } else {
                     // No colors: surround with spaces so the name stays
                     // legible against the ━ rule on either side.
@@ -1960,17 +1969,25 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // The previous alt-screen path emitted the flat
                 // `ApprovalPromptAlt` sentence — visually indistinct from
                 // a regular command-output row, so users couldn't tell at
-                // a glance that an approval was pending. tool/detail are
-                // already visible in the ToolCall row above, so we don't
-                // re-echo them here (same omission as retained).
-                let _ = (tool, detail);
+                // a glance that an approval was pending.
+                //
+                // Include the tool name and detail so the user knows which
+                // specific action they're being asked to approve. Without
+                // this, parallel batch approvals (e.g. 3 × Read) show
+                // identical prompts and the user can't tell which file
+                // they're approving (issue #439).
                 let waiting = t(Msg::ApprovalWaitingLabel);
                 let allow = t(Msg::ApprovalAllow);
                 let always = t(Msg::ApprovalAlways);
                 let deny = t(Msg::ApprovalDeny);
+                let tool_label = if detail.is_empty() {
+                    format!("{}: ", tool)
+                } else {
+                    format!("{}({}): ", tool, detail)
+                };
                 let row = if self.caps.colors {
                     format!(
-                        "{bold}{yellow}{waiting}{reset}{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
+                        "{bold}{yellow}{waiting}{tool_label}{reset}{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
                         bold = SGR_BOLD,
                         yellow = SGR_YELLOW,
                         rev = SGR_REVERSE,
@@ -1979,12 +1996,13 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                         red = SGR_RED,
                         reset = SGR_RESET,
                         waiting = waiting,
+                        tool_label = tool_label,
                         allow = allow,
                         always = always,
                         deny = deny,
                     )
                 } else {
-                    format!("{waiting} Y {allow} A {always} N {deny}")
+                    format!("{waiting}{tool_label}Y {allow} A {always} N {deny}")
                 };
                 self.push_body_row(row);
             }

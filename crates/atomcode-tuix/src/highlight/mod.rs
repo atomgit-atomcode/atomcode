@@ -29,20 +29,72 @@ pub mod theme;
 /// happens before the first tinted code block.
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 
-/// Lazily-built atomcode theme that paints 8 token classes with the colors
-/// declared in `theme.rs`. Constructed once; reused across all highlight calls.
-static ATOMCODE_THEME: OnceLock<Theme> = OnceLock::new();
+/// Lazily-built syntect themes — one per palette. `theme.rs`'s runtime
+/// `MODE` selects which is returned per highlight call. Both initialised
+/// on first use; the unused one stays uncompiled until the user flips
+/// to it (effectively never in single-session use).
+static ATOMCODE_THEME_DARK: OnceLock<Theme> = OnceLock::new();
+static ATOMCODE_THEME_LIGHT: OnceLock<Theme> = OnceLock::new();
 
 fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
-fn atomcode_theme() -> &'static Theme {
-    ATOMCODE_THEME.get_or_init(build_atomcode_theme)
+/// RGB tuple for a single syntect scope. Kept in lockstep with the SGR
+/// strings emitted by `theme.rs`'s accessor fns — the test
+/// `palette_rgbs_match_theme_sgr_strings` pins this invariant so any
+/// future drift breaks the build.
+struct Rgb(u8, u8, u8);
+
+struct CodePalette {
+    keyword: Rgb,
+    string: Rgb,
+    number: Rgb,
+    comment: Rgb,
+    function: Rgb,
+    type_: Rgb,
 }
 
-/// Build the syntect Theme from our 8 token color constants. Uses TextMate
-/// scope selectors that match across most syntect-bundled syntaxes:
+const DARK: CodePalette = CodePalette {
+    keyword:  Rgb(198, 120, 221),
+    string:   Rgb(152, 195, 121),
+    number:   Rgb(209, 154, 102),
+    comment:  Rgb(124, 132, 153),
+    function: Rgb(97, 175, 239),
+    type_:    Rgb(229, 192, 123),
+};
+
+/// `Light` palette: dark, saturated variants hitting ≥ 11:1 contrast
+/// on `#FFFFFF` (overshoots WCAG AA 4.5:1 by a wide margin — chosen
+/// after a Mac Terminal user reported the earlier 8-9:1 values read
+/// "soft" against the white background; the slightly-softer colours
+/// stayed AA-compliant but didn't feel "saturated" the way users
+/// expect light-theme code highlighting to look). Reproduces the same
+/// scope→colour mapping as `DARK` so syntect's TextMate selectors
+/// don't need re-tuning. Must stay in lockstep with `theme.rs`'s
+/// per-token accessor SGR strings.
+const LIGHT: CodePalette = CodePalette {
+    keyword:  Rgb(74, 0, 114),    // #4A0072
+    string:   Rgb(0, 100, 0),     // #006400
+    number:   Rgb(102, 51, 0),    // #663300
+    comment:  Rgb(74, 80, 96),    // #4A5060 (kept moderate — comments stay secondary)
+    function: Rgb(0, 33, 113),    // #002171
+    type_:    Rgb(91, 58, 0),     // #5B3A00
+};
+
+fn atomcode_theme() -> &'static Theme {
+    // `theme::set_theme_mode(true)` flips `MODE`; we read it here to
+    // pick the right OnceLock-cached Theme. Each variant is built at
+    // most once per process.
+    if theme::is_light_for_highlight() {
+        ATOMCODE_THEME_LIGHT.get_or_init(|| build_atomcode_theme(&LIGHT))
+    } else {
+        ATOMCODE_THEME_DARK.get_or_init(|| build_atomcode_theme(&DARK))
+    }
+}
+
+/// Build the syntect Theme from a palette. Uses TextMate scope
+/// selectors that match across most syntect-bundled syntaxes:
 ///
 ///   keyword / storage              -> KEYWORD (purple)
 ///   string                         -> STRING (green)
@@ -53,11 +105,11 @@ fn atomcode_theme() -> &'static Theme {
 ///
 /// Default foreground is set to the sentinel Color { a: 0 } so that chunks
 /// not matching any scope above can be detected and emitted without ANSI.
-fn build_atomcode_theme() -> Theme {
-    let item = |scope_str: &str, r: u8, g: u8, b: u8, italic: bool| ThemeItem {
+fn build_atomcode_theme(p: &CodePalette) -> Theme {
+    let item = |scope_str: &str, c: &Rgb, italic: bool| ThemeItem {
         scope: ScopeSelectors::from_str(scope_str).expect("valid scope selector"),
         style: StyleModifier {
-            foreground: Some(Color { r, g, b, a: 0xFF }),
+            foreground: Some(Color { r: c.0, g: c.1, b: c.2, a: 0xFF }),
             background: None,
             font_style: if italic {
                 Some(FontStyle::ITALIC)
@@ -77,14 +129,15 @@ fn build_atomcode_theme() -> Theme {
             ..ThemeSettings::default()
         },
         scopes: vec![
-            item("keyword, storage", 198, 120, 221, false),
-            item("string", 152, 195, 121, false),
-            item("constant.numeric, constant.language", 209, 154, 102, false),
-            item("comment", 124, 132, 153, true),
-            item("entity.name.function, support.function", 97, 175, 239, false),
+            item("keyword, storage", &p.keyword, false),
+            item("string", &p.string, false),
+            item("constant.numeric, constant.language", &p.number, false),
+            item("comment", &p.comment, true),
+            item("entity.name.function, support.function", &p.function, false),
             item(
                 "entity.name.type, support.type, support.class",
-                229, 192, 123, false,
+                &p.type_,
+                false,
             ),
         ],
     }
@@ -272,7 +325,7 @@ mod tests {
         // both flow-control keywords and storage keywords land in purple.
         let out = highlight_block(Some("rust"), "fn main() { let x = 1; }", caps_color());
         assert!(
-            out.contains(theme::KEYWORD),
+            out.contains(theme::keyword()),
             "expected keyword color in tinted rust output, got: {:?}",
             out
         );
@@ -282,7 +335,7 @@ mod tests {
     fn python_keyword_gets_keyword_color() {
         let out = highlight_block(Some("python"), "def foo():\n    return 1", caps_color());
         assert!(
-            out.contains(theme::KEYWORD),
+            out.contains(theme::keyword()),
             "expected keyword color in tinted python output, got: {:?}",
             out
         );
@@ -292,7 +345,7 @@ mod tests {
     fn rust_string_literal_gets_string_color() {
         let out = highlight_block(Some("rust"), r#"let s = "hello";"#, caps_color());
         assert!(
-            out.contains(theme::STRING),
+            out.contains(theme::string()),
             "expected string color: {:?}",
             out
         );
@@ -302,7 +355,7 @@ mod tests {
     fn rust_number_gets_number_color() {
         let out = highlight_block(Some("rust"), "let n = 42;", caps_color());
         assert!(
-            out.contains(theme::NUMBER),
+            out.contains(theme::number()),
             "expected number color: {:?}",
             out
         );
@@ -314,7 +367,7 @@ mod tests {
         // COMMENT is "\x1b[3;38;2;124;132;153m" — italic prefix is part of the constant,
         // BUT we may emit italic separately. Check for the truecolor body of COMMENT.
         let comment_body = "\x1b[38;2;124;132;153m";
-        let comment_full = theme::COMMENT;
+        let comment_full = theme::comment();
         assert!(
             out.contains(comment_body) || out.contains(comment_full),
             "expected comment color in some form: {:?}",
@@ -330,8 +383,8 @@ mod tests {
         let out = highlight_block(Some("rust"), src, caps_color());
         let lines: Vec<_> = out.split('\n').collect();
         assert_eq!(lines.len(), 2, "expected 2 output lines, got: {:?}", out);
-        assert!(lines[0].contains(theme::STRING), "line0 missing string color: {:?}", lines[0]);
-        assert!(lines[1].contains(theme::STRING), "line1 missing string color: {:?}", lines[1]);
+        assert!(lines[0].contains(theme::string()), "line0 missing string color: {:?}", lines[0]);
+        assert!(lines[1].contains(theme::string()), "line1 missing string color: {:?}", lines[1]);
     }
 
     #[test]

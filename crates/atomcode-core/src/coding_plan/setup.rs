@@ -38,9 +38,49 @@ use crate::auth;
 use crate::config::provider::ProviderConfig;
 use crate::config::Config;
 
-/// Base URL for the LLM gateway behind AtomGit's infrastructure — same
-/// value the historical `/login` auto-registration used.
-const LLM_BASE_URL: &str = "https://api-ai.gitcode.com/v1";
+/// Default LLM gateway base URL for CodingPlan-managed providers when
+/// the `models-v2` payload doesn't carry a per-model `base_url`. Used
+/// only inside [`codingplan_llm_base_url`] — call that, not this.
+///
+/// The new signed gateway. `coding_plan::crypto::is_atomgit_gateway`
+/// **only** matches `llm-api.atomgit.com` (see the host whitelist at
+/// `crypto.rs:129`), so this is the URL where codingplan request
+/// signing actually engages. The previous default (the legacy
+/// `api-ai.gitcode.com` host) silently routed new installs to a
+/// plaintext path that bypassed signing — and surfaced in users'
+/// error logs as "my requests go to a URL I never configured."
+const DEFAULT_CODINGPLAN_LLM_BASE_URL: &str = "https://llm-api.atomgit.com/v1";
+
+/// Resolve the LLM gateway base URL for CodingPlan-managed providers.
+///
+/// Read order:
+///   1. `ATOMCODE_CODINGPLAN_LLM_BASE_URL` env var (trimmed, trailing
+///      `/` stripped, empty value treated as unset). Set this when
+///      pointing the client at a staging gateway.
+///   2. [`DEFAULT_CODINGPLAN_LLM_BASE_URL`].
+///
+/// Cached once at first call via `OnceLock` — same shape as
+/// [`auth::oauth::platform_base_url`] — so every provider registered
+/// by `step_models_and_register` lands on the same host even if the
+/// env var changes mid-flight, and the per-provider build cost is
+/// one atomic read after the first call.
+///
+/// Returns `String` rather than `&'static str` because the cached
+/// value's lifetime is tied to the `OnceLock`; callers that need an
+/// owned URL (e.g. `ProviderConfig::base_url: Option<String>`) get
+/// one without an extra clone.
+fn codingplan_llm_base_url() -> String {
+    use std::sync::OnceLock;
+    static URL: OnceLock<String> = OnceLock::new();
+    URL.get_or_init(|| {
+        std::env::var("ATOMCODE_CODINGPLAN_LLM_BASE_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_CODINGPLAN_LLM_BASE_URL.to_string())
+    })
+    .clone()
+}
 
 /// Provider type for the AtomGit LLM gateway (it's OpenAI-compatible).
 const PROVIDER_TYPE: &str = "openai";
@@ -955,8 +995,8 @@ fn is_codingplan_provider_name(name: &str) -> bool {
 
 /// Build a ProviderConfig from a model-list entry. The server's
 /// per-model fields take precedence; missing fields fall back to the
-/// historical constants (`LLM_BASE_URL` / `PROVIDER_TYPE` /
-/// `CONTEXT_WINDOW`) so older `models-v2` payloads without the new
+/// historical fallbacks ([`codingplan_llm_base_url`] / `PROVIDER_TYPE`
+/// / `CONTEXT_WINDOW`) so older `models-v2` payloads without the new
 /// columns continue to work without code changes.
 ///
 /// `api_key` stays `None` regardless — `create_provider()` loads the
@@ -976,7 +1016,7 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
                 .base_url
                 .clone()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| LLM_BASE_URL.to_string()),
+                .unwrap_or_else(codingplan_llm_base_url),
         ),
         system_prompt: None,
         user_agent: None,
@@ -1005,8 +1045,9 @@ mod tests {
 
     /// Build a `ModelEntry` for tests that only care about the
     /// model name and want every other field to take its fallback
-    /// (`base_url` → `LLM_BASE_URL`, `provider_type` → `PROVIDER_TYPE`,
-    /// `context_window` → `CONTEXT_WINDOW`, `plan_available: true`).
+    /// (`base_url` → [`codingplan_llm_base_url`], `provider_type` →
+    /// `PROVIDER_TYPE`, `context_window` → `CONTEXT_WINDOW`,
+    /// `plan_available: true`).
     /// Lets the bulk of the test suite stay short while the
     /// per-field-override behaviour gets its own dedicated tests
     /// further down.
@@ -1032,6 +1073,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
         }
     }
 
@@ -1134,9 +1176,43 @@ mod tests {
         );
         let fresh = &config.providers["AtomGit"];
         assert_eq!(fresh.model, "meta-llama/Llama-3-70B");
-        assert_eq!(fresh.base_url.as_deref(), Some(LLM_BASE_URL));
+        assert_eq!(
+            fresh.base_url.as_deref(),
+            Some(codingplan_llm_base_url().as_str())
+        );
         assert_eq!(fresh.provider_type, PROVIDER_TYPE);
         assert_eq!(config.default_provider, "AtomGit");
+    }
+
+    #[test]
+    fn codingplan_llm_base_url_defaults_to_new_signed_gateway() {
+        // Lock in the default. If `ATOMCODE_CODINGPLAN_LLM_BASE_URL` is
+        // set in the test environment (CI / staging override / dev box
+        // with a stray export), honour it — otherwise the default must
+        // be the modern `llm-api.atomgit.com` host. Anything else (most
+        // notably the legacy `api-ai.gitcode.com`) silently disables
+        // codingplan request signing because `is_atomgit_gateway` in
+        // `coding_plan::crypto` only whitelists the new host.
+        //
+        // OnceLock caches across test threads, so this test reflects
+        // whatever the env was at the FIRST call site in the process.
+        // That's deliberate — it ensures every test in this module
+        // agrees on the URL, mirroring production behaviour where the
+        // value is fixed for the lifetime of one `atomcode` run.
+        let actual = codingplan_llm_base_url();
+        let env_override = std::env::var("ATOMCODE_CODINGPLAN_LLM_BASE_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
+        if let Some(want) = env_override {
+            assert_eq!(actual, want, "env override must win when set");
+        } else {
+            assert_eq!(
+                actual, "https://llm-api.atomgit.com/v1",
+                "default must point at the new signed gateway (NOT legacy api-ai.gitcode.com); \
+                 otherwise codingplan signing never engages"
+            );
+        }
     }
 
     #[test]
@@ -1147,7 +1223,10 @@ mod tests {
         // `type`, or `context_window`.
         let p = build_codingplan_provider(&entry("foo/bar"));
         assert_eq!(p.provider_type, "openai");
-        assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
+        assert_eq!(
+            p.base_url.as_deref(),
+            Some(codingplan_llm_base_url().as_str())
+        );
         assert_eq!(p.context_window, 64_000);
         assert!(
             p.api_key.is_none(),
@@ -1193,7 +1272,10 @@ mod tests {
         };
         let p = build_codingplan_provider(&e);
         assert_eq!(p.provider_type, "openai");
-        assert_eq!(p.base_url.as_deref(), Some("https://api-ai.gitcode.com/v1"));
+        assert_eq!(
+            p.base_url.as_deref(),
+            Some(codingplan_llm_base_url().as_str())
+        );
         assert_eq!(p.context_window, 64_000);
     }
 

@@ -12,6 +12,7 @@ pub mod render;
 pub mod sanitize;
 pub mod state;
 pub mod terminal;
+pub mod terminal_bg;
 #[cfg(test)]
 pub mod test_term;
 pub mod think;
@@ -318,6 +319,34 @@ pub async fn run(
     }
 
     let (_guard, kbd_enhanced) = TerminalGuard::activate(caps)?;
+
+    // Pick the colour palette now that raw mode is on (OSC 11 detection
+    // requires it — otherwise the response is line-buffered and never
+    // reaches us before timeout).
+    //
+    // - `Light` / `Dark`: explicit, skip detection.
+    // - `Auto`: query the terminal background; fall back to `dark` if
+    //   it doesn't reply within 100ms. Responsive emulators (iTerm2,
+    //   WezTerm, Alacritty, Kitty, Windows Terminal, VSCode integrated)
+    //   reply on first byte well under the budget; non-responsive
+    //   terminals (macOS Terminal.app, Windows conhost, SSH through
+    //   relays that strip OSC) silently default to dark — matches the
+    //   legacy behaviour, never makes things worse.
+    let theme_light = match config.ui.theme {
+        atomcode_core::config::UiTheme::Light => true,
+        atomcode_core::config::UiTheme::Dark => false,
+        atomcode_core::config::UiTheme::Auto => {
+            if caps.colors {
+                crate::terminal_bg::detect_light(
+                    std::time::Duration::from_millis(100),
+                )
+                .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    };
+    crate::highlight::theme::set_theme_mode(theme_light);
 
     // If the terminal doesn't support Kitty keyboard protocol (CSI u),
     // set an env var so the event loop can show a hint on startup.

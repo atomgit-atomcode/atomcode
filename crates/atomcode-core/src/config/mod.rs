@@ -136,6 +136,41 @@ pub struct Config {
     /// short key defined by `Locale`'s serde rename (e.g. `"zh_CN"`).
     #[serde(default)]
     pub language: Option<crate::locale::Locale>,
+    /// UI rendering preferences. Currently exposes the light/dark theme
+    /// switch driving the TUIX colour palette (markdown headings, code
+    /// block syntax highlight, session-name pill). Missing from older
+    /// configs → defaults to `dark` (legacy behaviour).
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// UI section of the config — currently just the theme switch driving
+/// the TUIX colour palette. Persisted as a top-level `[ui]` table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// Colour palette to use for markdown / code-block / chrome
+    /// rendering. `dark` keeps the legacy palette (designed for dark
+    /// terminals); `light` swaps in darker saturated variants that hit
+    /// WCAG AA contrast on `#FFFFFF`. Defaults to `dark` so existing
+    /// configs see no behaviour change.
+    #[serde(default)]
+    pub theme: UiTheme,
+}
+
+/// UI colour palette selector.
+///
+/// - `Auto` (default): query the terminal's background colour via
+///   OSC 11 at startup and pick light or dark accordingly. Terminals
+///   that don't respond (macOS Terminal.app, Windows conhost) fall
+///   back to dark.
+/// - `Dark` / `Light`: skip detection, use the explicit palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiTheme {
+    #[default]
+    Auto,
+    Dark,
+    Light,
 }
 
 impl Config {
@@ -177,6 +212,7 @@ impl Default for Config {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: UiConfig::default(),
         }
     }
 }
@@ -653,6 +689,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
         }
     }
 
@@ -815,6 +852,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1026,6 +1064,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: Some(crate::locale::Locale::ZhCn),
+            ui: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1125,6 +1164,7 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: preprocessor_key.map(|s| s.to_string()),
             language: None,
+            ui: Default::default(),
         }
     }
 

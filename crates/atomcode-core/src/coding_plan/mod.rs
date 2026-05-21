@@ -8,7 +8,8 @@
 //
 // All three REST endpoints live on `api.gitcode.com` (distinct host from
 // `atomgit.com` where the OAuth flow runs; same backend — the token
-// obtained from atomgit OAuth authenticates both). The shared UA
+// obtained from atomgit OAuth authenticates both). The base URL is
+// configurable via `ATOMCODE_CODINGPLAN_API_BASE`. The shared UA
 // (`ATOMCODE_USER_AGENT`) is honoured by every request so AtomGit's
 // API gateway sees a consistent `atomcode/<ver>` identifier.
 
@@ -18,7 +19,7 @@ pub mod setup;
 pub mod sync_marker;
 pub mod types;
 
-pub use client::{is_auth_expired, AuthExpired, Client, API_BASE};
+pub use client::{api_base_url, is_auth_expired, AuthExpired, Client};
 pub use crypto::{signer, RequestSigner, SignError, SignInput, SignOutput};
 pub use setup::{run, SetupReport, StepResult};
 pub use sync_marker::{read_last_sync, write_last_sync_now};
