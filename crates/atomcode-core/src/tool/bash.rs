@@ -1048,12 +1048,87 @@ fn check_destructive_command(command: &str) -> Option<String> {
         ("killall ", "Kill all matching processes"),
         ("git push --force", "Force push"),
         ("git push -f", "Force push"),
+        // --force-with-lease is the "safer" force push but it is still
+        // a force push; gate it the same as --force so accidental push
+        // to main/release branches still triggers an approval. Users
+        // who legitimately want it just confirm once.
+        ("git push --force-with-lease", "Force push (with-lease)"),
         (
             "git reset --hard",
             "Hard reset (destroys uncommitted changes)",
         ),
         ("git clean -f", "Force clean untracked files"),
+        // Skipping hooks. `--no-verify` is essentially git-only
+        // (pre-commit / commit-msg / pre-push). The CLAUDE.md and
+        // built-in system prompt both forbid skipping hooks unless the
+        // user explicitly requested it — making the bash layer ask
+        // mirrors that policy at execution time and catches the case
+        // where the model "decides" to skip a failing hook on its own.
+        ("--no-verify", "Bypassing git hooks (--no-verify)"),
+        // Irreversible history rewrites. These rewrite every commit
+        // touched and break clones — operators almost always want a
+        // second look before letting one through. `filter-branch` is
+        // the legacy tool, `filter-repo` is the modern replacement.
+        ("git filter-branch", "Git history rewrite (filter-branch)"),
+        ("git filter-repo", "Git history rewrite (filter-repo)"),
+        // Interactive rebase can drop / squash / reword commits with
+        // a single keystroke in the editor — the model can't see what
+        // the user (or its own editor sequence) will do. Plain
+        // non-interactive `git rebase` stays auto-allowed because the
+        // outcome is deterministic from the args.
+        (
+            "git rebase -i",
+            "Interactive rebase (can drop/squash commits)",
+        ),
+        (
+            "git rebase --interactive",
+            "Interactive rebase (can drop/squash commits)",
+        ),
+        // Force checkout discards everything in the working tree that
+        // hasn't been committed. Both flag spellings are guarded so
+        // `git checkout -f` and `git checkout --force` both prompt.
+        ("git checkout -f ", "Force checkout (discards working tree)"),
+        ("git checkout --force", "Force checkout (discards working tree)"),
+        // `git switch --discard-changes` is the modern equivalent of
+        // `checkout -f` — same destructive blast radius (clobbers the
+        // working tree), same gate.
+        (
+            "git switch --discard-changes",
+            "Switch with discard (clobbers working tree)",
+        ),
+        // Long-form variants of `git branch -D`. The short form is
+        // checked case-sensitively in the separate block below; the
+        // long forms here survive the case-fold safely.
+        (
+            "git branch --delete --force",
+            "Force delete branch (unmerged commits lost)",
+        ),
+        (
+            "git branch --force --delete",
+            "Force delete branch (unmerged commits lost)",
+        ),
     ];
+
+    // Case-sensitive git short-flag checks. The general pattern table
+    // above runs against `cmd` (already lowercased) which erases the
+    // semantic gap between `-d` (refuses unmerged) and `-D` (forces
+    // delete with unmerged commits). For these we must match the
+    // original `command` so `-D` triggers approval while `-d` stays
+    // auto-allowed.
+    let cs_git_patterns: &[(&str, &str)] = &[
+        (
+            "git branch -D",
+            "Force delete branch (-D drops unmerged commits)",
+        ),
+    ];
+    for (pat, reason) in cs_git_patterns {
+        if command.contains(pat) {
+            return Some(format!(
+                "Destructive command detected: {}. Command: {}",
+                reason, command
+            ));
+        }
+    }
 
     // --- Robust dd detection (handle if=/of= variants) ---
     // dd if=... can be written with spaces: dd if =/dev/zero
@@ -2432,6 +2507,113 @@ mod sanitize_tests {
                  not trigger an empty Bash() prompt"
             );
         }
+    }
+
+    // ── Git-specific destructive patterns ────────────────────────────
+    //
+    // The bash tool already gated `git push --force` / `git push -f` /
+    // `git reset --hard` / `git clean -f` from day one. This block pins
+    // the patterns added later — each one has a real cost when fired
+    // accidentally, and the system prompt's "no hooks bypass" /
+    // "no history rewrite" rules need the bash layer to enforce them
+    // at execution time (otherwise a confused model can sneak through).
+
+    #[test]
+    fn destructive_check_catches_no_verify_on_commit_and_push() {
+        // --no-verify on commit / push skips pre-commit / commit-msg /
+        // pre-push hooks — direct violation of the system prompt rule
+        // "Never skip hooks (--no-verify) unless the user has
+        // explicitly asked for it."
+        assert!(check_destructive_command("git commit -m 'wip' --no-verify").is_some());
+        assert!(check_destructive_command("git push origin main --no-verify").is_some());
+    }
+
+    #[test]
+    fn destructive_check_catches_force_with_lease_push() {
+        // --force-with-lease is the "safer" force push but it IS still
+        // a force push that rewrites the remote branch. Gating it
+        // mirrors --force / -f so a force push to main / release/*
+        // still surfaces a prompt.
+        assert!(
+            check_destructive_command("git push --force-with-lease origin release/v4.23.0")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn destructive_check_catches_history_rewrites() {
+        // filter-branch / filter-repo rewrite every commit they touch —
+        // operators almost always want a second look before letting
+        // one through, even on local branches.
+        assert!(check_destructive_command(
+            "git filter-branch --tree-filter 'rm secrets.txt' HEAD"
+        )
+        .is_some());
+        assert!(
+            check_destructive_command("git filter-repo --path secrets.txt --invert-paths").is_some()
+        );
+    }
+
+    #[test]
+    fn destructive_check_catches_interactive_rebase() {
+        // Interactive rebase can drop / squash / reword commits via
+        // the editor sequence — the model can't reason about the
+        // outcome from the args alone. Plain non-interactive rebase
+        // stays auto-allowed (deterministic from args).
+        assert!(check_destructive_command("git rebase -i HEAD~5").is_some());
+        assert!(check_destructive_command("git rebase --interactive main").is_some());
+    }
+
+    #[test]
+    fn destructive_check_allows_plain_rebase() {
+        // Non-interactive rebase IS NOT gated — the result is fully
+        // determined by the args, so it doesn't need confirmation.
+        assert!(check_destructive_command("git rebase main").is_none());
+        assert!(check_destructive_command("git rebase --onto base main feat").is_none());
+    }
+
+    #[test]
+    fn destructive_check_catches_force_checkout_and_switch() {
+        assert!(check_destructive_command("git checkout -f main").is_some());
+        assert!(check_destructive_command("git checkout --force main").is_some());
+        assert!(check_destructive_command("git switch --discard-changes main").is_some());
+    }
+
+    #[test]
+    fn destructive_check_catches_force_branch_delete_both_forms() {
+        // Long-form survives the case-fold safely; short form `-D`
+        // requires the separate case-sensitive check.
+        assert!(check_destructive_command("git branch --delete --force topic").is_some());
+        assert!(check_destructive_command("git branch --force --delete topic").is_some());
+        assert!(check_destructive_command("git branch -D topic").is_some());
+    }
+
+    #[test]
+    fn destructive_check_allows_safe_branch_delete() {
+        // `-d` (lowercase) refuses unmerged branches — safe by design,
+        // no approval needed. The case-sensitive block above is the
+        // only thing that distinguishes this from `-D` after the
+        // general lowercase fold.
+        assert!(check_destructive_command("git branch -d merged-topic").is_none());
+        assert!(check_destructive_command("git branch --delete merged-topic").is_none());
+    }
+
+    #[test]
+    fn destructive_check_allows_routine_git_ops() {
+        // Sanity: don't over-prompt on the commands an agent runs
+        // every turn. Each of these is fully recoverable / read-only
+        // and should NOT require approval.
+        assert!(check_destructive_command("git status").is_none());
+        assert!(check_destructive_command("git diff").is_none());
+        assert!(check_destructive_command("git log --oneline -10").is_none());
+        assert!(check_destructive_command("git add crates/atomcode-core/src/tool/bash.rs").is_none());
+        assert!(check_destructive_command("git commit -m 'fix(bash): tighten git destructive patterns'").is_none());
+        assert!(check_destructive_command("git push origin release/v4.23.0").is_none());
+        assert!(check_destructive_command("git pull --rebase origin main").is_none());
+        assert!(check_destructive_command("git checkout main").is_none());
+        assert!(check_destructive_command("git switch main").is_none());
+        assert!(check_destructive_command("git stash").is_none());
+        assert!(check_destructive_command("git fetch origin").is_none());
     }
 }
 
