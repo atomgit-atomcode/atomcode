@@ -2714,12 +2714,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn refresh_welcome_banner(&mut self, model: &str, working_dir: &str) {
-        // Update the cached banner (used by reflow_welcome_prefix to
-        // build the new rows) and splice those rows over the welcome
-        // segment of body_lines. Marking dirty lets the next
-        // flush_deferred diff catch the changed cells and emit just
-        // the patch — no flicker, no full repaint. No-op if the
-        // banner was never painted (welcome_banner is None).
+        // Body rows are written directly to the terminal during
+        // push_body_row — paint_frame only repaints the footer, so a
+        // body_lines edit alone doesn't change the bytes already
+        // on-screen. To make the new model/working_dir visible we:
+        //   1. update the cached banner + splice body_lines, and
+        //   2. compute the terminal-row position of each welcome line
+        //      that's still in the viewport (anything above viewport
+        //      top has already entered native scrollback and is no
+        //      longer reachable), then CUP+EL+write each row.
+        // Cursor is saved/restored via DECSC/DECRC so the surgical
+        // update doesn't disturb whatever the active footer/spinner
+        // path expects on its next paint.
         if self.welcome_banner.is_none() {
             return;
         }
@@ -2727,6 +2733,44 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let wd_scrubbed = scrub_controls(working_dir);
         self.welcome_banner = Some((model_scrubbed, wd_scrubbed));
         self.reflow_welcome_prefix();
+
+        let bottom = self.body_bottom_row() as usize;
+        if bottom == 0 || self.welcome_line_count == 0 {
+            return;
+        }
+        let n = self.body_lines.len();
+        if n == 0 {
+            return;
+        }
+        // body_lines tail is bottom-anchored: body_lines[i] sits at
+        // terminal row `bottom - n + i + 1` (1-indexed). Rows whose
+        // computed position would be <= 0 are already in scrollback.
+        let mut seq: Vec<u8> = Vec::with_capacity(self.welcome_line_count * 64);
+        seq.extend_from_slice(b"\x1b7");
+        let mut wrote = false;
+        for i in 0..self.welcome_line_count.min(n) {
+            // Saturating math: avoid underflow when n > bottom and i
+            // falls in the off-screen prefix. We *want* the result to
+            // be 0 in that case so the row is skipped below.
+            let abs = (bottom + i + 1).checked_sub(n).unwrap_or(0);
+            if abs == 0 {
+                continue;
+            }
+            use std::io::Write as _;
+            let _ = write!(&mut seq, "\x1b[{};1H\x1b[K", abs);
+            let bytes = serialize_row(&self.body_lines[i]);
+            seq.extend_from_slice(&bytes);
+            wrote = true;
+        }
+        seq.extend_from_slice(b"\x1b8");
+        if wrote {
+            let _ = self.out.write_all(&seq);
+            let _ = self.out.flush();
+            // Cells on those rows now hold the new content — invalidate
+            // the diff cache so the next frame doesn't decide the row
+            // is unchanged based on the stale snapshot.
+            self.screen.invalidate();
+        }
         self.dirty = true;
     }
 

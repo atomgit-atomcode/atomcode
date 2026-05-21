@@ -2733,6 +2733,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             &ctx.working_dir.to_string_lossy(),
                         );
                         renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
+                        // QR-fast-path onboarding bypasses the regular
+                        // first-boot idle render (see ~line 2506), so
+                        // the one-shot /setup tip never fires for users
+                        // who land through the scan flow. Surface it
+                        // here under the same gates: in-session
+                        // once-only + `should_auto_show_setup` (no
+                        // setup-state.json or missing recommender
+                        // skill).
+                        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
+                            renderer.render(crate::render::UiLine::CommandOutput(
+                                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
+                            ));
+                            renderer.flush();
+                            app.setup_hint_shown = true;
+                        }
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
@@ -3100,6 +3115,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             &ctx.working_dir.to_string_lossy(),
                         );
                         renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
+                        // QR-fast-path onboarding bypasses the regular
+                        // first-boot idle render (see ~line 2506), so
+                        // the one-shot /setup tip never fires for users
+                        // who land through the scan flow. Surface it
+                        // here under the same gates: in-session
+                        // once-only + `should_auto_show_setup` (no
+                        // setup-state.json or missing recommender
+                        // skill).
+                        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
+                            renderer.render(crate::render::UiLine::CommandOutput(
+                                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
+                            ));
+                            renderer.flush();
+                            app.setup_hint_shown = true;
+                        }
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
