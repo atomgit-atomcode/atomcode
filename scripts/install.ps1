@@ -12,7 +12,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.22.3" }
+$Version = if ($env:ATOMCODE_VERSION) { $env:ATOMCODE_VERSION } else { "v4.23.0" }
 $RepoBase = "https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 
 # --- detect arch ---
