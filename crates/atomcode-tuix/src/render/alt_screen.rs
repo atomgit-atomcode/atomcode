@@ -1609,58 +1609,76 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         self.push_body_row(format!("{} {}", bullet, scrub_controls(working_dir)));
         self.push_body_row(format!("{} {}", bullet, scrub_controls(model)));
         self.push_body_row(String::new());
-        // Onboarding hints — first thing a new user reads. Slash
-        // shortcuts in cyan accent; surrounding prose in dim text so
-        // it reads as subordinate to primary content.
-        let hint_a = if self.caps.colors {
-            format!(
-                "{}{}{}{}{}{}{}{}",
-                SGR_DIM,
-                t(Msg::IdleHintPrefix),
-                SGR_RESET,
-                SGR_CYAN,
-                t(Msg::IdleHintSlash),
-                SGR_RESET,
-                SGR_DIM,
-                t(Msg::IdleHintSuffix),
-            ) + SGR_RESET
+        // Onboarding hints: combine onto one row when the terminal is
+        // wide enough; otherwise emit three rows. Mirrors the same
+        // decision the retained renderer makes — push_body_row can't
+        // reflow, so on narrow widths we'd otherwise overflow off the
+        // right edge.
+        let idle_full_w = display_width(&t(Msg::IdleHintFull));
+        let provider_full_w = display_width(&t(Msg::IdleHintProviderFull));
+        let codingplan_full_w = display_width(&t(Msg::IdleHintCodingplanFull));
+        let combined_w = idle_full_w + 3 + provider_full_w + 3 + codingplan_full_w;
+        if combined_w <= self.width as usize {
+            let hint_line = if self.caps.colors {
+                let hint_a = format!(
+                    "{}{}{}{}{}{}{}{}{}",
+                    SGR_DIM, t(Msg::IdleHintPrefix), SGR_RESET,
+                    SGR_CYAN, t(Msg::IdleHintSlash), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintSuffix), SGR_RESET,
+                );
+                let hint_b = format!(
+                    "{}{}{}  {}{}{}",
+                    SGR_CYAN, t(Msg::IdleHintProvider), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintProviderSuffix), SGR_RESET,
+                );
+                let hint_c = format!(
+                    "{}{}{}  {}{}{}",
+                    SGR_CYAN, t(Msg::IdleHintCodingplan), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintCodingplanSuffix), SGR_RESET,
+                );
+                format!("{}   {}   {}", hint_a, hint_b, hint_c)
+            } else {
+                format!(
+                    "{}   {}   {}",
+                    t(Msg::IdleHintFull),
+                    t(Msg::IdleHintProviderFull),
+                    t(Msg::IdleHintCodingplanFull),
+                )
+            };
+            self.push_body_row(hint_line);
         } else {
-            t(Msg::IdleHintFull).into_owned()
-        };
-        self.push_body_row(hint_a);
-        let hint_b = if self.caps.colors {
-            format!(
-                "{}{}{}  {}{}{}",
-                SGR_CYAN,
-                t(Msg::IdleHintProvider),
-                SGR_RESET,
-                SGR_DIM,
-                t(Msg::IdleHintProviderSuffix),
-                SGR_RESET
-            )
-        } else {
-            t(Msg::IdleHintProviderFull).into_owned()
-        };
-        self.push_body_row(hint_b);
-        // Third hint mirrors hint_b's slash/cyan + suffix/dim layout —
-        // points at /codingplan as the path to a free token quota.
-        // Surfaced here (rather than only on the QR fast path) so a
-        // user who already had a config but no provider can still find
-        // the free-quota route from the idle banner.
-        let hint_c = if self.caps.colors {
-            format!(
-                "{}{}{}  {}{}{}",
-                SGR_CYAN,
-                t(Msg::IdleHintCodingplan),
-                SGR_RESET,
-                SGR_DIM,
-                t(Msg::IdleHintCodingplanSuffix),
-                SGR_RESET
-            )
-        } else {
-            t(Msg::IdleHintCodingplanFull).into_owned()
-        };
-        self.push_body_row(hint_c);
+            let hint_a = if self.caps.colors {
+                format!(
+                    "{}{}{}{}{}{}{}{}{}",
+                    SGR_DIM, t(Msg::IdleHintPrefix), SGR_RESET,
+                    SGR_CYAN, t(Msg::IdleHintSlash), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintSuffix), SGR_RESET,
+                )
+            } else {
+                t(Msg::IdleHintFull).into_owned()
+            };
+            self.push_body_row(hint_a);
+            let hint_b = if self.caps.colors {
+                format!(
+                    "{}{}{}  {}{}{}",
+                    SGR_CYAN, t(Msg::IdleHintProvider), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintProviderSuffix), SGR_RESET,
+                )
+            } else {
+                t(Msg::IdleHintProviderFull).into_owned()
+            };
+            self.push_body_row(hint_b);
+            let hint_c = if self.caps.colors {
+                format!(
+                    "{}{}{}  {}{}{}",
+                    SGR_CYAN, t(Msg::IdleHintCodingplan), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintCodingplanSuffix), SGR_RESET,
+                )
+            } else {
+                t(Msg::IdleHintCodingplanFull).into_owned()
+            };
+            self.push_body_row(hint_c);
+        }
         self.push_body_row(String::new());
     }
 

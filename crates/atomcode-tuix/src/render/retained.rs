@@ -1936,45 +1936,87 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (DarkGrey would vanish on some iTerm2 light presets, default
         // fg unmuted competes with the user's input on dark presets).
         // Slash shortcuts stay accent_bold (cyan) for visual emphasis.
+        // Hint row(s): input prompt + /provider + /codingplan.
+        //
+        // Wide enough to fit on one visual row → emit a single combined
+        // line (user's preferred shape on standard 100+ col terminals).
+        // Narrower → fall back to three separate rows; the alternative
+        // is a single line that `build_wrapped_text_rows` would
+        // hard-break mid-token (`/provider` → `/provi`+`der`), which
+        // looks worse than three short rows on a small terminal.
         let hint_text = self.style_faint(Role::Secondary);
         let accent_bold = self.style_bold(Role::Accent);
         let idle_prefix = t(Msg::IdleHintPrefix);
         let idle_slash = t(Msg::IdleHintSlash);
         let idle_suffix = t(Msg::IdleHintSuffix);
-        rows.extend(self.build_wrapped_text_rows(
-            &[
-                (&idle_prefix, hint_text.clone()),
-                (&idle_slash, accent_bold.clone()),
-                (&idle_suffix, hint_text.clone()),
-            ],
-            content_w,
-        ));
-
         let provider_cmd = t(Msg::IdleHintProvider);
         let provider_suffix = t(Msg::IdleHintProviderSuffix);
-        rows.extend(self.build_wrapped_text_rows(
-            &[
-                (&provider_cmd, accent_bold.clone()),
-                ("  ", hint_text.clone()),
-                (&provider_suffix, hint_text.clone()),
-            ],
-            content_w,
-        ));
-
-        // Third hint — mirrors the /provider row layout, points at
-        // /codingplan as the free-token-quota path. Added in lockstep
-        // with the alt_screen.rs paint_welcome hint_c row so both
-        // renderer paths surface the same three slash-command hints.
         let codingplan_cmd = t(Msg::IdleHintCodingplan);
         let codingplan_suffix = t(Msg::IdleHintCodingplanSuffix);
-        rows.extend(self.build_wrapped_text_rows(
-            &[
-                (&codingplan_cmd, accent_bold),
-                ("  ", hint_text.clone()),
-                (&codingplan_suffix, hint_text),
-            ],
-            content_w,
-        ));
+        let combined_width: usize = [
+            idle_prefix.as_ref(),
+            idle_slash.as_ref(),
+            idle_suffix.as_ref(),
+            "   ",
+            provider_cmd.as_ref(),
+            "  ",
+            provider_suffix.as_ref(),
+            "   ",
+            codingplan_cmd.as_ref(),
+            "  ",
+            codingplan_suffix.as_ref(),
+        ]
+        .iter()
+        .map(|s| unicode_width::UnicodeWidthStr::width(*s))
+        .sum();
+        if combined_width <= content_w {
+            rows.extend(self.build_wrapped_text_rows(
+                &[
+                    (&idle_prefix, hint_text.clone()),
+                    (&idle_slash, accent_bold.clone()),
+                    (&idle_suffix, hint_text.clone()),
+                    ("   ", hint_text.clone()),
+                    (&provider_cmd, accent_bold.clone()),
+                    ("  ", hint_text.clone()),
+                    (&provider_suffix, hint_text.clone()),
+                    ("   ", hint_text.clone()),
+                    (&codingplan_cmd, accent_bold),
+                    ("  ", hint_text.clone()),
+                    (&codingplan_suffix, hint_text),
+                ],
+                content_w,
+            ));
+        } else {
+            rows.extend(self.build_wrapped_text_rows(
+                &[
+                    (&idle_prefix, hint_text.clone()),
+                    (&idle_slash, accent_bold.clone()),
+                    (&idle_suffix, hint_text.clone()),
+                ],
+                content_w,
+            ));
+            rows.extend(self.build_wrapped_text_rows(
+                &[
+                    (&provider_cmd, accent_bold.clone()),
+                    ("  ", hint_text.clone()),
+                    (&provider_suffix, hint_text.clone()),
+                ],
+                content_w,
+            ));
+            rows.extend(self.build_wrapped_text_rows(
+                &[
+                    (&codingplan_cmd, accent_bold),
+                    ("  ", hint_text.clone()),
+                    (&codingplan_suffix, hint_text),
+                ],
+                content_w,
+            ));
+        }
+
+        // Trailing blank so subsequent async events (MCP "已连接",
+        // upgrade hints, etc.) don't butt up against the hint row.
+        // Mirrors alt_screen's push_welcome trailing blank.
+        rows.push(Vec::new());
 
         rows
     }
@@ -2668,6 +2710,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             let _ = self.out.flush();
             self.skip_next_body_scroll = true;
         }
+        self.dirty = true;
+    }
+
+    fn refresh_welcome_banner(&mut self, model: &str, working_dir: &str) {
+        // Update the cached banner (used by reflow_welcome_prefix to
+        // build the new rows) and splice those rows over the welcome
+        // segment of body_lines. Marking dirty lets the next
+        // flush_deferred diff catch the changed cells and emit just
+        // the patch — no flicker, no full repaint. No-op if the
+        // banner was never painted (welcome_banner is None).
+        if self.welcome_banner.is_none() {
+            return;
+        }
+        let model_scrubbed = scrub_controls(model);
+        let wd_scrubbed = scrub_controls(working_dir);
+        self.welcome_banner = Some((model_scrubbed, wd_scrubbed));
+        self.reflow_welcome_prefix();
         self.dirty = true;
     }
 
@@ -4286,14 +4345,14 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Body bottom-anchored: 6 body lines + footer 5 rows on a
-        // 24-row screen → body occupies rows 13-18, footer 19-23.
-        // Verify the row containing "AtomCode" exists somewhere in
-        // the body region (exact row depends on layout math).
-        let found_brand = (13..=18).any(|r| vterm.row_text(r).contains("AtomCode"));
-        let found_cwd = (13..=18).any(|r| vterm.row_text(r).contains("~/p/a"));
-        let found_model = (13..=18).any(|r| vterm.row_text(r).contains("glm-5"));
-        let found_hint = (13..=18).any(|r| vterm.row_text(r).contains("browse commands"));
+        // Body bottom-anchored: 7 welcome rows (title + cwd + model
+        // + blank + 3 hint rows) + footer 5 rows on a 24-row screen →
+        // body occupies rows 12-18, footer 19-23. Verify each
+        // expected piece exists somewhere in the body region.
+        let found_brand = (12..=18).any(|r| vterm.row_text(r).contains("AtomCode"));
+        let found_cwd = (12..=18).any(|r| vterm.row_text(r).contains("~/p/a"));
+        let found_model = (12..=18).any(|r| vterm.row_text(r).contains("glm-5"));
+        let found_hint = (12..=18).any(|r| vterm.row_text(r).contains("browse commands"));
         assert!(
             found_brand && found_cwd && found_model && found_hint,
             "welcome rows missing (brand={} cwd={} model={} hint={})\ndump:\n{}",
@@ -4540,8 +4599,15 @@ mod tests {
 
     #[test]
     fn retained_welcome_reflows_path_model_and_hints_on_narrow_terminal() {
-        let (mut r, buf) = new_capturing(22, 20);
-        let mut vterm = crate::test_term::VirtualTerminal::new(22, 20);
+        // 22-col WIDTH is the test's actual subject (column reflow).
+        // Use 26-row HEIGHT — large enough that the reflowed banner
+        // (title × 2 + path × 4 + model × 2 + blank + hint_a × 3 +
+        // hint_b × 2 + hint_c × 3 = 17 body rows, plus 4 footer rows)
+        // fits entirely in the viewport with headroom. With a 20-row
+        // viewport the brand line scrolled into scrollback and made the
+        // assertion brittle to small additions to the hint block.
+        let (mut r, buf) = new_capturing(22, 26);
+        let mut vterm = crate::test_term::VirtualTerminal::new(22, 26);
 
         r.render(UiLine::Welcome {
             model: "MiniMax-M2.7-long".into(),
@@ -4558,32 +4624,32 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         assert!(
-            (0..20).any(|row| vterm.row_text(row).contains("AtomCode")),
+            (0..26).any(|row| vterm.row_text(row).contains("AtomCode")),
             "brand missing on narrow terminal\n{}",
             vterm.dump()
         );
         assert!(
-            (0..20).any(|row| vterm.row_text(row).contains("workspace")),
+            (0..26).any(|row| vterm.row_text(row).contains("workspace")),
             "path should wrap instead of disappearing on narrow terminal\n{}",
             vterm.dump()
         );
         assert!(
-            (0..20).any(|row| vterm.row_text(row).contains("MiniMax")),
+            (0..26).any(|row| vterm.row_text(row).contains("MiniMax")),
             "model should wrap instead of disappearing on narrow terminal\n{}",
             vterm.dump()
         );
         assert!(
-            (0..20).any(|row| vterm.row_text(row).contains("type something")),
+            (0..26).any(|row| vterm.row_text(row).contains("type something")),
             "welcome input hint should remain visible on narrow terminal\n{}",
             vterm.dump()
         );
         assert!(
-            (0..20).any(|row| vterm.row_text(row).contains("commands")),
+            (0..26).any(|row| vterm.row_text(row).contains("commands")),
             "welcome commands hint should remain visible on narrow terminal\n{}",
             vterm.dump()
         );
         assert!(
-            (0..20).any(|row| vterm.row_text(row).contains("/provider")),
+            (0..26).any(|row| vterm.row_text(row).contains("/provider")),
             "provider hint should remain visible on narrow terminal\n{}",
             vterm.dump()
         );
@@ -6033,8 +6099,9 @@ mod tests {
         let status = status_basic();
 
         // Initial welcome (no menu). Footer = 4 rows (top_rule /
-        // middle / bot_rule / status). Welcome 6 rows bottom-anchored
-        // at rows 14..=19 (0-idx).
+        // middle / bot_rule / status). Welcome 8 rows bottom-anchored
+        // at rows 12..=19 (0-idx). Banner = title + path + model +
+        // blank + 3 hint rows + trailing blank.
         r.render(UiLine::Welcome {
             model: "glm-5".into(),
             working_dir: "~/project/atomcode".into(),
@@ -6050,7 +6117,7 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         // Open menu ("/" pressed). Footer grows by 4 rows (menu) →
-        // 8 rows. Welcome paints at 0-idx rows 10..=15.
+        // 8 rows. Welcome (8 rows) paints at 0-idx rows 8..=15.
         let items: Vec<(String, String)> = vec![
             ("model".into(), "Switch model".into()),
             ("provider".into(), "Add provider".into()),
@@ -6073,7 +6140,7 @@ mod tests {
 
         // Close menu (Esc). Footer shrinks back to 4, welcome
         // re-paints via `ensure_scroll_region`'s grew branch →
-        // back to 0-idx rows 14..=19.
+        // back to 0-idx rows 12..=19.
         r.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -6084,23 +6151,23 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Welcome brand at row 14 post-close. Row 10 (where brand
+        // Welcome brand at row 12 post-close. Row 8 (where brand
         // lived mid-menu) must be blank now — the zombie-zone erase
         // must have cleaned it.
         assert!(
-            vterm.row_text(14).contains("AtomCode"),
-            "menu-close: welcome brand missing at row 14:\n{}",
+            vterm.row_text(12).contains("AtomCode"),
+            "menu-close: welcome brand missing at row 12:\n{}",
             vterm.dump()
         );
         assert!(
-            !vterm.row_text(10).contains("AtomCode"),
-            "menu-close: row 10 still shows ghost welcome brand:\n{}",
+            !vterm.row_text(8).contains("AtomCode"),
+            "menu-close: row 8 still shows ghost welcome brand:\n{}",
             vterm.dump()
         );
-        // Same for cwd row (was 0-idx row 11 mid-menu, moves to 15).
+        // Same for cwd row (was 0-idx row 9 mid-menu, moves to 13).
         assert!(
-            !vterm.row_text(11).contains("project"),
-            "menu-close: row 11 still shows ghost cwd:\n{}",
+            !vterm.row_text(9).contains("project"),
+            "menu-close: row 9 still shows ghost cwd:\n{}",
             vterm.dump()
         );
     }
@@ -6129,9 +6196,9 @@ mod tests {
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
 
-        // Welcome (6 body rows) + 20 User echoes (2 rows each =
-        // 40 body rows). Total 46 rows pushed; body region bottom
-        // with a 1-line-input footer is < 20, so ~26 rows are
+        // Welcome (7 body rows) + 20 User echoes (2 rows each =
+        // 40 body rows). Total 47 rows pushed; body region bottom
+        // with a 1-line-input footer is < 20, so ~27 rows are
         // already in terminal scrollback via the normal emit path.
         r.render(UiLine::Welcome {
             model: "MiniMax-M2.7".into(),
@@ -6295,10 +6362,12 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Welcome fingerprint: the hint row is unique to the welcome
-        // banner. It must appear exactly once in the *visible*
-        // viewport and zero times in scrollback.
-        let hint = "to add a custom model";
+        // Welcome fingerprint: `/codingplan` is unique to the welcome
+        // hint row and is a single non-wrapping token, so it gives a
+        // stable single-row marker even when the combined hint line
+        // soft-wraps at narrower widths. Must appear exactly once in
+        // the *visible* viewport and zero times in scrollback.
+        let hint = "/codingplan";
         let visible_count = (0..24)
             .filter(|r| vterm.row_text(*r).contains(hint))
             .count();

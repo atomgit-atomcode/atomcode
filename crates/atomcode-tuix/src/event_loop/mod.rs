@@ -2701,6 +2701,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 }
                 match ev {
                     OauthEvent::Authorized => {
+                        // Banner FIRST, /codingplan output below — per
+                        // user direction: AtomCode chrome should anchor
+                        // the top of scrollback, the codingplan claim
+                        // output is verbose detail underneath. Model
+                        // bullet is blank at this point because the
+                        // claim hasn't picked a default provider yet —
+                        // refreshed below once the claim writes
+                        // ctx.model_name.
+                        crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
                         // `pending_run_codingplan` is only drained by the
                         // keystroke-handler path (handle_input → modal
                         // close → drain flag). The OAuth poll path doesn't
@@ -2714,14 +2723,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             ));
                             renderer.flush();
                         }
-                        // Paint the welcome banner so the user lands on
-                        // the standard idle frame (banner + cwd + model
-                        // + slash hints including the /codingplan tip)
-                        // instead of a bare /codingplan output above the
-                        // input box. The Esc / Setup-Skip paths in the
-                        // wizard already do this; this is the missing
-                        // mirror for the poll-driven happy path.
-                        crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
+                        // Splice the resolved model name into the
+                        // banner painted above. `run_codingplan_flow`
+                        // updates `ctx.model_name` from the picked
+                        // default provider (see commands.rs:2906) — at
+                        // this point the banner's cached model="" is
+                        // stale, so refresh in place.
+                        let dir_display = crate::platform::collapse_home(
+                            &ctx.working_dir.to_string_lossy(),
+                        );
+                        renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
@@ -3057,6 +3068,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 }
                 match ev {
                     OauthEvent::Authorized => {
+                        // Banner FIRST, /codingplan output below — per
+                        // user direction: AtomCode chrome should anchor
+                        // the top of scrollback, the codingplan claim
+                        // output is verbose detail underneath. Model
+                        // bullet is blank at this point because the
+                        // claim hasn't picked a default provider yet —
+                        // refreshed below once the claim writes
+                        // ctx.model_name.
+                        crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
                         // `pending_run_codingplan` is only drained by the
                         // keystroke-handler path (handle_input → modal
                         // close → drain flag). The OAuth poll path doesn't
@@ -3070,14 +3090,16 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             ));
                             renderer.flush();
                         }
-                        // Paint the welcome banner so the user lands on
-                        // the standard idle frame (banner + cwd + model
-                        // + slash hints including the /codingplan tip)
-                        // instead of a bare /codingplan output above the
-                        // input box. The Esc / Setup-Skip paths in the
-                        // wizard already do this; this is the missing
-                        // mirror for the poll-driven happy path.
-                        crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
+                        // Splice the resolved model name into the
+                        // banner painted above. `run_codingplan_flow`
+                        // updates `ctx.model_name` from the picked
+                        // default provider (see commands.rs:2906) — at
+                        // this point the banner's cached model="" is
+                        // stale, so refresh in place.
+                        let dir_display = crate::platform::collapse_home(
+                            &ctx.working_dir.to_string_lossy(),
+                        );
+                        renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(

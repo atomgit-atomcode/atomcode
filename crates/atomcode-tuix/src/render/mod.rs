@@ -281,6 +281,19 @@ pub trait Renderer: Send {
     fn copy_selection(&mut self) -> bool {
         false
     }
+
+    /// Update the cached welcome banner's model / working_dir fields in
+    /// place and trigger a repaint of the banner rows. Used after the
+    /// QR-onboarding `/codingplan` claim finishes: the banner was
+    /// painted at the top of scrollback with `model=""` (the claim
+    /// hadn't picked a default provider yet) — once the claim writes
+    /// `ctx.model_name`, this hook splices the resolved model into the
+    /// existing banner rows so the user doesn't see a permanently
+    /// blank model bullet.
+    ///
+    /// Default no-op: renderers without a retained body buffer can't
+    /// edit already-emitted rows in place.
+    fn refresh_welcome_banner(&mut self, _model: &str, _working_dir: &str) {}
 }
 
 /// Visual style for the menu popup. Drives whether the renderer prefixes
