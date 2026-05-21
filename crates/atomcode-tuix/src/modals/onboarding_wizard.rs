@@ -248,7 +248,7 @@ fn center_lines(
 /// canvas with only the idle prompt. Does NOT emit the
 /// `CmdNewSession` "新会话已开始" toast — onboarding-exit is not
 /// the same intent as `/session` and the toast would be noise.
-fn paint_welcome(
+pub(crate) fn paint_welcome(
     ctx: &crate::event_loop::LoopCtx,
     renderer: &mut dyn crate::render::Renderer,
 ) {

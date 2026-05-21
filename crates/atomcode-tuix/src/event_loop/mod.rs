@@ -2714,6 +2714,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             ));
                             renderer.flush();
                         }
+                        // Paint the welcome banner so the user lands on
+                        // the standard idle frame (banner + cwd + model
+                        // + slash hints including the /codingplan tip)
+                        // instead of a bare /codingplan output above the
+                        // input box. The Esc / Setup-Skip paths in the
+                        // wizard already do this; this is the missing
+                        // mirror for the poll-driven happy path.
+                        crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
@@ -3062,6 +3070,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                             ));
                             renderer.flush();
                         }
+                        // Paint the welcome banner so the user lands on
+                        // the standard idle frame (banner + cwd + model
+                        // + slash hints including the /codingplan tip)
+                        // instead of a bare /codingplan output above the
+                        // input box. The Esc / Setup-Skip paths in the
+                        // wizard already do this; this is the missing
+                        // mirror for the poll-driven happy path.
+                        crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
                     }
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
