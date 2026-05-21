@@ -805,7 +805,7 @@ impl OnboardingWizard {
 
         let mut content: Vec<String> = Vec::new();
         content.push(String::new());
-        content.push(center("扫码登录,自动领取 CodingPlan 免费额度"));
+        content.push(center("微信扫码登录,自动领取 CodingPlan 免费额度"));
         content.push(String::new());
 
         if let Some(reason) = &self.qr_login_error {
@@ -828,7 +828,7 @@ impl OnboardingWizard {
                 content.push(String::new());
             }
             content.push(center(if unicode_symbols {
-                "手机微信扫码,或在浏览器打开:"
+                "或在浏览器打开:"
             } else {
                 "无法显示二维码 — 请在浏览器打开:"
             }));
