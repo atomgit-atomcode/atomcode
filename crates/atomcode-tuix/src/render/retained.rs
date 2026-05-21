@@ -1471,6 +1471,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let seq = format!("\x1b[{};1H\x1b[K", bottom);
                 let _ = self.out.write_all(seq.as_bytes());
             }
+            // The CUP+EL above erased the inflight row in place — the
+            // committed row should land in that exact slot. Without
+            // this flag, `push_body_prefixed`'s underlying
+            // `emit_body_line_inner` emits an LF that scrolls the body
+            // region up by one, leaving the just-erased row as a
+            // second blank between the user message and the committed
+            // tool call (visible as the `> question \n \n ● tool`
+            // double-gap in screenshots).
+            self.skip_next_body_scroll = true;
             self.push_body_prefixed(
                 // Frozen icon matches the static ToolCall arm — see its
                 // comment for the Windows-font rationale that picked ●
