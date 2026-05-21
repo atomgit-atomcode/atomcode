@@ -719,14 +719,7 @@ impl AgentLoop {
 
         let mut registry = SkillRegistry::new();
         let _ = registry.reload(&working_dir);
-        let has_skills = !registry.is_empty();
         let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(registry));
-        // Only register use_skill tool when skills are available.
-        // Otherwise the model invents skill names and wastes turns.
-        // Honour ATOMCODE_DISABLE_TOOLS here too — main.rs filters the base
-        // CLI tools at construction time, but AgentLoop::new adds internal
-        // tools (graph queries, use_skill) that must respect the same
-        // gate so `--disable-tools trace_callers` actually works.
         let disabled_internal: std::collections::HashSet<String> =
             std::env::var("ATOMCODE_DISABLE_TOOLS")
                 .ok()
@@ -739,7 +732,13 @@ impl AgentLoop {
                 .unwrap_or_default();
         let internal_enabled = |name: &str| !disabled_internal.contains(name);
 
-        if has_skills && internal_enabled("use_skill") {
+        // Always register use_skill — the tool itself gracefully reports
+        // "no skills available" when the registry is empty. Gating on
+        // has_skills breaks Windows where skills are installed via plugins
+        // that may not be present at compile time. The model only wastes
+        // a turn calling use_skill with an empty registry, not 5+ turns
+        // re-describing the task that a skill would have covered.
+        if internal_enabled("use_skill") {
             tool_registry.register_sync(Box::new(UseSkillTool {
                 registry: skill_registry.clone(),
             }));
