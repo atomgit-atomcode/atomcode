@@ -828,7 +828,7 @@ impl OnboardingWizard {
                 content.push(String::new());
             }
             content.push(center(if unicode_symbols {
-                "手机扫码,或在浏览器打开:"
+                "手机微信扫码,或在浏览器打开:"
             } else {
                 "无法显示二维码 — 请在浏览器打开:"
             }));
