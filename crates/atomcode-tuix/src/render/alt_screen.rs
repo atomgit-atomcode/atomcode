@@ -2013,6 +2013,11 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // this, parallel batch approvals (e.g. 3 × Read) show
                 // identical prompts and the user can't tell which file
                 // they're approving (issue #439).
+                //
+                // Split into two lines: line 1 is the label (auto-wraps
+                // via push_body_row_raw), line 2 is the Y/A/N chips —
+                // always on their own line so they remain visible even
+                // when the tool label is long.
                 let waiting = t(Msg::ApprovalWaitingLabel);
                 let allow = t(Msg::ApprovalAllow);
                 let always = t(Msg::ApprovalAlways);
@@ -2022,26 +2027,42 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 } else {
                     format!("{}({}): ", tool, detail)
                 };
-                let row = if self.caps.colors {
-                    format!(
-                        "{bold}{yellow}{waiting}{tool_label}{reset}{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
+                let prefix_w = crate::width::display_width(&waiting);
+                let cont_pad = " ".repeat(prefix_w);
+
+                // Line 1: label — auto-wraps if too long.
+                if self.caps.colors {
+                    let label_row = format!(
+                        "{bold}{yellow}{waiting}{tool_label}{reset}",
                         bold = SGR_BOLD,
                         yellow = SGR_YELLOW,
+                        reset = SGR_RESET,
+                        waiting = waiting,
+                        tool_label = tool_label,
+                    );
+                    self.push_body_row_raw(label_row);
+                } else {
+                    let label_row = format!("{waiting}{tool_label}");
+                    self.push_body_row_raw(label_row);
+                }
+
+                // Line 2: Y/A/N chips.
+                let chips_row = if self.caps.colors {
+                    format!(
+                        "{cont_pad}{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
                         rev = SGR_REVERSE,
                         green = SGR_GREEN,
                         cyan = SGR_CYAN,
                         red = SGR_RED,
                         reset = SGR_RESET,
-                        waiting = waiting,
-                        tool_label = tool_label,
                         allow = allow,
                         always = always,
                         deny = deny,
                     )
                 } else {
-                    format!("{waiting}{tool_label}Y {allow} A {always} N {deny}")
+                    format!("{cont_pad}Y {allow} A {always} N {deny}")
                 };
-                self.push_body_row(row);
+                self.push_body_row(chips_row);
             }
 
             // ── body: command output / errors ──
