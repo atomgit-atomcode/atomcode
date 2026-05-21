@@ -158,6 +158,32 @@ pub struct UiState {
     /// MiniMax-M2.7). Toggled by Ctrl+O together with `show_tool_output`.
     /// When false (default), reasoning content is hidden during streaming.
     pub show_reasoning: bool,
+    /// Active goal condition string, if a `/goal` is running.
+    pub goal_condition: Option<String>,
+    /// Current round number of the running goal loop.
+    pub goal_round: u32,
+    /// When the goal was started, for elapsed-time display.
+    pub goal_started_at: Option<std::time::Instant>,
+    /// Per-turn stats buffered from the most recent `TurnComplete`. The
+    /// separator line is NOT rendered immediately so that — if the next
+    /// event happens to be `GoalUpdate(active=false)` (the goal just
+    /// ended) — we can render the goal verdict banner ABOVE the line.
+    /// Any other event flushes this buffer with the usual `↻ goal round N`
+    /// or `✓ done` label.
+    pub pending_separator: Option<PendingSeparator>,
+}
+
+/// Stats captured at `TurnComplete` and held until the next event decides
+/// how to render the turn-boundary separator.
+#[derive(Debug, Clone)]
+pub struct PendingSeparator {
+    pub duration: std::time::Duration,
+    pub turn_count: usize,
+    pub tool_call_count: usize,
+    pub total_tokens: usize,
+    /// Whether the turn ran inside an active `/goal` (decides `↻` vs `✓`
+    /// when flushed without a goal-end event).
+    pub was_goal_round: bool,
 }
 
 impl Default for UiState {
@@ -193,6 +219,10 @@ impl UiState {
             pending_context_render: None,
             show_tool_output: false,
             show_reasoning: false,
+            goal_condition: None,
+            goal_round: 0,
+            goal_started_at: None,
+            pending_separator: None,
         }
     }
 

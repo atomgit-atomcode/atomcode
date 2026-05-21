@@ -523,7 +523,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let secondary = self.style_faint(Role::Secondary);
         let error = self.style_for(Role::Error);
 
-        let mut parts: Vec<String> = Vec::with_capacity(3);
+        let mut parts: Vec<String> = Vec::with_capacity(4);
         if !status.model.is_empty() {
             parts.push(scrub_controls(&status.model));
         }
@@ -532,6 +532,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         if status.total_tokens > 0 {
             parts.push(format_token_count(status.total_tokens));
+        }
+        if let Some(ref gi) = status.goal_indicator {
+            parts.push(scrub_controls(gi));
         }
         let left = parts.join(" · ");
         let max = rule_width.max(1);
@@ -2442,6 +2445,7 @@ mod tests {
             cwd: "~/project/atomcode".into(),
             total_tokens: 0,
             hint: None,
+            goal_indicator: None,
         }
     }
 

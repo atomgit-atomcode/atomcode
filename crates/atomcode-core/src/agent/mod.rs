@@ -5,6 +5,8 @@
 pub mod background;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
+pub mod goal;
+pub mod goal_evaluator;
 pub mod sub_agent;
 pub mod subtask_driver;
 
@@ -79,6 +81,12 @@ pub enum AgentCommand {
     /// or other change to plugin state. Cheap (just re-reads JSON files);
     /// does NOT touch provider/model state, unlike ReloadConfig.
     ReloadHooks,
+    /// Set a goal condition — agent will loop until evaluator says met.
+    SetGoal {
+        condition: String,
+    },
+    /// Clear the active goal.
+    ClearGoal,
     /// Shutdown the agent.
     Shutdown,
 }
@@ -192,6 +200,14 @@ pub enum AgentEvent {
     Error(String),
     /// Sub-agent progress (real-time parallel task display).
     SubAgentProgress { file: String, status: String },
+    /// Goal evaluator update — TUI shows progress.
+    GoalUpdate {
+        active: bool,
+        round: u32,
+        elapsed_secs: u64,
+        condition: String,
+        last_reason: Option<String>,
+    },
     /// `/background` task finished. `summary` is the final assistant text
     /// (truncated if long). `success` is false on error / timeout / cancel.
     BackgroundComplete {
@@ -412,6 +428,23 @@ pub struct AgentLoop {
     // Datalog writer — writes per-turn markdown logs to datalog/ directory.
     datalog: crate::turn::datalog::DatalogWriter,
 
+    /// Active /goal state. Default is inactive (no goal set).
+    goal: goal::GoalState,
+
+    /// Files edited across all rounds of the current /goal session.
+    /// `files_edited_this_turn` is reset every turn boundary, so we maintain
+    /// this separate cumulative set for the evaluator's summary — lets the
+    /// evaluator see progress across many rounds (see CR M13).
+    /// Cleared in `SetGoal` and `finalize_goal_cancelled`.
+    goal_files_edited: Vec<String>,
+
+    /// Goal evaluator — built lazily in `run()` from evaluator_provider config.
+    goal_evaluator: Option<goal_evaluator::GoalEvaluator>,
+
+    /// Stop reason from the most recent turn loop iteration. Updated by
+    /// `finish_turn` so `run_turn_loop` can return it.
+    last_stop_reason: TurnStopReason,
+
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -625,6 +658,10 @@ impl AgentLoop {
             hook_executor,
             reindex_tx: None,
             datalog,
+            goal: goal::GoalState::default(),
+            goal_files_edited: Vec::new(),
+            goal_evaluator: None,
+            last_stop_reason: TurnStopReason::Natural,
             cmd_rx,
             event_tx,
         };
@@ -690,6 +727,77 @@ impl AgentLoop {
             self.hook_executor.run_session_event(crate::hook::HookEvent::SessionStart, &ctx).await;
         }
 
+        // Build goal evaluator from evaluator_provider config (or fall back
+        // to the main provider when not configured).
+        //
+        // `create_provider` may run blocking I/O (OAuth refresh via
+        // `reqwest::blocking::Client`) when the provider config doesn't
+        // carry a static `api_key` (e.g. atomgit endpoints). Calling that
+        // from this async `run()` context panics with "Cannot drop a
+        // runtime in a context where blocking is not allowed". Wrap the
+        // construction in `spawn_blocking` so the blocking client lives
+        // and dies on a blocking-allowed worker thread.
+        //
+        // Failure of an *explicitly configured* evaluator_provider is
+        // surfaced to the TUI via AgentEvent::Error rather than silently
+        // falling back to the main model — otherwise the user thinks they
+        // are paying for a cheap Haiku eval but is actually paying for
+        // the main (Opus-class) model to evaluate every round (CR C6).
+        {
+            let eval_provider: std::sync::Arc<dyn crate::provider::LlmProvider> = match self
+                .config
+                .evaluator_provider
+                .clone()
+            {
+                None => self.turn_runner.provider.clone(),
+                Some(key) => match self.config.providers.get(&key).cloned() {
+                    None => {
+                        let msg = format!(
+                            "[goal] evaluator_provider '{key}' not found in [providers] — using main model. Add `[providers.{key}]` to config or remove `evaluator_provider` to silence this warning."
+                        );
+                        eprintln!("{msg}");
+                        let _ = self.event_tx.send(AgentEvent::Error(msg));
+                        self.turn_runner.provider.clone()
+                    }
+                    Some(pc) => {
+                        let build_result = tokio::task::spawn_blocking({
+                            let pc = pc.clone();
+                            move || crate::provider::create_provider(&pc)
+                        })
+                        .await;
+                        match build_result {
+                            Ok(Ok(p)) => std::sync::Arc::from(p),
+                            Ok(Err(e)) => {
+                                let msg = format!(
+                                    "[goal] evaluator_provider '{key}' failed to initialise: {e:#} — using main model for goal evaluation"
+                                );
+                                eprintln!("{msg}");
+                                let _ = self.event_tx.send(AgentEvent::Error(msg));
+                                self.turn_runner.provider.clone()
+                            }
+                            Err(join_err) if join_err.is_panic() => {
+                                let msg = format!(
+                                    "[goal] evaluator_provider '{key}' construction panicked: {join_err} — using main model"
+                                );
+                                eprintln!("{msg}");
+                                let _ = self.event_tx.send(AgentEvent::Error(msg));
+                                self.turn_runner.provider.clone()
+                            }
+                            Err(join_err) => {
+                                let msg = format!(
+                                    "[goal] evaluator_provider '{key}' construction cancelled: {join_err} — using main model"
+                                );
+                                eprintln!("{msg}");
+                                let _ = self.event_tx.send(AgentEvent::Error(msg));
+                                self.turn_runner.provider.clone()
+                            }
+                        }
+                    }
+                },
+            };
+            self.goal_evaluator = Some(goal_evaluator::GoalEvaluator::new(eval_provider));
+        }
+
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 AgentCommand::SendMessage(content) => {
@@ -701,6 +809,13 @@ impl AgentLoop {
                     self.phase = AgentPhase::Idle;
                     // Cancel the current turn - remove partial messages from conversation
                     self.conversation.cancel_current_turn();
+                    // Ctrl+C/Esc must also halt any /goal auto-continuation
+                    // — otherwise the evaluator schedules a new turn right
+                    // after this cancel and the user sees endless
+                    // "(cancelled)" cycles (CR C3).
+                    if self.goal.active {
+                        self.finalize_goal_cancelled();
+                    }
                     // Sync the cleaned messages to TUI
                     let messages = self.conversation.messages.clone();
                     let _ = self.event_tx.send(AgentEvent::TurnCancelled { messages });
@@ -990,6 +1105,18 @@ impl AgentLoop {
                     );
                     self.turn_runner.hook_executor = self.hook_executor.clone();
                 }
+                AgentCommand::SetGoal { condition } => {
+                    self.goal = goal::GoalState::new(condition);
+                    self.goal_files_edited.clear();
+                    self.emit_goal_update(true, None);
+                }
+                AgentCommand::ClearGoal => {
+                    let prev_active = self.goal.active;
+                    self.goal.clear();
+                    if prev_active {
+                        self.emit_goal_update(false, Some("cleared by user".into()));
+                    }
+                }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
                     if self.hook_executor.has_hooks() {
@@ -1229,7 +1356,157 @@ impl AgentLoop {
             .event_tx
             .send(AgentEvent::PhaseChange(AgentPhase::Thinking));
 
-        self.run_turn_loop().await;
+        let mut stop_reason = self.run_turn_loop().await;
+
+        // ── Goal auto-continuation loop ──
+        // If user cancelled (Esc/Ctrl+C) mid-turn, halt the goal and tell
+        // the TUI so the indicator clears. Previously this clear was silent
+        // and left the indicator spinning forever (CR C3).
+        if matches!(stop_reason, TurnStopReason::Cancelled) {
+            self.finalize_goal_cancelled();
+            return;
+        }
+
+        while self.goal.active && !self.goal.is_evaluator_exhausted() {
+            // Carry over this turn's edits into the goal-level cumulative set
+            // so the evaluator's summary shows progress across many rounds.
+            for f in self.files_edited_this_turn.iter() {
+                if !self.goal_files_edited.contains(f) {
+                    self.goal_files_edited.push(f.clone());
+                }
+            }
+
+            let summary = self.summarize_recent_turns_for_goal();
+
+            // Evaluator call. Pass our cancel_token so Esc fires immediately
+            // rather than waiting the full 30s evaluator timeout (CR C5).
+            let outcome = if let Some(ref evaluator) = self.goal_evaluator {
+                evaluator
+                    .evaluate(&self.goal.condition, &summary, &self.cancel_token)
+                    .await
+            } else {
+                goal_evaluator::EvalOutcome {
+                    result: goal::GoalResult::Error(anyhow::anyhow!(
+                        "no evaluator configured"
+                    )),
+                    usage: None,
+                }
+            };
+
+            // Accumulate evaluator cost so /goal status shows the full bill.
+            let (prompt_tok, completion_tok) = match &outcome.usage {
+                Some(u) => (Some(u.prompt_tokens), Some(u.completion_tokens)),
+                None => (None, None),
+            };
+            if let Some(u) = outcome.usage.as_ref() {
+                self.goal
+                    .add_tokens((u.prompt_tokens + u.completion_tokens) as u64);
+            }
+
+            // Audit trail: evaluator calls happen between main turns and
+            // therefore aren't covered by the per-turn datalog. Without this,
+            // users debugging "why did the goal stop / why does it keep
+            // looping" have no record of what the evaluator was asked or
+            // what it said (CR M4).
+            let (verdict_for_log, reason_for_log) = match &outcome.result {
+                goal::GoalResult::Met { reason } => ("yes", reason.as_str()),
+                goal::GoalResult::NotMet { reason } => ("no", reason.as_str()),
+                goal::GoalResult::Error(_) => ("error", "(see TUI for details)"),
+            };
+            self.datalog.log_evaluator_round(
+                self.goal.round + 1,
+                verdict_for_log,
+                reason_for_log,
+                prompt_tok,
+                completion_tok,
+            );
+
+            // Cancellation can fire during evaluate() — bail before injecting
+            // any continuation prompt (CR C5).
+            if self.cancel_token.is_cancelled() {
+                self.finalize_goal_cancelled();
+                return;
+            }
+
+            match outcome.result {
+                goal::GoalResult::Met { reason } => {
+                    self.goal.active = false;
+                    self.goal.last_eval_reason = Some(reason.clone());
+                    // TUI renders the "✓ Goal met: ..." banner from the
+                    // GoalUpdate event itself (active=false + reason).
+                    // Avoid sending an extra TextDelta — the alt-screen
+                    // markdown path drops it after a TurnSeparator and the
+                    // user sees nothing.
+                    self.emit_goal_update(false, Some(reason));
+                    break;
+                }
+                goal::GoalResult::NotMet { reason } => {
+                    self.goal.round += 1;
+                    self.goal.last_eval_reason = Some(reason.clone());
+                    self.goal.evaluator_consecutive_failures = 0;
+                    self.emit_goal_update(true, Some(reason.clone()));
+
+                    // Wrap condition in a fence so negative-keyword heuristics
+                    // ("stop"/"cancel"/"wrong") in the literal goal text don't
+                    // trip discipline injections meant for real user feedback
+                    // (CR M6).
+                    self.conversation.add_user_message(&format!(
+                        "Goal not yet met: {}\n\nContinue working toward this goal:\n```\n{}\n```",
+                        reason, self.goal.condition
+                    ));
+
+                    // Reset per-turn state for the next iteration.
+                    self.turn_count = 0;
+                    self.tool_call_count = 0;
+                    self.retry_count = 0;
+                    self.cancel_token = CancellationToken::new();
+                    self.files_edited_this_turn.clear();
+                    self.files_read_this_turn.clear();
+
+                    stop_reason = self.run_turn_loop().await;
+
+                    if matches!(stop_reason, TurnStopReason::Cancelled) {
+                        self.finalize_goal_cancelled();
+                        return;
+                    }
+                }
+                goal::GoalResult::Error(e) => {
+                    self.goal.evaluator_consecutive_failures += 1;
+                    let public = format!("{:#}", e);
+                    // Surface every failure so the user sees activity rather
+                    // than ~90s of silence before the final "unavailable"
+                    // message lands (CR M12).
+                    self.emit_goal_update(
+                        true,
+                        Some(format!(
+                            "evaluator failed ({}/{}): {}",
+                            self.goal.evaluator_consecutive_failures,
+                            goal::MAX_EVAL_FAILURES,
+                            public
+                        )),
+                    );
+                    if self.goal.is_evaluator_exhausted() {
+                        self.goal.active = false;
+                        // TUI renders "⚠ Goal stopped: evaluator unavailable …"
+                        // from GoalUpdate's last_reason — no extra TextDelta.
+                        self.emit_goal_update(
+                            false,
+                            Some(format!("evaluator unavailable: {public}")),
+                        );
+                        break;
+                    }
+                    // Backoff so a transient blip can't burn all 3 strikes
+                    // in milliseconds; cooperate with cancel during the wait.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        _ = self.cancel_token.cancelled() => {
+                            self.finalize_goal_cancelled();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // needs_planning replaced by task_classifier::TaskType::needs_planning()
@@ -1240,7 +1517,7 @@ impl AgentLoop {
     /// Multi-turn execution loop using TurnRunner.
     /// Each iteration calls TurnRunner.run() for one LLM turn, then applies
     /// discipline (reminders, step limits) and decides whether to continue.
-    async fn run_turn_loop(&mut self) {
+    async fn run_turn_loop(&mut self) -> TurnStopReason {
         loop {
             // Turn budget check BEFORE incrementing, so the reported
             // turn_count equals the number of turns actually executed
@@ -1249,7 +1526,7 @@ impl AgentLoop {
             // the CLI [done] line surfaces it as `stopped=turn_limit`.
             if self.check_turn_limit() {
                 self.finish_turn(TurnStopReason::TurnLimit);
-                return;
+                return self.last_stop_reason;
             }
             self.turn_count += 1;
 
@@ -1825,7 +2102,7 @@ impl AgentLoop {
                     }
 
                     self.finish_turn(TurnStopReason::Natural);
-                    return;
+                    return self.last_stop_reason;
                 }
                 TurnResult::UsedTools {
                     tool_count,
@@ -1876,7 +2153,7 @@ impl AgentLoop {
                                         // no extra "Summarize" user-turn — it just triggers
                                         // another round of re-narration. Let the turn stop naturally.
                                         self.finish_turn(TurnStopReason::Natural);
-                                        return;
+                                        return self.last_stop_reason;
                                     }
                                 }
                                 // Failed — fall through to serial execution
@@ -1896,7 +2173,7 @@ impl AgentLoop {
                     // Safety cap at 200 tool calls — only for runaway cost protection.
                     if self.check_step_limit() {
                         self.finish_turn(TurnStopReason::StepLimit);
-                        return;
+                        return self.last_stop_reason;
                     }
                     // Continue to next turn
                     self.phase = AgentPhase::Thinking;
@@ -1963,7 +2240,7 @@ impl AgentLoop {
                             .event_tx
                             .send(AgentEvent::Error(public_error_message(&e)));
                         self.finish_turn(TurnStopReason::Error);
-                        return;
+                        return self.last_stop_reason;
                     } else if self.retry_count < 3 {
                         self.retry_count += 1;
                         let wait = (self.retry_count as u64 * 3).min(15);
@@ -1980,15 +2257,23 @@ impl AgentLoop {
                             .event_tx
                             .send(AgentEvent::Error(public_error_message(&e)));
                         self.finish_turn(TurnStopReason::Error);
-                        return;
+                        return self.last_stop_reason;
                     }
                 }
                 TurnResult::Cancelled => {
+                    // Mark stop reason FIRST so callers (notably the /goal
+                    // wrapper) see Cancelled and break out of their auto-
+                    // continuation loop. Without this the field keeps the
+                    // previous turn's value (typically Natural), so the
+                    // wrapper thinks the turn ended cleanly and immediately
+                    // schedules another round — producing repeated
+                    // "(cancelled)" cycles when the user keeps hitting Esc.
+                    self.last_stop_reason = TurnStopReason::Cancelled;
                     // Check if turn was already cancelled by AgentCommand::Cancel
                     // (which removes the turn from tracker immediately)
                     if self.conversation.turn_tracker.active_turn().is_none() {
                         // Already handled by AgentCommand::Cancel - just return
-                        return;
+                        return self.last_stop_reason;
                     }
                     // Remove the current turn's messages before saving
                     self.conversation.cancel_current_turn();
@@ -2009,9 +2294,18 @@ impl AgentLoop {
                         .event_tx
                         .send(AgentEvent::PhaseChange(AgentPhase::Idle));
                     self.conversation.save(&Conversation::history_path());
-                    return;
+                    return self.last_stop_reason;
                 }
             }
+        }
+        // run_turn_loop's body is `loop { ... }` — every match arm returns,
+        // so the post-loop expression below is unreachable. Kept as an
+        // explicit `unreachable!` (rather than removed) so any future
+        // change that introduces a `break` will fail loudly instead of
+        // silently returning a stale `last_stop_reason`.
+        #[allow(unreachable_code)]
+        {
+            unreachable!("run_turn_loop must return via a match arm");
         }
     }
 
@@ -2278,7 +2572,111 @@ impl AgentLoop {
         summary
     }
 
+    /// Emit a `GoalUpdate` event reflecting current `GoalState`. Centralises
+    /// the 6-field event construction that was duplicated 6 times across the
+    /// agent loop — adding/renaming a field now only touches this one place
+    /// and reduces "I forgot one path" bugs.
+    fn emit_goal_update(&self, active: bool, last_reason: Option<String>) {
+        let _ = self.event_tx.send(AgentEvent::GoalUpdate {
+            active,
+            round: self.goal.round,
+            elapsed_secs: self.goal.elapsed_secs(),
+            condition: self.goal.condition.clone(),
+            last_reason,
+        });
+    }
+
+    /// Clear the goal AND notify the TUI in one shot. Used by Esc/Cancel
+    /// paths — historically these clears were silent and left the TUI
+    /// indicator running even after the agent had given up (see CR C3).
+    fn finalize_goal_cancelled(&mut self) {
+        if !self.goal.active && self.goal.condition.is_empty() {
+            return; // nothing to clear
+        }
+        self.goal.clear();
+        self.emit_goal_update(false, Some("cancelled by user".to_owned()));
+    }
+
+    /// Compact summary of recent agent work for the goal evaluator. Includes:
+    /// - last 5 assistant text responses (truncated to ~200 chars), and
+    /// - cumulative facts (file edits, last evaluator reason) so evaluators
+    ///   see *progress over time* rather than a single-frame snapshot. At
+    ///   round 20 the evaluator was previously blind to "we already passed
+    ///   12/14 tests" — the cumulative summary fixes that (see CR M13).
+    fn summarize_recent_turns_for_goal(&self) -> String {
+        use crate::conversation::message::{MessageContent, Role};
+
+        let mut sections: Vec<String> = Vec::new();
+
+        // Cumulative facts across all rounds of this /goal session. The
+        // agent's `files_edited_this_turn` is reset at every turn boundary,
+        // so we maintain a separate `goal_files_edited` set on the wrapper.
+        // Round-over-round visibility: at round 20 the evaluator can see
+        // "we already wrote tests/auth.rs in round 3" instead of just the
+        // current frame's chatter (see CR M13).
+        if !self.goal_files_edited.is_empty() {
+            let head: Vec<&String> = self.goal_files_edited.iter().take(20).collect();
+            let more = self.goal_files_edited.len().saturating_sub(head.len());
+            let extra = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
+            sections.push(format!(
+                "Files edited this goal: {}{}",
+                head.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                extra,
+            ));
+        }
+
+        if let Some(reason) = self.goal.last_eval_reason.as_deref() {
+            sections.push(format!(
+                "Previous round verdict (round {}): {}",
+                self.goal.round, reason
+            ));
+        }
+
+        // Recent assistant replies — newest first scan, drop empties, cap 5.
+        let mut recent: Vec<String> = Vec::new();
+        for msg in self.conversation.messages.iter().rev() {
+            if msg.role != Role::Assistant {
+                continue;
+            }
+            let text = match &msg.content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::AssistantWithToolCalls { text, .. } => {
+                    text.clone().unwrap_or_default()
+                }
+                _ => continue,
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            recent.push(text.chars().take(200).collect());
+            if recent.len() >= 5 {
+                break;
+            }
+        }
+        recent.reverse();
+        if !recent.is_empty() {
+            sections.push(format!(
+                "Recent assistant replies (oldest → newest):\n{}",
+                recent.join("\n---\n")
+            ));
+        }
+
+        if sections.is_empty() {
+            "(no agent work yet)".to_owned()
+        } else {
+            sections.join("\n\n")
+        }
+    }
+
     fn finish_turn(&mut self, stop_reason: TurnStopReason) {
+        self.last_stop_reason = stop_reason;
         // Error exits must not leave the user's message in the history
         // as an "orphan turn" (user message with no assistant reply).
         // The next send_message would then stack another user message

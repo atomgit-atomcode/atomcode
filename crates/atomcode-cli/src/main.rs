@@ -888,6 +888,7 @@ async fn run() -> Result<i32> {
             eprintln!("Warning: failed to load config ({}), using defaults", e);
             Config {
                 default_provider: String::new(),
+                evaluator_provider: None,
                 default_workdir: None,
                 providers: HashMap::new(),
                 datalog: Default::default(),
@@ -903,6 +904,7 @@ async fn run() -> Result<i32> {
         // No config yet — TUI Welcome screen will guide first-run setup
         Config {
             default_provider: String::new(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: HashMap::new(),
             datalog: Default::default(),
@@ -1512,6 +1514,9 @@ async fn run_headless(
                     eprintln!("[background files={}]", files_edited.join(","));
                 }
             }
+            AgentEvent::GoalUpdate { .. } => {
+                // Goal progress — headless mode ignores for now.
+            }
         }
     }
 
@@ -1812,6 +1817,7 @@ fn run_codingplan_core(
         Ok(c) => c,
         Err(_) => Config {
             default_provider: String::new(),
+            evaluator_provider: None,
             default_workdir: None,
             providers: std::collections::HashMap::new(),
             datalog: Default::default(),

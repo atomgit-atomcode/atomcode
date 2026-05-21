@@ -2835,7 +2835,9 @@ fn handle_approval_key(
         if armed {
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
         } else {
-            // First Ctrl+C: deny the tool and arm the exit confirmation
+            // First Ctrl+C: deny the current tool and arm the exit confirmation.
+            // The goal (if any) continues; Claude Code's /goal works the same way.
+            // A second Ctrl+C within the window triggers Shutdown above.
             app.exit_pending = Some(now);
             renderer.pop_approval_prompt();
             ctx.agent.cmd_tx.send(AgentCommand::DenyTool).ok();
@@ -2862,6 +2864,11 @@ fn handle_approval_key(
     // the tool result, creating visual noise.
     renderer.pop_approval_prompt();
     ctx.agent.cmd_tx.send(cmd).ok();
+    // Per Claude Code semantics, denying a tool does NOT stop the active
+    // /goal — the evaluator will see the user's refusal on the next round
+    // and either change tactics or judge the goal complete. The user can
+    // explicitly halt with `/goal clear` or by pressing Esc outside this
+    // approval prompt (inside the prompt, Esc denies the tool instead).
     app.state.on_approval_resolved();
     Ok(())
 }
@@ -3010,6 +3017,39 @@ pub(super) fn handle_upgrade_event(
     renderer.flush();
 }
 
+/// Flush a buffered turn-end separator. `as_goal_end=true` is used when the
+/// caller is about to render (or just rendered) a `✓ Goal met` / `⚠ Goal
+/// stopped` banner immediately above; in that case the separator drops the
+/// `↻ goal round N` / `✓ done · N rounds` prefix and shows just the stats —
+/// the verdict banner already told the user what happened, the line below
+/// only needs the cost & duration. No-op when no separator is pending.
+fn flush_pending_separator(state: &mut UiState, renderer: &mut dyn Renderer, as_goal_end: bool) {
+    let Some(ps) = state.pending_separator.take() else { return };
+    let dur = crate::render::fmt_dur(ps.duration);
+    let label = if as_goal_end {
+        format!(
+            "{} tools · {} · {} tokens",
+            ps.tool_call_count, dur, ps.total_tokens
+        )
+    } else if ps.was_goal_round {
+        format!(
+            "↻ goal round {} · {} tools · {} · {} tokens",
+            state.goal_round.max(1),
+            ps.tool_call_count,
+            dur,
+            ps.total_tokens
+        )
+    } else {
+        let done = state.next_done_label();
+        format!(
+            "✓ {} · {} rounds · {} tools · {} · {} tokens",
+            done, ps.turn_count, ps.tool_call_count, dur, ps.total_tokens
+        )
+    };
+    renderer.render(UiLine::TurnSeparator { label });
+    renderer.flush();
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -3021,6 +3061,38 @@ fn handle_agent_event(
     fixissue_buffer: &mut String,
     reasoning_buffer: &mut String,
 ) {
+    // Whitelist which events should flush a buffered turn-end separator
+    // BEFORE we handle them. The buffered separator was deferred at
+    // `TurnComplete` precisely so that — if the goal is about to end —
+    // the `✓ Goal met` banner can render ABOVE the line. So we only
+    // flush on events that signal "a new action is starting" (next round
+    // beginning, next tool call, next user-bound stream, etc.). Passive
+    // events like `PhaseChange(Idle)` / `TokenUsage` come right after
+    // `TurnComplete` but BEFORE the wrapper's `GoalUpdate(active=false)`;
+    // flushing on them would render the line above the banner — the bug
+    // this whitelist exists to prevent.
+    //
+    // `GoalUpdate(active=false)` is intentionally absent here — its
+    // handler renders the banner and then flushes the separator itself
+    // (with a stripped, stats-only label).
+    let should_flush_now = matches!(
+        &ev,
+        AgentEvent::TextDelta(_)
+            | AgentEvent::ReasoningDelta(_)
+            | AgentEvent::ToolCallStreaming { .. }
+            | AgentEvent::ToolCallStarted { .. }
+            | AgentEvent::ApprovalNeeded { .. }
+            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::Thinking)
+            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::CallingTool(_))
+            | AgentEvent::PhaseChange(atomcode_core::agent::AgentPhase::WaitingApproval)
+            | AgentEvent::GoalUpdate { active: true, .. }
+            | AgentEvent::TurnCancelled { .. }
+            | AgentEvent::Error(_)
+    );
+    if should_flush_now {
+        flush_pending_separator(state, renderer, /* as_goal_end */ false);
+    }
+
     match ev {
         AgentEvent::TextDelta(text) => {
             let visible = think.feed(&text);
@@ -3244,13 +3316,20 @@ fn handle_agent_event(
             );
             renderer.render(UiLine::AssistantLineBreak);
             pending_tools.clear();
-            let done = state.next_done_label();
-            let dur = crate::render::fmt_dur(duration);
-            let label = format!(
-                "✓ {} · {} rounds · {} tools · {} · {} tokens",
-                done, turn_count, tool_call_count, dur, total_tokens
-            );
-            renderer.render(UiLine::TurnSeparator { label });
+            // Buffer the separator stats instead of rendering immediately.
+            // The next event decides the rendering:
+            //   - if it's GoalUpdate(active=false) → the goal just ended, so
+            //     we want `✓ Goal met: ...` ABOVE a stats-only separator
+            //   - any other event → flush as the normal `↻ goal round N`
+            //     (mid-goal turn) or `✓ done · N rounds` (no goal active)
+            //     banner so per-turn UX is unchanged
+            state.pending_separator = Some(crate::state::PendingSeparator {
+                duration,
+                turn_count,
+                tool_call_count,
+                total_tokens,
+                was_goal_round: state.goal_condition.is_some(),
+            });
             renderer.flush();
             state.on_turn_complete();
 
@@ -3413,6 +3492,49 @@ fn handle_agent_event(
             }
         }
         AgentEvent::SubAgentProgress { .. } => {}
+        AgentEvent::GoalUpdate { active, round, condition, last_reason, .. } => {
+            if active {
+                state.goal_condition = Some(condition);
+                state.goal_round = round;
+                if state.goal_started_at.is_none() {
+                    state.goal_started_at = Some(std::time::Instant::now());
+                }
+            } else {
+                // Goal ended. Render order: banner (CommandOutput, bypasses
+                // markdown) ABOVE a stats-only separator. The user wanted
+                // the verdict to read top-down: assistant output → ✓ Goal
+                // met → quiet horizontal line with timing. The earlier
+                // TurnComplete buffered its stats into `pending_separator`
+                // precisely so we could re-render them in this stripped
+                // form here.
+                if state.goal_condition.is_some() {
+                    if let Some(reason) = last_reason.as_deref() {
+                        let banner = if reason.contains("cancelled") {
+                            // Cancel already gets its own UiLine via
+                            // TurnCancelled — skip to avoid double banner.
+                            None
+                        } else if reason.contains("evaluator unavailable")
+                            || reason.contains("cleared by user")
+                        {
+                            Some(format!("  ⚠ Goal stopped: {reason}\n"))
+                        } else {
+                            Some(format!("  ✓ Goal met: {reason}\n"))
+                        };
+                        if let Some(line) = banner {
+                            renderer.render(UiLine::CommandOutput(line));
+                            renderer.flush();
+                        }
+                    }
+                }
+                state.goal_condition = None;
+                state.goal_round = 0;
+                state.goal_started_at = None;
+                // Now flush the buffered separator as a stats-only line —
+                // the verdict above already conveys what happened, the
+                // separator just visually closes the turn.
+                flush_pending_separator(state, renderer, /* as_goal_end */ true);
+            }
+        }
         AgentEvent::BackgroundComplete {
             summary,
             files_edited,
@@ -3588,11 +3710,23 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         ctx.model_name.clone()
     };
+    let goal_indicator = if state.goal_condition.is_some() {
+        let round = state.goal_round;
+        let elapsed = state.goal_started_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let mins = elapsed / 60;
+        let secs = elapsed % 60;
+        Some(format!("◎ /goal (round {}, {}m {}s)", round, mins, secs))
+    } else {
+        None
+    };
     crate::render::StatusLine {
         model,
         cwd,
         total_tokens: state.total_tokens,
         hint,
+        goal_indicator,
     }
 }
 

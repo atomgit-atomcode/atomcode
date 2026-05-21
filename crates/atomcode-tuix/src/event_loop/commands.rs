@@ -872,6 +872,90 @@ pub(super) fn execute_slash_command(
                 }
             }
         }
+        "goal" => {
+            // Sub-commands aligned with Claude Code's /goal (v2.1.139+):
+            //   /goal <condition>             → set a new goal
+            //   /goal                         → show status (or hint if none)
+            //   /goal status                  → explicit status (same)
+            //   /goal clear|stop|off|reset|none|cancel  → halt the active goal
+            //   /goal help|?|-h|--help        → usage
+            //
+            // CC has no `--max-rounds` flag and no wall-clock cap. Users
+            // express budgets in the condition text instead (e.g. "or stop
+            // after 20 turns"). Esc / Ctrl+C also halts at any time.
+            let trimmed = arg.trim();
+            let (head, _rest) = trimmed
+                .split_once(char::is_whitespace)
+                .map(|(h, r)| (h, r.trim()))
+                .unwrap_or((trimmed, ""));
+            match head {
+                "" | "status" => {
+                    if let Some(ref cond) = state.goal_condition {
+                        let round = state.goal_round;
+                        let elapsed = state
+                            .goal_started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let mins = elapsed / 60;
+                        let secs = elapsed % 60;
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  ◎ Goal: {}\n  Round: {}\n  Elapsed: {}m {}s\n",
+                            cond, round, mins, secs
+                        )));
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            "  No active goal.\n  Usage: /goal <condition>   |   /goal help\n"
+                                .into(),
+                        ));
+                    }
+                    renderer.flush();
+                }
+                "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
+                    ctx.agent.cmd_tx.send(AgentCommand::ClearGoal).ok();
+                    state.goal_condition = None;
+                    state.goal_round = 0;
+                    state.goal_started_at = None;
+                    renderer.render(UiLine::CommandOutput("  Goal cleared.\n".into()));
+                    renderer.flush();
+                }
+                "help" | "?" | "-h" | "--help" => {
+                    renderer.render(UiLine::CommandOutput(
+                        "  /goal — autonomous multi-round work toward a stated condition.\n  \
+                         Usage:\n  \
+                         \u{20}\u{20}/goal <condition>     set a new goal; agent loops until the evaluator says met\n  \
+                         \u{20}\u{20}/goal                 show current goal status\n  \
+                         \u{20}\u{20}/goal status          same as above\n  \
+                         \u{20}\u{20}/goal clear           stop the active goal (aliases: stop, off, reset, none, cancel)\n  \
+                         \u{20}\u{20}/goal help            this help\n  \
+                         Notes:\n  \
+                         \u{20}\u{20}- A fast model evaluates each round; configure via [providers] +\n  \
+                         \u{20}\u{20}\u{20}\u{20}evaluator_provider in ~/.atomcode/config.toml.\n  \
+                         \u{20}\u{20}- No built-in round / time cap — express budgets in the condition\n  \
+                         \u{20}\u{20}\u{20}\u{20}text itself (e.g. \"or stop after 20 turns\"). CC's /goal works the same way.\n  \
+                         \u{20}\u{20}- Esc / Ctrl+C stops the goal at any time.\n".into(),
+                    ));
+                    renderer.flush();
+                }
+                _ => {
+                    // Treat the entire trimmed input as the condition.
+                    // (Empty input is unreachable here — `head` would be ""
+                    // and the `"" | "status"` arm above would have matched.)
+                    let condition = trimmed.to_owned();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SetGoal { condition: condition.clone() })
+                        .ok();
+                    state.goal_condition = Some(condition.clone());
+                    state.goal_round = 0;
+                    state.goal_started_at = Some(std::time::Instant::now());
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage(condition))
+                        .ok();
+                    state.on_submit();
+                }
+            }
+        }
         "plugin" => {
             handle_plugin(arg, ctx, renderer);
         }

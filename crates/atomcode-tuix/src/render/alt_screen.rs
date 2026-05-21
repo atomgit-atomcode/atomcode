@@ -854,13 +854,17 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         {
             let model = scrub_controls(&self.pending_status.model);
             let cwd = scrub_controls(&self.pending_status.cwd);
-            if model.is_empty() {
+            let mut base = if model.is_empty() {
                 format!("  {}", cwd)
             } else if cwd.is_empty() {
                 format!("  {}", model)
             } else {
                 format!("  {} \u{00b7} {}", model, cwd)
+            };
+            if let Some(ref gi) = self.pending_status.goal_indicator {
+                base.push_str(&format!(" \u{00b7} {}", scrub_controls(gi)));
             }
+            base
         } else {
             String::new()
         };
