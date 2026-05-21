@@ -11,6 +11,7 @@ pub mod glob;
 pub mod grep;
 pub mod list_dir;
 pub mod list_symbols;
+pub mod open_file;
 pub mod parallel_edit;
 pub mod read;
 pub mod read_symbol;

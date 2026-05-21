@@ -35,6 +35,7 @@ use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::glob::GlobTool;
 use atomcode_core::tool::grep::GrepTool;
 use atomcode_core::tool::list_dir::ListDirTool;
+use atomcode_core::tool::open_file::OpenFileTool;
 use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::search_replace::SearchReplaceTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
@@ -1171,6 +1172,9 @@ async fn run() -> Result<i32> {
     }
     if enabled("search_replace") {
         tool_registry.register_sync(Box::new(SearchReplaceTool));
+    }
+    if enabled("open_file") {
+        tool_registry.register_sync(Box::new(OpenFileTool));
     }
 
     // Determine if we're running in headless mode BEFORE loading MCP.

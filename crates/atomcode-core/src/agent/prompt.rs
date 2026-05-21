@@ -88,6 +88,31 @@ impl AgentLoop {
             model_display
         ));
 
+        // Opening files in the GUI is a user-visible side effect — a
+        // browser window popping up uninvited is jarring. Tell the
+        // model to ASK first rather than auto-open after every HTML
+        // write. The `open_file` tool handles cross-platform dispatch
+        // (open / xdg-open / start / wslview) and refuses cleanly on
+        // SSH / CI / headless so the model never has to second-guess
+        // whether a window will actually appear.
+        prompt.push_str(
+            "\n=== OPENING FILES (PREVIEW) ===\n\
+             After you create or edit an HTML / PDF / image / SVG file, DO NOT \
+             automatically open it in the user's browser or viewer. The file \
+             existing on disk is enough — opening a window is a visible side \
+             effect the user may not want.\n\
+             \n\
+             Ask first. Phrasing like \"Want me to open it for preview?\" is \
+             plenty. Only call the `open_file` tool when:\n\
+             - the user explicitly asks (\"preview it\", \"open in browser\", \
+             \"show me\"), OR\n\
+             - the user has just confirmed they want a preview after you asked.\n\
+             \n\
+             `open_file` handles the OS / WSL / SSH / CI dispatch itself — \
+             prefer it over raw `bash open`, `bash xdg-open`, etc. so the \
+             behaviour stays consistent and headless sessions refuse cleanly.\n",
+        );
+
         // Layered instructions (global / project / user)
         if !merged_instructions.is_empty() {
             prompt.push_str(&format!("\n{}\n", merged_instructions));
