@@ -144,6 +144,7 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
+          <tr><td><code>/setup</code></td><td>扫描当前项目并把 atomcode 内置的推荐 seed(skills / slash commands / hooks / MCP 模板)解压到 <code>~/.atomcode/</code> 与 <code>.atomcode/</code>,完成后自动 reload 让新装的 skills 立刻出现在 <code>/skills</code> 菜单里。会获取项目级锁防止并发执行,写完会落一份 <code>setup-state.json</code> 记录已安装项 + 当前 atomcode 版本;同一项目重跑会跳过已装的,需要重装请加 <code>--force</code>。第一次拿到一个项目跑一次最划算</td></tr>
           <tr><td><code>/skills</code></td><td>浏览当前已加载的 skills(项目级 + 用户级)。每个 skill 也会以独立的斜杠命令形式出现在补全菜单里,可以直接 <code>/&lt;skill-name&gt;</code> 触发</td></tr>
           <tr><td><code>/plugin marketplace</code></td><td>打开插件市场浏览器,从已注册的 marketplace 中挑选并安装</td></tr>
           <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>从指定 marketplace 安装插件</td></tr>

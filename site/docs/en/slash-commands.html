@@ -144,6 +144,7 @@
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
         <tbody>
+          <tr><td><code>/setup</code></td><td>Scan the current project and unpack atomcode's bundled recommended seeds (skills / slash commands / hooks / MCP templates) into <code>~/.atomcode/</code> and <code>.atomcode/</code>, then auto-reload so the new skills appear in <code>/skills</code> immediately. Takes a project-level lock to prevent concurrent runs and writes a <code>setup-state.json</code> recording what was installed plus the current atomcode version; subsequent runs in the same project are idempotent — pass <code>--force</code> to reinstall. Best run once on first checkout of a new project</td></tr>
           <tr><td><code>/skills</code></td><td>Browse loaded skills (project- and user-level). Each skill also appears as a standalone slash command in the menu — trigger with <code>/&lt;skill-name&gt;</code></td></tr>
           <tr><td><code>/plugin marketplace</code></td><td>Open the plugin marketplace browser to pick and install from a registered marketplace</td></tr>
           <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>Install a plugin from the named marketplace</td></tr>
