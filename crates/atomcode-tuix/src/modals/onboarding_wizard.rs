@@ -940,18 +940,6 @@ impl crate::modals::Modal for OnboardingWizard {
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
-            PureOutcome::ApplyQrLoginThenClose => {
-                // User pressed Enter after scanning the QR. Hand off
-                // to the existing /codingplan driver which detects the
-                // freshly-written auth.toml (from the broker exchange
-                // they completed in the browser) and claims the plan.
-                // If they actually pressed Enter without scanning,
-                // /codingplan will run its own login() and re-prompt
-                // — same behaviour as today's /codingplan slash cmd.
-                ctx.pending_run_codingplan = true;
-                renderer.clear_screen();
-                Ok(ModalAction::Close)
-            }
             PureOutcome::RetryQrLogin => {
                 // Re-run start_login() in-place so the user can recover
                 // from a transient network blip without restarting
@@ -1101,10 +1089,6 @@ pub(super) enum PureOutcome {
     /// Set the appropriate `pending_*` flag based on `setup_idx`, then
     /// close.
     ApplySetupThenClose,
-    /// User confirmed QR-fast-path login; flip
-    /// `pending_run_codingplan` and close so the existing
-    /// `/codingplan` driver picks up the freshly-authorised state.
-    ApplyQrLoginThenClose,
     /// QR step's `start_login()` previously errored; user pressed
     /// Enter to retry. Wrapper re-runs `start_login()` and resets
     /// the wizard's `qr_login_url` / `qr_login_error` fields, then
