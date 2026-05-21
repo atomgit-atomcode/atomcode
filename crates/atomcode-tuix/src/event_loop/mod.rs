@@ -5867,7 +5867,7 @@ fn handle_agent_event(
             for (c, detail) in calls.iter().zip(disambiguated.iter()) {
                 pending_tools.insert(
                     c.id.clone(),
-                    (display_tool_name_short(&c.name).clone(), detail.clone(), true),
+                    (display_tool_name_short(&c.name), detail.clone(), true),
                 );
             }
             state.active_tool_batches.insert(
