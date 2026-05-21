@@ -87,10 +87,6 @@ fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
             if o[0] == 100 && (o[1] & 0xc0) == 64 {
                 return reject("CGNAT 100.64/10");
             }
-            // Benchmarking 198.18.0.0/15
-            if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
-                return reject("benchmark 198.18/15");
-            }
             Ok(())
         }
         IpAddr::V6(v6) => {
