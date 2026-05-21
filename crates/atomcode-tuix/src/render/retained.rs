@@ -1954,9 +1954,24 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let provider_suffix = t(Msg::IdleHintProviderSuffix);
         rows.extend(self.build_wrapped_text_rows(
             &[
-                (&provider_cmd, accent_bold),
+                (&provider_cmd, accent_bold.clone()),
                 ("  ", hint_text.clone()),
-                (&provider_suffix, hint_text),
+                (&provider_suffix, hint_text.clone()),
+            ],
+            content_w,
+        ));
+
+        // Third hint — mirrors the /provider row layout, points at
+        // /codingplan as the free-token-quota path. Added in lockstep
+        // with the alt_screen.rs paint_welcome hint_c row so both
+        // renderer paths surface the same three slash-command hints.
+        let codingplan_cmd = t(Msg::IdleHintCodingplan);
+        let codingplan_suffix = t(Msg::IdleHintCodingplanSuffix);
+        rows.extend(self.build_wrapped_text_rows(
+            &[
+                (&codingplan_cmd, accent_bold),
+                ("  ", hint_text.clone()),
+                (&codingplan_suffix, hint_text),
             ],
             content_w,
         ));
