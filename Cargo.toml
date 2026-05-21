@@ -34,3 +34,6 @@ edition = "2021"
 license = "MIT"
 repository = "https://atomgit.com/atomgit_atomcode/atomcode"
 description = "Open-source terminal AI coding agent"
+
+[workspace.dependencies]
+anyhow = "1"
