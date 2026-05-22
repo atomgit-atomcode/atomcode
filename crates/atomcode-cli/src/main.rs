@@ -533,7 +533,7 @@ enum Commands {
         action: TelemetryAction,
     },
     /// Manage skill/command plugins (mirrors `claude plugin ...`).
-    /// Operates on `~/.atomcode/plugins/` shared with the TUI's `/plugin`
+    /// Operates on `$ATOMCODE_HOME/plugins/` shared with the TUI's `/plugin`
     /// slash command — anything installed via either path is visible to both.
     #[command(subcommand)]
     Plugin(PluginCli),
@@ -2038,7 +2038,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
 
 /// Dispatch `atomcode plugin ...` subcommands. Each branch calls the same
 /// `atomcode_core::plugin::*` API the TUI's `/plugin` slash command uses, so
-/// CLI installs and TUI installs share state under `~/.atomcode/plugins/`.
+    /// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
 fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
     use atomcode_core::plugin::{installer, marketplace};
     match sub {

@@ -32,7 +32,7 @@ impl ToolResultStore {
         Self { cache_dir }
     }
 
-    /// Default cache directory: `~/.atomcode/tool_cache/`
+    /// Default cache directory: `$ATOMCODE_HOME/tool_cache/`
     pub fn default_dir() -> PathBuf {
         crate::config::Config::config_dir().join("tool_cache")
     }

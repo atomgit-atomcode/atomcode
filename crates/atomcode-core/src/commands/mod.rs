@@ -3,7 +3,7 @@
 // Custom slash-command registry. Users define commands as `.md` files with
 // YAML-style frontmatter in two locations:
 //
-//   1. `~/.atomcode/commands/`          — global (apply to every project)
+//   1. `$ATOMCODE_HOME/commands/`          — global (apply to every project)
 //   2. `<project>/.atomcode/commands/`  — project-level (override global
 //                                          when names collide)
 //
@@ -54,7 +54,7 @@ pub struct CustomCommandRegistry {
 }
 
 impl CustomCommandRegistry {
-    /// Scan both global (`~/.atomcode/commands/`) and project-level
+    /// Scan both global (`$ATOMCODE_HOME/commands/`) and project-level
     /// (`<project_root>/.atomcode/commands/`) directories, merging results.
     /// Project entries win on name collision.
     pub fn load(project_root: &Path) -> Self {

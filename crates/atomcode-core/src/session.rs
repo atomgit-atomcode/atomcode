@@ -185,7 +185,7 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    /// Get the root directory for all sessions (~/.atomcode/sessions/).
+    /// Get the root directory for all sessions ($ATOMCODE_HOME/sessions/).
     pub fn sessions_root_dir() -> PathBuf {
         crate::config::Config::config_dir().join("sessions")
     }

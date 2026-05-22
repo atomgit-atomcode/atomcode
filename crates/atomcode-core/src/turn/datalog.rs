@@ -3,8 +3,8 @@
 //! projects don't pile their logs into a single bucket.
 //!
 //! Default layout:
-//!   ~/.atomcode/datalog/<project-slug>/YYYY-MM-DD_HH-MM-SS.md
-//!   ~/.atomcode/datalog/<project-slug>/llm/YYYY-MM-DD_HH-MM-SS_sss.json
+//!   $ATOMCODE_HOME/datalog/<project-slug>/YYYY-MM-DD_HH-MM-SS.md
+//!   $ATOMCODE_HOME/datalog/<project-slug>/llm/YYYY-MM-DD_HH-MM-SS_sss.json
 //!
 //! Project slug = sanitized cwd basename + 8-char sha256 prefix of the canonical
 //! cwd path. The hash suffix prevents collisions when two unrelated projects
@@ -13,11 +13,11 @@
 //! Content mirrors what the user sees on screen.
 //! Every write operation flushes immediately so logs survive crashes.
 //!
-//! Configured via `[datalog]` in `~/.atomcode/config.toml`:
+//! Configured via `[datalog]` in `$ATOMCODE_HOME/config.toml`:
 //! - `enabled = false`     — disables logging entirely (writer becomes a no-op)
 //! - `dir = "<path>"`      — root directory; project slug is always appended
 //!   underneath. Accepts absolute, `~/…`, or relative paths. Default
-//!   `"~/.atomcode/datalog"`.
+//!   `"$ATOMCODE_HOME/datalog"`.
 
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ pub struct DatalogWriter {
     /// resolve `configured_dir` when it's relative.
     base_dir: PathBuf,
     /// Raw user-configured root (pre-resolution). `None` → default to
-    /// `~/.atomcode/datalog`. Otherwise absolute, `~/…`, or relative. The
+    /// `$ATOMCODE_HOME/datalog`. Otherwise absolute, `~/…`, or relative. The
     /// project slug is always appended underneath whichever value resolves.
     configured_dir: Option<String>,
     /// When false, all methods are no-ops and no files are created.
@@ -100,7 +100,7 @@ impl DatalogWriter {
     /// unit tests.
     ///
     /// The result is always `<root>/<project-slug>` so multiple projects don't
-    /// collide. `<root>` is `~/.atomcode/datalog` by default, or whatever the
+    /// collide. `<root>` is `$ATOMCODE_HOME/datalog` by default, or whatever the
     /// user configured (absolute / `~/…` / relative-to-cwd).
     pub fn resolve_log_dir(base_dir: &Path, configured: Option<&str>) -> PathBuf {
         let root = match configured {
@@ -123,7 +123,7 @@ impl DatalogWriter {
         root.join(project_slug(base_dir))
     }
 
-    /// `~/.atomcode/datalog` — the built-in root used when `[datalog].dir`
+    /// `$ATOMCODE_HOME/datalog` — the built-in root used when `[datalog].dir`
     /// is unset. Respects `ATOMCODE_HOME` environment variable if set.
     /// Falls back to a CWD-relative path on the (vanishingly rare)
     /// platforms where `$HOME` can't be resolved.
@@ -619,7 +619,7 @@ mod tests {
 
     fn make_log(dir: &Path) -> DatalogWriter {
         // Pin `dir` explicitly so tests write under the temp root, not the
-        // real `~/.atomcode/datalog/` (the new default). Slug subdir still
+        // real `$ATOMCODE_HOME/datalog/` (the new default). Slug subdir still
         // gets appended underneath — file_path lookups in the test go via
         // `log.file_path`, so the exact slugged path is opaque to callers.
         let cfg = DatalogConfig {
@@ -636,10 +636,9 @@ mod tests {
     fn resolve_log_dir_default_lands_under_home() {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, None);
-        let expected_root = crate::tool::real_home_dir()
-            .unwrap()
-            .join(".atomcode")
-            .join("datalog");
+        // default_root() uses Config::config_dir().join("datalog"),
+        // which resolves ATOMCODE_HOME when set, else $HOME/.atomcode.
+        let expected_root = crate::config::Config::config_dir().join("datalog");
         assert!(
             p.starts_with(&expected_root),
             "{:?} should start with {:?}",
@@ -684,6 +683,9 @@ mod tests {
     fn resolve_log_dir_tilde_expands_home() {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("~/.atomcode/logs"));
+        // `~/.atomcode/logs` expands via real_home_dir, which always resolves
+        // to the system home (not ATOMCODE_HOME) — this is the same as the
+        // `~/` expansion in the datalog dir config.
         let expected_root = crate::tool::real_home_dir().unwrap().join(".atomcode/logs");
         assert!(p.starts_with(&expected_root));
         assert!(p
@@ -745,7 +747,7 @@ mod tests {
     #[test]
     fn disabled_writer_never_creates_files() {
         // Point `dir` at a temp subdir so this test doesn't depend on (or
-        // pollute) the real `~/.atomcode/datalog/`. With enabled=false the
+        // pollute) the real `$ATOMCODE_HOME/datalog/`. With enabled=false the
         // writer should still create nothing under that root.
         let dir = std::env::temp_dir().join("atomcode_test_datalog_disabled");
         let _ = std::fs::remove_dir_all(&dir);

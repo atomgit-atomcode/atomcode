@@ -540,7 +540,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServersHeader =>
             "  MCP Servers:\n".into(),
         Msg::McpReloadFailed { error } =>
-            format!("mcp reload failed: failed to load .mcp.json / ~/.atomcode/mcp.json: {:#}", error).into(),
+            format!("mcp reload failed: failed to load .mcp.json / $ATOMCODE_HOME/mcp.json: {:#}", error).into(),
         // /mcp login / logout
         Msg::McpOAuthLoginUsage =>
             "  Usage: /mcp login <server>\n  Example: /mcp login github\n".into(),
@@ -695,7 +695,7 @@ Msg::CmdDescSetup =>
         Msg::CmdDescProvider => "Manage providers (add / edit / delete)".into(),
         Msg::CmdDescStatus => "Show session status".into(),
         Msg::CmdDescConfig => "Show config path".into(),
-        Msg::CmdDescReload => "Reload ~/.atomcode/config.toml from disk".into(),
+        Msg::CmdDescReload => "Reload $ATOMCODE_HOME/config.toml from disk".into(),
         Msg::CmdDescCd => "Change working directory".into(),
 Msg::CmdDescInit => "Generate .atomcode.md project instructions from the working directory".into(),
 Msg::CmdDescBg => "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>".into(),

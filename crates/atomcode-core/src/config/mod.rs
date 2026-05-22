@@ -86,7 +86,7 @@ pub struct Config {
     pub default_workdir: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
     /// Per-turn datalog settings. Missing from older configs → defaults to
-    /// enabled=true, dir="~/.atomcode/datalog" (project slug appended underneath).
+    /// enabled=true, dir="$ATOMCODE_HOME/datalog" (project slug appended underneath).
     ///
     /// `skip_serializing` intentionally suppresses serde's automatic output;
     /// `save()` writes this section manually with explanatory comments and
@@ -158,7 +158,7 @@ pub struct Config {
 pub struct PluginConfig {
     /// First-startup behaviour: when true (default), atomcode runs a
     /// one-time `git clone` of the default `atomcode-skills`
-    /// marketplace into `~/.atomcode/plugins/marketplaces/`. A marker
+    /// marketplace into `$ATOMCODE_HOME/plugins/marketplaces/`. A marker
     /// file (`~/.atomcode/.plugin_bootstrap_v1`) is touched after the
     /// first attempt — set or unset — so the install fires exactly
     /// once per user. A subsequent `/plugin uninstall` is respected;

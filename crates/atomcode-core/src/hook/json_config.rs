@@ -1,7 +1,7 @@
 //! Hooks JSON configuration loading — mirrors the MCP config pattern.
 //!
 //! Hooks are configured in JSON files:
-//! - `~/.atomcode/hooks.json`       — global hooks
+//! - `$ATOMCODE_HOME/hooks.json` — global hooks
 //! - `<project>/.hooks.json`        — project-level hooks (override global by name)
 //!
 //! Project hooks override global hooks with the same name. Hooks with
@@ -39,15 +39,13 @@ fn default_timeout() -> u64 {
     10_000
 }
 
-/// Load and merge hooks from global (`~/.atomcode/hooks.json`) and project
+/// Load and merge hooks from global (`$ATOMCODE_HOME/hooks.json`) and project
 /// (`.hooks.json`) config files.
 ///
 /// Project hooks override global hooks with the same name. Disabled hooks
 /// are filtered out.
 pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
-    let global_path = dirs::home_dir()
-        .map(|h| h.join(".atomcode/hooks.json"))
-        .unwrap_or_default();
+    let global_path = crate::config::Config::config_dir().join("hooks.json");
     let project_path = project_dir.join(".hooks.json");
 
     let mut merged: BTreeMap<String, HookConfig> = BTreeMap::new();
