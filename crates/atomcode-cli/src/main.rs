@@ -99,6 +99,51 @@ fn truncate_log_line(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Append a streaming reasoning/thinking `chunk` to `out`, maintaining a
+/// single-line `[thinking] ...` representation across many tiny deltas.
+///
+/// `open` tracks whether a `[thinking]` line is currently open (i.e. has a
+/// prefix written but no trailing newline). The first chunk gets a fresh
+/// `[thinking] ` prefix; subsequent chunks append directly. Embedded newlines
+/// inside a chunk are preserved, with each non-empty new line getting its own
+/// `[thinking] ` prefix so multi-line thinking stays readable.
+///
+/// Pulled out of `run_headless` so it can be unit-tested without spinning up
+/// the agent loop. Regression target: the old per-chunk `eprintln!` produced
+/// "one word per line" output for streaming reasoning models.
+fn format_thinking_chunk(out: &mut String, open: &mut bool, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    if !*open {
+        out.push_str("[thinking] ");
+        *open = true;
+    }
+    let mut parts = chunk.split('\n');
+    if let Some(first) = parts.next() {
+        out.push_str(first);
+    }
+    for part in parts {
+        out.push('\n');
+        *open = false;
+        if !part.is_empty() {
+            out.push_str("[thinking] ");
+            out.push_str(part);
+            *open = true;
+        }
+    }
+}
+
+/// Close any in-flight `[thinking]` line by writing a newline if one is open.
+/// Mirrors the inline `close_thinking_line` used inside `run_headless`, but
+/// writes to a buffer so it can be unit-tested.
+fn close_thinking_chunk(out: &mut String, open: &mut bool) {
+    if *open {
+        out.push('\n');
+        *open = false;
+    }
+}
+
 /// True if `--dev` is present in argv. Used to skip every auto-update
 /// path (pre-parse `apply_pending_upgrade`, sync stage+apply, and the
 /// post-parse detached stager). Scanned manually because two of those
@@ -1482,14 +1527,32 @@ async fn run_headless(
     let mut exit_code: i32 = 0;
     let mut had_denial = false;
     let mut last_text_ended_with_newline = true;
+    // Tracks whether we're inside a streaming `[thinking]` line. When true, the
+    // next non-reasoning event must close the line with a `\n` so subsequent
+    // log lines don't glue onto the tail of the thinking text.
+    let mut thinking_line_open = false;
     // When `capture` is set, we also buffer every TextDelta the agent
     // emits so the caller (e.g. the fixissue workflow) can post the
     // full assistant output back to AtomGit as an issue comment.
     let mut captured: Option<String> = if capture { Some(String::new()) } else { None };
 
+    // Helper: close any in-flight `[thinking]` line before emitting a new log
+    // line on stderr. Avoids `[thinking] ...[tool→ ...]` mashups in verbose.
+    // Thin wrapper over the unit-tested `close_thinking_chunk` that flushes
+    // directly to stderr.
+    fn close_thinking_line(open: &mut bool) {
+        let mut buf = String::new();
+        close_thinking_chunk(&mut buf, open);
+        if !buf.is_empty() {
+            eprint!("{}", buf);
+            let _ = io::stderr().flush();
+        }
+    }
+
     while let Some(event) = event_rx.recv().await {
         match event {
             AgentEvent::TextDelta(text) => {
+                close_thinking_line(&mut thinking_line_open);
                 if !text.is_empty() {
                     last_text_ended_with_newline = text.ends_with('\n');
                 }
@@ -1500,13 +1563,22 @@ async fn run_headless(
                 io::stdout().flush()?;
             }
             AgentEvent::ReasoningDelta(text) => {
-                // In CLI verbose mode, show reasoning/thinking content
-                if verbose {
-                    eprintln!("[thinking] {}", text);
+                // In CLI verbose mode, show reasoning/thinking content.
+                // Reasoning arrives as many tiny streaming chunks (often a
+                // single token). The old implementation used `eprintln!` per
+                // chunk, producing "one word per line" output. We now stream
+                // chunks onto a single `[thinking] ...` line via the
+                // unit-tested `format_thinking_chunk` helper.
+                if verbose && !text.is_empty() {
+                    let mut buf = String::new();
+                    format_thinking_chunk(&mut buf, &mut thinking_line_open, &text);
+                    eprint!("{}", buf);
+                    let _ = io::stderr().flush();
                 }
             }
             AgentEvent::ToolCallStreaming { name, hint } => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     let detail = if hint.is_empty() {
                         String::new()
                     } else {
@@ -1521,13 +1593,16 @@ async fn run_headless(
                 arguments,
             } => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     let args = truncate_log_line(&arguments, 200);
                     eprintln!("[tool→ {} args={}]", name, args);
                 }
             }
             AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     eprint!("{}", chunk);
+                    let _ = io::stderr().flush();
                 }
             }
             AgentEvent::ToolCallResult {
@@ -1538,6 +1613,7 @@ async fn run_headless(
                 duration,
             } => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     let status = if success { "OK" } else { "FAILED" };
                     let dur_ms = duration.as_millis();
                     let trimmed = output.trim_end();
@@ -1552,6 +1628,7 @@ async fn run_headless(
             AgentEvent::ApprovalNeeded {
                 tool_name, reason, ..
             } => {
+                close_thinking_line(&mut thinking_line_open);
                 if tool_name == "bash" {
                     // -p / headless cannot prompt; user opts in by using non-interactive mode.
                     eprintln!("[headless] auto-approved bash: {}", reason);
@@ -1565,6 +1642,7 @@ async fn run_headless(
             }
             AgentEvent::TokenUsage(usage) => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     eprintln!(
                         "[tokens] prompt={} completion={}",
                         usage.prompt_tokens, usage.completion_tokens
@@ -1582,6 +1660,7 @@ async fn run_headless(
                 stop_reason,
                 messages: _,
             } => {
+                close_thinking_line(&mut thinking_line_open);
                 atomcode_core::notify::notify_turn_finished(
                     &notifications,
                     atomcode_core::notify::TurnNotification {
@@ -1621,6 +1700,7 @@ async fn run_headless(
                 break;
             }
             AgentEvent::TurnCancelled { .. } => {
+                close_thinking_line(&mut thinking_line_open);
                 // Always shown — user needs to know cancellation happened.
                 eprintln!("[cancelled]");
                 exit_code = 130;
@@ -1628,6 +1708,7 @@ async fn run_headless(
                 break;
             }
             AgentEvent::Error { error, messages: _ } => {
+                close_thinking_line(&mut thinking_line_open);
                 // Always shown — errors are not noise.
                 eprintln!("[error] {}", error);
                 exit_code = 1;
@@ -2271,7 +2352,9 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_working_dir, truncate_log_line};
+    use super::{
+        close_thinking_chunk, format_thinking_chunk, resolve_working_dir, truncate_log_line,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -2351,5 +2434,110 @@ mod tests {
             read_back, content,
             "--prompt-file must preserve trailing newline (unlike bash $(...))"
         );
+    }
+
+    // ---- format_thinking_chunk / close_thinking_chunk ----
+    //
+    // Regression suite for the "one word per line" bug in headless verbose
+    // output. The old `eprintln!("[thinking] {}", text)` printed a fresh
+    // prefix + trailing newline for every streaming chunk, so a streaming
+    // reasoning model produced output like:
+    //
+    //   [thinking] are
+    //   [thinking] already
+    //   [thinking] configured
+    //
+    // The new formatter must keep a single line open across many tiny
+    // chunks until something else (text, tool call, turn complete, etc.)
+    // explicitly closes it.
+
+    /// Streaming many single-token chunks must produce ONE line, not N.
+    #[test]
+    fn thinking_chunks_stream_onto_single_line() {
+        let mut buf = String::new();
+        let mut open = false;
+        for tok in ["are", " already", " configured", " and", " what"] {
+            format_thinking_chunk(&mut buf, &mut open, tok);
+        }
+        assert_eq!(buf, "[thinking] are already configured and what");
+        assert!(open, "line should remain open until something closes it");
+    }
+
+    /// A non-reasoning event must close the line with a single newline.
+    #[test]
+    fn close_appends_newline_and_clears_open() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "hello");
+        close_thinking_chunk(&mut buf, &mut open);
+        assert_eq!(buf, "[thinking] hello\n");
+        assert!(!open);
+        // Closing again is a no-op (idempotent).
+        close_thinking_chunk(&mut buf, &mut open);
+        assert_eq!(buf, "[thinking] hello\n");
+    }
+
+    /// Embedded newlines inside a chunk must produce a re-prefixed next line.
+    #[test]
+    fn embedded_newline_reprefixes_next_line() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "first line\nsecond line");
+        assert_eq!(buf, "[thinking] first line\n[thinking] second line");
+        assert!(open);
+    }
+
+    /// A chunk ending with `\n` closes the line; the next chunk must
+    /// re-introduce the `[thinking] ` prefix.
+    #[test]
+    fn trailing_newline_closes_and_next_chunk_reprefixes() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "para1\n");
+        assert!(!open, "trailing newline should close the line");
+        format_thinking_chunk(&mut buf, &mut open, "para2");
+        assert_eq!(buf, "[thinking] para1\n[thinking] para2");
+        assert!(open);
+    }
+
+    /// Empty chunks must be skipped without emitting a stray prefix.
+    #[test]
+    fn empty_chunk_is_noop() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "");
+        assert_eq!(buf, "");
+        assert!(!open);
+        // Still no prefix after empty input.
+        format_thinking_chunk(&mut buf, &mut open, "x");
+        assert_eq!(buf, "[thinking] x");
+    }
+
+    /// CJK content (common in Chinese reasoning models) must not break the
+    /// single-line invariant — every char-level chunk just appends.
+    #[test]
+    fn cjk_chunks_stream_correctly() {
+        let mut buf = String::new();
+        let mut open = false;
+        for tok in ["先", "看", "看", "你", "当前的", "环境"] {
+            format_thinking_chunk(&mut buf, &mut open, tok);
+        }
+        assert_eq!(buf, "[thinking] 先看看你当前的环境");
+    }
+
+    /// Simulated end-to-end event sequence: thinking deltas, then a tool
+    /// call. The tool call must appear on its OWN line, not mashed onto
+    /// the tail of the thinking text.
+    #[test]
+    fn thinking_followed_by_tool_call_is_separated() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "I should");
+        format_thinking_chunk(&mut buf, &mut open, " check");
+        format_thinking_chunk(&mut buf, &mut open, " the file");
+        // Now a non-reasoning event arrives → close, then emit it.
+        close_thinking_chunk(&mut buf, &mut open);
+        buf.push_str("[tool→ read_file]\n");
+        assert_eq!(buf, "[thinking] I should check the file\n[tool→ read_file]\n");
     }
 }
