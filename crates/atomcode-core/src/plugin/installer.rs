@@ -368,7 +368,7 @@ mod tests {
     use std::process::Command;
 
     fn make_repo(name: &str, manifest: Option<&str>) -> PathBuf {
-        let work = tempfile::tempdir().unwrap().into_path();
+        let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join(name);
         std::fs::create_dir_all(&repo).unwrap();
         Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
@@ -488,7 +488,7 @@ mod tests {
     #[serial_test::serial]
     fn install_external_local_copies_tree() {
         let _home = isolated_home();
-        let local_src = tempfile::tempdir().unwrap().into_path();
+        let local_src = tempfile::tempdir().unwrap().keep();
         std::fs::create_dir_all(local_src.join("skills/x")).unwrap();
         std::fs::write(local_src.join("skills/x/SKILL.md"), "body").unwrap();
 
@@ -512,7 +512,7 @@ mod tests {
     fn install_external_url_dedups_with_marketplace() {
         let _home = isolated_home();
         // Single repo whose manifest references its own clone URL.
-        let work = tempfile::tempdir().unwrap().into_path();
+        let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join("self_ref");
         std::fs::create_dir_all(&repo).unwrap();
         Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
