@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 
-/// Parsed coordinates of an AtomGit issue URL.
+/// Parsed coordinates of an AtomGit/GitCode issue URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueRef {
     pub owner: String,
@@ -157,7 +157,8 @@ pub fn detect_cwd_atomgit_repo(cwd: &std::path::Path) -> std::io::Result<Option<
 }
 
 impl IssueRef {
-    /// Parse `https://atomgit.com/{owner}/{repo}/issues/{number}`.
+    /// Parse `https://atomgit.com/{owner}/{repo}/issues/{number}` or the
+    /// equivalent `gitcode.com` mirror URL.
     /// Trailing slash and `?query`/`#fragment` are tolerated.
     pub fn parse(url: &str) -> Result<Self> {
         let trimmed = url.trim();
@@ -176,9 +177,10 @@ impl IssueRef {
         let host = parts
             .next()
             .ok_or_else(|| anyhow!("missing host in issue URL"))?;
-        if !host.eq_ignore_ascii_case("atomgit.com") {
+        let host = strip_port(host);
+        if !is_atomgit_host(host) {
             return Err(anyhow!(
-                "only atomgit.com issue URLs are supported (got host {})",
+                "only atomgit.com/gitcode.com issue URLs are supported (got host {})",
                 host
             ));
         }
@@ -237,6 +239,23 @@ mod tests {
     fn parses_with_query_and_fragment() {
         let r = IssueRef::parse("https://atomgit.com/a/b/issues/7?x=1#comment").unwrap();
         assert_eq!(r.number, 7);
+    }
+
+    #[test]
+    fn parses_gitcode_mirror_issue_url() {
+        let r = IssueRef::parse("https://gitcode.com/atomgit_atomcode/atomcode/issues/340")
+            .unwrap();
+        assert_eq!(r.owner, "atomgit_atomcode");
+        assert_eq!(r.repo, "atomcode");
+        assert_eq!(r.number, 340);
+    }
+
+    #[test]
+    fn parses_issue_url_with_host_port() {
+        let r = IssueRef::parse("https://gitcode.com:443/a/b/issues/8").unwrap();
+        assert_eq!(r.owner, "a");
+        assert_eq!(r.repo, "b");
+        assert_eq!(r.number, 8);
     }
 
     #[test]
