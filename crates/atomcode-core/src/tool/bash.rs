@@ -2566,7 +2566,7 @@ mod sanitize_tests {
         // mirrors --force / -f so a force push to main / release/*
         // still surfaces a prompt.
         assert!(
-            check_destructive_command("git push --force-with-lease origin release/v4.23.0")
+            check_destructive_command("git push --force-with-lease origin release/v4.23.1")
                 .is_some()
         );
     }
@@ -2639,7 +2639,7 @@ mod sanitize_tests {
         assert!(check_destructive_command("git log --oneline -10").is_none());
         assert!(check_destructive_command("git add crates/atomcode-core/src/tool/bash.rs").is_none());
         assert!(check_destructive_command("git commit -m 'fix(bash): tighten git destructive patterns'").is_none());
-        assert!(check_destructive_command("git push origin release/v4.23.0").is_none());
+        assert!(check_destructive_command("git push origin release/v4.23.1").is_none());
         assert!(check_destructive_command("git pull --rebase origin main").is_none());
         assert!(check_destructive_command("git checkout main").is_none());
         assert!(check_destructive_command("git switch main").is_none());
