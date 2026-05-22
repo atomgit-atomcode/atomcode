@@ -105,30 +105,18 @@ pub struct RollbackSummary {
 /// caller must surface a clean "unsupported platform" message rather
 /// than fall through to a 404 download.
 pub fn detect_target() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            Some("darwin-arm64")
-        } else if cfg!(target_arch = "x86_64") {
-            Some("darwin-x64")
-        } else {
-            None
-        }
-    } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "x86_64") {
-            Some("linux-x64")
-        } else {
-            None
-        }
-    } else if cfg!(target_os = "windows") {
-        if cfg!(target_arch = "x86_64") {
-            Some("windows-x64")
-        } else if cfg!(target_arch = "aarch64") {
-            Some("windows-arm64")
-        } else {
-            None
-        }
-    } else {
-        None
+    target_tag(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn target_tag(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("windows", "x86_64") => Some("windows-x64"),
+        ("windows", "aarch64") => Some("windows-arm64"),
+        _ => None,
     }
 }
 
@@ -1037,6 +1025,17 @@ mod tests {
                 assert!(t.is_some(), "expected target tag on this host");
             }
         }
+    }
+
+    #[test]
+    fn target_tag_matches_release_manifest_targets() {
+        assert_eq!(target_tag("macos", "aarch64"), Some("darwin-arm64"));
+        assert_eq!(target_tag("macos", "x86_64"), Some("darwin-x64"));
+        assert_eq!(target_tag("linux", "x86_64"), Some("linux-x64"));
+        assert_eq!(target_tag("linux", "aarch64"), Some("linux-arm64"));
+        assert_eq!(target_tag("windows", "x86_64"), Some("windows-x64"));
+        assert_eq!(target_tag("windows", "aarch64"), Some("windows-arm64"));
+        assert_eq!(target_tag("linux", "arm"), None);
     }
 
     #[test]
