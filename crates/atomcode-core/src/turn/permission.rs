@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 /// Different implementations support interactive (main agent) and automatic (subagent) modes.
 #[async_trait]
 pub trait PermissionDecider: Send + Sync {
-    async fn decide(&self, call: &ToolCall, reason: &str) -> PermissionDecision;
+    async fn decide(&self, call: &ToolCall, approval: &ApprovalRequirement) -> PermissionDecision;
 
     /// Quick synchronous check: will this call be auto-approved without
     /// user interaction?  Used by TurnRunner to skip the
@@ -47,7 +47,7 @@ impl AutoPermissionDecider {
 
 #[async_trait]
 impl PermissionDecider for AutoPermissionDecider {
-    async fn decide(&self, call: &ToolCall, _reason: &str) -> PermissionDecision {
+    async fn decide(&self, call: &ToolCall, _approval: &ApprovalRequirement) -> PermissionDecision {
         match self.mode {
             AutoPermissionMode::BypassAll => PermissionDecision::Allow,
             AutoPermissionMode::AcceptEdits => {
@@ -108,22 +108,30 @@ impl InteractivePermissionDecider {
 
 #[async_trait]
 impl PermissionDecider for InteractivePermissionDecider {
-    async fn decide(&self, call: &ToolCall, reason: &str) -> PermissionDecision {
+    async fn decide(&self, call: &ToolCall, approval: &ApprovalRequirement) -> PermissionDecision {
         // Check PermissionStore first — session grants and overrides
-        // take effect without prompting the user again.
+        // take effect without prompting the user again. The full
+        // `ApprovalRequirement` (including `RequireApprovalAlways`) is
+        // passed through so the store can honor variants that must
+        // always prompt regardless of prior session grants.
         if let Ok(store) = self.permission_store.read() {
-            let approval = crate::tool::ApprovalRequirement::RequireApproval(reason.to_string());
-            match store.check(&call.name, &approval) {
+            match store.check(&call.name, approval) {
                 PermissionDecision::Allow => return PermissionDecision::Allow,
                 PermissionDecision::Deny => return PermissionDecision::Deny,
                 PermissionDecision::Ask(_) => {} // fall through to interactive
             }
         }
 
+        let reason = match approval {
+            ApprovalRequirement::RequireApproval(r)
+            | ApprovalRequirement::RequireApprovalAlways(r) => r.clone(),
+            ApprovalRequirement::AutoApprove => return PermissionDecision::Allow,
+        };
+
         // Not in store — send interactive approval request
         let request = ApprovalRequest {
             call: call.clone(),
-            reason: reason.to_string(),
+            reason,
         };
         if self.request_tx.send(request).is_err() {
             return PermissionDecision::Deny;
@@ -134,22 +142,14 @@ impl PermissionDecider for InteractivePermissionDecider {
 
     fn will_auto_approve(&self, call: &ToolCall, approval: &ApprovalRequirement) -> bool {
         // Mirror the PermissionStore check that `decide()` performs
-        // before falling through to the interactive channel.
-        // IMPORTANT: `decide()` constructs a fresh `RequireApproval` from
-        // the reason string (ignoring RequireApprovalAlways) before
-        // calling `store.check()`.  We must use the same variant here so
-        // that `will_auto_approve` and `decide()` stay consistent.
-        let check_approval = match approval {
-            ApprovalRequirement::RequireApproval(reason)
-            | ApprovalRequirement::RequireApprovalAlways(reason) => {
-                ApprovalRequirement::RequireApproval(reason.clone())
-            }
-            // AutoApprove tools never reach this code path (the if-let
-            // in execute_single_tool only matches RequireApproval*).
-            ApprovalRequirement::AutoApprove => return true,
-        };
+        // before falling through to the interactive channel. The full
+        // variant is forwarded so `RequireApprovalAlways` continues to
+        // prompt even when a session grant exists for the tool.
+        if matches!(approval, ApprovalRequirement::AutoApprove) {
+            return true;
+        }
         if let Ok(store) = self.permission_store.read() {
-            matches!(store.check(&call.name, &check_approval), PermissionDecision::Allow)
+            matches!(store.check(&call.name, approval), PermissionDecision::Allow)
         } else {
             false
         }
@@ -172,7 +172,7 @@ mod tests {
     async fn test_auto_bypass_allows_all() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::BypassAll);
         assert!(matches!(
-            d.decide(&make_call("bash"), "dangerous").await,
+            d.decide(&make_call("bash"), &ApprovalRequirement::RequireApproval("dangerous".into())).await,
             PermissionDecision::Allow
         ));
     }
@@ -181,7 +181,7 @@ mod tests {
     async fn test_auto_deny_denies_all() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::DenyAll);
         assert!(matches!(
-            d.decide(&make_call("bash"), "dangerous").await,
+            d.decide(&make_call("bash"), &ApprovalRequirement::RequireApproval("dangerous".into())).await,
             PermissionDecision::Deny
         ));
     }
@@ -190,15 +190,15 @@ mod tests {
     async fn test_auto_accept_edits_allows_write() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::AcceptEdits);
         assert!(matches!(
-            d.decide(&make_call("create_file"), "write").await,
+            d.decide(&make_call("create_file"), &ApprovalRequirement::RequireApproval("write".into())).await,
             PermissionDecision::Allow
         ));
         assert!(matches!(
-            d.decide(&make_call("edit_file"), "edit").await,
+            d.decide(&make_call("edit_file"), &ApprovalRequirement::RequireApproval("edit".into())).await,
             PermissionDecision::Allow
         ));
         assert!(matches!(
-            d.decide(&make_call("search_replace"), "sr").await,
+            d.decide(&make_call("search_replace"), &ApprovalRequirement::RequireApproval("sr".into())).await,
             PermissionDecision::Allow
         ));
     }
@@ -207,7 +207,7 @@ mod tests {
     async fn test_auto_accept_edits_denies_bash() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::AcceptEdits);
         assert!(matches!(
-            d.decide(&make_call("bash"), "dangerous").await,
+            d.decide(&make_call("bash"), &ApprovalRequirement::RequireApproval("dangerous".into())).await,
             PermissionDecision::Deny
         ));
     }
@@ -221,7 +221,8 @@ mod tests {
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
 
         let call = make_call("bash");
-        let fut = d.decide(&call, "dangerous");
+        let approval = ApprovalRequirement::RequireApproval("dangerous".into());
+        let fut = d.decide(&call, &approval);
 
         tokio::spawn(async move {
             let _req = req_rx.recv().await.unwrap();
@@ -240,7 +241,8 @@ mod tests {
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
 
         let call = make_call("bash");
-        let fut = d.decide(&call, "dangerous");
+        let approval = ApprovalRequirement::RequireApproval("dangerous".into());
+        let fut = d.decide(&call, &approval);
 
         tokio::spawn(async move {
             let _req = req_rx.recv().await.unwrap();
@@ -261,7 +263,7 @@ mod tests {
         drop(req_rx); // close request channel
         let call = make_call("bash");
         assert!(matches!(
-            d.decide(&call, "dangerous").await,
+            d.decide(&call, &ApprovalRequirement::RequireApproval("dangerous".into())).await,
             PermissionDecision::Deny
         ));
     }
@@ -281,8 +283,32 @@ mod tests {
 
         // Should return Allow immediately from PermissionStore,
         // WITHOUT sending a request on the channel (channel is not even read).
-        let decision = d.decide(&call, "dangerous").await;
+        let decision = d.decide(&call, &ApprovalRequirement::RequireApproval("dangerous".into())).await;
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn test_interactive_require_approval_always_with_grant_still_prompts() {
+        // RequireApprovalAlways must always prompt the user — even if [A] was
+        // pressed earlier for this tool. The session grant must NOT bypass it.
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let store =
+            std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
+        store.write().unwrap().grant_session("bash");
+        let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
+        let call = make_call("bash");
+        let approval = ApprovalRequirement::RequireApprovalAlways("sensitive".into());
+        let fut = d.decide(&call, &approval);
+
+        // Expect a request on the channel (NOT auto-approved by the store).
+        // Deny it and confirm decide() returns Deny.
+        tokio::spawn(async move {
+            let _req = req_rx.recv().await.expect("channel must receive request");
+            resp_tx.send(PermissionDecision::Deny).unwrap();
+        });
+
+        assert!(matches!(fut.await, PermissionDecision::Deny));
     }
 
     // ── will_auto_approve tests ──
@@ -337,11 +363,8 @@ mod tests {
 
     #[test]
     fn test_will_auto_approve_interactive_require_approval_always_with_grant() {
-        // RequireApprovalAlways with a session grant: `decide()` constructs
-        // a fresh `RequireApproval` before calling `store.check()`, so the
-        // session grant DOES take effect and `decide()` returns Allow.
-        // `will_auto_approve` must mirror this by converting
-        // RequireApprovalAlways → RequireApproval before checking.
+        // RequireApprovalAlways means "always prompt, even if [A] was pressed
+        // earlier for this tool". A session grant must NOT bypass it.
         let (req_tx, _req_rx) = mpsc::unbounded_channel();
         let (_resp_tx, resp_rx) = mpsc::unbounded_channel();
         let store =
@@ -349,7 +372,7 @@ mod tests {
         store.write().unwrap().grant_session("bash");
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
         let call = make_call("bash");
-        assert!(d.will_auto_approve(&call, &ApprovalRequirement::RequireApprovalAlways("sensitive".into())));
+        assert!(!d.will_auto_approve(&call, &ApprovalRequirement::RequireApprovalAlways("sensitive".into())));
     }
 
     #[test]

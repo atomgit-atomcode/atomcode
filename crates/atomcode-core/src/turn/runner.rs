@@ -1262,7 +1262,7 @@ impl TurnRunner {
                 });
             }
 
-            let decision = self.permission.decide(call, reason).await;
+            let decision = self.permission.decide(call, &approval).await;
             if !matches!(decision, PermissionDecision::Allow) {
                 let output = format!("Tool '{}' was denied by the user.", call.name);
                 let _ = event_tx.send(TurnEvent::ToolCallResult {

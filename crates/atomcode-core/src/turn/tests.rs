@@ -1343,7 +1343,7 @@ async fn malformed_write_file_args_short_circuit_without_approval() {
         async fn decide(
             &self,
             _call: &crate::tool::ToolCall,
-            _reason: &str,
+            _approval: &crate::tool::ApprovalRequirement,
         ) -> crate::tool::PermissionDecision {
             panic!("validate_args gate must short-circuit before approval is requested");
         }
