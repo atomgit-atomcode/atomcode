@@ -41,6 +41,7 @@ tree-sitter-c-sharp = "0.23"
 tree-sitter-html = "0.23"
 tree-sitter-php = "0.24"
 ignore = "0.4"
+globset = "0.4"
 regex = "1"
 bincode = "1"
 # Decode Chinese Windows text files (GBK/GB18030) that fail UTF-8 validation.
