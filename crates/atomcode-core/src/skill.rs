@@ -388,12 +388,11 @@ impl SkillRegistry {
         // System home directory (for Claude Code compat paths)
         let system_home = crate::tool::real_home_dir();
 
-        // AtomCode home directory (respects ATOMCODE_HOME env var)
-        let atomcode_home: Option<PathBuf> = std::env::var("ATOMCODE_HOME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| system_home.clone());
+        // AtomCode config dir (respects ATOMCODE_HOME env var; defaults to
+        // ~/.atomcode). This is the SAME root used by config.toml, history,
+        // plugins/, etc. — see Config::config_dir() for the single source of
+        // truth.
+        let atomcode_config_dir = crate::config::Config::config_dir();
 
         // All "loose" skills (i.e. not loaded through a plugin manifest)
         // share the synthetic `skills:` namespace so they're visually
@@ -409,11 +408,9 @@ impl SkillRegistry {
             self.load_skills_dir(&home.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
         }
 
-        // Load atomcode native paths from ATOMCODE_HOME (or system home as fallback)
-        if let Some(ref home) = atomcode_home {
-            self.load_flat_commands(&home.join(".atomcode").join("commands"), LOOSE_NS, &mut warnings);
-            self.load_skills_dir(&home.join(".atomcode").join("skills"), LOOSE_NS, &mut warnings);
-        }
+        // Load atomcode native paths from the unified config dir.
+        self.load_flat_commands(&atomcode_config_dir.join("commands"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(&atomcode_config_dir.join("skills"), LOOSE_NS, &mut warnings);
 
         // Project-level skills (always from working dir)
         self.load_flat_commands(&working_dir.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
@@ -830,7 +827,9 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", tmp.path());
 
         // Fake a registered + installed plugin on disk.
-        let plugins_root = tmp.path().join(".atomcode/plugins");
+        // Under unified ATOMCODE_HOME semantics, plugins live at $HOME/plugins
+        // (not $HOME/.atomcode/plugins) — see plugin/paths.rs.
+        let plugins_root = tmp.path().join("plugins");
         let plugin_dir = plugins_root.join("marketplaces/p");
         let skill_dir = plugin_dir.join("skills/hello");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -921,7 +920,8 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", tmp.path());
 
         // Fake a plugin whose plugin.json uses CC array format.
-        let plugins_root = tmp.path().join(".atomcode/plugins");
+        // Plugins live directly under ATOMCODE_HOME (unified semantics).
+        let plugins_root = tmp.path().join("plugins");
         let plugin_dir = plugins_root.join("marketplaces/karpathy-skills");
         let skill_dir = plugin_dir.join("skills/karpathy-guidelines");
         std::fs::create_dir_all(&skill_dir).unwrap();

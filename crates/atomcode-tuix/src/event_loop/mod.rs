@@ -4960,14 +4960,10 @@ fn should_auto_show_setup(ctx: &LoopCtx) -> bool {
     }
 
     // setup-state.json exists but the skill may have been deleted manually.
-    // Path must match SkillRegistry::reload's scan path:
-    //   - ATOMCODE_HOME set → ATOMCODE_HOME/.atomcode/skills/
-    //   - otherwise → config_dir()/skills/ (config_dir == ~/.atomcode)
-    let skill_dir = std::env::var("ATOMCODE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|home| std::path::PathBuf::from(home).join(".atomcode").join("skills"))
-        .unwrap_or_else(|| atomcode_core::config::Config::config_dir().join("skills"))
+    // Path must match SkillRegistry::reload's scan path: the unified
+    // Config::config_dir() (== ATOMCODE_HOME when set, else ~/.atomcode).
+    let skill_dir = atomcode_core::config::Config::config_dir()
+        .join("skills")
         .join("atomcode-automation-recommender");
     !skill_dir.exists()
 }

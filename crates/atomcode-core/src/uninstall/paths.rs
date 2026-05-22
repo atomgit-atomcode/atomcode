@@ -8,15 +8,14 @@ use std::path::PathBuf;
 #[cfg(any(unix, test))]
 use std::path::Path;
 
-/// Return `~/.atomcode/` (or override via `ATOMCODE_HOME_OVERRIDE` env var,
-/// used by tests).
+/// Return the atomcode data root (`~/.atomcode/` by default, or
+/// `$ATOMCODE_HOME` when set). Routes through [`crate::config::Config::config_dir`]
+/// so install/setup/skill/plugin/uninstall all agree on a single root —
+/// previously this module looked at a separate `ATOMCODE_HOME_OVERRIDE`
+/// variable, which let users customise their data dir but then lose track
+/// of it at uninstall time. One variable, one semantics.
 pub fn atomcode_dir() -> PathBuf {
-    if let Some(p) = std::env::var_os("ATOMCODE_HOME_OVERRIDE") {
-        return PathBuf::from(p);
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".atomcode")
+    crate::config::Config::config_dir()
 }
 
 /// Filenames inside `~/.atomcode/` that the uninstaller knows about, grouped.
@@ -104,10 +103,12 @@ mod tests {
 
     #[test]
     #[serial]
-    fn atomcode_home_override_wins() {
-        std::env::set_var("ATOMCODE_HOME_OVERRIDE", "/tmp/override");
+    fn atomcode_home_env_wins() {
+        // Under unified semantics, ATOMCODE_HOME IS the data root.
+        // The legacy ATOMCODE_HOME_OVERRIDE variable is gone.
+        std::env::set_var("ATOMCODE_HOME", "/tmp/override");
         assert_eq!(atomcode_dir(), std::path::PathBuf::from("/tmp/override"));
-        std::env::remove_var("ATOMCODE_HOME_OVERRIDE");
+        std::env::remove_var("ATOMCODE_HOME");
     }
 
     #[test]

@@ -37,7 +37,7 @@ if ($Purge -and $KeepData) { Write-Error "-Purge conflicts with -KeepData"; exit
 $InstallDir = if ($env:ATOMCODE_PREFIX) { $env:ATOMCODE_PREFIX } else { Join-Path $env:LOCALAPPDATA "AtomCode" }
 $Binary = Join-Path $InstallDir "atomcode.exe"
 
-$DataDir = if ($env:ATOMCODE_HOME_OVERRIDE) { $env:ATOMCODE_HOME_OVERRIDE } else { Join-Path $env:USERPROFILE ".atomcode" }
+$DataDir = if ($env:ATOMCODE_HOME) { $env:ATOMCODE_HOME } else { Join-Path $env:USERPROFILE ".atomcode" }
 
 # plan
 Write-Host "Will remove (Group 1):"

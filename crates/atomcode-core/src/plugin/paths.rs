@@ -1,13 +1,12 @@
 use std::path::PathBuf;
 
-/// Root directory: `${ATOMCODE_HOME:-$HOME}/.atomcode/plugins/`.
+/// Root directory: `${ATOMCODE_HOME:-$HOME/.atomcode}/plugins/`.
+///
+/// Always returns `Some(_)`. The underlying `Config::config_dir()` falls back
+/// to `./.atomcode` when `$HOME` cannot be resolved, so callers no longer
+/// need to handle a `None`.
 pub fn plugins_root() -> Option<PathBuf> {
-    let home: PathBuf = std::env::var("ATOMCODE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::tool::real_home_dir())?;
-    Some(home.join(".atomcode").join("plugins"))
+    Some(crate::config::Config::config_dir().join("plugins"))
 }
 
 pub fn marketplaces_root() -> Option<PathBuf> {
@@ -29,8 +28,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn plugins_root_uses_atomcode_home_override() {
+        // Under the unified semantics, ATOMCODE_HOME IS the config root
+        // (equivalent to ~/.atomcode), so plugins land directly under it.
         let _home = crate::plugin::test_support::isolated_home();
         let root = plugins_root().unwrap();
-        assert_eq!(root, _home.path().join(".atomcode").join("plugins"));
+        assert_eq!(root, _home.path().join("plugins"));
     }
 }

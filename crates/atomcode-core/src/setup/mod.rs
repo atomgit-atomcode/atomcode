@@ -112,14 +112,10 @@ fn install_directory_skills_from_seeds(
     force: bool,
 ) {
     let seeds_skills = cache_dir.join("skills");
-    // Target path must match SkillRegistry::reload's scan path:
-    //   - When ATOMCODE_HOME is set: ATOMCODE_HOME/.atomcode/skills
-    //   - Otherwise: config_dir()/skills  (config_dir == ~/.atomcode)
-    let target_skills = std::env::var("ATOMCODE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|home| PathBuf::from(home).join(".atomcode").join("skills"))
-        .unwrap_or_else(|| crate::config::Config::config_dir().join("skills"));
+    // Target path must match SkillRegistry::reload's scan path: a single
+    // unified config dir (Config::config_dir()) that resolves to
+    // ATOMCODE_HOME when set, else $HOME/.atomcode.
+    let target_skills = crate::config::Config::config_dir().join("skills");
 
     let entries = match std::fs::read_dir(&seeds_skills) {
         Ok(e) => e,
