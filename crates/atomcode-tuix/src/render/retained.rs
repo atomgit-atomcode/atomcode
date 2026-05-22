@@ -2567,31 +2567,55 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let prefix_w = crate::width::display_width(&waiting);
                 let cont_pad: String = " ".repeat(prefix_w);
 
-                // Line 1: "▶ 等待审批：Tool(detail)" — auto-wraps when
-                // the tool label is long so the Y/A/N chips always remain
-                // visible on line 2. Uses build_prefixed_rows for proper
-                // wrapping with continuation-line indentation.
-                let safe_tool_label = crate::sanitize::scrub_controls(&tool_label);
-                let prefixed_rows = self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
-                for row in prefixed_rows {
-                    self.push_body_row(row);
-                }
-
-                // Line 2: Y/A/N chips — always on their own line so they
-                // remain visible even when the label wraps. Indent by the
-                // ▶ glyph width so chips align under the label content.
                 let allow = t(Msg::ApprovalAllow);
                 let always = t(Msg::ApprovalAlways);
                 let deny = t(Msg::ApprovalDeny);
-                let mut chips_row = Vec::new();
-                push_str_cells(&mut chips_row, &cont_pad, &plain);
-                push_str_cells(&mut chips_row, " Y ", &chip_y);
-                push_str_cells(&mut chips_row, &allow, &plain);
-                push_str_cells(&mut chips_row, " A ", &chip_a);
-                push_str_cells(&mut chips_row, &always, &plain);
-                push_str_cells(&mut chips_row, " N ", &chip_n);
-                push_str_cells(&mut chips_row, &deny, &plain);
-                self.push_body_row(chips_row);
+
+                // Build the Y/A/N chips cells once — reused whether
+                // we place them inline or on a separate line.
+                let mut chips_cells: Vec<Cell> = Vec::new();
+                push_str_cells(&mut chips_cells, " Y ", &chip_y);
+                push_str_cells(&mut chips_cells, &allow, &plain);
+                push_str_cells(&mut chips_cells, " A ", &chip_a);
+                push_str_cells(&mut chips_cells, &always, &plain);
+                push_str_cells(&mut chips_cells, " N ", &chip_n);
+                push_str_cells(&mut chips_cells, &deny, &plain);
+                let chips_width: usize = chips_cells.iter().map(|c| c.width as usize).sum();
+
+                // Build the label rows, then decide: if the last label
+                // row + chips fit within the screen width, append chips
+                // inline (issue #454). Otherwise, emit chips on a
+                // separate line so they remain visible.
+                let safe_tool_label = crate::sanitize::scrub_controls(&tool_label);
+                let mut prefixed_rows = self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
+                let screen_w = self.screen.width() as usize;
+                let last_row_w: usize = prefixed_rows
+                    .last()
+                    .map(|r| r.iter().map(|c| c.width as usize).sum())
+                    .unwrap_or(0);
+
+                if last_row_w + chips_width <= screen_w {
+                    // Everything fits on one line — append chips directly
+                    // after the label.  issue #454: users reported that
+                    // splitting into two lines was unnecessary when the
+                    // terminal is wide enough.
+                    if let Some(last_row) = prefixed_rows.last_mut() {
+                        last_row.extend(chips_cells);
+                    }
+                    for row in prefixed_rows {
+                        self.push_body_row(row);
+                    }
+                } else {
+                    // Label too long — keep chips on a separate line so
+                    // they remain visible even when the label wraps.
+                    for row in prefixed_rows {
+                        self.push_body_row(row);
+                    }
+                    let mut chips_row = Vec::new();
+                    push_str_cells(&mut chips_row, &cont_pad, &plain);
+                    chips_row.extend(chips_cells);
+                    self.push_body_row(chips_row);
+                }
             }
             UiLine::Error(msg) => {
                 let err_style = self.style_for(Role::Error);
@@ -2694,12 +2718,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn pop_approval_prompt(&mut self) {
-        // The approval prompt now spans multiple body rows:
-        //   1+ label rows: the first starts with '▶' at col 0,
-        //      continuation rows start with spaces (indented to
-        //      align under the ▶ prefix).
-        //   1 chips row: "  Y  允许  A  总是  N  拒绝",
-        //      also starting with spaces.
+        // The approval prompt spans one or more body rows:
+        //   - When label + chips fit on one line: a single row
+        //     starting with '▶' containing both the label and
+        //     the Y/A/N chips.
+        //   - When the label is long: 1+ label rows (first starts
+        //     with '▶', continuation rows start with spaces) plus
+        //     1 chips row (also starting with spaces).
         // We need to pop all of them. Strategy: walk backwards
         // from the tail, popping every row until we find the ▶
         // header row (which we also pop). Other symbol rows hold
@@ -5261,8 +5286,8 @@ mod tests {
     /// After moving ▶ to col 0, `pop_approval_prompt` must still
     /// detect the approval rows via col 0 and must NOT be fooled by
     /// an adjacent ● tool-call row (also at col 0, different glyph).
-    /// The approval prompt now spans 2 rows (label + chips), so
-    /// pop_approval_prompt must remove both.
+    /// In an 80-col terminal the label + chips fit on one line, so
+    /// pop_approval_prompt removes a single row.
     #[test]
     fn retained_approval_pop_still_detects_glyph() {
         let (mut r, _buf) = new_capturing(80, 24);
@@ -5280,8 +5305,8 @@ mod tests {
         let after = r.body_lines.len();
         assert_eq!(
             before - after,
-            2,
-            "pop_approval_prompt should drop both the label and chips rows"
+            1,
+            "pop_approval_prompt should drop the single label+chips row"
         );
 
         // Second call: last row is now the tool-call `●`, not `▶`.
