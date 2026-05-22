@@ -1881,8 +1881,8 @@ async fn process_chat_request(
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
-        read::ReadFileTool, search_replace::SearchReplaceTool, web_fetch::WebFetchTool,
-        web_search::WebSearchTool, write::WriteFileTool,
+        read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
+        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
     };
     // Load config
     let config_path = Config::default_path();
@@ -1978,6 +1978,9 @@ async fn process_chat_request(
     }
     if enabled("search_replace") {
         tool_registry.register_sync(Box::new(SearchReplaceTool));
+    }
+    if enabled("todo") {
+        tool_registry.register_sync(Box::new(TodoTool::new()));
     }
 
     // Load skills and register use_skill tool
