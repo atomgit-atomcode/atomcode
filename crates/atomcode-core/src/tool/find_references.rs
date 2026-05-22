@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
+use serde_json::Value;
 use tokio::process::Command;
 
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
@@ -75,14 +76,14 @@ impl Tool for FindReferencesTool {
         let pattern = format!(r"\b{}\b", regex::escape(&parsed.symbol));
         let mut cmd = Command::new("rg");
         cmd.args(&[
-                "--line-number",
-                "--no-heading",
-                "--color=never",
-                "--max-count=30",
-                "-w", // word boundary
-                &pattern,
-                &search_dir,
-            ]);
+            "--json",
+            "--line-number",
+            "--color=never",
+            "--max-count=30",
+            "-w", // word boundary
+            &pattern,
+            &search_dir,
+        ]);
         crate::process_utils::suppress_console_window(&mut cmd);
         let output = cmd.output().await;
 
@@ -113,26 +114,17 @@ impl Tool for FindReferencesTool {
         let mut definitions = Vec::new();
         let mut references = Vec::new();
 
-        for line in rg_output.lines().take(30) {
-            // Parse rg output: file:line:content
-            let parts: Vec<&str> = line.splitn(3, ':').collect();
-            if parts.len() < 3 {
-                continue;
-            }
-            let file = parts[0];
-            let line_no: usize = parts[1].parse().unwrap_or(0);
-            let content = parts[2].trim();
-
-            let file_path = std::path::Path::new(file);
+        for matched in parse_rg_json_matches(&rg_output).into_iter().take(30) {
+            let file_path = std::path::Path::new(&matched.file);
 
             // Try to determine if this is a definition or usage
             let is_def = if let Some(symbols) = searcher.list_symbols(file_path) {
                 symbols
                     .iter()
-                    .any(|s| s.name == parsed.symbol && s.start_line == line_no)
+                    .any(|s| s.name == parsed.symbol && s.start_line == matched.line_no)
             } else {
                 // Heuristic: check if line contains definition keywords
-                let trimmed = content.trim();
+                let trimmed = matched.content.trim();
                 trimmed.starts_with("fn ")
                     || trimmed.starts_with("pub fn ")
                     || trimmed.starts_with("def ")
@@ -147,12 +139,13 @@ impl Tool for FindReferencesTool {
                     || trimmed.contains("=> {")
             };
 
-            let short_file = file
+            let short_file = matched
+                .file
                 .strip_prefix(&search_dir)
-                .unwrap_or(file)
+                .unwrap_or(&matched.file)
                 .trim_start_matches('/');
 
-            let entry = format!("  {}:{}: {}", short_file, line_no, content);
+            let entry = format!("  {}:{}: {}", short_file, matched.line_no, matched.content.trim());
             if is_def {
                 definitions.push(entry);
             } else {
@@ -184,5 +177,55 @@ impl Tool for FindReferencesTool {
             output: out,
             success: true,
         })
+    }
+}
+
+struct RgMatch {
+    file: String,
+    line_no: usize,
+    content: String,
+}
+
+fn parse_rg_json_matches(output: &str) -> Vec<RgMatch> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line).ok()?;
+            if value.get("type")?.as_str()? != "match" {
+                return None;
+            }
+            let data = value.get("data")?;
+            let file = data.get("path")?.get("text")?.as_str()?.to_string();
+            let line_no = data.get("line_number")?.as_u64()? as usize;
+            let content = data.get("lines")?.get("text")?.as_str()?.to_string();
+            Some(RgMatch {
+                file,
+                line_no,
+                content,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_rg_json_with_colons_in_matched_file_paths() {
+        let output = r#"{"type":"begin","data":{"path":{"text":"src:main.rs"}}}
+{"type":"match","data":{"path":{"text":"src:main.rs"},"lines":{"text":"fn target_symbol() {}\n"},"line_number":1,"absolute_offset":0,"submatches":[]}}
+{"type":"match","data":{"path":{"text":"src:main.rs"},"lines":{"text":"fn caller() { target_symbol(); }\n"},"line_number":2,"absolute_offset":22,"submatches":[]}}
+{"type":"end","data":{"path":{"text":"src:main.rs"},"binary_offset":null,"stats":{}}}
+"#;
+
+        let matches = parse_rg_json_matches(output);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].file, "src:main.rs");
+        assert_eq!(matches[0].line_no, 1);
+        assert_eq!(matches[0].content, "fn target_symbol() {}\n");
+        assert_eq!(matches[1].file, "src:main.rs");
+        assert_eq!(matches[1].line_no, 2);
+        assert_eq!(matches[1].content, "fn caller() { target_symbol(); }\n");
     }
 }
