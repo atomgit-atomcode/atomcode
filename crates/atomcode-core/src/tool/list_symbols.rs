@@ -48,7 +48,7 @@ impl Tool for ListSymbolsTool {
         match super::approval_for_path(
             &parsed.file_path,
             &working_dir,
-            super::ExternalPathAction::Enumerate,
+            super::ExternalPathAction::Read,
         ) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
@@ -109,5 +109,39 @@ impl Tool for ListSymbolsTool {
                 success: false,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn approval_auto_for_workspace_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = serde_json::json!({ "file_path": "main.rs" }).to_string();
+
+        assert!(matches!(
+            ListSymbolsTool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::AutoApprove
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_requires_read_confirmation_for_external_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = serde_json::json!({ "file_path": file }).to_string();
+
+        assert!(matches!(
+            ListSymbolsTool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::RequireApproval(_)
+        ));
     }
 }
