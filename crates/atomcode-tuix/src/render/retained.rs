@@ -2563,20 +2563,35 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     format!("{}({}): ", tool, detail)
                 };
 
-                let mut row = Vec::new();
                 let waiting = t(Msg::ApprovalWaitingLabel);
+                let prefix_w = crate::width::display_width(&waiting);
+                let cont_pad: String = " ".repeat(prefix_w);
+
+                // Line 1: "▶ 等待审批：Tool(detail)" — auto-wraps when
+                // the tool label is long so the Y/A/N chips always remain
+                // visible on line 2. Uses build_prefixed_rows for proper
+                // wrapping with continuation-line indentation.
+                let safe_tool_label = crate::sanitize::scrub_controls(&tool_label);
+                let prefixed_rows = self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
+                for row in prefixed_rows {
+                    self.push_body_row(row);
+                }
+
+                // Line 2: Y/A/N chips — always on their own line so they
+                // remain visible even when the label wraps. Indent by the
+                // ▶ glyph width so chips align under the label content.
                 let allow = t(Msg::ApprovalAllow);
                 let always = t(Msg::ApprovalAlways);
                 let deny = t(Msg::ApprovalDeny);
-                push_str_cells(&mut row, &waiting, &warn);
-                push_str_cells(&mut row, &tool_label, &warn);
-                push_str_cells(&mut row, " Y ", &chip_y);
-                push_str_cells(&mut row, &allow, &plain);
-                push_str_cells(&mut row, " A ", &chip_a);
-                push_str_cells(&mut row, &always, &plain);
-                push_str_cells(&mut row, " N ", &chip_n);
-                push_str_cells(&mut row, &deny, &plain);
-                self.push_body_row(row);
+                let mut chips_row = Vec::new();
+                push_str_cells(&mut chips_row, &cont_pad, &plain);
+                push_str_cells(&mut chips_row, " Y ", &chip_y);
+                push_str_cells(&mut chips_row, &allow, &plain);
+                push_str_cells(&mut chips_row, " A ", &chip_a);
+                push_str_cells(&mut chips_row, &always, &plain);
+                push_str_cells(&mut chips_row, " N ", &chip_n);
+                push_str_cells(&mut chips_row, &deny, &plain);
+                self.push_body_row(chips_row);
             }
             UiLine::Error(msg) => {
                 let err_style = self.style_for(Role::Error);
@@ -2679,34 +2694,56 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn pop_approval_prompt(&mut self) {
-        // Approval rows are the only body rows whose col-0 cell is
-        // '▶' (the prompt glyph we emit in the ApprovalPrompt arm).
-        // Other symbol rows hold '▸' (tool call) or '❯' (user turn)
-        // at col 0 — distinct glyphs. All remaining body rows
-        // (assistant prose, errors, cmd output, diff, turn separator
-        // with '─' at col 2, tool result with '└' at col 4) have
-        // whitespace at col 0. None match '▶'. Checking the tail is
-        // safe because the agent doesn't append further body rows
+        // The approval prompt now spans multiple body rows:
+        //   1+ label rows: the first starts with '▶' at col 0,
+        //      continuation rows start with spaces (indented to
+        //      align under the ▶ prefix).
+        //   1 chips row: "  Y  允许  A  总是  N  拒绝",
+        //      also starting with spaces.
+        // We need to pop all of them. Strategy: walk backwards
+        // from the tail, popping every row until we find the ▶
+        // header row (which we also pop). Other symbol rows hold
+        // '●' (tool call) or '❯' (user turn) at col 0 — distinct
+        // glyphs — so the first ▶ we encounter must be ours.
+        // Safe because the agent doesn't append further body rows
         // between `ApprovalNeeded` and the user's Y/A/N reply.
-        let is_approval = self
-            .body_lines
-            .last()
-            .and_then(|r| r.get(0))
-            .map(|c| c.ch == '▶')
-            .unwrap_or(false);
-        if !is_approval {
+        let mut popped_any = false;
+        loop {
+            let action = match self.body_lines.last() {
+                None => break,
+                Some(last) => last.get(0).map(|c| c.ch),
+            };
+            match action {
+                // ▶ header: pop it and stop (we've found the start).
+                Some('▶') => {
+                    self.body_lines.pop();
+                    popped_any = true;
+                    break;
+                }
+                // Space-padded continuation / chips row: pop and keep going.
+                Some(' ') => {
+                    self.body_lines.pop();
+                    popped_any = true;
+                }
+                // Any other glyph (● tool-call, ❯ user turn, etc.):
+                // not part of the approval block — stop without popping.
+                _ => break,
+            }
+        }
+        if !popped_any {
             return;
         }
-        self.body_lines.pop();
-        // Physically wipe the bottom body row for instant visual
-        // feedback on Y/A/N even before the ToolCallResult arrives.
-        // Then flag the next body emit to overwrite this row in place
-        // rather than scroll the region — so `⎿ result` lands exactly
-        // where the approval prompt used to be, keeping `▸ Tool` and
-        // `⎿ result` visually adjacent.
+        // Physically wipe the body rows that we just removed for
+        // instant visual feedback on Y/A/N even before the next
+        // ToolCallResult arrives. We popped multiple rows, so clear
+        // from the new bottom row downward. Then flag the next body
+        // emit to overwrite this row in place rather than scroll the
+        // region — so `⎿ result` lands exactly where the approval
+        // prompt used to be, keeping `● Tool` and `⎿ result` visually
+        // adjacent.
         let bottom = self.body_bottom_row();
         if bottom > 0 {
-            let _ = write!(self.out, "\x1b[{};1H\x1b[2K", bottom);
+            let _ = write!(self.out, "\x1b[{};1H\x1b[J", bottom);
             let _ = self.out.flush();
             self.skip_next_body_scroll = true;
         }
@@ -5222,8 +5259,10 @@ mod tests {
     }
 
     /// After moving ▶ to col 0, `pop_approval_prompt` must still
-    /// detect the approval row via col 0 and must NOT be fooled by
-    /// an adjacent ▸ tool-call row (also at col 0, different glyph).
+    /// detect the approval rows via col 0 and must NOT be fooled by
+    /// an adjacent ● tool-call row (also at col 0, different glyph).
+    /// The approval prompt now spans 2 rows (label + chips), so
+    /// pop_approval_prompt must remove both.
     #[test]
     fn retained_approval_pop_still_detects_glyph() {
         let (mut r, _buf) = new_capturing(80, 24);
@@ -5241,12 +5280,50 @@ mod tests {
         let after = r.body_lines.len();
         assert_eq!(
             before - after,
-            1,
-            "pop_approval_prompt should drop exactly the approval row"
+            2,
+            "pop_approval_prompt should drop both the label and chips rows"
         );
 
-        // Second call: last row is now the tool-call `▸`, not `▶`.
+        // Second call: last row is now the tool-call `●`, not `▶`.
         // Must be a no-op.
+        let before2 = r.body_lines.len();
+        r.pop_approval_prompt();
+        let after2 = r.body_lines.len();
+        assert_eq!(
+            before2, after2,
+            "pop_approval_prompt must not drop non-approval rows"
+        );
+    }
+
+    /// When the approval label wraps across multiple lines (narrow
+    /// terminal), pop_approval_prompt must remove ALL of them: the
+    /// wrapped label rows + the chips row.
+    #[test]
+    fn retained_approval_pop_multiline() {
+        // 30-col terminal: "▶ 等待审批：Bash(a very long command)"
+        // should wrap the label, producing 2+ label rows + 1 chips row.
+        let (mut r, _buf) = new_capturing(30, 24);
+
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "a very long command".into(),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "a very long command".into(),
+        });
+        let before = r.body_lines.len();
+        r.pop_approval_prompt();
+        let after = r.body_lines.len();
+        // Should pop at least the chips row + the ▶ header row.
+        // If the label wrapped, it pops even more.
+        assert!(
+            before - after >= 2,
+            "pop_approval_prompt should drop at least 2 rows (label + chips), got {}",
+            before - after
+        );
+
+        // Second call: no more approval rows — must be a no-op.
         let before2 = r.body_lines.len();
         r.pop_approval_prompt();
         let after2 = r.body_lines.len();
