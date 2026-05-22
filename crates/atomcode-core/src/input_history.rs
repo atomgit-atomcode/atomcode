@@ -1,6 +1,6 @@
 //! Cross-session input history for the TUI input box (↑/↓ recall).
 //!
-//! Stored as one line per submitted user input in `~/.atomcode/input_history.txt`,
+//! Stored as one line per submitted user input in `$ATOMCODE_HOME/input_history.txt`,
 //! append-only, capped at `MAX_ENTRIES`. Unlike conversation messages, entries
 //! are plain strings with no role/tool structure — this is purely a UX aid for
 //! recalling past text, not for restoring conversation context.

@@ -5,7 +5,7 @@
 //!
 //! 1. **Fresh install** — atomcode runs for the first time on a host
 //!    that has never run it. The marker file
-//!    `~/.atomcode/.plugin_bootstrap_v1` does not exist. We `git clone`
+//!    `$ATOMCODE_HOME/.plugin_bootstrap_v1` does not exist. We `git clone`
 //!    the default `atomcode-skills` marketplace and touch the marker.
 //!    Failure (no network, no git on PATH, upstream down) is logged
 //!    and swallowed — startup proceeds without skills.
@@ -18,7 +18,7 @@
 //! The marker file makes (1) a one-time event. If the user later runs
 //! `/plugin uninstall atomcode-skills`, the marker stays and we
 //! respect their intent — no re-install on subsequent startups. To
-//! force a re-bootstrap, the user can `rm ~/.atomcode/.plugin_bootstrap_v1`.
+//! force a re-bootstrap, the user can `rm $ATOMCODE_HOME/.plugin_bootstrap_v1`.
 //!
 //! Both functions are best-effort and never propagate errors —
 //! atomcode must remain usable on offline machines, in air-gapped
@@ -82,7 +82,7 @@ fn touch_marker() {
 }
 
 /// Plan A: clone the default skills marketplace into
-/// `~/.atomcode/plugins/marketplaces/atomcode-skills/` if (a) the
+/// `$ATOMCODE_HOME/plugins/marketplaces/atomcode-skills/` if (a) the
 /// bootstrap marker isn't there yet AND (b) the marketplace isn't
 /// already installed. After this attempt — successful or not — the
 /// marker is written so the next startup doesn't try again.

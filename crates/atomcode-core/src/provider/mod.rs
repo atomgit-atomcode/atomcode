@@ -317,7 +317,7 @@ mod format_http_error_tests {
 }
 
 /// Factory: create the right provider from config.
-/// If `api_key` is `None`, automatically loads from `~/.atomcode/auth.toml`
+/// If `api_key` is `None`, automatically loads from `$ATOMCODE_HOME/auth.toml`
 /// (with token refresh if expired).
 pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
     let mut config = if config.api_key.is_none() && config.provider_type != "ollama" {
@@ -410,7 +410,7 @@ struct StoredAuth {
     created_at: i64,
 }
 
-/// Read a valid access token from `~/.atomcode/auth.toml`.
+/// Read a valid access token from `$ATOMCODE_HOME/auth.toml`.
 /// Automatically refreshes expired tokens via the OAuth refresh_token flow.
 fn load_auth_token() -> Result<String> {
     let auth_path = crate::auth::auth_file_path();

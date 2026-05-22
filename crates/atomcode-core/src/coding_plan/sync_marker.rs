@@ -5,7 +5,7 @@
 // to surface a "list has changed, re-run /codingplan" hint when server
 // state drifts from local config > 24h later.
 //
-// The file lives next to `config.toml` (same `ATOMCODE_HOME` / `~/.atomcode`
+// The file lives next to `config.toml` (same `$ATOMCODE_HOME` / `~/.atomcode`
 // resolution) and carries a single ISO-8601 timestamp. Any I/O failure —
 // missing file, corrupt JSON, unparseable timestamp — is treated as
 // "never synced" rather than an error: the caller then applies the

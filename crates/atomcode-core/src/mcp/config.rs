@@ -288,7 +288,7 @@ fn collect_merged_mcp_server_maps(root: &Map<String, Value>) -> Map<String, Valu
     out
 }
 
-/// Add or replace a **stdio** MCP server entry in a JSON config file (`.mcp.json` or `~/.atomcode/mcp.json`).
+/// Add or replace a **stdio** MCP server entry in a JSON config file (`.mcp.json` or `$ATOMCODE_HOME/mcp.json`).
 ///
 /// Merges existing `servers` and `mcpServers` maps, then writes a single `mcpServers` object (drops the legacy
 /// `servers` key). Other top-level JSON keys are preserved.

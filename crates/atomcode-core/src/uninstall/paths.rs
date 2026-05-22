@@ -8,8 +8,8 @@ use std::path::PathBuf;
 #[cfg(any(unix, test))]
 use std::path::Path;
 
-/// Return the atomcode data root (`~/.atomcode/` by default, or
-/// `$ATOMCODE_HOME` when set). Routes through [`crate::config::Config::config_dir`]
+/// Return the atomcode data root (`$ATOMCODE_HOME` when set, or
+/// `~/.atomcode/` by default). Routes through [`crate::config::Config::config_dir`]
 /// so install/setup/skill/plugin/uninstall all agree on a single root —
 /// previously this module looked at a separate `ATOMCODE_HOME_OVERRIDE`
 /// variable, which let users customise their data dir but then lose track
@@ -18,7 +18,7 @@ pub fn atomcode_dir() -> PathBuf {
     crate::config::Config::config_dir()
 }
 
-/// Filenames inside `~/.atomcode/` that the uninstaller knows about, grouped.
+/// Filenames inside `$ATOMCODE_HOME/` that the uninstaller knows about, grouped.
 pub struct UninstallManifest {
     pub credential_files: &'static [&'static str],
     pub state_files: &'static [&'static str],

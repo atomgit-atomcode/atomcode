@@ -1,4 +1,4 @@
-//! Setup wizard — install seed files (skills/commands/hooks/MCP) to `~/.atomcode/`.
+//! Setup wizard — install seed files (skills/commands/hooks/MCP) to `$ATOMCODE_HOME/`.
 //!
 //! Simplified pipeline: lock → scan → install all seeds → setup-state → report.
 
@@ -101,7 +101,7 @@ pub fn run(opts: RunOptions) -> SetupResult<SetupReport> {
     })
 }
 
-/// Copy directory-style skills from seeds-cache to ~/.atomcode/skills/.
+/// Copy directory-style skills from seeds-cache to $ATOMCODE_HOME/skills/.
 /// E.g., `atomcode-automation-recommender/SKILL.md` + `references/`.
 ///
 /// When `force` is true, skills are reinstalled even if the content hash matches

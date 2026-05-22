@@ -82,7 +82,7 @@ pub struct ExecuteContext {
 /// Execute the uninstall plan in spec-prescribed order:
 /// 1) State (least load-bearing)
 /// 2) Credentials
-/// 3) rmdir ~/.atomcode if empty
+/// 3) rmdir $ATOMCODE_HOME if empty
 /// 4) PATH cleanup (rc / Windows User PATH)
 /// 5) Binary self-update artifacts
 /// 6) Self-delete (last)
@@ -130,7 +130,7 @@ pub fn execute(
         }
     }
 
-    // --- 3. rmdir ~/.atomcode/ if empty ---
+    // --- 3. rmdir $ATOMCODE_HOME/ if empty ---
     if plan.atomcode_dir.exists() {
         let _ = std::fs::remove_dir(&plan.atomcode_dir); // ignore non-empty error
     }
