@@ -62,9 +62,11 @@ impl Tool for CdTool {
 
         // Resolve the path (expand ~ if needed, resolve relative to current working_dir)
         let current_wd = ctx.working_dir.read().await.clone();
-        let target = if path.starts_with('~') {
+        let target = if path == "~" {
+            super::real_home_dir().unwrap_or_else(|| PathBuf::from(path))
+        } else if let Some(rest) = path.strip_prefix("~/") {
             super::real_home_dir()
-                .map(|h| h.join(path.strip_prefix("~/").unwrap_or(&path[1..])))
+                .map(|h| h.join(rest))
                 .unwrap_or_else(|| PathBuf::from(path))
         } else if path.starts_with('/') {
             PathBuf::from(path)
@@ -96,5 +98,45 @@ impl Tool for CdTool {
                 success: false,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn tilde_prefixed_relative_dir_is_not_expanded_to_home() {
+        let workspace = TempDir::new().unwrap();
+        let target = workspace.path().join("~cache");
+        std::fs::create_dir(&target).unwrap();
+
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let tool = CdTool;
+
+        let result = tool.execute(r#"{"path":"~cache"}"#, &ctx).await.unwrap();
+        assert!(result.success, "unexpected output: {}", result.output);
+        assert_eq!(
+            *ctx.working_dir.read().await,
+            std::fs::canonicalize(target).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_after_tilde_still_expands_to_home() {
+        let Some(home) = super::super::real_home_dir() else {
+            return;
+        };
+
+        let ctx = ToolContext::new(PathBuf::from("/tmp"));
+        let tool = CdTool;
+
+        let result = tool.execute(r#"{"path":"~/"}"#, &ctx).await.unwrap();
+        assert!(result.success, "unexpected output: {}", result.output);
+        assert_eq!(
+            *ctx.working_dir.read().await,
+            std::fs::canonicalize(home).unwrap()
+        );
     }
 }

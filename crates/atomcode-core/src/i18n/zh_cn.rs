@@ -529,7 +529,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServersHeader =>
             "  MCP 服务器：\n".into(),
         Msg::McpReloadFailed { error } =>
-            format!("MCP 重载失败：无法加载 .mcp.json / ~/.atomcode/mcp.json：{:#}", error).into(),
+            format!("MCP 重载失败：无法加载 .mcp.json / $ATOMCODE_HOME/mcp.json：{:#}", error).into(),
         // /mcp login / logout
         Msg::McpOAuthLoginUsage =>
             "  用法：/mcp login <服务名>\n  示例：/mcp login github\n".into(),
@@ -684,7 +684,7 @@ Msg::CmdDescSetup =>
         Msg::CmdDescProvider => "管理 Provider（添加 / 编辑 / 删除）".into(),
         Msg::CmdDescStatus => "显示会话状态".into(),
         Msg::CmdDescConfig => "显示配置文件路径".into(),
-        Msg::CmdDescReload => "从磁盘重新加载 ~/.atomcode/config.toml".into(),
+        Msg::CmdDescReload => "从磁盘重新加载 $ATOMCODE_HOME/config.toml".into(),
         Msg::CmdDescCd => "切换工作目录".into(),
 Msg::CmdDescInit => "从工作目录生成 .atomcode.md 项目指令".into(),
 Msg::CmdDescBg => "后台会话：/bg、/bg list、/bg <N>、/bg drop <N>".into(),

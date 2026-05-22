@@ -1881,8 +1881,8 @@ async fn process_chat_request(
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
-        read::ReadFileTool, search_replace::SearchReplaceTool, web_fetch::WebFetchTool,
-        web_search::WebSearchTool, write::WriteFileTool,
+        read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
+        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
     };
     // Load config
     let config_path = Config::default_path();
@@ -1978,6 +1978,9 @@ async fn process_chat_request(
     }
     if enabled("search_replace") {
         tool_registry.register_sync(Box::new(SearchReplaceTool));
+    }
+    if enabled("todo") {
+        tool_registry.register_sync(Box::new(TodoTool::new()));
     }
 
     // Load skills and register use_skill tool
@@ -2814,7 +2817,7 @@ async fn main() {
     }
 
     // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
-    // are migrated to the canonical location (~/.atomcode/sessions) before any handler reads it.
+    // are migrated to the canonical location ($ATOMCODE_HOME/sessions) before any handler reads it.
     SessionManager::migrate_from_legacy();
 
     // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default
@@ -2853,7 +2856,7 @@ async fn main() {
     telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id));
 
     // Initialize MCP registry from project working directory config
-    // This reads both ~/.atomcode/mcp.json (user-level) and <project>/.mcp.json (project-level)
+    // This reads both $ATOMCODE_HOME/mcp.json (user-level) and <project>/.mcp.json (project-level)
     let mcp_registry = McpRegistry::from_config_background(&project_state.working_dir);
 
     // Step 7: Build AppState (R1.4)

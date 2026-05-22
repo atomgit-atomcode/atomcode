@@ -1,7 +1,7 @@
 //! File-level snapshot history — backup files before every edit/write.
 //!
 //! Inspired by Claude Code's file checkpointing: every file is backed up
-//! before modification, stored in `~/.atomcode/file-history/{session}/`.
+//! before modification, stored in `$ATOMCODE_HOME/file-history/{session}/`.
 //! No git required. Users can rewind to any previous version via `/undo`.
 //!
 //! Design:
@@ -25,7 +25,7 @@ struct FileVersions {
 
 /// File history manager for one session.
 pub struct FileHistory {
-    /// Base directory: ~/.atomcode/file-history/{session}/
+    /// Base directory: $ATOMCODE_HOME/file-history/{session}/
     backup_dir: PathBuf,
     /// Track versions per file path.
     files: HashMap<String, FileVersions>,

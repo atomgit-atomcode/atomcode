@@ -208,6 +208,7 @@ emit_entry() {
         "darwin-x64:atomcode-${VERSION}-darwin-x64" \
         "linux-x64:atomcode-${VERSION}-linux-x64" \
         "linux-arm64:atomcode-${VERSION}-linux-arm64" \
+        "ohos-arm64:atomcode-${VERSION}-ohos-arm64" \
         "windows-x64:atomcode-${VERSION}-windows-x64.exe" \
         "windows-arm64:atomcode-${VERSION}-windows-arm64.exe"
     do

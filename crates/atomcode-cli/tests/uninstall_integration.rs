@@ -2,9 +2,13 @@ use assert_cmd::Command;
 use std::fs;
 use tempfile::TempDir;
 
-/// Build a fake `~/.atomcode/` so the CLI sees something to scan.
+/// Build a fake atomcode data dir so the CLI sees something to scan.
+///
+/// Under unified semantics, `ATOMCODE_HOME` IS the data root (equivalent to
+/// `~/.atomcode/`), so we point the env var directly at this dir — no extra
+/// `.atomcode` subdir.
 fn make_fake_data(tmp: &TempDir) -> std::path::PathBuf {
-    let data = tmp.path().join(".atomcode");
+    let data = tmp.path().join("atomcode-data");
     fs::create_dir(&data).unwrap();
     fs::write(data.join("auth.toml"), b"k=1").unwrap();
     fs::write(data.join("config.toml"), b"x=1").unwrap();
@@ -19,7 +23,7 @@ fn dry_run_makes_no_changes() {
     let data = make_fake_data(&tmp);
     Command::cargo_bin("atomcode")
         .unwrap()
-        .env("ATOMCODE_HOME_OVERRIDE", &data)
+        .env("ATOMCODE_HOME", &data)
         .args(["uninstall", "--dry-run"])
         .assert()
         .success()
@@ -36,7 +40,7 @@ fn no_tty_no_flag_exits_2() {
     let data = make_fake_data(&tmp);
     Command::cargo_bin("atomcode")
         .unwrap()
-        .env("ATOMCODE_HOME_OVERRIDE", &data)
+        .env("ATOMCODE_HOME", &data)
         .arg("uninstall")
         .write_stdin("")
         .assert()
@@ -53,7 +57,7 @@ fn purge_and_keep_data_conflict_exit_2() {
     let data = make_fake_data(&tmp);
     Command::cargo_bin("atomcode")
         .unwrap()
-        .env("ATOMCODE_HOME_OVERRIDE", &data)
+        .env("ATOMCODE_HOME", &data)
         .args(["uninstall", "--purge", "--keep-data"])
         .assert()
         .failure()

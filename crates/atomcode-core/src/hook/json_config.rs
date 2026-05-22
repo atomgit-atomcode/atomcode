@@ -1,7 +1,7 @@
 //! Hooks JSON configuration loading — mirrors the MCP config pattern.
 //!
 //! Hooks are configured in JSON files:
-//! - `~/.atomcode/hooks.json`       — global hooks
+//! - `$ATOMCODE_HOME/hooks.json` — global hooks
 //! - `<project>/.hooks.json`        — project-level hooks (override global by name)
 //!
 //! Project hooks override global hooks with the same name. Hooks with
@@ -39,15 +39,13 @@ fn default_timeout() -> u64 {
     10_000
 }
 
-/// Load and merge hooks from global (`~/.atomcode/hooks.json`) and project
+/// Load and merge hooks from global (`$ATOMCODE_HOME/hooks.json`) and project
 /// (`.hooks.json`) config files.
 ///
 /// Project hooks override global hooks with the same name. Disabled hooks
 /// are filtered out.
 pub fn load_hooks_config(project_dir: &Path) -> Vec<HookConfig> {
-    let global_path = dirs::home_dir()
-        .map(|h| h.join(".atomcode/hooks.json"))
-        .unwrap_or_default();
+    let global_path = crate::config::Config::config_dir().join("hooks.json");
     let project_path = project_dir.join(".hooks.json");
 
     let mut merged: BTreeMap<String, HookConfig> = BTreeMap::new();
@@ -159,6 +157,12 @@ fn cc_event_name_to_event(name: &str) -> Option<HookEvent> {
     })
 }
 
+fn parse_hook_event(name: &str) -> Option<HookEvent> {
+    serde_json::from_value::<HookEvent>(serde_json::Value::String(name.to_string()))
+        .ok()
+        .or_else(|| cc_event_name_to_event(name))
+}
+
 /// Parse a single hooks JSON file and return named hook configs.
 ///
 /// Disabled hooks are filtered out. Missing files return an empty vec
@@ -177,9 +181,9 @@ fn load_hooks_file(path: &Path) -> Result<Vec<(String, HookConfig)>> {
         if entry.disabled {
             continue;
         }
-        let event: HookEvent =
-            serde_json::from_value(serde_json::Value::String(entry.event.clone()))
-                .unwrap_or(HookEvent::PreToolUse);
+        let Some(event) = parse_hook_event(&entry.event) else {
+            continue;
+        };
         configs.push((
             name,
             HookConfig {
@@ -454,6 +458,40 @@ mod tests {
         assert_eq!(map["h4"].event, HookEvent::SessionEnd);
     }
 
+    #[test]
+    fn pascal_case_event_names_are_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let json = r#"{
+            "hooks": {
+                "h1": { "event": "PreToolUse", "command": "a" },
+                "h2": { "event": "UserPromptSubmit", "command": "b" }
+            }
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        let hooks = load_hooks_file(&path).unwrap();
+        let map: BTreeMap<String, HookConfig> = hooks.into_iter().collect();
+        assert_eq!(map["h1"].event, HookEvent::PreToolUse);
+        assert_eq!(map["h2"].event, HookEvent::UserPromptSubmit);
+    }
+
+    #[test]
+    fn invalid_event_name_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let json = r#"{
+            "hooks": {
+                "typo": { "event": "pre_tool", "command": "should-not-run" },
+                "valid": { "event": "post_tool_use", "command": "echo ok" }
+            }
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        let hooks = load_hooks_file(&path).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].0, "valid");
+        assert_eq!(hooks[0].1.event, HookEvent::PostToolUse);
+    }
+
     /// Malformed JSON returns an error, not a panic.
     #[test]
     fn malformed_json_returns_error() {
@@ -501,7 +539,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMCODE_HOME", tmp.path());
 
-        let plugin_dir = tmp.path().join(".atomcode/plugins/marketplaces/p");
+        let plugin_dir = tmp.path().join("plugins/marketplaces/p");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(
             plugin_dir.join("hooks.json"),
@@ -509,7 +547,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            tmp.path().join(".atomcode/plugins/installed_plugins.json"),
+            tmp.path().join("plugins/installed_plugins.json"),
             r#"{"version":1,"plugins":{"p@p":{"marketplace":"p","plugin":"p","plugin_dir":"marketplaces/p","installed_at":"x"}}}"#,
         )
         .unwrap();

@@ -54,30 +54,167 @@ fn detect_light_unix(timeout: Duration) -> Option<bool> {
     let stdin = std::io::stdin();
     let fd = stdin.as_raw_fd();
 
+    // Two-phase budget.
+    //
+    // Phase 1 (main read): caller's contract — up to `timeout` for the
+    // FIRST byte. If nothing arrives in this window the terminal is
+    // non-responsive (macOS Terminal.app, classic conhost, OSC-stripping
+    // SSH relays) and we fall straight through to the dark-mode default
+    // without blocking startup further. If we DO see an OSC opener
+    // (`\x1b]`) within `timeout`, we extend by 250ms so the trailing
+    // bytes of a slow / chunked response can land — without this a
+    // partial OSC 11 reply (e.g. JediTerm, remote relays, Windows
+    // Terminal under load) leaks past the original single-shot read
+    // and the crossterm reader thread later picks those bytes up as
+    // keystrokes. The visible bug was `]11;rgb:0000/0000/0000\` (and
+    // shorter prefixes like `0c/0c0c\`) appearing in the input box.
+    //
+    // Phase 2 (tail-drain): handles the case where the OSC response
+    // started arriving AFTER `timeout` — Phase 1 already broke out
+    // empty-handed, but the bytes are about to land. We spend an extra
+    // 80ms peeking; we only commit to bulk-draining once we've confirmed
+    // a `\x1b]` opener, so a user keystroke that happens to land in
+    // this window loses at most one or two bytes (vs. the bulk read in
+    // Phase 1 which would swallow up to 128). In practice the input
+    // prompt isn't on screen during the 100–180ms window so the user
+    // hasn't started typing yet, but the byte-at-a-time probe keeps
+    // the worst case bounded if they have.
+    let start = std::time::Instant::now();
+    let initial_deadline = start + timeout;
+    let extended_deadline = initial_deadline + Duration::from_millis(250);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    let mut saw_osc_start = false;
+
+    // Phase 1.
+    loop {
+        let deadline = if saw_osc_start { extended_deadline } else { initial_deadline };
+        let mut chunk = [0u8; 128];
+        // SAFETY: chunk is stack-allocated and lives for the call; fd
+        // is owned by stdin for the process lifetime.
+        let nread = unsafe { poll_read(fd, deadline, &mut chunk) };
+        if nread == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..nread]);
+
+        // Lock in the deadline extension the first time we see the OSC
+        // opener; from here on Phase 1 keeps draining until terminator.
+        if !saw_osc_start {
+            saw_osc_start = buf.windows(2).any(|w| w == b"\x1b]");
+            // First bytes weren't an OSC opener — almost certainly a
+            // stray keystroke that landed in the input queue before
+            // our query. Don't keep slurping their input in bulk-read
+            // mode; if the OSC reply is still coming, Phase 2 will
+            // catch it.
+            if !saw_osc_start {
+                break;
+            }
+        }
+
+        if has_osc_terminator(&buf) {
+            break;
+        }
+    }
+
+    // Phase 2: tail-drain. Only runs when Phase 1 didn't already
+    // consume a complete OSC reply (terminator absent from `buf`).
+    if !has_osc_terminator(&buf) {
+        let tail_deadline = std::time::Instant::now() + Duration::from_millis(80);
+        // If Phase 1 already saw the opener, we're committed to bulk
+        // draining. Otherwise we probe a byte at a time.
+        let mut committed = saw_osc_start;
+        loop {
+            if committed {
+                let mut chunk = [0u8; 128];
+                // SAFETY: same invariants as the Phase 1 read.
+                let nread = unsafe { poll_read(fd, tail_deadline, &mut chunk) };
+                if nread == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..nread]);
+            } else {
+                // Peek the first byte. Anything other than ESC means
+                // it's not an OSC reply — stop immediately so we don't
+                // keep eating user input.
+                let mut probe = [0u8; 1];
+                // SAFETY: see Phase 1.
+                let nread = unsafe { poll_read(fd, tail_deadline, &mut probe) };
+                if nread == 0 {
+                    break;
+                }
+                if probe[0] != b'\x1b' {
+                    buf.push(probe[0]);
+                    break;
+                }
+                buf.push(probe[0]);
+                // ESC seen — disambiguate `\x1b]` (OSC, what we want)
+                // from `\x1b[` / `\x1bO` / bare ESC (which we leave
+                // alone). The terminal may send ESC and pause briefly
+                // before the next byte; poll again with what's left
+                // of the tail budget.
+                let mut probe2 = [0u8; 1];
+                // SAFETY: see Phase 1.
+                let nread2 = unsafe { poll_read(fd, tail_deadline, &mut probe2) };
+                if nread2 == 0 {
+                    break;
+                }
+                buf.push(probe2[0]);
+                if probe2[0] != b']' {
+                    break;
+                }
+                committed = true;
+            }
+
+            if has_osc_terminator(&buf) {
+                break;
+            }
+        }
+    }
+
+    parse_osc11_response(&buf)
+}
+
+/// True when `buf` contains an OSC terminator (BEL or ESC \). Used by
+/// both phases of [`detect_light_unix`] to know when an in-flight OSC
+/// reply is fully drained.
+#[cfg(unix)]
+fn has_osc_terminator(buf: &[u8]) -> bool {
+    buf.contains(&b'\x07') || buf.windows(2).any(|w| w == b"\x1b\\")
+}
+
+/// Wait until `deadline` for `fd` to be readable, then read up to
+/// `out.len()` bytes into `out`. Returns the number of bytes read, or
+/// `0` on timeout / poll error / EOF / read error. Factored out so
+/// the two phases of [`detect_light_unix`] share one poll-then-read
+/// path with identical clamping and SAFETY invariants.
+///
+/// # Safety
+/// `fd` must be a valid file descriptor for the entire call; `out`
+/// must be writable for `out.len()` bytes.
+#[cfg(unix)]
+unsafe fn poll_read(fd: i32, deadline: std::time::Instant, out: &mut [u8]) -> usize {
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return 0;
+    }
+    // poll() ms argument is i32; clamp to its range.
+    let ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
     let mut pollfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    // poll() ms argument is i32; clamp the duration to its range.
-    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: pollfd is a properly-initialised single-element array;
-    // libc::poll mutates its `revents` field in-place. fd is valid for
-    // the duration of the call (stdin owns it for the process lifetime).
-    let n = unsafe { libc::poll(&mut pollfd, 1, ms) };
+    let n = libc::poll(&mut pollfd, 1, ms);
     if n <= 0 {
-        return None;
+        return 0;
     }
-
-    let mut buf = [0u8; 128];
-    // SAFETY: buf is a stack-allocated array; len matches its size.
-    let nread = unsafe {
-        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-    };
+    let nread = libc::read(fd, out.as_mut_ptr() as *mut libc::c_void, out.len());
     if nread <= 0 {
-        return None;
+        0
+    } else {
+        nread as usize
     }
-    parse_osc11_response(&buf[..nread as usize])
 }
 
 /// Parse an OSC 11 reply of shape `ESC ] 11 ; rgb:RRRR/GGGG/BBBB BEL`

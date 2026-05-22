@@ -1,4 +1,4 @@
-//! Setup wizard — install seed files (skills/commands/hooks/MCP) to `~/.atomcode/`.
+//! Setup wizard — install seed files (skills/commands/hooks/MCP) to `$ATOMCODE_HOME/`.
 //!
 //! Simplified pipeline: lock → scan → install all seeds → setup-state → report.
 
@@ -101,7 +101,7 @@ pub fn run(opts: RunOptions) -> SetupResult<SetupReport> {
     })
 }
 
-/// Copy directory-style skills from seeds-cache to ~/.atomcode/skills/.
+/// Copy directory-style skills from seeds-cache to $ATOMCODE_HOME/skills/.
 /// E.g., `atomcode-automation-recommender/SKILL.md` + `references/`.
 ///
 /// When `force` is true, skills are reinstalled even if the content hash matches
@@ -112,14 +112,10 @@ fn install_directory_skills_from_seeds(
     force: bool,
 ) {
     let seeds_skills = cache_dir.join("skills");
-    // Target path must match SkillRegistry::reload's scan path:
-    //   - When ATOMCODE_HOME is set: ATOMCODE_HOME/.atomcode/skills
-    //   - Otherwise: config_dir()/skills  (config_dir == ~/.atomcode)
-    let target_skills = std::env::var("ATOMCODE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|home| PathBuf::from(home).join(".atomcode").join("skills"))
-        .unwrap_or_else(|| crate::config::Config::config_dir().join("skills"));
+    // Target path must match SkillRegistry::reload's scan path: a single
+    // unified config dir (Config::config_dir()) that resolves to
+    // ATOMCODE_HOME when set, else $HOME/.atomcode.
+    let target_skills = crate::config::Config::config_dir().join("skills");
 
     let entries = match std::fs::read_dir(&seeds_skills) {
         Ok(e) => e,

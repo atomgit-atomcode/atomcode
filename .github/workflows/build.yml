@@ -3,7 +3,7 @@ name: build
 on:
   push:
     tags:
-      - "atomcode-v*"
+      - "v*"
   workflow_dispatch:
 
 jobs:
@@ -47,8 +47,8 @@ jobs:
 
           mkdir -p dist
 
-          cp target/aarch64-apple-darwin/release/atomcode dist/${TAG_NAME}-macos-arm64
-          cp target/x86_64-apple-darwin/release/atomcode dist/${TAG_NAME}-macos-x86_64
+          cp target/aarch64-apple-darwin/release/atomcode dist/atomcode-${TAG_NAME}-darwin-arm64
+          cp target/x86_64-apple-darwin/release/atomcode dist/atomcode-${TAG_NAME}-darwin-x64
 
           chmod +x dist/*
 
@@ -75,8 +75,8 @@ jobs:
 
           python3 .github/workflows/create_tag_release.py \
             --tag-name=${TAG_NAME} \
-            --file-name=${TAG_NAME}-macos-arm64 \
-            --file-path=dist/${TAG_NAME}-macos-arm64 \
+            --file-name=atomcode-${TAG_NAME}-darwin-arm64 \
+            --file-path=dist/atomcode-${TAG_NAME}-darwin-arm64 \
             --access-token=${{ secrets.ACCESS_TOKEN }}
 
       # 1️⃣1️⃣ 上传 x86_64
@@ -87,8 +87,8 @@ jobs:
 
           python3 .github/workflows/create_tag_release.py \
             --tag-name=${TAG_NAME} \
-            --file-name=${TAG_NAME}-macos-x86_64 \
-            --file-path=dist/${TAG_NAME}-macos-x86_64 \
+            --file-name=atomcode-${TAG_NAME}-darwin-x64 \
+            --file-path=dist/atomcode-${TAG_NAME}-darwin-x64 \
             --access-token=${{ secrets.ACCESS_TOKEN }}
 
   build-linux:
@@ -130,7 +130,7 @@ jobs:
       - name: Build ARM64
         run: cargo build --release --target aarch64-unknown-linux-gnu
         env:
-          CC_aarch64-unknown-linux-gnu: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       # 7️⃣ 生成带版本号的二进制
@@ -140,8 +140,8 @@ jobs:
 
           mkdir -p dist
 
-          cp target/x86_64-unknown-linux-gnu/release/atomcode dist/${TAG_NAME}-linux-x86_64
-          cp target/aarch64-unknown-linux-gnu/release/atomcode dist/${TAG_NAME}-linux-arm64
+          cp target/x86_64-unknown-linux-gnu/release/atomcode dist/atomcode-${TAG_NAME}-linux-x64
+          cp target/aarch64-unknown-linux-gnu/release/atomcode dist/atomcode-${TAG_NAME}-linux-arm64
 
           chmod +x dist/*
 
@@ -149,8 +149,8 @@ jobs:
       - name: Strip binaries
         run: |
           TAG_NAME=${GITHUB_REF#refs/tags/}
-          strip dist/${TAG_NAME}-linux-x86_64 || true
-          aarch64-linux-gnu-strip dist/${TAG_NAME}-linux-arm64 || true
+          strip dist/atomcode-${TAG_NAME}-linux-x64 || true
+          aarch64-linux-gnu-strip dist/atomcode-${TAG_NAME}-linux-arm64 || true
 
       # 9️⃣ 安装 Python
       - name: Setup Python
@@ -166,8 +166,8 @@ jobs:
 
           python3 .github/workflows/create_tag_release.py \
             --tag-name=${TAG_NAME} \
-            --file-name=${TAG_NAME}-linux-x86_64 \
-            --file-path=dist/${TAG_NAME}-linux-x86_64 \
+            --file-name=atomcode-${TAG_NAME}-linux-x64 \
+            --file-path=dist/atomcode-${TAG_NAME}-linux-x64 \
             --access-token=${{ secrets.ACCESS_TOKEN }}
 
       # 1️⃣1️⃣ 上传 ARM64
@@ -178,8 +178,8 @@ jobs:
 
           python3 .github/workflows/create_tag_release.py \
             --tag-name=${TAG_NAME} \
-            --file-name=${TAG_NAME}-linux-arm64 \
-            --file-path=dist/${TAG_NAME}-linux-arm64 \
+            --file-name=atomcode-${TAG_NAME}-linux-arm64 \
+            --file-path=dist/atomcode-${TAG_NAME}-linux-arm64 \
             --access-token=${{ secrets.ACCESS_TOKEN }}
 
   build-windows:
@@ -225,8 +225,8 @@ jobs:
 
           mkdir -p dist
 
-          cp target/aarch64-pc-windows-msvc/release/atomcode.exe dist/${TAG_NAME}-windows-arm64.exe
-          cp target/x86_64-pc-windows-msvc/release/atomcode.exe dist/${TAG_NAME}-windows-x86_64.exe
+          cp target/aarch64-pc-windows-msvc/release/atomcode.exe dist/atomcode-${TAG_NAME}-windows-arm64.exe
+          cp target/x86_64-pc-windows-msvc/release/atomcode.exe dist/atomcode-${TAG_NAME}-windows-x64.exe
 
       # 7️⃣ 安装 Python
       - name: Setup Python
@@ -243,8 +243,8 @@ jobs:
 
           python3 .github/workflows/create_tag_release.py \
             --tag-name=${TAG_NAME} \
-            --file-name=${TAG_NAME}-windows-arm64.exe \
-            --file-path=dist/${TAG_NAME}-windows-arm64.exe \
+            --file-name=atomcode-${TAG_NAME}-windows-arm64.exe \
+            --file-path=dist/atomcode-${TAG_NAME}-windows-arm64.exe \
             --access-token=${{ secrets.ACCESS_TOKEN }}
 
       # 9️⃣ 上传 x86_64
@@ -256,6 +256,6 @@ jobs:
 
           python3 .github/workflows/create_tag_release.py \
             --tag-name=${TAG_NAME} \
-            --file-name=${TAG_NAME}-windows-x86_64.exe \
-            --file-path=dist/${TAG_NAME}-windows-x86_64.exe \
+            --file-name=atomcode-${TAG_NAME}-windows-x64.exe \
+            --file-path=dist/atomcode-${TAG_NAME}-windows-x64.exe \
             --access-token=${{ secrets.ACCESS_TOKEN }}

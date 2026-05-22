@@ -1202,17 +1202,26 @@ impl Buffer {
 
     /// Try to move the cursor up one logical line, preserving the
     /// column (measured in display cells so CJK lines up). Returns
-    /// `false` if the cursor was already on the first line — caller
+    /// `false` only when the cursor is already at byte 0 — caller
     /// can then fall through to history navigation. Designed for the
     /// `Up` keystroke in multi-line composition: pressing Up walks
-    /// the cursor through the buffer's lines first; only when there
-    /// are no more lines above does it surface history.
+    /// the cursor through the buffer's lines first, then snaps to
+    /// the start of the first line, and only the next Up after that
+    /// surfaces history. Costs one extra keystroke before history
+    /// kicks in but rescues anyone who paged Up to fix a typo on
+    /// line 1 from losing their draft.
     pub fn cursor_line_up(&mut self) -> bool {
         let cur_line_start = self.text[..self.cursor]
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
         if cur_line_start == 0 {
+            // Already on the first line. Snap to byte 0 first; only
+            // the next Up after that falls through to HistoryPrev.
+            if self.cursor > 0 {
+                self.cursor = 0;
+                return true;
+            }
             return false;
         }
         let target_col = crate::width::display_width(&self.text[cur_line_start..self.cursor]);
@@ -1226,10 +1235,17 @@ impl Buffer {
         true
     }
 
-    /// Mirror of [`cursor_line_up`] for `Down`. Returns `false` if the
-    /// cursor was already on the last logical line.
+    /// Mirror of [`cursor_line_up`] for `Down`. Returns `false` only
+    /// when the cursor is already at `text.len()` — caller then
+    /// falls through to HistoryNext. On the last logical line, Down
+    /// first snaps to end-of-buffer; the keystroke after that hands
+    /// off to history.
     pub fn cursor_line_down(&mut self) -> bool {
         let Some(rel_end) = self.text[self.cursor..].find('\n') else {
+            if self.cursor < self.text.len() {
+                self.cursor = self.text.len();
+                return true;
+            }
             return false;
         };
         let cur_line_start = self.text[..self.cursor]
@@ -1657,9 +1673,11 @@ mod menu_tests {
     #[test]
     fn cursor_line_up_walks_lines_then_signals_history_at_top() {
         // "1\n2\n3" with cursor after the trailing "3". Up should
-        // walk: end-of-3 → end-of-2 → end-of-1. Once we're on line
-        // 1, another Up returns false so the caller switches to
-        // history navigation.
+        // walk: end-of-3 → end-of-2 → end-of-1 → start-of-1 → false.
+        // The start-of-1 snap is the rescue step: even on a single-
+        // line draft, Up first parks at column 0 before history nav
+        // kicks in, so a fat-fingered Up can't silently swallow what
+        // the user just typed.
         let mut buf = Buffer::new();
         buf.text = "1\n2\n3".into();
         buf.cursor = buf.text.len();
@@ -1669,10 +1687,14 @@ mod menu_tests {
         assert!(buf.cursor_line_up(), "second Up moves up from line 2");
         assert_eq!(&buf.text[..buf.cursor], "1");
         assert!(
-            !buf.cursor_line_up(),
-            "on the first line cursor_line_up returns false → caller falls through to HistoryPrev"
+            buf.cursor_line_up(),
+            "on the first line Up snaps to byte 0 before yielding"
         );
-        assert_eq!(&buf.text[..buf.cursor], "1");
+        assert_eq!(buf.cursor, 0);
+        assert!(
+            !buf.cursor_line_up(),
+            "already at byte 0 → caller falls through to HistoryPrev"
+        );
     }
 
     #[test]
@@ -1686,9 +1708,38 @@ mod menu_tests {
         assert!(buf.cursor_line_down(), "Down from line 2 → line 3");
         assert_eq!(&buf.text[..buf.cursor], "1\n2\n");
         assert!(
-            !buf.cursor_line_down(),
-            "on the last line cursor_line_down returns false"
+            buf.cursor_line_down(),
+            "on the last line Down snaps to end-of-buffer before yielding"
         );
+        assert_eq!(buf.cursor, buf.text.len());
+        assert!(
+            !buf.cursor_line_down(),
+            "already at end → caller falls through to HistoryNext"
+        );
+    }
+
+    #[test]
+    fn cursor_line_up_snaps_to_start_on_single_line() {
+        // Single-line draft: Up should pull the cursor to column 0
+        // first; only the next Up after that surfaces history.
+        let mut buf = Buffer::new();
+        buf.text = "hello world".into();
+        buf.cursor = 7; // inside the word "world"
+
+        assert!(buf.cursor_line_up(), "Up snaps to byte 0 on single line");
+        assert_eq!(buf.cursor, 0);
+        assert!(!buf.cursor_line_up(), "second Up yields to history");
+    }
+
+    #[test]
+    fn cursor_line_down_snaps_to_end_on_single_line() {
+        let mut buf = Buffer::new();
+        buf.text = "hello world".into();
+        buf.cursor = 4;
+
+        assert!(buf.cursor_line_down(), "Down snaps to end on single line");
+        assert_eq!(buf.cursor, buf.text.len());
+        assert!(!buf.cursor_line_down(), "second Down yields to history");
     }
 
     #[test]
@@ -4909,14 +4960,10 @@ fn should_auto_show_setup(ctx: &LoopCtx) -> bool {
     }
 
     // setup-state.json exists but the skill may have been deleted manually.
-    // Path must match SkillRegistry::reload's scan path:
-    //   - ATOMCODE_HOME set → ATOMCODE_HOME/.atomcode/skills/
-    //   - otherwise → config_dir()/skills/ (config_dir == ~/.atomcode)
-    let skill_dir = std::env::var("ATOMCODE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|home| std::path::PathBuf::from(home).join(".atomcode").join("skills"))
-        .unwrap_or_else(|| atomcode_core::config::Config::config_dir().join("skills"))
+    // Path must match SkillRegistry::reload's scan path: the unified
+    // Config::config_dir() (== ATOMCODE_HOME when set, else ~/.atomcode).
+    let skill_dir = atomcode_core::config::Config::config_dir()
+        .join("skills")
         .join("atomcode-automation-recommender");
     !skill_dir.exists()
 }

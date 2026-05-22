@@ -86,7 +86,7 @@ pub struct Config {
     pub default_workdir: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
     /// Per-turn datalog settings. Missing from older configs → defaults to
-    /// enabled=true, dir="~/.atomcode/datalog" (project slug appended underneath).
+    /// enabled=true, dir="$ATOMCODE_HOME/datalog" (project slug appended underneath).
     ///
     /// `skip_serializing` intentionally suppresses serde's automatic output;
     /// `save()` writes this section manually with explanatory comments and
@@ -158,7 +158,7 @@ pub struct Config {
 pub struct PluginConfig {
     /// First-startup behaviour: when true (default), atomcode runs a
     /// one-time `git clone` of the default `atomcode-skills`
-    /// marketplace into `~/.atomcode/plugins/marketplaces/`. A marker
+    /// marketplace into `$ATOMCODE_HOME/plugins/marketplaces/`. A marker
     /// file (`~/.atomcode/.plugin_bootstrap_v1`) is touched after the
     /// first attempt — set or unset — so the install fires exactly
     /// once per user. A subsequent `/plugin uninstall` is respected;
@@ -452,6 +452,25 @@ fn render_notifications_section(cfg: &NotificationConfig) -> String {
     out
 }
 
+fn render_telemetry_section(cfg: &TelemetryConfig) -> String {
+    if cfg.enabled.is_none() && cfg.endpoint.is_none() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("\n# Anonymous telemetry. Omit `enabled` for the default enabled behavior.\n");
+    out.push_str("# Set `enabled = false` to opt out persistently.\n");
+    out.push_str("[telemetry]\n");
+    if let Some(enabled) = cfg.enabled {
+        out.push_str(&format!("enabled = {}\n", enabled));
+    }
+    if let Some(endpoint) = cfg.endpoint.as_deref() {
+        let escaped = endpoint.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!("endpoint = \"{}\"\n", escaped));
+    }
+    out
+}
+
 /// Render a documentation comment about the layered instruction file system.
 /// Always emitted (even on first save) so users discover the feature.
 fn render_instructions_section() -> String {
@@ -558,6 +577,7 @@ impl Config {
         let mut content = toml::to_string_pretty(&persistent)?;
         content.push_str(&render_datalog_section(&self.datalog));
         content.push_str(&render_notifications_section(&self.notifications));
+        content.push_str(&render_telemetry_section(&self.telemetry));
         content.push_str(&render_instructions_section());
         content.push_str(&render_hooks_json_section());
         std::fs::write(path, content)?;
@@ -1337,5 +1357,42 @@ endpoint = "https://test.example/v1"
             c.telemetry.endpoint.as_deref(),
             Some("https://test.example/v1")
         );
+    }
+
+    #[test]
+    fn saved_config_preserves_explicit_telemetry_section() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atomcode_cfg_telemetry_rt_{}.toml",
+            std::process::id()
+        ));
+        let cfg = Config {
+            default_provider: "p".to_string(),
+            default_workdir: None,
+            providers: HashMap::new(),
+            datalog: DatalogConfig::default(),
+            notifications: NotificationConfig::default(),
+            auto_update: true,
+            reflection_cadence: 7,
+            telemetry: TelemetryConfig {
+                enabled: Some(false),
+                endpoint: Some("https://telemetry.example/v1".to_string()),
+            },
+            lsp: LspConfig::default(),
+            auto_commit: false,
+        };
+
+        cfg.save(&tmp).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        assert!(text.contains("[telemetry]"));
+        assert!(text.contains("enabled = false"));
+        assert!(text.contains("endpoint = \"https://telemetry.example/v1\""));
+
+        let reloaded = Config::load(&tmp).unwrap();
+        assert_eq!(reloaded.telemetry.enabled, Some(false));
+        assert_eq!(
+            reloaded.telemetry.endpoint.as_deref(),
+            Some("https://telemetry.example/v1")
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }

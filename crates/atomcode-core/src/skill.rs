@@ -180,12 +180,7 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
 
     let after_open = &content[if content.starts_with("---\r\n") { 5 } else { 4 }..];
 
-    let close = after_open
-        .find("\n---\n")
-        .map(|p| (p, 5usize))
-        .or_else(|| after_open.find("\n---\r\n").map(|p| (p, 6)));
-
-    let (close_pos, skip) = match close {
+    let (close_pos, skip) = match find_frontmatter_close(after_open) {
         Some(v) => v,
         None => return (fm, content.to_string()),
     };
@@ -221,6 +216,32 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
     }
 
     (fm, template)
+}
+
+fn find_frontmatter_close(after_open: &str) -> Option<(usize, usize)> {
+    if after_open == "---" {
+        return Some((0, 3));
+    }
+    if after_open == "---\r" {
+        return Some((0, 4));
+    }
+    if after_open.starts_with("---\n") {
+        return Some((0, 4));
+    }
+    if after_open.starts_with("---\r\n") {
+        return Some((0, 5));
+    }
+
+    after_open
+        .find("\n---\n")
+        .map(|p| (p, 5usize))
+        .or_else(|| after_open.find("\n---\r\n").map(|p| (p, 6)))
+        .or_else(|| after_open.strip_suffix("\n---").map(|_| (after_open.len() - 4, 4)))
+        .or_else(|| {
+            after_open
+                .strip_suffix("\n---\r")
+                .map(|_| (after_open.len() - 5, 5))
+        })
 }
 
 /// Extract a description from the first non-empty paragraph of the template,
@@ -388,12 +409,11 @@ impl SkillRegistry {
         // System home directory (for Claude Code compat paths)
         let system_home = crate::tool::real_home_dir();
 
-        // AtomCode home directory (respects ATOMCODE_HOME env var)
-        let atomcode_home: Option<PathBuf> = std::env::var("ATOMCODE_HOME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| system_home.clone());
+        // AtomCode config dir (respects ATOMCODE_HOME env var; defaults to
+        // ~/.atomcode). This is the SAME root used by config.toml, history,
+        // plugins/, etc. — see Config::config_dir() for the single source of
+        // truth.
+        let atomcode_config_dir = crate::config::Config::config_dir();
 
         // All "loose" skills (i.e. not loaded through a plugin manifest)
         // share the synthetic `skills:` namespace so they're visually
@@ -409,11 +429,9 @@ impl SkillRegistry {
             self.load_skills_dir(&home.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
         }
 
-        // Load atomcode native paths from ATOMCODE_HOME (or system home as fallback)
-        if let Some(ref home) = atomcode_home {
-            self.load_flat_commands(&home.join(".atomcode").join("commands"), LOOSE_NS, &mut warnings);
-            self.load_skills_dir(&home.join(".atomcode").join("skills"), LOOSE_NS, &mut warnings);
-        }
+        // Load atomcode native paths from the unified config dir.
+        self.load_flat_commands(&atomcode_config_dir.join("commands"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(&atomcode_config_dir.join("skills"), LOOSE_NS, &mut warnings);
 
         // Project-level skills (always from working dir)
         self.load_flat_commands(&working_dir.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
@@ -678,6 +696,23 @@ mod tests {
     }
 
     #[test]
+    fn test_frontmatter_closing_delimiter_at_eof() {
+        let content = "---\nname: eof-skill\ndescription: EOF skill\n---";
+        let (fm, tmpl) = parse_frontmatter(content);
+        assert_eq!(fm.name.as_deref(), Some("eof-skill"));
+        assert_eq!(fm.description, "EOF skill");
+        assert_eq!(tmpl, "");
+    }
+
+    #[test]
+    fn test_empty_frontmatter_before_body() {
+        let content = "---\n---\nBody.\n";
+        let (fm, tmpl) = parse_frontmatter(content);
+        assert_eq!(fm.description, "");
+        assert_eq!(tmpl, "Body.\n");
+    }
+
+    #[test]
     fn test_frontmatter_unclosed() {
         let content = "---\ndescription: broken\nno closing delimiter";
         let (fm, tmpl) = parse_frontmatter(content);
@@ -830,7 +865,9 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", tmp.path());
 
         // Fake a registered + installed plugin on disk.
-        let plugins_root = tmp.path().join(".atomcode/plugins");
+        // Under unified ATOMCODE_HOME semantics, plugins live at $HOME/plugins
+        // (not $HOME/.atomcode/plugins) — see plugin/paths.rs.
+        let plugins_root = tmp.path().join("plugins");
         let plugin_dir = plugins_root.join("marketplaces/p");
         let skill_dir = plugin_dir.join("skills/hello");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -921,7 +958,8 @@ mod tests {
         std::env::set_var("ATOMCODE_HOME", tmp.path());
 
         // Fake a plugin whose plugin.json uses CC array format.
-        let plugins_root = tmp.path().join(".atomcode/plugins");
+        // Plugins live directly under ATOMCODE_HOME (unified semantics).
+        let plugins_root = tmp.path().join("plugins");
         let plugin_dir = plugins_root.join("marketplaces/karpathy-skills");
         let skill_dir = plugin_dir.join("skills/karpathy-guidelines");
         std::fs::create_dir_all(&skill_dir).unwrap();

@@ -83,7 +83,7 @@ mod tests {
     use std::process::Command;
 
     fn make_repo(name: &str) -> PathBuf {
-        let work = tempfile::tempdir().unwrap().into_path();
+        let work = tempfile::tempdir().unwrap().keep();
         let repo = work.join(name);
         std::fs::create_dir_all(&repo).unwrap();
         Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();

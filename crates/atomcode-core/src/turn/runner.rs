@@ -207,7 +207,7 @@ impl TurnRunner {
         // sessions.
         //
         // `datalog_dir` is resolved from `[datalog].dir` (default
-        // `~/.atomcode/datalog/<project-slug>/`) — the same root the
+        // `$ATOMCODE_HOME/datalog/<project-slug>/`) — the same root the
         // markdown writer uses, so request JSON, response JSON, calls.log,
         // and the markdown summary all live next to each other for any
         // given project.
@@ -1262,7 +1262,7 @@ impl TurnRunner {
                 });
             }
 
-            let decision = self.permission.decide(call, reason).await;
+            let decision = self.permission.decide(call, &approval).await;
             if !matches!(decision, PermissionDecision::Allow) {
                 let output = format!("Tool '{}' was denied by the user.", call.name);
                 let _ = event_tx.send(TurnEvent::ToolCallResult {

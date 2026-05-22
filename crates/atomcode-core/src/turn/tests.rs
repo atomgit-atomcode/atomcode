@@ -436,7 +436,7 @@ async fn test_turn_runner_emits_text_delta_events() {
 
 #[tokio::test]
 async fn test_turn_runner_executes_tool_call() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
@@ -466,7 +466,7 @@ async fn test_turn_runner_executes_tool_call() {
 
 #[tokio::test]
 async fn test_turn_runner_emits_tool_events() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
@@ -616,7 +616,7 @@ async fn test_turn_runner_cancellation() {
 
 #[tokio::test]
 async fn test_turn_runner_auto_deny_blocks_dangerous_tool() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
@@ -646,7 +646,7 @@ async fn test_turn_runner_auto_deny_blocks_dangerous_tool() {
 
 #[tokio::test]
 async fn test_turn_runner_auto_bypass_allows_dangerous_tool() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
@@ -675,7 +675,7 @@ async fn test_turn_runner_auto_bypass_allows_dangerous_tool() {
 
 #[tokio::test]
 async fn test_turn_runner_interactive_approval_allow() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let (req_tx, mut req_rx) = mpsc::unbounded_channel();
@@ -715,7 +715,7 @@ async fn test_turn_runner_interactive_approval_allow() {
 
 #[tokio::test]
 async fn test_turn_runner_interactive_approval_deny() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let (req_tx, mut req_rx) = mpsc::unbounded_channel();
@@ -756,7 +756,7 @@ async fn test_turn_runner_interactive_approval_deny() {
 
 #[tokio::test]
 async fn test_turn_runner_uses_context_aware_approval() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(ContextDangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("context_dangerous", "{}");
@@ -938,7 +938,7 @@ async fn test_turn_runner_adds_assistant_message_on_text_response() {
 
 #[tokio::test]
 async fn test_turn_runner_adds_tool_call_and_result_messages() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", "{}");
@@ -973,7 +973,7 @@ async fn test_turn_runner_adds_tool_call_and_result_messages() {
 /// conversation (AssistantWithToolCalls → matching ToolResult).
 #[tokio::test]
 async fn test_tool_result_content_in_llm_context() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
@@ -1049,7 +1049,7 @@ async fn test_tool_result_content_in_llm_context() {
 /// with correct call_id linkage in the conversation.
 #[tokio::test]
 async fn test_multiple_tool_calls_results_in_context() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
     tools.register(Box::new(EchoTool { name: "read_file" })).await;
 
@@ -1140,7 +1140,7 @@ async fn test_multiple_tool_calls_results_in_context() {
 /// (with success=false), so the LLM knows the tool was denied and can adjust.
 #[tokio::test]
 async fn test_denied_tool_result_in_llm_context() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
@@ -1235,7 +1235,7 @@ async fn test_empty_turn_reminder_is_noop() {
 /// ToolRegistry should return definitions in stable (sorted) order.
 #[tokio::test]
 async fn test_tool_registry_stable_order() {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     // Register in reverse alphabetical order
     registry.register(Box::new(EchoTool { name: "write_file" })).await;
     registry.register(Box::new(EchoTool { name: "bash" })).await;
@@ -1343,7 +1343,7 @@ async fn malformed_write_file_args_short_circuit_without_approval() {
         async fn decide(
             &self,
             _call: &crate::tool::ToolCall,
-            _reason: &str,
+            _approval: &crate::tool::ApprovalRequirement,
         ) -> crate::tool::PermissionDecision {
             panic!("validate_args gate must short-circuit before approval is requested");
         }
@@ -1560,8 +1560,8 @@ mod telemetry_tests {
 
     #[tokio::test]
     async fn turn_emits_llm_chat_with_tool_calls_count() {
-        let mut tools = ToolRegistry::new();
-        tools.register(Box::new(EchoTool { name: "echo" }));
+        let tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool { name: "echo" })).await;
 
         let (mut runner, captured) = make_runner_with_telemetry(
             MockProvider::with_tool_call("echo", r#"{"msg":"hi"}"#),
