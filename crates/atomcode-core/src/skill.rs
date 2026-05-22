@@ -180,12 +180,7 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
 
     let after_open = &content[if content.starts_with("---\r\n") { 5 } else { 4 }..];
 
-    let close = after_open
-        .find("\n---\n")
-        .map(|p| (p, 5usize))
-        .or_else(|| after_open.find("\n---\r\n").map(|p| (p, 6)));
-
-    let (close_pos, skip) = match close {
+    let (close_pos, skip) = match find_frontmatter_close(after_open) {
         Some(v) => v,
         None => return (fm, content.to_string()),
     };
@@ -221,6 +216,32 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
     }
 
     (fm, template)
+}
+
+fn find_frontmatter_close(after_open: &str) -> Option<(usize, usize)> {
+    if after_open == "---" {
+        return Some((0, 3));
+    }
+    if after_open == "---\r" {
+        return Some((0, 4));
+    }
+    if after_open.starts_with("---\n") {
+        return Some((0, 4));
+    }
+    if after_open.starts_with("---\r\n") {
+        return Some((0, 5));
+    }
+
+    after_open
+        .find("\n---\n")
+        .map(|p| (p, 5usize))
+        .or_else(|| after_open.find("\n---\r\n").map(|p| (p, 6)))
+        .or_else(|| after_open.strip_suffix("\n---").map(|_| (after_open.len() - 4, 4)))
+        .or_else(|| {
+            after_open
+                .strip_suffix("\n---\r")
+                .map(|_| (after_open.len() - 5, 5))
+        })
 }
 
 /// Extract a description from the first non-empty paragraph of the template,
@@ -671,6 +692,23 @@ mod tests {
         assert!(!fm.user_invocable);
         assert_eq!(fm.argument_hint.as_deref(), Some("[file]"));
         assert_eq!(fm.allowed_tools, vec!["Read", "Grep"]);
+        assert_eq!(tmpl, "Body.\n");
+    }
+
+    #[test]
+    fn test_frontmatter_closing_delimiter_at_eof() {
+        let content = "---\nname: eof-skill\ndescription: EOF skill\n---";
+        let (fm, tmpl) = parse_frontmatter(content);
+        assert_eq!(fm.name.as_deref(), Some("eof-skill"));
+        assert_eq!(fm.description, "EOF skill");
+        assert_eq!(tmpl, "");
+    }
+
+    #[test]
+    fn test_empty_frontmatter_before_body() {
+        let content = "---\n---\nBody.\n";
+        let (fm, tmpl) = parse_frontmatter(content);
+        assert_eq!(fm.description, "");
         assert_eq!(tmpl, "Body.\n");
     }
 
