@@ -496,9 +496,15 @@ fn generate_state() -> String {
     format!("atomcode_{}", timestamp)
 }
 
-/// Open browser with the authorization URL
+/// Open browser with the authorization URL.
+///
+/// `pub` because TUI modals (e.g. the QR-login onboarding step) need to
+/// invoke the same platform browser launch the CLI flow already does via
+/// `LoginSession::open_browser_best_effort` — callers without a live
+/// `LoginSession` only carry the URL string, so they go through this
+/// free function directly.
 #[cfg(target_os = "macos")]
-fn open_browser(url: &str) -> Result<()> {
+pub fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("open")
         .arg(url)
         .spawn()
@@ -507,7 +513,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_browser(url: &str) -> Result<()> {
+pub fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(url)
         .spawn()
@@ -516,7 +522,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn open_browser(url: &str) -> Result<()> {
+pub fn open_browser(url: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
     std::process::Command::new("cmd")
         .raw_arg(format!("/C start \"\" \"{}\"", url))
@@ -526,7 +532,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn open_browser(_url: &str) -> Result<()> {
+pub fn open_browser(_url: &str) -> Result<()> {
     anyhow::bail!("Unsupported platform for browser auto-open");
 }
 

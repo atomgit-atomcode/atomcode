@@ -531,20 +531,26 @@ impl OnboardingWizard {
             (Setup, KeyCode::Esc) => PureOutcome::Close,
 
             // QrLogin (fast path, first-launch only).
-            // - start_login failed → Enter retries, Esc bails
-            // - start_login ok → Enter is a no-op. The background
-            //   poll thread auto-closes the modal the moment AtomGit
-            //   reports authorisation, so a manual Enter would only
-            //   race that — and an impatient Enter before the poll
-            //   completes ran run_codingplan_flow against an empty
-            //   auth.toml, which then re-ran start_login under the
-            //   covers and painted a SECOND duplicate QR + URL block
-            //   into scrollback (bug report screenshot). Letting Enter
-            //   be a no-op eliminates the race entirely; users
-            //   waiting on a stuck poll can Esc and rerun /codingplan.
+            // - start_login failed → Enter retries, Esc bails.
+            // - start_login ok → Enter mirrors the
+            //   `session.open_browser_best_effort()` call that
+            //   `/codingplan`'s `run_oauth_with_renderer` makes
+            //   automatically, so a user who'd rather click than scan
+            //   gets a one-key path into the consent page. We
+            //   deliberately do NOT re-run start_login here — that's
+            //   what the old ApplyQrLoginThenClose did, and it raced
+            //   the background poll's auth.toml write, painting a
+            //   duplicate QR + URL block into scrollback. The new
+            //   outcome only spawns the platform browser command;
+            //   failures (xdg-open missing on Linux, no $DISPLAY,
+            //   etc.) are silently swallowed and the on-screen QR
+            //   + URL stay as fallbacks. The in-flight poll still
+            //   auto-closes the modal on its own.
             (QrLogin, KeyCode::Enter) => {
                 if self.qr_login_error.is_some() {
                     PureOutcome::RetryQrLogin
+                } else if self.qr_login_url.is_some() {
+                    PureOutcome::OpenQrUrlInBrowser
                 } else {
                     PureOutcome::Noop
                 }
@@ -841,11 +847,14 @@ impl OnboardingWizard {
                 "无法显示二维码 — 请在浏览器打开:"
             }));
             content.push(center(url));
+            content.push(center("(按 Enter 自动打开)"));
             content.push(String::new());
             // Polling thread auto-closes the modal the moment AtomGit
-            // reports authorisation. Enter is deliberately NOT shown
-            // as a force-continue path — see handle_key_pure's
-            // QrLogin Enter arm for the duplicate-QR bug it caused.
+            // reports authorisation, so no force-continue Enter is
+            // needed. Enter is wired to a best-effort browser launch
+            // on the URL above (mirrors what /codingplan does); see
+            // handle_key_pure's QrLogin Enter arm for the rationale
+            // and the historical duplicate-QR bug that gates it.
             content.push(center("扫码完成后自动跳转"));
         } else {
             // Shouldn't happen — `new_qr_fast_path` always populates
@@ -938,6 +947,20 @@ impl crate::modals::Modal for OnboardingWizard {
                 self.step = Step::Setup;
                 renderer.clear_screen();
                 self.draw(buf, state, ctx, renderer);
+                Ok(ModalAction::Continue)
+            }
+            PureOutcome::OpenQrUrlInBrowser => {
+                // Same call /codingplan's run_oauth_with_renderer
+                // makes after rendering the QR. Best-effort: failures
+                // (xdg-open missing on a minimal Linux image, no
+                // $DISPLAY in an SSH session, etc.) are swallowed so
+                // the modal stays put and the user falls back to
+                // scanning the QR or copying the URL. No redraw —
+                // panel content is unchanged; the browser launch is
+                // a pure side effect.
+                if let Some(url) = &self.qr_login_url {
+                    let _ = atomcode_core::auth::oauth::open_browser(url);
+                }
                 Ok(ModalAction::Continue)
             }
             PureOutcome::RetryQrLogin => {
@@ -1094,6 +1117,13 @@ pub(super) enum PureOutcome {
     /// the wizard's `qr_login_url` / `qr_login_error` fields, then
     /// ClearAndRedraw.
     RetryQrLogin,
+    /// QR step Enter on the happy path — launch the platform browser
+    /// at the already-displayed login URL, mirroring the
+    /// `session.open_browser_best_effort()` call `/codingplan` makes
+    /// automatically. Failures are silently swallowed (xdg-open
+    /// missing, headless Linux, etc.); the QR + URL remain on screen
+    /// as fallbacks, so the modal layout doesn't change.
+    OpenQrUrlInBrowser,
     /// Close modal, no side effect.
     Close,
     /// Ignore the key.
@@ -1915,16 +1945,30 @@ mod tests {
     }
 
     #[test]
-    fn qr_login_enter_when_url_present_is_noop() {
-        // Was ApplyQrLoginThenClose before the manual-Enter handoff
-        // was removed — a forced /codingplan invocation BEFORE the
-        // background poll thread finished writing auth.toml caused
-        // a second start_login round-trip + duplicate QR in
-        // scrollback. Polling auto-closes the modal the instant
-        // AtomGit reports authorisation, so Enter is intentionally
-        // inert in the normal state; users on a stuck poll can Esc
-        // and rerun /codingplan.
+    fn qr_login_enter_when_url_present_opens_browser() {
+        // Enter on the happy QR path now mirrors /codingplan's
+        // `session.open_browser_best_effort()` — same platform
+        // browser launch the CLI flow makes automatically, just
+        // user-triggered. The historical Noop was a fix for a
+        // duplicate-QR bug caused by re-running start_login on
+        // Enter (ApplyQrLoginThenClose); the new outcome doesn't
+        // touch start_login at all, so that bug stays gone.
         let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let outcome = w.handle_key_pure(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(outcome, PureOutcome::OpenQrUrlInBrowser);
+    }
+
+    #[test]
+    fn qr_login_enter_with_neither_url_nor_error_is_noop() {
+        // Defensive: if construction landed in a state where neither
+        // the URL nor the error is populated (shouldn't happen — the
+        // constructor always produces exactly one), Enter must NOT
+        // dispatch OpenQrUrlInBrowser (would try to open None) and
+        // must NOT dispatch RetryQrLogin (no error to surface). Noop
+        // keeps the modal inert until Esc.
+        let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        w.qr_login_url = None;
+        w.qr_login_error = None;
         let outcome = w.handle_key_pure(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(outcome, PureOutcome::Noop);
     }
@@ -1996,6 +2040,28 @@ mod tests {
         assert!(blob.contains("无法生成登录链接"));
         assert!(blob.contains("transport: timeout after 10s"));
         assert!(blob.contains("按 Enter 重试"));
+    }
+
+    #[test]
+    fn qr_login_draw_surfaces_enter_to_open_hint() {
+        // Users on a desktop terminal can press Enter to launch the
+        // browser at the displayed URL — the modal must SHOW that
+        // affordance, otherwise nobody knows it exists. Both Unicode
+        // and ASCII renderings carry the hint since the action is
+        // available in either layout.
+        let w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
+        let unicode_blob = w.draw_qr_login_lines(80, true).join("\n");
+        assert!(
+            unicode_blob.contains("Enter"),
+            "Unicode QR step missing Enter-to-open affordance:\n{}",
+            unicode_blob
+        );
+        let ascii_blob = w.draw_qr_login_lines(80, false).join("\n");
+        assert!(
+            ascii_blob.contains("Enter"),
+            "ASCII QR step missing Enter-to-open affordance:\n{}",
+            ascii_blob
+        );
     }
 
     #[test]
