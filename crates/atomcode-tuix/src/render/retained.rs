@@ -2768,9 +2768,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // adjacent.
         let bottom = self.body_bottom_row();
         if bottom > 0 {
+            // \x1b[J erases from cursor to end of screen, which
+            // includes the footer rows below the body strip.
+            // screen.prev_cells still holds the old footer content,
+            // so without invalidation the next render_diff() would
+            // see identical prev/current footer cells and skip the
+            // repaint — leaving the footer permanently blank.
+            // Invalidate prev_cells so the next flush_deferred()
+            // emits a full repaint of every non-blank cell.
             let _ = write!(self.out, "\x1b[{};1H\x1b[J", bottom);
             let _ = self.out.flush();
             self.skip_next_body_scroll = true;
+            self.screen.invalidate();
         }
         self.dirty = true;
     }
@@ -5355,6 +5364,67 @@ mod tests {
         assert_eq!(
             before2, after2,
             "pop_approval_prompt must not drop non-approval rows"
+        );
+    }
+
+    /// Regression for issue #455: `pop_approval_prompt()` uses \x1b[J
+    /// which erases from the cursor to the end of the screen, wiping
+    /// the footer rows. Without `screen.invalidate()`, the next
+    /// `render_diff()` sees identical prev/current footer cells and
+    /// skips the repaint, leaving the footer permanently blank.
+    /// After the fix, `invalidate()` blanks `prev_cells` so the next
+    /// `flush_deferred()` emits a full repaint of the footer.
+    #[test]
+    fn retained_approval_pop_preserves_footer_on_repaint() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Set up footer state so paint_footer has content.
+        r.render(UiLine::InputPrompt {
+            buf: "hello".into(),
+            cursor_byte: 5,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Add a tool call + approval prompt (the typical sequence).
+        r.render(UiLine::ToolCall {
+            name: "read_file".into(),
+            detail: "test.txt".into(),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "read_file".into(),
+            detail: "test.txt".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Pop the approval prompt — this used to wipe the footer
+        // without invalidating prev_cells.
+        r.pop_approval_prompt();
+
+        // Trigger a repaint. The footer must be present in the
+        // emitted diff — without the invalidate() fix the diff
+        // would be empty for the footer rows.
+        r.render(UiLine::InputPrompt {
+            buf: "hello".into(),
+            cursor_byte: 5,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Verify the input box content is on screen.
+        assert!(
+            vterm.any_row(|row| row.contains("hello")),
+            "footer input must be repainted after pop_approval_prompt\ndump:\n{}",
+            vterm.dump()
         );
     }
 

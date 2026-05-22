@@ -3104,7 +3104,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer, &app.buf);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -3484,7 +3484,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer, &app.buf);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -5605,6 +5605,7 @@ fn handle_agent_event(
     fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
     fixissue_buffer: &mut String,
     reasoning_buffer: &mut String,
+    buf: &Buffer,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -5927,6 +5928,17 @@ fn handle_agent_event(
                 ),
             );
             state.on_approval_needed(&tool_name);
+            // Redraw the footer (input box) so the user can type
+            // Y/A/N in response. Without this, a prior
+            // on_approval_resolved() transition to Streaming may
+            // have left the footer stale — especially when
+            // TurnRunner dispatches the second approval before any
+            // spinner tick fires (issue #455: "待审批输入 Y 后，
+            // 输入框没了"). Use redraw_idle_plain instead of
+            // draw_spinner_now because the spinner label may be
+            // stale/misleading in the approval phase (mirrors the
+            // /bg resume path).
+            redraw_idle_plain(buf, state, ctx, renderer);
         }
         AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
         AgentEvent::PhaseChange(AgentPhase::CallingTool(name)) => {
