@@ -166,6 +166,23 @@ impl PluginManifest {
     pub fn skills_path(&self) -> &str {
         self.skills.as_ref().map(|p| p.first()).filter(|s| !s.is_empty()).unwrap_or("skills")
     }
+    /// All skills paths declared in the manifest.
+    ///
+    /// When `skills` is absent, returns `vec!["skills"]` (single default).
+    /// When it is a CC-style array (`["./skills/foo", "./skills/bar"]`),
+    /// each entry is included so that `SkillRegistry::reload` can load
+    /// skills from every declared directory.
+    pub fn skills_paths(&self) -> Vec<&str> {
+        match &self.skills {
+            None => vec!["skills"],
+            Some(PathOrList::One(s)) if s.is_empty() => vec!["skills"],
+            Some(PathOrList::One(s)) => vec![s.as_str()],
+            Some(PathOrList::Many(v)) => {
+                let paths: Vec<&str> = v.iter().map(String::as_str).filter(|s| !s.is_empty()).collect();
+                if paths.is_empty() { vec!["skills"] } else { paths }
+            }
+        }
+    }
     pub fn commands_path(&self) -> &str {
         self.commands.as_ref().map(|p| p.first()).filter(|s| !s.is_empty()).unwrap_or("commands")
     }
@@ -365,5 +382,30 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let m = load_plugin_manifest(tmp.path()).unwrap();
         assert_eq!(m.skills_path(), "skills");
+    }
+
+    #[test]
+    fn skills_paths_default_returns_single_skills() {
+        let m = PluginManifest::default();
+        assert_eq!(m.skills_paths(), vec!["skills"]);
+    }
+
+    #[test]
+    fn skills_paths_single_string() {
+        let m: PluginManifest = serde_json::from_str(r#"{"skills":"my_skills"}"#).unwrap();
+        assert_eq!(m.skills_paths(), vec!["my_skills"]);
+    }
+
+    #[test]
+    fn skills_paths_cc_array() {
+        let m: PluginManifest =
+            serde_json::from_str(r#"{"skills":["./skills/foo","./skills/bar"]}"#).unwrap();
+        assert_eq!(m.skills_paths(), vec!["./skills/foo", "./skills/bar"]);
+    }
+
+    #[test]
+    fn skills_paths_empty_array_falls_back() {
+        let m: PluginManifest = serde_json::from_str(r#"{"skills":[]}"#).unwrap();
+        assert_eq!(m.skills_paths(), vec!["skills"]);
     }
 }

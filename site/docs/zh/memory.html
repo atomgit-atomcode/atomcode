@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>永久记忆 · AtomCode 文档</title>
+<meta name="description" content="永久记忆 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="memory">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>永久记忆</h1>
+      <p class="lede">用 <code>/remember</code> 把零碎的偏好、约定、命令记下来,AtomCode 会在每一轮对话的系统提示里把它们带给模型。和 <a href="./project-instructions.html"><code>.atomcode.md</code> 项目指令文件</a> 互补:指令文件适合写整篇规范,记忆适合积累那些"突然想起来该告诉它"的零散事实。</p>
+
+      <h2>命令总览</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/remember &lt;内容&gt;</code></td><td>记一条到 <strong>项目级</strong> 记忆(默认作用域,绑定当前工作目录)</td></tr>
+          <tr><td><code>/remember --global &lt;内容&gt;</code></td><td>记一条到 <strong>全局</strong> 记忆(所有项目共享)</td></tr>
+          <tr><td><code>/forget &lt;关键词&gt;</code></td><td>删除全局 + 项目记忆中含该关键词的所有条目(大小写不敏感),输出会列出删了哪些条目</td></tr>
+          <tr><td><code>/memory</code></td><td>查看当前生效的所有记忆,按 <code>[Global]</code> / <code>[Project]</code> 分组并显示磁盘路径</td></tr>
+        </tbody>
+      </table>
+
+      <h2>存储位置</h2>
+      <table>
+        <thead>
+          <tr><th>作用域</th><th>路径</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>全局</td><td><code>~/.atomcode/memory.md</code>(或 <code>$ATOMCODE_HOME/memory.md</code>)</td></tr>
+          <tr><td>项目</td><td><code>&lt;project_root&gt;/.atomcode/memory.md</code></td></tr>
+        </tbody>
+      </table>
+      <p>格式是普通 Markdown,每行一条 <code>- </code> 开头的列表项。可以用 <code>/remember</code> 也可以直接手编辑——AtomCode 在下一轮会重新读取。<strong>非 <code>- </code> 开头的行会被忽略</strong>,所以可以加注释、空行、标题分组,记忆条目本身不受影响。</p>
+
+      <h2>模型怎么"用"这些记忆</h2>
+      <p>每次发请求时,AtomCode 会把<strong>全局 + 项目记忆合并</strong>注入到系统提示里(<code>crates/atomcode-core/src/agent/prompt.rs:64</code>),格式如下:</p>
+      <pre><code>=== MEMORY ===
+The user has asked you to remember these facts and preferences:
+
+[Global]
+- 用户偏好简洁回答,避免冗长解释
+- 中文回复,但 commit message 用英文
+
+[Project: atomcode]
+- 测试命令是 cargo test --workspace --no-fail-fast
+- CI 失败时先看 .github/workflows/ci.yml 第 78-92 行</code></pre>
+      <p>模型每个 turn 都能看到这块。<strong>没有"语义检索"或"按需召回"</strong>——是无条件全量注入,所以记忆条目越多,每个 turn 消耗的 token 越多。务必删除过时的条目,保持精简。</p>
+
+      <h2>容量限制</h2>
+      <table>
+        <thead>
+          <tr><th>限制</th><th>数值</th><th>触发后行为</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>单个记忆文件大小</td><td>64 KB</td><td>只读末尾 64KB(按行边界对齐,不会切坏 UTF-8 字符)</td></tr>
+          <tr><td>注入提示的总字符</td><td>4000 字符</td><td>截断并附 <code>[...truncated, run /memory to review]</code> 提示</td></tr>
+        </tbody>
+      </table>
+      <p>到上限就用 <code>/forget</code> 清理,把最近不再相关的条目删掉。</p>
+
+      <h2>使用建议</h2>
+
+      <h3>1. 项目特定的命令、约定、坑(项目级)</h3>
+      <pre><code>&gt; /remember 用 npm run check 跑类型检查(不是 npm run typecheck)
+&gt; /remember CI 失败时先看 .github/workflows/ci.yml 第 78-92 行
+&gt; /remember 这个 repo 严禁用 sed -i 改文件(macOS/Linux 行为不一致)
+&gt; /remember 数据库迁移 SQL 必须先在 staging 跑过才能上 main</code></pre>
+
+      <h3>2. 全局编码偏好、工作流(全局)</h3>
+      <pre><code>&gt; /remember --global 改完代码先跑测试再 commit
+&gt; /remember --global 不要主动 git push,让我手动确认
+&gt; /remember --global 中文回复,但 commit message 用英文
+&gt; /remember --global 优先编辑现有文件,不要擅自创建文档(*.md)</code></pre>
+
+      <h3>3. 个人或团队信息(全局)</h3>
+      <pre><code>&gt; /remember --global 我的 GitHub 用户名是 alice
+&gt; /remember --global 默认时区 Asia/Shanghai
+&gt; /remember --global 团队 standup 是周一周三周五 9:30</code></pre>
+
+      <h3>4. 清理过时记忆</h3>
+      <pre><code>&gt; /forget npm run check
+  [project] - 用 npm run check 跑类型检查(不是 npm run typecheck)
+  (removed 1 matching entry)
+
+&gt; /memory
+  [Global] (/Users/alice/.atomcode/memory.md)
+    - 改完代码先跑测试再 commit
+    - 不要主动 git push,让我手动确认
+  [Project] (/Users/alice/code/myrepo/.atomcode/memory.md)
+    - CI 失败时先看 .github/workflows/ci.yml 第 78-92 行</code></pre>
+
+      <h2>记忆 vs 项目指令文件 vs 会话历史</h2>
+      <p>AtomCode 提供了三种持久化"上下文"的方式,各自定位不同:</p>
+      <table>
+        <thead>
+          <tr><th></th><th><code>.atomcode.md</code></th><th>记忆(memory.md)</th><th>会话(<code>/resume</code>)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>适合内容</td><td>整篇规范、技术栈、详细约定</td><td>零散事实、个人偏好、命令速查</td><td>过去的对话和工具调用</td></tr>
+          <tr><td>作用范围</td><td>项目</td><td>项目 + 全局</td><td>具体某次会话</td></tr>
+          <tr><td>添加方式</td><td>手动编辑</td><td><code>/remember</code> 或手动编辑</td><td>每次对话自动保存</td></tr>
+          <tr><td>注入机制</td><td>启动时注入系统提示</td><td>每轮注入系统提示</td><td><code>/resume</code> 时整段恢复</td></tr>
+          <tr><td>token 预算</td><td>较大(整篇文档)</td><td>受 4000 字符上限</td><td>受上下文窗口限制</td></tr>
+        </tbody>
+      </table>
+      <p>典型组合:</p>
+      <ul>
+        <li><strong>团队规范</strong> 写在 <code>.atomcode.md</code> 里(进 git,所有人共享)</li>
+        <li><strong>个人偏好</strong> 用 <code>/remember --global</code>(只在你本机)</li>
+        <li><strong>项目特定坑</strong> 用 <code>/remember</code>(留在项目本地的 <code>.atomcode/memory.md</code>,可以选择是否进 git)</li>
+      </ul>
+      <p>关于 <code>.atomcode/memory.md</code> 是否提交进 git:如果团队都用 AtomCode 且记忆是项目知识(如踩过的坑、约定),可以提交;如果是个人开发笔记,可以加进 <code>.gitignore</code>。</p>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./project-instructions.html">项目指令文件</a> —— 整篇规范的最佳入口</li>
+        <li><a href="./slash-commands.html">斜杠命令</a> —— 完整命令参考</li>
+        <li><a href="./sessions.html">会话与撤销</a> —— <code>/resume</code> 的细节</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

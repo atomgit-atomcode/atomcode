@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>基本使用 · AtomCode 文档</title>
+<meta name="description" content="基本使用 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="basic-usage">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>基本使用</h1>
+      <p class="lede">掌握 CLI 参数、如何描述任务、如何给模型提供上下文、如何在多个任务之间切换。</p>
+
+      <h2>启动方式</h2>
+      <pre><code># 在当前目录启动 TUI
+atomcode
+
+# 指定工作目录
+atomcode -C /path/to/project
+
+# 指定 provider / 模型(一次性覆盖默认)
+atomcode --provider claude --model claude-sonnet-4-6
+
+# 继续上一次会话
+atomcode -c
+atomcode --continue
+
+# 使用指定的配置文件
+atomcode --config ./custom.toml</code></pre>
+
+      <h2>CLI 参数总览</h2>
+      <table>
+        <thead>
+          <tr><th>参数</th><th>简写</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>--dir PATH</code></td><td><code>-C</code></td><td>工作目录,不指定则使用当前目录</td></tr>
+          <tr><td><code>--continue</code></td><td><code>-c</code></td><td>继续上一次会话,而不是新建</td></tr>
+          <tr><td><code>--provider NAME</code></td><td>—</td><td>覆盖默认 provider</td></tr>
+          <tr><td><code>--model NAME</code></td><td>—</td><td>覆盖当前 provider 的 model</td></tr>
+          <tr><td><code>--config PATH</code></td><td>—</td><td>使用指定的配置文件</td></tr>
+          <tr><td><code>--prompt TEXT</code></td><td><code>-p</code></td><td>非交互模式,单次执行并把回复写到 stdout</td></tr>
+          <tr><td><code>--prompt-file PATH</code></td><td>—</td><td>从文件读取 prompt(适合长文本,与 <code>-p</code> 互斥)</td></tr>
+          <tr><td><code>--verbose</code></td><td><code>-v</code></td><td>非交互模式下把工具调用、token 用量等信息打到 stderr</td></tr>
+          <tr><td><code>--max-turns N</code></td><td>—</td><td>强制限制 Agent 循环的最大轮数,防止无限跑下去</td></tr>
+          <tr><td><code>--disable-tools LIST</code></td><td>—</td><td>逗号分隔,禁用某些工具。例如 <code>--disable-tools bash,web_fetch</code></td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p><code>--disable-tools</code> 让被禁用的工具对模型完全不可见(不会出现在 schemas 中),模型就不会重复尝试调用它。在沙箱评测、离线环境、禁止联网的 CI 等场景里非常实用。</p>
+      </div>
+
+      <h2>描述任务的原则</h2>
+      <p>AtomCode 的 Agent 循环能力主要取决于你给出的任务描述的质量。几条经验:</p>
+      <ul>
+        <li><strong>说目标,不说步骤</strong> —— "修复登录后跳 404 的 bug",而不是"打开 src/auth/callback.ts,删除第 27 行,再…"。模型有足够的探索能力。</li>
+        <li><strong>点明约束</strong> —— 当你有偏好时明确说出:"保持 API 兼容"、"不改动测试文件"、"用 TypeScript 而不是 JS"。</li>
+        <li><strong>给出验证方式</strong> —— "改完后跑 <code>npm test</code> 确认通过",让模型完成自我验证闭环。</li>
+        <li><strong>先问后改</strong> —— 不确定方向时,先让它"分析这个模块的结构并提出重构方案",对齐之后再让它动手。</li>
+      </ul>
+
+      <h2>示例任务</h2>
+      <pre><code># Bug 修复
+&gt; 修复 OAuth 回调后用户被重定向到 404 的问题,确保回调完整恢复原始路径
+
+# 新增功能
+&gt; 在设置页增加深色模式切换,使用 Tailwind 的 dark: 前缀,并持久化到 localStorage
+
+# 重构
+&gt; 把 src/db/*.ts 重构成使用连接池,保持公有 API 不变,改完后跑 npm test
+
+# 测试
+&gt; 给 src/payment/processor.ts 写单元测试,覆盖所有异常分支
+
+# 代码理解
+&gt; 简要说明这个仓库的目录结构、构建入口和核心模块职责</code></pre>
+
+      <h2>多行输入</h2>
+      <p>在 TUI 中:</p>
+      <ul>
+        <li><code>Enter</code> 发送消息</li>
+        <li><code>Shift+Enter</code> / <code>Ctrl+Enter</code> / <code>Ctrl+J</code> 换行(需要 Kitty 键盘协议: kitty / WezTerm / Alacritty / iTerm2 ≥3.5 / Windows Terminal ≥1.21)</li>
+        <li><code>Alt+Enter</code> 换行(多数终端可用,但 Windows Terminal 默认绑给"切换全屏",需在设置里解绑)</li>
+        <li>输入框高度会随内容自动增长</li>
+      </ul>
+
+      <h2 id="at-mention"><code>@</code> 引用文件</h2>
+      <p>在输入框里敲一个 <code>@</code>(前面是空白或行首)就会弹出项目内文件/目录的候选菜单。这是把代码里某个具体路径"指给模型看"最快的方式 — 你只负责定位,要不要展开、读多少由模型按需调 <code>read_file</code> 决定。</p>
+
+      <h3>交互</h3>
+      <ul>
+        <li><strong>触发</strong> —— <code>@</code> 前面是空白或行首才生效。<code>email@host.com</code> 这种中间出现的 <code>@</code> 不会触发,避免误弹。</li>
+        <li><strong>过滤</strong> —— 继续敲字符做子串匹配(大小写不敏感)。例如 <code>@cra</code> 能命中 <code>crates/</code>;<code>@toml</code> 能命中所有 <code>*.toml</code>。</li>
+        <li><strong>下钻</strong> —— 敲 <code>/</code> 进入某个目录,菜单收紧到该目录的内容。例如 <code>@crates/</code> → <code>@crates/atomcode-cli/</code> → ...</li>
+        <li><strong>导航</strong> —— <code>↑</code> / <code>↓</code> 切换候选,<code>Enter</code> 或 <code>Tab</code> 都可以选中。<code>Esc</code> 关菜单不插入。</li>
+        <li><strong>插入形式</strong> —— 选中后,输入框里的 <code>@xxx</code> 部分被替换为 <code>@完整相对路径</code>(目录会带 <code>/</code>)再加一个尾随空格,光标停在空格后,可以直接继续打字。</li>
+        <li><strong>回退继续选</strong> —— 删掉尾随空格后,菜单会就地重开,方便从当前目录继续往下钻。</li>
+      </ul>
+
+      <h3>候选来自哪里</h3>
+      <ul>
+        <li>项目根目录下的<strong>所有文件和目录</strong> — 文件、目录都能选;目录用尾随 <code>/</code> 标识。</li>
+        <li><strong>尊重 <code>.gitignore</code></strong>(以及全局 ignore、<code>.git/info/exclude</code>),被忽略的路径不会出现在菜单里。</li>
+        <li><strong><code>.git/</code> 内部内容</strong>不出现在候选里 — 几乎没人想 <code>@</code> 引用 git 元数据。</li>
+        <li><strong>隐藏文件保留</strong> — <code>.env</code>、<code>.atomcode.md</code> 这类点开头文件能正常命中(只要没被 gitignore 屏蔽)。</li>
+        <li><strong>跨级模糊匹配</strong> — 一旦你开始打过滤字符,匹配会穿透多级目录(不只是当前 scope 的直接子项)。空过滤时只显示当前 scope 的直接子项。</li>
+        <li><strong>排序</strong>:当前 scope 的直接子项优先 → 目录优先于文件 → 字母序。</li>
+      </ul>
+
+      <h3>对模型意味着什么</h3>
+      <p>提交时,<code>@crates/atomcode-cli/src/main.rs</code> 作为<strong>字面文本</strong>一同发给模型 — AtomCode <em>不会</em>在前端预读文件内容并内联。模型看到这段路径后,会按需调用内置的 <code>read_file</code> 工具去读。这样:</p>
+      <ul>
+        <li>大文件不会无脑塞进上下文,token 预算更可控。</li>
+        <li>引用目录时模型会先 <code>list</code> 再决定读哪些。</li>
+        <li>多次复读不会重复内联同一份内容。</li>
+      </ul>
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>如果想强制把文件内容直接喂进对话(比如让模型针对某段代码做精读、不希望它再走一次 <code>read_file</code>),用粘贴 — 直接把内容粘进输入框,bracketed paste 会把它折叠成 <em>[paste #N]</em> 标记,提交时整段带入。</p>
+      </div>
+
+      <h3>限制</h3>
+      <ul>
+        <li>候选菜单一次最多展示 <strong>30 条</strong>,继续打过滤字符可以缩小命中范围。</li>
+        <li><strong>路径中含空格的文件不会出现在候选里</strong> — 因为 <code>@</code> 引用以空白作为终止符。</li>
+        <li>文件索引在会话内<strong>一次性构建</strong>,会话期间新建的文件不会自动出现在菜单里;切换会话或重启会重新扫描。</li>
+        <li>不跟随符号链接。</li>
+        <li>没有大小、类型过滤 — 所有未被 ignore 的文件都会出现。</li>
+      </ul>
+
+      <h2>粘贴长文本</h2>
+      <p>AtomCode 支持 bracketed paste。当你粘贴一段很长的内容(比如一堆日志)时,TUI 会把它折叠成一个紧凑的 <em>[paste #N · 132 lines]</em> 指示器,避免输入框被撑爆。发送时会完整带入。</p>
+
+      <h2 id="image-attach">图片附件 / 截图</h2>
+      <p>除了文本,你还能把<strong>图片</strong>带进对话 — 报错截图、UI mock、白板照片等。AtomCode 提供三条入口,任选其一:</p>
+      <ul>
+        <li><strong>Ctrl+V</strong> — 系统剪贴板里有图片时(刚 <code>Cmd+Shift+4</code> 截图、从浏览器复制图等),按 Ctrl+V 直接 attach。这是 macOS + iTerm2 等终端默认 Cmd+V 不传图给 PTY 时的兜底方案,任何终端都通用。</li>
+        <li><strong>Cmd+V(macOS / iTerm2,需简单配置)</strong> — iTerm2 → Settings → Profiles → Keys → Key Mappings,把 <code>⌘V</code> 映射为 <code>Send Hex Codes: 0x16</code>,之后 Cmd+V 就跟 Ctrl+V 等价。</li>
+        <li><strong>Finder 拖拽 / iTerm2 自动转路径</strong> — 把一张图直接拖进终端窗口,iTerm2 / Wezterm 等会把文件路径以 plaintext 方式粘进来;AtomCode 识别到绝对路径 + <code>.png</code> / <code>.jpg</code> / <code>.jpeg</code> / <code>.gif</code> / <code>.webp</code> 扩展名 + 文件存在 + 大小 ≤ 20MB 时,会自动读取文件并 attach。原始路径字符串不会留在输入框里。</li>
+      </ul>
+      <p>每次成功 attach 时,输入框会就地插入一个 <code>[Image #N]</code> 标记,提交时图片字节随消息一起发。状态栏右侧也会出现 <em>Image in clipboard · ctrl+v to paste</em> 的提示(剪贴板还有未粘的图时)。</p>
+
+      <h3>非视觉模型怎么处理图片?</h3>
+      <p>当前 active provider 不支持图片输入(比如 DeepSeek-V3 / Kimi 等纯文本模型)时,AtomCode 不会直接拒绝,而是会自动调用一个独立的 <strong>VL preprocessor</strong>(视觉模型,比如 Qwen3-VL / GLM-4V)对图片做 OCR + 描述,把结果作为文本 splice 到用户消息里再发给主模型。这样无论主模型支不支持图片,你都能"贴张截图问问题"。</p>
+      <ul>
+        <li>preprocessor 用哪个模型?由配置文件里的 <code>vision_preprocessor_provider</code> 决定 — 详见 <a href="./configuration.html#vision-preprocessor">配置文件 · 视觉预处理器</a>。</li>
+        <li><code>/codingplan</code> 流程会自动从模型列表里挑一个 VL/OCR 模型自动设置进去。</li>
+        <li>VL 调用使用<strong>无进展超时</strong>(idle timeout):只要 stream 持续吐 chunk,不限总时长;30 秒没动静才算超时。失败时会以 <em>VL 预处理失败</em> 的警告呈现,图片识别失败但消息照常发。</li>
+      </ul>
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>如果当前模型本身就支持视觉输入(Claude 3+ / GPT-4o / Gemini / Qwen-VL 等),会直接发原始图片字节,不走 preprocessor。</p>
+      </div>
+
+      <h2>切换会话和目录</h2>
+      <ul>
+        <li><code>/resume</code> —— 在不同会话之间切换或恢复</li>
+        <li><code>/session</code> —— 新建一个干净会话</li>
+        <li><code>/cd</code> 或直接输入 <code>cd /path</code> —— 切换工作目录(状态栏实时更新)</li>
+        <li><code>/clear</code> —— 清空当前会话的消息</li>
+        <li><code>/compact</code> —— 压缩历史消息以腾出上下文预算</li>
+      </ul>
+      <p>详细行为见 <a href="./sessions.html">会话与撤销</a>。</p>
+
+      <h2>查看成本和 diff</h2>
+      <ul>
+        <li><code>/cost</code> —— 本次会话输出 token 数和上下文用量(不支持 usage 的 API 会自动估算)</li>
+        <li><code>/diff</code> —— 当前工作目录未提交改动的 git diff</li>
+        <li><code>/undo</code> —— 回滚上一轮的所有文件编辑</li>
+      </ul>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./slash-commands.html">斜杠命令</a> —— 30+ 个命令的完整参考</li>
+        <li><a href="./keybindings.html">快捷键</a> —— 熟练使用键盘将大幅提升效率</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

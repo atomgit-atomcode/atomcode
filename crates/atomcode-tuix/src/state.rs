@@ -109,6 +109,17 @@ pub struct ContextSnapshot {
     pub system_prompt: String,
 }
 
+/// One entry in `message_queue`. Replaces the prior `String`-only
+/// representation so queued messages can carry their pasted images +
+/// markers — otherwise queueing a message during streaming silently
+/// drops attachments.
+#[derive(Debug, Clone)]
+pub struct QueuedMessage {
+    pub text: String,
+    pub images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub image_markers: Vec<usize>,
+}
+
 pub struct UiState {
     pub phase: UiPhase,
     pub agent_mode: AgentMode,
@@ -128,9 +139,17 @@ pub struct UiState {
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
-    /// turn-complete / turn-cancelled / error. Used by the spinner to
-    /// display live elapsed time.
+    /// turn-complete / turn-cancelled / error. Used to surface the
+    /// total wall-clock duration in the TurnComplete event payload.
     pub turn_started_at: Option<std::time::Instant>,
+    /// When the current phase began. Reset on every phase transition
+    /// (on_submit, on_thinking, on_tool_call_streaming,
+    /// on_tool_call_started) so the spinner shows time spent on the
+    /// CURRENT operation — `Pondering… 12s`, `Running ReadFile… 4s`
+    /// — instead of accumulating over the whole turn. Cleared on
+    /// turn-complete / turn-cancelled / error so the idle spinner
+    /// (rare) doesn't tick a stale duration.
+    pub phase_started_at: Option<std::time::Instant>,
     /// Last observed context breakdown. Populated from
     /// `AgentEvent::ContextStats` — `/context` renders this. `None`
     /// before the first turn completes.
@@ -150,6 +169,40 @@ pub struct UiState {
     /// loop. The bool is the `prompt` sub-arg (include full system
     /// prompt body).
     pub pending_context_render: Option<bool>,
+    /// Images pasted from clipboard (Ctrl+V) waiting to be sent with
+    /// the next user message. Drained on submit.
+    pub pending_images: Vec<atomcode_core::conversation::message::ImagePart>,
+    /// Parallel to `pending_images` — content fingerprint of each pasted
+    /// image's raw RGBA bytes. Used by the right-aligned status hint to
+    /// suppress `Image in clipboard · ctrl+v to paste` once the clipboard
+    /// content matches an already-attached image (avoids dup paste prompts),
+    /// while still surfacing the hint when the user copies a new image
+    /// after pasting an earlier one. Cleared together with `pending_images`
+    /// on submit.
+    pub pending_image_hashes: Vec<u64>,
+    /// Parallel to `pending_images` — the marker number `N` originally
+    /// printed for each image at paste time. Submit-time matching does
+    /// `line.contains("[Image #N]")` against this number to decide
+    /// whether the image survived editing. Must NOT be `i + 1` from the
+    /// vec position — once `session_image_count` became monotonic across
+    /// turns, paste-time numbers diverge from positional indices, and
+    /// using the index dropped images on every retry that wasn't the
+    /// first paste of the session.
+    pub pending_image_markers: Vec<usize>,
+    /// Image attachments to re-attach when the user submits a recalled
+    /// history entry. Populated by the up-arrow handler from the
+    /// recalled `HistoryEntry::images`; drained on submit by the
+    /// hydrate prelude in `event_loop/mod.rs`. Lazy by design — disk
+    /// reads happen at submit time, not on every navigation.
+    pub pending_recalled_attachments: Vec<crate::input::history::HistoryImageRef>,
+    /// Monotonic counter for the `[Image #N]` marker shown in the input
+    /// buffer + scrollback. Incremented on every paste and NEVER reset
+    /// across turns — so two images pasted in different turns get
+    /// distinct labels (e.g. `[Image #1]` in turn 1, `[Image #2]` in
+    /// turn 2). Without this, both turns' first paste would both render
+    /// as `[Image #1]`, making it ambiguous which image a later
+    /// reference points at when scrolling back.
+    pub session_image_count: usize,
     /// Whether to show real-time tool output (e.g., bash stdout/stderr).
     /// Toggled by Ctrl+O. When false (default), tool output is hidden
     /// during execution and only shown in the final result.
@@ -158,6 +211,51 @@ pub struct UiState {
     /// MiniMax-M2.7). Toggled by Ctrl+O together with `show_tool_output`.
     /// When false (default), reasoning content is hidden during streaming.
     pub show_reasoning: bool,
+    /// Number of fork sub-agents currently dispatched. While > 0, the
+    /// foreground turn is blocked awaiting `pool.execute_all` — there's
+    /// no fresh tool / think event to update the spinner, so without an
+    /// override the label stays frozen on the last tool name (e.g.
+    /// "Running ReadFile… 82s") for the entire pool duration. Cleared
+    /// on `SubAgentDispatchEnd`.
+    pub sub_agent_total: usize,
+    /// How many sub-agents in the current dispatch have reported a
+    /// terminal status (done / failed / timeout). Updated by
+    /// `on_sub_agent_settled`. Reset to 0 on each new dispatch.
+    pub sub_agent_done: usize,
+    /// Per-task descriptors (path + dedup suffix) for the active
+    /// dispatch. Indexed identically to the `tasks` field on
+    /// `AgentEvent::SubAgentDispatchStart` so the UI can look up a
+    /// child's display path from the `index` field on Started/Done/
+    /// Failed events. Cleared on `on_sub_agent_dispatch_end`.
+    pub sub_agent_tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+    /// Number of failed sub-agents in the current dispatch — tracked
+    /// separately from `sub_agent_done` so the aggregate summary can
+    /// distinguish "6/7 ok · 1 fail" from "7/7 ok". Reset on each new
+    /// dispatch.
+    pub sub_agent_failed: usize,
+    /// Wall-clock start of the current dispatch. Used to render the
+    /// elapsed-time figure on the `SubAgentDispatchEnd` aggregate
+    /// summary line. Cleared with the rest of the dispatch state.
+    pub sub_agent_started_at: Option<std::time::Instant>,
+
+    /// Active tool batches, keyed by `batch_id`. Populated on
+    /// `ToolBatchStarted` and cleared on `ToolBatchCompleted`. Used by
+    /// per-call event handlers to detect "this ToolCallStarted/Result
+    /// belongs to an active batch" and skip the standalone row render
+    /// (the batch header already represents it).
+    pub active_tool_batches: std::collections::HashMap<String, ActiveToolBatch>,
+    /// Reverse map call_id → batch_id for O(1) lookup when a per-call
+    /// event arrives. Mirrors `active_tool_batches` membership; cleared
+    /// together.
+    pub call_id_to_batch: std::collections::HashMap<String, String>,
+}
+
+/// Per-batch state for an active `ToolBatchStarted`. Tracks how many
+/// children have completed so the UI can emit the final `· N/M ok`
+/// summary on `ToolBatchCompleted`.
+#[derive(Debug, Clone)]
+pub struct ActiveToolBatch {
+    pub call_ids: Vec<String>,
 }
 
 impl Default for UiState {
@@ -188,11 +286,24 @@ impl UiState {
             prior_phase: None,
             thinking_idx: 0,
             turn_started_at: None,
+            phase_started_at: None,
             last_context: None,
             last_submitted_message: None,
             pending_context_render: None,
+            pending_images: Vec::new(),
+            pending_image_hashes: Vec::new(),
+            pending_image_markers: Vec::new(),
+            pending_recalled_attachments: Vec::new(),
+            session_image_count: 0,
             show_tool_output: false,
             show_reasoning: false,
+            sub_agent_total: 0,
+            sub_agent_done: 0,
+            sub_agent_tasks: Vec::new(),
+            sub_agent_failed: 0,
+            sub_agent_started_at: None,
+            active_tool_batches: std::collections::HashMap::new(),
+            call_id_to_batch: std::collections::HashMap::new(),
         }
     }
 
@@ -271,6 +382,18 @@ impl UiState {
         self.turn_started_at.map(|t| t.elapsed())
     }
 
+    /// Elapsed wall time since the current phase began. The spinner
+    /// uses this so its `· 12s` suffix shows time on the current
+    /// operation (LLM round-trip / tool execution), not cumulative
+    /// turn time. Falls back to `turn_elapsed()` when no phase
+    /// transition has fired yet — defensive, should not normally
+    /// happen since `on_submit` seeds both.
+    pub fn phase_elapsed(&self) -> Option<std::time::Duration> {
+        self.phase_started_at
+            .map(|t| t.elapsed())
+            .or_else(|| self.turn_elapsed())
+    }
+
     fn current_thinking(&self) -> &'static str {
         THINKING_LABELS[self.thinking_idx % THINKING_LABELS.len()]
     }
@@ -280,13 +403,16 @@ impl UiState {
         self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
         self.thinking_idx = self.thinking_idx.wrapping_add(1);
-        self.turn_started_at = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.turn_started_at = Some(now);
+        self.phase_started_at = Some(now);
     }
 
     pub fn on_turn_complete(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        self.phase_started_at = None;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -299,23 +425,28 @@ impl UiState {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        self.phase_started_at = None;
     }
 
     pub fn on_error(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        self.phase_started_at = None;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
     /// the renderer appends `...` uniformly so it looks right even when
-    /// the elapsed-time suffix is appended).
+    /// the elapsed-time suffix is appended). Resets the phase clock so
+    /// the spinner timer starts fresh on this tool execution.
     pub fn on_tool_call_started(&mut self, name: &str) {
         self.spinner_label = format!("Running {}", name);
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_tool_call_streaming(&mut self, name: &str) {
         self.spinner_label = format!("Preparing {}", name);
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_thinking(&mut self) {
@@ -323,6 +454,71 @@ impl UiState {
         // on submit, one rotation per turn not per state transition).
         let idx = self.thinking_idx.saturating_sub(1) % THINKING_LABELS.len();
         self.spinner_label = THINKING_LABELS[idx].to_string();
+        // New LLM round-trip → new phase clock. Without this reset the
+        // displayed time keeps growing across consecutive thinks/tools
+        // and ends up showing "Noodling… 1301s" mid-turn.
+        self.phase_started_at = Some(std::time::Instant::now());
+    }
+
+    /// Begin a fork dispatch. Stores the per-task descriptors so the UI
+    /// can look up each child's display path + dedup-suffix by index
+    /// when a `SubAgentTaskStarted/Done/Failed` event arrives — the
+    /// previous flow flattened identical basenames (`tunnel.rs` × 3)
+    /// into indistinguishable rows. Also overrides the foreground
+    /// spinner label since `pool.execute_all` blocks the loop.
+    pub fn on_sub_agent_dispatch_start(
+        &mut self,
+        tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+    ) {
+        self.sub_agent_total = tasks.len();
+        self.sub_agent_done = 0;
+        self.sub_agent_failed = 0;
+        self.spinner_label = format!("Sub-agents 0/{}", tasks.len());
+        self.phase_started_at = Some(std::time::Instant::now());
+        self.sub_agent_started_at = Some(std::time::Instant::now());
+        self.sub_agent_tasks = tasks;
+    }
+
+    /// Mark one sub-agent as completed (success). Late events after
+    /// `on_sub_agent_dispatch_end` are no-ops — `sub_agent_total == 0`
+    /// is the gate.
+    pub fn on_sub_agent_task_done(&mut self) {
+        if self.sub_agent_total == 0 {
+            return;
+        }
+        self.sub_agent_done = self.sub_agent_done.saturating_add(1);
+        self.refresh_sub_agent_label();
+    }
+
+    /// Mark one sub-agent as failed (error / timeout / no-edit).
+    /// Increments BOTH the done and failed counters — for the spinner
+    /// label `done` is "settled" regardless of outcome, but the
+    /// aggregate emitted on dispatch_end needs the success/fail split.
+    pub fn on_sub_agent_task_failed(&mut self) {
+        if self.sub_agent_total == 0 {
+            return;
+        }
+        self.sub_agent_done = self.sub_agent_done.saturating_add(1);
+        self.sub_agent_failed = self.sub_agent_failed.saturating_add(1);
+        self.refresh_sub_agent_label();
+    }
+
+    fn refresh_sub_agent_label(&mut self) {
+        self.spinner_label = format!("Sub-agents {}/{}", self.sub_agent_done, self.sub_agent_total);
+    }
+
+    /// End the dispatch — clears descriptors so subsequent thinks/tools
+    /// resume normal label behaviour. The next `on_thinking` /
+    /// `on_tool_call_started` will overwrite `spinner_label`; we leave it
+    /// alone here so the final "N/N" stays visible until the next phase.
+    /// The success/fail split is preserved long enough for the event
+    /// loop to render the aggregate summary line, then cleared.
+    pub fn on_sub_agent_dispatch_end(&mut self) {
+        self.sub_agent_total = 0;
+        self.sub_agent_done = 0;
+        self.sub_agent_failed = 0;
+        self.sub_agent_tasks.clear();
+        self.sub_agent_started_at = None;
     }
 
     pub fn on_approval_needed(&mut self, _tool: &str) {
@@ -429,6 +625,42 @@ mod tests {
         assert_eq!(s.phase, UiPhase::Idle);
     }
 
+    /// Regression for the cross-turn `[Image #N]` ambiguity: the marker
+    /// counter must NOT reset when `pending_images` drains on submit —
+    /// otherwise turn 1's first paste and turn 2's first paste would
+    /// both render as `[Image #1]` in scrollback. The counter lives on
+    /// `session_image_count`, monotonically increasing for the whole
+    /// session.
+    #[test]
+    fn session_image_count_starts_at_zero_on_new_state() {
+        let s = UiState::new();
+        assert_eq!(s.session_image_count, 0);
+    }
+
+    /// Simulate two-turn paste flow: paste image in turn 1, drain
+    /// `pending_images` on submit, paste image in turn 2. The second
+    /// paste must get marker `#2`, not `#1`.
+    #[test]
+    fn session_image_count_survives_pending_images_drain() {
+        let mut s = UiState::new();
+        // Turn 1: simulate paste sites' increment-then-push pattern.
+        s.session_image_count += 1;
+        let n1 = s.session_image_count;
+        s.pending_images.push(atomcode_core::conversation::message::ImagePart {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        });
+        s.pending_image_hashes.push(0xdead_beef);
+        // Submit drains pending_images / hashes (mirrors event_loop logic).
+        let _ = std::mem::take(&mut s.pending_images);
+        let _ = std::mem::take(&mut s.pending_image_hashes);
+        // Turn 2: another paste.
+        s.session_image_count += 1;
+        let n2 = s.session_image_count;
+        assert_eq!(n1, 1, "first paste of session is #1");
+        assert_eq!(n2, 2, "first paste of next turn must be #2, not #1");
+    }
+
     #[test]
     fn submit_transitions_to_streaming() {
         let mut s = UiState::new();
@@ -505,6 +737,104 @@ mod tests {
         assert_eq!(AgentMode::default(), AgentMode::Build);
     }
 
+    fn task_info(path: &str, dedup: &str) -> atomcode_core::agent::SubAgentTaskInfo {
+        atomcode_core::agent::SubAgentTaskInfo {
+            path: path.to_string(),
+            dedup_suffix: dedup.to_string(),
+        }
+    }
+
+    #[test]
+    fn sub_agent_dispatch_overrides_stale_tool_label() {
+        // Reproduces the user's "Running ReadFile… 82s" stale-spinner
+        // problem: the foreground turn was waiting on pool.execute_all and
+        // the last tool name (read_file) stayed pinned. After dispatch_start
+        // the label must reflect the sub-agent counter, not the dead tool.
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("read_file");
+        assert!(s.spinner_label.contains("read_file"));
+        let tasks = (0..6).map(|i| task_info(&format!("a{}.rs", i), "")).collect();
+        s.on_sub_agent_dispatch_start(tasks);
+        assert_eq!(s.spinner_label, "Sub-agents 0/6");
+    }
+
+    #[test]
+    fn sub_agent_task_done_increments_counter() {
+        let mut s = UiState::new();
+        let tasks = vec![
+            task_info("a.rs", ""),
+            task_info("b.rs", ""),
+            task_info("c.rs", ""),
+        ];
+        s.on_sub_agent_dispatch_start(tasks);
+        s.on_sub_agent_task_done();
+        assert_eq!(s.spinner_label, "Sub-agents 1/3");
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_done();
+        assert_eq!(s.spinner_label, "Sub-agents 3/3");
+        assert_eq!(s.sub_agent_failed, 0);
+    }
+
+    #[test]
+    fn sub_agent_task_failed_counts_toward_done_and_failed() {
+        // `sub_agent_done` is "settled" — done OR failed. The aggregate
+        // line emitted on dispatch_end uses `sub_agent_failed` to split
+        // them apart for "6 ok · 1 fail" rendering.
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(vec![task_info("x.rs", ""), task_info("y.rs", "")]);
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_failed();
+        assert_eq!(s.sub_agent_done, 2);
+        assert_eq!(s.sub_agent_failed, 1);
+    }
+
+    #[test]
+    fn sub_agent_task_event_outside_dispatch_is_noop() {
+        // A late event after DispatchEnd must not bring the counter
+        // label back from the dead.
+        let mut s = UiState::new();
+        s.on_thinking();
+        let pre = s.spinner_label.clone();
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_failed();
+        assert_eq!(s.spinner_label, pre);
+    }
+
+    #[test]
+    fn sub_agent_dispatch_end_clears_descriptors() {
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(vec![task_info("a.rs", ""), task_info("b.rs", "")]);
+        assert_eq!(s.sub_agent_tasks.len(), 2);
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_dispatch_end();
+        assert_eq!(s.sub_agent_total, 0);
+        assert_eq!(s.sub_agent_done, 0);
+        assert_eq!(s.sub_agent_failed, 0);
+        assert!(s.sub_agent_tasks.is_empty());
+        assert!(s.sub_agent_started_at.is_none());
+        s.on_thinking();
+        assert!(!s.spinner_label.starts_with("Sub-agents"));
+    }
+
+    #[test]
+    fn sub_agent_dispatch_preserves_dedup_suffix() {
+        // Three tasks against tunnel.rs must come through as #1/#2/#3
+        // suffixes from the dispatcher, and `state.sub_agent_tasks`
+        // must carry that data so a `SubAgentTaskStarted { index: 2 }`
+        // event renders the right disambiguator.
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(vec![
+            task_info("src/server/tunnel.rs", " (#1)"),
+            task_info("src/client/tunnel.rs", ""),
+            task_info("src/server/tunnel.rs", " (#2)"),
+        ]);
+        assert_eq!(s.sub_agent_tasks[0].dedup_suffix, " (#1)");
+        assert_eq!(s.sub_agent_tasks[1].dedup_suffix, "");
+        assert_eq!(s.sub_agent_tasks[2].dedup_suffix, " (#2)");
+    }
+
     #[test]
     fn agent_mode_build_label() {
         assert_eq!(AgentMode::Build.label(), "Build");
@@ -528,5 +858,25 @@ mod tests {
     #[test]
     fn agent_mode_double_toggle_returns_to_original() {
         assert_eq!(AgentMode::Build.toggle().toggle(), AgentMode::Build);
+    }
+
+    #[test]
+    fn pending_recalled_attachments_starts_empty() {
+        let s = UiState::new();
+        assert!(s.pending_recalled_attachments.is_empty());
+    }
+
+    #[test]
+    fn queued_message_carries_images() {
+        let q = QueuedMessage {
+            text: "hi".into(),
+            images: vec![atomcode_core::conversation::message::ImagePart {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+            image_markers: vec![1],
+        };
+        assert_eq!(q.images.len(), 1);
+        assert_eq!(q.image_markers, vec![1]);
     }
 }

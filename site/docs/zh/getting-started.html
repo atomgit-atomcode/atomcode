@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>快速开始 · AtomCode 文档</title>
+<meta name="description" content="快速开始 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="getting-started">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>快速开始</h1>
+      <p class="lede">几分钟内完成安装、首次运行和第一个任务,体验 AtomCode 的完整流程。</p>
+
+      <h2>系统要求</h2>
+      <ul>
+        <li><strong>操作系统</strong>:macOS (Apple Silicon 或 Intel)、Linux、Windows、HarmonyOS PC</li>
+        <li><strong>Rust 工具链</strong>:1.75+(仅在从源码构建时需要)</li>
+        <li><strong>LLM 模型</strong>:任一支持的 provider 的 API Key,或一个 AtomGit 账号(用于 OAuth 登录)</li>
+      </ul>
+
+      <h2>安装</h2>
+
+      <h3>方式 1:一键安装(推荐)</h3>
+      <p>在 macOS 或 Linux 或 HarmonyOS PC 终端执行:</p>
+      <pre><code>curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.23.0/install.sh | sh</code></pre>
+      <p>脚本会自动下载对应平台的预编译二进制,并放置到 <code>~/.local/bin/atomcode</code>。请确保该目录在 <code>PATH</code> 中。</p>
+      <p>在 Windows PowerShell 中执行:</p>
+      <pre><code>irm https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.23.0/install.ps1 | iex</code></pre>
+      <p>脚本会自动下载 Windows x64 预编译二进制,并完成 <code>PATH</code> 配置,新开终端即可使用 <code>atomcode</code> 命令。</p>
+
+      <h3>方式 2:从源码构建</h3>
+      <pre><code>git clone https://atomgit.com/atomgit_atomcode/atomcode.git
+cd atomcode
+cargo build --release
+cp target/release/atomcode ~/.local/bin/</code></pre>
+      <p>Release 构建编译时间较长,但生成的二进制体积小、运行速度快。开发调试时用 <code>cargo build</code> 即可。</p>
+
+      <h2>验证安装</h2>
+      <pre><code>atomcode --version</code></pre>
+      <p>你应该看到类似 <code>atomcode 4.20.x (build-id)</code> 的输出。</p>
+
+      <h2>首次运行</h2>
+      <p>直接在任意目录运行:</p>
+      <pre><code>atomcode</code></pre>
+      <p>第一次启动会自动弹出 <strong>3 步首次启动向导</strong>(也可以随时用 <code>/welcome</code> 重新打开):</p>
+
+      <h3>第 1/3 步 · 欢迎</h3>
+      <pre><code>             ███  █████  ███  █     █  ████  ███  ████  █████
+            █   █   █   █   █ ██   ██ █     █   █ █   █ █
+            █████   █   █   █ █ █ █ █ █     █   █ █   █ ████
+            █   █   █   █   █ █  █  █ █     █   █ █   █ █
+            █   █   █    ███  █     █  ████  ███  ████  █████
+
+  AtomCode
+  版本 4.22.3  ·  在终端里运行的 AI 编程代理
+
+  • 多步骤 agent loop · 内置代码图工具
+  • 兼容所有 OpenAI 风格 API
+  • 通过 CodingPlan 获取免费额度
+
+  按 Enter 继续。   Ctrl+C 可随时退出。</code></pre>
+
+      <h3>第 2/3 步 · 语言 (Choose your language / 选择语言)</h3>
+      <pre><code>  1. 自动检测 (LC_ALL / LANG)
+  2. English
+  3. 简体中文 (Simplified Chinese)
+
+  1-3 选择 · Enter 确认 · ← 返回 · Esc 跳过</code></pre>
+      <p>选完会立即应用,并写回 <code>~/.atomcode/config.toml</code> 的 <code>locale</code> 字段。之后任意时刻可以用 <code>/language</code> 再改。</p>
+
+      <h3>第 3/3 步 · 配置 (想怎么开始?)</h3>
+      <pre><code>  1. 用 AtomGit CodingPlan 一键接入  (推荐 · 免费额度 + 自动配 provider)
+  2. 手动配置 provider              (已有 API Key)
+  3. 跳过,先进 TUI 探索             (之后再 /codingplan 或 /provider)
+
+  1-3 选择 · Enter 确认 · ← 返回 · Esc 跳过</code></pre>
+      <ul>
+        <li><strong>CodingPlan</strong> —— 推荐路径,等价于在 TUI 内执行 <code>/codingplan</code>:浏览器唤起 AtomGit OAuth,登录后自动申领免费额度,并把额度模型列表写成 provider 配置。</li>
+        <li><strong>手动配置</strong> —— 等价于 <code>/provider</code>,进入 provider 管理界面填 Key / base URL / model。</li>
+        <li><strong>跳过</strong> —— 直接进 TUI 探索,之后再用 <code>/codingplan</code>、<code>/login</code> 或 <code>/provider</code> 完成配置。</li>
+      </ul>
+      <p>更详细的选择参见 <a href="./login.html">登录方式</a>。任何时候可以用 <code>/welcome</code> 重新打开这个向导。</p>
+
+      <h2>第一个任务</h2>
+      <p>进入一个你熟悉的项目目录,启动 atomcode,然后直接描述你想做的事:</p>
+      <pre><code>cd ~/projects/my-web-app
+atomcode
+
+> 简要介绍一下这个项目的目录结构和技术栈</code></pre>
+      <p>AtomCode 会自主地:</p>
+      <ol>
+        <li>运行 <code>list_directory</code>、<code>read_file</code> 等工具探索代码</li>
+        <li>识别关键描述文件(<code>package.json</code> / <code>Cargo.toml</code> 等)</li>
+        <li>给出结构化的总结</li>
+      </ol>
+
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>不确定要问什么?试试:"<em>修复 README 里所有的拼写错误</em>"、"<em>把 src/utils.ts 里的函数加上 TypeScript 类型</em>"、"<em>跑一下测试并修复失败用例</em>"。</p>
+      </div>
+
+      <h2>卸载</h2>
+      <p>不再需要 AtomCode 时,用内置的 <code>uninstall</code> 子命令一步清理。它会按组询问你是否删除以下三类内容:二进制本身 + 安装脚本写入的 <code>PATH</code> 编辑、<code>~/.atomcode/auth.toml</code> 等凭据、<code>~/.atomcode/sessions/</code> 等运行状态。</p>
+
+      <h3>交互式(推荐)</h3>
+      <pre><code>atomcode uninstall</code></pre>
+      <p>每个组单独询问 y/N,按当前默认决策(二进制=是、凭据=否、状态=是)预填 — 直接回车也是合理选择。</p>
+
+      <h3>非交互式</h3>
+      <pre><code># 全自动:按默认决策走,不弹任何提示
+atomcode uninstall --yes
+
+# 一键全清(包括 ~/.atomcode/ 整个目录)
+atomcode uninstall --purge
+
+# 只删二进制和 PATH 编辑,~/.atomcode/ 完整保留
+atomcode uninstall --keep-data
+
+# 只打印执行计划,什么都不做
+atomcode uninstall --dry-run</code></pre>
+
+      <div class="callout callout-warn">
+        <strong>注意</strong>
+        <p><code>--purge</code> 会连带删除<strong>所有会话历史、记忆、自定义 provider 配置、OAuth token</strong>;不可逆。如果以后还可能用 AtomCode,优先用默认交互式或 <code>--keep-data</code>。</p>
+      </div>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./configuration.html">配置文件</a> —— 学会管理多个 provider 和模型。</li>
+        <li><a href="./basic-usage.html">基本使用</a> —— 熟悉 CLI 参数和描述任务的最佳实践。</li>
+        <li><a href="./slash-commands.html">斜杠命令</a> —— 掌握 <code>/resume</code>、<code>/undo</code>、<code>/diff</code> 等高频命令。</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

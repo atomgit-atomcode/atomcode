@@ -17,6 +17,19 @@ pub enum StreamEvent {
     /// final text on `Done` if `content` ends up empty, which keeps us from
     /// silently returning 0-token "Nailed it" responses for reasoning models.
     Reasoning(String),
+    /// One complete Anthropic extended-thinking content block. Emitted at
+    /// `content_block_stop` by claude.rs after both `thinking_delta` and
+    /// `signature_delta` have streamed in for a given block. The runner
+    /// accumulates these into `MessageContent::AssistantWithToolCalls.
+    /// thinking_blocks` so the next request can echo them back verbatim
+    /// (Anthropic 400s otherwise: `The content[].thinking in the thinking
+    /// mode must be passed back to the API`). Atomic per-block (vs
+    /// streaming text + signature separately) keeps the runner from
+    /// having to pair up out-of-order deltas across content blocks.
+    ThinkingBlock {
+        text: String,
+        signature: String,
+    },
     ToolCallStart {
         id: String,
         name: String,
@@ -30,4 +43,10 @@ pub enum StreamEvent {
         truncated: bool,
     },
     Error(String),
+    /// Non-fatal advisory the provider wants surfaced to the user. Unlike
+    /// `Error`, the stream and the turn continue normally — the warning
+    /// is a heads-up (e.g. "your proxy looks like it's truncating
+    /// input"), not a failure. The runner forwards it to
+    /// `TurnEvent::Warning` so the TUI can render it without aborting.
+    Warning(String),
 }

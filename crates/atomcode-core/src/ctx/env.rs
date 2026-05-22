@@ -152,14 +152,14 @@ fn is_git_repo(wd: &Path) -> bool {
 /// intentionally discarded — this is best-effort context enrichment and
 /// error spam doesn't help the user.
 fn run_git(wd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(wd)
         // Suppress paging in case user has `pager.*` configured.
         .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .output()
-        .ok()?;
+        .env("PAGER", "cat");
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }

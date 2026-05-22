@@ -80,7 +80,13 @@ fn main() -> io::Result<()> {
                     })
                 })
             }
-            "notifications/initialized" => None,
+            "notifications/initialized" => {
+                if std::env::var_os("MCP_TEST_STDOUT_NOISE_AFTER_INITIALIZED").is_some() {
+                    writeln!(writer, "✅ MCP server initialized and ready (stdio).")?;
+                    writer.flush()?;
+                }
+                None
+            }
             _ => id.map(|id| {
                 serde_json::json!({
                     "jsonrpc": "2.0",
@@ -101,7 +107,11 @@ fn main() -> io::Result<()> {
 
 /// MCP stdio: newline-delimited JSON (NDJSON).
 fn write_frame<W: Write>(writer: &mut W, payload: &serde_json::Value) -> io::Result<()> {
-    writeln!(writer, "{}", serde_json::to_string(payload).map_err(io::Error::other)?)?;
+    writeln!(
+        writer,
+        "{}",
+        serde_json::to_string(payload).map_err(io::Error::other)?
+    )?;
     writer.flush()?;
     Ok(())
 }
@@ -112,10 +122,7 @@ fn read_frame<R: BufRead + Read>(reader: &mut R) -> io::Result<serde_json::Value
         line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "stdin closed",
-            ));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stdin closed"));
         }
         let t = line.trim();
         if t.is_empty() {

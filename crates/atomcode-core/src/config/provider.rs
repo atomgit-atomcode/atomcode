@@ -65,6 +65,17 @@ pub struct ProviderConfig {
     pub ephemeral: bool,
 }
 
+impl ProviderConfig {
+    /// True if this provider's active model can accept image inputs.
+    /// Driven entirely by the model-name heuristic in
+    /// `provider::model_name_suggests_vision` — if a future model isn't
+    /// recognised, extend the heuristic rather than threading a
+    /// per-provider config flag (no user-facing knob to discover).
+    pub fn accepts_images(&self) -> bool {
+        crate::provider::model_name_suggests_vision(&self.model)
+    }
+}
+
 fn default_context_window() -> usize {
     128000
 }
@@ -79,6 +90,32 @@ pub fn default_context_window_for(provider_type: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_images_false_for_text_only_model() {
+        // Regression for the user's GLM-5.1 case: heuristic rejects
+        // text-only models so the TUI's Ctrl+V handler refuses image
+        // paste before sending a doomed request.
+        let toml_str = r#"
+            type = "openai"
+            model = "GLM-5.1"
+            api_key = "sk-test"
+            base_url = "https://api-ai.gitcode.com/v1"
+        "#;
+        let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.accepts_images());
+    }
+
+    #[test]
+    fn accepts_images_true_via_heuristic_on_known_vision_model() {
+        let toml_str = r#"
+            type = "claude"
+            model = "claude-sonnet-4-5"
+            api_key = "sk-test"
+        "#;
+        let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.accepts_images());
+    }
 
     #[test]
     fn thinking_fields_default_to_none() {
@@ -150,7 +187,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        };
+
+};
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
             !serialized.contains("skip_tls_verify"),
@@ -176,7 +214,8 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: true,
             ephemeral: false,
-        };
+
+};
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
             serialized.contains("skip_tls_verify = true"),

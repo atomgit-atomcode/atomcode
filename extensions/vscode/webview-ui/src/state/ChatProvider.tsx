@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useReducer, useEffect, useCallback, useRef } from 'react';
 import { ChatState, ChatAction, ExtensionMessage } from './types';
 import { chatReducer, initialState } from './reducer';
-import { postMessage } from '../vscode';
+import { postMessage, getVSCodeApi } from '../vscode';
 
 // ─── Context ────────────────────────────────────────────────────
 
@@ -11,8 +11,18 @@ interface ChatContextValue {
   send: (text: string) => void;
   stop: () => void;
   newConversation: () => void;
-  selectModel: (model: string) => void;
+  selectModel: (provider: string, model?: string) => void;
   loadSession: (sessionId: string, projectHash?: string) => void;
+  openSidebar: () => void;
+  openSessionInTab: (sessionId?: string, projectHash?: string) => void;
+  renameSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
+  deleteSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
+  deleteSessions: (sessions: Array<{ id: string; project_hash?: string; name?: string }>) => void;
+  startLogin: () => void;
+  cancelLogin: () => void;
+  setupCodingPlan: () => void;
+  refreshSetupState: () => void;
+  setDefaultProvider: (name: string) => void;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -38,10 +48,28 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
       const msg = event.data;
       switch (msg.type) {
         case 'init':
-          dispatch({ type: 'INIT', generating: msg.generating, currentModel: msg.currentModel });
+          dispatch({
+            type: 'INIT',
+            generating: msg.generating,
+            currentModel: msg.currentModel,
+            viewMode: msg.viewMode,
+            activeSessionId: msg.activeSessionId,
+            projectHash: msg.projectHash,
+            isSessionList: msg.isSessionList,
+          });
+          // Persist session binding so tabs survive VS Code restart
+          if (msg.activeSessionId) {
+            getVSCodeApi().setState({ sessionId: msg.activeSessionId, projectHash: msg.projectHash });
+          }
           break;
         case 'userMessage':
           dispatch({ type: 'ADD_USER_MESSAGE', text: msg.text });
+          break;
+        case 'queuedMessageSent':
+          dispatch({ type: 'SEND_QUEUED_MESSAGE', id: msg.id });
+          break;
+        case 'assistantMessage':
+          dispatch({ type: 'ADD_ASSISTANT_MESSAGE', text: msg.text });
           break;
         case 'generationStarted':
           dispatch({ type: 'START_GENERATION' });
@@ -49,24 +77,29 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         case 'text':
           dispatch({ type: 'APPEND_TEXT', content: msg.content });
           break;
+        case 'toolBatchStart':
+          dispatch({ type: 'TOOL_BATCH_START', calls: msg.calls });
+          break;
         case 'toolStart':
           dispatch({
             type: 'TOOL_START',
-            id: `tool-${++_toolIdCounter}`,
+            id: msg.id || `tool-${++_toolIdCounter}`,
             name: msg.name,
             args: msg.args,
           });
           break;
         case 'toolResult':
-          // Find the latest running tool in the last assistant message
+          // Match tool by ID if provided, otherwise find the latest running tool
           {
             const msgs = stateRef.current.messages;
             const last = msgs[msgs.length - 1];
-            const runningTool = last?.toolCalls?.findLast((t) => t.status === 'running');
-            if (runningTool) {
+            const targetTool = msg.id
+              ? last?.toolCalls?.find((t) => t.id === msg.id)
+              : last?.toolCalls?.findLast((t) => t.status === 'running');
+            if (targetTool) {
               dispatch({
                 type: 'TOOL_RESULT',
-                id: runningTool.id,
+                id: targetTool.id,
                 name: msg.name,
                 output: msg.output,
                 success: msg.success,
@@ -80,6 +113,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'done':
           dispatch({ type: 'GENERATION_DONE', tokens: msg.tokens });
+          if (msg.sessionId) {
+            dispatch({ type: 'SET_ACTIVE_SESSION', sessionId: msg.sessionId });
+          }
           break;
         case 'stopped':
         case 'generationStopped':
@@ -91,11 +127,54 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         case 'clearChat':
           dispatch({ type: 'CLEAR_CHAT' });
           break;
+        case 'resumeStreaming':
+          dispatch({ type: 'RESUME_STREAMING' });
+          break;
         case 'sessions':
           dispatch({ type: 'SET_SESSIONS', sessions: msg.sessions });
           break;
+        case 'sessionSelected':
+          dispatch({ type: 'SET_ACTIVE_SESSION', sessionId: msg.sessionId, projectHash: msg.projectHash });
+          break;
         case 'models':
           dispatch({ type: 'SET_MODELS', models: msg.models });
+          break;
+        case 'providers':
+          dispatch({ type: 'SET_PROVIDERS', providers: msg.providers, defaultProvider: msg.defaultProvider });
+          break;
+        case 'authStatus':
+          dispatch({ type: 'SET_AUTH', auth: msg.auth });
+          break;
+        case 'setupState':
+          dispatch({
+            type: 'SET_SETUP_STATE',
+            auth: msg.auth,
+            providers: msg.providers,
+            defaultProvider: msg.defaultProvider,
+            currentModel: msg.currentModel,
+            setupRequired: msg.setupRequired,
+          });
+          break;
+        case 'loginStarted':
+          dispatch({ type: 'SET_SETUP_STATUS', status: 'Waiting for browser authorization...', loginUrl: msg.url });
+          break;
+        case 'loginPending':
+          dispatch({ type: 'SET_SETUP_STATUS', status: 'Waiting for browser authorization...' });
+          break;
+        case 'loginAuthorized':
+          dispatch({ type: 'SET_SETUP_STATUS', status: 'Signed in. Sync CodingPlan models or add a provider.' });
+          break;
+        case 'setupWorking':
+          dispatch({ type: 'SET_SETUP_STATUS', status: msg.message });
+          break;
+        case 'codingPlanResult':
+          dispatch({
+            type: 'SET_SETUP_STATUS',
+            status: msg.result.report_text,
+          });
+          break;
+        case 'setupError':
+          dispatch({ type: 'SET_SETUP_STATUS', error: msg.message });
           break;
         case 'sessionMessages':
           dispatch({ type: 'LOAD_SESSION_MESSAGES', messages: msg.messages });
@@ -137,11 +216,19 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   // ── Outbound actions ──
   const send = useCallback(
     (text: string) => {
+      const state = stateRef.current;
       const ctx = stateRef.current.contextFiles.length > 0
         ? stateRef.current.contextFiles.map((f) => ({ path: f.path, type: f.type }))
         : undefined;
-      dispatch({ type: 'ADD_USER_MESSAGE', text, contextFiles: stateRef.current.contextFiles });
-      postMessage({ type: 'send', text, context: ctx });
+      const contextFiles = state.contextFiles;
+      const isQueued = state.isGenerating;
+      const clientMessageId = `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      if (isQueued) {
+        dispatch({ type: 'ADD_QUEUED_MESSAGE', id: clientMessageId, text, contextFiles });
+      } else {
+        dispatch({ type: 'ADD_USER_MESSAGE', text, contextFiles });
+      }
+      postMessage({ type: 'send', text, context: ctx, clientMessageId: isQueued ? clientMessageId : undefined, sessionId: state.activeSessionId });
       // Clear context after sending
       dispatch({ type: 'CLEAR_CONTEXT' });
     },
@@ -156,13 +243,70 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     postMessage({ type: 'newConversation' });
   }, []);
 
-  const selectModel = useCallback((model: string) => {
-    dispatch({ type: 'SET_CURRENT_MODEL', model });
-    postMessage({ type: 'selectModel', model });
+  const selectModel = useCallback((provider: string, model?: string) => {
+    dispatch({ type: 'SET_CURRENT_PROVIDER', provider, model });
+    postMessage({ type: 'selectModel', provider, model });
   }, []);
 
   const loadSession = useCallback((sessionId: string, projectHash?: string) => {
     postMessage({ type: 'loadSession', sessionId, projectHash });
+  }, []);
+
+  const openSidebar = useCallback(() => {
+    postMessage({ type: 'openSidebar' });
+  }, []);
+
+  const openSessionInTab = useCallback((sessionId?: string, projectHash?: string) => {
+    postMessage({ type: 'openSessionInTab', sessionId, projectHash });
+  }, []);
+
+  const renameSession = useCallback((session: { id: string; project_hash?: string; name?: string; title?: string }) => {
+    postMessage({
+      type: 'renameSession',
+      sessionId: session.id,
+      projectHash: session.project_hash,
+      name: session.name || session.title || '',
+    });
+  }, []);
+
+  const deleteSession = useCallback((session: { id: string; project_hash?: string; name?: string; title?: string }) => {
+    postMessage({
+      type: 'deleteSession',
+      sessionId: session.id,
+      projectHash: session.project_hash,
+      name: session.name || session.title || '',
+    });
+  }, []);
+
+  const deleteSessions = useCallback((sessions: Array<{ id: string; project_hash?: string; name?: string }>) => {
+    postMessage({
+      type: 'deleteSessions',
+      sessions: sessions.map((s) => ({
+        sessionId: s.id,
+        projectHash: s.project_hash,
+        name: s.name || '',
+      })),
+    });
+  }, []);
+
+  const startLogin = useCallback(() => {
+    postMessage({ type: 'authLoginStart' });
+  }, []);
+
+  const cancelLogin = useCallback(() => {
+    postMessage({ type: 'authLoginCancel' });
+  }, []);
+
+  const setupCodingPlan = useCallback(() => {
+    postMessage({ type: 'codingPlanSetup' });
+  }, []);
+
+  const refreshSetupState = useCallback(() => {
+    postMessage({ type: 'refreshSetupState' });
+  }, []);
+
+  const setDefaultProvider = useCallback((name: string) => {
+    postMessage({ type: 'providerSetDefault', name });
   }, []);
 
   const value: ChatContextValue = {
@@ -170,9 +314,19 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     dispatch,
     send,
     stop,
+    openSidebar,
     newConversation,
     selectModel,
     loadSession,
+    openSessionInTab,
+    renameSession,
+    deleteSession,
+    deleteSessions,
+    startLogin,
+    cancelLogin,
+    setupCodingPlan,
+    refreshSetupState,
+    setDefaultProvider,
   };
 
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;

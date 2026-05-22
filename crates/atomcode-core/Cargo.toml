@@ -2,15 +2,21 @@
 name = "atomcode-core"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+zstd = "0.13"
+tar = "0.4"
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "blocking"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time", "net"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
@@ -19,6 +25,7 @@ dirs = "6"
 url = "2"
 which = "7"
 uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
 
 # Semantic analysis
 tree-sitter = "0.26"
@@ -32,6 +39,7 @@ tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-html = "0.23"
+tree-sitter-php = "0.24"
 ignore = "0.4"
 regex = "1"
 bincode = "1"
@@ -39,7 +47,32 @@ bincode = "1"
 # Used by read_file's fallback path.
 encoding_rs = "0.8"
 sha2 = "0.10"
+base64 = "0.22"
+# Project-level advisory file lock (POSIX flock / Windows LockFileEx) for setup.
+fs2 = "0.4"
+# Used by setup::lock for log lines on stale/force lock takeover. The setup
+# module is the first consumer; other crates emit logs via println!.
+getrandom = "0.2"
+thiserror = "1"
+tracing = "0.1"
 atomcode-telemetry = { path = "../atomcode-telemetry" }
+# Embedded setup seeds (rust-best-practices.md, /review command, etc.) are
+# packed into a tar.zst by build.rs and extracted at first run. The same crates
+# are listed under [build-dependencies] for the packer; runtime needs them too
+# (separate dependency trees).
+zstd = "0.13"
+tar = "0.4"
+
+# AtomCode request-signing crate. Stub in the open-source tree; the
+# official build pipeline replaces `crates/atomcode-codingplan-crypto/`
+# with the closed-source overlay and turns the feature on. Off by
+# default — the stub crate is linked only when this feature is enabled,
+# never in standard `cargo build`.
+atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional = true }
+
+[features]
+default = []
+codingplan-crypto = ["dep:atomcode-codingplan-crypto"]
 
 # Non-blocking poll on stdin in the OAuth callback path so the stdin
 # reader thread can exit cleanly when the HTTP listener wins — otherwise
@@ -47,6 +80,10 @@ atomcode-telemetry = { path = "../atomcode-telemetry" }
 # after login returns.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "3"

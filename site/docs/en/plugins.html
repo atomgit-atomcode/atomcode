@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Plugin System · AtomCode Docs</title>
+<meta name="description" content="One-line install of community plugin bundles — skills, commands, and hooks — over git, Claude Code compatible.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="plugins">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Plugin System</h1>
+      <p class="lede">A plugin is a bundle of skills / commands / hooks distributed over a git repository. One <code>/plugin install</code> drops someone else's workflow into AtomCode and you can use it immediately. AtomCode's plugin protocol is compatible with Claude Code — CC-ecosystem plugin repos install and run out of the box.</p>
+
+      <h2>Core concepts</h2>
+      <ul>
+        <li><strong>Marketplace</strong> — a git repository whose root contains <code>.atomcode-plugin/marketplace.json</code> or <code>.claude-plugin/marketplace.json</code>, declaring the plugins it provides.</li>
+        <li><strong>Plugin</strong> — an entry in a marketplace. It can be a subdirectory of the same repo, or it can point to an <strong>external git repository</strong> (<code>url</code> / <code>github</code> / <code>git</code>) or a <strong>local path</strong> (<code>local</code>).</li>
+        <li><strong>Skill / Command / Hook</strong> — the three asset types a plugin contributes. Skills and commands are namespaced with <code>plugin-name:</code> (to avoid collisions); hooks fire on events.</li>
+      </ul>
+
+      <h2>Install a plugin</h2>
+
+      <h3>Method 1: in the TUI</h3>
+      <pre><code># 1. Register the marketplace (clones its git repo locally)
+/plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
+
+# 2. Install one of its plugins
+/plugin install ascend-model-agent-plugin@ascend-model-agent-plugin
+
+# 3. List installed plugins
+/plugin list</code></pre>
+
+      <h3>Method 2: CLI</h3>
+      <pre><code>atomcode plugin marketplace add &lt;git-url&gt;
+atomcode plugin install &lt;plugin&gt;@&lt;marketplace&gt;
+atomcode plugin list
+atomcode plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;
+atomcode plugin marketplace remove|update|list</code></pre>
+      <p>The CLI and TUI share the <code>~/.atomcode/plugins/</code> directory; anything installed on one side is visible on the other immediately.</p>
+
+      <h3>After install</h3>
+      <ul>
+        <li>Skills contributed by the plugin appear in the <code>/</code> menu with a <code>&lt;plugin-name&gt;:</code> prefix, e.g. <code>/ascend-model-agent-plugin:ascend-model-verification</code>.</li>
+        <li>The model can also invoke these skills through the <code>UseSkill</code> tool.</li>
+        <li>Hooks activate immediately — since v4.21.1, <code>/plugin install</code> rebuilds the hook executor automatically; no need to <code>/cd</code> or restart.</li>
+      </ul>
+
+      <h2>Directory layout</h2>
+      <pre><code>~/.atomcode/plugins/
+├── marketplaces.json              # Registered marketplace metadata
+├── installed_plugins.json         # Status records for installed plugins
+├── marketplaces/
+│   └── &lt;marketplace-name&gt;/        # The marketplace repository clone
+│       ├── .claude-plugin/marketplace.json
+│       └── &lt;plugin-subdir&gt;/        # Inline plugin
+└── installed/
+    └── &lt;marketplace&gt;/&lt;plugin&gt;/    # Clones of plugins from external sources</code></pre>
+
+      <h2>plugin.json shape</h2>
+      <p>The <code>plugin.json</code> in each plugin's root (or its <code>.claude-plugin/</code> / <code>.atomcode-plugin/</code> subdirectory):</p>
+      <pre><code>{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "description": "What it does",
+  "skills": ["./skills"],          // Also accepts the string "skills"
+  "commands": ["./commands"],
+  "hooks": {                        // Also accepts a path string "hooks.json"
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python \"${CLAUDE_PLUGIN_ROOT}/hook.py\"",
+        "timeout": 5
+      }]
+    }]
+  }
+}</code></pre>
+
+      <h2>Hook events</h2>
+      <p>Plugins can hook the following events (matching CC):</p>
+      <table>
+        <thead>
+          <tr><th>Event</th><th>When it fires</th><th>Typical use</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>UserPromptSubmit</code></td><td>After the user submits a message, before the LLM call</td><td>Inject additional context / route / block</td></tr>
+          <tr><td><code>PreToolUse</code></td><td>Before a tool call</td><td>Validation, blocking, argument rewriting</td></tr>
+          <tr><td><code>PostToolUse</code></td><td>After a tool call</td><td>Audit, side effects</td></tr>
+          <tr><td><code>SessionStart</code></td><td>Session startup</td><td>Warm-up, logging</td></tr>
+          <tr><td><code>SessionEnd</code></td><td>Session end</td><td>Cleanup, archiving</td></tr>
+          <tr><td><code>Notification</code></td><td>System notification</td><td>Forward to external alert channels</td></tr>
+        </tbody>
+      </table>
+
+      <h3>UserPromptSubmit IO protocol</h3>
+      <p>The hook receives JSON on stdin and decides what to do via stdout:</p>
+      <pre><code>{
+  "session_id": "...",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "the user's input text",
+  "cwd": "/working/directory"
+}</code></pre>
+      <p>The hook can respond in the following ways (highest priority first):</p>
+      <ul>
+        <li><strong>Non-zero exit code</strong> — blocks the prompt; reason is taken from stderr.</li>
+        <li><strong>JSON on stdout</strong> <code>{"decision": "block", "reason": "..."}</code> — block with an explicit reason.</li>
+        <li><strong>JSON on stdout</strong> <code>{"hookSpecificOutput": {"additionalContext": "..."}}</code> — append <code>additionalContext</code> to the user message as extra LLM context.</li>
+        <li><strong>Plain text on stdout</strong> — the whole block is injected as <code>additionalContext</code>.</li>
+        <li><strong>Empty stdout / unparseable JSON</strong> — passthrough; the prompt reaches the LLM unchanged.</li>
+      </ul>
+      <p>When parsing stdout, AtomCode first tries the <strong>last non-empty line</strong> as JSON; on failure it falls back to whole-text injection — so a hook script can print debug output earlier without affecting the final decision.</p>
+
+      <h3>Path variables</h3>
+      <p>Hook command strings can reference these environment variables (injected by the executor):</p>
+      <ul>
+        <li><code>${CLAUDE_PLUGIN_ROOT}</code> — absolute path of the plugin install directory (CC compatible).</li>
+        <li><code>${ATOMCODE_PLUGIN_ROOT}</code> — same thing, atomcode alias.</li>
+      </ul>
+      <p>These are <strong>real environment variables</strong> expanded by the shell itself, not string substitutions — install paths with spaces, quotes, <code>$</code>, or <code>;</code> won't break the command.</p>
+
+      <h2>Marketplace management</h2>
+      <pre><code># List registered marketplaces
+/plugin marketplace list
+
+# Pull the latest commit (refreshes the plugin list this marketplace exposes)
+/plugin marketplace update &lt;name&gt;
+
+# Remove (refuses if any plugin from this marketplace is still installed)
+/plugin marketplace remove &lt;name&gt;</code></pre>
+
+      <h2>Walkthrough: installing the Ascend plugin</h2>
+      <pre><code>/plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
+# &gt; cloning marketplace from https://gitcode.com/...
+# &gt; marketplace `ascend-model-agent-plugin` added at 7a59537 (1 plugins)
+
+/plugin install ascend-model-agent-plugin@ascend-model-agent-plugin
+# &gt; installing `...`...
+# &gt; installed `ascend-model-agent-plugin@ascend-model-agent-plugin` — 23 skills loaded, 5 skipped
+
+# This plugin installs a UserPromptSubmit hook (workflow_planner_hook.py).
+# When you say "help me verify Qwen3 adaptation on Ascend", it injects a
+# workflow JSON and routes the model through the ascend-model-verification
+# skill pipeline.
+help me verify Qwen3 adaptation on Ascend</code></pre>
+
+      <h2>Known limits</h2>
+      <ul>
+        <li><strong>Unsupported CC events</strong>: <code>Stop</code> / <code>PreCompact</code> / <code>SubagentStop</code> are silently skipped.</li>
+        <li><strong>Multi-line indented JSON output</strong>: when a hook prints with <code>print(json.dumps(..., indent=2))</code>, the last line is <code>}</code>, which our last-line JSON parser fails on — falling back to plain-text injection. Functionally it still works (the LLM still reads the content) but it's not on the structured path. Hook authors should use single-line <code>json.dumps(...)</code> output.</li>
+        <li><strong>Strict skill-name validation</strong>: <code>[a-z0-9_-]</code>, matching CC. Skill names with <code>/</code> or mixed case are skipped.</li>
+      </ul>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li><a href="./skills.html">Skills</a> — write your own skills; they work inside plugins too.</li>
+        <li><a href="./slash-commands.html">Slash Commands</a> — full <code>/plugin</code> command list.</li>
+        <li><a href="./mcp.html">MCP Integration</a> — another path for connecting external tools; complementary to plugins.</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

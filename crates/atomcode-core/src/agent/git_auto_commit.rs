@@ -50,6 +50,7 @@ pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> 
     // Stage only the files that were actually edited.
     let mut add_cmd = Command::new("git");
     add_cmd.arg("add").arg("--").args(&file_paths).current_dir(working_dir);
+    crate::process_utils::suppress_console_window_sync(&mut add_cmd);
     let output = match add_cmd.output() {
         Ok(output) => output,
         Err(e) => {
@@ -72,10 +73,11 @@ pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> 
     }
 
     // Check if there are staged changes
-    let diff_output = Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(working_dir)
-        .status();
+    let mut diff_cmd = Command::new("git");
+    diff_cmd.args(["diff", "--cached", "--quiet"])
+        .current_dir(working_dir);
+    crate::process_utils::suppress_console_window_sync(&mut diff_cmd);
+    let diff_output = diff_cmd.status();
     if let Ok(status) = diff_output {
         if status.success() {
             // Exit code 0 means no staged changes
@@ -91,11 +93,11 @@ pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> 
 
     let message = generate_commit_message(edited_files);
 
-    let output = match Command::new("git")
-        .args(["commit", "-m", &message])
-        .current_dir(working_dir)
-        .output()
-    {
+    let mut commit_cmd = Command::new("git");
+    commit_cmd.args(["commit", "-m", &message])
+        .current_dir(working_dir);
+    crate::process_utils::suppress_console_window_sync(&mut commit_cmd);
+    let output = match commit_cmd.output() {
         Ok(output) => output,
         Err(e) => {
             return AutoCommitOutcome::Failed {
@@ -111,11 +113,11 @@ pub fn auto_commit_edited_files(working_dir: &Path, edited_files: &[String]) -> 
     }
 
     // Extract commit SHA
-    let sha_output = match Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(working_dir)
-        .output()
-    {
+    let mut rev_cmd = Command::new("git");
+    rev_cmd.args(["rev-parse", "--short", "HEAD"])
+        .current_dir(working_dir);
+    crate::process_utils::suppress_console_window_sync(&mut rev_cmd);
+    let sha_output = match rev_cmd.output() {
         Ok(output) => output,
         Err(e) => {
             return AutoCommitOutcome::Failed {
@@ -171,20 +173,22 @@ fn generate_commit_message(files: &[String]) -> String {
 }
 
 fn is_git_repo(working_dir: &Path) -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(working_dir)
-        .output()
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--git-dir"])
+        .current_dir(working_dir);
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    cmd.output()
         .ok()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
 fn has_staged_changes(working_dir: &Path) -> bool {
-    Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(working_dir)
-        .status()
+    let mut cmd = Command::new("git");
+    cmd.args(["diff", "--cached", "--quiet"])
+        .current_dir(working_dir);
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    cmd.status()
         .map(|status| !status.success())
         .unwrap_or(true)
 }

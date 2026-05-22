@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +19,10 @@ use super::types::{CallToolResult, InitializeResult, ListToolsResult, ServerStat
 
 /// Default timeout for MCP operations (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum non-protocol lines to skip before giving up.
+/// Protects against servers that spam stdout with logs.
+const MAX_SKIP_LINES: usize = 100;
 
 /// stdio-based MCP client.
 pub struct StdioClient {
@@ -69,8 +73,17 @@ impl StdioClient {
 
     /// Start the subprocess and set up communication.
     async fn start(&self) -> Result<()> {
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&self.args)
+        // On Windows, commands like `npx`, `npm` are .cmd/.bat scripts
+        // that cannot be spawned directly via Command::new(). Wrap them
+        // through `cmd.exe /C` so the OS can locate and execute them.
+        #[cfg(target_os = "windows")]
+        let (command, args) = windows_wrap_command(&self.command, &self.args);
+
+        #[cfg(not(target_os = "windows"))]
+        let (command, args) = (self.command.clone(), self.args.clone());
+
+        let mut cmd = Command::new(&command);
+        cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -79,9 +92,26 @@ impl StdioClient {
             cmd.env(key, value);
         }
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn MCP server: {}", self.command))?;
+        crate::process_utils::suppress_console_window(&mut cmd);
+
+        let mut child = cmd.spawn().with_context(|| {
+            #[cfg(target_os = "windows")]
+            {
+                let msg = format!(
+                    "Failed to spawn MCP server: {}. \
+                     On Windows, commands like 'npx' are .cmd scripts and must \
+                     be executed through 'cmd /C'. AtomCode wraps known commands \
+                     automatically; if this is a custom .cmd/.bat, set command to \
+                     'cmd' and add '/C' before the script name in args.",
+                    self.command
+                );
+                msg
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                format!("Failed to spawn MCP server: {}", self.command)
+            }
+        })?;
 
         let stdin = child.stdin.take().context("Failed to get stdin")?;
         let stdout = child.stdout.take().context("Failed to get stdout")?;
@@ -108,9 +138,15 @@ impl StdioClient {
         // The official JS MCP SDK's stdio transport can hang when it receives
         // `"params": null` for methods that expect params to be absent.
         let mut request = serde_json::Map::new();
-        request.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
+        request.insert(
+            "jsonrpc".to_string(),
+            serde_json::Value::String("2.0".to_string()),
+        );
         request.insert("id".to_string(), serde_json::Value::Number(id.into()));
-        request.insert("method".to_string(), serde_json::Value::String(method.to_string()));
+        request.insert(
+            "method".to_string(),
+            serde_json::Value::String(method.to_string()),
+        );
         if let Some(p) = params {
             request.insert("params".to_string(), p);
         }
@@ -121,9 +157,7 @@ impl StdioClient {
         // Write request (NDJSON).
         {
             let mut stdin = self.stdin.lock().await;
-            let stdin = stdin
-                .as_mut()
-                .context("MCP server not connected (stdin)")?;
+            let stdin = stdin.as_mut().context("MCP server not connected (stdin)")?;
 
             let mut body = serde_json::to_vec(&request)?;
             body.push(b'\n');
@@ -134,15 +168,15 @@ impl StdioClient {
         // Read response with timeout
         let result = tokio::time::timeout(timeout, self.recv_jsonrpc_response())
             .await
-            .with_context(|| format!("MCP request {} timed out after {}ms", method, self.timeout_ms))??;
+            .with_context(|| {
+                format!(
+                    "MCP request {} timed out after {}ms",
+                    method, self.timeout_ms
+                )
+            })??;
 
         if let Some(error) = result.error {
-            bail!(
-                "MCP error {} (code {}): {}",
-                error.message,
-                error.code,
-                ""
-            );
+            bail!("MCP error {} (code {}): {}", error.message, error.code, "");
         }
 
         result
@@ -175,10 +209,9 @@ impl McpClient for StdioClient {
             }
         });
 
-        let result: InitializeResult = serde_json::from_value(
-            self.send_request("initialize", Some(params)).await?,
-        )
-        .context("Failed to parse initialize result")?;
+        let result: InitializeResult =
+            serde_json::from_value(self.send_request("initialize", Some(params)).await?)
+                .context("Failed to parse initialize result")?;
 
         // Send initialized notification
         {
@@ -206,7 +239,11 @@ impl McpClient for StdioClient {
         serde_json::from_value(result).context("Failed to parse tools/list result")
     }
 
-    async fn call_tool(&self, tool_name: &str, arguments: serde_json::Value) -> Result<CallToolResult> {
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<CallToolResult> {
         let params = serde_json::json!({
             "name": tool_name,
             "arguments": arguments
@@ -236,35 +273,46 @@ impl StdioClient {
             .as_mut()
             .context("MCP server not connected (reader)")?;
 
-        let line = if let Some(s) = self.preread_line.lock().await.take() {
-            s
-        } else {
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                let n = reader.read_line(&mut buf).await?;
-                if n == 0 {
-                    bail!("MCP server closed connection");
+        let mut skipped_lines = 0;
+        loop {
+            let line = if let Some(s) = self.preread_line.lock().await.take() {
+                s
+            } else {
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    let n = reader.read_line(&mut buf).await?;
+                    if n == 0 {
+                        bail!("MCP server closed connection");
+                    }
+                    if !buf.trim().is_empty() {
+                        break;
+                    }
                 }
-                if !buf.trim().is_empty() {
-                    break;
-                }
-            }
-            buf
-        };
+                buf
+            };
 
-        let body = line.trim_end_matches(['\r', '\n']).trim_start();
-        if body.starts_with('{') || body.starts_with('[') {
-            return serde_json::from_str(body)
-                .context("Failed to parse NDJSON MCP message as JSON-RPC");
+            let body = line.trim_end_matches(['\r', '\n']).trim_start();
+            if body.starts_with('{') || body.starts_with('[') {
+                return serde_json::from_str(body)
+                    .context("Failed to parse NDJSON MCP message as JSON-RPC");
+            }
+            if strip_prefix_ci(body, "content-length:").is_some() {
+                return read_content_length_message(reader, line).await;
+            }
+
+            // Some third-party MCP servers incorrectly print status logs to stdout
+            // after initialization. MCP requires stdout to contain only protocol
+            // messages, but skipping plain-text lines keeps otherwise usable tools
+            // available while still failing on malformed JSON-RPC frames above.
+            skipped_lines += 1;
+            if skipped_lines > MAX_SKIP_LINES {
+                bail!(
+                    "MCP stdio: too many non-protocol lines (>{MAX_SKIP_LINES}), last line: {}",
+                    body.chars().take(80).collect::<String>()
+                );
+            }
         }
-        if strip_prefix_ci(body, "content-length:").is_some() {
-            return read_content_length_message(reader, line).await;
-        }
-        bail!(
-            "Unexpected MCP stdio line (expected NDJSON or Content-Length): {}",
-            body.chars().take(160).collect::<String>()
-        );
     }
 
     /// Drain non-protocol lines the server may print to stdout before the first MCP message.
@@ -347,6 +395,53 @@ async fn read_content_length_message(
     serde_json::from_slice(&body).context("Failed to parse JSON-RPC response")
 }
 
+/// On Windows, commands like `npx`, `npm`, `yarn`, `pnpm` are actually
+/// `.cmd`/`.bat` scripts that cannot be spawned directly via
+/// `Command::new()`. The OS `CreateProcess` API only launches `.exe`
+/// files directly. This function detects such commands and wraps them
+/// through `cmd.exe /C` so the OS can locate and execute the script.
+///
+/// If the user has already wrapped the command themselves (e.g.
+/// `command: "cmd"`, `args: ["/C", "npx", ...]`), this function is a
+/// no-op — `cmd` / `cmd.exe` are not in the wrap list.
+///
+/// The core logic is platform-independent (and testable on all platforms);
+/// the `shell` parameter is `"cmd.exe"` on Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn wrap_cmd_script(command: &str, args: &[String], shell: &str) -> (String, Vec<String>) {
+    /// Commands that are known to be `.cmd`/`.bat` scripts on Windows.
+    /// Checked case-insensitively.
+    const CMD_SCRIPTS: &[&str] = &[
+        "npx",
+        "npm",
+        "npx.cmd",
+        "npm.cmd",
+        "yarn",
+        "yarn.cmd",
+        "pnpm",
+        "pnpm.cmd",
+    ];
+
+    let lower = command.to_ascii_lowercase();
+    let needs_wrap = CMD_SCRIPTS.iter().any(|&s| lower == s)
+        || lower.ends_with(".cmd")
+        || lower.ends_with(".bat");
+
+    if needs_wrap {
+        let mut wrapped_args = vec!["/C".to_string(), command.to_string()];
+        wrapped_args.extend(args.iter().cloned());
+        (shell.to_string(), wrapped_args)
+    } else {
+        (command.to_string(), args.to_vec())
+    }
+}
+
+/// Windows-specific entry point that passes `"cmd.exe"` as the shell.
+#[cfg(target_os = "windows")]
+fn windows_wrap_command(command: &str, args: &[String]) -> (String, Vec<String>) {
+    wrap_cmd_script(command, args, "cmd.exe")
+}
+
 impl Drop for StdioClient {
     fn drop(&mut self) {
         // Try to kill the subprocess gracefully
@@ -355,5 +450,101 @@ impl Drop for StdioClient {
                 let _ = child.start_kill();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Platform-independent tests for wrap_cmd_script logic ---
+    // These run on ALL platforms (macOS, Linux, Windows) so we can
+    // verify the wrapping logic locally without a Windows machine.
+
+    #[test]
+    fn wrap_npx() {
+        let (cmd, args) = wrap_cmd_script("npx", &["-y".into(), "@pkg/server".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "npx", "-y", "@pkg/server"]);
+    }
+
+    #[test]
+    fn wrap_npx_cmd_suffix() {
+        let (cmd, args) = wrap_cmd_script("npx.cmd", &["-y".into(), "@pkg/server".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "npx.cmd", "-y", "@pkg/server"]);
+    }
+
+    #[test]
+    fn wrap_npm() {
+        let (cmd, args) = wrap_cmd_script("npm", &["install".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "npm", "install"]);
+    }
+
+    #[test]
+    fn wrap_yarn() {
+        let (cmd, args) = wrap_cmd_script("yarn", &["add".into(), "lodash".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "yarn", "add", "lodash"]);
+    }
+
+    #[test]
+    fn wrap_pnpm() {
+        let (cmd, args) = wrap_cmd_script("pnpm", &["install".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "pnpm", "install"]);
+    }
+
+    #[test]
+    fn wrap_custom_bat() {
+        let (cmd, args) = wrap_cmd_script("my-script.bat", &["--flag".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "my-script.bat", "--flag"]);
+    }
+
+    #[test]
+    fn wrap_custom_cmd_suffix() {
+        let (cmd, args) = wrap_cmd_script("build.cmd", &[], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "build.cmd"]);
+    }
+
+    #[test]
+    fn no_wrap_exe() {
+        let (cmd, args) = wrap_cmd_script("node", &["server.js".into()], "cmd.exe");
+        assert_eq!(cmd, "node");
+        assert_eq!(args, vec!["server.js"]);
+    }
+
+    #[test]
+    fn no_wrap_already_wrapped() {
+        // If user already set command to "cmd", don't double-wrap
+        let (cmd, args) =
+            wrap_cmd_script("cmd", &["/C".into(), "npx".into(), "-y".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd");
+        assert_eq!(args, vec!["/C", "npx", "-y"]);
+    }
+
+    #[test]
+    fn wrap_case_insensitive() {
+        let (cmd, args) = wrap_cmd_script("NPX", &["-y".into(), "@pkg/server".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args, vec!["/C", "NPX", "-y", "@pkg/server"]);
+    }
+
+    #[test]
+    fn wrap_preserves_original_command_in_args() {
+        // The original command (with original casing) should appear in args
+        let (cmd, args) = wrap_cmd_script("Npx", &["-y".into()], "cmd.exe");
+        assert_eq!(cmd, "cmd.exe");
+        assert_eq!(args[1], "Npx"); // original casing preserved
+    }
+
+    #[test]
+    fn no_wrap_python() {
+        let (cmd, args) = wrap_cmd_script("python", &["-m".into(), "server".into()], "cmd.exe");
+        assert_eq!(cmd, "python");
+        assert_eq!(args, vec!["-m", "server"]);
     }
 }

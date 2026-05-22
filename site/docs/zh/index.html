@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>使用指南 · AtomCode 文档</title>
+<meta name="description" content="使用指南 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="index">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<div class="doc-hero">
+      <div class="eyebrow"><span class="dot"></span><span data-i18n="hero.eyebrow">AtomCode · 开源终端 AI 编码助手</span></div>
+      <h1>AtomCode 使用指南</h1>
+      <p class="lede">住在终端里的 AI 编码助手。给它一个自然语言任务，它会自主读取、编辑、运行并自我验证。本文档带你从零开始，逐步掌握 AtomCode 的每一项能力。</p>
+      <div class="tags">
+        <span class="tag accent">v4.23.0</span>
+        <span class="tag" data-i18n="hero.tag.license">许可证 MIT</span>
+        <span class="tag" data-i18n="hero.tag.lang">语言 Rust 1.88+</span>
+        <span class="tag" data-i18n="hero.tag.platforms">平台 macOS · Linux · HarmonyOS PC · Windows</span>
+        <span class="tag" data-i18n="hero.tag.ai">100% AI 生成</span>
+      </div>
+    </div>
+
+      <h2>三步开始</h2>
+      <ol>
+        <li><strong>安装</strong> —— 一条 curl 命令或者从源码构建，参见 <a href="./getting-started.html">快速开始</a>。</li>
+        <li><strong>登录或配置模型</strong> —— AtomGit OAuth 一键登录最省事，也支持任意 OpenAI 兼容 API Key，参见 <a href="./login.html">登录方式</a> 和 <a href="./configuration.html">配置文件</a>。</li>
+        <li><strong>开始提问</strong> —— 在项目目录下运行 <code>atomcode</code>，用自然语言描述你的任务即可。</li>
+      </ol>
+
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>如果只是想快速体验，跑一条命令即可：<code>atomcode -p "简要介绍一下这个仓库"</code>，一次性执行并把结果输出到 stdout。</p>
+      </div>
+
+      <h2>文档导览</h2>
+      <div class="doc-grid">
+        <a class="doc-card" href="./getting-started.html">
+          <h3>快速开始</h3>
+          <p>安装方式、首次运行的 3 步启动向导、完成第一个任务,以及 <code>atomcode uninstall</code> 卸载流程。</p>
+        </a>
+        <a class="doc-card" href="./configuration.html">
+          <h3>配置文件</h3>
+          <p><code>~/.atomcode/config.toml</code> 字段说明、各家 provider 配置示例,含视觉预处理器(非视觉模型也能问图)。</p>
+        </a>
+        <a class="doc-card" href="./login.html">
+          <h3>登录方式</h3>
+          <p>AtomGit OAuth 一键登录(自动持久化)与 API Key 配置对比。</p>
+        </a>
+        <a class="doc-card" href="./basic-usage.html">
+          <h3>基本使用</h3>
+          <p>如何描述任务、常用 CLI 参数、文件引用、多行输入,以及图片附件 / 截图(Ctrl+V / 拖拽)。</p>
+        </a>
+        <a class="doc-card" href="./slash-commands.html">
+          <h3>斜杠命令</h3>
+          <p>30+ 个内置斜杠命令参考表,涵盖会话、模型、撤销、Issue、对话模式、扩展生态等操作。</p>
+        </a>
+        <a class="doc-card" href="./keybindings.html">
+          <h3>快捷键</h3>
+          <p>输入、导航、选区复制等全部 TUI 快捷键。</p>
+        </a>
+        <a class="doc-card" href="./tools.html">
+          <h3>内置工具</h3>
+          <p>21 个内置工具:文件/Shell、代码图谱、Web、自动化分类说明。</p>
+        </a>
+        <a class="doc-card" href="./sessions.html">
+          <h3>会话与撤销</h3>
+          <p>持久化会话恢复、<code>/undo</code> 回滚、清空与压缩上下文。</p>
+        </a>
+        <a class="doc-card" href="./project-instructions.html">
+          <h3>项目指令文件</h3>
+          <p>用 <code>.atomcode.md</code> 给 AtomCode 定制项目级规范。</p>
+        </a>
+        <a class="doc-card" href="./skills.html">
+          <h3>Skills 扩展</h3>
+          <p>编写用户自定义 skill,扩展斜杠命令生态。</p>
+        </a>
+        <a class="doc-card" href="./plugins.html">
+          <h3>Plugin 系统</h3>
+          <p>从 git 仓库一键安装别人写好的 skill / 命令 / hook 套件,与 Claude Code 生态兼容。</p>
+        </a>
+        <a class="doc-card" href="./mcp.html">
+          <h3>MCP 集成</h3>
+          <p>通过 <code>.mcp.json</code> 接入外部 MCP server,把 GitHub、数据库、Playwright 等生态工具暴露给模型。</p>
+        </a>
+        <a class="doc-card" href="./faq.html">
+          <h3>常见问题</h3>
+          <p>安装、连不上模型、权限确认、上下文超限等常见疑问解答。</p>
+        </a>
+      </div>
+
+      <h2>反馈与参与</h2>
+      <p>AtomCode 是开源项目,欢迎提交 issue 或 PR:</p>
+      <ul>
+        <li>开源仓库:<a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">https://atomgit.com/atomgit_atomcode/atomcode</a></li>
+        <li>Issue:终端内直接运行 <code>/issue</code> 即可快速创建</li>
+        <li>许可证:MIT</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

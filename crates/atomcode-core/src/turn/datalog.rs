@@ -50,10 +50,28 @@ pub struct DatalogWriter {
     step: usize,
     /// File path for this turn
     file_path: Option<PathBuf>,
+    /// Optional suffix inserted into the markdown filename before `.md`.
+    filename_tag: Option<String>,
 }
 
 impl DatalogWriter {
     pub fn new(working_dir: &Path, config: &DatalogConfig) -> Self {
+        Self::new_inner(working_dir, config, None)
+    }
+
+    pub fn new_with_filename_tag(
+        working_dir: &Path,
+        config: &DatalogConfig,
+        filename_tag: &str,
+    ) -> Self {
+        Self::new_inner(
+            working_dir,
+            config,
+            Some(sanitize_filename_tag(filename_tag)),
+        )
+    }
+
+    fn new_inner(working_dir: &Path, config: &DatalogConfig, filename_tag: Option<String>) -> Self {
         Self {
             base_dir: working_dir.to_path_buf(),
             configured_dir: config.dir.clone(),
@@ -64,6 +82,7 @@ impl DatalogWriter {
             llm_turn_start: None,
             step: 0,
             file_path: None,
+            filename_tag: filename_tag.filter(|s| !s.is_empty()),
         }
     }
 
@@ -145,7 +164,11 @@ impl DatalogWriter {
         self.start = Some(Instant::now());
 
         let timestamp = format_timestamp();
-        let filename = format!("{}.md", timestamp.replace(' ', "_").replace(':', "-"));
+        let filename_stem = timestamp.replace(' ', "_").replace(':', "-");
+        let filename = match self.filename_tag.as_deref() {
+            Some(tag) => format!("{filename_stem}_{tag}.md"),
+            None => format!("{filename_stem}.md"),
+        };
         let log_dir = Self::resolve_log_dir(&self.base_dir, self.configured_dir.as_deref());
         let _ = std::fs::create_dir_all(&log_dir);
         self.file_path = Some(log_dir.join(filename));
@@ -392,6 +415,19 @@ impl DatalogWriter {
         self.flush();
     }
 
+    /// Log a non-fatal advisory (e.g. provider truncation detector).
+    /// Persisting it here makes post-hoc datalog inspection useful even
+    /// when the live TUI line scrolls past — the user can grep the
+    /// markdown for `**Warning:**` after the run.
+    pub fn log_warning(&mut self, warning: &str) {
+        if !self.active {
+            return;
+        }
+        let _ = writeln!(&mut self.buf, "**Warning:** {}", warning);
+        let _ = writeln!(&mut self.buf);
+        self.flush();
+    }
+
     /// End the turn: write duration and final flush.
     pub fn end_turn(&mut self, total_tokens: usize, tool_call_count: usize) {
         if !self.active {
@@ -523,6 +559,20 @@ fn format_timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn sanitize_filename_tag(tag: &str) -> String {
+    tag.chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                Some(c)
+            } else if c.is_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Per-project slug derived from `working_dir`. Shape: `<basename>-<hash8>`.
 ///
 /// - `<basename>`: the last path component, with anything outside
@@ -611,7 +661,11 @@ mod tests {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("/var/logs/atomcode"));
         assert!(p.starts_with("/var/logs/atomcode"));
-        assert!(p.file_name().unwrap().to_string_lossy().starts_with("work-"));
+        assert!(p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("work-"));
     }
 
     #[test]
@@ -619,7 +673,11 @@ mod tests {
         let base = PathBuf::from("/tmp/work");
         let p = DatalogWriter::resolve_log_dir(&base, Some("logs/ac"));
         assert!(p.starts_with("/tmp/work/logs/ac"));
-        assert!(p.file_name().unwrap().to_string_lossy().starts_with("work-"));
+        assert!(p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("work-"));
     }
 
     #[test]
@@ -628,7 +686,11 @@ mod tests {
         let p = DatalogWriter::resolve_log_dir(&base, Some("~/.atomcode/logs"));
         let expected_root = crate::tool::real_home_dir().unwrap().join(".atomcode/logs");
         assert!(p.starts_with(&expected_root));
-        assert!(p.file_name().unwrap().to_string_lossy().starts_with("work-"));
+        assert!(p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("work-"));
     }
 
     #[test]
@@ -697,7 +759,46 @@ mod tests {
         log.log_text("response");
         log.end_turn(0, 0);
         assert!(log.file_path.is_none());
-        assert!(!dir.exists(), "disabled writer must not create the root dir");
+        assert!(
+            !dir.exists(),
+            "disabled writer must not create the root dir"
+        );
+    }
+
+    #[test]
+    fn filename_tag_is_added_only_for_tagged_writer() {
+        let dir = std::env::temp_dir().join("atomcode_test_datalog_filename_tag");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = DatalogConfig {
+            enabled: true,
+            dir: Some(dir.to_string_lossy().to_string()),
+        };
+
+        let mut default_log = DatalogWriter::new(&dir, &cfg);
+        default_log.begin_turn("hello", "m", 1000);
+        let default_name = default_log
+            .file_path
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(!default_name.contains("runtime-2"));
+
+        let mut tagged_log = DatalogWriter::new_with_filename_tag(&dir, &cfg, "runtime-2");
+        tagged_log.begin_turn("hello", "m", 1000);
+        let tagged_name = tagged_log
+            .file_path
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(tagged_name.ends_with("_runtime-2.md"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

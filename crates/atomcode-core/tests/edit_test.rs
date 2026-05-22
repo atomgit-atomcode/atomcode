@@ -838,3 +838,153 @@ fn main() {
     }
     cleanup(&path);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// P1 #14c+11 — fuzzy match indent stability (2026-04-23)
+// ═══════════════════════════════════════════════════════════════
+//
+// Regression: hermes session 2026-04-22_21-06 showed fuzzy match
+// destroying indentation across consecutive edits — line 276 drifted
+// 8 → 17 → 26 spaces over two edits. Root cause: `try_fuzzy_replace`
+// computed `new_base_indent` via `.min()` across all non-empty lines,
+// including outdented lines like `}` (at column 0). A block of indented
+// code followed by a closing brace made `min = 0`, inflating the
+// relative indent of the nested lines.
+//
+// Fix: anchor on the FIRST non-empty line's indent; support outdented
+// lines via signed relative diff with saturation at 0.
+
+#[tokio::test]
+async fn fuzzy_match_preserves_indent_on_miscased_old_string() {
+    // Exact hermes 21-06 shape: model writes old_string at 9 spaces
+    // (one extra), file has 8 spaces, fuzzy-match should succeed and
+    // OUTPUT at 8 spaces (file's true indent).
+    let content = "\
+fn main() {
+    tauri::Builder::default()
+        .run(tauri::generate_context!())
+        .expect(\"error while running tauri application\");
+}
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    // Model's args — 9-space indent instead of 8, plus adding a marker line
+    let args = serde_json::json!({
+        "file_path": path,
+        "old_string": "         .run(tauri::generate_context!())\n         .expect(\"error while running tauri application\");\n}",
+        "new_string": "         .run(tauri::generate_context!())\n         .expect(\"error while running tauri application\");\n}\nundefined_marker();"
+    });
+    let r: ToolResult = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(r.success, "fuzzy match should succeed; got: {}", r.output);
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    // The critical assertion: `.run(...)` must still be at 8 spaces,
+    // not 17 (8 + 9 drift) nor any other amount.
+    let run_line = after.lines().find(|l| l.contains(".run(tauri::"))
+        .expect("`.run(` line must still exist after edit");
+    let run_indent = run_line.len() - run_line.trim_start().len();
+    assert_eq!(
+        run_indent, 8,
+        "indent drift detected: `.run(...)` should stay at 8 spaces, got {} — content:\n{}",
+        run_indent, after
+    );
+    // Expect `.expect(...)` on its own 8-space-indented line too.
+    assert!(after.contains("        .expect(\"error while running"),
+        "`.expect(...)` should keep 8-space indent; got:\n{}", after);
+    // Marker was added (new_string included it).
+    assert!(after.contains("undefined_marker"), "marker should be present");
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn fuzzy_match_stable_across_two_consecutive_edits() {
+    // Simulates the exact session: add marker (edit 1), delete marker
+    // (edit 2). Without the fix, indent drifts 8 → 17 → 26. With the
+    // fix, indent stays at 8 after both edits.
+    let content = "\
+fn main() {
+    tauri::Builder::default()
+        .run(tauri::generate_context!())
+        .expect(\"error while running tauri application\");
+}
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    // Edit 1: add marker (model sends 9-space old/new_string)
+    let args1 = serde_json::json!({
+        "file_path": path,
+        "old_string": "         .run(tauri::generate_context!())\n         .expect(\"error while running tauri application\");\n}",
+        "new_string": "         .run(tauri::generate_context!())\n         .expect(\"error while running tauri application\");\n}\nmarker();"
+    });
+    let r1 = tool.execute(&args1.to_string(), &ctx).await.unwrap();
+    assert!(r1.success);
+
+    // Edit 2: delete marker (same miscased old_string shape)
+    let args2 = serde_json::json!({
+        "file_path": path,
+        "old_string": "         .run(tauri::generate_context!())\n         .expect(\"error while running tauri application\");\n}\nmarker();",
+        "new_string": "         .run(tauri::generate_context!())\n         .expect(\"error while running tauri application\");\n}"
+    });
+    let r2 = tool.execute(&args2.to_string(), &ctx).await.unwrap();
+    assert!(r2.success);
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    let run_line = after.lines().find(|l| l.contains(".run(tauri::"))
+        .expect("`.run(` line");
+    let run_indent = run_line.len() - run_line.trim_start().len();
+    // Without the fix this would be 17 or 26. With the fix it's 8.
+    assert_eq!(
+        run_indent, 8,
+        "two-edit indent stability failed: `.run(...)` at {} spaces. content:\n{}",
+        run_indent, after
+    );
+    // Marker should be gone.
+    assert!(!after.contains("marker"), "marker should be deleted, got:\n{}", after);
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn fuzzy_match_handles_outdented_lines_correctly() {
+    // Verify the signed-arithmetic outdent path works: new_string has
+    // a line that's outdented RELATIVE to the anchor — it should land
+    // at the corresponding outdented position in the output file, NOT
+    // get inflated to the anchor's indent.
+    let content = "\
+    if cond {
+        foo();
+        bar();
+    }
+";
+    let path = create_test_file(content);
+    let ctx = test_context();
+    let tool = atomcode_core::tool::edit::EditFileTool;
+
+    // Replace the block. new_string has `.foo()` at 2 spaces (outdented
+    // by 6 relative to the 8-space `foo();`) and `.bar()` at 0.
+    let args = serde_json::json!({
+        "file_path": path,
+        "old_string": "        foo();\n        bar();",
+        "new_string": "        updated_foo();\n  outdented();\nbareline();"
+    });
+    let r = tool.execute(&args.to_string(), &ctx).await.unwrap();
+    assert!(r.success, "got: {}", r.output);
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    // `updated_foo` should keep its 8-space indent (anchor match).
+    let foo_line = after.lines().find(|l| l.contains("updated_foo"))
+        .expect("updated_foo line");
+    assert_eq!(foo_line.len() - foo_line.trim_start().len(), 8);
+    // `outdented()` was 6 less than anchor → 8 - 6 = 2 spaces.
+    let out_line = after.lines().find(|l| l.contains("outdented"))
+        .expect("outdented line");
+    assert_eq!(out_line.len() - out_line.trim_start().len(), 2);
+    // `bareline()` was 8 less than anchor → clamp to 0.
+    let bare_line = after.lines().find(|l| l.contains("bareline"))
+        .expect("bareline");
+    assert_eq!(bare_line.len() - bare_line.trim_start().len(), 0);
+    cleanup(&path);
+}

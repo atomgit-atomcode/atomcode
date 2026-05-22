@@ -2,22 +2,34 @@ import * as http from 'http';
 import {
   ChatRequest,
   ChatStreamCallbacks,
+  AuthStatusResponse,
+  ConfigResponse,
   ChatEvent,
+  CodingPlanSetupResponse,
+  CreateProviderRequest,
   HealthResponse,
+  LoginPollResponse,
+  LoginStartResponse,
   ModelInfo,
+  PatchProviderRequest,
+  PatchThinkingRequest,
   ProjectState,
+  ProviderInfo,
+  ProvidersResponse,
   SessionMeta,
   SessionDetail,
   CreateSessionResponse,
   ChangeDirResponse,
 } from './types';
 
-const REST_TIMEOUT = 5000;
+const REST_TIMEOUT = 30000;
 
 export class DaemonClient {
   private baseUrl: string;
   private host: string;
   private port: number;
+  /** Called when a request fails with ECONNREFUSED. If set, the client retries once after this resolves. */
+  public onConnectionLost?: () => Promise<boolean>;
 
   constructor(port: number) {
     this.port = port;
@@ -28,6 +40,22 @@ export class DaemonClient {
   // ── REST helpers ──────────────────────────────────────────────
 
   private request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    return this.requestOnce<T>(method, path, body).catch(async (err) => {
+      // Auto-reconnect: if daemon is down and we have a reconnect handler, try to restart it.
+      // Skip reconnect for health/shutdown endpoints to avoid infinite recursion.
+      if (err instanceof Error && err.message === 'Daemon not running'
+          && this.onConnectionLost
+          && path !== '/health' && path !== '/shutdown') {
+        const restarted = await this.onConnectionLost();
+        if (restarted) {
+          return this.requestOnce<T>(method, path, body);
+        }
+      }
+      throw err;
+    });
+  }
+
+  private requestOnce<T>(method: string, path: string, body?: unknown): Promise<T> {
     return new Promise((resolve, reject) => {
       const payload = body ? JSON.stringify(body) : undefined;
       const options: http.RequestOptions = {
@@ -37,6 +65,7 @@ export class DaemonClient {
         method,
         headers: {
           'Content-Type': 'application/json',
+          'X-AtomCode-Client': 'vscode',
           ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
         },
         timeout: REST_TIMEOUT,
@@ -48,7 +77,7 @@ export class DaemonClient {
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf-8');
           if (!res.statusCode || res.statusCode >= 400) {
-            reject(new Error(`HTTP ${res.statusCode}: ${raw}`));
+            reject(new Error(`HTTP ${res.statusCode}: ${this.errorMessage(raw)}`));
             return;
           }
           try {
@@ -95,6 +124,15 @@ export class DaemonClient {
     return this.request<T>('DELETE', path);
   }
 
+  private errorMessage(raw: string): string {
+    try {
+      const parsed = JSON.parse(raw) as { error?: string; message?: string };
+      return parsed.error || parsed.message || raw;
+    } catch {
+      return raw;
+    }
+  }
+
   // ── Health ────────────────────────────────────────────────────
 
   async isRunning(): Promise<boolean> {
@@ -110,6 +148,12 @@ export class DaemonClient {
     return this.get<HealthResponse>('/health');
   }
 
+  // ── Shutdown ───────────────────────────────────────────────────
+
+  shutdown(): Promise<{ success: boolean }> {
+    return this.post<{ success: boolean }>('/shutdown');
+  }
+
   // ── Project ───────────────────────────────────────────────────
 
   getProject(): Promise<ProjectState> {
@@ -117,13 +161,73 @@ export class DaemonClient {
   }
 
   changeDir(dir: string): Promise<ChangeDirResponse> {
-    return this.post<ChangeDirResponse>('/project/cd', { path: dir });
+    return this.post<ChangeDirResponse>('/cd', { path: dir });
   }
 
   // ── Models ────────────────────────────────────────────────────
 
   listModels(): Promise<ModelInfo[]> {
     return this.get<ModelInfo[]>('/models');
+  }
+
+  // ── Config / Providers ───────────────────────────────────────
+
+  getConfig(): Promise<ConfigResponse> {
+    return this.get<ConfigResponse>('/config');
+  }
+
+  reloadConfig(): Promise<ConfigResponse> {
+    return this.post<ConfigResponse>('/config/reload');
+  }
+
+  listProviders(): Promise<ProvidersResponse> {
+    return this.get<ProvidersResponse>('/providers');
+  }
+
+  createProvider(req: CreateProviderRequest): Promise<ProviderInfo> {
+    return this.post<ProviderInfo>('/providers', req);
+  }
+
+  patchProvider(name: string, req: PatchProviderRequest): Promise<ProviderInfo> {
+    return this.patch<ProviderInfo>(`/providers/${encodeURIComponent(name)}`, req);
+  }
+
+  deleteProvider(name: string): Promise<ProvidersResponse> {
+    return this.delete<ProvidersResponse>(`/providers/${encodeURIComponent(name)}`);
+  }
+
+  setDefaultProvider(name: string): Promise<ConfigResponse> {
+    return this.post<ConfigResponse>(`/providers/${encodeURIComponent(name)}/default`);
+  }
+
+  patchThinking(name: string, req: PatchThinkingRequest): Promise<ProviderInfo> {
+    return this.patch<ProviderInfo>(`/providers/${encodeURIComponent(name)}/thinking`, req);
+  }
+
+  // ── Auth / CodingPlan ────────────────────────────────────────
+
+  authStatus(): Promise<AuthStatusResponse> {
+    return this.get<AuthStatusResponse>('/auth/status');
+  }
+
+  startLogin(openBrowser = true): Promise<LoginStartResponse> {
+    return this.post<LoginStartResponse>('/auth/login/start', { open_browser: openBrowser });
+  }
+
+  pollLogin(loginId: string): Promise<LoginPollResponse> {
+    return this.post<LoginPollResponse>(`/auth/login/${encodeURIComponent(loginId)}/poll`);
+  }
+
+  cancelLogin(loginId: string): Promise<{ success: boolean }> {
+    return this.delete<{ success: boolean }>(`/auth/login/${encodeURIComponent(loginId)}`);
+  }
+
+  logout(): Promise<AuthStatusResponse> {
+    return this.post<AuthStatusResponse>('/auth/logout');
+  }
+
+  setupCodingPlan(loginId?: string): Promise<CodingPlanSetupResponse> {
+    return this.post<CodingPlanSetupResponse>('/codingplan/setup', { login_id: loginId });
   }
 
   // ── Sessions ──────────────────────────────────────────────────
@@ -138,17 +242,22 @@ export class DaemonClient {
 
   createSession(name?: string, workingDir?: string): Promise<CreateSessionResponse> {
     return this.post<CreateSessionResponse>('/sessions', {
-      name,
+      title: name,
       working_dir: workingDir,
     });
   }
 
-  renameSession(id: string, name: string): Promise<SessionMeta> {
-    return this.patch<SessionMeta>(`/sessions/${id}`, { name });
+  renameSession(projectHash: string, id: string, name: string): Promise<string> {
+    return this.patch<string>(
+      `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(id)}/rename`,
+      { name },
+    );
   }
 
-  deleteSession(id: string): Promise<{ success: boolean }> {
-    return this.delete<{ success: boolean }>(`/sessions/${id}`);
+  deleteSession(projectHash: string, id: string): Promise<string> {
+    return this.delete<string>(
+      `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(id)}`,
+    );
   }
 
   searchSessions(query: string): Promise<SessionMeta[]> {
@@ -169,6 +278,7 @@ export class DaemonClient {
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'text/event-stream',
+        'X-AtomCode-Client': 'vscode',
         'Content-Length': Buffer.byteLength(payload),
       },
     };
@@ -179,7 +289,7 @@ export class DaemonClient {
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf-8');
-          callbacks.onError(`HTTP ${res.statusCode}: ${raw}`);
+          callbacks.onError(`HTTP ${res.statusCode}: ${this.errorMessage(raw)}`);
         });
         return;
       }
@@ -224,7 +334,23 @@ export class DaemonClient {
 
     httpReq.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'ECONNREFUSED') {
-        callbacks.onError('Daemon not running');
+        // Try auto-reconnect for streaming too
+        if (this.onConnectionLost) {
+          this.onConnectionLost().then((restarted) => {
+            if (restarted) {
+              // Retry the stream by calling streamChat again
+              const retryController = this.streamChat(req, callbacks);
+              // Forward abort from original controller to retry
+              controller.signal.addEventListener('abort', () => retryController.abort());
+            } else {
+              callbacks.onError('Daemon not running');
+            }
+          }).catch(() => {
+            callbacks.onError('Daemon not running');
+          });
+        } else {
+          callbacks.onError('Daemon not running');
+        }
       } else if (controller.signal.aborted) {
         // Intentional abort, don't report as error
         callbacks.onStopped();
@@ -257,11 +383,16 @@ export class DaemonClient {
       case 'text':
         callbacks.onText(event.content);
         break;
+      case 'tool_batch':
+        callbacks.onToolBatch(
+          event.calls.map((c) => ({ id: c.id, name: c.name, args: c.arguments })),
+        );
+        break;
       case 'tool_start':
-        callbacks.onToolStart(event.name, event.arguments);
+        callbacks.onToolStart(event.id, event.name, event.arguments);
         break;
       case 'tool_result':
-        callbacks.onToolResult(event.name, event.output, event.success, event.duration_ms);
+        callbacks.onToolResult(event.id, event.name, event.output, event.success, event.duration_ms);
         break;
       case 'tokens':
         callbacks.onTokens(event.prompt, event.completion, event.total);
@@ -289,7 +420,11 @@ export class DaemonClient {
 
   // ── Stop generation ───────────────────────────────────────────
 
-  stopGeneration(): Promise<{ success: boolean }> {
-    return this.post<{ success: boolean }>('/chat/stop');
+  stopGeneration(sessionId: string): Promise<{ success: boolean; message: string }> {
+    return this.post<{ success: boolean; message: string }>('/chat/stop', { session_id: sessionId });
+  }
+
+  activeSessions(): Promise<string[]> {
+    return this.get<string[]>('/chat/active');
   }
 }

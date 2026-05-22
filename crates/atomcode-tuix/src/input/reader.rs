@@ -47,6 +47,62 @@ fn paste_candidate_char(ev: &Event) -> Option<char> {
     }
 }
 
+/// True when an aggregated `paste_candidate_char` burst should be treated
+/// as a real `InputEvent::Paste` rather than emitted as individual key
+/// events. Conjuncted conditions:
+///
+/// 1. **At least 2 chars** — singletons are normal typing.
+/// 2. **Contains `\n`** — the unambiguous "this is multi-line content"
+///    signal. Bursts of plain printable chars (someone typing fast) get
+///    handled per-key just fine without aggregation.
+/// 3. **At least one non-whitespace char** — distinguishes a real paste
+///    from buffered Enter/Tab keystrokes left in the tty input queue at
+///    startup. Without this guard, two Enters mashed by the user before
+///    atomcode took over the terminal (e.g. while waiting for a slow
+///    `cargo build` to finish) get aggregated into `Paste("\n\n")` and
+///    inserted as text — the input box opens with two pre-typed blank
+///    lines. Genuine pastes containing only whitespace + newlines are
+///    vanishingly rare; falling back to per-key submission of those bursts
+///    is the right trade-off.
+/// 4. **Avg ≥ 2 non-newline chars per line** when the burst is 3+ lines.
+///    Defends against the JediTerm IME commit storm reported on Windows:
+///    every Pinyin candidate selection emitted `<char> + Enter` in rapid
+///    succession (within the 2ms aggregation window), producing a burst
+///    like `[首, \n, 页, \n, 中, \n, …]`. Old heuristic accepted that as
+///    a paste, leaving the buffer with `\n` between every CJK char and
+///    the input row showing `首↵页↵中↵…`. Genuine multi-line pastes
+///    always have lines with text; IME bursts have exactly 1 text char
+///    per line. Threshold scoped to 3+ lines so a legitimate 2-line
+///    paste with two single-char lines (rare but possible) still flows
+///    through the paste path.
+fn is_paste_burst(chars: &[char]) -> bool {
+    if chars.len() < 2 {
+        return false;
+    }
+    let mut has_enter = false;
+    let mut has_text_char = false;
+    let mut newline_count = 0usize;
+    for &c in chars {
+        if c == '\n' {
+            has_enter = true;
+            newline_count += 1;
+        }
+        if !c.is_whitespace() {
+            has_text_char = true;
+        }
+    }
+    if !has_enter || !has_text_char {
+        return false;
+    }
+    let line_count = newline_count + 1;
+    let non_newline_count = chars.len() - newline_count;
+    if line_count >= 3 && non_newline_count <= line_count {
+        // Mean ≤ 1 char per line. JediTerm IME pattern, not a paste.
+        return false;
+    }
+    true
+}
+
 /// Lifecycle commands for the reader thread. Sent from the event loop
 /// whenever an external process (OAuth browser flow, `/shell`, etc.)
 /// needs stdin/stdout in cooked mode without our reader racing for bytes.
@@ -303,7 +359,6 @@ fn run(
         // conservative.
         if let Some(c0) = paste_candidate_char(&ev) {
             let mut chars = vec![c0];
-            let mut has_enter = c0 == '\n';
             let mut trailing: Option<Event> = None;
             const BATCH_CAP: usize = 8192;
             while chars.len() < BATCH_CAP {
@@ -339,9 +394,6 @@ fn run(
                 match paste_candidate_char(&nxt) {
                     Some(c) => {
                         chars.push(c);
-                        if c == '\n' {
-                            has_enter = true;
-                        }
                     }
                     None => {
                         trailing = Some(nxt);
@@ -349,7 +401,7 @@ fn run(
                     }
                 }
             }
-            if chars.len() >= 2 && has_enter {
+            if is_paste_burst(&chars) {
                 let text: String = chars.into_iter().collect();
                 crate::tuix_trace!("RD", "paste-burst synth len={}", text.len());
                 if tx.send(InputEvent::Paste(text)).is_err() {
@@ -439,6 +491,12 @@ fn run(
 }
 
 fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
+    // Trace EVERY arrival, regardless of kind. The kind-specific arms
+    // below only log scroll/down/drag/up; on Windows conhost a wheel
+    // tick can arrive as `Moved` or another variant we silently drop,
+    // and without this top-of-function trace there's no way to tell
+    // "no mouse events arriving" from "events arriving but ignored".
+    crate::tuix_trace!("RD", "mouse kind={:?} col={} row={}", m.kind, m.column, m.row);
     match m.kind {
         crossterm::event::MouseEventKind::ScrollUp => {
             crate::tuix_trace!("RD", "mouse scroll up");
@@ -555,6 +613,87 @@ mod tests {
     fn paste_candidate_accepts_plain_enter() {
         let ev = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(paste_candidate_char(&ev), Some('\n'));
+    }
+
+    /// Regression: two Enters left in the tty input queue at startup
+    /// (e.g. user mashed Enter while waiting for `cargo build` to
+    /// finish before atomcode took over) used to aggregate into a
+    /// synthetic `Paste("\n\n")` and insert two blank lines into the
+    /// input box on launch. Pure-newline bursts must NOT count as paste.
+    #[test]
+    fn pure_newline_burst_is_not_paste() {
+        assert!(!is_paste_burst(&['\n', '\n']));
+        assert!(!is_paste_burst(&['\n', '\n', '\n']));
+    }
+
+    /// Whitespace-only bursts (newline + space, newline + tab) likewise
+    /// fail the "real content" test — same root cause as the buffered-
+    /// Enter case, just with adjacent whitespace instead.
+    #[test]
+    fn whitespace_only_burst_is_not_paste() {
+        assert!(!is_paste_burst(&[' ', '\n']));
+        assert!(!is_paste_burst(&['\t', '\n']));
+        assert!(!is_paste_burst(&['\n', ' ', '\t', '\n']));
+    }
+
+    /// Real multi-line paste (text + embedded newline) must still be
+    /// recognised — that's the entire reason the burst path exists for
+    /// terminals without bracketed paste.
+    #[test]
+    fn text_with_newline_burst_is_paste() {
+        assert!(is_paste_burst(&['h', 'i', '\n']));
+        assert!(is_paste_burst(&['\n', 'h', 'i']));
+        assert!(is_paste_burst(&['l', 'i', 'n', 'e', '1', '\n', 'l', 'i', 'n', 'e', '2']));
+    }
+
+    /// Bursts without any newline fall through to per-key handling
+    /// regardless of length — just fast typing, not a paste signal.
+    #[test]
+    fn no_newline_burst_is_not_paste() {
+        assert!(!is_paste_burst(&['a', 'b', 'c', 'd']));
+    }
+
+    /// Regression: JediTerm IME on Windows commits each Pinyin candidate
+    /// as `<char> + Enter`, producing bursts of single-char-per-line.
+    /// Old heuristic accepted these as pastes; the buffer ended up with
+    /// `\n` between every CJK char and the input row showed `首↵页↵中↵…`.
+    /// New rule: 3+ lines averaging ≤1 non-newline char per line is the
+    /// IME pattern, not a paste.
+    #[test]
+    fn ime_commit_storm_is_not_paste() {
+        // Real-world reproduction from the user screenshot: typing
+        // `首页中的` via IME emits `首 \n 页 \n 中 \n 的 \n`.
+        assert!(!is_paste_burst(&['首', '\n', '页', '\n', '中', '\n', '的', '\n']));
+        // Bare CJK without trailing newline — same shape, also rejected.
+        assert!(!is_paste_burst(&['首', '\n', '页', '\n', '中']));
+        // ASCII char-per-line bursts also caught (rare keyboard
+        // remapping but same root cause — phantom Enter between chars).
+        assert!(!is_paste_burst(&['a', '\n', 'b', '\n', 'c', '\n']));
+    }
+
+    /// 2-line pastes with two short lines must still flow through the
+    /// paste path — the IME-rejection threshold is gated on 3+ lines so
+    /// legitimate short pastes aren't caught as collateral.
+    #[test]
+    fn two_line_short_paste_still_recognised() {
+        assert!(is_paste_burst(&['a', '\n', 'b']));
+    }
+
+    /// Multi-line paste with substantial text per line stays a paste
+    /// even when CJK is involved — char-per-line check counts NON-newline
+    /// chars, so `你好世界 \n 再见` (7 non-newline + 1 newline = 2 lines,
+    /// avg 3.5/line) sails through.
+    #[test]
+    fn cjk_multi_line_paste_still_recognised() {
+        assert!(is_paste_burst(&['你', '好', '世', '界', '\n', '再', '见']));
+    }
+
+    /// Singleton "bursts" are never pastes; aggregation requires ≥ 2.
+    #[test]
+    fn singleton_burst_is_not_paste() {
+        assert!(!is_paste_burst(&['\n']));
+        assert!(!is_paste_burst(&['x']));
+        assert!(!is_paste_burst(&[]));
     }
 
     /// Regression for the Windows-resize crash. `crossterm::event::poll`

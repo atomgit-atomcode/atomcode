@@ -102,6 +102,85 @@ impl LlmProvider for MockProvider {
 }
 
 // ---------------------------------------------------------------------------
+// SequencedMockProvider: Multi-turn provider for SubAgent integration tests
+// ---------------------------------------------------------------------------
+
+/// Multi-turn provider: returns the i-th `Vec<StreamEvent>` on the i-th
+/// `chat_stream` call. Used to simulate hallucinating agents (turn 0:
+/// read_file, turn 1: read_file, ...) and recovery flows (turn 0:
+/// timeout error, turn 1: edit success).
+struct SequencedMockProvider {
+    sequences: std::sync::Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+}
+
+impl SequencedMockProvider {
+    fn new(sequences: Vec<Vec<StreamEvent>>) -> Self {
+        Self {
+            sequences: std::sync::Mutex::new(sequences.into()),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for SequencedMockProvider {
+    fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: Option<&[ToolDef]>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        let next = self
+            .sequences
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![StreamEvent::Done { truncated: false }]);
+        let events: Vec<Result<StreamEvent>> = next.into_iter().map(Ok).collect();
+        Ok(Box::pin(stream::iter(events)))
+    }
+    fn model_name(&self) -> &str {
+        "sequenced-mock"
+    }
+}
+
+/// Quick builder for a single-tool-call turn (used in sequenced tests).
+fn tool_call_events(call_id: &str, name: &str, args: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolCallStart {
+            id: call_id.into(),
+            name: name.into(),
+        },
+        StreamEvent::ToolCallDelta(args.into()),
+        StreamEvent::ToolCallDone(ToolCall {
+            id: call_id.into(),
+            name: name.into(),
+            arguments: args.into(),
+        }),
+        StreamEvent::Usage(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 8,
+            cached_tokens: 0,
+        }),
+        StreamEvent::Done { truncated: false },
+    ]
+}
+
+fn text_only_events(text: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::Delta(text.into()),
+        StreamEvent::Usage(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            cached_tokens: 0,
+        }),
+        StreamEvent::Done { truncated: false },
+    ]
+}
+
+fn error_events(msg: &str) -> Vec<StreamEvent> {
+    vec![StreamEvent::Error(msg.into())]
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers: Mock Tools
 // ---------------------------------------------------------------------------
 
@@ -206,7 +285,8 @@ fn test_config() -> Config {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-        },
+
+},
     );
     Config {
         default_provider: "test".to_string(),
@@ -215,10 +295,14 @@ fn test_config() -> Config {
         datalog: Default::default(),
         notifications: Default::default(),
         auto_update: false,
-        reflection_cadence: 7,
         telemetry: Default::default(),
         lsp: Default::default(),
         auto_commit: false,
+        subagent: Default::default(),
+        vision_preprocessor_provider: None,
+        language: None,
+        ui: Default::default(),
+            plugin: Default::default(),
     }
 }
 
@@ -249,7 +333,8 @@ fn make_runner(
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
-    };
+
+};
     let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
         std::sync::Arc::new(crate::ctx::DefaultCtx::new(&test_provider));
 
@@ -261,11 +346,10 @@ fn make_runner(
         ctx: test_ctx,
         permission,
         recently_edited_files: Vec::new(),
-        recent_calls: Vec::new(),
-        file_read_counts: std::collections::HashMap::new(),
         hook_executor: std::sync::Arc::new(
             crate::hook::executor::HookExecutor::empty()
         ),
+        loop_guard: Default::default(),
     }
 }
 
@@ -439,6 +523,55 @@ async fn test_turn_runner_unknown_tool_returns_error_result() {
         }
         other => panic!("Expected UsedTools, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_turn_runner_loop_guard_blocks_third_identical_call() {
+    // Integration-level pin for the cross-batch loop guard wired into
+    // `run_with_filter` (see runner.rs). Three sequential `run()`
+    // invocations using the same MockProvider produce three identical
+    // tool calls (same name + same args) with identical EchoTool
+    // output. The first two execute (so the model gets two "maybe
+    // this time will differ" chances on real flakes), the third must
+    // be short-circuited with a synthetic Loop guard ToolResult — no
+    // EchoTool output should appear in the third result.
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(EchoTool { name: "grep" })).await;
+    let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
+    let mut runner = make_runner(provider, tools, auto_bypass());
+    let mut conv = Conversation::new();
+    conv.add_user_message("search");
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    for _ in 0..3 {
+        runner
+            .run(&mut conv, "system", &tx, CancellationToken::new())
+            .await;
+    }
+
+    // Walk the conversation, collect every ToolResult body in order.
+    let mut results: Vec<String> = Vec::new();
+    for msg in &conv.messages {
+        if let crate::conversation::message::MessageContent::ToolResult(r) = &msg.content {
+            results.push(r.output.clone());
+        }
+    }
+    assert_eq!(results.len(), 3, "expected 3 tool results, got {}", results.len());
+    assert!(
+        results[0].contains("executed grep"),
+        "1st call should run normally, got: {:?}",
+        results[0]
+    );
+    assert!(
+        results[1].contains("executed grep"),
+        "2nd call should run normally, got: {:?}",
+        results[1]
+    );
+    assert!(
+        results[2].contains("Loop guard"),
+        "3rd identical call should be blocked by loop guard, got: {:?}",
+        results[2]
+    );
 }
 
 #[tokio::test]
@@ -1182,114 +1315,136 @@ fn test_rules_no_dynamic_content() {
 }
 
 // ===========================================================================
-// detect_call_loop — Pattern 1 (per-region read saturation) integration tests
+// validate_args gate: malformed tool-call args bounce back to the model
+// without prompting the user or running execute.
 // ===========================================================================
 
-/// Scanning 5 distinct regions of a large file must NOT trip the cap.
-/// This was the regression captured in the v4.20 screenshot: the model read
-/// multiple function bodies of a 1592-line render.rs with correct offsets and
-/// hit the region cap on the Nth read even though every region was different.
-#[test]
-fn detect_call_loop_does_not_block_scanning_distinct_regions() {
-    let mut runner = make_runner(
-        MockProvider::text_only(""),
-        ToolRegistry::new(),
-        auto_bypass(),
-    );
+#[tokio::test]
+async fn malformed_write_file_args_short_circuit_without_approval() {
+    use crate::tool::write::WriteFileTool;
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(WriteFileTool)).await;
 
-    // Five reads with offsets spaced well apart (>> READ_REGION_BUCKET).
-    let offsets = [1, 200, 400, 700, 1000];
-    for off in offsets {
-        let args = format!(
-            r#"{{"file_path":"/p/render.rs","offset":{},"limit":50}}"#,
-            off
-        );
-        let verdict = runner.detect_call_loop("read_file", &args);
-        assert!(
-            verdict.is_none(),
-            "offset {} should not block — it's a new region\nGot: {:?}",
-            off,
-            verdict
-        );
+    // 2026-05-02 datalog `atomgr/2026-05-02_20-23-21.md` line 330:
+    // provider stream truncated mid-args, closing bracket wrong, no
+    // `content` field. Pre-fix, this would (a) fail json_repair, (b)
+    // fall into write_file's fail-closed approval branch which prompts
+    // the user, (c) the user approves, (d) execute() re-parses and
+    // returns the same missing-field error. Post-fix the runner's
+    // validate_args gate short-circuits to a tool-result error and
+    // approval/execute are never reached.
+    let bad_args = r#"{"file_path": "/tmp/x.rs"]"#;
+    let provider = MockProvider::with_tool_call("write_file", bad_args);
+    // Use a permission decider that PANICS if asked — proves no
+    // approval round-trip happened.
+    struct PanicOnApproval;
+    #[async_trait]
+    impl super::permission::PermissionDecider for PanicOnApproval {
+        async fn decide(
+            &self,
+            _call: &crate::tool::ToolCall,
+            _reason: &str,
+        ) -> crate::tool::PermissionDecision {
+            panic!("validate_args gate must short-circuit before approval is requested");
+        }
+
+        fn will_auto_approve(
+            &self,
+            _call: &crate::tool::ToolCall,
+            _approval: &crate::tool::ApprovalRequirement,
+        ) -> bool {
+            false
+        }
     }
-}
+    let mut runner = make_runner(provider, tools, Box::new(PanicOnApproval));
+    let mut conv = Conversation::new();
+    conv.add_user_message("write a file");
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
-/// Re-reading the SAME region 3 times MUST trip Pattern 1. Each call tweaks
-/// `limit` so the exact-args Pattern 2 guard does NOT fire first — this
-/// isolates Pattern 1's semantics ("same bucket, any args"). The realistic
-/// triggering pattern is the model cycling limit on an unreadable file
-/// trying to coax different output from the same slice.
-#[test]
-fn detect_call_loop_blocks_three_reads_of_same_region() {
-    let mut runner = make_runner(
-        MockProvider::text_only(""),
-        ToolRegistry::new(),
-        auto_bypass(),
-    );
+    let _ = runner
+        .run(&mut conv, "system", &tx, CancellationToken::new())
+        .await;
+    drop(tx);
 
-    // Same offset → same bucket, but varying limit so args_hash differs and
-    // Pattern 2 (identical-args) stays dormant.
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/doc.docx","offset":1,"limit":{}}}"#,
-            40 + i * 10
-        );
-        assert!(
-            runner.detect_call_loop("read_file", &args).is_none(),
-            "call #{} of same region should not block yet",
-            i
-        );
+    let mut got_error_result = false;
+    while let Some(event) = rx.recv().await {
+        if let TurnEvent::ToolCallResult {
+            name,
+            success,
+            output,
+            ..
+        } = event
+        {
+            if name == "write_file" {
+                assert!(!success, "validate-fail must surface as success=false");
+                assert!(
+                    output.to_lowercase().contains("missing field")
+                        || output.to_lowercase().contains("re-issue"),
+                    "tool result must carry the structured retry hint, got: {output}"
+                );
+                got_error_result = true;
+            }
+        }
     }
-    // 3rd read still in the same bucket → Pattern 1 fires.
-    let third = r#"{"file_path":"/p/doc.docx","offset":1,"limit":95}"#;
-    let blocked = runner.detect_call_loop("read_file", third);
-    let msg = blocked.expect("3rd call to same region must be blocked by Pattern 1");
     assert!(
-        msg.contains("SAME region"),
-        "block message must mention 'SAME region' so the model understands why\nGot: {}",
-        msg
+        got_error_result,
+        "validate-fail must still emit a ToolCallResult so the model can retry"
     );
-    assert!(msg.contains("doc.docx"), "block message must name the file");
 }
 
-/// A successful edit on the same file clears every region's counter so
-/// post-edit verification reads aren't blocked even if some region was near
-/// the cap pre-edit.
 #[test]
-fn detect_call_loop_edit_resets_all_regions_for_file() {
-    let mut runner = make_runner(
-        MockProvider::text_only(""),
-        ToolRegistry::new(),
-        auto_bypass(),
+fn write_file_validate_args_catches_real_datalog_fixtures() {
+    use crate::tool::write::WriteFileTool;
+    use crate::tool::Tool as _;
+    let tool = WriteFileTool;
+
+    // 2026-05-02 datalog 10-37-51.md line 225: stream cut at `{`.
+    assert!(
+        tool.validate_args("{").is_err(),
+        "single-brace truncation must reject"
     );
+    // 2026-05-02 datalog 20-23-21.md line 330: closing `]`, no content.
+    assert!(
+        tool.validate_args(r#"{"file_path": "/tmp/x.rs"]"#).is_err(),
+        "closing-bracket-wrong + missing field must reject"
+    );
+    // Empty args.
+    assert!(tool.validate_args("").is_err());
+    assert!(tool.validate_args("{}").is_err(), "empty object must reject");
+    // Valid call passes.
+    assert!(
+        tool.validate_args(r#"{"file_path":"/tmp/x.rs","content":"hi"}"#)
+            .is_ok()
+    );
+}
 
-    // Two reads of the same bucket (one shy of the 3-call cap, varying limit
-    // so Pattern 2 stays dormant).
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#,
-            30 + i * 10
-        );
-        assert!(runner.detect_call_loop("read_file", &args).is_none());
-    }
+#[test]
+fn edit_file_validate_args_rejects_missing_fields() {
+    use crate::tool::edit::EditFileTool;
+    use crate::tool::Tool as _;
+    let tool = EditFileTool;
+    assert!(tool.validate_args("{}").is_err());
+    assert!(
+        tool.validate_args(r#"{"file_path":"/x.rs"}"#).is_err(),
+        "missing old_string + new_string must reject"
+    );
+    assert!(
+        tool.validate_args(
+            r#"{"file_path":"/x.rs","old_string":"a","new_string":"b"}"#
+        )
+        .is_ok()
+    );
+}
 
-    // Edit on the same file → reset all region counts for x.rs.
-    let edit_args = r#"{"file_path":"/p/x.rs","old_string":"a","new_string":"b"}"#;
-    assert!(runner.detect_call_loop("edit_file", edit_args).is_none());
-
-    // The previously-hot bucket should now be freshly empty; 2 more reads
-    // stay unblocked post-edit (verifying the `retain` cleared the entry).
-    for i in 1..=2 {
-        let args = format!(
-            r#"{{"file_path":"/p/x.rs","offset":1,"limit":{}}}"#,
-            100 + i * 10
-        );
-        assert!(
-            runner.detect_call_loop("read_file", &args).is_none(),
-            "post-edit read #{} should not be blocked — edit reset the counter",
-            i
-        );
-    }
+#[test]
+fn search_replace_validate_args_rejects_missing_fields() {
+    use crate::tool::search_replace::SearchReplaceTool;
+    use crate::tool::Tool as _;
+    let tool = SearchReplaceTool;
+    assert!(tool.validate_args("{}").is_err());
+    assert!(
+        tool.validate_args(r#"{"search":"a","replace":"b"}"#).is_ok()
+    );
 }
 
 // ===========================================================================
@@ -1300,7 +1455,7 @@ fn detect_call_loop_edit_resets_all_regions_for_file() {
 mod telemetry_tests {
     use super::*;
     use crate::tool::ToolContext;
-    use atomcode_telemetry::{Event, Telemetry};
+    use atomcode_telemetry::{Event, Telemetry, ToolErrorKind};
     use std::path::PathBuf;
 
     /// Build a TurnRunner wired to a real in-memory Telemetry handle so we can
@@ -1331,7 +1486,8 @@ mod telemetry_tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: true,
-        };
+
+};
         let test_ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder> =
             std::sync::Arc::new(crate::ctx::DefaultCtx::new(&test_provider_cfg));
 
@@ -1343,11 +1499,10 @@ mod telemetry_tests {
             ctx: test_ctx,
             permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
             recently_edited_files: Vec::new(),
-            recent_calls: Vec::new(),
-            file_read_counts: std::collections::HashMap::new(),
             hook_executor: std::sync::Arc::new(
                 crate::hook::executor::HookExecutor::empty()
             ),
+            loop_guard: Default::default(),
         };
         (runner, captured)
     }
@@ -1468,4 +1623,550 @@ mod telemetry_tests {
             assert!(had_error, "failed turn must set had_error=true");
         }
     }
+
+    /// A mock tool that always fails (simulates a command that exits non-zero).
+    struct FailingTool;
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn definition(&self) -> ToolDef {
+            ToolDef {
+                name: "bash",
+                description: "Always-failing bash mock".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+            }
+        }
+        fn approval(&self, _args: &str) -> ApprovalRequirement {
+            ApprovalRequirement::AutoApprove
+        }
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+            Ok(ToolResult {
+                call_id: String::new(),
+                output: "[elapsed: 0.0s, exit: 1]\ncat: /nonexistent_file.txt: No such file or directory\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]".to_string(),
+                success: false,
+            })
+        }
+    }
+
+    /// A mock tool that succeeds but produces stderr (simulates rm on nonexistent file).
+    struct WarningTool;
+
+    #[async_trait]
+    impl Tool for WarningTool {
+        fn definition(&self) -> ToolDef {
+            ToolDef {
+                name: "bash",
+                description: "Warning bash mock (exit 0 + stderr)".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+            }
+        }
+        fn approval(&self, _args: &str) -> ApprovalRequirement {
+            ApprovalRequirement::AutoApprove
+        }
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+            Ok(ToolResult {
+                call_id: String::new(),
+                output: "[elapsed: 0.0s, exit: 0]\nSTDERR:\nrm: /tmp/test.txt: No such file or directory".to_string(),
+                success: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_failure_emits_execution_failed_error_kind() {
+        let tools = {
+            let mut t = ToolRegistry::new();
+            t.register(Box::new(FailingTool)).await;
+            t
+        };
+
+        let (mut runner, captured) = make_runner_with_telemetry(
+            MockProvider::with_tool_call("bash", r#"{"command":"cat /nonexistent_file.txt"}"#),
+            tools,
+        );
+        let mut conv = Conversation::new();
+        conv.add_user_message("cat a missing file");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runner
+            .run(&mut conv, "system", &tx, CancellationToken::new())
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().await;
+        let tool_calls: Vec<_> = events
+            .iter()
+            .filter(|r| matches!(r.event, Event::ToolCall { .. }))
+            .collect();
+
+        assert_eq!(tool_calls.len(), 1, "expected one ToolCall event, got {}", tool_calls.len());
+
+        if let Event::ToolCall { name, success, error_kind, error_data, .. } = &tool_calls[0].event {
+            assert_eq!(name, "bash");
+            assert!(!success, "ToolCall.success must be false for failing tool");
+            assert!(error_kind.is_some(), "error_kind must be Some for failing tool, got None");
+            assert_eq!(error_kind.unwrap(), ToolErrorKind::ExecutionFailed,
+                "error_kind must be ExecutionFailed for failing tool");
+
+            assert!(error_data.is_some(), "error_data must be Some for failing tool, got None");
+            let ed: serde_json::Value = serde_json::from_str(error_data.as_ref().unwrap()).unwrap();
+            assert_eq!(ed["reason"], "Tool execution returned an error");
+            assert!(ed["output_tail"].as_str().unwrap().contains("No such file"),
+                "error_data.output_tail must contain the stderr, got: {}", ed["output_tail"]);
+        } else {
+            panic!("Expected ToolCall event");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_warning_with_stderr_emits_warning_error_kind() {
+        let tools = {
+            let mut t = ToolRegistry::new();
+            t.register(Box::new(WarningTool)).await;
+            t
+        };
+
+        let (mut runner, captured) = make_runner_with_telemetry(
+            MockProvider::with_tool_call("bash", r#"{"command":"rm -rf /tmp/test.txt"}"#),
+            tools,
+        );
+        let mut conv = Conversation::new();
+        conv.add_user_message("rm a missing file");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runner
+            .run(&mut conv, "system", &tx, CancellationToken::new())
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().await;
+        let tool_calls: Vec<_> = events
+            .iter()
+            .filter(|r| matches!(r.event, Event::ToolCall { .. }))
+            .collect();
+
+        assert_eq!(tool_calls.len(), 1, "expected one ToolCall event, got {}", tool_calls.len());
+
+        if let Event::ToolCall { name, success, error_kind, error_data, .. } = &tool_calls[0].event {
+            assert_eq!(name, "bash");
+            assert!(success, "ToolCall.success must be true for warning tool (exit 0)");
+            assert!(error_kind.is_some(), "error_kind must be Some for warning tool, got None");
+            assert_eq!(error_kind.unwrap(), ToolErrorKind::Warning,
+                "error_kind must be Warning when exit 0 + stderr");
+
+            assert!(error_data.is_some(), "error_data must be Some for warning tool, got None");
+            let ed: serde_json::Value = serde_json::from_str(error_data.as_ref().unwrap()).unwrap();
+            assert_eq!(ed["reason"], "Command succeeded (exit 0) but produced stderr output");
+            assert!(ed.get("resolution").is_some(), "warning error_data must contain resolution");
+        } else {
+            panic!("Expected ToolCall event");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_success_without_stderr_emits_no_error_fields() {
+        let tools = {
+            let mut t = ToolRegistry::new();
+            t.register(Box::new(EchoTool { name: "bash" })).await;
+            t
+        };
+
+        let (mut runner, captured) = make_runner_with_telemetry(
+            MockProvider::with_tool_call("bash", r#"{"command":"echo hello"}"#),
+            tools,
+        );
+        let mut conv = Conversation::new();
+        conv.add_user_message("say hello");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runner
+            .run(&mut conv, "system", &tx, CancellationToken::new())
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().await;
+        let tool_calls: Vec<_> = events
+            .iter()
+            .filter(|r| matches!(r.event, Event::ToolCall { .. }))
+            .collect();
+
+        assert_eq!(tool_calls.len(), 1, "expected one ToolCall event, got {}", tool_calls.len());
+
+        if let Event::ToolCall { name, success, error_kind, error_data, .. } = &tool_calls[0].event {
+            assert_eq!(name, "bash");
+            assert!(success, "ToolCall.success must be true");
+            assert!(error_kind.is_none(), "error_kind must be None for successful tool without stderr, got Some");
+            assert!(error_data.is_none(), "error_data must be None for successful tool without stderr, got Some");
+        } else {
+            panic!("Expected ToolCall event");
+        }
+    }
+}
+
+// ===========================================================================
+// SubAgentTask integration tests (Task 9: resilience layer + 7 end-to-end)
+// ===========================================================================
+
+#[tokio::test]
+async fn sub_agent_normal_path_completes_one_turn() {
+    use crate::agent::sub_agent::SubAgentTask;
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("test.rs");
+    std::fs::write(&path, "foo\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let edit_args = format!(
+        r#"{{"file_path":"{}","old_string":"foo","new_string":"bar"}}"#,
+        path_str
+    );
+
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        tool_call_events("c1", "edit_file", &edit_args),
+        text_only_events("Done."),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "foo".into(),
+        task_instruction: "Replace foo with bar".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(
+            provider as Arc<dyn LlmProvider>,
+            tools,
+            &test_config(),
+            tmp.path(),
+            12,
+        )
+        .await;
+
+    assert!(result.success, "expected success, got: {:?}", result.failures);
+    assert!(
+        result.diagnostic.edited_files.iter().any(|f| f.contains("test.rs")),
+        "expected edit recorded in diagnostic"
+    );
+}
+
+#[tokio::test]
+async fn sub_agent_hallucinating_mock_breaks_after_nudge_unheeded() {
+    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("halluc.rs");
+    std::fs::write(&path, "stub\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let read_args = format!(r#"{{"file_path":"{}"}}"#, path_str);
+
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        tool_call_events("c1", "read_file", &read_args),
+        tool_call_events("c2", "read_file", &read_args),
+        tool_call_events("c3", "read_file", &read_args),
+        tool_call_events("c4", "read_file", &read_args),
+        tool_call_events("c5", "read_file", &read_args),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "stub".into(),
+        task_instruction: "Make changes".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    assert!(!result.success);
+    assert!(
+        result.failures.iter().any(|f| matches!(
+            f,
+            SubAgentFailure::NoProgress { .. }
+                | SubAgentFailure::HallucinationLoop { .. }
+                | SubAgentFailure::BudgetExhaustedNoEdits
+        )),
+        "expected NoProgress, HallucinationLoop, or BudgetExhaustedNoEdits, got: {:?}",
+        result.failures
+    );
+    assert!(
+        result.diagnostic.hallucination_nudges_sent >= 1,
+        "expected at least one nudge to fire"
+    );
+}
+
+#[tokio::test]
+async fn sub_agent_recovers_from_first_timeout_then_succeeds() {
+    use crate::agent::sub_agent::SubAgentTask;
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("recover.rs");
+    std::fs::write(&path, "x\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let edit_args = format!(
+        r#"{{"file_path":"{}","old_string":"x","new_string":"y"}}"#,
+        path_str
+    );
+
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        error_events("stream timeout after 60s"),
+        tool_call_events("c1", "edit_file", &edit_args),
+        text_only_events("Done."),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "x".into(),
+        task_instruction: "Replace x with y".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    assert!(result.success, "retry should recover; got failures: {:?}", result.failures);
+    assert_eq!(result.diagnostic.timeouts, 1, "exactly one timeout retry");
+}
+
+#[tokio::test]
+async fn sub_agent_provider_hard_error_breaks_immediately_no_retry() {
+    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("h.rs");
+    std::fs::write(&path, "x").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        error_events("401 Unauthorized"),
+        text_only_events("would-be retry"),  // never reached if no-retry works
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "x".into(),
+        task_instruction: "—".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    assert!(!result.success);
+    assert!(
+        result.failures.iter().any(|f| matches!(f, SubAgentFailure::ProviderError(_))),
+        "expected ProviderError, got: {:?}",
+        result.failures
+    );
+    assert_eq!(result.diagnostic.timeouts, 0, "non-timeout errors must not retry");
+}
+
+#[tokio::test]
+async fn sub_agent_blocked_tool_redirects_via_validate_args() {
+    use crate::agent::sub_agent::SubAgentTask;
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sand.rs");
+    std::fs::write(&path, "a\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let edit_args = format!(
+        r#"{{"file_path":"{}","old_string":"a","new_string":"b"}}"#,
+        path_str
+    );
+
+    // Turn 0: try bash (blocked by sandbox).
+    // Turn 1: receive "tool not available" → fall through to edit_file.
+    // Turn 2: done.
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        tool_call_events("c1", "bash", r#"{"command":"ls"}"#),
+        tool_call_events("c2", "edit_file", &edit_args),
+        text_only_events("done"),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "a".into(),
+        task_instruction: "—".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    // Bash was attempted but should not have run (filtered out of registry).
+    // Sandbox routed back, edit succeeded on turn 1.
+    assert!(result.success, "model recovered after sandbox redirect");
+    assert!(!result.diagnostic.edited_files.is_empty());
+}
+
+#[tokio::test]
+async fn sub_agent_failed_edit_doesnt_burn_progress_signal() {
+    use crate::agent::sub_agent::{SubAgentFailure, SubAgentTask};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("fail.rs");
+    std::fs::write(&path, "actual content\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let bad_args = format!(
+        r#"{{"file_path":"{}","old_string":"NOT_THERE","new_string":"y"}}"#,
+        path_str
+    );
+
+    // 5 edit_file calls all with old_string that won't match.
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        tool_call_events("c1", "edit_file", &bad_args),
+        tool_call_events("c2", "edit_file", &bad_args),
+        tool_call_events("c3", "edit_file", &bad_args),
+        tool_call_events("c4", "edit_file", &bad_args),
+        tool_call_events("c5", "edit_file", &bad_args),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let task = SubAgentTask {
+        file_path: path_str,
+        file_content: "actual content".into(),
+        task_instruction: "—".into(),
+        contract: "—".into(),
+        sibling_skeletons: "".into(),
+    };
+
+    let result = task
+        .execute(provider, tools, &test_config(), tmp.path(), 12)
+        .await;
+
+    assert!(!result.success, "no successful edit should land");
+    assert!(
+        result.failures.iter().any(|f| matches!(
+            f,
+            SubAgentFailure::NoProgress { .. } | SubAgentFailure::BudgetExhaustedNoEdits
+        )),
+        "expected NoProgress or BudgetExhausted, got: {:?}",
+        result.failures
+    );
+    assert!(
+        result.diagnostic.edited_files.is_empty(),
+        "no successful edit means edited_files stays empty"
+    );
+}
+
+#[tokio::test]
+async fn sub_agent_pool_one_failure_doesnt_affect_others() {
+    use crate::agent::sub_agent::{SubAgentPool, SubAgentTask};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let good_path = tmp.path().join("good.rs");
+    let bad_path = tmp.path().join("bad.rs");
+    std::fs::write(&good_path, "x\n").unwrap();
+    std::fs::write(&bad_path, "y\n").unwrap();
+    let good_path_str = good_path.to_string_lossy().to_string();
+    let bad_path_str = bad_path.to_string_lossy().to_string();
+
+    let edit_args = format!(
+        r#"{{"file_path":"{}","old_string":"x","new_string":"z"}}"#,
+        good_path_str
+    );
+
+    // max_concurrent=1 forces serial: task A first (succeeds), task B second (401).
+    let provider = Arc::new(SequencedMockProvider::new(vec![
+        // task A: succeeds
+        tool_call_events("a1", "edit_file", &edit_args),
+        text_only_events("done"),
+        // task B: 401 hard error
+        error_events("401 Unauthorized"),
+    ]));
+
+    let tools = {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tool::edit::EditFileTool)).await;
+        tools.register(Box::new(crate::tool::read::ReadFileTool)).await;
+        Arc::new(tools)
+    };
+
+    let pool = SubAgentPool {
+        tasks: vec![
+            SubAgentTask {
+                file_path: good_path_str,
+                file_content: "x".into(),
+                task_instruction: "—".into(),
+                contract: "—".into(),
+                sibling_skeletons: "".into(),
+            },
+            SubAgentTask {
+                file_path: bad_path_str,
+                file_content: "y".into(),
+                task_instruction: "—".into(),
+                contract: "—".into(),
+                sibling_skeletons: "".into(),
+            },
+        ],
+        max_concurrent: 1, // Force serial so the sequence is deterministic
+        timeout_secs: 60,
+    };
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let results = pool.execute_all(provider, tools, &test_config(), tmp.path(), &event_tx).await;
+
+    assert_eq!(results.len(), 2);
+    let succeeded = results.iter().filter(|r| r.success).count();
+    let failed = results.iter().filter(|r| !r.success).count();
+    assert_eq!(succeeded, 1, "exactly one task should succeed");
+    assert_eq!(failed, 1, "exactly one task should fail");
 }

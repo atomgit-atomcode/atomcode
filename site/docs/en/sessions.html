@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Sessions &amp; Undo · AtomCode Docs</title>
+<meta name="description" content="Persistent session restore, /undo rollback, clearing and compacting context.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="sessions">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Sessions &amp; Undo</h1>
+      <p class="lede">AtomCode persists every conversation by default, so you can restore, resume, clear, or compact at any time. File edits are also tracked in file-history — a single <code>/undo</code> rolls back every change from the last turn.</p>
+
+      <h2>Session lifecycle</h2>
+      <p>Each <code>atomcode</code> launch creates a session. A session contains:</p>
+      <ul>
+        <li>Full message history (user prompts, AI replies, tool calls)</li>
+        <li>The associated working directory</li>
+        <li>The associated provider / model</li>
+        <li>Token usage stats</li>
+        <li>File-history snapshots of every file edit made in that session</li>
+      </ul>
+      <p>Session data is persisted under <code>~/.atomcode/sessions/</code>, grouped by project (working-directory hash).</p>
+
+      <h2>Resuming sessions</h2>
+      <h3>Continue the last one from the CLI</h3>
+      <pre><code>atomcode -c        # or atomcode --continue</code></pre>
+      <p>The most common case: pick up exactly where you left off yesterday.</p>
+
+      <h3>Switch sessions inside the TUI</h3>
+      <pre><code>/resume</code></pre>
+      <p>Opens the session picker. It lists this project's historical sessions newest-first; jump to any of them quickly. Each entry uses the most recent user prompt as its label for easy recognition.</p>
+
+      <h3>Start a clean new session</h3>
+      <pre><code>/session</code></pre>
+      <p>Spin up a fresh context without changing the working directory. Good for "the previous task is wrapped — onto something totally unrelated".</p>
+
+      <h2 id="bg">Background sessions (<code>/bg</code>)</h2>
+      <p>Need to juggle multiple tasks without losing the current conversation? <code>/bg</code> parks the current session in the background and opens a fresh foreground — switch back any time. Up to <strong>16 concurrent background slots</strong>.</p>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>What it does</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/bg</code></td><td>Send the current session to the background and open a new foreground</td></tr>
+          <tr><td><code>/bg list</code> (alias <code>/bg ls</code>)</td><td>List all background sessions: slot, ID, state, created, summary</td></tr>
+          <tr><td><code>/bg &lt;N&gt;</code></td><td>Resume slot N as foreground (the current foreground is swapped to background)</td></tr>
+          <tr><td><code>/bg drop &lt;N&gt;</code></td><td>Drop background slot N</td></tr>
+          <tr><td><code>/bg help</code> (aliases <code>-h</code>, <code>--help</code>)</td><td>Show built-in help</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Session states</h3>
+      <p>The <em>state</em> column in <code>/bg list</code> reflects what each background session is doing:</p>
+      <ul>
+        <li><strong>running</strong> — the model loop is still executing; tool calls and output keep advancing in the background</li>
+        <li><strong>idle</strong> — the model turn finished; waiting for your next prompt</li>
+        <li><strong>done</strong> — the session was explicitly ended</li>
+        <li><strong>cancelled / error</strong> — interrupted, or the background run hit an error</li>
+      </ul>
+      <p>So <code>/bg</code> isn't just "suspend" — the model actually keeps working in the background; when you switch back, the result is already there.</p>
+
+      <h3><code>/background &lt;task&gt;</code> — one-shot dispatch</h3>
+      <p>If you don't want to swap foreground/background manually and just want to "have it look something up real quick", use the <code>/background</code> compatibility entry:</p>
+      <pre><code>/background list every unused dependency under src</code></pre>
+      <p>It starts a one-shot task in a <code>/bg</code> slot (configured with a read-only tool subset by default so the main conversation context isn't polluted). When done, check <code>/bg list</code>, use <code>/bg &lt;N&gt;</code> to read the result, <code>/bg drop &lt;N&gt;</code> to discard.</p>
+
+      <div class="callout callout-tip">
+        <strong>Typical pattern</strong>
+        <p>The foreground is debugging module A; the model is editing and running <code>cargo check</code> (slow). You realise you also want to refactor module B — <code>/bg</code> straight to a new foreground for B. The build on A finishes in the background, state flips to <em>done</em>; <code>/bg 1</code> to switch back and read the result.</p>
+      </div>
+
+      <h2>Clear vs compact vs new session</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Keeps history</th><th>Keeps session ID</th><th>When to use</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/clear</code></td><td>No</td><td>Yes</td><td>"Reset the dialogue" within the same session; keep the session entry so you can <code>/resume</code> later</td></tr>
+          <tr><td><code>/compact</code></td><td>Partial (summarised)</td><td>Yes</td><td>Context is filling up but you don't want to lose the earlier thread</td></tr>
+          <tr><td><code>/session</code></td><td>Starts new thread</td><td>No (new ID)</td><td>Beginning a completely unrelated task</td></tr>
+        </tbody>
+      </table>
+
+      <h2>File edits and <code>/undo</code></h2>
+      <p>Every file-editing tool in AtomCode (<code>write_file</code>, <code>edit_file</code>, <code>search_replace</code>, …) snapshots the original content to file-history before writing. Running:</p>
+      <pre><code>/undo</code></pre>
+      <p>rolls back every file edit from the AI's last turn to its pre-tool-call state, in one shot.</p>
+
+      <div class="callout callout-warn">
+        <strong>Where the boundary is</strong>
+        <p><code>/undo</code> only reverts file edits — it does <em>not</em> undo side effects from bash commands. If the model ran <code>rm -rf</code> or dropped a database, <code>/undo</code> can't help you — those actions should have triggered a permission confirmation before they ran.</p>
+      </div>
+
+      <h2>Inspecting and trimming cost</h2>
+      <pre><code>/cost</code></pre>
+      <p>Shows cumulative input / output tokens for the current session. When the number approaches the provider's <code>context_window</code>:</p>
+      <ul>
+        <li>Use <code>/compact</code> to compact history (early messages become a summary)</li>
+        <li>Or just <code>/session</code> and start fresh</li>
+        <li>To avoid keeping large tool-call results, tell the model in the prompt to "stop re-reading those big files"</li>
+      </ul>
+
+      <h2>Multi-project workflows</h2>
+      <p>AtomCode groups sessions by working directory. Recommended ways to switch:</p>
+      <ul>
+        <li>From the CLI, specify with <code>-C</code></li>
+        <li>While running, use <code>/cd</code>; <code>default_workdir</code> is persisted automatically</li>
+      </ul>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li><a href="./project-instructions.html">Project Instructions</a> — lock in per-project context with <code>.atomcode.md</code></li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

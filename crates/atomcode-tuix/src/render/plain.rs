@@ -10,6 +10,7 @@ use crate::terminal::TerminalCaps;
 // a shorter frame doesn't leave glyphs from a longer previous frame.
 const SGR_RESET: &str = "\x1b[0m";
 const SGR_RED: &str = "\x1b[31m";
+const SGR_BOLD_YELLOW: &str = "\x1b[1;33m";
 const SGR_GREEN: &str = "\x1b[32m";
 const SGR_CYAN: &str = "\x1b[36m";
 const SGR_DIM: &str = "\x1b[2m";
@@ -175,12 +176,16 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let detail = scrub_controls(&detail);
                 let arrow_color = if self.caps.colors { SGR_CYAN } else { "" };
                 let reset = if self.caps.colors { SGR_RESET } else { "" };
+                // ● (U+25CF) — Geometric Shapes block; broadly available
+                // across Windows monospace fonts. Aligns with retained
+                // and alt-screen renderers (see retained.rs ToolCall
+                // arm for the Windows-font tofu rationale).
                 if detail.is_empty() {
-                    let _ = writeln!(self.out, "{}▸ {}{}", arrow_color, name, reset);
+                    let _ = writeln!(self.out, "{}● {}{}", arrow_color, name, reset);
                 } else {
                     let _ = writeln!(
                         self.out,
-                        "{}▸ {}{}({})",
+                        "{}● {}{}({})",
                         arrow_color, name, reset, detail
                     );
                 }
@@ -188,6 +193,27 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             UiLine::ToolCallCommit { call_id: _ } => {
                 // Plain mode never animated the row, so there is
                 // nothing to freeze. Skip silently.
+            }
+            UiLine::ToolGroupRender { batch_id: _, header, children } => {
+                // Plain mode lacks CUP-rewrite — print header + each
+                // child row plainly. Subsequent ToolGroupChildUpdate
+                // events also print plainly (see the ChildUpdate arm
+                // below), so plain output ends up with header, then
+                // children, then update lines. Less elegant than
+                // retained's in-place ✓, but functional.
+                self.drop_transient();
+                let _ = writeln!(self.out, "{}", header);
+                for c in children {
+                    let _ = writeln!(self.out, "{}", c.text);
+                }
+            }
+            UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
+                self.drop_transient();
+                let _ = writeln!(self.out, "{}", new_text);
+            }
+            UiLine::ToolGroupSummary { text } => {
+                self.drop_transient();
+                let _ = writeln!(self.out, "{}", text);
             }
             UiLine::ToolResult { success, summary } => {
                 self.drop_transient();
@@ -249,9 +275,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let _ = writeln!(
                     self.out,
-                    "Allow {}({})? [Y]es / [N]o / [A]lways",
-                    scrub_controls(&tool),
-                    scrub_controls(&detail)
+                    "{}",
+                    crate::i18n::t(crate::i18n::Msg::ApprovalPromptAlt {
+                        tool: &scrub_controls(&tool),
+                        detail: &scrub_controls(&detail),
+                    })
                 );
             }
             UiLine::Error(msg) => {
@@ -261,6 +289,18 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 let _ = writeln!(
                     self.out,
                     "{}[Error: {}]{}",
+                    color,
+                    scrub_controls(&msg),
+                    reset
+                );
+            }
+            UiLine::Warning(msg) => {
+                self.drop_transient();
+                let color = if self.caps.colors { SGR_BOLD_YELLOW } else { "" };
+                let reset = if self.caps.colors { SGR_RESET } else { "" };
+                let _ = writeln!(
+                    self.out,
+                    "{}! {}{}",
                     color,
                     scrub_controls(&msg),
                     reset
@@ -330,11 +370,29 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             }
             UiLine::CommandOutput(text) => {
                 self.drop_transient();
-                let safe = scrub_controls(&text);
+                // CommandOutput is trusted internal text — keep SGR so
+                // colours / bold reach the terminal. See the matching
+                // alt_screen note for why this is safe.
+                let safe = crate::sanitize::scrub_controls_keep_sgr(&text);
                 let _ = self.out.write_all(safe.as_bytes());
                 if !safe.ends_with('\n') {
                     let _ = self.out.write_all(b"\n");
                 }
+            }
+            UiLine::ImageAttachment(n) => {
+                // Plain mode echoes attachment markers with the same
+                // 2-space indent as the TTY renderers, then a newline.
+                self.drop_transient();
+                let _ = writeln!(self.out, "  └ [Image #{}]", n);
+            }
+            UiLine::VisionPreprocessSuccess { msg, model } => {
+                // Plain mode loses styling distinctions; print
+                // message + model as one line, same indent as
+                // ImageAttachment, then a blank line so the next
+                // event's output reads as a separate paragraph.
+                self.drop_transient();
+                let _ = writeln!(self.out, "  {}  {}", msg, model);
+                let _ = writeln!(self.out);
             }
         }
     }
@@ -422,7 +480,7 @@ mod tests {
         r.flush();
         let s = String::from_utf8(buf).unwrap();
         assert!(!s.contains('\x1b'), "dumb mode must emit zero SGR. got: {}", s);
-        assert!(s.contains("▸ read_file(x.rs)"));
+        assert!(s.contains("● read_file(x.rs)"));
         assert!(s.contains("✓ done"));
     }
 
@@ -523,6 +581,7 @@ mod tests {
             cursor_byte: 2,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
@@ -536,6 +595,7 @@ mod tests {
             cursor_byte: 2,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();
@@ -601,6 +661,7 @@ mod tests {
             cursor_byte: 0,
             menu: None,
             status: crate::render::StatusLine::default(),
+            attachments: Vec::new(),
         });
         r.flush();
         let s = String::from_utf8(buf).unwrap();

@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Slash Commands · AtomCode Docs</title>
+<meta name="description" content="Reference for the 30+ built-in slash commands organised by category.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="slash-commands">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Slash Commands</h1>
+      <p class="lede">Start an input with <code>/</code> in the TUI to trigger a command and get an autocomplete menu. The 30+ built-in commands are organised below; commands loaded from Skills and Plugins also appear in the menu automatically.</p>
+
+      <h2>Core</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/codingplan</code></td><td><strong>Recommended</strong> — one command logs you in, claims AtomGit CodingPlan free tokens, and auto-configures a provider from the granted model list. The lowest-friction entry point for first-time users</td></tr>
+          <tr><td><code>/login</code></td><td>Only performs AtomGit OAuth identity auth, <strong>does not change provider config</strong> (for users who already have an API key but want AtomGit integrations like <code>/issue</code>)</td></tr>
+          <tr><td><code>/resume</code></td><td>Open the session picker to restore any previously persisted session (messages, directory, and model state)</td></tr>
+          <tr><td><code>/session</code></td><td>Start a fresh, clean session</td></tr>
+          <tr><td><code>/bg</code></td><td>Send the current session to the background and open a new foreground; subcommands: <code>/bg list</code>, <code>/bg &lt;N&gt;</code>, <code>/bg drop &lt;N&gt;</code>, <code>/bg help</code>. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
+          <tr><td><code>/background &lt;task&gt;</code></td><td>Compatibility entry: start a one-shot task in a <code>/bg</code> slot (<a href="./sessions.html#bg">details</a>)</td></tr>
+          <tr><td><code>/rename &lt;new-name&gt;</code></td><td>Rename the current session (changes the display name in the <code>/resume</code> picker)</td></tr>
+          <tr><td><code>/provider</code></td><td>Open the provider manager: add / edit / remove / switch</td></tr>
+          <tr><td><code>/model</code></td><td>Switch models within the current provider, or jump across providers</td></tr>
+          <tr><td><code>/cd</code></td><td>Change working directory and write it back as <code>default_workdir</code>. You can also just type <code>cd /path</code> (no slash prefix)</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Tools &amp; utilities</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/undo</code></td><td>Roll back every AI file edit from the last turn, using file-history snapshots</td></tr>
+          <tr><td><code>/diff</code></td><td>Show the git diff of uncommitted changes in the working directory</td></tr>
+          <tr><td><code>/cost</code></td><td>Show output tokens for the current session. APIs without usage reporting are estimated automatically</td></tr>
+          <tr><td><code>/context</code></td><td>Show this turn's context budget breakdown: system prompt, tool defs, cold-zone compaction, total messages, and context-window usage</td></tr>
+          <tr><td><code>/compact</code></td><td>Compact history: summarise earlier messages to free up context budget</td></tr>
+          <tr><td><code>/clear</code></td><td>Clear the current session's messages (working directory and model are kept)</td></tr>
+          <tr><td><code>/init</code></td><td>Scan the working directory and generate / refresh the <code>.atomcode.md</code> project instructions file — covering build / test commands, tech-stack summary, layout, etc.; injected as system prompt on subsequent launches</td></tr>
+          <tr><td><code>/background &lt;task&gt;</code></td><td>Dispatch a task to an isolated background agent (read-only-leaning tool subset) without polluting the main conversation. Useful for "go check X on the side" sort of light exploration. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
+          <tr><td><code>/worktree &lt;subcommand&gt;</code></td><td>Git worktree isolation: <code>create</code> a new branch with its own worktree, <code>list</code> existing worktrees, <code>done</code> squash worktree changes back to the main branch, <code>cleanup</code> remove finished worktrees</td></tr>
+          <tr><td><code>/issue</code></td><td>Interactive wizard: file a new issue against the AtomGit repository for the current git repo (requires OAuth login; cwd must be a clone of an atomgit.com repository)</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Conversation modes &amp; thinking</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/plan</code></td><td>Switch to <strong>Plan mode</strong>: read-only exploration. The model can call <code>read_file</code> / <code>grep</code> / <code>list_directory</code> and other non-writing tools, but <code>edit_file</code> / <code>bash</code> are blocked. Useful for getting alignment before action</td></tr>
+          <tr><td><code>/build</code></td><td>Switch back to <strong>Build mode</strong> (the default): all tools available — read, write, execute. <code>/plan</code> and <code>/build</code> are freely interchangeable</td></tr>
+          <tr><td><code>/think on</code> / <code>off</code></td><td>Toggle extended thinking (for supported models — Claude / DeepSeek-R1 / GLM-4.5 / …). When on, the model surfaces its reasoning at the cost of latency and tokens</td></tr>
+          <tr><td><code>/think budget &lt;N&gt;</code></td><td>Cap the thinking token budget (Claude family); controls reasoning length</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Persistent memory</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/remember &lt;content&gt;</code></td><td>Write to project-scoped memory (default scope, bound to the current working directory)</td></tr>
+          <tr><td><code>/remember --global &lt;content&gt;</code></td><td>Write to global memory (shared across all projects)</td></tr>
+          <tr><td><code>/forget &lt;keyword&gt;</code></td><td>Delete every entry in global + project memory matching the keyword (case-insensitive)</td></tr>
+          <tr><td><code>/memory</code></td><td>Show all active memories, grouped by <code>[Global]</code> / <code>[Project]</code></td></tr>
+        </tbody>
+      </table>
+      <p>Full usage and best practices at <a href="./memory.html">Persistent Memory</a>.</p>
+
+      <h2>Extension ecosystem</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/setup</code></td><td>On first run, install the bundled <code>atomcode-automation-recommender</code> skill into <code>~/.atomcode/skills/</code>, append <code>.atomcode/local/</code> to project <code>.gitignore</code>, and write <code>.atomcode/setup-state.json</code> (signals hash + atomcode version + installed list) under a project-level lock. Then invoke the recommender skill — it scans the project (languages, frameworks, hooks already in use), searches the web, and proposes additional atomcode skills to install for this codebase. Subsequent runs skip the seed install and re-invoke the skill directly. Extra text after the command is forwarded to the skill as a steering hint, e.g. <code>/setup focus on testing</code>. The CLI form <code>atomcode setup --force</code> forces a clean reinstall of seed files even when their content hash matches</td></tr>
+          <tr><td><code>/skills</code></td><td>Browse loaded skills (project- and user-level). Each skill also appears as a standalone slash command in the menu — trigger with <code>/&lt;skill-name&gt;</code></td></tr>
+          <tr><td><code>/plugin marketplace</code></td><td>Open the plugin marketplace browser to pick and install from a registered marketplace</td></tr>
+          <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>Install a plugin from the named marketplace</td></tr>
+          <tr><td><code>/plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>Uninstall an installed plugin (the marketplace registration is kept)</td></tr>
+          <tr><td><code>/plugin list</code></td><td>List locally installed plugins</td></tr>
+        </tbody>
+      </table>
+      <p>See <a href="./skills.html">Skills</a> and <a href="./plugins.html">Plugin System</a> for details.</p>
+
+      <h2>MCP integration</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/mcp</code></td><td>List successfully connected MCP servers and their status (failed servers don't show here — only as red error lines in the session area)</td></tr>
+          <tr><td><code>/mcp tools &lt;server&gt;</code></td><td>Async-list the remote tools actually exposed by a specific MCP server (you'll be told if it times out or fails)</td></tr>
+          <tr><td><code>/mcp reload</code></td><td>Re-read <code>.mcp.json</code> / <code>~/.atomcode/mcp.json</code> and reconnect every server in the background</td></tr>
+        </tbody>
+      </table>
+      <p>Full configuration and usage at <a href="./mcp.html">MCP Integration</a>.</p>
+
+      <h2>Config &amp; help</h2>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/status</code></td><td>Show login status, current provider, model, context budget, CodingPlan usage and reset time</td></tr>
+          <tr><td><code>/whoami</code></td><td>Show the username / email of the current AtomGit-logged-in user</td></tr>
+          <tr><td><code>/config</code></td><td>Show the path of <code>~/.atomcode/config.toml</code></td></tr>
+          <tr><td><code>/reload</code></td><td>Hot-reload <code>~/.atomcode/config.toml</code> from disk — external edits (or changes from another terminal's <code>/codingplan</code>) take effect without restarting atomcode</td></tr>
+          <tr><td><code>/language</code></td><td>Switch UI language: auto-detect (<code>LC_ALL</code> / <code>LANG</code>), English, or Simplified Chinese. Takes effect immediately and is written back to <code>~/.atomcode/config.toml</code></td></tr>
+          <tr><td><code>/welcome</code></td><td>Re-open the 3-step first-run wizard (welcome → language → setup). Non-empty sessions are confirmed with a <code>y/N</code> before clearing the screen. Both language and default onboarding path can be revisited here</td></tr>
+          <tr><td><code>/logout</code></td><td>Clear the AtomGit OAuth token</td></tr>
+          <tr><td><code>/upgrade</code></td><td>Auto-upgrade to the latest version; <code>/upgrade rollback</code> reverts to the previous version</td></tr>
+          <tr><td><code>/help</code></td><td>List every available slash command</td></tr>
+          <tr><td><code>/keys</code></td><td>Show the keyboard-shortcut reference (grouped by input / history / session / modal navigation, with per-terminal compatibility notes for <code>Shift+Enter</code> and <code>Alt+Enter</code>). See <a href="./keybindings.html">Keybindings</a></td></tr>
+          <tr><td><code>/quit</code></td><td>Exit atomcode (or hit <code>Ctrl+C</code> twice)</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Tips</h2>
+      <ul>
+        <li><strong>Autocomplete</strong> — typing <code>/</code> pops up the menu immediately; use <code>↑↓</code> to navigate, <code>Tab</code> / <code>Enter</code> to confirm.</li>
+        <li><strong>Fuzzy match</strong> — completion supports substring matching, e.g. <code>/prov</code> hits <code>/provider</code>.</li>
+        <li><strong>Interrupt the model</strong> — while the model is streaming, press <code>Esc</code> to interrupt; you can then enter a new command or prompt.</li>
+        <li><strong>Skills appear in the menu</strong> — once you add your own commands under <a href="./skills.html">Skills</a>, they show up in the menu in the same format.</li>
+      </ul>
+
+      <h2>Typical workflows</h2>
+
+      <h3>First launch — one-click onboarding</h3>
+      <pre><code>&gt; /codingplan
+  ✔ Logged in as alice (alice, alice@example.com)
+  ✔ CodingPlan claimed — CodingPlan Free · expires 2026-05-22 (29d / 30d)
+  ✔ 3 models registered as AtomGit-* providers
+  ✔ Default provider set to AtomGit-GLM
+&gt; hello</code></pre>
+
+      <h3>Check cost before wrapping up</h3>
+      <pre><code>&gt; refactor src/db to use a connection pool
+... (AI works)
+&gt; /cost
+Session token usage
+- Total output tokens: 8342
+- Current turn tokens: 2156
+- Context: 42K / 128K</code></pre>
+
+      <h3>Roll back when the result isn't what you wanted</h3>
+      <pre><code>&gt; add JSDoc to every function
+... (AI edited 12 files)
+&gt; /undo
+Rolled back 12 file edits from the last turn.</code></pre>
+
+      <h3>Swap the model when it underperforms</h3>
+      <pre><code>&gt; /model
+&gt; (pick claude-opus-4-6 from the popup)
+&gt; try again — this time preserve existing comments</code></pre>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li><a href="./keybindings.html">Keybindings</a> — pair commands with keybindings to double your speed</li>
+        <li><a href="./sessions.html">Sessions &amp; Undo</a> — full behaviour of <code>/resume</code>, <code>/undo</code>, <code>/compact</code></li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

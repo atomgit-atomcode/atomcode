@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>配置文件 · AtomCode 文档</title>
+<meta name="description" content="配置文件 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="configuration">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>配置文件</h1>
+      <p class="lede">AtomCode 的配置采用 TOML 格式,支持多个 provider 并行存在、随时切换。本页讲清每一个字段的含义和常见 provider 的示例配置。</p>
+
+      <h2>配置文件位置</h2>
+      <p>默认路径:</p>
+      <ul>
+        <li>macOS / Linux / HarmonyOS PC:<code>~/.atomcode/config.toml</code></li>
+        <li>Windows:<code>%USERPROFILE%\.atomcode\config.toml</code></li>
+      </ul>
+      <p>也可以通过 <code>--config /path/to/config.toml</code> 指定任意路径。首次运行时,若该文件不存在,3 步启动向导会引导你完成初始化。</p>
+
+      <h2>最小示例</h2>
+      <pre><code>default_provider = "deepseek"
+
+[providers.deepseek]
+type = "openai"
+api_key = "sk-xxxxxxxxxxxxxxxx"
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+context_window = 64000</code></pre>
+      <p>这个配置已经可以启动 atomcode 并与 DeepSeek 对话。</p>
+
+      <h2>顶层字段</h2>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>default_provider</code></td><td>string</td><td>启动时默认使用的 provider 名(必须是 <code>[providers.*]</code> 中定义过的 key)</td></tr>
+          <tr><td><code>default_workdir</code></td><td>string?</td><td>默认工作目录。用 <code>/cd</code> 切换目录时自动写回这里,下次启动恢复</td></tr>
+          <tr><td><code>providers</code></td><td>table</td><td>provider 名到 <a href="#provider-config">ProviderConfig</a> 的映射</td></tr>
+          <tr><td><code>vision_preprocessor_provider</code></td><td>string?</td><td>当主 provider 不支持图片但用户 attach 了图时,把图片转交给这里指定的 provider 做 OCR / 描述,结果以文本形式 splice 给主模型。详见 <a href="#vision-preprocessor">视觉预处理器</a></td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="provider-config">ProviderConfig 字段</h2>
+      <p>每一个 <code>[providers.xxx]</code> 表下可用的字段:</p>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>类型</th><th>必填</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>type</code></td><td>string</td><td>是</td><td>provider 协议类型,目前支持 <code>openai</code>、<code>claude</code>、<code>ollama</code></td></tr>
+          <tr><td><code>api_key</code></td><td>string?</td><td>视情况</td><td>API Key。<code>ollama</code> 可不填。OAuth 登录的 provider 不含此字段,token 从 <code>~/.atomcode/auth.toml</code> 自动读取</td></tr>
+          <tr><td><code>model</code></td><td>string</td><td>是</td><td>模型名,比如 <code>deepseek-chat</code>、<code>gpt-4o</code>、<code>claude-sonnet-4-6</code></td></tr>
+          <tr><td><code>base_url</code></td><td>string</td><td>是</td><td>API 基地址,需指向实际接口。例:<code>https://api.deepseek.com/v1</code>、<code>http://localhost:11434</code></td></tr>
+          <tr><td><code>context_window</code></td><td>integer</td><td>否</td><td>模型上下文窗口(tokens),默认 64000。<code>ollama</code> 默认 8000</td></tr>
+          <tr><td><code>max_tokens</code></td><td>integer?</td><td>否</td><td>单次响应的最大输出 token 数。留空则使用 <code>context_window / 4</code></td></tr>
+          <tr><td><code>system_prompt</code></td><td>string?</td><td>否</td><td>覆盖默认系统提示。大多数场景不需要</td></tr>
+          <tr><td><code>user_agent</code></td><td>string?</td><td>否</td><td>覆盖 HTTP 请求的 User-Agent,当上游接口屏蔽通用 UA 时使用</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-info">
+        <strong>为什么默认 64K 而不是 128K?</strong>
+        <p>即便模型官方声称支持 128K+,其有效注意力窗口通常要小得多,过大上下文反而会触发"迷失在中段"的问题,并且阻止 AtomCode 的上下文压缩策略生效。64K 是经验上最稳的默认值,若你确定模型表现良好,可自行上调。</p>
+      </div>
+
+      <h2>常见 provider 配置示例</h2>
+
+      <h3>Claude (Anthropic)</h3>
+      <pre><code>[providers.claude]
+type = "claude"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-6"
+context_window = 128000</code></pre>
+
+      <h3>OpenAI</h3>
+      <pre><code>[providers.openai]
+type = "openai"
+api_key = "sk-..."
+model = "gpt-4o"
+context_window = 128000</code></pre>
+
+      <h3>DeepSeek</h3>
+      <pre><code>[providers.deepseek]
+type = "openai"
+api_key = "sk-..."
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+context_window = 64000</code></pre>
+
+      <h3>智谱 GLM</h3>
+      <pre><code>[providers.glm]
+type = "openai"
+api_key = "..."
+model = "glm-4-plus"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+context_window = 128000</code></pre>
+
+      <h3>通义千问 Qwen</h3>
+      <pre><code>[providers.qwen]
+type = "openai"
+api_key = "sk-..."
+model = "qwen-plus"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+context_window = 128000</code></pre>
+
+      <h3>SiliconFlow</h3>
+      <pre><code>[providers.siliconflow]
+type = "openai"
+api_key = "sk-..."
+model = "Qwen/Qwen2.5-72B-Instruct"
+base_url = "https://api.siliconflow.cn/v1"</code></pre>
+
+      <h3>Ollama(本地)</h3>
+      <pre><code>[providers.ollama]
+type = "ollama"
+model = "llama3.2"
+base_url = "http://localhost:11434"
+context_window = 8000</code></pre>
+      <div class="callout callout-warn">
+        <strong>注意</strong>
+        <p>Ollama 模型 function calling 的兼容性参差不齐,弱一些的本地模型可能无法稳定触发工具调用。建议优先尝试 Qwen2.5 / Llama3.2 的 Instruct 版本。</p>
+      </div>
+
+      <h2>多 provider 与快速切换</h2>
+      <p>配置文件允许同时存在任意数量的 provider:</p>
+      <pre><code>default_provider = "claude"
+
+[providers.claude]
+type = "claude"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-6"
+
+[providers.deepseek]
+type = "openai"
+api_key = "sk-..."
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+
+[providers.local]
+type = "ollama"
+model = "qwen2.5:14b"
+base_url = "http://localhost:11434"</code></pre>
+      <p>在 TUI 中可以用 <code>/provider</code> 在这些条目之间切换,用 <code>/model</code> 只切换当前 provider 下的模型。命令行启动时也支持一次性覆盖:</p>
+      <pre><code>atomcode --provider deepseek --model deepseek-reasoner</code></pre>
+
+      <h2 id="vision-preprocessor">视觉预处理器</h2>
+      <p>当当前 active provider 的模型不支持图片输入(纯文本模型,比如 DeepSeek-V3 / Kimi),用户却 <a href="./basic-usage.html#image-attach">attach 了图片</a>时,AtomCode 不会直接拒绝,而是会把图片转给一个独立的"视觉预处理 provider"做 OCR + 描述,把结果以文本形式 splice 进用户消息里再发给主模型。</p>
+      <p>启用方式:在配置里指定一个支持图片的 provider key 作为 <code>vision_preprocessor_provider</code>:</p>
+      <pre><code>default_provider = "deepseek"
+vision_preprocessor_provider = "qwen-vl"
+
+[providers.deepseek]
+type = "openai"
+api_key = "sk-..."
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+
+[providers.qwen-vl]
+type = "openai"
+api_key = "sk-..."
+model = "Qwen/Qwen3-VL-32B-Instruct"
+base_url = "https://api.siliconflow.cn/v1"</code></pre>
+      <ul>
+        <li>这里的 <code>qwen-vl</code> 必须是 <code>[providers.*]</code> 里已经定义过的 key,且对应的模型支持视觉输入(常见的有 <code>Qwen3-VL-*</code> / <code>GLM-4V-*</code> / <code>claude-3+</code> / <code>gpt-4o</code> / <code>gemini-*</code> 等)。</li>
+        <li>当前 active provider 自身就支持图片时,<strong>不会</strong>走预处理器,直接发原始图片字节。</li>
+        <li><code>/codingplan</code> 流程会从下发的模型列表中自动挑选一个 VL/OCR 模型并写入这个字段(可在事后手动覆盖)。</li>
+        <li>VL 调用使用<strong>无进展超时</strong>(idle timeout):只要 stream 持续吐 chunk 不限总时长;30 秒没动静才超时。失败时主模型仍会收到带 "图片识别失败" 标记的消息,而不是静默吞掉。</li>
+      </ul>
+      <p>用法层面的细节参见 <a href="./basic-usage.html#image-attach">基本使用 · 图片附件 / 截图</a>。</p>
+
+      <h2>编辑配置的三种方式</h2>
+      <ul>
+        <li><strong>手动编辑</strong> —— 直接用你喜欢的编辑器打开 <code>~/.atomcode/config.toml</code>。</li>
+        <li><strong>TUI 内 <code>/config</code></strong> —— 在 atomcode 内部直接调用默认编辑器打开配置文件。</li>
+        <li><strong>TUI 内 <code>/provider</code></strong> —— 交互式地添加、编辑、删除 provider,改动会自动落盘。</li>
+      </ul>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./login.html">登录方式</a> —— 如果不想手动管理 API Key,用 AtomGit OAuth 一步到位。</li>
+        <li><a href="./basic-usage.html">基本使用</a> —— 看看 CLI 参数如何一次性覆盖配置。</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

@@ -4,6 +4,8 @@
   "main": "index.js",
   "scripts": {
     "build:css": "tailwindcss -c tailwind.config.js -i input.css -o dist.css --minify",
+    "build:search": "node build-search-index.mjs",
+    "build": "npm run build:css && npm run build:search",
     "watch:css": "tailwindcss -c tailwind.config.js -i input.css -o dist.css --watch",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

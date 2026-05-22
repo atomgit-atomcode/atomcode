@@ -51,6 +51,12 @@ impl SubtaskDriver {
         let reference_files = extract_reference_files(plan_text);
 
         // Extract all file names, skip those that are reference-only.
+        // Splitter must include Chinese full-width punctuation — without it
+        // a sentence like "constants.rs，types.rs。platform.rs 和 mod.rs"
+        // tokenizes into ONE giant string ending in `.rs` (passes
+        // is_source_file but is unfindable on disk). 2026-05-03 datalog
+        // showed this collapsing 4 valid files into 1 broken path,
+        // making sub-agent dispatch silently fall back to serial.
         for word in plan_text.split(|c: char| {
             c.is_whitespace()
                 || c == ','
@@ -59,6 +65,23 @@ impl SubtaskDriver {
                 || c == '\''
                 || c == '('
                 || c == ')'
+                || c == '['
+                || c == ']'
+                // Chinese full-width punctuation
+                || c == '\u{FF0C}' // ，
+                || c == '\u{3002}' // 。
+                || c == '\u{3001}' // 、
+                || c == '\u{FF1B}' // ；
+                || c == '\u{FF1A}' // ：
+                || c == '\u{FF08}' // （
+                || c == '\u{FF09}' // ）
+                || c == '\u{300A}' // 《
+                || c == '\u{300B}' // 》
+                || c == '\u{300C}' // 「
+                || c == '\u{300D}' // 」
+                || c == '\u{FF1F}' // ？
+                || c == '\u{FF01}' // ！
+                || c == '\u{2014}' // —
         }) {
             let trimmed = word
                 .trim()
@@ -253,6 +276,36 @@ fn extract_reference_files(plan_text: &str) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-05-03 datalog: deepseek-v4-flash on atomgr emitted exactly this
+    /// sentence in turn 3, with Chinese full-width comma `，` and Chinese
+    /// period `。` separating file names. Pre-fix the splitter only honoured
+    /// ASCII punctuation, so `types.rs，它们已经有一些中文注释但不够完整。platform.rs`
+    /// became a single token ending in `.rs` — extracted as ONE bogus
+    /// "filename" that didn't exist on disk, killing sub-agent dispatch.
+    #[test]
+    fn extract_handles_chinese_punctuation_separators() {
+        let plan = "\u{73B0}\u{5728}\u{9010}\u{4E00}\u{5904}\u{7406} 4 \u{4E2A}\u{6587}\u{4EF6}\u{3002}\u{5148}\u{5904}\u{7406} constants.rs \u{548C} types.rs\u{FF0C}\u{5B83}\u{4EEC}\u{5DF2}\u{7ECF}\u{6709}\u{4E00}\u{4E9B}\u{4E2D}\u{6587}\u{6CE8}\u{91CA}\u{4F46}\u{4E0D}\u{591F}\u{5B8C}\u{6574}\u{3002}platform.rs \u{548C} mod.rs \u{4E5F}\u{9700}\u{8981}\u{8865}\u{5168}\u{3002}";
+
+        let mut driver = SubtaskDriver::new();
+        driver.extract_from_plan(plan);
+
+        assert!(driver.active);
+        assert_eq!(driver.subtasks.len(), 4, "expected 4 .rs files extracted, got: {:?}", driver.subtasks);
+        let names: Vec<&str> = driver.subtasks.iter().map(|s| s.file.as_str()).collect();
+        assert!(names.contains(&"constants.rs"));
+        assert!(names.contains(&"types.rs"));
+        assert!(names.contains(&"platform.rs"));
+        assert!(names.contains(&"mod.rs"));
+        // None of the extracted names should contain garbage like "，" or "。"
+        for s in &driver.subtasks {
+            assert!(
+                !s.file.contains('\u{FF0C}') && !s.file.contains('\u{3002}'),
+                "extracted name `{}` contains Chinese punctuation — splitter missed",
+                s.file
+            );
+        }
+    }
 
     #[test]
     fn extract_files_from_plan() {

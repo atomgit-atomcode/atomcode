@@ -7,6 +7,9 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct BashTool;
@@ -165,7 +168,7 @@ impl Tool for BashTool {
                     let current = ctx.working_dir.read().await.clone();
                     let resolved = if new_dir.starts_with('/') {
                         std::path::PathBuf::from(&new_dir)
-                    } else if new_dir.starts_with('~') {
+                    } else if new_dir == "~" || new_dir.starts_with("~/") {
                         super::real_home_dir()
                             .map(|h| h.join(new_dir.strip_prefix("~/").unwrap_or(&new_dir[1..])))
                             .unwrap_or_else(|| std::path::PathBuf::from(&new_dir))
@@ -292,15 +295,14 @@ impl Tool for BashTool {
 async fn snapshot_workspace_changes(
     wd: &std::path::Path,
 ) -> Option<std::collections::HashSet<String>> {
-    let out = tokio::process::Command::new("git")
-        .args(["status", "--porcelain", "-uall"])
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["status", "--porcelain", "-uall"])
         .current_dir(wd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    crate::process_utils::suppress_console_window(&mut cmd);
+    let out = cmd.output().await.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -318,9 +320,12 @@ async fn snapshot_workspace_changes(
 }
 
 async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-    let mut parsed: BashArgs = serde_json::from_str(args)?;
-    // Strip model-added tail/head pipes — framework's truncation handles output length.
-    parsed.command = strip_output_pipes(&parsed.command);
+    let parsed: BashArgs = serde_json::from_str(args)?;
+    // Command runs verbatim — no stripping of trailing tail/head/etc.
+    // Aligns with Claude Code: model decides how to shape its own
+    // output. Previous strip-and-notice path mis-fired on `ssh "...
+    // | tail -30"` (inner pipe inside SSH quotes) and similar nested
+    // forms.
 
     // Cap timeout: model may request absurdly large values. Max 5 min.
     let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
@@ -330,13 +335,17 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
 
     // Platform-aware shell: cmd.exe on Windows, bash on Unix
     #[cfg(target_os = "windows")]
-    let mut child = Command::new("cmd.exe")
-        .args(&["/C", &parsed.command])
-        .current_dir(&wd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/C");
+        cmd.as_std_mut().raw_arg(&parsed.command);
+        cmd.current_dir(&wd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        crate::process_utils::suppress_console_window(&mut cmd);
+        cmd.spawn()?
+    };
 
     #[cfg(not(target_os = "windows"))]
     let mut child = {
@@ -1039,12 +1048,87 @@ fn check_destructive_command(command: &str) -> Option<String> {
         ("killall ", "Kill all matching processes"),
         ("git push --force", "Force push"),
         ("git push -f", "Force push"),
+        // --force-with-lease is the "safer" force push but it is still
+        // a force push; gate it the same as --force so accidental push
+        // to main/release branches still triggers an approval. Users
+        // who legitimately want it just confirm once.
+        ("git push --force-with-lease", "Force push (with-lease)"),
         (
             "git reset --hard",
             "Hard reset (destroys uncommitted changes)",
         ),
         ("git clean -f", "Force clean untracked files"),
+        // Skipping hooks. `--no-verify` is essentially git-only
+        // (pre-commit / commit-msg / pre-push). The CLAUDE.md and
+        // built-in system prompt both forbid skipping hooks unless the
+        // user explicitly requested it — making the bash layer ask
+        // mirrors that policy at execution time and catches the case
+        // where the model "decides" to skip a failing hook on its own.
+        ("--no-verify", "Bypassing git hooks (--no-verify)"),
+        // Irreversible history rewrites. These rewrite every commit
+        // touched and break clones — operators almost always want a
+        // second look before letting one through. `filter-branch` is
+        // the legacy tool, `filter-repo` is the modern replacement.
+        ("git filter-branch", "Git history rewrite (filter-branch)"),
+        ("git filter-repo", "Git history rewrite (filter-repo)"),
+        // Interactive rebase can drop / squash / reword commits with
+        // a single keystroke in the editor — the model can't see what
+        // the user (or its own editor sequence) will do. Plain
+        // non-interactive `git rebase` stays auto-allowed because the
+        // outcome is deterministic from the args.
+        (
+            "git rebase -i",
+            "Interactive rebase (can drop/squash commits)",
+        ),
+        (
+            "git rebase --interactive",
+            "Interactive rebase (can drop/squash commits)",
+        ),
+        // Force checkout discards everything in the working tree that
+        // hasn't been committed. Both flag spellings are guarded so
+        // `git checkout -f` and `git checkout --force` both prompt.
+        ("git checkout -f ", "Force checkout (discards working tree)"),
+        ("git checkout --force", "Force checkout (discards working tree)"),
+        // `git switch --discard-changes` is the modern equivalent of
+        // `checkout -f` — same destructive blast radius (clobbers the
+        // working tree), same gate.
+        (
+            "git switch --discard-changes",
+            "Switch with discard (clobbers working tree)",
+        ),
+        // Long-form variants of `git branch -D`. The short form is
+        // checked case-sensitively in the separate block below; the
+        // long forms here survive the case-fold safely.
+        (
+            "git branch --delete --force",
+            "Force delete branch (unmerged commits lost)",
+        ),
+        (
+            "git branch --force --delete",
+            "Force delete branch (unmerged commits lost)",
+        ),
     ];
+
+    // Case-sensitive git short-flag checks. The general pattern table
+    // above runs against `cmd` (already lowercased) which erases the
+    // semantic gap between `-d` (refuses unmerged) and `-D` (forces
+    // delete with unmerged commits). For these we must match the
+    // original `command` so `-D` triggers approval while `-d` stays
+    // auto-allowed.
+    let cs_git_patterns: &[(&str, &str)] = &[
+        (
+            "git branch -D",
+            "Force delete branch (-D drops unmerged commits)",
+        ),
+    ];
+    for (pat, reason) in cs_git_patterns {
+        if command.contains(pat) {
+            return Some(format!(
+                "Destructive command detected: {}. Command: {}",
+                reason, command
+            ));
+        }
+    }
 
     // --- Robust dd detection (handle if=/of= variants) ---
     // dd if=... can be written with spaces: dd if =/dev/zero
@@ -1352,9 +1436,24 @@ fn check_destructive_command(command: &str) -> Option<String> {
     None
 }
 
-/// Detect if a bash command is (or starts with) a `cd` and extract the target
-/// directory.  Handles: `cd /path`, `cd ~/path`, `cd dir && ...`, `cd dir; ...`.
-/// Returns None for non-cd commands or bare `cd` (go home).
+/// Detect a *persistent* `cd` intent and extract the target directory.
+///
+/// Returns `Some(path)` ONLY for a bare top-level cd (`cd /path`, `cd ~/x`,
+/// `cd subdir`, or bare `cd` → home). Any chained form — `cd X && cmd`,
+/// `cd X; cmd`, `cd X | cmd`, `cd X || cmd` — is treated as a *scoped*
+/// shell cd and returns `None`, leaving the agent's `working_dir`
+/// unchanged.
+///
+/// Rationale: when a model emits `cd /tmp && wget URL` it follows
+/// standard shell semantics — the cd is local to the subshell that
+/// `bash -c` spawns and is forgotten the moment the command exits.
+/// Promoting that to a persistent change strands the agent in /tmp for
+/// every subsequent bash / read_file / edit_file call until something
+/// fails loud enough to notice. Users (correctly) complain that
+/// AtomCode "randomly switches working directory". The dedicated
+/// `change_dir` tool (`tool/cd.rs`) is the one true way to switch
+/// persistently; this auto-detection only honours commands that are
+/// *unambiguously* a top-level cd.
 fn detect_cd_target(cmd: &str) -> Option<String> {
     let trimmed = cmd.trim();
     if !trimmed.starts_with("cd ") && trimmed != "cd" {
@@ -1364,34 +1463,16 @@ fn detect_cd_target(cmd: &str) -> Option<String> {
         // bare `cd` goes to $HOME
         return super::real_home_dir().map(|h| h.to_string_lossy().to_string());
     }
-    // Extract the path after `cd `, stopping at `&&`, `;`, `||`, `|`, or end.
     let after_cd = trimmed[3..].trim_start();
-    let end = after_cd.find(['&', ';', '|'])
-        .unwrap_or(after_cd.len());
-    let path = after_cd[..end].trim().trim_matches('"').trim_matches('\'');
+    // Any chained continuation → scoped cd, do not promote.
+    if after_cd.contains(['&', ';', '|']) {
+        return None;
+    }
+    let path = after_cd.trim().trim_matches('"').trim_matches('\'');
     if path.is_empty() {
         return super::real_home_dir().map(|h| h.to_string_lossy().to_string());
     }
     Some(path.to_string())
-}
-
-/// Strip model-added `| tail -N` / `| head -N` from the end of bash commands.
-/// The framework's truncation system manages output length — model shouldn't self-truncate.
-/// Preserves `tail -f` (streaming), `| grep` (filtering), `| sort` (semantics).
-fn strip_output_pipes(cmd: &str) -> String {
-    let trimmed = cmd.trim_end();
-    // Find last pipe
-    if let Some(pipe_pos) = trimmed.rfind('|') {
-        let after_pipe = trimmed[pipe_pos + 1..].trim();
-        // Check if it's `tail -N`, `tail -n N`, `head -N`, `head -n N`
-        let is_tail_head = (after_pipe.starts_with("tail ") || after_pipe.starts_with("head "))
-            && !after_pipe.contains("-f")  // preserve tail -f (streaming)
-            && after_pipe.chars().any(|c| c.is_ascii_digit()); // must have a number
-        if is_tail_head {
-            return trimmed[..pipe_pos].trim_end().to_string();
-        }
-    }
-    cmd.to_string()
 }
 
 fn format_output(stdout: &str, stderr: &str) -> String {
@@ -1524,6 +1605,32 @@ mod exit_code_tests {
         assert!(r.output.contains("exit: 0"), "output was: {}", r.output);
     }
 
+    /// Model-supplied tail/head pipes pass through verbatim — bash
+    /// runs the command exactly as written. Aligns with Claude Code:
+    /// the model decides how to shape its own output.
+    #[tokio::test]
+    async fn bash_runs_model_pipes_verbatim() {
+        let (_d, ctx) = ctx();
+        let r = BashTool
+            .execute(r#"{"command":"printf 'a\nb\nc\n' | tail -1"}"#, &ctx)
+            .await
+            .unwrap();
+        assert!(r.success);
+        // Should contain only "c" — the tail actually ran.
+        assert!(
+            r.output.contains("c"),
+            "tail -1 must produce 'c'; got:\n{}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("a") || !r.output.contains("b"),
+            "tail -1 must NOT include earlier lines; got:\n{}",
+            r.output
+        );
+        // No "stripped trailing" notice anywhere.
+        assert!(!r.output.contains("stripped trailing"));
+    }
+
     #[tokio::test]
     async fn failure_marker_includes_specific_exit_code() {
         let (_d, ctx) = ctx();
@@ -1647,8 +1754,8 @@ mod exit_code_tests {
 
     #[tokio::test]
     async fn bash_sed_in_place_detected_via_effect() {
-        // The sed -i case old pattern-hardcode targeted — still caught, but
-        // now via effect, not via parsing the command for the literal "sed -i".
+        // The in-place edit case old pattern-hardcode targeted — still caught,
+        // but now via effect, not via parsing a literal tool spelling.
         let (dir, ctx) = git_ctx().await;
         let path = dir.path().join("app.vue");
         std::fs::write(&path, "class=\"active\"\n").unwrap();
@@ -1674,8 +1781,12 @@ mod exit_code_tests {
             .status()
             .await
             .unwrap();
+        let tmp = dir.path().join("app.vue.tmp");
         let cmd = format!(
-            r#"{{"command":"sed -i '' 's/active/is-active/' {}"}}"#,
+            r#"{{"command":"sed 's/active/is-active/' {} > {} && mv {} {}"}}"#,
+            path.display(),
+            tmp.display(),
+            tmp.display(),
             path.display()
         );
         let r = BashTool.execute(&cmd, &ctx).await.unwrap();
@@ -1741,6 +1852,22 @@ mod exit_code_tests {
             "gitignored path must not trigger nudge: {}",
             r.output
         );
+    }
+
+    #[tokio::test]
+    async fn bash_cd_preserves_tilde_prefixed_relative_dirs() {
+        let (dir, ctx) = ctx();
+        let target = dir.path().join("~cache");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let r = BashTool
+            .execute(r#"{"command":"cd '~cache'"}"#, &ctx)
+            .await
+            .unwrap();
+
+        assert!(r.success, "cd should succeed: {}", r.output);
+        let wd = ctx.working_dir.read().await.clone();
+        assert_eq!(wd, target.canonicalize().unwrap());
     }
 
     // --- Auto-STOP on resolved error (P0 #5, 2026-04-22) ---
@@ -2321,6 +2448,21 @@ mod sanitize_tests {
     }
 
     #[test]
+    fn bash_path_guard_preserves_tilde_prefixed_relative_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("~cache");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("notes.txt"), "workspace note").unwrap();
+
+        let approval = approval_for_command_paths("cat ~cache/notes.txt", workspace.path());
+
+        assert!(
+            approval.is_none(),
+            "~cache/notes.txt should be treated as a workspace-relative path"
+        );
+    }
+
+    #[test]
     fn bash_path_guard_requires_always_for_sensitive_reads() {
         let workspace = tempfile::tempdir().unwrap();
 
@@ -2396,6 +2538,113 @@ mod sanitize_tests {
                  not trigger an empty Bash() prompt"
             );
         }
+    }
+
+    // ── Git-specific destructive patterns ────────────────────────────
+    //
+    // The bash tool already gated `git push --force` / `git push -f` /
+    // `git reset --hard` / `git clean -f` from day one. This block pins
+    // the patterns added later — each one has a real cost when fired
+    // accidentally, and the system prompt's "no hooks bypass" /
+    // "no history rewrite" rules need the bash layer to enforce them
+    // at execution time (otherwise a confused model can sneak through).
+
+    #[test]
+    fn destructive_check_catches_no_verify_on_commit_and_push() {
+        // --no-verify on commit / push skips pre-commit / commit-msg /
+        // pre-push hooks — direct violation of the system prompt rule
+        // "Never skip hooks (--no-verify) unless the user has
+        // explicitly asked for it."
+        assert!(check_destructive_command("git commit -m 'wip' --no-verify").is_some());
+        assert!(check_destructive_command("git push origin main --no-verify").is_some());
+    }
+
+    #[test]
+    fn destructive_check_catches_force_with_lease_push() {
+        // --force-with-lease is the "safer" force push but it IS still
+        // a force push that rewrites the remote branch. Gating it
+        // mirrors --force / -f so a force push to main / release/*
+        // still surfaces a prompt.
+        assert!(
+            check_destructive_command("git push --force-with-lease origin release/v4.23.0")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn destructive_check_catches_history_rewrites() {
+        // filter-branch / filter-repo rewrite every commit they touch —
+        // operators almost always want a second look before letting
+        // one through, even on local branches.
+        assert!(check_destructive_command(
+            "git filter-branch --tree-filter 'rm secrets.txt' HEAD"
+        )
+        .is_some());
+        assert!(
+            check_destructive_command("git filter-repo --path secrets.txt --invert-paths").is_some()
+        );
+    }
+
+    #[test]
+    fn destructive_check_catches_interactive_rebase() {
+        // Interactive rebase can drop / squash / reword commits via
+        // the editor sequence — the model can't reason about the
+        // outcome from the args alone. Plain non-interactive rebase
+        // stays auto-allowed (deterministic from args).
+        assert!(check_destructive_command("git rebase -i HEAD~5").is_some());
+        assert!(check_destructive_command("git rebase --interactive main").is_some());
+    }
+
+    #[test]
+    fn destructive_check_allows_plain_rebase() {
+        // Non-interactive rebase IS NOT gated — the result is fully
+        // determined by the args, so it doesn't need confirmation.
+        assert!(check_destructive_command("git rebase main").is_none());
+        assert!(check_destructive_command("git rebase --onto base main feat").is_none());
+    }
+
+    #[test]
+    fn destructive_check_catches_force_checkout_and_switch() {
+        assert!(check_destructive_command("git checkout -f main").is_some());
+        assert!(check_destructive_command("git checkout --force main").is_some());
+        assert!(check_destructive_command("git switch --discard-changes main").is_some());
+    }
+
+    #[test]
+    fn destructive_check_catches_force_branch_delete_both_forms() {
+        // Long-form survives the case-fold safely; short form `-D`
+        // requires the separate case-sensitive check.
+        assert!(check_destructive_command("git branch --delete --force topic").is_some());
+        assert!(check_destructive_command("git branch --force --delete topic").is_some());
+        assert!(check_destructive_command("git branch -D topic").is_some());
+    }
+
+    #[test]
+    fn destructive_check_allows_safe_branch_delete() {
+        // `-d` (lowercase) refuses unmerged branches — safe by design,
+        // no approval needed. The case-sensitive block above is the
+        // only thing that distinguishes this from `-D` after the
+        // general lowercase fold.
+        assert!(check_destructive_command("git branch -d merged-topic").is_none());
+        assert!(check_destructive_command("git branch --delete merged-topic").is_none());
+    }
+
+    #[test]
+    fn destructive_check_allows_routine_git_ops() {
+        // Sanity: don't over-prompt on the commands an agent runs
+        // every turn. Each of these is fully recoverable / read-only
+        // and should NOT require approval.
+        assert!(check_destructive_command("git status").is_none());
+        assert!(check_destructive_command("git diff").is_none());
+        assert!(check_destructive_command("git log --oneline -10").is_none());
+        assert!(check_destructive_command("git add crates/atomcode-core/src/tool/bash.rs").is_none());
+        assert!(check_destructive_command("git commit -m 'fix(bash): tighten git destructive patterns'").is_none());
+        assert!(check_destructive_command("git push origin release/v4.23.0").is_none());
+        assert!(check_destructive_command("git pull --rebase origin main").is_none());
+        assert!(check_destructive_command("git checkout main").is_none());
+        assert!(check_destructive_command("git switch main").is_none());
+        assert!(check_destructive_command("git stash").is_none());
+        assert!(check_destructive_command("git fetch origin").is_none());
     }
 }
 
@@ -2490,7 +2739,7 @@ fn approval_for_command_paths(
         if arg.contains("://") {
             return None;
         }
-        let expanded = if arg.starts_with('~') {
+        let expanded = if arg == "~" || arg.starts_with("~/") {
             // Expand ~/path
             super::real_home_dir().map(|h| {
                 let rest = arg.strip_prefix('~').unwrap_or(arg);
@@ -2544,7 +2793,8 @@ fn approval_for_command_paths(
     }
 
     fn is_path_like(token: &str) -> bool {
-        token.starts_with('~')
+        token == "~"
+            || token.starts_with("~/")
             || token.starts_with('/')
             || token.starts_with("./")
             || token.starts_with("../")
@@ -2735,4 +2985,85 @@ fn approval_for_command_paths(
     }
 
     analyze_tokens(&shell_words(command), working_dir)
+}
+
+// ───────────────────────────────────────────────────────────────────
+// detect_cd_target tests
+// ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod detect_cd_target_tests {
+    use super::detect_cd_target;
+
+    #[test]
+    fn bare_absolute_cd_is_persistent() {
+        assert_eq!(detect_cd_target("cd /tmp"), Some("/tmp".to_string()));
+        assert_eq!(
+            detect_cd_target("cd /home/user/proj"),
+            Some("/home/user/proj".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_relative_cd_is_persistent() {
+        assert_eq!(detect_cd_target("cd subdir"), Some("subdir".to_string()));
+        assert_eq!(
+            detect_cd_target("cd ../sibling"),
+            Some("../sibling".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_tilde_cd_is_persistent() {
+        assert_eq!(detect_cd_target("cd ~/proj"), Some("~/proj".to_string()));
+    }
+
+    #[test]
+    fn quoted_path_is_unwrapped() {
+        assert_eq!(
+            detect_cd_target(r#"cd "/tmp/a b""#),
+            Some("/tmp/a b".to_string())
+        );
+        assert_eq!(
+            detect_cd_target("cd '/tmp/a b'"),
+            Some("/tmp/a b".to_string())
+        );
+    }
+
+    #[test]
+    fn non_cd_returns_none() {
+        assert_eq!(detect_cd_target("ls /tmp"), None);
+        assert_eq!(detect_cd_target("cargo build"), None);
+        // Don't match `cdr` or `cdrom` either — must be `cd ` with space.
+        assert_eq!(detect_cd_target("cdr foo"), None);
+    }
+
+    // ── Bug repro: scoped `cd <path> && <rest>` was getting promoted ──
+    // The model emits `cd /tmp && wget X` meaning "this command only".
+    // The OS shell honours that (subshell), but the bash tool used to
+    // capture the cd and mutate ctx.working_dir, leaving the agent
+    // stranded in /tmp for every subsequent call. Treat any `cd` that
+    // has a chained continuation as scoped — only a *bare* `cd <path>`
+    // is a real intent to switch the persistent working directory.
+
+    #[test]
+    fn cd_chained_with_amp_amp_is_scoped() {
+        assert_eq!(detect_cd_target("cd /tmp && wget http://x"), None);
+        assert_eq!(detect_cd_target("cd subdir && cargo test"), None);
+        assert_eq!(detect_cd_target("cd ../sibling && git log"), None);
+    }
+
+    #[test]
+    fn cd_chained_with_semicolon_is_scoped() {
+        assert_eq!(detect_cd_target("cd /tmp; ls -la"), None);
+        assert_eq!(detect_cd_target("cd /tmp ;ls"), None);
+    }
+
+    #[test]
+    fn cd_chained_with_pipe_is_scoped() {
+        // `cd /tmp | tee` is nonsensical but real models do produce it
+        // accidentally; still must not persist.
+        assert_eq!(detect_cd_target("cd /tmp | tee out.log"), None);
+        assert_eq!(detect_cd_target("cd /tmp || echo fail"), None);
+    }
 }

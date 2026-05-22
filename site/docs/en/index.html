@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Documentation · AtomCode</title>
+<meta name="description" content="AtomCode documentation — an open-source AI coding agent that lives in your terminal.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="index">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<div class="doc-hero">
+      <div class="eyebrow"><span class="dot"></span><span data-i18n="hero.eyebrow">AtomCode · 开源终端 AI 编码助手</span></div>
+      <h1>AtomCode Documentation</h1>
+      <p class="lede">An AI coding agent that lives in your terminal. Hand it a natural-language task and it will autonomously read, edit, run, and self-verify. These docs walk you from a fresh install to every feature AtomCode offers.</p>
+      <div class="tags">
+        <span class="tag accent">v4.23.0</span>
+        <span class="tag" data-i18n="hero.tag.license">许可证 MIT</span>
+        <span class="tag" data-i18n="hero.tag.lang">语言 Rust 1.88+</span>
+        <span class="tag" data-i18n="hero.tag.platforms">平台 macOS · Linux · HarmonyOS PC · Windows</span>
+        <span class="tag" data-i18n="hero.tag.ai">100% AI 生成</span>
+      </div>
+    </div>
+
+      <h2>Three steps to start</h2>
+      <ol>
+        <li><strong>Install</strong> — one curl command or build from source. See <a href="./getting-started.html">Quickstart</a>.</li>
+        <li><strong>Log in or configure a model</strong> — AtomGit OAuth is the easiest path; any OpenAI-compatible API key also works. See <a href="./login.html">Login Methods</a> and <a href="./configuration.html">Configuration</a>.</li>
+        <li><strong>Ask away</strong> — run <code>atomcode</code> inside any project directory and describe your task in natural language.</li>
+      </ol>
+
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>For a quick taste, run a single command: <code>atomcode -p "give me a brief overview of this repo"</code> — one-shot execution with the result piped to stdout.</p>
+      </div>
+
+      <h2>Documentation map</h2>
+      <div class="doc-grid">
+        <a class="doc-card" href="./getting-started.html">
+          <h3>Quickstart</h3>
+          <p>Install paths, the 3-step first-run wizard, your first task, and the <code>atomcode uninstall</code> flow.</p>
+        </a>
+        <a class="doc-card" href="./configuration.html">
+          <h3>Configuration</h3>
+          <p>Every <code>~/.atomcode/config.toml</code> field, per-provider examples, plus the vision preprocessor (so non-vision models can still answer about images).</p>
+        </a>
+        <a class="doc-card" href="./login.html">
+          <h3>Login Methods</h3>
+          <p>AtomGit OAuth one-click login (auto-persisted) versus API key setup, side by side.</p>
+        </a>
+        <a class="doc-card" href="./basic-usage.html">
+          <h3>Basic Usage</h3>
+          <p>How to phrase tasks, common CLI flags, file references, multiline input, and image attachments / screenshots (Ctrl+V / drag-and-drop).</p>
+        </a>
+        <a class="doc-card" href="./slash-commands.html">
+          <h3>Slash Commands</h3>
+          <p>Reference table for the 30+ built-in slash commands: sessions, models, undo, issues, conversation modes, and the extension ecosystem.</p>
+        </a>
+        <a class="doc-card" href="./keybindings.html">
+          <h3>Keybindings</h3>
+          <p>Every TUI keybinding: input, navigation, selection, copy, and more.</p>
+        </a>
+        <a class="doc-card" href="./tools.html">
+          <h3>Built-in Tools</h3>
+          <p>All 21 built-in tools categorised: filesystem/shell, code graph, web, and automation.</p>
+        </a>
+        <a class="doc-card" href="./sessions.html">
+          <h3>Sessions &amp; Undo</h3>
+          <p>Persistent session restore, <code>/undo</code> rollback, and clearing or compacting context.</p>
+        </a>
+        <a class="doc-card" href="./project-instructions.html">
+          <h3>Project Instructions</h3>
+          <p>Use <code>.atomcode.md</code> to give AtomCode project-level conventions to follow.</p>
+        </a>
+        <a class="doc-card" href="./skills.html">
+          <h3>Skills</h3>
+          <p>Write your own skills to extend the slash-command ecosystem.</p>
+        </a>
+        <a class="doc-card" href="./plugins.html">
+          <h3>Plugin System</h3>
+          <p>One-click install other people's skill / command / hook packs from any git repo — Claude Code ecosystem compatible.</p>
+        </a>
+        <a class="doc-card" href="./mcp.html">
+          <h3>MCP Integration</h3>
+          <p>Plug external MCP servers in via <code>.mcp.json</code> — expose GitHub, databases, Playwright, and more to your model.</p>
+        </a>
+        <a class="doc-card" href="./faq.html">
+          <h3>FAQ</h3>
+          <p>Install issues, model connectivity, permission prompts, context overflows, and other common questions.</p>
+        </a>
+      </div>
+
+      <h2>Feedback &amp; contributing</h2>
+      <p>AtomCode is open source — issues and pull requests welcome:</p>
+      <ul>
+        <li>Repository: <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">https://atomgit.com/atomgit_atomcode/atomcode</a></li>
+        <li>Issues: run <code>/issue</code> from inside AtomCode to file one quickly</li>
+        <li>License: MIT</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

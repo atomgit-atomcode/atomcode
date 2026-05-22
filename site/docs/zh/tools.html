@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>内置工具 · AtomCode 文档</title>
+<meta name="description" content="内置工具 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="tools">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.0</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>内置工具</h1>
+      <p class="lede">AtomCode 目前内置 21 个工具,按能力分成文件与 Shell、代码图谱、Web、自动化四类。模型会根据任务自动挑选,大多数情况下你不需要手动指定。</p>
+
+      <h2>文件与 Shell(9 个)</h2>
+      <table>
+        <thead>
+          <tr><th>工具</th><th>作用</th><th>需要确认</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>read_file</code></td><td>读取文件内容,支持行号偏移与范围</td><td>否</td></tr>
+          <tr><td><code>write_file</code></td><td>写入完整文件内容(覆盖写)</td><td>敏感路径:是</td></tr>
+          <tr><td><code>edit_file</code></td><td>基于字符串匹配的局部编辑,返回编辑上下文</td><td>敏感路径:是</td></tr>
+          <tr><td><code>search_replace</code></td><td>批量字符串替换,适合跨行 / 多处模式</td><td>敏感路径:是</td></tr>
+          <tr><td><code>bash</code></td><td>执行 shell 命令,破坏性命令会触发权限对话框</td><td>破坏性命令:是</td></tr>
+          <tr><td><code>grep</code></td><td>基于 ripgrep 语义的正则搜索</td><td>否</td></tr>
+          <tr><td><code>glob</code></td><td>文件名通配符匹配(如 <code>src/**/*.ts</code>)</td><td>否</td></tr>
+          <tr><td><code>list_directory</code></td><td>列出目录内容</td><td>否</td></tr>
+          <tr><td><code>change_dir</code></td><td>切换 agent 的当前工作目录</td><td>否</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-info">
+        <strong>敏感路径</strong>
+        <p>写入 <code>/etc</code>、<code>~/.ssh</code>、shell 配置文件等路径会强制触发权限对话框,无法用"始终允许"一次性跳过。源码文件的 <code>rm</code> 删除同样需要显式确认。</p>
+      </div>
+
+      <h2>代码图谱(8 个)</h2>
+      <p>这是 AtomCode 区别于一般 agent 的最大亮点。借助代码图谱索引,模型无需读遍整棵代码树就能精准定位符号、引用和调用关系,在大型仓库上效果尤其明显。</p>
+      <table>
+        <thead>
+          <tr><th>工具</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>list_symbols</code></td><td>列出某个文件或目录下定义的所有符号(函数、类、常量等)</td></tr>
+          <tr><td><code>read_symbol</code></td><td>精准读取某个符号的完整定义片段,而不用把整个文件拉进上下文</td></tr>
+          <tr><td><code>find_references</code></td><td>查找某个符号被引用的所有位置</td></tr>
+          <tr><td><code>trace_callers</code></td><td>回溯某个函数的调用方链路</td></tr>
+          <tr><td><code>trace_callees</code></td><td>展开某个函数内部调用了哪些下游</td></tr>
+          <tr><td><code>trace_chain</code></td><td>在两个符号之间搜索可能的调用链</td></tr>
+          <tr><td><code>file_deps</code></td><td>分析某个文件的 import/依赖关系</td></tr>
+          <tr><td><code>blast_radius</code></td><td>评估修改某个符号可能影响到的文件 / 符号范围</td></tr>
+        </tbody>
+      </table>
+
+      <h3>典型使用场景</h3>
+      <ul>
+        <li><strong>重构前评估风险</strong> —— "我想改 <code>formatDate</code> 的签名,影响面有多大?"模型会调用 <code>blast_radius</code> + <code>find_references</code>。</li>
+        <li><strong>定位 Bug 根源</strong> —— "用户点击按钮为什么没响应?" 从入口函数开始 <code>trace_callees</code>,一路下探。</li>
+        <li><strong>读懂陌生代码</strong> —— "帮我讲讲 <code>AuthService.login</code> 是怎么跑的" &rarr; <code>read_symbol</code> + <code>trace_callees</code>。</li>
+      </ul>
+
+      <h2>Web(2 个)</h2>
+      <table>
+        <thead>
+          <tr><th>工具</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>web_search</code></td><td>在 web 上搜索关键词,返回标题 / 摘要 / URL 列表</td></tr>
+          <tr><td><code>web_fetch</code></td><td>抓取某个 URL 的内容并转换为 markdown 供模型阅读</td></tr>
+        </tbody>
+      </table>
+      <p>典型用途:查最新的文档、对比不同库的 API、读取一篇 GitHub issue。在离线环境或想省钱时可以用 <code>--disable-tools web_search,web_fetch</code> 关掉它们。</p>
+
+      <h2>自动化(2 个)</h2>
+      <table>
+        <thead>
+          <tr><th>工具</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>auto_fix</code></td><td>运行项目的 lint / typecheck,按错误列表循环修复直到通过</td></tr>
+          <tr><td><code>use_skill</code></td><td>调用用户自定义的 skill,把一个多步流程打包成可复用的命令</td></tr>
+        </tbody>
+      </table>
+      <p>详见 <a href="./skills.html">Skills 扩展</a>。</p>
+
+      <h2>禁用特定工具</h2>
+      <p>用 <code>--disable-tools</code> 参数可以在启动时把某些工具对模型完全隐藏。例如在 SWE-bench 沙箱里:</p>
+      <pre><code>atomcode -p "solve this issue" --disable-tools web_search,web_fetch</code></pre>
+      <p>禁用后的工具不会出现在 tool schemas 里,模型不会尝试去调用一个必然失败的工具。</p>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./sessions.html">会话与撤销</a> —— 文件编辑工具都会走 file-history,<code>/undo</code> 可以回滚</li>
+        <li><a href="./skills.html">Skills 扩展</a> —— 用 <code>use_skill</code> 包装你自己的工作流</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

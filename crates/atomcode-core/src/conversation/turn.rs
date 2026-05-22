@@ -266,6 +266,7 @@ mod tests {
                         arguments: "{}".into(),
                     }],
                     reasoning_content: None,
+                    thinking_blocks: Vec::new(),
                 },
             });
             msgs.push(Message {
