@@ -5926,7 +5926,10 @@ fn handle_agent_event(
                     },
                 ),
             );
-            state.on_approval_needed(&tool_name);
+            // `display` is the already-PascalCased name (e.g. "Bash",
+            // "ReadFile"); on_approval_needed stashes the current
+            // "Running X" label so on_approval_resolved can restore it.
+            state.on_approval_needed(&display);
         }
         AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
         AgentEvent::PhaseChange(AgentPhase::CallingTool(name)) => {

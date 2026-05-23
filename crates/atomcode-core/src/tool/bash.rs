@@ -154,7 +154,20 @@ impl Tool for BashTool {
         // tell when bash went around edit_file. `.gitignore` drives what
         // "counts" — tech-stack neutral, no pattern list of tool names.
         let pre_wd = ctx.working_dir.read().await.clone();
-        let workspace_before = snapshot_workspace_changes(&pre_wd).await;
+        // Skip the workspace-diff snapshot entirely for commands that have
+        // no chance of touching tracked files. Saves two `git status` forks
+        // per call on the hot path (echo / ls / grep / cat / ...). For
+        // anything chained, redirected, or unrecognised we still run the
+        // snapshot — capped at 2s by `snapshot_workspace_changes` itself.
+        let skip_snapshot = serde_json::from_str::<BashArgs>(args)
+            .ok()
+            .map(|p| is_pure_readonly_command(&p.command))
+            .unwrap_or(false);
+        let workspace_before = if skip_snapshot {
+            None
+        } else {
+            snapshot_workspace_changes(&pre_wd).await
+        };
 
         let mut result = bash_execute(args, ctx).await?;
 
@@ -292,6 +305,97 @@ impl Tool for BashTool {
 /// `dist/`, `__pycache__/`), so a `cargo build` that writes into `target/`
 /// doesn't spuriously trigger the nudge — the user controls the boundary,
 /// not a pattern list the framework maintains.
+/// Cap each `git status` invocation. The snapshot only powers the
+/// `[workspace modified via bash: ...]` hint — never load-bearing — so a
+/// timeout silently degrades to "no snapshot" instead of hanging the whole
+/// bash call. Past incident: a stuck `.git/index.lock` left every bash call
+/// blocked here for hundreds of seconds while the spinner said
+/// "Running Bash…" (bash_execute's own 60s timeout doesn't cover this
+/// pre/post step).
+const SNAPSHOT_TIMEOUT_SECS: u64 = 2;
+
+/// True for bash commands that obviously can't touch tracked workspace
+/// files, so the pre/post `git status` snapshot is just wasted work.
+/// Conservative on purpose: a false negative just runs the (now bounded)
+/// snapshot; a false positive would silently lose a legitimate "[workspace
+/// modified via bash: ...]" nudge. Anything chained / piped / redirected
+/// (besides `2>&1` / `2>/dev/null`) or that uses command substitution
+/// drops out.
+fn is_pure_readonly_command(cmd: &str) -> bool {
+    const READONLY_HEAD: &[&str] = &[
+        "echo", "ls", "pwd", "cat", "head", "tail", "wc", "file", "stat",
+        "grep", "rg", "find", "which", "type", "command", "whoami",
+        "hostname", "date", "uname", "env", "printenv", "true", "false",
+        "dirname", "basename", "realpath",
+    ];
+    let trimmed = cmd.trim();
+    // Allow the two harmless stderr-routing patterns before scanning for
+    // metacharacters — these are extremely common (`ls ... 2>&1`).
+    let stripped = trimmed.replace("2>&1", "").replace("2>/dev/null", "");
+    if stripped.contains("$(") || stripped.contains('`') {
+        return false;
+    }
+    if stripped
+        .chars()
+        .any(|c| matches!(c, '>' | '<' | '|' | ';' | '&'))
+    {
+        return false;
+    }
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    READONLY_HEAD.contains(&first)
+}
+
+#[cfg(test)]
+mod is_pure_readonly_command_tests {
+    use super::is_pure_readonly_command;
+
+    #[test]
+    fn allows_bare_readonly_commands() {
+        assert!(is_pure_readonly_command("echo hello"));
+        assert!(is_pure_readonly_command(r#"echo "${X:-}""#));
+        assert!(is_pure_readonly_command("ls -la /tmp"));
+        assert!(is_pure_readonly_command("pwd"));
+        assert!(is_pure_readonly_command("cat README.md"));
+    }
+
+    #[test]
+    fn allows_harmless_stderr_redirect() {
+        assert!(is_pure_readonly_command(
+            "ls -la ~/.atomcode/skills/foo/ 2>&1"
+        ));
+        assert!(is_pure_readonly_command("which git 2>/dev/null"));
+    }
+
+    #[test]
+    fn rejects_redirects_and_pipes() {
+        assert!(!is_pure_readonly_command("cat foo > bar"));
+        assert!(!is_pure_readonly_command("echo done | tee log"));
+        assert!(!is_pure_readonly_command("ls > out.txt"));
+        assert!(!is_pure_readonly_command("cat <input.txt"));
+    }
+
+    #[test]
+    fn rejects_command_substitution() {
+        assert!(!is_pure_readonly_command("cat $(echo file)"));
+        assert!(!is_pure_readonly_command("cat `echo file`"));
+    }
+
+    #[test]
+    fn rejects_chains() {
+        assert!(!is_pure_readonly_command("cd /tmp && rm x"));
+        assert!(!is_pure_readonly_command("ls; rm foo"));
+        assert!(!is_pure_readonly_command("test -f x || touch x"));
+    }
+
+    #[test]
+    fn rejects_non_readonly_heads() {
+        assert!(!is_pure_readonly_command("rm foo"));
+        assert!(!is_pure_readonly_command("cp a b"));
+        assert!(!is_pure_readonly_command("sed -i 's/x/y/' f"));
+        assert!(!is_pure_readonly_command("git commit -m msg"));
+    }
+}
+
 async fn snapshot_workspace_changes(
     wd: &std::path::Path,
 ) -> Option<std::collections::HashSet<String>> {
@@ -302,7 +406,15 @@ async fn snapshot_workspace_changes(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     crate::process_utils::suppress_console_window(&mut cmd);
-    let out = cmd.output().await.ok()?;
+    let out = match tokio::time::timeout(
+        Duration::from_secs(SNAPSHOT_TIMEOUT_SECS),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        _ => return None,
+    };
     if !out.status.success() {
         return None;
     }
