@@ -2166,6 +2166,61 @@ mod tool_format_tests {
         assert_eq!(out, "");
     }
 
+    #[test]
+    fn format_tool_detail_search_replace_shows_arrow() {
+        let args = r#"{"search":"bg-blue-600","replace":"bg-violet-600","glob":"*.vue"}"#;
+        let out = format_tool_detail("search_replace", args);
+        assert!(
+            out.contains("bg-blue-600"),
+            "should contain search term: got {:?}",
+            out
+        );
+        assert!(
+            out.contains("bg-violet-600"),
+            "should contain replace term: got {:?}",
+            out
+        );
+        assert!(
+            out.contains("→"),
+            "should contain arrow separator: got {:?}",
+            out
+        );
+        assert!(
+            out.contains("glob: *.vue"),
+            "should contain glob info: got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn format_tool_detail_search_replace_without_glob() {
+        let args = r#"{"search":"oldFunc","replace":"newFunc"}"#;
+        let out = format_tool_detail("search_replace", args);
+        assert_eq!(out, "oldFunc → newFunc");
+    }
+
+    #[test]
+    fn format_tool_detail_search_replace_with_path() {
+        let args = r#"{"search":"foo","replace":"bar","path":"/some/dir"}"#;
+        let out = format_tool_detail("search_replace", args);
+        assert!(
+            out.contains("path: dir"),
+            "should contain path basename: got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn format_tool_detail_search_replace_dot_path_omitted() {
+        let args = r#"{"search":"foo","replace":"bar","path":"."}"#;
+        let out = format_tool_detail("search_replace", args);
+        assert!(
+            !out.contains("path:"),
+            "default '.' path should be omitted: got {:?}",
+            out
+        );
+    }
+
     // ── disambiguate_batch_details tests (issue #437) ──
 
     #[test]
@@ -6923,16 +6978,33 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             get_str("file").map(|p| basename(&p)).unwrap_or_default()
         }
         "search_replace" => {
-            let file = get_str("file_path").or_else(|| get_str("file"));
-            let pat = get_str("pattern").or_else(|| get_str("old"));
-            match (file, pat) {
-                (Some(f), Some(p)) => format!(
-                    "{}: {}",
-                    basename(&f),
-                    crate::width::truncate_with_ellipsis(&p, 60)
-                ),
-                (Some(f), None) => basename(&f),
-                (None, Some(p)) => crate::width::truncate_with_ellipsis(&p, 100),
+            // SearchReplaceArgs uses search/replace/glob/path (not
+            // file_path/file/pattern/old). Show "search → replace" so
+            // the approval prompt tells the user WHAT will be replaced.
+            let search = get_str("search");
+            let replace = get_str("replace");
+            let glob = get_str("glob");
+            let path = get_str("path");
+            match (&search, &replace) {
+                (Some(s), Some(r)) => {
+                    let arrow = format!(
+                        "{} → {}",
+                        crate::width::truncate_with_ellipsis(s, 60),
+                        crate::width::truncate_with_ellipsis(r, 60)
+                    );
+                    let mut parts = vec![arrow];
+                    if let Some(g) = &glob {
+                        parts.push(format!("glob: {}", g));
+                    }
+                    if let Some(p) = &path {
+                        if p != "." {
+                            parts.push(format!("path: {}", basename(p)));
+                        }
+                    }
+                    parts.join(", ")
+                }
+                (None, Some(r)) => crate::width::truncate_with_ellipsis(r, 100),
+                (Some(s), None) => crate::width::truncate_with_ellipsis(s, 100),
                 _ => String::new(),
             }
         }
