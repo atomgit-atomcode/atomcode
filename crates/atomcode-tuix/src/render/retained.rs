@@ -309,7 +309,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// that follows Y/A/N would push the ▸ ToolCall row off to make
     /// space for itself, leaving a blank gap between `▸ Tool(detail)`
     /// and `⎿ result`.
-    skip_next_body_scroll: bool,
+    /// Number of upcoming `push_body_row` calls that should overwrite in
+    /// place instead of scrolling the body region. Set by
+    /// `pop_approval_prompt` when the popped approval block occupied
+    /// more than one terminal row — each skipped scroll closes one row
+    /// of the gap between the last content row and body_bottom.
+    /// Decremented on every `emit_body_line_inner` call.
+    skip_body_scroll_count: u16,
     /// Cached semantic welcome payload so resize can rebuild the
     /// startup banner for the new terminal width.
     welcome_banner: Option<(String, String)>,
@@ -392,7 +398,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             dirty: false,
             last_painted_footer_rows: 0,
             scroll_region_bottom: None,
-            skip_next_body_scroll: false,
+            skip_body_scroll_count: 0,
             welcome_banner: None,
             welcome_line_count: 0,
             live_spinner_active: false,
@@ -1305,7 +1311,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// scrollback, DECSTBM contains the scroll to the body strip).
     /// Assumes `ensure_scroll_region` has already set the region.
     ///
-    /// When `skip_next_body_scroll` is set (see `pop_approval_prompt`),
+    /// When `skip_body_scroll_count` is non-zero (see `pop_approval_prompt`),
     /// the LF is skipped — the new row overwrites whatever was sitting
     /// at body_bottom (typically the freshly-popped approval prompt)
     /// so the visual flow `▸ Tool` → `⎿ result` has no gap.
@@ -1319,13 +1325,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // empty spacer) let the previous row's tail bleed through —
         // classic symptom was `/provider  to add a custom model` from
         // the welcome banner leaking past shorter subsequent rows.
-        if self.skip_next_body_scroll {
+        if self.skip_body_scroll_count > 0 {
             // In-place overwrite: position + erase, no LF (so the
             // body region isn't shifted up; the prior approval prompt
-            // at body_bottom gets replaced cleanly).
-            let seq = format!("\x1b[{};1H\x1b[K", bottom);
+            // at body_bottom gets replaced cleanly). Each skipped
+            // scroll closes one row of the gap left by
+            // pop_approval_prompt.
+            let target = bottom.saturating_sub(self.skip_body_scroll_count - 1);
+            let seq = format!("\x1b[{};1H\x1b[K", target);
             let _ = self.out.write_all(seq.as_bytes());
-            self.skip_next_body_scroll = false;
+            self.skip_body_scroll_count -= 1;
         } else {
             let seq = format!("\x1b[{};1H\n\x1b[{};1H\x1b[K", bottom, bottom);
             let _ = self.out.write_all(seq.as_bytes());
@@ -1388,7 +1397,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // the current bottom row. That way the slot previously held
             // by the spinner becomes the slot for this new body row,
             // with no intervening blank line.
-            self.skip_next_body_scroll = true;
+            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
         }
         // Region might be stale (first call after resume, or footer
         // just changed); sync before emit so the LF in emit_body_line
@@ -1479,7 +1488,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // second blank between the user message and the committed
             // tool call (visible as the `> question \n \n ● tool`
             // double-gap in screenshots).
-            self.skip_next_body_scroll = true;
+            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
             self.push_body_prefixed(
                 // Frozen icon matches the static ToolCall arm — see its
                 // comment for the Windows-font rationale that picked ●
@@ -2666,7 +2675,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 //
                 // Mirror the `clear_live_spinner` pattern (see line
                 // ~1167): pop body_lines, EL-erase the row at
-                // body_bottom, then arm `skip_next_body_scroll` so the
+                // body_bottom, then arm `skip_body_scroll_count` so the
                 // next push_body_row overwrites in-place (no LF) instead
                 // of scrolling. After the attachment row, push a fresh
                 // trailing blank so the next turn's content still has
@@ -2679,7 +2688,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                         let seq = format!("\x1b[{};1H\x1b[K", bottom);
                         let _ = self.out.write_all(seq.as_bytes());
                     }
-                    self.skip_next_body_scroll = true;
+                    self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
                 }
                 let body = format!("└ [Image #{}]", n);
                 self.push_body_text(&body, &self.style_for(Role::Muted));
@@ -2796,7 +2805,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             let _ = self.out.write_all(seq.as_bytes());
             let _ = self.out.flush();
-            self.skip_next_body_scroll = true;
+            self.skip_body_scroll_count = popped_count;
             self.screen.invalidate();
         }
         self.dirty = true;
@@ -7003,5 +7012,135 @@ mod tests {
                 text,
             );
         }
+    }
+
+    /// Regression: after approving a bash tool call, the `● Bash(cmd)` row
+    /// and the `└ [elapsed: …]` result row should be adjacent with no
+    /// blank line between them. User reported a visible blank gap after
+    /// pressing Y on the approval prompt.
+    #[test]
+    fn retained_approval_pop_then_result_no_blank_gap() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Seed a full frame so footer is painted.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Simulate: ToolCallStarted → inflight spinner for Bash
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: "rm -f /tmp/test.txt".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Simulate: ApprovalNeeded → commit inflight to ● + show approval prompt
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "Bash".into(),
+            detail: "rm -f /tmp/test.txt".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // User presses Y → pop approval prompt
+        r.pop_approval_prompt();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Simulate: ToolCallResult arrives
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "[elapsed: 0.0s, exit: 0] (2 lines)".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Debug: print body_lines around the tool and result rows.
+        let tool_idx = r.body_lines.iter().rposition(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("Bash") && text.contains("rm -f")
+        }).expect("● Bash row should exist in body_lines");
+
+        let result_idx = r.body_lines.iter().rposition(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("elapsed")
+        }).expect("└ result row should exist in body_lines");
+
+        eprintln!("body_lines around tool row:");
+        for i in tool_idx.saturating_sub(2)..=result_idx+2 {
+            if let Some(row) = r.body_lines.get(i) {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                eprintln!("  [{}] {:?} (blank={})", i, text, row.is_empty());
+            }
+        }
+
+        // Check body_lines: there should be no blank row between the
+        // ● Bash row and the └ result row.
+        assert_eq!(
+            result_idx,
+            tool_idx + 1,
+            "result row should be immediately after tool row, but found gap.\n\
+             body_lines around tool row:\n  {:?}\n  {:?}\n  {:?}",
+            r.body_lines.get(tool_idx).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines.get(tool_idx + 1).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines.get(tool_idx + 2).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+        );
+
+        // Also check the virtual terminal: the ● Bash row and └ result row
+        // should be on adjacent terminal rows with no blank row between them.
+        eprintln!("vterm dump:\n{}", vterm.dump());
+        let bash_term_row = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("Bash") && vterm.row_text(i).contains("rm"))
+            .expect("Bash row should be on terminal");
+        let result_term_row = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("elapsed"))
+            .expect("result row should be on terminal");
+
+        assert_eq!(
+            result_term_row,
+            bash_term_row + 1,
+            "result should be on terminal row immediately below Bash row.\n\
+             Bash row {}: {:?}\n\
+             Row below: {:?}\n\
+             Result row {}: {:?}\n\
+             dump:\n{}",
+            bash_term_row,
+            vterm.row_text(bash_term_row),
+            vterm.row_text(bash_term_row + 1),
+            result_term_row,
+            vterm.row_text(result_term_row),
+            vterm.dump(),
+        );
     }
 }
