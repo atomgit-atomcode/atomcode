@@ -1367,18 +1367,11 @@ endpoint = "https://test.example/v1"
         ));
         let cfg = Config {
             default_provider: "p".to_string(),
-            default_workdir: None,
-            providers: HashMap::new(),
-            datalog: DatalogConfig::default(),
-            notifications: NotificationConfig::default(),
-            auto_update: true,
-            reflection_cadence: 7,
             telemetry: TelemetryConfig {
                 enabled: Some(false),
                 endpoint: Some("https://telemetry.example/v1".to_string()),
             },
-            lsp: LspConfig::default(),
-            auto_commit: false,
+            ..Config::default()
         };
 
         cfg.save(&tmp).unwrap();
