@@ -309,7 +309,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// that follows Y/A/N would push the ▸ ToolCall row off to make
     /// space for itself, leaving a blank gap between `▸ Tool(detail)`
     /// and `⎿ result`.
-    skip_next_body_scroll: bool,
+    /// Number of upcoming `push_body_row` calls that should overwrite in
+    /// place instead of scrolling the body region. Set by
+    /// `pop_approval_prompt` when the popped approval block occupied
+    /// more than one terminal row — each skipped scroll closes one row
+    /// of the gap between the last content row and body_bottom.
+    /// Decremented on every `emit_body_line_inner` call.
+    skip_body_scroll_count: u16,
     /// Cached semantic welcome payload so resize can rebuild the
     /// startup banner for the new terminal width.
     welcome_banner: Option<(String, String)>,
@@ -376,7 +382,13 @@ impl RetainedRenderer<BufWriter<Stdout>> {
 }
 
 impl<W: Write + Send> RetainedRenderer<W> {
-    pub fn with_writer(out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+    pub fn with_writer(mut out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+        // Clear scrollback buffer so previous terminal content (e.g. git log)
+        // doesn't remain visible above the atomcode viewport and mix with
+        // the atomcode session transcript. `\x1b[3J` only affects scrollback;
+        // it does not touch the visible screen rows.
+        let _ = out.write_all(b"\x1b[3J");
+        let _ = out.flush();
         Self {
             out,
             caps,
@@ -392,7 +404,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             dirty: false,
             last_painted_footer_rows: 0,
             scroll_region_bottom: None,
-            skip_next_body_scroll: false,
+            skip_body_scroll_count: 0,
             welcome_banner: None,
             welcome_line_count: 0,
             live_spinner_active: false,
@@ -1305,7 +1317,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// scrollback, DECSTBM contains the scroll to the body strip).
     /// Assumes `ensure_scroll_region` has already set the region.
     ///
-    /// When `skip_next_body_scroll` is set (see `pop_approval_prompt`),
+    /// When `skip_body_scroll_count` is non-zero (see `pop_approval_prompt`),
     /// the LF is skipped — the new row overwrites whatever was sitting
     /// at body_bottom (typically the freshly-popped approval prompt)
     /// so the visual flow `▸ Tool` → `⎿ result` has no gap.
@@ -1319,13 +1331,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // empty spacer) let the previous row's tail bleed through —
         // classic symptom was `/provider  to add a custom model` from
         // the welcome banner leaking past shorter subsequent rows.
-        if self.skip_next_body_scroll {
+        if self.skip_body_scroll_count > 0 {
             // In-place overwrite: position + erase, no LF (so the
             // body region isn't shifted up; the prior approval prompt
-            // at body_bottom gets replaced cleanly).
-            let seq = format!("\x1b[{};1H\x1b[K", bottom);
+            // at body_bottom gets replaced cleanly). Each skipped
+            // scroll closes one row of the gap left by
+            // pop_approval_prompt.
+            let target = bottom.saturating_sub(self.skip_body_scroll_count - 1);
+            let seq = format!("\x1b[{};1H\x1b[K", target);
             let _ = self.out.write_all(seq.as_bytes());
-            self.skip_next_body_scroll = false;
+            self.skip_body_scroll_count -= 1;
         } else {
             let seq = format!("\x1b[{};1H\n\x1b[{};1H\x1b[K", bottom, bottom);
             let _ = self.out.write_all(seq.as_bytes());
@@ -1388,7 +1403,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // the current bottom row. That way the slot previously held
             // by the spinner becomes the slot for this new body row,
             // with no intervening blank line.
-            self.skip_next_body_scroll = true;
+            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
         }
         // Region might be stale (first call after resume, or footer
         // just changed); sync before emit so the LF in emit_body_line
@@ -1467,19 +1482,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.inflight_tool_rows = 0;
             self.ensure_scroll_region();
             let bottom = self.body_bottom_row();
-            if bottom > 0 {
-                let seq = format!("\x1b[{};1H\x1b[K", bottom);
+            if bottom > 0 && remove > 0 {
+                // Erase ALL terminal rows previously occupied by the
+                // inflight spinner (may be >1 when the command was long
+                // enough to wrap). Without this, the old `⠙ Bash(...)`
+                // row lingers on-screen above the freshly committed
+                // `● Bash(...)` row, producing a visual duplicate.
+                let start_row = bottom.saturating_sub(remove as u16 - 1).max(1);
+                let mut seq = String::with_capacity((bottom - start_row + 1) as usize * 8);
+                use std::fmt::Write as _;
+                for row in start_row..=bottom {
+                    let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+                }
                 let _ = self.out.write_all(seq.as_bytes());
             }
-            // The CUP+EL above erased the inflight row in place — the
-            // committed row should land in that exact slot. Without
+            // The CUP+EL above erased the inflight rows in place — the
+            // committed rows should land in those exact slots. Without
             // this flag, `push_body_prefixed`'s underlying
             // `emit_body_line_inner` emits an LF that scrolls the body
             // region up by one, leaving the just-erased row as a
             // second blank between the user message and the committed
             // tool call (visible as the `> question \n \n ● tool`
-            // double-gap in screenshots).
-            self.skip_next_body_scroll = true;
+            // double-gap in screenshots). Use `remove` (not just 1)
+            // so multi-row inflight spinners are fully covered.
+            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(remove as u16);
             self.push_body_prefixed(
                 // Frozen icon matches the static ToolCall arm — see its
                 // comment for the Windows-font rationale that picked ●
@@ -2567,31 +2593,55 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let prefix_w = crate::width::display_width(&waiting);
                 let cont_pad: String = " ".repeat(prefix_w);
 
-                // Line 1: "▶ 等待审批：Tool(detail)" — auto-wraps when
-                // the tool label is long so the Y/A/N chips always remain
-                // visible on line 2. Uses build_prefixed_rows for proper
-                // wrapping with continuation-line indentation.
-                let safe_tool_label = crate::sanitize::scrub_controls(&tool_label);
-                let prefixed_rows = self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
-                for row in prefixed_rows {
-                    self.push_body_row(row);
-                }
-
-                // Line 2: Y/A/N chips — always on their own line so they
-                // remain visible even when the label wraps. Indent by the
-                // ▶ glyph width so chips align under the label content.
                 let allow = t(Msg::ApprovalAllow);
                 let always = t(Msg::ApprovalAlways);
                 let deny = t(Msg::ApprovalDeny);
-                let mut chips_row = Vec::new();
-                push_str_cells(&mut chips_row, &cont_pad, &plain);
-                push_str_cells(&mut chips_row, " Y ", &chip_y);
-                push_str_cells(&mut chips_row, &allow, &plain);
-                push_str_cells(&mut chips_row, " A ", &chip_a);
-                push_str_cells(&mut chips_row, &always, &plain);
-                push_str_cells(&mut chips_row, " N ", &chip_n);
-                push_str_cells(&mut chips_row, &deny, &plain);
-                self.push_body_row(chips_row);
+
+                // Build the Y/A/N chips cells once — reused whether
+                // we place them inline or on a separate line.
+                let mut chips_cells: Vec<Cell> = Vec::new();
+                push_str_cells(&mut chips_cells, " Y ", &chip_y);
+                push_str_cells(&mut chips_cells, &allow, &plain);
+                push_str_cells(&mut chips_cells, " A ", &chip_a);
+                push_str_cells(&mut chips_cells, &always, &plain);
+                push_str_cells(&mut chips_cells, " N ", &chip_n);
+                push_str_cells(&mut chips_cells, &deny, &plain);
+                let chips_width: usize = chips_cells.iter().map(|c| c.width as usize).sum();
+
+                // Build the label rows, then decide: if the last label
+                // row + chips fit within the screen width, append chips
+                // inline (issue #454). Otherwise, emit chips on a
+                // separate line so they remain visible.
+                let safe_tool_label = crate::sanitize::scrub_controls(&tool_label);
+                let mut prefixed_rows = self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
+                let screen_w = self.screen.width() as usize;
+                let last_row_w: usize = prefixed_rows
+                    .last()
+                    .map(|r| r.iter().map(|c| c.width as usize).sum())
+                    .unwrap_or(0);
+
+                if last_row_w + chips_width <= screen_w {
+                    // Everything fits on one line — append chips directly
+                    // after the label.  issue #454: users reported that
+                    // splitting into two lines was unnecessary when the
+                    // terminal is wide enough.
+                    if let Some(last_row) = prefixed_rows.last_mut() {
+                        last_row.extend(chips_cells);
+                    }
+                    for row in prefixed_rows {
+                        self.push_body_row(row);
+                    }
+                } else {
+                    // Label too long — keep chips on a separate line so
+                    // they remain visible even when the label wraps.
+                    for row in prefixed_rows {
+                        self.push_body_row(row);
+                    }
+                    let mut chips_row = Vec::new();
+                    push_str_cells(&mut chips_row, &cont_pad, &plain);
+                    chips_row.extend(chips_cells);
+                    self.push_body_row(chips_row);
+                }
             }
             UiLine::Error(msg) => {
                 let err_style = self.style_for(Role::Error);
@@ -2642,7 +2692,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 //
                 // Mirror the `clear_live_spinner` pattern (see line
                 // ~1167): pop body_lines, EL-erase the row at
-                // body_bottom, then arm `skip_next_body_scroll` so the
+                // body_bottom, then arm `skip_body_scroll_count` so the
                 // next push_body_row overwrites in-place (no LF) instead
                 // of scrolling. After the attachment row, push a fresh
                 // trailing blank so the next turn's content still has
@@ -2655,7 +2705,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                         let seq = format!("\x1b[{};1H\x1b[K", bottom);
                         let _ = self.out.write_all(seq.as_bytes());
                     }
-                    self.skip_next_body_scroll = true;
+                    self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
                 }
                 let body = format!("└ [Image #{}]", n);
                 self.push_body_text(&body, &self.style_for(Role::Muted));
@@ -2694,12 +2744,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn pop_approval_prompt(&mut self) {
-        // The approval prompt now spans multiple body rows:
-        //   1+ label rows: the first starts with '▶' at col 0,
-        //      continuation rows start with spaces (indented to
-        //      align under the ▶ prefix).
-        //   1 chips row: "  Y  允许  A  总是  N  拒绝",
-        //      also starting with spaces.
+        // The approval prompt spans one or more body rows:
+        //   - When label + chips fit on one line: a single row
+        //     starting with '▶' containing both the label and
+        //     the Y/A/N chips.
+        //   - When the label is long: 1+ label rows (first starts
+        //     with '▶', continuation rows start with spaces) plus
+        //     1 chips row (also starting with spaces).
         // We need to pop all of them. Strategy: walk backwards
         // from the tail, popping every row until we find the ▶
         // header row (which we also pop). Other symbol rows hold
@@ -2754,6 +2805,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // gap.
         let bottom = self.body_bottom_row();
         if bottom > 0 {
+            // Erase the popped body rows (may span multiple terminal
+            // lines). Use per-row \x1b[K instead of \x1b[J to avoid
+            // erasing the footer rows below the body strip.
+            // screen.prev_cells still holds the old footer content,
+            // so without invalidation the next render_diff() would
+            // see identical prev/current footer cells and skip the
+            // repaint — leaving the footer permanently blank.
+            // invalidate() below ensures the next flush_deferred()
+            // emits a full repaint of every non-blank cell.
             let start_row = bottom.saturating_sub(popped_count - 1).max(1);
             let mut seq = String::with_capacity((bottom - start_row + 1) as usize * 8);
             use std::fmt::Write as _;
@@ -2762,7 +2822,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             let _ = self.out.write_all(seq.as_bytes());
             let _ = self.out.flush();
-            self.skip_next_body_scroll = true;
+            self.skip_body_scroll_count = popped_count;
+            self.screen.invalidate();
         }
         self.dirty = true;
     }
@@ -5278,8 +5339,8 @@ mod tests {
     /// After moving ▶ to col 0, `pop_approval_prompt` must still
     /// detect the approval rows via col 0 and must NOT be fooled by
     /// an adjacent ● tool-call row (also at col 0, different glyph).
-    /// The approval prompt now spans 2 rows (label + chips), so
-    /// pop_approval_prompt must remove both.
+    /// In an 80-col terminal the label + chips fit on one line, so
+    /// pop_approval_prompt removes a single row.
     #[test]
     fn retained_approval_pop_still_detects_glyph() {
         let (mut r, _buf) = new_capturing(80, 24);
@@ -5297,8 +5358,8 @@ mod tests {
         let after = r.body_lines.len();
         assert_eq!(
             before - after,
-            2,
-            "pop_approval_prompt should drop both the label and chips rows"
+            1,
+            "pop_approval_prompt should drop the single label+chips row"
         );
 
         // Second call: last row is now the tool-call `●`, not `▶`.
@@ -6967,6 +7028,226 @@ mod tests {
                 "SGR bytes leaked into cells as literal text: {:?}",
                 text,
             );
+        }
+    }
+
+    /// Regression: after approving a bash tool call, the `● Bash(cmd)` row
+    /// and the `└ [elapsed: …]` result row should be adjacent with no
+    /// blank line between them. User reported a visible blank gap after
+    /// pressing Y on the approval prompt.
+    #[test]
+    fn retained_approval_pop_then_result_no_blank_gap() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Seed a full frame so footer is painted.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Simulate: ToolCallStarted → inflight spinner for Bash
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: "rm -f /tmp/test.txt".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Simulate: ApprovalNeeded → commit inflight to ● + show approval prompt
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "Bash".into(),
+            detail: "rm -f /tmp/test.txt".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // User presses Y → pop approval prompt
+        r.pop_approval_prompt();
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Simulate: ToolCallResult arrives
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "[elapsed: 0.0s, exit: 0] (2 lines)".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Debug: print body_lines around the tool and result rows.
+        let tool_idx = r.body_lines.iter().rposition(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("Bash") && text.contains("rm -f")
+        }).expect("● Bash row should exist in body_lines");
+
+        let result_idx = r.body_lines.iter().rposition(|row| {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            text.contains("elapsed")
+        }).expect("└ result row should exist in body_lines");
+
+        eprintln!("body_lines around tool row:");
+        for i in tool_idx.saturating_sub(2)..=result_idx+2 {
+            if let Some(row) = r.body_lines.get(i) {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                eprintln!("  [{}] {:?} (blank={})", i, text, row.is_empty());
+            }
+        }
+
+        // Check body_lines: there should be no blank row between the
+        // ● Bash row and the └ result row.
+        assert_eq!(
+            result_idx,
+            tool_idx + 1,
+            "result row should be immediately after tool row, but found gap.\n\
+             body_lines around tool row:\n  {:?}\n  {:?}\n  {:?}",
+            r.body_lines.get(tool_idx).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines.get(tool_idx + 1).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines.get(tool_idx + 2).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+        );
+
+        // Also check the virtual terminal: the ● Bash row and └ result row
+        // should be on adjacent terminal rows with no blank row between them.
+        eprintln!("vterm dump:\n{}", vterm.dump());
+        let bash_term_row = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("Bash") && vterm.row_text(i).contains("rm"))
+            .expect("Bash row should be on terminal");
+        let result_term_row = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("elapsed"))
+            .expect("result row should be on terminal");
+
+        assert_eq!(
+            result_term_row,
+            bash_term_row + 1,
+            "result should be on terminal row immediately below Bash row.\n\
+             Bash row {}: {:?}\n\
+             Row below: {:?}\n\
+             Result row {}: {:?}\n\
+             dump:\n{}",
+            bash_term_row,
+            vterm.row_text(bash_term_row),
+            vterm.row_text(bash_term_row + 1),
+            result_term_row,
+            vterm.row_text(result_term_row),
+            vterm.dump(),
+        );
+    }
+
+    /// Regression: when a long Bash command wraps to multiple terminal
+    /// rows, the inflight spinner `⠙ Bash(...)` may occupy 2+ body rows.
+    /// After `ToolCallCommit` freezes it to `● Bash(...)`, the old
+    /// spinner rows must all be erased — otherwise the user sees BOTH
+    /// `⠙ Bash(...)` and `● Bash(...)` on screen at the same time.
+    #[test]
+    fn retained_commit_inflight_erases_all_spinner_rows() {
+        // Use a narrow terminal so the command wraps to 2+ rows.
+        let (mut r, buf) = new_capturing(40, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
+        let status = status_basic();
+
+        // Seed a full frame so footer is painted.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // ToolCallInFlight with a long command that wraps to 2 rows.
+        let long_detail = "rm -rf /very/long/path/that/wraps/to/multiple/rows/on/40col/terminal";
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: long_detail.into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Confirm the inflight spinner occupies more than 1 body row.
+        assert!(
+            r.inflight_tool_rows > 1,
+            "inflight spinner should occupy multiple rows for a long command on 40-col terminal, \
+             but inflight_tool_rows = {}",
+            r.inflight_tool_rows,
+        );
+
+        // Now commit the inflight spinner (simulates ApprovalNeeded → ToolCallCommit).
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Check body_lines: there should be exactly one row with "● Bash"
+        // and NO row with a spinner glyph (⠙ or similar Braille pattern).
+        let bash_rows: Vec<_> = r.body_lines.iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("Bash")
+            })
+            .collect();
+
+        assert_eq!(
+            bash_rows.len(),
+            1,
+            "there should be exactly 1 Bash row in body_lines, found {}:\n{:?}",
+            bash_rows.len(),
+            bash_rows.iter().map(|(i, row)| (i, row.iter().map(|c| c.ch).collect::<String>())).collect::<Vec<_>>(),
+        );
+
+        // The committed row should start with ● (U+25CF), not a spinner glyph.
+        let (idx, bash_row) = bash_rows[0];
+        let first_ch = bash_row.first().map(|c| c.ch).unwrap_or('\0');
+        assert_eq!(
+            first_ch, '\u{25cf}',
+            "committed Bash row at index {} should start with ●, found '{}'",
+            idx, first_ch,
+        );
+
+        // Check virtual terminal: no row should contain a Braille spinner
+        // glyph (U+2800–U+28FF) alongside "Bash".
+        for i in 0..vterm.height() as usize {
+            let text = vterm.row_text(i);
+            if text.contains("Bash") {
+                let has_spinner = text.chars().any(|c| c >= '\u{2800}' && c <= '\u{28FF}');
+                assert!(
+                    !has_spinner,
+                    "terminal row {} still has a spinner glyph alongside Bash: {:?}",
+                    i, text,
+                );
+            }
         }
     }
 }

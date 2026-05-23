@@ -2014,10 +2014,9 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // identical prompts and the user can't tell which file
                 // they're approving (issue #439).
                 //
-                // Split into two lines: line 1 is the label (auto-wraps
-                // via push_body_row_raw), line 2 is the Y/A/N chips —
-                // always on their own line so they remain visible even
-                // when the tool label is long.
+                // When the label + chips fit on one line, place them
+                // together (issue #454: users reported unnecessary
+                // line-splitting). Only split when the label is too long.
                 let waiting = t(Msg::ApprovalWaitingLabel);
                 let allow = t(Msg::ApprovalAllow);
                 let always = t(Msg::ApprovalAlways);
@@ -2030,39 +2029,65 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 let prefix_w = crate::width::display_width(&waiting);
                 let cont_pad = " ".repeat(prefix_w);
 
-                // Line 1: label — auto-wraps if too long.
-                if self.caps.colors {
-                    let label_row = format!(
+                // Build the chips text — reused for both one-line and
+                // two-line layouts.
+                let chips_plain = format!("Y {allow} A {always} N {deny}");
+                let chips_colored = format!(
+                    "{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
+                    rev = SGR_REVERSE,
+                    green = SGR_GREEN,
+                    cyan = SGR_CYAN,
+                    red = SGR_RED,
+                    reset = SGR_RESET,
+                    allow = allow,
+                    always = always,
+                    deny = deny,
+                );
+                let chips_display_w = crate::width::display_width(&chips_plain);
+                let screen_w = self.width as usize;
+
+                // Build the label row (with or without color), wrap it,
+                // and measure the last wrapped chunk's visible width.
+                // This mirrors retained.rs which measures the last
+                // build_prefixed_rows row's cell width.
+                let label_raw = if self.caps.colors {
+                    format!(
                         "{bold}{yellow}{waiting}{tool_label}{reset}",
                         bold = SGR_BOLD,
                         yellow = SGR_YELLOW,
                         reset = SGR_RESET,
-                        waiting = waiting,
-                        tool_label = tool_label,
-                    );
-                    self.push_body_row_raw(label_row);
-                } else {
-                    let label_row = format!("{waiting}{tool_label}");
-                    self.push_body_row_raw(label_row);
-                }
-
-                // Line 2: Y/A/N chips.
-                let chips_row = if self.caps.colors {
-                    format!(
-                        "{cont_pad}{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
-                        rev = SGR_REVERSE,
-                        green = SGR_GREEN,
-                        cyan = SGR_CYAN,
-                        red = SGR_RED,
-                        reset = SGR_RESET,
-                        allow = allow,
-                        always = always,
-                        deny = deny,
                     )
                 } else {
-                    format!("{cont_pad}Y {allow} A {always} N {deny}")
+                    format!("{waiting}{tool_label}")
                 };
-                self.push_body_row(chips_row);
+                let wrapped_label = wrap_to_width_sgr_aware(&label_raw, screen_w);
+                let last_label_w = wrapped_label
+                    .last()
+                    .map(|s| line_display_width_sgr_aware(s))
+                    .unwrap_or(0);
+
+                if last_label_w + chips_display_w <= screen_w {
+                    // Everything fits on one line.
+                    if self.caps.colors {
+                        let row = format!(
+                            "{label_raw}{chips}",
+                            label_raw = label_raw,
+                            chips = chips_colored,
+                        );
+                        self.push_body_row_raw(row);
+                    } else {
+                        let row = format!("{label_raw}{chips_plain}");
+                        self.push_body_row_raw(row);
+                    }
+                } else {
+                    // Label too long — keep chips on a separate line.
+                    self.push_body_row_raw(label_raw);
+                    if self.caps.colors {
+                        self.push_body_row(format!("{cont_pad}{chips_colored}"));
+                    } else {
+                        self.push_body_row(format!("{cont_pad}{chips_plain}"));
+                    }
+                }
             }
 
             // ── body: command output / errors ──
