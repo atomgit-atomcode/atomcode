@@ -382,7 +382,13 @@ impl RetainedRenderer<BufWriter<Stdout>> {
 }
 
 impl<W: Write + Send> RetainedRenderer<W> {
-    pub fn with_writer(out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+    pub fn with_writer(mut out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+        // Clear scrollback buffer so previous terminal content (e.g. git log)
+        // doesn't remain visible above the atomcode viewport and mix with
+        // the atomcode session transcript. `\x1b[3J` only affects scrollback;
+        // it does not touch the visible screen rows.
+        let _ = out.write_all(b"\x1b[3J");
+        let _ = out.flush();
         Self {
             out,
             caps,
