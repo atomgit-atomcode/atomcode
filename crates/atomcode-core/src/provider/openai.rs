@@ -13,7 +13,7 @@ use crate::conversation::message::{Message, MessageContent, Role};
 use crate::stream::StreamEvent;
 use crate::tool::ToolDef;
 
-use crate::auth::oauth::get_stored_auth;
+use crate::auth::oauth::{get_stored_auth, refresh_access_token};
 use crate::coding_plan::crypto::{self, SignError, SignInput};
 use crate::i18n::{t, Msg};
 
@@ -107,7 +107,12 @@ fn build_codingplan_headers(
 
 pub struct OpenAiProvider {
     client: Client,
-    api_key: String,
+    /// Shared so `chat_stream` can refresh the OAuth access_token in-place
+    /// when an AtomGit-gateway request comes back 401, without rebuilding
+    /// the whole provider. For non-AtomGit providers this stays as the
+    /// user-supplied API key for the lifetime of the process — there's
+    /// no auth flow for those.
+    api_key: std::sync::Arc<tokio::sync::RwLock<String>>,
     model: String,
     base_url: String,
     max_tokens: usize,
@@ -151,7 +156,7 @@ impl OpenAiProvider {
         };
         Ok(Self {
             client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
-            api_key,
+            api_key: std::sync::Arc::new(tokio::sync::RwLock::new(api_key)),
             model: config.model.clone(),
             base_url: config
                 .base_url
@@ -580,6 +585,15 @@ impl LlmProvider for OpenAiProvider {
             // error is surfaced verbatim with a humanised explanation.
             const MAX_STREAM_ATTEMPTS: u32 = 2;
             let mut attempt: u32 = 0;
+            // AtomGit-gateway 401 reactive refresh: one shot per
+            // chat_stream call. The proactive `load_auth_token` path
+            // (provider/mod.rs) only refreshes when the local clock
+            // says the token is expired, which misses server-side
+            // revocation/rotation/clock-skew failures — those surface
+            // as a hard 401 mid-conversation. Without this flag a
+            // dead-loop is theoretically possible if the broker's
+            // refresh response still leaves us 401-able.
+            let mut auth_retry_used = false;
             'retry: loop {
                 attempt += 1;
                 let body_bytes = match serde_json::to_vec(&body) {
@@ -598,9 +612,13 @@ impl LlmProvider for OpenAiProvider {
                         return;
                     }
                 };
+                // Snapshot the current token. After a successful auth
+                // refresh below, the shared `api_key` will hold the new
+                // value and the next iteration picks it up here.
+                let current_token = api_key.read().await.clone();
                 let mut request = client
                     .post(&url)
-                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Authorization", format!("Bearer {}", current_token))
                     .header("Content-Type", "application/json")
                     .body(body_bytes);
                 for (name, value) in extra_headers {
@@ -621,12 +639,67 @@ impl LlmProvider for OpenAiProvider {
 
                 if !response.status().is_success() {
                     let status = response.status();
+
+                    // AtomGit-gateway 401: try `refresh_access_token`
+                    // once. On success, write the new token back to the
+                    // shared slot and retry the SAME request (doesn't
+                    // count against MAX_STREAM_ATTEMPTS — that budget is
+                    // for transient body-decode failures, not auth).
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        && !auth_retry_used
+                        && crypto::is_atomgit_gateway(&base_url_for_signing)
+                    {
+                        auth_retry_used = true;
+                        // Drain the response body so the connection can
+                        // be returned to the pool cleanly; otherwise
+                        // hyper logs a "connection reset" on drop.
+                        let _ = response.text().await;
+                        let api_key_handle = api_key.clone();
+                        let refresh_outcome =
+                            tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                                let auth = get_stored_auth().ok_or_else(|| {
+                                    anyhow::anyhow!("no stored auth — cannot refresh")
+                                })?;
+                                let new_auth = refresh_access_token(&auth)?;
+                                Ok(new_auth.access_token)
+                            })
+                            .await;
+                        if let Ok(Ok(new_token)) = refresh_outcome {
+                            *api_key_handle.write().await = new_token;
+                            // Auth retry doesn't burn a stream-attempt
+                            // slot — mid-stream retries are for
+                            // body-decode failures, which is orthogonal.
+                            attempt -= 1;
+                            continue 'retry;
+                        }
+                        // Fall through to the friendly-error branch
+                        // below; response is already consumed so build
+                        // the error from `status` alone.
+                        let _ = tx.send(Ok(StreamEvent::Error(
+                            t(Msg::ChatAuthExpired).to_string(),
+                        )));
+                        return;
+                    }
+
                     let resp_url = response.url().to_string();
                     let body = response.text().await.unwrap_or_default();
-                    let msg = super::extract_error_message(&body);
-                    let _ = tx.send(Ok(StreamEvent::Error(
-                        super::format_http_error(status, &resp_url, &msg),
-                    )));
+                    // 401 from an AtomGit gateway after the auth-retry
+                    // shot was already used (or refresh-then-still-401):
+                    // the raw server message ("Gitcode auth: token
+                    // rejected (status=401)") is not actionable. Swap
+                    // for an i18n hint pointing at /login. Non-atomgit
+                    // gateways (user-supplied sk-... keys) keep the
+                    // verbatim message so developers see the real
+                    // diagnostic.
+                    let formatted = if status == reqwest::StatusCode::UNAUTHORIZED
+                        && crypto::is_atomgit_gateway(&base_url_for_signing)
+                    {
+                        t(Msg::ChatAuthExpired).to_string()
+                    } else {
+                        let msg = super::extract_error_message(&body);
+                        super::format_http_error(status, &resp_url, &msg)
+                    };
+                    let _ = tx.send(Ok(StreamEvent::Error(formatted)));
                     return;
                 }
 
@@ -2065,6 +2138,75 @@ mod tests {
             "real truncation must NOT be misclassified as Error: {:?}",
             events
         );
+    }
+
+    // 401 from a non-atomgit gateway must keep the verbatim server
+    // error message — user-supplied `sk-...` API keys are not
+    // refreshable by us, and developers debugging a bad key need to
+    // see what the upstream actually said. The new auth-retry path is
+    // only allowed to engage for AtomGit gateway hosts.
+    #[tokio::test]
+    async fn non_atomgit_gateway_401_keeps_verbatim_error() {
+        let server = MockServer::start().await;
+        let body = r#"{"error":{"message":"invalid_api_key"}}"#;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider_pointing_at(&server.uri());
+        let events = collect_stream(&p).await;
+        let err_msg = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Error(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected StreamEvent::Error, got: {:?}", events));
+        assert!(
+            err_msg.contains("invalid_api_key"),
+            "non-atomgit 401 must include verbatim server message: {}",
+            err_msg
+        );
+        // The i18n-friendly hint is reserved for atomgit-gateway 401s;
+        // it must NOT leak into the generic OpenAI / sk-... path.
+        let friendly = crate::i18n::t(crate::i18n::Msg::ChatAuthExpired).to_string();
+        assert!(
+            !err_msg.contains(&friendly),
+            "non-atomgit 401 must NOT receive the AtomGit /login hint: got {}",
+            err_msg
+        );
+    }
+}
+
+#[cfg(test)]
+mod chat_auth_expired_i18n_tests {
+    use crate::i18n::{t_with, Locale, Msg};
+
+    #[test]
+    fn message_is_non_empty_in_both_locales() {
+        // Both must surface SOMETHING — an empty hint defeats the
+        // entire point of this branch (point user at /login).
+        let zh = t_with(Locale::ZhCn, Msg::ChatAuthExpired).to_string();
+        let en = t_with(Locale::En, Msg::ChatAuthExpired).to_string();
+        assert!(!zh.is_empty(), "zh message must be populated");
+        assert!(!en.is_empty(), "en message must be populated");
+    }
+
+    #[test]
+    fn message_mentions_login_in_both_locales() {
+        // The whole point of this message is to direct the user to
+        // re-authenticate. If a future translator drops the `/login`
+        // reference the hint becomes useless.
+        let zh = t_with(Locale::ZhCn, Msg::ChatAuthExpired).to_string();
+        let en = t_with(Locale::En, Msg::ChatAuthExpired).to_string();
+        assert!(zh.contains("/login"), "zh message must mention /login: {}", zh);
+        assert!(en.contains("/login"), "en message must mention /login: {}", en);
     }
 }
 
