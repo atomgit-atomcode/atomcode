@@ -993,8 +993,12 @@ pub fn save_auth(auth: &AuthInfo) -> Result<()> {
             .context("Failed to set auth file permissions")?;
     }
 
-    println!("  Auth saved to: {}\n", auth_path.display());
-
+    // No stdout output here. `save_auth` is called from CLI flows, TUI
+    // slash commands, the daemon, AND the silent in-chat 401 → refresh
+    // path. Printing here would corrupt the TUI input box on the silent
+    // refresh path (the cursor sits in the prompt and `println!` bypasses
+    // the renderer). CLI callers print their own user-facing success
+    // message right after calling this.
     Ok(())
 }
 
