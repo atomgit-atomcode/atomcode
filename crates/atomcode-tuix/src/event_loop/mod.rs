@@ -4600,11 +4600,10 @@ fn handle_idle_key(
         }
     }
 
-    // Tab on an empty buffer toggles Plan/Build mode instead of
-    // attempting slash-command completion (which has nothing to
-    // complete). When the buffer has text the normal tab-complete
-    // path runs as usual.
-    if code == KeyCode::Tab && app.buf.text.is_empty() {
+    // Tab toggles Plan/Build mode when no completion menu is visible —
+    // there is nothing to complete, so the key is repurposed for mode
+    // switching instead.
+    if code == KeyCode::Tab && menu_items.is_none() {
         app.state.agent_mode = app.state.agent_mode.toggle();
         let is_plan = matches!(app.state.agent_mode, crate::state::AgentMode::Plan);
         ctx.agent
