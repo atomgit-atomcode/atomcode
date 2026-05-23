@@ -1476,19 +1476,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.inflight_tool_rows = 0;
             self.ensure_scroll_region();
             let bottom = self.body_bottom_row();
-            if bottom > 0 {
-                let seq = format!("\x1b[{};1H\x1b[K", bottom);
+            if bottom > 0 && remove > 0 {
+                // Erase ALL terminal rows previously occupied by the
+                // inflight spinner (may be >1 when the command was long
+                // enough to wrap). Without this, the old `⠙ Bash(...)`
+                // row lingers on-screen above the freshly committed
+                // `● Bash(...)` row, producing a visual duplicate.
+                let start_row = bottom.saturating_sub(remove as u16 - 1).max(1);
+                let mut seq = String::with_capacity((bottom - start_row + 1) as usize * 8);
+                use std::fmt::Write as _;
+                for row in start_row..=bottom {
+                    let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+                }
                 let _ = self.out.write_all(seq.as_bytes());
             }
-            // The CUP+EL above erased the inflight row in place — the
-            // committed row should land in that exact slot. Without
+            // The CUP+EL above erased the inflight rows in place — the
+            // committed rows should land in those exact slots. Without
             // this flag, `push_body_prefixed`'s underlying
             // `emit_body_line_inner` emits an LF that scrolls the body
             // region up by one, leaving the just-erased row as a
             // second blank between the user message and the committed
             // tool call (visible as the `> question \n \n ● tool`
-            // double-gap in screenshots).
-            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
+            // double-gap in screenshots). Use `remove` (not just 1)
+            // so multi-row inflight spinners are fully covered.
+            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(remove as u16);
             self.push_body_prefixed(
                 // Frozen icon matches the static ToolCall arm — see its
                 // comment for the Windows-font rationale that picked ●
@@ -7142,5 +7153,95 @@ mod tests {
             vterm.row_text(result_term_row),
             vterm.dump(),
         );
+    }
+
+    /// Regression: when a long Bash command wraps to multiple terminal
+    /// rows, the inflight spinner `⠙ Bash(...)` may occupy 2+ body rows.
+    /// After `ToolCallCommit` freezes it to `● Bash(...)`, the old
+    /// spinner rows must all be erased — otherwise the user sees BOTH
+    /// `⠙ Bash(...)` and `● Bash(...)` on screen at the same time.
+    #[test]
+    fn retained_commit_inflight_erases_all_spinner_rows() {
+        // Use a narrow terminal so the command wraps to 2+ rows.
+        let (mut r, buf) = new_capturing(40, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
+        let status = status_basic();
+
+        // Seed a full frame so footer is painted.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // ToolCallInFlight with a long command that wraps to 2 rows.
+        let long_detail = "rm -rf /very/long/path/that/wraps/to/multiple/rows/on/40col/terminal";
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: long_detail.into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Confirm the inflight spinner occupies more than 1 body row.
+        assert!(
+            r.inflight_tool_rows > 1,
+            "inflight spinner should occupy multiple rows for a long command on 40-col terminal, \
+             but inflight_tool_rows = {}",
+            r.inflight_tool_rows,
+        );
+
+        // Now commit the inflight spinner (simulates ApprovalNeeded → ToolCallCommit).
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Check body_lines: there should be exactly one row with "● Bash"
+        // and NO row with a spinner glyph (⠙ or similar Braille pattern).
+        let bash_rows: Vec<_> = r.body_lines.iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("Bash")
+            })
+            .collect();
+
+        assert_eq!(
+            bash_rows.len(),
+            1,
+            "there should be exactly 1 Bash row in body_lines, found {}:\n{:?}",
+            bash_rows.len(),
+            bash_rows.iter().map(|(i, row)| (i, row.iter().map(|c| c.ch).collect::<String>())).collect::<Vec<_>>(),
+        );
+
+        // The committed row should start with ● (U+25CF), not a spinner glyph.
+        let (idx, bash_row) = bash_rows[0];
+        let first_ch = bash_row.first().map(|c| c.ch).unwrap_or('\0');
+        assert_eq!(
+            first_ch, '\u{25cf}',
+            "committed Bash row at index {} should start with ●, found '{}'",
+            idx, first_ch,
+        );
+
+        // Check virtual terminal: no row should contain a Braille spinner
+        // glyph (U+2800–U+28FF) alongside "Bash".
+        for i in 0..vterm.height() as usize {
+            let text = vterm.row_text(i);
+            if text.contains("Bash") {
+                let has_spinner = text.chars().any(|c| c >= '\u{2800}' && c <= '\u{28FF}');
+                assert!(
+                    !has_spinner,
+                    "terminal row {} still has a spinner glyph alongside Bash: {:?}",
+                    i, text,
+                );
+            }
+        }
     }
 }
