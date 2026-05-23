@@ -2706,12 +2706,11 @@ fn run_oauth_with_renderer(
     let session = atomcode_core::auth::start_login()?;
 
     // QR + URL + ESC affordance go through the body via UiLine::CommandOutput
-    // — same channel as `Auth saved to:` etc., so they sit in scrollback
-    // above the input box exactly like any other slash-command output. The
-    // QR is the primary CTA (scan with phone); the URL is the fallback for
-    // users who'd rather click into a desktop browser. Both render before
-    // the best-effort browser launch so the QR is on screen even when the
-    // browser opens instantly.
+    // so they sit in scrollback above the input box exactly like any other
+    // slash-command output. The QR is the primary CTA (scan with phone); the
+    // URL is the fallback for users who'd rather click into a desktop browser.
+    // Both render before the best-effort browser launch so the QR is on
+    // screen even when the browser opens instantly.
     renderer.render(UiLine::CommandOutput(compose_login_chrome(
         session.url(),
         ctx.caps.unicode_symbols,
