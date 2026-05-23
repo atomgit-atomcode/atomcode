@@ -5927,7 +5927,10 @@ fn handle_agent_event(
                     },
                 ),
             );
-            state.on_approval_needed(&tool_name);
+            // `display` is the already-PascalCased name (e.g. "Bash",
+            // "ReadFile"); on_approval_needed stashes the current
+            // "Running X" label so on_approval_resolved can restore it.
+            state.on_approval_needed(&display);
             // Redraw the footer (input box) so the user can type
             // Y/A/N in response. Without this, a prior
             // on_approval_resolved() transition to Streaming may

@@ -18,6 +18,15 @@ pub enum Msg<'a> {
     /// the user that's what's about to happen so the second
     /// "Open this URL in any browser…" block isn't a surprise.
     CpReauthAfter401,
+    /// Emitted by the OpenAI provider when an AtomGit-gateway chat
+    /// request returns 401 and our one automatic refresh_token attempt
+    /// either failed or the retried request still came back 401. The
+    /// raw server message ("Gitcode auth: token rejected") is not
+    /// useful to end users — this replaces it with an actionable hint
+    /// pointing at `/login`. Non-atomgit gateways still surface the
+    /// verbatim server error so user-supplied API keys (sk-...) get
+    /// the diagnostic detail.
+    ChatAuthExpired,
     // SetupReport renderer (core/coding_plan/setup.rs)
     CpSetupHeader,
     CpLoggedIn { who: &'a str, username: &'a str, email: &'a str },

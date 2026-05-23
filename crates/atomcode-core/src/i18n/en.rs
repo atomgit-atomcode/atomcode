@@ -19,6 +19,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("codingplan setup failed: {error}").into(),
         Msg::CpReauthAfter401 =>
             "  ⚠ Stored login expired — re-authenticating...\n".into(),
+        Msg::ChatAuthExpired =>
+            "Authentication expired — please run /login to sign in again".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan setup:\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>

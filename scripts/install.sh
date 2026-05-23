@@ -13,7 +13,7 @@
 # the manifest, but binary path / rc-edit format are not checked.
 set -eu
 
-VERSION="${ATOMCODE_VERSION:-v4.23.0}"
+VERSION="${ATOMCODE_VERSION:-v4.23.1}"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
 
 # --- detect platform ---

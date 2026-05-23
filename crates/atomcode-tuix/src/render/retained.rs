@@ -2732,7 +2732,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // glyphs — so the first ▶ we encounter must be ours.
         // Safe because the agent doesn't append further body rows
         // between `ApprovalNeeded` and the user's Y/A/N reply.
-        let mut popped_any = false;
+        let mut popped_count: u16 = 0;
         loop {
             let action = match self.body_lines.last() {
                 None => break,
@@ -2742,41 +2742,59 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // ▶ header: pop it and stop (we've found the start).
                 Some('▶') => {
                     self.body_lines.pop();
-                    popped_any = true;
+                    popped_count = popped_count.saturating_add(1);
                     break;
                 }
                 // Space-padded continuation / chips row: pop and keep going.
                 Some(' ') => {
                     self.body_lines.pop();
-                    popped_any = true;
+                    popped_count = popped_count.saturating_add(1);
                 }
                 // Any other glyph (● tool-call, ❯ user turn, etc.):
                 // not part of the approval block — stop without popping.
                 _ => break,
             }
         }
-        if !popped_any {
+        if popped_count == 0 {
             return;
         }
-        // Physically wipe the body rows that we just removed for
-        // instant visual feedback on Y/A/N even before the next
-        // ToolCallResult arrives. We popped multiple rows, so clear
-        // from the new bottom row downward. Then flag the next body
-        // emit to overwrite this row in place rather than scroll the
-        // region — so `⎿ result` lands exactly where the approval
-        // prompt used to be, keeping `● Tool` and `⎿ result` visually
-        // adjacent.
+        // Physically wipe the popped rows for instant visual feedback
+        // on Y/A/N. The popped rows sat at the BOTTOM of the body
+        // region — terminal rows `bottom - popped_count + 1 ..= bottom`
+        // (1-indexed). Erase them row-by-row with `\x1b[K` (EL).
+        //
+        // Why per-row EL and not `\x1b[J` (ED from cursor): the cursor
+        // sits at `bottom` (the LAST popped row), and `\x1b[J` erases
+        // FROM cursor TO end-of-screen — i.e. that one body row plus
+        // every footer row below it. That wipes the input box / top
+        // rule / status bar from the terminal. The cell-diff cache
+        // (`self.screen.prev_cells`) still holds the prior footer
+        // content, so the next `paint_footer` → `render_diff` produces
+        // an empty patch (cells == prev_cells, no diff) and the
+        // footer never gets redrawn — user sees "input box vanished
+        // after approving a tool". EL is row-local, never touches the
+        // footer area, and leaves prev_cells consistent. Then flag the
+        // next body emit to overwrite in place (no scroll) so
+        // `⎿ result` lands directly below the `● Tool` row with no
+        // gap.
         let bottom = self.body_bottom_row();
         if bottom > 0 {
-            // \x1b[J erases from cursor to end of screen, which
-            // includes the footer rows below the body strip.
+            // Erase the popped body rows (may span multiple terminal
+            // lines). Use per-row \x1b[K instead of \x1b[J to avoid
+            // erasing the footer rows below the body strip.
             // screen.prev_cells still holds the old footer content,
             // so without invalidation the next render_diff() would
             // see identical prev/current footer cells and skip the
             // repaint — leaving the footer permanently blank.
-            // Invalidate prev_cells so the next flush_deferred()
+            // invalidate() below ensures the next flush_deferred()
             // emits a full repaint of every non-blank cell.
-            let _ = write!(self.out, "\x1b[{};1H\x1b[J", bottom);
+            let start_row = bottom.saturating_sub(popped_count - 1).max(1);
+            let mut seq = String::with_capacity((bottom - start_row + 1) as usize * 8);
+            use std::fmt::Write as _;
+            for row in start_row..=bottom {
+                let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
+            }
+            let _ = self.out.write_all(seq.as_bytes());
             let _ = self.out.flush();
             self.skip_next_body_scroll = true;
             self.screen.invalidate();
@@ -5367,23 +5385,54 @@ mod tests {
         );
     }
 
-    /// Regression for issue #455: `pop_approval_prompt()` uses \x1b[J
-    /// which erases from the cursor to the end of the screen, wiping
-    /// the footer rows. Without `screen.invalidate()`, the next
-    /// `render_diff()` sees identical prev/current footer cells and
-    /// skips the repaint, leaving the footer permanently blank.
-    /// After the fix, `invalidate()` blanks `prev_cells` so the next
-    /// `flush_deferred()` emits a full repaint of the footer.
+    /// Regression: when the user approves a tool (presses Y/A/N),
+    /// `pop_approval_prompt` must NOT erase the footer (input box,
+    /// top/bot rules, status bar) from the terminal. Earlier versions
+    /// used `\x1b[J` from `body_bottom;1` which erased to end-of-screen
+    /// — i.e. through the footer — and the cell-diff cache then prevented
+    /// the footer from being redrawn (cells unchanged → no diff →
+    /// no emit), leaving the user with no visible input prompt.
     #[test]
-    fn retained_approval_pop_preserves_footer_on_repaint() {
+    fn retained_pop_approval_preserves_footer() {
         let (mut r, buf) = new_capturing(80, 24);
         let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
         let status = status_basic();
 
-        // Set up footer state so paint_footer has content.
+        // Paint a full frame with an active footer (status bar visible).
         r.render(UiLine::InputPrompt {
-            buf: "hello".into(),
-            cursor_byte: 5,
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        // Confirm baseline: status row visible.
+        assert!(
+            vterm.any_row(|row| row.contains("glm-5")),
+            "baseline: status row should be on screen\ndump:\n{}",
+            vterm.dump()
+        );
+
+        // Now render an approval prompt and pop it.
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "ls".into(),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        r.pop_approval_prompt();
+        // Trigger a new paint cycle (mirrors what happens after the
+        // user presses Y and the agent emits the next body event).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
             menu: None,
             status: status.clone(),
             attachments: Vec::new(),
@@ -5391,39 +5440,14 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Add a tool call + approval prompt (the typical sequence).
-        r.render(UiLine::ToolCall {
-            name: "read_file".into(),
-            detail: "test.txt".into(),
-        });
-        r.render(UiLine::ApprovalPrompt {
-            tool: "read_file".into(),
-            detail: "test.txt".into(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Pop the approval prompt — this used to wipe the footer
-        // without invalidating prev_cells.
-        r.pop_approval_prompt();
-
-        // Trigger a repaint. The footer must be present in the
-        // emitted diff — without the invalidate() fix the diff
-        // would be empty for the footer rows.
-        r.render(UiLine::InputPrompt {
-            buf: "hello".into(),
-            cursor_byte: 5,
-            menu: None,
-            status,
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Verify the input box content is on screen.
+        // Footer (status bar) must still be visible. Before the fix
+        // this assertion failed: pop_approval_prompt's `\x1b[J`
+        // erased the status row, and the diff cache stopped paint_footer
+        // from re-emitting it.
         assert!(
-            vterm.any_row(|row| row.contains("hello")),
-            "footer input must be repainted after pop_approval_prompt\ndump:\n{}",
+            vterm.any_row(|row| row.contains("glm-5")),
+            "input box / status row should still be on screen after \
+             approval pop\ndump:\n{}",
             vterm.dump()
         );
     }
