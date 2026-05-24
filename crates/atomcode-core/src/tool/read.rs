@@ -363,14 +363,54 @@ impl Tool for ReadFileTool {
                 });
             }
 
-            // Streaming slice path: when the file exceeds MAX_FULL_BYTES AND
-            // the model asked for a specific range (offset/limit), avoid the
-            // slurp entirely and read line-by-line with a byte budget. Memory
-            // becomes O(limit × MAX_LINE_LENGTH), independent of file size.
-            // Small files keep the slurp+cache path so FileStore can still
-            // serve repeated slices from memory.
+            // Size-aware dispatch. With sniff done, we know it's text;
+            // metadata gives the size. Three large-file outcomes:
+            //   - slice  + large   → stream (read.rs #2)
+            //   - full   + large   → refuse with offset/limit & bash hints
+            //                        (this block; read.rs #3)
+            //   - either + small   → fall through to slurp + cache + skeleton
+            //                        path below (unchanged)
+            // Refusing early protects RAM: the model can't usefully consume
+            // a 50 MB file (≈ context budget × 50) anyway, and `tokio::fs::read`
+            // would lock that much RAM until the response is rendered AND the
+            // FileStore caches another copy indefinitely.
             let is_slice = parsed.offset.is_some() || parsed.limit.is_some();
             let is_large = disk_len.map_or(false, |l| l > MAX_FULL_BYTES);
+            if is_large && !is_slice {
+                let n = disk_len.unwrap_or(0);
+                let q = shell_quote(&parsed.file_path);
+                // Rough offset estimate for "tail-ish" suggestion: assume
+                // ~100 bytes/line average. This is a hint, not a contract —
+                // model is expected to use `wc -l` if it needs exact.
+                let tail_offset = (n / 100).saturating_sub(200).max(1);
+                let output = format!(
+                    "File too large to read in full: {n} bytes ({mb:.1} MB). \
+                     read_file caps full reads at {cap_mb} MB so the response \
+                     stays inside the model's context budget — anything larger \
+                     wouldn't fit anyway, and slurping it would pin RAM in the \
+                     FileStore cache long after the call returned.\n\n\
+                     Read a slice instead (streamed, O(limit) memory):\n  \
+                     read_file({{\"file_path\":\"{path}\",\"offset\":1,\"limit\":200}})       # head\n  \
+                     read_file({{\"file_path\":\"{path}\",\"offset\":{tail_offset},\"limit\":200}})  # rough tail\n\n\
+                     Or use bash for log / grep workflows:\n  \
+                     wc -l {q}                      # exact line count first\n  \
+                     head -n 200 {q}\n  \
+                     tail -n 200 {q}\n  \
+                     sed -n '1000,1500p' {q}        # specific line range\n  \
+                     grep -n 'pattern' {q} | head -50",
+                    n = n,
+                    mb = n as f64 / 1_048_576.0,
+                    cap_mb = MAX_FULL_BYTES / 1_048_576,
+                    path = parsed.file_path,
+                    tail_offset = tail_offset,
+                    q = q,
+                );
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output,
+                    success: false,
+                });
+            }
             if is_slice && is_large {
                 if !looks_utf8(&sample) {
                     // GB18030 / Latin-1 stream isn't supported by line-by-line
@@ -1934,6 +1974,105 @@ mod tests {
             !r.output.contains(" 105| line 000105"),
             "limit must stop at 104, but 105 appeared",
         );
+    }
+
+    // --- Large-file full-read refusal regression tests (read.rs #3) ---
+    //
+    // For files > MAX_FULL_BYTES read WITHOUT offset/limit, slurping is
+    // both wasteful (>200× the model's effective context budget) and
+    // dangerous (FileStore would pin the same memory indefinitely).
+    // We refuse early with a redirect message.
+
+    /// 6 MB file + full read (no offset/limit) → refused with message
+    /// pointing the model at slicing or bash. The slurp must never run:
+    /// asserted by the size annotation in the refusal text matching the
+    /// metadata len exactly (a slurp-then-decide path would carry the
+    /// real bytes through).
+    #[tokio::test]
+    async fn read_file_full_read_refuses_when_above_max_full_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.log");
+        let mut body = String::with_capacity(6 * 1024 * 1024);
+        for i in 1..=60_000usize {
+            body.push_str(&format!("line {:0>6}: {}\n", i, "x".repeat(80)));
+        }
+        std::fs::write(&path, &body).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len > MAX_FULL_BYTES, "fixture must exceed cap");
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(!r.success, "full read of large file must be refused");
+        assert!(
+            r.output.contains("File too large to read in full"),
+            "expected size refusal, got:\n{}",
+            r.output
+        );
+        // Size header from metadata, not from a (non-existent) slurp.
+        assert!(
+            r.output.contains(&len.to_string()),
+            "refusal must report metadata byte count {}, got:\n{}",
+            len,
+            r.output
+        );
+        // Concrete next-step suggestions to keep the model unstuck.
+        assert!(r.output.contains("offset"), "missing offset suggestion");
+        assert!(r.output.contains("head -n"), "missing bash head hint");
+        assert!(r.output.contains("grep -n"), "missing grep hint");
+    }
+
+    /// Slice of the same large file is NOT refused — it goes through
+    /// the streaming path from read.rs #2. Negative-control for the
+    /// refusal above.
+    #[tokio::test]
+    async fn read_file_slice_of_large_file_is_not_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.log");
+        let mut body = String::with_capacity(6 * 1024 * 1024);
+        for i in 1..=60_000usize {
+            body.push_str(&format!("line {:0>6}: {}\n", i, "x".repeat(80)));
+        }
+        std::fs::write(&path, &body).unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(
+            r#"{{"file_path":"{}","offset":50,"limit":3}}"#,
+            path.display()
+        );
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success, "{}", r.output);
+        assert!(
+            !r.output.contains("File too large to read in full"),
+            "slice path must NOT trip the full-read refusal; got:\n{}",
+            r.output
+        );
+        assert!(r.output.contains("  50| line 000050"));
+    }
+
+    /// Files at or below MAX_FULL_BYTES continue to work as full reads.
+    /// Belt-and-suspenders: a too-tight threshold would silently break
+    /// the dominant "read a normal source file" case.
+    #[tokio::test]
+    async fn read_file_full_read_under_cap_still_works() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("normal.rs");
+        // 100 KB — well under 5 MB cap and well under skeleton threshold.
+        let body: String = (1..=400)
+            .map(|n| format!("fn f{n}() {{ println!(\"{n}\"); }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &body).unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(!r.output.contains("File too large"));
+        assert!(r.output.contains("fn f1()"));
     }
 
     /// Small files keep the slurp path so FileStore can amortize repeat
