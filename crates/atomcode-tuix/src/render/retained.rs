@@ -2170,14 +2170,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-                // Muted gray (SGR 90 / DarkGrey) for the per-turn rule
-                // and summary text. The input box border below uses full
-                // cyan; making this rule cyan too produced three
-                // identical bright-cyan rules in one viewport (see
-                // screenshot regression). Gray is the historically
-                // expected look — quiet historical separator that
-                // doesn't compete with the live input chrome.
-                let rule = self.style_for(Role::Muted);
+                // SGR 2 (faint) on the terminal-default fg. This is the
+                // quiet "historical" look: the rule and `resumed:` label
+                // sit at ~50% intensity so they read as scaffolding, not
+                // body text. Previously we used `Role::Muted`, but when
+                // MUTED_DARK was widened from SGR 90 → 37 (so tool-batch
+                // child rows stay readable on Warp dark), this rule lost
+                // its contrast against assistant text. Mirrors the SGR_DIM
+                // approach `alt_screen::build_turn_separator` already uses.
+                let rule = self.style_faint(Role::Secondary);
                 for _ in 0..left {
                     row.push(Cell {
                         ch: '─',
@@ -2186,7 +2187,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     });
                 }
                 push_str_cells(&mut row, " ", &pad);
-                push_str_cells(&mut row, &safe, &self.style_for(Role::Muted));
+                push_str_cells(&mut row, &safe, &rule);
                 push_str_cells(&mut row, " ", &pad);
                 for _ in 0..right {
                     row.push(Cell {
@@ -5217,6 +5218,45 @@ mod tests {
         let found = vterm
             .any_row(|row| row.contains("─") && row.contains("Sealed") && row.contains("1 turn"));
         assert!(found, "separator missing\ndump:\n{}", vterm.dump());
+    }
+
+    /// TurnSeparator rule must render dim (default fg + SGR 2) — not
+    /// pinned to a bright muted color. v4.23.0 broadened MUTED_DARK to
+    /// SGR 37 (light gray) so child rows of tool batches read on Warp
+    /// dark, but reusing `Role::Muted` here made the `resumed:` rule
+    /// blend into body text. The fix: this rule is decoration, so it
+    /// should use the same SGR-2 dim that alt_screen uses, leaving fg
+    /// at terminal default.
+    #[test]
+    fn retained_turn_separator_rule_uses_default_fg() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::TurnSeparator {
+            label: "resumed: mcp with plan mode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&r| vterm.row_text(r).contains("─") && vterm.row_text(r).contains("resumed"))
+            .unwrap_or_else(|| panic!("separator row missing\ndump:\n{}", vterm.dump()));
+        let row_text = vterm.row_text(row_idx);
+        let col = row_text.find('─').unwrap();
+        let cell = vterm.cell_at(row_idx, col);
+        assert!(
+            cell.fg.is_none(),
+            "separator rule should use terminal-default fg (dimmed via SGR 2), \
+             not a pinned color — got fg={:?}",
+            cell.fg,
+        );
     }
 
     /// Error line: `[Error: msg]` body row with red fg — we assert
