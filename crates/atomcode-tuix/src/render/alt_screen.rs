@@ -1549,8 +1549,10 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// Build a horizontal-rule TurnSeparator like
     /// `─────── label ───────` centred on the terminal width. Mirrors
     /// the retained renderer's TurnSeparator rendering at a coarser
-    /// grain (no Cell layout, just inline SGR). Muted gray colour to
-    /// match the existing aesthetic.
+    /// grain (no Cell layout, just inline SGR). Dimmed via SGR 2 on
+    /// the terminal-default fg so the rule reads as "quiet decoration"
+    /// across light/dark themes — same contract as retained's
+    /// `style_faint(Role::Secondary)`.
     fn build_turn_separator(&self, label: &str) -> String {
         let w = (self.width as usize).max(20);
         let label_text = format!(" {} ", scrub_controls(label));

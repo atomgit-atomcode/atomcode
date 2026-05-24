@@ -5227,6 +5227,13 @@ mod tests {
     /// blend into body text. The fix: this rule is decoration, so it
     /// should use the same SGR-2 dim that alt_screen uses, leaving fg
     /// at terminal default.
+    ///
+    /// Two complementary assertions are needed: the vterm grid only
+    /// tracks fg/bold/reverse (no faint/dim field), so `cell.fg.is_none()`
+    /// alone wouldn't catch a regression to `style_for(Role::Secondary)`
+    /// — that also has `fg=None` but drops the `\x1b[2m`, leaving the
+    /// rule at full intensity. We pin the byte stream too so the dim
+    /// requirement survives a future refactor.
     #[test]
     fn retained_turn_separator_rule_uses_default_fg() {
         let (mut r, buf) = new_capturing(80, 24);
@@ -5243,19 +5250,47 @@ mod tests {
             attachments: Vec::new(),
         });
         r.flush_deferred();
+
+        // Snapshot raw bytes BEFORE `drain_into_vterm` consumes the
+        // buffer — we need to inspect the SGR stream that the vterm
+        // grid can't represent.
+        let raw_bytes = buf.lock().unwrap().clone();
         drain_into_vterm(&buf, &mut vterm);
 
         let row_idx = (0..vterm.height() as usize)
             .find(|&r| vterm.row_text(r).contains("─") && vterm.row_text(r).contains("resumed"))
             .unwrap_or_else(|| panic!("separator row missing\ndump:\n{}", vterm.dump()));
         let row_text = vterm.row_text(row_idx);
-        let col = row_text.find('─').unwrap();
-        let cell = vterm.cell_at(row_idx, col);
+        let rule_col = row_text.find('─').unwrap();
+        let rule_cell = vterm.cell_at(row_idx, rule_col);
         assert!(
-            cell.fg.is_none(),
+            rule_cell.fg.is_none(),
             "separator rule should use terminal-default fg (dimmed via SGR 2), \
              not a pinned color — got fg={:?}",
-            cell.fg,
+            rule_cell.fg,
+        );
+
+        // Same contract on the `resumed:` label cell — rule and label
+        // share one `CellStyle`; a future split that recolours only the
+        // label would silently break the "quiet decoration" intent.
+        let label_col = row_text.find('r').expect("`resumed` label missing");
+        let label_cell = vterm.cell_at(row_idx, label_col);
+        assert!(
+            label_cell.fg.is_none(),
+            "`resumed:` label should share the rule's default-fg style — got fg={:?}",
+            label_cell.fg,
+        );
+
+        // Byte-stream guard: `\x1b[2m` MUST appear in the rendered
+        // output. Catches a regression to `style_for(Role::Secondary)`
+        // — same `fg=None` so vterm assertions above pass, but no dim
+        // is emitted and the rule visually matches body text again.
+        let bytes_str = String::from_utf8_lossy(&raw_bytes);
+        assert!(
+            bytes_str.contains("\x1b[2m"),
+            "separator must emit SGR 2 (faint) so terminal renders the rule \
+             and label dimmed against body text; got bytes (truncated): {:?}",
+            &bytes_str[..bytes_str.len().min(400)],
         );
     }
 
