@@ -191,6 +191,45 @@ fn rewrite_windows_path_body(body: &str, out: &mut String) {
     }
 }
 
+/// For each position in `chars`, true iff that char is structural
+/// JSON (outside any string body). The surrounding `"` chars themselves
+/// are considered structural; everything between them — including
+/// escape pairs like `\"` and `\n` — is non-structural so structural
+/// passes don't mistake string content for grammar.
+///
+/// Used by the unquoted-key fix, trailing-comma removal, and brace
+/// balance to skip work that would otherwise corrupt strings whose
+/// contents look like JSON fragments (source code with `{`/`,}`/
+/// `class:`/etc.).
+fn structural_mask(chars: &[char]) -> Vec<bool> {
+    let mut mask = vec![true; chars.len()];
+    let mut in_string = false;
+    let mut i = 0;
+    while i < chars.len() {
+        if !in_string {
+            if chars[i] == '"' {
+                in_string = true;
+            }
+            i += 1;
+            continue;
+        }
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            mask[i] = false;
+            mask[i + 1] = false;
+            i += 2;
+            continue;
+        }
+        if chars[i] == '"' {
+            in_string = false;
+            i += 1;
+            continue;
+        }
+        mask[i] = false;
+        i += 1;
+    }
+    mask
+}
+
 /// Attempt to repair common JSON issues from LLM output:
 /// - Trailing commas before } or ]
 /// - Single quotes instead of double quotes (outside of string values)
@@ -300,12 +339,16 @@ pub fn repair_json(s: &str) -> String {
     result = chars.into_iter().collect();
 
     // Fix unquoted keys: {path: "src"} → {"path": "src"}
-    // Simple approach: find patterns like {key: or ,key: and add quotes
+    // Guarded by `structural_mask` so a `{`/`,` INSIDE a string value
+    // doesn't trigger the rewrite — otherwise source code like
+    // `"snippet { class: foo }"` would have `"class"` injected into
+    // the string body, corrupting both content and JSON validity.
     let mut fixed = String::with_capacity(result.len() + 20);
     let rchars: Vec<char> = result.chars().collect();
+    let mask = structural_mask(&rchars);
     let mut ri = 0;
     while ri < rchars.len() {
-        if rchars[ri] == '{' || rchars[ri] == ',' {
+        if mask[ri] && (rchars[ri] == '{' || rchars[ri] == ',') {
             fixed.push(rchars[ri]);
             ri += 1;
             // Skip whitespace
@@ -345,11 +388,32 @@ pub fn repair_json(s: &str) -> String {
     }
     result = fixed;
 
-    // Remove trailing commas before } or ]
+    // Remove trailing commas before } or ]. Both the `,` and the
+    // closing brace must be structural — a literal `,}` inside a
+    // string value (e.g. `"tail,}"`) must survive unchanged.
     loop {
-        let before = result.clone();
-        result = result.replace(",}", "}").replace(",]", "]");
-        if result == before {
+        let rchars: Vec<char> = result.chars().collect();
+        let mask = structural_mask(&rchars);
+        let mut next = String::with_capacity(rchars.len());
+        let mut i = 0;
+        let mut changed = false;
+        while i < rchars.len() {
+            if mask[i]
+                && rchars[i] == ','
+                && i + 1 < rchars.len()
+                && mask[i + 1]
+                && (rchars[i + 1] == '}' || rchars[i + 1] == ']')
+            {
+                next.push(rchars[i + 1]);
+                i += 2;
+                changed = true;
+                continue;
+            }
+            next.push(rchars[i]);
+            i += 1;
+        }
+        result = next;
+        if !changed {
             break;
         }
     }
@@ -359,9 +423,24 @@ pub fn repair_json(s: &str) -> String {
         result = format!("{{{}}}", result);
     }
 
-    // Count braces and add missing closing ones
-    let open_braces = result.chars().filter(|c| *c == '{').count();
-    let close_braces = result.chars().filter(|c| *c == '}').count();
+    // Count braces and add missing closing ones. Only structural
+    // `{`/`}` count — a string value containing source code with
+    // `{ … }` is balanced from the JSON envelope's perspective and
+    // must not provoke extra `}` appends.
+    let rchars: Vec<char> = result.chars().collect();
+    let mask = structural_mask(&rchars);
+    let mut open_braces = 0usize;
+    let mut close_braces = 0usize;
+    for (i, &c) in rchars.iter().enumerate() {
+        if !mask[i] {
+            continue;
+        }
+        if c == '{' {
+            open_braces += 1;
+        } else if c == '}' {
+            close_braces += 1;
+        }
+    }
     for _ in 0..(open_braces.saturating_sub(close_braces)) {
         result.push('}');
     }
@@ -940,5 +1019,87 @@ mod tests {
         let once = pre_escape_windows_paths_in_json(r#"{"p": "D:\\a\\b"}"#);
         let twice = pre_escape_windows_paths_in_json(&once);
         assert_eq!(once, twice, "pre_escape should be idempotent");
+    }
+
+    // --- repair_json in_string awareness regression tests ---
+    //
+    // These call `repair_json` DIRECTLY rather than through
+    // `repair_tool_args` because the end-to-end `extract_json_fields`
+    // fallback otherwise rescues these scenarios and masks the
+    // structural-pass bugs. The contract under test is "repair_json's
+    // output should be parseable when the input was already mostly
+    // valid, even if string contents look JSON-shaped".
+
+    #[test]
+    fn repair_json_brace_balance_ignores_braces_in_strings() {
+        // Pre-fix brace balance counted `{` inside the string value,
+        // saw 2 `{` vs 1 `}`, and appended a spurious closing brace,
+        // producing `{"k":"v{"}}` which fails to parse.
+        let input = r#"{"old_string": "fn main() {"}"#;
+        let repaired = repair_json(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired)
+            .unwrap_or_else(|e| panic!("brace balance should not over-close; got {repaired:?}: {e}"));
+        assert_eq!(v["old_string"], "fn main() {");
+    }
+
+    #[test]
+    fn repair_json_unquoted_key_does_not_quote_inside_string() {
+        // String value contains `{ class: foo }` which looks like an
+        // unquoted-key pattern. Pre-fix the walker happily inserted
+        // `"class"` INSIDE the string, mutating the model's content
+        // and corrupting the JSON to boot.
+        let input = r#"{"outer": "snippet { class: foo }", "n": 1}"#;
+        let repaired = repair_json(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired)
+            .unwrap_or_else(|e| panic!("unquoted-key fix must not touch string content; got {repaired:?}: {e}"));
+        assert_eq!(v["outer"], "snippet { class: foo }");
+    }
+
+    #[test]
+    fn repair_json_trailing_comma_skips_literal_inside_string() {
+        // Pre-fix used `result.replace(",}", "}")` globally, so a
+        // string value containing `,}` literal got its content
+        // rewritten to `}`.
+        let input = r#"{"outer": "tail,}", "n": 1}"#;
+        let repaired = repair_json(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired)
+            .unwrap_or_else(|e| panic!("trailing-comma replace must not touch strings; got {repaired:?}: {e}"));
+        assert_eq!(v["outer"], "tail,}");
+    }
+
+    #[test]
+    fn repair_json_handles_multiple_braces_in_source_string() {
+        // edit_file old_string with nested `{ }` in source — common
+        // for Rust/JS code. With unquoted-key + brace-balance both
+        // fixed, the walker leaves the string alone and brace count
+        // nets to zero from the envelope's perspective.
+        let input = r#"{"old_string": "fn x() { if y { return z; } }", "k": 1}"#;
+        let repaired = repair_json(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired)
+            .unwrap_or_else(|e| panic!("nested braces in string must not break repair; got {repaired:?}: {e}"));
+        assert_eq!(v["old_string"], "fn x() { if y { return z; } }");
+    }
+
+    #[test]
+    fn repair_json_unquoted_key_outside_string_still_works() {
+        // Make sure the in_string guard doesn't disable the normal
+        // unquoted-key fix on real unquoted keys.
+        let input = r#"{path: "src/main.rs", depth: 2}"#;
+        let repaired = repair_json(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired)
+            .expect("legit unquoted keys must still be wrapped");
+        assert_eq!(v["path"], "src/main.rs");
+        assert_eq!(v["depth"], 2);
+    }
+
+    #[test]
+    fn repair_json_trailing_comma_outside_string_still_removed() {
+        // Make sure the in_string guard doesn't disable the normal
+        // trailing-comma removal on real trailing commas.
+        let input = r#"{"k": "v",}"#;
+        let repaired = repair_json(input);
+        let v: serde_json::Value = serde_json::from_str(&repaired)
+            .expect("legit trailing comma must still be stripped");
+        assert_eq!(v["k"], "v");
     }
 }
