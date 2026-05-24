@@ -11,6 +11,33 @@ use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 /// Shared with `agent::tool_dispatch` so its first-read heuristic stays aligned.
 pub(crate) const SKELETON_LINE_THRESHOLD: usize = 300;
 
+/// Upper bound on bytes returned in a single `read_file` response when
+/// streaming the slice path (offset/limit). A 100 k-line file with very
+/// long lines otherwise pushes a 10 MB payload through a 1 MB-context
+/// model. opencode uses 50 KB; we go larger since AtomCode targets
+/// bigger-context models, but still well below MAX_FULL_BYTES so the
+/// "small file: just slurp" path isn't pre-empted.
+pub(crate) const MAX_BYTES_PER_RESPONSE: usize = 256 * 1024;
+
+/// Hard cap on bytes the full-content (no offset/limit) path will slurp.
+/// Files above this go through the streaming slice reader when sliced,
+/// or are refused with a "use offset/limit or bash head/grep" hint when
+/// fully read (the refusal is read.rs #3). Reads with offset/limit on
+/// files BELOW this stay on the slurp+cache path — cheap, and lets
+/// FileStore amortize repeat slices.
+pub(crate) const MAX_FULL_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Max chars per line in the streaming slice path. A single 100 MB
+/// minified-JS line otherwise blows the response budget on one entry.
+/// Truncated lines get a "... (line truncated to N chars)" suffix so
+/// the model knows the line is incomplete.
+pub(crate) const MAX_LINE_LENGTH: usize = 2000;
+
+/// Default `limit` for the streaming slice path when the model passes
+/// only `offset` (or wants a sensible page size). Mirrors opencode's
+/// `DEFAULT_READ_LIMIT`.
+pub(crate) const DEFAULT_READ_LIMIT: usize = 2000;
+
 /// Sample window for binary detection. Read this many leading bytes,
 /// sniff for NUL / control-char ratio, and refuse the full slurp if
 /// the file looks binary — saves loading a 10 GB `.tar.gz` into RAM
@@ -323,6 +350,56 @@ impl Tool for ReadFileTool {
                     size_for_msg,
                     binary_recovery_hint(path_ref, &parsed.file_path),
                 );
+                if let Some(mtime) = disk_mtime {
+                    ctx.read_cache
+                        .write()
+                        .await
+                        .insert(cache_key.clone(), (mtime, output.clone(), 1));
+                }
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output,
+                    success: true,
+                });
+            }
+
+            // Streaming slice path: when the file exceeds MAX_FULL_BYTES AND
+            // the model asked for a specific range (offset/limit), avoid the
+            // slurp entirely and read line-by-line with a byte budget. Memory
+            // becomes O(limit × MAX_LINE_LENGTH), independent of file size.
+            // Small files keep the slurp+cache path so FileStore can still
+            // serve repeated slices from memory.
+            let is_slice = parsed.offset.is_some() || parsed.limit.is_some();
+            let is_large = disk_len.map_or(false, |l| l > MAX_FULL_BYTES);
+            if is_slice && is_large {
+                if !looks_utf8(&sample) {
+                    // GB18030 / Latin-1 stream isn't supported by line-by-line
+                    // reader. Slurp+decode would defeat the OOM protection on
+                    // a 10 GB file. Hand the model the bash escape hatch.
+                    let start = parsed.offset.unwrap_or(1).max(1);
+                    let take = parsed.limit.unwrap_or(DEFAULT_READ_LIMIT);
+                    let end = start.saturating_add(take).saturating_sub(1);
+                    let output = format!(
+                        "File too large to slurp ({} bytes) and not UTF-8 — \
+                         streaming slice reader only supports UTF-8 input.\n\n\
+                         Decode + slice via bash:\n  \
+                         iconv -f GBK -t UTF-8 {q} | sed -n '{start},{end}p'\n  \
+                         # detect encoding first if unsure: `chardetect {q}` or `file -i {q}`",
+                        disk_len.unwrap_or(0),
+                        q = shell_quote(&parsed.file_path),
+                        start = start,
+                        end = end,
+                    );
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output,
+                        success: false,
+                    });
+                }
+                let slice = stream_slice_lines(&path, parsed.offset, parsed.limit)
+                    .await
+                    .with_context(|| format!("Failed to stream-read {}", path.display()))?;
+                let output = format_streamed_slice(&parsed.file_path, &slice);
                 if let Some(mtime) = disk_mtime {
                     ctx.read_cache
                         .write()
@@ -654,6 +731,174 @@ async fn read_file_head(path: &std::path::Path, max: usize) -> std::io::Result<V
     let n = file.read(&mut buf).await?;
     buf.truncate(n);
     Ok(buf)
+}
+
+/// Result of `stream_slice_lines`: the captured lines plus enough
+/// metadata to render the truncation hints that tell the model how
+/// to continue reading.
+struct SliceResult {
+    /// 1-indexed file line of `lines[0]` (= the `offset` we honored).
+    start_line: usize,
+    /// The captured lines, post per-line truncation.
+    lines: Vec<String>,
+    /// True if we stopped before EOF (limit hit or byte budget hit).
+    more: bool,
+    /// True specifically if the byte budget (`MAX_BYTES_PER_RESPONSE`)
+    /// hit — separate from `more` so the message says "Output capped"
+    /// vs "Showing lines …" so the model can distinguish "ask for the
+    /// next page" from "this single page is huge, narrow your query".
+    cut: bool,
+    /// Total line count, available only if we read to EOF. None when
+    /// we stopped early — counting to EOF would defeat the point of
+    /// streaming a 10 GB log.
+    total_lines: Option<usize>,
+}
+
+/// True iff a byte sample is consistent with UTF-8: either fully valid,
+/// or invalid only because the trailing codepoint was cut mid-bytes by
+/// the sample boundary. Used to gate the streaming slice path so we
+/// don't UTF-8-decode a GB18030 / Latin-1 file line-by-line and produce
+/// mojibake — those files go through the slurp+decode_non_utf8_text path.
+fn looks_utf8(sample: &[u8]) -> bool {
+    match std::str::from_utf8(sample) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none(),
+    }
+}
+
+/// Read a byte-budgeted slice of `path` line by line, skipping the
+/// first `offset-1` lines and taking up to `limit` lines (defaulting
+/// to `DEFAULT_READ_LIMIT`). Stops early when the accumulated UTF-8
+/// byte size exceeds `MAX_BYTES_PER_RESPONSE`. Memory is bounded by
+/// `limit * MAX_LINE_LENGTH`, independent of file size — that's the
+/// point of this path vs the slurp path.
+///
+/// Per-line truncation at `MAX_LINE_LENGTH` chars protects against
+/// minified-source-on-one-line pathology. The truncation suffix
+/// `... (line truncated to N chars)` mirrors opencode so the model
+/// can see what happened without inspecting metadata.
+async fn stream_slice_lines(
+    path: &std::path::Path,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> std::io::Result<SliceResult> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let file = tokio::fs::File::open(path).await?;
+    let mut lines_iter = BufReader::new(file).lines();
+
+    let start = offset.unwrap_or(1).max(1);
+    let take = limit.unwrap_or(DEFAULT_READ_LIMIT);
+
+    let mut lines: Vec<String> = Vec::with_capacity(take.min(2048));
+    let mut bytes_acc: usize = 0;
+    let mut current: usize = 1;
+    let mut more = false;
+    let mut cut = false;
+    let mut total_lines: Option<usize> = None;
+
+    loop {
+        match lines_iter.next_line().await? {
+            Some(text) => {
+                if current < start {
+                    current += 1;
+                    continue;
+                }
+                if lines.len() >= take {
+                    more = true;
+                    break;
+                }
+                // Per-line truncation. char-counted (UTF-8 aware) so
+                // CJK content isn't cut at half a codepoint.
+                let line = if text.chars().count() > MAX_LINE_LENGTH {
+                    let truncated: String = text.chars().take(MAX_LINE_LENGTH).collect();
+                    format!(
+                        "{}... (line truncated to {} chars)",
+                        truncated, MAX_LINE_LENGTH
+                    )
+                } else {
+                    text
+                };
+                // +1 for the joining `\n` we'd insert when rendering;
+                // matches opencode's accounting.
+                let line_bytes = line.len().saturating_add(1);
+                if !lines.is_empty() && bytes_acc + line_bytes > MAX_BYTES_PER_RESPONSE {
+                    cut = true;
+                    more = true;
+                    break;
+                }
+                bytes_acc += line_bytes;
+                lines.push(line);
+                current += 1;
+            }
+            None => {
+                // Reached EOF cleanly — record total line count.
+                // `current` points to the next line index after the
+                // last consumed one, so total = current - 1.
+                total_lines = Some(current.saturating_sub(1));
+                break;
+            }
+        }
+    }
+
+    Ok(SliceResult {
+        start_line: start,
+        lines,
+        more,
+        cut,
+        total_lines,
+    })
+}
+
+/// Render a `SliceResult` into the same `   N| <content>` body the
+/// slurp path emits, plus a trailing footer that tells the model what
+/// to do next (continue with offset=N+1, narrow the query if cut, or
+/// stop because we hit EOF). Mirrors the slurp path's "Showing lines
+/// X-Y of total" footer where possible so the model sees consistent
+/// truncation language across slurp and stream paths.
+fn format_streamed_slice(file_path_for_msg: &str, slice: &SliceResult) -> String {
+    let mut output = String::new();
+    for (i, line) in slice.lines.iter().enumerate() {
+        if i > 0 {
+            output.push('\n');
+        }
+        let line_num = slice.start_line + i;
+        output.push_str(&format!("{:>4}| {}", line_num, line));
+    }
+    if slice.lines.is_empty() {
+        // Caller asked for an offset past EOF, or limit=0. Be explicit
+        // — silent empty body would otherwise look like a tool failure.
+        output.push_str(&format!(
+            "[no lines in requested range (start={}, count=0)]",
+            slice.start_line
+        ));
+        return output;
+    }
+    let last = slice.start_line + slice.lines.len() - 1;
+    let next = last + 1;
+    if slice.cut {
+        output.push_str(&format!(
+            "\n\n[Output capped at {} KB. Streamed lines {}-{}. Use offset={} to continue.]",
+            MAX_BYTES_PER_RESPONSE / 1024,
+            slice.start_line,
+            last,
+            next,
+        ));
+    } else if slice.more {
+        output.push_str(&format!(
+            "\n\n[Streamed lines {}-{}. Use offset={} to continue. \
+             Total line count unknown — file is large; run `wc -l {q}` to count if needed.]",
+            slice.start_line,
+            last,
+            next,
+            q = shell_quote(file_path_for_msg),
+        ));
+    } else if let Some(total) = slice.total_lines {
+        output.push_str(&format!(
+            "\n\n[Streamed lines {}-{} of {} total (EOF).]",
+            slice.start_line, last, total,
+        ));
+    }
+    output
 }
 
 /// Decide whether the file is binary by looking at extension + a small
@@ -1548,6 +1793,180 @@ mod tests {
             expected_len,
             r.output
         );
+    }
+
+    // --- Streaming slice path regression tests ---
+    //
+    // For large files with offset/limit, read_file now reads line-by-line
+    // with a byte budget instead of slurping. These tests pin the unit-level
+    // contract (stream_slice_lines) and the end-to-end integration (big
+    // file + slice → streaming path triggered).
+
+    #[tokio::test]
+    async fn stream_slice_lines_skips_offset_then_takes_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.txt");
+        let body = (1..=20)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).unwrap();
+
+        let r = stream_slice_lines(&path, Some(5), Some(3)).await.unwrap();
+        assert_eq!(r.start_line, 5);
+        assert_eq!(r.lines, vec!["line5", "line6", "line7"]);
+        assert!(r.more, "limit hit before EOF");
+        assert!(!r.cut);
+        assert!(r.total_lines.is_none(), "early stop must not claim a total");
+    }
+
+    #[tokio::test]
+    async fn stream_slice_lines_reads_to_eof_reports_total() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+        let r = stream_slice_lines(&path, Some(1), Some(100))
+            .await
+            .unwrap();
+        assert_eq!(r.lines, vec!["a", "b", "c"]);
+        assert!(!r.more);
+        assert_eq!(r.total_lines, Some(3));
+    }
+
+    #[tokio::test]
+    async fn stream_slice_lines_truncates_overlong_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.txt");
+        let long_line: String = "x".repeat(MAX_LINE_LENGTH + 500);
+        std::fs::write(&path, &long_line).unwrap();
+
+        let r = stream_slice_lines(&path, None, Some(10)).await.unwrap();
+        assert_eq!(r.lines.len(), 1);
+        assert!(
+            r.lines[0].contains("line truncated to"),
+            "expected truncation suffix: {}",
+            &r.lines[0][..100.min(r.lines[0].len())]
+        );
+        // Should be MAX_LINE_LENGTH chars + the suffix, not the full 2500.
+        assert!(r.lines[0].chars().count() < MAX_LINE_LENGTH + 100);
+    }
+
+    #[tokio::test]
+    async fn stream_slice_lines_byte_budget_cuts_early() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.txt");
+        // 1 KB lines × 1000 = 1 MB, way over MAX_BYTES_PER_RESPONSE (256 KB).
+        // Streaming must stop short, marking cut=true.
+        let line: String = "x".repeat(1024);
+        let body = std::iter::repeat(line)
+            .take(1000)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).unwrap();
+
+        let r = stream_slice_lines(&path, Some(1), Some(1000))
+            .await
+            .unwrap();
+        assert!(r.cut, "byte budget should fire before limit on 1 KB × 1000");
+        assert!(r.more);
+        assert!(
+            r.lines.len() < 1000,
+            "expected fewer than 1000 lines, got {}",
+            r.lines.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_slice_lines_offset_past_eof_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+        let r = stream_slice_lines(&path, Some(100), Some(10))
+            .await
+            .unwrap();
+        assert!(r.lines.is_empty());
+        assert_eq!(r.total_lines, Some(3));
+    }
+
+    /// End-to-end: a 6 MB file with offset/limit must go through the
+    /// streaming path (not the slurp). Verified by (a) the "Streamed
+    /// lines" marker in the footer that only the stream path emits and
+    /// (b) correct line content at the requested offset.
+    #[tokio::test]
+    async fn read_file_large_file_slice_streams_not_slurps() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.log");
+        // 6 MB target — comfortably > MAX_FULL_BYTES (5 MB).
+        // ~100-byte lines × 65 k lines ≈ 6.5 MB.
+        let mut body = String::with_capacity(7 * 1024 * 1024);
+        for i in 1..=65_000usize {
+            body.push_str(&format!(
+                "line {:0>6} padded with x's to about 100 chars: {}\n",
+                i,
+                "x".repeat(60)
+            ));
+        }
+        std::fs::write(&path, &body).unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > MAX_FULL_BYTES,
+            "test fixture must exceed MAX_FULL_BYTES",
+        );
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(
+            r#"{{"file_path":"{}","offset":100,"limit":5}}"#,
+            path.display()
+        );
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success, "{}", r.output);
+        assert!(
+            r.output.contains("Streamed lines"),
+            "large slice must take the streaming path (footer marker absent); got:\n{}",
+            &r.output[..r.output.len().min(500)],
+        );
+        // Sanity: requested offset visible, beyond-limit line not.
+        assert!(r.output.contains(" 100| line 000100"), "offset line missing");
+        assert!(r.output.contains(" 104| line 000104"), "limit-1 line missing");
+        assert!(
+            !r.output.contains(" 105| line 000105"),
+            "limit must stop at 104, but 105 appeared",
+        );
+    }
+
+    /// Small files keep the slurp path so FileStore can amortize repeat
+    /// slices — guard against an over-eager `is_slice && is_large` that
+    /// would force small files through the (slightly slower per-call)
+    /// streaming reader and lose the cache benefit.
+    #[tokio::test]
+    async fn read_file_small_file_slice_uses_slurp_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("small.txt");
+        let body = (1..=50)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(
+            r#"{{"file_path":"{}","offset":10,"limit":3}}"#,
+            path.display()
+        );
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        // Slurp path emits "Showing lines X-Y of Z total" — streaming
+        // emits "Streamed lines …". Small file must stay on slurp.
+        assert!(
+            !r.output.contains("Streamed lines"),
+            "small file slice must not be routed through streaming; got:\n{}",
+            r.output
+        );
+        assert!(r.output.contains("  10| line 10"));
+        assert!(r.output.contains("  12| line 12"));
     }
 
     /// Symmetric positive case: a real text file with the same byte
