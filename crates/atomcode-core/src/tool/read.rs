@@ -11,6 +11,14 @@ use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 /// Shared with `agent::tool_dispatch` so its first-read heuristic stays aligned.
 pub(crate) const SKELETON_LINE_THRESHOLD: usize = 300;
 
+/// Sample window for binary detection. Read this many leading bytes,
+/// sniff for NUL / control-char ratio, and refuse the full slurp if
+/// the file looks binary — saves loading a 10 GB `.tar.gz` into RAM
+/// just to discover it's not text. opencode uses 4 KB; we go slightly
+/// higher to catch text files with a small binary preamble (BOMs,
+/// minified-JS source maps embedded as data: URIs, etc.) cleanly.
+pub(crate) const SAMPLE_BYTES: usize = 8192;
+
 pub struct ReadFileTool;
 
 /// Deserialize a number that may arrive as a float string (weak models often send "50.0" instead of 50).
@@ -136,10 +144,9 @@ impl Tool for ReadFileTool {
         // tool replays content. Aligns with the "framework doesn't
         // educate the model about its own behaviour" principle.
         let cache_key: crate::tool::ReadCacheKey = (path.clone(), parsed.offset, parsed.limit);
-        let disk_mtime = tokio::fs::metadata(&path)
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok());
+        let disk_meta = tokio::fs::metadata(&path).await.ok();
+        let disk_mtime = disk_meta.as_ref().and_then(|m| m.modified().ok());
+        let disk_len = disk_meta.as_ref().map(|m| m.len());
         if let Some(mtime) = disk_mtime {
             let cached = ctx.read_cache.read().await.get(&cache_key).cloned();
             if let Some((cached_mtime, cached_output, _)) = cached {
@@ -303,36 +310,69 @@ impl Tool for ReadFileTool {
             // what's currently on disk.
             c
         } else {
+            // Sniff first SAMPLE_BYTES for a binary verdict BEFORE slurping
+            // the whole file. Catches the "model reads a 10 GB .tar.gz / .exe
+            // / .mp4 and OOMs" case at near-zero cost.
+            let sample = read_file_head(&path, SAMPLE_BYTES)
+                .await
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            if is_binary_sample(path_ref, &sample) {
+                let size_for_msg = disk_len.unwrap_or(sample.len() as u64);
+                let output = format!(
+                    "Binary file ({} bytes), cannot display as text.{}",
+                    size_for_msg,
+                    binary_recovery_hint(path_ref, &parsed.file_path),
+                );
+                if let Some(mtime) = disk_mtime {
+                    ctx.read_cache
+                        .write()
+                        .await
+                        .insert(cache_key.clone(), (mtime, output.clone(), 1));
+                }
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output,
+                    success: true,
+                });
+            }
+
             let bytes = tokio::fs::read(&path)
                 .await
                 .with_context(|| format!("Failed to read {}", path.display()))?;
 
-            // Decode: UTF-8 first (the vast majority of text files), then GBK
-            // fallback for plain-text extensions (Chinese Windows legacy files
-            // that fail UTF-8 validation), then declare binary.
-            match String::from_utf8(bytes.clone()) {
+            // Decode: UTF-8 first (vast majority of text), then GBK fallback
+            // for plain-text extensions (Chinese Windows legacy `.txt`),
+            // then declare binary. Consume `bytes` via `String::from_utf8`
+            // to avoid the prior `.clone()` (which doubled peak memory for
+            // large files); on Err recover the original `Vec` via
+            // `e.into_bytes()` so the GBK and binary paths still see the
+            // raw content without ever holding two copies.
+            match String::from_utf8(bytes) {
                 Ok(s) => s,
-                Err(_) => match decode_non_utf8_text(path_ref, &bytes) {
-                    Some(s) => s,
-                    None => {
-                        let output = format!(
-                            "Binary file ({} bytes), cannot display as text.{}",
-                            bytes.len(),
-                            binary_recovery_hint(path_ref, &parsed.file_path),
-                        );
-                        if let Some(mtime) = disk_mtime {
-                            ctx.read_cache
-                                .write()
-                                .await
-                                .insert(cache_key.clone(), (mtime, output.clone(), 1));
+                Err(e) => {
+                    let bytes = e.into_bytes();
+                    match decode_non_utf8_text(path_ref, &bytes) {
+                        Some(s) => s,
+                        None => {
+                            let output = format!(
+                                "Binary file ({} bytes), cannot display as text.{}",
+                                bytes.len(),
+                                binary_recovery_hint(path_ref, &parsed.file_path),
+                            );
+                            if let Some(mtime) = disk_mtime {
+                                ctx.read_cache
+                                    .write()
+                                    .await
+                                    .insert(cache_key.clone(), (mtime, output.clone(), 1));
+                            }
+                            return Ok(ToolResult {
+                                call_id: String::new(),
+                                output,
+                                success: true,
+                            });
                         }
-                        return Ok(ToolResult {
-                            call_id: String::new(),
-                            output,
-                            success: true,
-                        });
                     }
-                },
+                }
             }
         };
 
@@ -601,6 +641,81 @@ fn has_text_extension(path: &std::path::Path) -> bool {
             GBK_CANDIDATE_EXTENSIONS.iter().any(|t| *t == e)
         })
         .unwrap_or(false)
+}
+
+/// Read up to `max` bytes from the start of `path`. Returns whatever
+/// the first `read()` produced — used purely as a binary-sniff probe,
+/// so partial reads (large pipe-buffer reads only refilled on next
+/// poll) are fine.
+async fn read_file_head(path: &std::path::Path, max: usize) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; max];
+    let n = file.read(&mut buf).await?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Decide whether the file is binary by looking at extension + a small
+/// leading sample. Two-pronged because each prong has blind spots:
+///   - extension alone misses files saved without one (raw `.bin`)
+///   - content alone misses zip-based formats (.docx / .xlsx) whose
+///     first KB looks like plain ASCII (PK signature + filenames)
+///
+/// Sample heuristic: any NUL byte is an instant binary verdict
+/// (UTF-8 text never contains `\0`); otherwise count non-printable
+/// control chars (anything below 32 except TAB/LF/FF/CR) and call it
+/// binary if their share exceeds 30%. Mirrors opencode's check, plus
+/// the NUL-shortcut from `file(1)`'s heuristic.
+fn is_binary_sample(path: &std::path::Path, sample: &[u8]) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    const BINARY_EXTENSIONS: &[&str] = &[
+        // archives & compressed
+        "zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "7z", "rar", "zst",
+        // executables & objects
+        "exe", "dll", "so", "dylib", "a", "lib", "o", "obj", "wasm",
+        // jvm / .net / python compiled
+        "class", "jar", "war", "pyc", "pyo",
+        // office (binary or zip-based — handled via recovery_hint downstream)
+        "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp",
+        // images
+        "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "ico", "heic", "heif", "avif",
+        // audio / video
+        "mp3", "mp4", "wav", "flac", "ogg", "opus", "m4a", "aac",
+        "avi", "mov", "mkv", "webm", "wmv", "flv", "mpg", "mpeg",
+        // raw binary blobs
+        "bin", "dat", "iso", "img", "dmg",
+        // databases
+        "db", "sqlite", "sqlite3",
+        // PDF (handled via recovery_hint)
+        "pdf",
+    ];
+    if BINARY_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
+    }
+
+    if sample.is_empty() {
+        return false;
+    }
+
+    let mut non_printable: usize = 0;
+    for &b in sample {
+        if b == 0 {
+            // NUL byte: text files never contain this. file(1) uses
+            // the same shortcut. One sighting is enough.
+            return true;
+        }
+        // Allow TAB (9), LF (10), FF (12), CR (13). Everything below
+        // 32 outside that set is non-printable.
+        if b < 9 || b == 11 || (b > 13 && b < 32) {
+            non_printable += 1;
+        }
+    }
+    non_printable * 10 > sample.len() * 3 // >30% non-printable
 }
 
 /// Attempt to decode a file that failed UTF-8 validation. Today this tries
@@ -1350,5 +1465,115 @@ mod tests {
                 r.output
             );
         }
+    }
+
+    // --- Pre-slurp binary detection regression tests ---
+    //
+    // Before this layer, `read_file` would happily `tokio::fs::read()` a
+    // 10 GB tarball into RAM, then `bytes.clone()` for UTF-8 validation,
+    // peak ~20 GB and OOM. Now `is_binary_sample` rejects the file from
+    // the first 8 KB and the full slurp never happens.
+
+    #[test]
+    fn binary_sample_nul_byte_short_circuits() {
+        let p = std::path::Path::new("/tmp/no-such.txt");
+        assert!(is_binary_sample(p, b"hello\0world"), "single NUL = binary");
+    }
+
+    #[test]
+    fn binary_sample_extension_blacklist_triggers_on_empty() {
+        // .tar.gz / .exe etc: extension is enough — sample can be empty.
+        // Critical for the OOM case: we never even read the 10 GB tarball.
+        let p = std::path::Path::new("foo.tar.gz");
+        assert!(is_binary_sample(p, &[]), "extension alone should be enough");
+        assert!(is_binary_sample(std::path::Path::new("foo.exe"), &[]));
+        assert!(is_binary_sample(std::path::Path::new("foo.png"), &[]));
+        assert!(is_binary_sample(std::path::Path::new("foo.mp4"), &[]));
+    }
+
+    #[test]
+    fn binary_sample_plain_text_passes() {
+        let p = std::path::Path::new("a.rs");
+        assert!(!is_binary_sample(p, b"fn main() {}\n"));
+        // Chinese UTF-8 is multi-byte but all bytes are >= 0x80 (continuation
+        // / start), none below 32 — must NOT be flagged as binary.
+        assert!(!is_binary_sample(p, "你好世界\n".as_bytes()));
+        // Source code with tabs/newlines/CRLF: ASCII printable + whitelisted controls.
+        let mixed = b"line1\n\tindented\r\nline3\n";
+        assert!(!is_binary_sample(p, mixed));
+    }
+
+    #[test]
+    fn binary_sample_high_nonprintable_ratio_flags() {
+        let p = std::path::Path::new("unknown");
+        // >30% bytes in (1..9) ∪ {11} ∪ (14..32) range.
+        let mut bytes = vec![b'A'; 10];
+        bytes.extend(std::iter::repeat(0x01u8).take(5)); // 5/15 = 33% non-printable
+        assert!(is_binary_sample(p, &bytes));
+    }
+
+    /// End-to-end: a file with a binary extension + binary contents
+    /// rejects via `read_file` without slurping. We don't write a
+    /// huge file (slow on CI) — just assert the binary-error branch
+    /// fires and includes byte count from metadata, not from a slurp.
+    #[tokio::test]
+    async fn read_file_rejects_binary_via_sample() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("blob.tar.gz");
+        // Real-ish gzip magic: 1f 8b ... + some bytes
+        let payload: Vec<u8> = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03"
+            .iter()
+            .chain(std::iter::repeat(&0u8).take(1024))
+            .copied()
+            .collect();
+        std::fs::write(&path, &payload).unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success); // intentional: "successfully detected as binary"
+        assert!(
+            r.output.contains("Binary file"),
+            "should be binary-rejected, got: {}",
+            r.output
+        );
+        // Recovery hint matches the .tar.gz family (no specific handler →
+        // generic). Critical assertion: the byte count came from metadata,
+        // so it should equal the file size, not the 8 KB sample.
+        let expected_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            r.output.contains(&expected_len.to_string()),
+            "binary error must report full file size from metadata ({}), got: {}",
+            expected_len,
+            r.output
+        );
+    }
+
+    /// Symmetric positive case: a real text file with the same byte
+    /// count must NOT be falsely rejected. Guards against the binary
+    /// detection getting tightened to the point that legitimate code
+    /// files (e.g. Rust with `#![…]` byte-order-marky preamble) trip it.
+    #[tokio::test]
+    async fn read_file_accepts_normal_text_after_sniff() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("normal.rs");
+        let mut content = String::from("// header\nfn main() {\n");
+        for _ in 0..200 {
+            content.push_str("    println!(\"x\");\n");
+        }
+        content.push_str("}\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(r#"{{"file_path":"{}"}}"#, path.display());
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(
+            !r.output.contains("Binary file"),
+            "normal Rust file must not be flagged binary, got: {}",
+            r.output
+        );
     }
 }
