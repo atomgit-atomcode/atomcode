@@ -113,7 +113,13 @@ impl Tool for BashTool {
             Err(_) => return ApprovalRequirement::AutoApprove,
         };
         if let Some(reason) = check_destructive_command(&parsed.command) {
-            return ApprovalRequirement::RequireApproval(reason);
+            // RequireApprovalAlways — not RequireApproval — so a prior session
+            // grant on "bash" (user pressed [A] on a safe command earlier)
+            // cannot disarm the destructive-command guard. Real-world incident
+            // 2026-05-24: `rmdir /s /q D:\…\native` ran without a prompt after
+            // a session grant, wiping the workspace including .git. See
+            // `bash_destructive_command_through_store_with_session_grant_asks`.
+            return ApprovalRequirement::RequireApprovalAlways(reason);
         }
         ApprovalRequirement::AutoApprove
     }
@@ -2627,6 +2633,55 @@ mod sanitize_tests {
         );
 
         assert!(approval.is_none());
+    }
+
+    // Regression: a single `[A]` (Always Allow for bash) on a safe command
+    // (cargo build, ls, git status) must NOT silently disarm the destructive
+    // check for the rest of the session. Real-world incident: model emitted
+    // `rmdir /s /q D:\...\native` after the user had pressed [A] earlier;
+    // PermissionStore::check honored the session grant and the bash tool's
+    // RequireApproval was bypassed, deleting the workspace including .git.
+    //
+    // Fix contract: destructive bash commands return RequireApprovalAlways
+    // — the variant PermissionStore::check unconditionally routes to Ask,
+    // regardless of session grants or AlwaysAllow overrides.
+    #[test]
+    fn bash_destructive_commands_require_always_not_session_bypassable() {
+        let cases = [
+            r#"{"command":"rmdir /s /q D:\\StorePlugin\\project"}"#,
+            r#"{"command":"rm -rf /important_directory"}"#,
+            r#"{"command":"del /q C:\\Users\\victim\\files"}"#,
+            r#"{"command":"git push --force origin main"}"#,
+            r#"{"command":"git reset --hard HEAD~5"}"#,
+            r#"{"command":"dd if=/dev/zero of=/dev/sda"}"#,
+        ];
+        for args in cases {
+            assert!(
+                matches!(
+                    BashTool.approval(args),
+                    ApprovalRequirement::RequireApprovalAlways(_)
+                ),
+                "{args} should return RequireApprovalAlways so session grant cannot bypass approval; \
+                 a single [A] press on a safe command must NOT disarm destructive-command detection"
+            );
+        }
+    }
+
+    // Cross-layer integration: bash destructive command → PermissionStore
+    // with an existing `grant_session("bash")` must still Ask. This pins the
+    // contract end-to-end so a future refactor of either layer can't quietly
+    // reintroduce the rmdir-bypass incident.
+    #[test]
+    fn bash_destructive_command_through_store_with_session_grant_asks() {
+        use crate::tool::{PermissionDecision, PermissionStore};
+        let mut store = PermissionStore::new();
+        store.grant_session("bash"); // simulate prior [A] on a safe command
+        let approval = BashTool.approval(r#"{"command":"rmdir /s /q D:\\proj"}"#);
+        let decision = store.check("bash", &approval);
+        assert!(
+            matches!(decision, PermissionDecision::Ask(_)),
+            "destructive bash command must prompt the user even with a session grant, got {decision:?}"
+        );
     }
 
     // Regression: weak models occasionally send malformed bash args
