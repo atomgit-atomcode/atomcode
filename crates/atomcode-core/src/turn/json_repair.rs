@@ -284,12 +284,7 @@ pub fn extract_json_fields(s: &str) -> serde_json::Value {
                 i += 1;
             }
             let raw: String = chars[start..i.min(len)].iter().collect();
-            // Unescape JSON sequences: \n → newline, \t → tab, \" → quote, \\ → backslash
-            let val = raw
-                .replace("\\n", "\n")
-                .replace("\\t", "\t")
-                .replace("\\\"", "\"")
-                .replace("\\\\", "\\");
+            let val = unescape_json_string_contents(&raw);
             map.insert(key, serde_json::json!(val));
             if i < len {
                 i += 1;
@@ -400,11 +395,7 @@ fn unescape_field_value(raw: &str) -> String {
     let t = raw.trim().trim_end_matches(',').trim();
     let inner = if t.starts_with('"') { &t[1..] } else { t };
     let inner = inner.trim_end_matches('"');
-    inner
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
+    unescape_json_string_contents(inner)
 }
 
 fn unescape_field_value_end(raw: &str) -> String {
@@ -417,11 +408,45 @@ fn unescape_field_value_end(raw: &str) -> String {
         .or_else(|| inner.rfind("\"\n}"))
         .unwrap_or(inner.len());
     let content = &inner[..end];
-    content
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
+    unescape_json_string_contents(content)
+}
+
+/// Single-pass JSON-string unescape.
+///
+/// Sequential `s.replace("\\t", "\t")` chains are unsafe for this: a properly
+/// escaped Windows path like `\\test` (raw chars `\` `\` `t`) gets its second
+/// `\` + `t` matched as a `\t` escape, corrupting the path. We must consume
+/// each backslash + char as one unit.
+///
+/// Recognized: `\\` `\"` `\/` `\n` `\r` `\t` `\b` `\f`. Unknown `\X` keeps the
+/// backslash literal (callers may receive paths that were never JSON-escaped).
+/// `\u` Unicode escapes are intentionally not interpreted — out of scope for
+/// this last-resort recovery path.
+fn unescape_json_string_contents(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('/') => out.push('/'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -582,5 +607,65 @@ mod tests {
         // the tool emits the real parse error (not a misleading repaired stub).
         let input = "!!!";
         assert_eq!(repair_tool_args("write_file", input), "!!!");
+    }
+
+    // --- Windows-path unescape regression tests ---
+    //
+    // Properly-escaped Windows paths arrive in raw form as `\` `\` `t` (3 chars).
+    // The old `.replace("\\t", "\t")` chain mistakenly matched the literal "\t"
+    // formed by the second backslash + the t, turning `\\test` into `\<TAB>est`.
+
+    #[test]
+    fn extract_fields_windows_path_keeps_backslash_t() {
+        // JSON-legal: every Windows backslash doubled.
+        let input = r#"{"file_path": "D:\\work\\prj\\test-wsd\\run.py"}"#;
+        let result = extract_json_fields(input);
+        assert_eq!(
+            result["file_path"], "D:\\work\\prj\\test-wsd\\run.py",
+            "escaped backslashes must collapse to single backslashes, not produce TAB",
+        );
+        assert!(
+            !result["file_path"].as_str().unwrap().contains('\t'),
+            "no tab character should appear",
+        );
+    }
+
+    #[test]
+    fn extract_fields_unc_long_path_prefix() {
+        // \\?\D:\... long-path prefix, fully escaped → \\?\D:\test-wsd\run.py
+        let input = r#"{"file_path": "\\\\?\\D:\\test-wsd\\run.py"}"#;
+        let result = extract_json_fields(input);
+        assert_eq!(result["file_path"], "\\\\?\\D:\\test-wsd\\run.py");
+    }
+
+    #[test]
+    fn extract_fields_literal_backslash_n_preserved() {
+        // Raw `\` `\` `n` must decode to `\n` (backslash + n), not a newline —
+        // sequential `.replace` could swap order and produce a real newline here.
+        let input = r#"{"x": "a\\nb"}"#;
+        let result = extract_json_fields(input);
+        assert_eq!(result["x"], "a\\nb");
+        assert!(!result["x"].as_str().unwrap().contains('\n'));
+    }
+
+    #[test]
+    fn extract_fields_real_escapes_still_work() {
+        // Don't regress the intended behavior: \n → newline, \t → tab, \" → ".
+        let input = r#"{"a": "line1\nline2", "b": "col1\tcol2", "c": "say \"hi\""}"#;
+        let result = extract_json_fields(input);
+        assert_eq!(result["a"], "line1\nline2");
+        assert_eq!(result["b"], "col1\tcol2");
+        assert_eq!(result["c"], "say \"hi\"");
+    }
+
+    #[test]
+    fn extract_edit_file_windows_path_in_old_string() {
+        // old_string/new_string go through unescape_field_value(_end). A Windows
+        // path embedded in them must not have its `\t` swallowed into a tab.
+        let input = r#"{"file_path": "/src/x.py", "old_string": "p = 'C:\\foo\\test.py'", "new_string": "p = 'C:\\foo\\bar.py'"}"#;
+        let result = extract_edit_file_args(input).expect("should parse");
+        assert_eq!(result["old_string"], "p = 'C:\\foo\\test.py'");
+        assert_eq!(result["new_string"], "p = 'C:\\foo\\bar.py'");
+        assert!(!result["old_string"].as_str().unwrap().contains('\t'));
     }
 }
