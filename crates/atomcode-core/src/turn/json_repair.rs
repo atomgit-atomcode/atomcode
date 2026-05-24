@@ -14,18 +14,28 @@
 /// `tool_name` selects a specialized extractor when available (e.g. `edit_file`
 /// which may contain unescaped source code in `old_string`/`new_string`).
 pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
+    // Pre-pass: rescue ambiguous Windows paths BEFORE any JSON parsing
+    // touches them. `{"file_path": "D:\test\foo.py"}` is *valid* JSON
+    // (`\t` and `\f` are spec-legal escapes), so the fast path would
+    // hand it straight to `serde_json::from_str`, which would decode
+    // `D:<TAB>est<FF>oo.py` and write to the wrong file. The pre-pass
+    // detects drive-letter strings and double-escapes their ambiguous
+    // `\X` sequences so the resulting JSON encodes the path the model
+    // actually meant. Idempotent on already-correctly-escaped input.
+    let pre = pre_escape_windows_paths_in_json(args);
+
     // Fast path: already valid JSON.
-    if serde_json::from_str::<serde_json::Value>(args).is_ok() {
-        return args.to_string();
+    if serde_json::from_str::<serde_json::Value>(&pre).is_ok() {
+        return pre;
     }
     // Generic JSON repair (trailing commas, unquoted keys, fence strip, etc.).
-    let repaired = repair_json(args);
+    let repaired = repair_json(&pre);
     if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
         return repaired;
     }
     // Specialized: edit_file often ships source code with unescaped quotes/newlines.
     if tool_name == "edit_file" {
-        if let Some(v) = extract_edit_file_args(args) {
+        if let Some(v) = extract_edit_file_args(&pre) {
             if let Ok(s) = serde_json::to_string(&v) {
                 return s;
             }
@@ -33,7 +43,7 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
     }
     // Last resort: key-value field extraction. Only return this if it actually
     // recovered something — an empty object is no better than the original garbage.
-    let extracted = extract_json_fields(args);
+    let extracted = extract_json_fields(&pre);
     if let Some(obj) = extracted.as_object() {
         if !obj.is_empty() {
             if let Ok(s) = serde_json::to_string(&extracted) {
@@ -42,6 +52,143 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
         }
     }
     args.to_string()
+}
+
+/// Pre-escape ambiguous backslash sequences inside JSON string literals
+/// that look like Windows paths.
+///
+/// Why: `{"file_path": "D:\test\foo.py"}` parses as valid JSON, but
+/// `serde_json` decodes `\t`→TAB and `\f`→FF, corrupting the path. The
+/// model almost certainly meant literal backslashes. For strings that
+/// contain a drive-letter prefix (`[A-Za-z]:[\\/]`), this pass treats
+/// the bare `\X` (X ∈ {t,n,r,b,f,u}) as a literal backslash and doubles
+/// it so JSON decodes back to the intended path.
+///
+/// Idempotent: already-correctly-escaped `\\` is preserved (the second
+/// backslash is consumed as part of the escape pair, not a fresh one).
+/// JSON-legal `\"` and `\/` are also passed through verbatim.
+///
+/// Heuristic precision: the drive-letter detector requires the alpha
+/// char to be a *single* letter (not the tail of a longer word), so
+/// strings like `"category:\nimportant"` don't trip it — the byte
+/// preceding the alpha must not itself be alphabetic.
+fn pre_escape_windows_paths_in_json(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(n + 16);
+    let mut i = 0;
+    while i < n {
+        if chars[i] != '"' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Opening quote — find the matching close, honoring JSON
+        // backslash escapes so `\"` doesn't terminate.
+        let body_start = i + 1;
+        let mut j = body_start;
+        while j < n {
+            if chars[j] == '\\' && j + 1 < n {
+                j += 2;
+                continue;
+            }
+            if chars[j] == '"' {
+                break;
+            }
+            j += 1;
+        }
+        let body_end = j.min(n);
+        let body: String = chars[body_start..body_end].iter().collect();
+        out.push('"');
+        if looks_like_windows_path(&body) {
+            rewrite_windows_path_body(&body, &mut out);
+        } else {
+            out.push_str(&body);
+        }
+        if body_end < n {
+            out.push('"');
+            i = body_end + 1;
+        } else {
+            i = body_end;
+        }
+    }
+    out
+}
+
+/// True iff `s` contains a Windows drive-letter path prefix
+/// (`[A-Za-z]:[\\/]`) where the drive letter stands alone (not the
+/// tail of a longer alphabetic run).
+fn looks_like_windows_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 {
+        return false;
+    }
+    for i in 0..bytes.len().saturating_sub(2) {
+        if !bytes[i].is_ascii_alphabetic() {
+            continue;
+        }
+        if bytes[i + 1] != b':' {
+            continue;
+        }
+        if bytes[i + 2] != b'\\' && bytes[i + 2] != b'/' {
+            continue;
+        }
+        // Tail-of-word guard: drive letter is a single char, so the
+        // byte before must NOT be alphabetic (rules out `category:\…`).
+        if i > 0 && bytes[i - 1].is_ascii_alphabetic() {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Walk an already-extracted JSON string body (between but not
+/// including the surrounding quotes) and double any bare `\X` that
+/// `looks_like_windows_path` flagged as ambiguous, while leaving
+/// already-escaped sequences alone.
+fn rewrite_windows_path_body(body: &str, out: &mut String) {
+    let chars: Vec<char> = body.chars().collect();
+    let mut k = 0;
+    while k < chars.len() {
+        if chars[k] != '\\' {
+            out.push(chars[k]);
+            k += 1;
+            continue;
+        }
+        match chars.get(k + 1).copied() {
+            Some('\\') => {
+                // Already escaped — preserve both bytes.
+                out.push_str("\\\\");
+                k += 2;
+            }
+            Some(c @ ('"' | '/')) => {
+                // JSON-legal escape unrelated to paths — preserve.
+                out.push('\\');
+                out.push(c);
+                k += 2;
+            }
+            Some(c @ ('t' | 'n' | 'r' | 'b' | 'f' | 'u')) => {
+                // Ambiguous in Windows-path context: model meant a
+                // literal backslash, not a JSON escape. Double the
+                // backslash so the JSON parser decodes `\X` back to
+                // the two chars `\` and X.
+                out.push_str("\\\\");
+                out.push(c);
+                k += 2;
+            }
+            Some(other) => {
+                // Invalid JSON escape — leave for repair_json to fix.
+                out.push('\\');
+                out.push(other);
+                k += 2;
+            }
+            None => {
+                out.push('\\');
+                k += 1;
+            }
+        }
+    }
 }
 
 /// Attempt to repair common JSON issues from LLM output:
@@ -667,5 +814,131 @@ mod tests {
         assert_eq!(result["old_string"], "p = 'C:\\foo\\test.py'");
         assert_eq!(result["new_string"], "p = 'C:\\foo\\bar.py'");
         assert!(!result["old_string"].as_str().unwrap().contains('\t'));
+    }
+
+    // --- pre_escape_windows_paths_in_json regression tests ---
+    //
+    // The fast path in `repair_tool_args` would otherwise hand
+    // `{"file_path": "D:\test\foo.py"}` (spec-valid JSON) straight to
+    // `serde_json::from_str`, which decodes `\t`→TAB and `\f`→FF.
+    // c1f33e62 only fixed `extract_json_fields` (last-resort); the main
+    // path needed its own guard.
+
+    #[test]
+    fn repair_tool_args_rescues_windows_path_in_valid_json() {
+        // Model emits valid JSON with a single-backslash Windows path —
+        // this would silently decode to "D:<TAB>est<FF>oo.py" without
+        // the pre-pass. Raw bytes: `D` `:` `\` `t` `e` `s` `t` `\` `f`...
+        let input = "{\"file_path\": \"D:\\test\\foo.py\"}";
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("should be valid JSON after pre-pass");
+        assert_eq!(v["file_path"], "D:\\test\\foo.py");
+        let s = v["file_path"].as_str().unwrap();
+        assert!(!s.contains('\t'), "tab must not appear: got {:?}", s);
+        assert!(!s.contains('\u{000C}'), "form feed must not appear: got {:?}", s);
+    }
+
+    #[test]
+    fn repair_tool_args_idempotent_on_correctly_escaped_path() {
+        // Properly escaped Windows path — pre-pass must not double again.
+        // Raw bytes: `D` `:` `\` `\` `w` `o` `r` `k` `\` `\` `a` ...
+        let input = r#"{"file_path": "D:\\work\\app.py"}"#;
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["file_path"], "D:\\work\\app.py");
+    }
+
+    #[test]
+    fn repair_tool_args_preserves_unc_long_path_prefix() {
+        // \\?\D:\... long-path prefix, fully escaped. The leading
+        // \\\\?\\ region must survive pre-pass and parse correctly.
+        let input = r#"{"file_path": "\\\\?\\D:\\test-wsd\\run.py"}"#;
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["file_path"], "\\\\?\\D:\\test-wsd\\run.py");
+    }
+
+    #[test]
+    fn repair_tool_args_non_path_string_with_tab_preserved() {
+        // Drive-letter heuristic must NOT fire on plain text containing
+        // a `\t` escape — `category:\n…` looks superficially similar
+        // (alpha-then-`:`-then-`\`) but `y` is the tail of a word, not
+        // a single-letter drive. The tab MUST be decoded as a tab.
+        let input = r#"{"category": "fast\ttab\nnewline"}"#;
+        let out = repair_tool_args("write_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let s = v["category"].as_str().unwrap();
+        assert!(s.contains('\t'), "real \\t should remain a tab: {:?}", s);
+        assert!(s.contains('\n'), "real \\n should remain a newline: {:?}", s);
+    }
+
+    #[test]
+    fn repair_tool_args_word_ending_with_colon_then_backslash_is_not_path() {
+        // `category:\nimportant` — drive letter must be SINGLE alpha,
+        // not the tail of a longer word. False-positive would corrupt
+        // the intended newline into the two chars `\` + `n`.
+        let input = r#"{"label": "category:\nimportant"}"#;
+        let out = repair_tool_args("write_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let s = v["label"].as_str().unwrap();
+        assert!(s.contains('\n'), "newline should survive: got {:?}", s);
+        assert!(!s.contains('\\'), "no literal backslash should remain: got {:?}", s);
+    }
+
+    #[test]
+    fn repair_tool_args_lowercase_drive_letter_recognized() {
+        // Lowercase `c:\` is also a valid Windows drive prefix.
+        let input = "{\"file_path\": \"c:\\users\\me\\file.txt\"}";
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["file_path"], "c:\\users\\me\\file.txt");
+    }
+
+    #[test]
+    fn repair_tool_args_windows_path_in_malformed_json_recovered() {
+        // Pre-pass + repair_json combined: trailing comma (parses-fail)
+        // AND single-backslash Windows path. Pre-pass fixes the path
+        // first, then repair_json strips the trailing comma.
+        let input = "{\"file_path\": \"D:\\test\\foo.py\",}";
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("should recover via repair_json");
+        assert_eq!(v["file_path"], "D:\\test\\foo.py");
+    }
+
+    #[test]
+    fn repair_tool_args_edit_file_windows_path_in_old_string() {
+        // edit_file old_string contains a code snippet with a Windows
+        // path literal — the pre-pass must rewrite that literal so the
+        // generic JSON parser sees the model's intent.
+        let input = "{\"file_path\": \"/src/x.py\", \"old_string\": \"path = 'D:\\test'\", \"new_string\": \"path = 'D:\\prod'\"}";
+        let out = repair_tool_args("edit_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["old_string"], "path = 'D:\\test'");
+        assert_eq!(v["new_string"], "path = 'D:\\prod'");
+    }
+
+    #[test]
+    fn repair_tool_args_windows_path_after_escaped_quote() {
+        // Body contains `\"D:\foo\"` — pre-pass walker must honour `\"`
+        // when locating the string close, so the drive-letter detection
+        // sees the right body content.
+        let input = "{\"cmd\": \"run \\\"D:\\foo.exe\\\"\"}";
+        let out = repair_tool_args("bash", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let s = v["cmd"].as_str().unwrap();
+        assert!(s.contains("D:\\foo.exe"), "Windows path inside quoted arg lost: {:?}", s);
+        assert!(!s.contains('\t'), "no tab corruption: {:?}", s);
+    }
+
+    #[test]
+    fn pre_escape_idempotent_under_double_application() {
+        // Belt-and-suspenders: pre-pass must be a fixed point so a
+        // future refactor that accidentally applies it twice doesn't
+        // double-escape paths.
+        let once = pre_escape_windows_paths_in_json(r#"{"p": "D:\\a\\b"}"#);
+        let twice = pre_escape_windows_paths_in_json(&once);
+        assert_eq!(once, twice, "pre_escape should be idempotent");
     }
 }
