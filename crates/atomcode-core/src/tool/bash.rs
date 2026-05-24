@@ -410,7 +410,11 @@ async fn snapshot_workspace_changes(
         .current_dir(wd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        // kill_on_drop: if SNAPSHOT_TIMEOUT_SECS fires or the caller's
+        // future is dropped (Ctrl-C cancel), tokio Drops the internal
+        // Child and we want the git process killed, not orphaned.
+        .kill_on_drop(true);
     crate::process_utils::suppress_console_window(&mut cmd);
     let out = match tokio::time::timeout(
         Duration::from_secs(SNAPSHOT_TIMEOUT_SECS),
@@ -460,7 +464,11 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         cmd.current_dir(&wd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // kill_on_drop covers the direct cmd.exe PID on `tokio::select!`
+            // cancel / hard timeout. NOTE: Windows process trees still leak
+            // grandchildren — that's #3's Job Object work.
+            .kill_on_drop(true);
         crate::process_utils::suppress_console_window(&mut cmd);
         cmd.spawn()?
     };
@@ -479,7 +487,12 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
             .current_dir(&wd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // kill_on_drop ensures bash itself dies if the tool future is
+            // dropped mid-flight (runner.rs `tokio::select!` cancel branch).
+            // Grandchildren (cargo / ssh / dev-server reparented via
+            // `setsid()`) still need pgroup-level cleanup — see #2.
+            .kill_on_drop(true);
         // Detach child from the controlling terminal so neither it nor any
         // grandchild (ssh, git credential helpers, server-side hook output
         // rendered by git) can write directly to /dev/tty.  Without this,
