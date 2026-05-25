@@ -305,6 +305,13 @@ pub(super) fn execute_slash_command(
             ));
             renderer.flush();
         }
+        "scrollbar" => {
+            let now_on = renderer.toggle_scrollbar();
+            renderer.render(UiLine::CommandOutput(
+                t(if now_on { Msg::ScrollbarOn } else { Msg::ScrollbarOff }).into_owned(),
+            ));
+            renderer.flush();
+        }
         "plan" => {
             state.agent_mode = AgentMode::Plan;
             ctx.agent.cmd_tx.send(AgentCommand::SetPlanMode(true)).ok();
