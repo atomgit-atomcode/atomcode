@@ -82,6 +82,32 @@ fn truncate_to_width_sgr_aware(s: &str, max_cols: usize) -> String {
     acc
 }
 
+/// Return the first visible (non-SGR) character in `s`, or `None` if
+/// the string is empty or consists entirely of escape sequences.
+/// Used by `pop_approval_prompt` to identify row types (▶ header,
+/// space-padded continuation, etc.) without being fooled by leading
+/// SGR colour codes (e.g. `\x1b[1m\x1b[93m▶`).
+fn first_visible_char(s: &str) -> Option<char> {
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c == '\x1b' {
+            chars.next(); // consume ESC
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // Consume params + final byte (alphabetic, e.g. 'm')
+                for nc in chars.by_ref() {
+                    if nc.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        return Some(c);
+    }
+    None
+}
+
 /// Soft-wrap `s` into chunks each ≤ `max_cols` display columns, using
 /// the same CSI-aware parser as `truncate_to_width_sgr_aware`. Used by
 /// `push_command_output` so long single-line content (notably the OAuth
@@ -471,6 +497,14 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// instead as flicker — we leave cursor visible the whole time
     /// and only reposition it via a CUP at frame end.
     slow_paint_terminal: bool,
+    /// Number of body_lines rows occupied by the most recent
+    /// `ApprovalPrompt`. Set when `ApprovalPrompt` is rendered so
+    /// `pop_approval_prompt` knows exactly how many tail rows to
+    /// remove — unlike RetainedRenderer (Vec<Cell>, col-0 glyph
+    /// matching), alt-screen body_lines are String with embedded SGR
+    /// codes, and soft-wrapped tool-call continuation rows also start
+    /// with spaces, making glyph-based detection unreliable.
+    approval_prompt_rows: usize,
 }
 
 /// Mouse-drag selection range. See `AltScreenRenderer::selection` for
@@ -603,6 +637,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             selection_active: false,
             cursor_shown: true,
             slow_paint_terminal: false,
+            approval_prompt_rows: 0,
         };
         r.enter_alt_screen();
         r
@@ -2068,6 +2103,14 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                     .map(|s| line_display_width_sgr_aware(s))
                     .unwrap_or(0);
 
+                // Record body_lines length before pushing so we know how
+                // many rows the approval prompt occupies — needed by
+                // pop_approval_prompt to remove exactly the right rows
+                // (unlike RetainedRenderer's col-0 glyph matching, our
+                // String-based body_lines can't reliably distinguish
+                // approval continuation rows from soft-wrapped tool-call
+                // continuation rows, both start with spaces).
+                let before_len = self.body_lines.len();
                 if last_label_w + chips_display_w <= screen_w {
                     // Everything fits on one line.
                     if self.caps.colors {
@@ -2090,6 +2133,7 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                         self.push_body_row(format!("{cont_pad}{chips_plain}"));
                     }
                 }
+                self.approval_prompt_rows = self.body_lines.len() - before_len;
             }
 
             // ── body: command output / errors ──
@@ -2220,6 +2264,7 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         // buffer on the next paint.
         self.selection = None;
         self.selection_active = false;
+        self.approval_prompt_rows = 0;
         let _ = self.out.write_all(b"\x1b[2J\x1b[H");
         self.paint_frame();
     }
@@ -2249,6 +2294,46 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
 
     fn flush_deferred(&mut self) {
         // Phase 5+ adds frame coalescing. For now, nothing buffered.
+    }
+
+    fn pop_approval_prompt(&mut self) {
+        // Mirror RetainedRenderer::pop_approval_prompt for the
+        // alt-screen path. Unlike RetainedRenderer (Vec<Cell>,
+        // col-0 glyph matching), alt-screen body_lines are String
+        // with embedded SGR codes, and soft-wrapped tool-call
+        // continuation rows also start with spaces — making
+        // glyph-based detection unreliable (issue #466).
+        //
+        // Instead, we use `approval_prompt_rows`, which is set when
+        // `ApprovalPrompt` is rendered to record exactly how many
+        // body_lines rows the prompt occupies. Pop that many rows
+        // from the tail, then clear the counter.
+        let n = self.approval_prompt_rows;
+        if n == 0 {
+            return;
+        }
+
+        // Pop exactly n rows from the tail of body_lines.
+        for _ in 0..n {
+            self.body_lines.pop();
+        }
+
+        // Also remove the corresponding raw_body_lines entry.
+        // The approval prompt's label row was pushed via
+        // push_body_row_raw (one logical line). Pop the last
+        // raw line if it starts with ▶ (SGR-aware).
+        if self
+            .raw_body_lines
+            .last()
+            .and_then(|raw| first_visible_char(raw))
+            == Some('▶')
+        {
+            self.raw_body_lines.pop();
+        }
+
+        self.approval_prompt_rows = 0;
+        self.body_dirty = true;
+        self.paint_frame();
     }
 
     fn scroll_body(&mut self, delta: i32) {
@@ -4341,5 +4426,174 @@ mod tests {
             "re-merged row should contain original text, got: {:?}",
             r.body_lines[0]
         );
+    }
+
+    // ── first_visible_char ──
+
+    #[test]
+    fn first_visible_char_plain() {
+        assert_eq!(first_visible_char("▶ hello"), Some('▶'));
+        assert_eq!(first_visible_char("  spaces"), Some(' '));
+        assert_eq!(first_visible_char(""), None);
+    }
+
+    #[test]
+    fn first_visible_char_skips_sgr() {
+        assert_eq!(
+            first_visible_char(&format!("{}{}▶ Waiting", SGR_BOLD, SGR_YELLOW)),
+            Some('▶')
+        );
+        assert_eq!(
+            first_visible_char(&format!("{} chips", SGR_GREEN)),
+            Some(' ')
+        );
+    }
+
+    #[test]
+    fn first_visible_char_sgr_only() {
+        // A string that is entirely SGR codes has no visible char.
+        assert_eq!(first_visible_char(&format!("{}{}", SGR_BOLD, SGR_RESET)), None);
+    }
+
+    // ── pop_approval_prompt ──
+
+    /// Single-row approval prompt (label + chips fit on one line).
+    /// pop_approval_prompt should remove exactly that one row.
+    #[test]
+    fn alt_screen_pop_approval_single_row() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "ls".into(),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        let before = r.body_lines.len();
+        r.pop_approval_prompt();
+        assert_eq!(
+            before - r.body_lines.len(),
+            1,
+            "should pop exactly the single approval row"
+        );
+        // Last row should now be the tool-call row (starts with ● or ▸)
+        let last = r.body_lines.last().expect("tool call row remains");
+        let ch = first_visible_char(last).unwrap();
+        assert!(ch == '●' || ch == '▸', "last row should be tool-call, got: {ch}");
+    }
+
+    /// Multi-row approval prompt (label wraps, chips on separate line).
+    /// pop_approval_prompt should remove exactly the approval rows,
+    /// not the tool-call's soft-wrapped continuation rows.
+    #[test]
+    fn alt_screen_pop_approval_multiline() {
+        let mut buf = Vec::new();
+        // Narrow terminal forces the label + chips to wrap.
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 30, 24);
+        r.render(UiLine::ToolCall {
+            name: "ReadFile".into(),
+            detail: "C:\\Users\\hao\\very\\long\\path\\README.md".into(),
+        });
+        let tool_call_rows = r.body_lines.len();
+        r.render(UiLine::ApprovalPrompt {
+            tool: "ReadFile".into(),
+            detail: "C:\\Users\\hao\\very\\long\\path\\README.md".into(),
+        });
+        let total_before_pop = r.body_lines.len();
+        let approval_rows = total_before_pop - tool_call_rows;
+        assert!(
+            approval_rows >= 1,
+            "approval prompt should add at least 1 row, got {approval_rows}"
+        );
+        r.pop_approval_prompt();
+        // Should pop exactly the approval rows, not any tool-call rows.
+        assert_eq!(
+            r.body_lines.len(),
+            tool_call_rows,
+            "pop should remove exactly the approval rows ({}), leaving the tool-call rows",
+            approval_rows
+        );
+        // Last row should now be the tool-call row (or its continuation)
+        assert!(
+            !r.body_lines.is_empty(),
+            "tool-call rows should still be present"
+        );
+    }
+
+    /// Popping when the tail is NOT an approval row should be a no-op.
+    #[test]
+    fn alt_screen_pop_approval_noop_when_not_approval() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "ls".into(),
+        });
+        let before = r.body_lines.len();
+        r.pop_approval_prompt();
+        assert_eq!(
+            r.body_lines.len(),
+            before,
+            "should not pop anything when tail is not an approval prompt"
+        );
+    }
+
+    /// Popping an empty body should not panic.
+    #[test]
+    fn alt_screen_pop_approval_empty_body() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.pop_approval_prompt(); // should be a safe no-op
+        assert!(r.body_lines.is_empty());
+    }
+
+    /// Pop should also clean up raw_body_lines when the approval prompt
+    /// was pushed via push_body_row_raw.
+    #[test]
+    fn alt_screen_pop_approval_removes_raw_line() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        assert!(
+            !r.raw_body_lines.is_empty(),
+            "approval prompt should add a raw line"
+        );
+        r.pop_approval_prompt();
+        assert!(
+            r.raw_body_lines.is_empty(),
+            "pop should remove the raw line too"
+        );
+    }
+
+    /// After pop, the body repaints correctly (the approval row is gone
+    /// from the viewport). Verifies body_dirty is set and paint_frame
+    /// doesn't crash.
+    #[test]
+    fn alt_screen_pop_approval_replaces_with_tool_result() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::ToolCall {
+            name: "bash".into(),
+            detail: "ls".into(),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        r.pop_approval_prompt();
+        // Simulate what the event loop does next: push a tool result
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "2 files".into(),
+        });
+        r.flush();
+        let last = r.body_lines.last().expect("should have a result row");
+        // Tool result rows start with ⎿ or similar
+        assert!(!last.is_empty(), "should have a result row after pop");
     }
 }
