@@ -198,7 +198,14 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
         match part.parse::<u32>().ok() {
             Some(0) => *style = CellStyle::default(),
             Some(1) => style.bold = true,
-            Some(22) => style.bold = false,
+            Some(2) => style.faint = true,
+            Some(22) => {
+                // ECMA-48 22 = normal intensity — clears both bold AND
+                // faint as a pair. There is no per-attribute toggle for
+                // faint, so bold→off and faint→off both route through 22.
+                style.bold = false;
+                style.faint = false;
+            }
             // Italic (3/23) — no CellStyle bit; text renders plain.
             Some(3) | Some(23) => {}
             Some(7) => style.reverse = true,
@@ -3290,29 +3297,35 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 fn build_one_row(text: &str, style: &CellStyle, screen_w: u16) -> Vec<Cell> {
     let avail = (screen_w as usize).saturating_sub(PAD_COL);
     let safe = scrub_controls(text);
-    let truncated = if safe.chars().count() > avail.max(1) {
-        let take_n = avail.saturating_sub(1).max(1);
-        let mut s: String = safe.chars().take(take_n).collect();
-        s.push('…');
-        s
-    } else {
-        safe
-    };
+    // Width-aware truncation: CJK glyphs occupy 2 cols each, so a row of
+    // 30 汉字 (60 cols) on a 40-col screen must trip truncate and append `…`,
+    // not slip past the chars().count() check and leak past the screen edge.
+    let truncated = crate::width::truncate_with_ellipsis(&safe, avail.max(1));
     let mut row = Vec::new();
     push_str_cells(&mut row, &truncated, style);
     row
 }
 
-/// Truncate `body_str` to at most `max_chars` display-width characters,
-/// preserving whole characters (not splitting multi-byte sequences).
-/// This is a rendering safeguard to prevent degenerate bodies
-/// (e.g. multi-KB bash commands) from producing hundreds of terminal lines.
-fn truncate_body_str(body_str: &str, max_chars: usize) -> String {
-    if let Some((idx, _)) = body_str.char_indices().nth(max_chars) {
-        format!("{}… (truncated)", &body_str[..idx])
-    } else {
-        body_str.to_string()
+/// Truncate `body_str` so its display width is at most `max_cols`,
+/// preserving grapheme clusters (never splits a multi-codepoint emoji or
+/// a CJK glyph). Appends `… (truncated)` when a cut happened.
+///
+/// Rendering safeguard against degenerate bodies (e.g. multi-KB bash
+/// commands) producing hundreds of terminal lines.
+fn truncate_body_str(body_str: &str, max_cols: usize) -> String {
+    if crate::width::display_width(body_str) <= max_cols {
+        return body_str.to_string();
     }
+    let suffix = "… (truncated)";
+    let suffix_w = crate::width::display_width(suffix);
+    let budget = max_cols.saturating_sub(suffix_w);
+    if budget == 0 {
+        // Budget too small to fit even one cluster of body + the suffix.
+        // Emit just the suffix, capped at max_cols.
+        return crate::width::truncate_to_width(suffix, max_cols);
+    }
+    let head = crate::width::truncate_to_width(body_str, budget);
+    format!("{}{}", head, suffix)
 }
 
 /// Pluck the metadata suffix (` · 12s` and/or ` · N queued`) out of a
@@ -7324,5 +7337,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- width-aware truncation tests (Bug B) ---
+    //
+    // ToolGroup rows are forced to single terminal lines so child indices map
+    // 1:1 with terminal positions for in-place CUP rewrites. Pre-fix the
+    // truncators counted code points instead of display columns, so a row of
+    // 30 汉字 (60 cols) on a 40-col screen never tripped the truncate branch
+    // and the wide cells leaked past the screen edge — Screen::draw_row then
+    // hard-cut mid-glyph with no `…` marker.
+
+    #[test]
+    fn build_one_row_cjk_does_not_overflow_screen() {
+        // 30 汉字 = 60 display cols. Screen 40 → avail = 40 - PAD_COL = 38.
+        // Row's summed cell widths must fit within avail.
+        let text = "你".repeat(30);
+        let row = build_one_row(&text, &CellStyle::default(), 40);
+        let total_cols: usize = row.iter().map(|c| c.width as usize).sum();
+        assert!(
+            total_cols <= 38,
+            "row width {} cols exceeds avail 38 (screen=40, PAD_COL=2)",
+            total_cols
+        );
+    }
+
+    #[test]
+    fn truncate_body_str_uses_display_width_not_char_count() {
+        // 50 汉字 = 100 display cols. Budget 10 means "≤10 display cols of
+        // visible content"; the old `char_indices().nth(10)` cut after 10 code
+        // points (= 20 cols) which still overflows narrow ToolGroup rows.
+        let out = truncate_body_str(&"你".repeat(50), 10);
+        let w = crate::width::display_width(&out);
+        assert!(w <= 10, "output {} cols exceeds budget 10", w);
+    }
+
+    // --- SGR parser parity (Bug C) ---
+    //
+    // `CellStyle.faint` exists (cell.rs:48) and `cell::apply_sgr_params`
+    // already honors SGR 2 + clears it on SGR 22. The retained.rs local
+    // parser was missing both — commit 24b6dc04 switched the resumed
+    // divider to `\x1b[2m`, but trusted output routed through this parser
+    // would silently drop dim.
+
+    #[test]
+    fn apply_sgr_handles_faint_sgr_2() {
+        let mut style = CellStyle::default();
+        apply_sgr("2", &mut style);
+        assert!(style.faint, "SGR 2 must set faint");
+    }
+
+    #[test]
+    fn apply_sgr_22_clears_both_bold_and_faint() {
+        let mut style = CellStyle {
+            bold: true,
+            faint: true,
+            ..CellStyle::default()
+        };
+        apply_sgr("22", &mut style);
+        // ECMA-48 22 = "normal intensity" — clears bold AND faint as a pair;
+        // there's no per-attribute toggle for faint.
+        assert!(!style.bold, "SGR 22 must clear bold");
+        assert!(!style.faint, "SGR 22 must clear faint");
     }
 }
