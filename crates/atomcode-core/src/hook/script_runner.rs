@@ -261,43 +261,23 @@ mod tests {
 
     #[test]
     fn config_default_script_type() {
-        let config = ScriptHookConfig {
-            name: "test".into(),
-            trigger: "pre_tool".into(),
-            script: PathBuf::from("test.sh"),
-            script_type: Default::default(),
-            enabled: Default::default(),
-            timeout_secs: Default::default(),
-            description: Default::default(),
-        };
+        // Test serde defaults by deserializing from minimal JSON
+        let json = r#"{"name":"test","trigger":"pre_tool","script":"test.sh"}"#;
+        let config: ScriptHookConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.script_type, "shell");
     }
 
     #[test]
     fn config_default_enabled() {
-        let config = ScriptHookConfig {
-            name: "test".into(),
-            trigger: "pre_tool".into(),
-            script: PathBuf::from("test.sh"),
-            script_type: Default::default(),
-            enabled: Default::default(),
-            timeout_secs: Default::default(),
-            description: Default::default(),
-        };
+        let json = r#"{"name":"test","trigger":"pre_tool","script":"test.sh"}"#;
+        let config: ScriptHookConfig = serde_json::from_str(json).unwrap();
         assert!(config.enabled);
     }
 
     #[test]
     fn config_default_timeout() {
-        let config = ScriptHookConfig {
-            name: "test".into(),
-            trigger: "pre_tool".into(),
-            script: PathBuf::from("test.sh"),
-            script_type: Default::default(),
-            enabled: Default::default(),
-            timeout_secs: Default::default(),
-            description: Default::default(),
-        };
+        let json = r#"{"name":"test","trigger":"pre_tool","script":"test.sh"}"#;
+        let config: ScriptHookConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.timeout_secs, 2);
     }
 
