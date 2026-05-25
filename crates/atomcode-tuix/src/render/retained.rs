@@ -2115,6 +2115,42 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .splice(0..self.welcome_line_count, rows.into_iter());
         self.welcome_line_count = new_len;
     }
+
+    /// Force a fresh paint of body region rows from body_lines.
+    /// In view_mode: paint body_lines[viewport_top..viewport_top+body_height].
+    /// Out of view_mode (just exited): paint body_lines tail.
+    /// Always uses CUP+EL+content per row; never emits LF.
+    fn repaint_body_region(&mut self) {
+        let bottom = self.body_bottom_row();
+        if bottom == 0 || self.body_lines.is_empty() {
+            return;
+        }
+        let body_height = bottom as usize;
+        let total = self.body_lines.len();
+        let start = if self.view_mode {
+            self.viewport_top.min(total.saturating_sub(1))
+        } else {
+            total.saturating_sub(body_height)
+        };
+        let end = (start + body_height).min(total);
+        // Clone the slice to avoid simultaneous borrow of self.
+        let rows: Vec<Vec<Cell>> = self.body_lines[start..end].to_vec();
+        for (i, row) in rows.iter().enumerate() {
+            let target_row = 1 + i as u16;
+            let seq = format!("\x1b[{};1H\x1b[K", target_row);
+            let _ = self.out.write_all(seq.as_bytes());
+            let bytes = serialize_row(row);
+            let _ = self.out.write_all(&bytes);
+        }
+        // Clear any rows below content (when body_lines is short).
+        for i in (end - start)..body_height {
+            let target_row = 1 + i as u16;
+            let seq = format!("\x1b[{};1H\x1b[K", target_row);
+            let _ = self.out.write_all(seq.as_bytes());
+        }
+        let _ = self.out.flush();
+        self.screen.invalidate();
+    }
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -3249,6 +3285,64 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             );
         }
         let _ = self.out.flush();
+    }
+
+    fn scroll_body(&mut self, delta: i32) {
+        let body_height = self.body_bottom_row() as usize;
+        let total = self.body_lines.len();
+        let max_top = total.saturating_sub(body_height);
+        if max_top == 0 {
+            // Nothing to scroll; stay sticky.
+            self.sticky_bottom = true;
+            self.view_mode = false;
+            return;
+        }
+        let current_top = if self.sticky_bottom {
+            max_top
+        } else {
+            self.viewport_top
+        };
+        let new_top: usize = if delta < 0 {
+            current_top.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            (current_top + delta as usize).min(max_top)
+        };
+        self.viewport_top = new_top;
+        self.sticky_bottom = new_top >= max_top;
+        let was_view = self.view_mode;
+        self.view_mode = !self.sticky_bottom;
+        // Trigger paint. When transitioning out of view_mode (was_view=true,
+        // view_mode=false), the next paint_body must repaint the body tail
+        // without a `\n` scroll (handled in P3.5).
+        if was_view != self.view_mode || self.view_mode {
+            self.repaint_body_region();
+        }
+    }
+
+    fn scroll_body_to_top(&mut self) {
+        let body_height = self.body_bottom_row() as usize;
+        let total = self.body_lines.len();
+        if total <= body_height {
+            return;
+        }
+        self.viewport_top = 0;
+        self.sticky_bottom = false;
+        self.view_mode = true;
+        self.repaint_body_region();
+    }
+
+    fn scroll_body_to_bottom(&mut self) {
+        let was_view = self.view_mode;
+        self.viewport_top = self
+            .body_lines
+            .len()
+            .saturating_sub(self.body_bottom_row() as usize);
+        self.sticky_bottom = true;
+        self.view_mode = false;
+        if was_view {
+            // Exiting view: repaint body tail without LF (Task 3.5).
+            self.repaint_body_region();
+        }
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
@@ -7561,5 +7655,42 @@ mod tests {
         // 5010 / 2 = 2505 marks dropped; 5005 - 2505 = 2500 survive.
         assert_eq!(r.message_marks.len(), 2500);
         assert_eq!(r.message_marks[0].line_idx, 0, "first surviving mark should point at body_lines[0] after drain");
+    }
+
+    #[test]
+    fn retained_scroll_up_enters_view_mode() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        for i in 0..30 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        assert!(r.sticky_bottom);
+        assert!(!r.view_mode);
+        r.scroll_body(-3);
+        assert!(r.view_mode, "scroll up must enter view_mode");
+        assert!(!r.sticky_bottom);
+    }
+
+    #[test]
+    fn retained_scroll_to_bottom_exits_view_mode() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        for i in 0..30 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.scroll_body(-5);
+        assert!(r.view_mode);
+        r.scroll_body_to_bottom();
+        assert!(!r.view_mode);
+        assert!(r.sticky_bottom);
+    }
+
+    #[test]
+    fn retained_scroll_up_then_to_top_lands_at_zero() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        for i in 0..30 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.scroll_body_to_top();
+        assert_eq!(r.viewport_top, 0);
+        assert!(r.view_mode);
     }
 }
