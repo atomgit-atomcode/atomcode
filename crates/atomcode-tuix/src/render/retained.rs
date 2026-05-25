@@ -3800,6 +3800,31 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 }
 
+impl<W: Write + Send> Drop for RetainedRenderer<W> {
+    /// Belt-and-suspenders mouse-capture release. `shutdown()` already
+    /// runs on graceful exit, but a panic anywhere above this layer
+    /// (e.g. inside `paint_frame`, channel send failures, OOM in a
+    /// downstream consumer) bypasses `shutdown()` and leaves the host
+    /// shell receiving SGR mouse reports (`\x1b[<0;X;YM`) as stdin
+    /// garbage every time the user clicks. AltScreenRenderer already
+    /// has the equivalent Drop at alt_screen.rs:2208; without this
+    /// retained leaves the terminal in a broken state on any panic
+    /// after `with_writer` ran.
+    ///
+    /// Minimal cleanup only — no paint, no flush retries, no body
+    /// promotion. The mouse mode toggle is idempotent: `shutdown()`
+    /// emits the same bytes earlier on the graceful path, and the
+    /// terminal accepts the duplicate disable as a no-op.
+    fn drop(&mut self) {
+        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        #[cfg(windows)]
+        if let Some(prior) = self.prior_console_in_mode.take() {
+            crate::render::conhost::restore_conhost_console_in_mode(prior);
+        }
+        let _ = self.out.flush();
+    }
+}
+
 /// Build a single-line row from `text`, flush-left at col 0, truncated
 /// with `…` when the text overflows the screen width. Used by the
 /// live-group rendering path (ToolGroupRender header / children /
@@ -8250,10 +8275,18 @@ mod tests {
     #[test]
     fn retained_with_writer_enables_mouse_capture() {
         let mut buf = Vec::new();
-        let _r = RetainedRenderer::with_writer(&mut buf, caps_with_color(), 80, 24);
+        let r = RetainedRenderer::with_writer(&mut buf, caps_with_color(), 80, 24);
+        // Drop the renderer FIRST — its Drop impl emits the mouse-OFF
+        // sequence, and the borrow checker won't let us read `buf` while
+        // `r` still holds a mutable borrow.
+        drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("\x1b[?1002h"), "must enable button-event tracking: {:?}", s);
         assert!(s.contains("\x1b[?1006h"), "must enable SGR coordinates: {:?}", s);
+        // Belt-and-suspenders: confirm Drop also emitted the disable
+        // sequence (same contract alt_screen tests pin at alt_screen.rs:2244).
+        assert!(s.contains("\x1b[?1002l"), "Drop must emit mouse-mode disable (1002l): {:?}", s);
+        assert!(s.contains("\x1b[?1006l"), "Drop must emit mouse-mode disable (1006l): {:?}", s);
     }
 
     #[test]
