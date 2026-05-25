@@ -49,8 +49,10 @@ mod tests {
     use super::*;
     use std::env;
     use tempfile::TempDir;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn ui_state_round_trip_via_atomcode_home() {
         let td = TempDir::new().unwrap();
         env::set_var("ATOMCODE_HOME", td.path());
@@ -62,6 +64,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn ui_state_missing_file_returns_default() {
         let td = TempDir::new().unwrap();
         env::set_var("ATOMCODE_HOME", td.path());

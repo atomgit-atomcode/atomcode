@@ -56,3 +56,4 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 [dev-dependencies]
 tempfile = "3"
 vte = "0.15.0"
+serial_test = "3"
