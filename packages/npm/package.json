@@ -1,0 +1,25 @@
+{
+  "name": "@atomgit.com/atomcode",
+  "version": "0.0.0-dev",
+  "description": "Open-source terminal AI coding agent — connect any LLM, edit code, run commands, verify autonomously",
+  "keywords": ["ai", "coding", "cli", "agent", "terminal", "llm"],
+  "homepage": "https://atomgit.com/atomgit_atomcode/atomcode",
+  "repository": {
+    "type": "git",
+    "url": "git+https://atomgit.com/atomgit_atomcode/atomcode.git"
+  },
+  "license": "MIT",
+  "author": "AtomGit",
+  "bin": {
+    "atomcode": "./bin/atomcode.js"
+  },
+  "files": [
+    "bin/atomcode.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
