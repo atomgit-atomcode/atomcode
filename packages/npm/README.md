@@ -55,7 +55,7 @@ npm 版本号与 AtomCode 发布版本一致。详见 [Releases](https://atomgit
 
 - [源码仓库](https://atomgit.com/atomgit_atomcode/atomcode)
 - [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues)
-- [许可证](https://atomgit.com/atomgit_atomcode/atomcode/src/main/LICENSE)
+- [许可证](https://atomgit.com/atomgit_atomcode/atomcode/blob/main/LICENSE)
 
 ---
 
