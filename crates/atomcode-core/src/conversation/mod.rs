@@ -116,6 +116,32 @@ impl Conversation {
         self.turn_tracker.on_user_message(idx);
     }
 
+    /// Add an agent-authored synthetic message through the `Role::User`
+    /// channel — `[Additional context from user]`, `Output limit hit`
+    /// self-prompts, `[Context was compressed]` state summaries, etc.
+    /// See `Message.synthetic` doc for the full rationale.
+    ///
+    /// Same API-compat merge behavior as `add_user_message` (avoids two
+    /// consecutive `Role::User` messages which break OpenAI-compatible
+    /// providers), BUT the merge preserves the EXISTING message's
+    /// `synthetic` flag — appending synthetic content to a real user
+    /// prompt doesn't reclassify the real prompt as synthetic. Only a
+    /// freshly-pushed message carries `synthetic = true`.
+    pub fn add_synthetic_user_message(&mut self, content: &str) {
+        if let Some(last) = self.messages.last_mut() {
+            if matches!(last.role, Role::User) {
+                if let MessageContent::Text(ref mut text) = last.content {
+                    text.push('\n');
+                    text.push_str(content);
+                    return;
+                }
+            }
+        }
+        let idx = self.messages.len();
+        self.messages.push(Message::synthetic_user(content));
+        self.turn_tracker.on_user_message(idx);
+    }
+
     /// Cancel the current active turn: save all conversation content up to
     /// the moment of cancel. The user cancelled because they want to
     /// redirect the model, not because they want to lose context — the
@@ -180,6 +206,7 @@ impl Conversation {
                     output: "(cancelled)".into(),
                     success: false,
                 }),
+                            synthetic: false,
             });
             self.turn_tracker.on_message_added(idx);
         }
@@ -260,6 +287,7 @@ impl Conversation {
                 reasoning_content: reasoning.map(|s| s.to_string()),
                 thinking_blocks,
             },
+                    synthetic: false,
         });
         self.turn_tracker.on_message_added(idx);
     }
@@ -269,6 +297,7 @@ impl Conversation {
         self.messages.push(Message {
             role: Role::Tool,
             content: MessageContent::ToolResult(result),
+                    synthetic: false,
         });
         self.turn_tracker.on_message_added(idx);
     }
@@ -1578,6 +1607,7 @@ mod tests {
                 byte_size: 20_000,
                 success: true,
             }),
+                    synthetic: false,
         });
         conv.turn_tracker.on_message_added(idx);
 
@@ -1767,6 +1797,7 @@ mod tests {
                     byte_size: 10_000,
                     success: true,
                 }),
+                            synthetic: false,
             });
             conv.turn_tracker.on_message_added(idx);
         }
@@ -1827,6 +1858,7 @@ mod tests {
                 byte_size: 50_000,
                 success: true,
             }),
+                    synthetic: false,
         });
         conv.turn_tracker.on_message_added(idx);
 
@@ -2035,5 +2067,74 @@ mod tests {
         // Only the previous turn survives
         assert_eq!(conv.turn_tracker.turns.len(), 1);
         assert_eq!(conv.turn_tracker.turns[0].status, TurnStatus::Completed);
+    }
+
+    // ── add_synthetic_user_message tests ──────────────────────────────
+
+    /// `add_synthetic_user_message` pushes a Message with `synthetic =
+    /// true`, distinguishable from real user messages. Compaction relies
+    /// on this distinction to find the original prompt.
+    #[test]
+    fn add_synthetic_user_message_marks_message_synthetic() {
+        let mut conv = Conversation::new();
+        // First add an assistant message so add_synthetic_user_message
+        // doesn't try to merge into a User predecessor.
+        conv.messages.push(Message::new(Role::Assistant, "ack"));
+        conv.add_synthetic_user_message("[Context was compressed.] state");
+        assert_eq!(conv.messages.len(), 2);
+        let last = conv.messages.last().unwrap();
+        assert!(
+            last.synthetic,
+            "synthetic injection must carry synthetic=true"
+        );
+        assert!(matches!(last.role, Role::User));
+    }
+
+    /// Critical: `add_synthetic_user_message` invoked when the previous
+    /// message is a real user message MUST merge into it (API-compat
+    /// against consecutive User messages) AND keep the existing
+    /// `synthetic=false` flag. Otherwise a real prompt would be
+    /// reclassified as synthetic just because synthetic content was
+    /// appended — exactly the failure mode `synthetic` is meant to
+    /// prevent.
+    #[test]
+    fn synthetic_merge_into_real_user_preserves_real_flag() {
+        let mut conv = Conversation::new();
+        conv.add_user_message("real original prompt");
+        conv.add_synthetic_user_message("[Additional context]: synthetic appended");
+
+        assert_eq!(conv.messages.len(), 1, "merge collapses into one message");
+        let m = &conv.messages[0];
+        assert!(
+            !m.synthetic,
+            "merged message keeps existing `synthetic=false` — origin is real"
+        );
+        assert!(
+            m.text().unwrap().contains("real original prompt"),
+            "real text preserved"
+        );
+        assert!(
+            m.text().unwrap().contains("[Additional context]"),
+            "synthetic body still appended"
+        );
+    }
+
+    /// Symmetric merge case: synthetic-into-synthetic. When the last
+    /// message is already synthetic and we add another synthetic, the
+    /// merge collapses them and the flag stays true (no real authorship
+    /// was introduced).
+    #[test]
+    fn synthetic_merge_into_synthetic_keeps_flag_true() {
+        let mut conv = Conversation::new();
+        // Need a non-User predecessor so the FIRST synthetic creates a
+        // new message, not merges.
+        conv.messages.push(Message::new(Role::Assistant, "ack"));
+        conv.add_synthetic_user_message("[Output limit hit]");
+        conv.add_synthetic_user_message("[Context was compressed]");
+        assert_eq!(conv.messages.len(), 2);
+        assert!(
+            conv.messages[1].synthetic,
+            "two synthetics merged stays synthetic"
+        );
     }
 }

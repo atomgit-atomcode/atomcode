@@ -6620,10 +6620,14 @@ pub(crate) fn apply_session_messages(
         || session.name.trim_start().starts_with('[');
     if should_rename {
         use atomcode_core::conversation::message::Role;
+        // Primary signal: `Message.synthetic` field (accurate for sessions
+        // saved after the field landed). Secondary signal: bracket-prefix
+        // legacy heuristic for sessions saved before the field existed
+        // and so default-loaded as `synthetic = false`.
         let first_real_user = session
             .messages
             .iter()
-            .filter(|m| matches!(m.role, Role::User))
+            .filter(|m| matches!(m.role, Role::User) && !m.synthetic)
             .find_map(|m| m.text().filter(|t| !is_synthetic_user_text(t)));
         if let Some(text) = first_real_user {
             let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();

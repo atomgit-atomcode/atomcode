@@ -1399,6 +1399,7 @@ mod tests {
                     data: "AAAA".to_string(),
                 }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         assert_eq!(out.len(), 1, "one message in, one out");
@@ -1431,6 +1432,7 @@ mod tests {
                     ImagePart { media_type: "image/jpeg".into(), data: "SECOND".into() },
                 ],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         let content = out[0]["content"].as_array().unwrap();
@@ -1451,6 +1453,7 @@ mod tests {
                 text: None,
                 images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         let content = out[0]["content"].as_array().unwrap();
@@ -1477,6 +1480,7 @@ mod tests {
                 text: Some("[Image #1] 这是什么图啊".into()),
                 images: vec![ImagePart { media_type: "image/png".into(), data: "AAAA".into() }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
         assert_eq!(out.len(), 1);
@@ -1516,6 +1520,7 @@ mod tests {
                 text: None,
                 images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
         let content = out[0]["content"].as_str().expect("string content");
@@ -1717,6 +1722,7 @@ mod tests {
                 reasoning_content: reasoning.map(|s| s.to_string()),
                 thinking_blocks: Vec::new(),
             },
+            synthetic: false,
         }
     }
 
@@ -1778,6 +1784,7 @@ mod tests {
         let msgs = vec![Message {
             role: Role::Assistant,
             content: MessageContent::Text("当前系统时间是 …".into()),
+                    synthetic: false,
         }];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
@@ -2034,6 +2041,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: MessageContent::Text("hi".into()),
+                    synthetic: false,
         };
         let mut stream = p.chat_stream(&[msg], None).expect("stream");
         let mut out = Vec::new();

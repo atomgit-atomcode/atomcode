@@ -1284,6 +1284,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: MessageContent::ToolResultRef(big_ref),
+                    synthetic: false,
         };
         // (5 + 10) / 4 + 4 = 7. Pre-fix this was (200000 + 10) / 4 + 4 = 50006.
         assert!(
@@ -1572,6 +1573,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -1580,6 +1582,7 @@ mod tests {
                     output: format!("first line for {}\n{}", name, "x".repeat(4_000)),
                     success: *success,
                 }),
+                            synthetic: false,
             });
         }
 
@@ -1839,6 +1842,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -1847,6 +1851,7 @@ mod tests {
                     output: format!("[elapsed: 0.0s, exit: 0]\n{}", "p".repeat(4_000)),
                     success: true,
                 }),
+                            synthetic: false,
             });
         }
 
@@ -1866,6 +1871,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -1874,6 +1880,7 @@ mod tests {
                     output: format!("[elapsed: 0.0s, exit: 0]\n{}", "c".repeat(4_000)),
                     success: true,
                 }),
+                            synthetic: false,
             });
         }
 
@@ -2212,6 +2219,7 @@ mod tests {
                     output: "some output".to_string(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message::new(Role::User, "hello"),
         ];
@@ -2240,6 +2248,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2248,6 +2257,7 @@ mod tests {
                     output: "ok".to_string(),
                     success: true,
                 }),
+                            synthetic: false,
             },
         ];
         sanitize_messages(&mut msgs);
@@ -2291,6 +2301,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2299,6 +2310,7 @@ mod tests {
                     output: "ok1".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2307,6 +2319,7 @@ mod tests {
                     output: "ok2".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             // c3 result MISSING — the source of the 400.
             Message::new(Role::User, "second"),
@@ -2346,6 +2359,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2354,6 +2368,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             // a2 missing.
             Message {
@@ -2368,6 +2383,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2376,6 +2392,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
         ];
         sanitize_messages(&mut msgs);
@@ -2417,6 +2434,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2425,6 +2443,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             // c2 missing, conversation ends here.
         ];
@@ -2462,6 +2481,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2470,6 +2490,7 @@ mod tests {
                     output: "ok1".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2478,6 +2499,7 @@ mod tests {
                     output: "ok2".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message::new(Role::Assistant, "done"),
             Message::new(Role::User, "second"),
@@ -2608,6 +2630,7 @@ mod tests {
                         reasoning_content: None,
                         thinking_blocks: Vec::new(),
                     },
+                                    synthetic: false,
                 });
                 msgs.push(Message {
                     role: Role::Tool,
@@ -2616,6 +2639,7 @@ mod tests {
                         output: "x".repeat(1000),
                         success: true,
                     }),
+                                    synthetic: false,
                 });
             }
             msgs

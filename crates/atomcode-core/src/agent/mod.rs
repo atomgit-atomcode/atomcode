@@ -1633,6 +1633,7 @@ impl AgentLoop {
                     text: if clean.is_empty() { None } else { Some(clean.clone()) },
                     images,
                 },
+                synthetic: false,
             };
             let idx = self.conversation.messages.len();
             self.conversation.messages.push(msg);
@@ -1747,7 +1748,7 @@ impl AgentLoop {
             // Inject any pending user input appended during streaming.
             if let Some(input) = self.pending_input.take() {
                 self.conversation
-                    .add_user_message(&format!("[Additional context from user]: {}", input));
+                    .add_synthetic_user_message(&format!("[Additional context from user]: {}", input));
             }
 
             // Planning phase: inject planning reminder on turn 3.
@@ -2342,7 +2343,7 @@ impl AgentLoop {
                     // Reverting to the principled state machine.
                     if truncated && self.retry_count < 1 {
                         self.retry_count += 1;
-                        self.conversation.add_user_message(
+                        self.conversation.add_synthetic_user_message(
                             "Output limit hit. If the task is already complete, just output a \
                              short summary and stop (no tool calls). Otherwise resume where you left off."
                         );
@@ -2645,7 +2646,7 @@ impl AgentLoop {
             &self.files_edited_this_turn,
             &self.files_read_this_turn,
         ) {
-            self.conversation.add_user_message(&msg);
+            self.conversation.add_synthetic_user_message(&msg);
         }
     }
 
@@ -3160,35 +3161,43 @@ fn reload_should_clear_conversation(
 /// messages, since that's how `truncate(len - 4)` corrupted state.
 ///
 /// Sacred invariants (won't violate even if it means staying over budget):
-/// 1. The last `User` message is kept (current task anchor).
-/// 2. The drop boundary snaps to a turn boundary so we never split a
+/// 1. The FIRST real user message is kept — it's the conversation
+///    anchor that `/resume` display starts from. Dropping it leaves
+///    the user with a session that opens on a tool_call with no
+///    visible reason for it.
+/// 2. The LAST real user message is kept — it's the current question
+///    the model is answering. Dropping it breaks the in-flight turn.
+/// 3. Both filters skip `synthetic` user messages — agent-authored
+///    injections like `[Context was compressed]` / `Output limit hit`
+///    / `[Additional context]` are plumbing, NOT user anchors. The
+///    pre-`synthetic`-field code matched any `Role::User` here and
+///    routinely picked a synthetic injection as the "last user",
+///    leaving the original prompt unprotected for the drain.
+/// 4. The drop boundary snaps to a turn boundary so we never split a
 ///    `tool_call` from its paired `tool_result`.
 fn hard_truncate_to_target(
     conv: &mut crate::conversation::Conversation,
     target_tokens: usize,
     sys_tokens: usize,
 ) {
-    use crate::conversation::message::{MessageContent, Role};
+    use crate::conversation::message::{Message, MessageContent, Role};
     if conv.messages.is_empty() {
         return;
     }
     let total_budget = target_tokens.saturating_sub(sys_tokens);
 
-    // Find the last User message — it must survive.
-    let last_user_idx = conv
-        .messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, m)| m.role == Role::User)
-        .map(|(i, _)| i);
+    let is_real_user = |m: &Message| m.role == Role::User && !m.synthetic;
+    let first_real_user_idx = conv.messages.iter().position(|m| is_real_user(m));
+    let last_real_user_idx = conv.messages.iter().rposition(|m| is_real_user(m));
 
     let mut kept_tokens = 0usize;
     let mut keep_from = conv.messages.len();
     for i in (0..conv.messages.len()).rev() {
         let mt = conv.messages[i].estimate_tokens();
-        // Always keep the last user message regardless of budget.
-        let is_sacred = Some(i) == last_user_idx;
+        // Sacred set: first AND last real user messages. Both pass
+        // through regardless of remaining budget.
+        let is_sacred =
+            Some(i) == first_real_user_idx || Some(i) == last_real_user_idx;
         if !is_sacred && kept_tokens + mt > total_budget && keep_from < conv.messages.len() {
             break;
         }
@@ -3207,11 +3216,13 @@ fn hard_truncate_to_target(
             _ => break,
         }
     }
-    // Don't skip past the sacred last-user index even if the boundary
-    // walker would have taken us there — better to ship one stub
-    // tool_result than to drop the user msg.
-    if let Some(lu) = last_user_idx {
+    // Don't skip past either sacred anchor. Better to ship over budget
+    // than to drop the original prompt or the current question.
+    if let Some(lu) = last_real_user_idx {
         keep_from = keep_from.min(lu);
+    }
+    if let Some(fr) = first_real_user_idx {
+        keep_from = keep_from.min(fr);
     }
 
     if keep_from > 0 {
@@ -4128,6 +4139,193 @@ mod bash_deleted_file_tracking_tests {
                 "/tmp/project/b.rs".to_string()
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod hard_truncate_tests {
+    use super::hard_truncate_to_target;
+    use crate::conversation::Conversation;
+    use crate::conversation::message::{Message, MessageContent, Role};
+    use crate::tool::{ToolCall, ToolResult};
+
+    /// Build a "real prompt → many tool calls → synthetic injection"
+    /// conversation matching the production bug scenario: user asks a
+    /// question, agent explores a codebase across many tool calls (each
+    /// chewing tokens), then the agent self-injects a synthetic
+    /// `[Context was compressed.]` user message before continuing.
+    /// Before this fix, `hard_truncate_to_target` would identify the
+    /// SYNTHETIC injection as "last user" and drop the original prompt.
+    fn build_real_then_synthetic_conv() -> Conversation {
+        let mut conv = Conversation::new();
+        conv.messages
+            .push(Message::new(Role::User, "ORIGINAL PROMPT: please explore the codebase and explain"));
+        // Pad with 10 turns of assistant tool_call + tool_result, each
+        // ~80-100 chars so total est ≥ ~300 tokens.
+        for i in 0..10 {
+            conv.messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: format!("c{}", i),
+                        name: "read_file".into(),
+                        arguments: format!(r#"{{"file_path":"src/module_{}.rs"}}"#, i),
+                    }],
+                    reasoning_content: None,
+                    thinking_blocks: Vec::new(),
+                },
+                synthetic: false,
+            });
+            conv.messages.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: format!("c{}", i),
+                    output: format!(
+                        "lots of file contents here for module {}, including \
+                         many lines of code that the agent had to read",
+                        i
+                    ),
+                    success: true,
+                }),
+                synthetic: false,
+            });
+        }
+        // The synthetic injection that triggered the bug. Role::User,
+        // synthetic=true, [...]-bracketed text.
+        conv.messages.push(Message::synthetic_user(
+            "[Context was compressed. Here is your current state:]\nTASK: explore the codebase",
+        ));
+        conv
+    }
+
+    /// Regression for the bug reported on /resume (2026-05-25): a
+    /// session that triggered hard_truncate would lose the original
+    /// user prompt because `last_user_idx` matched the synthetic
+    /// `[Context was compressed]` injection instead of the real prompt
+    /// at index 0. Resume then opened on a tool_call with no visible
+    /// reason for it and the JSON had no prompt to display.
+    ///
+    /// Post-fix: BOTH the first AND last real user messages are sacred.
+    /// The synthetic injection is filtered out by `!m.synthetic`, so
+    /// the only real user message (at index 0) is now both first AND
+    /// last real-user and is preserved no matter how tight the budget.
+    #[test]
+    fn hard_truncate_preserves_original_prompt_over_synthetic_injection() {
+        let mut conv = build_real_then_synthetic_conv();
+
+        // Tight budget: well below the conversation's total tokens. Pre-
+        // fix, `last_user_idx` would land on the synthetic injection
+        // (because it had Role::User), leaving messages[0] unprotected
+        // and the drain would silently delete the original prompt.
+        hard_truncate_to_target(&mut conv, /* target */ 80, /* sys */ 0);
+
+        // ── Primary assertion: messages[0] is still the real prompt. ──
+        let first = &conv.messages[0];
+        assert!(
+            !first.synthetic,
+            "messages[0] must be the REAL user prompt, not the synthetic injection"
+        );
+        assert!(
+            matches!(first.role, Role::User),
+            "messages[0] must be Role::User, got {:?}",
+            first.role
+        );
+        assert!(
+            first.text().unwrap_or("").contains("ORIGINAL PROMPT"),
+            "messages[0] must literally be the original prompt, got: {:?}",
+            first.text()
+        );
+        // ── Trade-off documented: with the original prompt at index 0
+        // both first_real_user AND last_real_user point there, so the
+        // sacred set forces `keep_from = 0` — compaction stays over
+        // budget in this scenario rather than dropping the anchor. We
+        // accept this: tier 1/2 (tool-result stubbing, LLM summary) are
+        // already non-destructive ways to reduce tokens; tier 3 only
+        // exists to drop OLD TURNS, and a single-turn conversation has
+        // none. Better to leave the convo intact than silently lose the
+        // prompt. The pre-fix behavior would have shrunk here — at the
+        // cost of breaking /resume display, which is the bug.
+    }
+
+    /// `last_user_idx` must also filter synthetics: in a multi-turn
+    /// conversation where the user sent two real prompts AND the agent
+    /// later injected a synthetic, the "last real user" should be the
+    /// second human prompt, not the post-synthetic injection. Verifies
+    /// the symmetric pole of the sacred set.
+    #[test]
+    fn hard_truncate_last_real_user_skips_trailing_synthetic() {
+        let mut conv = Conversation::new();
+        conv.messages.push(Message::new(Role::User, "first real prompt"));
+        for i in 0..6 {
+            conv.messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::AssistantWithToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: format!("a{}", i),
+                        name: "bash".into(),
+                        arguments: r#"{"command":"echo ok"}"#.into(),
+                    }],
+                    reasoning_content: None,
+                    thinking_blocks: Vec::new(),
+                },
+                synthetic: false,
+            });
+            conv.messages.push(Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    call_id: format!("a{}", i),
+                    output: "ok and lots of output filler bytes for token weight".into(),
+                    success: true,
+                }),
+                synthetic: false,
+            });
+        }
+        conv.messages
+            .push(Message::new(Role::User, "second real follow-up prompt"));
+        conv.messages.push(Message::synthetic_user(
+            "[Context was compressed.] dropped a bunch of stale state",
+        ));
+
+        hard_truncate_to_target(&mut conv, /* target */ 80, /* sys */ 0);
+
+        // Find what survived as the LAST user-role message — it should
+        // be the second REAL prompt, not the trailing synthetic.
+        let last_user = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::User))
+            .expect("at least one user message must survive");
+        // We may also see the trailing synthetic if it survived, so
+        // iterate further to find the most recent REAL one.
+        let last_real = conv
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::User) && !m.synthetic)
+            .expect("a real user message must survive");
+        assert!(
+            last_real
+                .text()
+                .unwrap_or("")
+                .contains("second real follow-up"),
+            "last real user must be the second real prompt, got: {:?}",
+            last_real.text()
+        );
+        // The trailing synthetic might or might not have survived
+        // depending on budget — what matters is that `last_user` (if it
+        // happens to be the synthetic) doesn't shadow the real one.
+        let _ = last_user;
+    }
+
+    /// Empty conversation: no-op, no panic. Covers the early-return.
+    #[test]
+    fn hard_truncate_empty_convo_is_noop() {
+        let mut conv = Conversation::new();
+        hard_truncate_to_target(&mut conv, 100, 0);
+        assert_eq!(conv.messages.len(), 0);
     }
 }
 
