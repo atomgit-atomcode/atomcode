@@ -7,6 +7,7 @@ pub mod plain;
 pub mod qr;
 pub mod retained;
 pub mod screen;
+pub mod scrollbar;
 pub mod selection;
 pub mod theme;
 pub mod ui_state;
