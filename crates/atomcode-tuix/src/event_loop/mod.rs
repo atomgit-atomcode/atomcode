@@ -4181,6 +4181,24 @@ fn handle_scroll_key(
             renderer.scroll_body(10);
             Some(true)
         }
+        // Message-jump scrolls. Alt+Up/Down jumps to prev/next message.
+        // Ctrl+Up/Down jumps to prev/next user message.
+        KeyCode::Up if modifiers.contains(KeyModifiers::ALT) && !has_shift => {
+            renderer.scroll_to_prev_message();
+            Some(true)
+        }
+        KeyCode::Down if modifiers.contains(KeyModifiers::ALT) && !has_shift => {
+            renderer.scroll_to_next_message();
+            Some(true)
+        }
+        KeyCode::Up if modifiers.contains(KeyModifiers::CONTROL) && !has_shift => {
+            renderer.scroll_to_prev_user_message();
+            Some(true)
+        }
+        KeyCode::Down if modifiers.contains(KeyModifiers::CONTROL) && !has_shift => {
+            renderer.scroll_to_next_user_message();
+            Some(true)
+        }
         // Line-step. Shift+Up / Shift+Down is the cross-keyboard
         // alternative for users without a dedicated PageUp/Down key.
         // Bare Up/Down stays bound to input-history navigation
