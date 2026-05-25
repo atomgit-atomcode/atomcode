@@ -11,8 +11,8 @@ pub mod marketplace;
 // Internal modules: state schema, manifest types, path helpers, URL
 // helpers. Not part of the public API; if a downstream consumer needs one
 // of these symbols, re-export it explicitly above.
-pub(crate) mod manifest;
 pub(crate) mod claude;
+pub(crate) mod manifest;
 pub(crate) mod paths;
 pub(crate) mod state;
 pub(crate) mod url;

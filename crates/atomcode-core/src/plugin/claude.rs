@@ -9,7 +9,7 @@
 //! alongside AtomCode-native skills.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -47,6 +47,8 @@ pub struct ClaudePluginAssets {
     pub plugin: String,
 
     /// Marketplace source (e.g. `"claude-plugins-official"`).
+    /// Reserved for future use: displaying the source marketplace in the
+    /// `/skills` UI or diagnostics.
     #[allow(dead_code)]
     pub marketplace: String,
 
@@ -66,14 +68,13 @@ impl ClaudePluginAssets {
     }
 }
 
-/// Scan all plugins that Claude Code has installed and return those that
-/// have at least one asset directory (`skills/` or `commands/`) on disk.
-pub fn get_claude_code_plugins() -> Vec<ClaudePluginAssets> {
-    let home = match crate::tool::real_home_dir() {
-        Some(h) => h,
-        None => return vec![],
-    };
-
+/// Scan all plugins that Claude Code has installed under `home` and return
+/// those that have at least one asset directory (`skills/` or `commands/`)
+/// on disk.
+///
+/// This is the testable core that accepts an explicit home directory.
+/// The public [`get_claude_code_plugins`] wraps it with the real home dir.
+fn get_claude_code_plugins_from(home: &Path) -> Vec<ClaudePluginAssets> {
     let state_path = home
         .join(".claude")
         .join("plugins")
@@ -85,24 +86,38 @@ pub fn get_claude_code_plugins() -> Vec<ClaudePluginAssets> {
 
     let raw = match std::fs::read_to_string(&state_path) {
         Ok(s) => s,
-        Err(_) => return vec![],
+        Err(e) => {
+            tracing::debug!("failed to read Claude Code plugins state file {}: {}", state_path.display(), e);
+            return vec![];
+        }
     };
 
     let file: ClaudeInstalledPluginsFile = match serde_json::from_str(&raw) {
         Ok(f) => f,
-        Err(_) => return vec![],
+        Err(e) => {
+            tracing::debug!("failed to parse Claude Code plugins state file {}: {}", state_path.display(), e);
+            return vec![];
+        }
     };
 
     let mut result = Vec::new();
 
     for (plugin_id, entries) in &file.plugins {
         // plugin_id format: "<plugin>@<marketplace>"
-        let entry = match entries.first() {
+        let entry = match pick_best_entry(entries) {
             Some(e) => e,
             None => continue,
         };
 
+        // Resolve install_path: could be absolute or relative (relative to
+        // ~/.claude/plugins/cache/).
         let install_path = PathBuf::from(&entry.install_path);
+        let install_path = if install_path.is_absolute() {
+            install_path
+        } else {
+            home.join(".claude/plugins/cache").join(&install_path)
+        };
+
         if !install_path.is_dir() {
             continue;
         }
@@ -123,6 +138,37 @@ pub fn get_claude_code_plugins() -> Vec<ClaudePluginAssets> {
     }
 
     result
+}
+
+/// Scan all plugins that Claude Code has installed and return those that
+/// have at least one asset directory (`skills/` or `commands/`) on disk.
+///
+/// Delegates to [`get_claude_code_plugins_from`] with the real home dir.
+pub fn get_claude_code_plugins() -> Vec<ClaudePluginAssets> {
+    let home = match crate::tool::real_home_dir() {
+        Some(h) => h,
+        None => return vec![],
+    };
+
+    get_claude_code_plugins_from(&home)
+}
+
+/// Choose the best install entry from a list of scoped records.
+///
+/// Priority: `user` > `project` > last entry (fallback).
+/// This mirrors Claude Code's own behaviour where `user`-scoped installs
+/// take precedence over `project`-scoped ones.
+fn pick_best_entry(entries: &[ClaudeInstalledPlugin]) -> Option<&ClaudeInstalledPlugin> {
+    if entries.is_empty() {
+        return None;
+    }
+    // Prefer user scope, then project scope, then fall back to the last entry.
+    entries
+        .iter()
+        .rev()
+        .find(|e| e.scope == "user")
+        .or_else(|| entries.iter().rev().find(|e| e.scope == "project"))
+        .or_else(|| entries.last())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -189,18 +235,11 @@ mod tests {
 
     #[test]
     fn get_skips_missing_state_file() {
-        // When the state file does not exist (or any I/O error occurs),
-        // the function returns an empty vector without panicking.
-        // We test this by temporarily relocating HOME to a path that
-        // definitely has no `.claude` directory.
+        // When the state file does not exist, the function returns an empty
+        // vector without panicking.  Uses get_claude_code_plugins_from with
+        // a fake home dir that has no `.claude` directory.
         let fake_home = tempfile::tempdir().expect("tempdir");
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", fake_home.path());
-        let results = get_claude_code_plugins();
-        std::env::remove_var("HOME");
-        if let Some(h) = original_home {
-            std::env::set_var("HOME", h);
-        }
+        let results = get_claude_code_plugins_from(fake_home.path());
         assert!(results.is_empty(), "should be empty when no Claude state file exists");
     }
 
@@ -208,7 +247,9 @@ mod tests {
     fn get_skips_missing_install_path() {
         // Install path in JSON but directory doesn't exist → skip.
         let dir = tempfile::tempdir().expect("tempdir");
-        let state_path = dir.path().join("installed_plugins.json");
+        let claude_dir = dir.path().join(".claude/plugins");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let state_path = claude_dir.join("installed_plugins.json");
         let json = format!(
             r#"{{
             "version": 2,
@@ -226,31 +267,135 @@ mod tests {
         );
         std::fs::write(&state_path, &json).expect("write state file");
 
-        // The function uses real_home_dir() which we can't mock, so we
-        // test the filtering logic inline instead.
-        let raw = std::fs::read_to_string(&state_path).unwrap();
-        let file: ClaudeInstalledPluginsFile = serde_json::from_str(&raw).unwrap();
-        let results: Vec<_> = file
-            .plugins
-            .iter()
-            .filter_map(|(id, entries)| {
-                let entry = entries.first()?;
-                let install_path = PathBuf::from(&entry.install_path);
-                if !install_path.is_dir() {
-                    return None;
-                }
-                if !install_path.join("skills").is_dir() && !install_path.join("commands").is_dir()
-                {
-                    return None;
-                }
-                let (plugin, marketplace) = id.split_once('@')?;
-                Some(ClaudePluginAssets {
-                    plugin: plugin.to_string(),
-                    marketplace: marketplace.to_string(),
-                    plugin_dir: install_path,
-                })
-            })
-            .collect();
+        // Use get_claude_code_plugins_from to test the actual function.
+        let results = get_claude_code_plugins_from(dir.path());
         assert!(results.is_empty(), "nonexistent dir should be skipped");
+    }
+
+    #[test]
+    fn get_skips_plugin_without_skills_or_commands() {
+        // Plugin dir exists but has neither skills/ nor commands/ → skip.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = dir.path().join(".claude/plugins/cache/mkt/test/1.0.0");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let claude_dir = dir.path().join(".claude/plugins");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let state_path = claude_dir.join("installed_plugins.json");
+        let json = format!(
+            r#"{{
+            "version": 2,
+            "plugins": {{
+                "test@mkt": [
+                    {{
+                        "scope": "user",
+                        "installPath": "{}",
+                        "version": "1.0.0"
+                    }}
+                ]
+            }}
+        }}"#,
+            plugin_dir.display().to_string().replace('\\', "/")
+        );
+        std::fs::write(&state_path, &json).unwrap();
+
+        let results = get_claude_code_plugins_from(dir.path());
+        assert!(results.is_empty(), "plugin without skills/ or commands/ should be skipped");
+    }
+
+    #[test]
+    fn picks_user_scope_over_project_scope() {
+        let entries_str = r#"[
+            {"scope": "project", "installPath": "/project/path", "version": "1.0.0"},
+            {"scope": "user", "installPath": "/user/path", "version": "1.0.0"}
+        ]"#;
+        let entries: Vec<ClaudeInstalledPlugin> = serde_json::from_str(entries_str).unwrap();
+        let picked = pick_best_entry(&entries).unwrap();
+        assert_eq!(picked.scope, "user");
+        assert_eq!(picked.install_path, "/user/path");
+    }
+
+    #[test]
+    fn picks_project_scope_when_no_user_scope() {
+        let entries_str = r#"[
+            {"scope": "project", "installPath": "/project/path", "version": "1.0.0"}
+        ]"#;
+        let entries: Vec<ClaudeInstalledPlugin> = serde_json::from_str(entries_str).unwrap();
+        let picked = pick_best_entry(&entries).unwrap();
+        assert_eq!(picked.scope, "project");
+    }
+
+    #[test]
+    fn falls_back_to_last_entry_for_unknown_scope() {
+        let entries_str = r#"[
+            {"scope": "unknown", "installPath": "/unknown/path", "version": "1.0.0"}
+        ]"#;
+        let entries: Vec<ClaudeInstalledPlugin> = serde_json::from_str(entries_str).unwrap();
+        let picked = pick_best_entry(&entries).unwrap();
+        assert_eq!(picked.install_path, "/unknown/path");
+    }
+
+    #[test]
+    fn resolves_relative_install_path() {
+        // When installPath is relative, it should be resolved against
+        // ~/.claude/plugins/cache/.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = dir.path().join(".claude/plugins/cache/mkt/test-plugin/1.0.0");
+        std::fs::create_dir_all(plugin_dir.join("skills")).unwrap();
+        let claude_dir = dir.path().join(".claude/plugins");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let state_path = claude_dir.join("installed_plugins.json");
+        let json = r#"{
+            "version": 2,
+            "plugins": {
+                "test-plugin@mkt": [
+                    {
+                        "scope": "user",
+                        "installPath": "mkt/test-plugin/1.0.0",
+                        "version": "1.0.0"
+                    }
+                ]
+            }
+        }"#;
+        std::fs::write(&state_path, json).unwrap();
+
+        let results = get_claude_code_plugins_from(dir.path());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].plugin, "test-plugin");
+        assert!(results[0].plugin_dir.is_absolute());
+        assert!(results[0].skills_dir().is_dir());
+    }
+
+    #[test]
+    fn loads_commands_dir() {
+        // Verify that a plugin with a commands/ directory (but no skills/)
+        // is discovered and its commands_dir() points to the right place.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = dir.path().join(".claude/plugins/cache/mkt/cmd-plugin/1.0.0");
+        std::fs::create_dir_all(plugin_dir.join("commands")).unwrap();
+        let claude_dir = dir.path().join(".claude/plugins");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let state_path = claude_dir.join("installed_plugins.json");
+        let json = format!(
+            r#"{{
+            "version": 2,
+            "plugins": {{
+                "cmd-plugin@mkt": [
+                    {{
+                        "scope": "user",
+                        "installPath": "{}",
+                        "version": "1.0.0"
+                    }}
+                ]
+            }}
+        }}"#,
+            plugin_dir.display().to_string().replace('\\', "/")
+        );
+        std::fs::write(&state_path, &json).unwrap();
+
+        let results = get_claude_code_plugins_from(dir.path());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].plugin, "cmd-plugin");
+        assert!(results[0].commands_dir().is_dir());
+        assert!(!results[0].skills_dir().is_dir());
     }
 }
