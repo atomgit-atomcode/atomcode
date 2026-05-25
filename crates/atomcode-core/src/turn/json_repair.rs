@@ -162,13 +162,27 @@ fn rewrite_windows_path_body(body: &str, out: &mut String) {
                 out.push_str("\\\\");
                 k += 2;
             }
-            Some(c @ ('"' | '/')) => {
-                // JSON-legal escape unrelated to paths — preserve.
+            Some(c @ ('"' | '/' | 'u')) => {
+                // JSON-legal escape unrelated to single-char ambiguity
+                // — preserve verbatim.
+                //
+                // `\u` is the JSON Unicode escape `\uXXXX` (always 6
+                // chars total, 4 hex digits follow). Unlike `\t`/`\n`/
+                // `\r`/`\b`/`\f` — single-letter shortcuts that a
+                // Windows path could naturally produce as
+                // backslash+letter — `\u` is unambiguous: a Windows
+                // path containing literal `\u` is impossible (drive
+                // letter + `:` + `\` then directory char; no shell or
+                // model would normalise a directory called "u…" to a
+                // `\u` glyph). Treating `\u` as ambiguous corrupted
+                // legitimate Unicode escapes inside drive-letter
+                // strings: `"D:A\foo"` → `"D:\\u0041\\foo"`
+                // decoded to literal `D:A\foo` instead of `D:A\foo`.
                 out.push('\\');
                 out.push(c);
                 k += 2;
             }
-            Some(c @ ('t' | 'n' | 'r' | 'b' | 'f' | 'u')) => {
+            Some(c @ ('t' | 'n' | 'r' | 'b' | 'f')) => {
                 // Ambiguous in Windows-path context: model meant a
                 // literal backslash, not a JSON escape. Double the
                 // backslash so the JSON parser decodes `\X` back to
@@ -1019,6 +1033,47 @@ mod tests {
         let once = pre_escape_windows_paths_in_json(r#"{"p": "D:\\a\\b"}"#);
         let twice = pre_escape_windows_paths_in_json(&once);
         assert_eq!(once, twice, "pre_escape should be idempotent");
+    }
+
+    /// `\u` Unicode escapes inside a drive-letter string must survive
+    /// the Windows pre-pass intact. `\u` is the 6-char `\uXXXX` JSON
+    /// escape — not a single-char ambiguity like `\t`/`\n` that could
+    /// arise from a literal Windows path. Treating it as ambiguous
+    /// would corrupt legitimate Unicode escapes (`张` for "张" in
+    /// `C:\Users\张三\…`) by doubling the backslash and turning the
+    /// Chinese name into the literal text `张`.
+    #[test]
+    fn pre_escape_preserves_unicode_escape_in_windows_path() {
+        // Raw bytes: `C` `:` `\` `\` `U` `s` `e` `r` `s` `\` `\` `\` `u` `5` `f` `2` `0` …
+        // After JSON decode that's `C:\Users\张三\file.txt`.
+        let input = r#"{"file_path": "C:\\Users\\张三\\file.txt"}"#;
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["file_path"], "C:\\Users\\张三\\file.txt");
+        // Negative: bytes after pre-pass MUST NOT contain `\\u` —
+        // that would mean we doubled the backslash and broke the
+        // Unicode escape. Check via the round-trip: if the decoded
+        // string contains a literal `\u` substring, the pre-pass
+        // corrupted it.
+        let s = v["file_path"].as_str().unwrap();
+        assert!(
+            !s.contains("\\u"),
+            "Unicode escape must not survive as literal `\\u`; got {s:?}",
+        );
+    }
+
+    /// Mixed: `\u` preserved (legit escape) AND `\t`/`\f` doubled
+    /// (Windows path chars). The path-context heuristic applies per
+    /// `\X` pair independently. JSON body `D:\testA\foo` should
+    /// decode to `D:\testA\foo` — the `A` from `A` snaps directly
+    /// onto `test` because no backslash separates them in the source.
+    #[test]
+    fn pre_escape_mixes_unicode_escape_with_ambiguous_letter() {
+        let input = "{\"file_path\": \"D:\\test\\u0041\\foo\"}";
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        // \t → literal `\t`; A → "A"; \f → literal `\f`.
+        assert_eq!(v["file_path"], "D:\\testA\\foo");
     }
 
     // --- repair_json in_string awareness regression tests ---
