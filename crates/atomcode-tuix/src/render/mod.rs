@@ -1,14 +1,36 @@
 // crates/atomcode-tuix/src/render/mod.rs
 pub mod alt_screen;
+#[cfg(windows)]
+pub mod conhost;
 pub mod cell;
 pub mod plain;
 pub mod qr;
 pub mod retained;
 pub mod screen;
+pub mod scrollbar;
+pub mod selection;
 pub mod theme;
+pub mod ui_state;
 pub mod worker;
 
 use std::time::Duration;
+
+/// Boundary marker for an originated message in the body buffer. Drives
+/// "jump to prev/next message" navigation keys. Marked at push time;
+/// kept in sync when body_lines drains from the front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    User,
+    Assistant,
+    ToolCall,
+    ToolResult,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MessageMark {
+    pub line_idx: usize,
+    pub kind: MarkKind,
+}
 
 /// Semantic line to render. Renderer implementations translate this to bytes.
 ///
@@ -294,6 +316,17 @@ pub trait Renderer: Send {
     /// Default no-op: renderers without a retained body buffer can't
     /// edit already-emitted rows in place.
     fn refresh_welcome_banner(&mut self, _model: &str, _working_dir: &str) {}
+
+    /// Toggle the right-side visible scrollbar. Default: no-op for renderers
+    /// that don't have a body region (Plain). Returns the new state — true = now shown.
+    fn toggle_scrollbar(&mut self) -> bool { false }
+
+    /// Jump body viewport to the prev/next message boundary. No-op when no
+    /// such boundary exists in the configured direction.
+    fn scroll_to_prev_message(&mut self) {}
+    fn scroll_to_next_message(&mut self) {}
+    fn scroll_to_prev_user_message(&mut self) {}
+    fn scroll_to_next_user_message(&mut self) {}
 }
 
 /// Visual style for the menu popup. Drives whether the renderer prefixes

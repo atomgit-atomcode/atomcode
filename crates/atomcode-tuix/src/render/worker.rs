@@ -62,6 +62,12 @@ enum RenderCmd {
     /// Jump body viewport to absolute top / bottom of scrollback.
     ScrollBodyToTop,
     ScrollBodyToBottom,
+    /// Jump body viewport to the prev/next message boundary.
+    /// Fire-and-forget — no ACK needed.
+    ScrollToPrevMessage,
+    ScrollToNextMessage,
+    ScrollToPrevUserMessage,
+    ScrollToNextUserMessage,
     /// Mouse-drag selection lifecycle. Forwarded to the inner renderer;
     /// only AltScreenRenderer acts on these. `(col, row)` are 0-indexed
     /// terminal cells.
@@ -88,6 +94,7 @@ enum AckOp {
     SuspendForExternal,
     ResumeFromExternal,
     Shutdown,
+    ToggleScrollbar,
 }
 
 /// Renderer facade that forwards every call to a background OS thread.
@@ -196,6 +203,22 @@ impl Renderer for TaskRenderer {
         let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToBottom);
     }
 
+    fn scroll_to_prev_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToPrevMessage);
+    }
+
+    fn scroll_to_next_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToNextMessage);
+    }
+
+    fn scroll_to_prev_user_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToPrevUserMessage);
+    }
+
+    fn scroll_to_next_user_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToNextUserMessage);
+    }
+
     fn begin_selection(&mut self, col: u16, row: u16) {
         let _ = self.cmd_tx.send(RenderCmd::BeginSelection(col, row));
     }
@@ -214,6 +237,12 @@ impl Renderer for TaskRenderer {
             return false;
         }
         ack_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+    }
+
+    fn toggle_scrollbar(&mut self) -> bool {
+        self.ack(AckOp::ToggleScrollbar);
+        // Read the new state back from persisted ui-state (best-effort)
+        crate::render::ui_state::load().ui.show_scrollbar
     }
 }
 
@@ -283,6 +312,18 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             RenderCmd::ScrollBodyToBottom => {
                 inner.scroll_body_to_bottom();
             }
+            RenderCmd::ScrollToPrevMessage => {
+                inner.scroll_to_prev_message();
+            }
+            RenderCmd::ScrollToNextMessage => {
+                inner.scroll_to_next_message();
+            }
+            RenderCmd::ScrollToPrevUserMessage => {
+                inner.scroll_to_prev_user_message();
+            }
+            RenderCmd::ScrollToNextUserMessage => {
+                inner.scroll_to_next_user_message();
+            }
             RenderCmd::BeginSelection(col, row) => {
                 inner.begin_selection(col, row);
             }
@@ -316,6 +357,9 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                         // discarded (the sender's next send errors,
                         // which callers treat as "worker gone").
                         return;
+                    }
+                    AckOp::ToggleScrollbar => {
+                        let _ = inner.toggle_scrollbar();
                     }
                 }
                 crate::tuix_trace!("REN", "Ack {:?} dur={}µs", op, t0.elapsed().as_micros());

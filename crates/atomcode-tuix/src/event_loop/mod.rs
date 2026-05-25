@@ -4159,10 +4159,10 @@ fn handle_input(
 ///     cursor instead)
 ///   - `None`        → not a scroll key at all
 ///
-/// AltScreenRenderer is the only renderer that does anything with
-/// these calls; the trait defaults are no-op so retained / plain
-/// silently fall through and let the existing phase dispatch handle
-/// the key (e.g. End-of-line cursor movement during input).
+/// Both AltScreenRenderer and RetainedRenderer implement these scroll
+/// methods (unified-scroll feature, Phase 3+7); PlainRenderer uses the
+/// trait no-op defaults and silently falls through to the existing
+/// phase dispatch (e.g. End-of-line cursor movement during input).
 fn handle_scroll_key(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -4185,6 +4185,24 @@ fn handle_scroll_key(
         }
         KeyCode::PageDown => {
             renderer.scroll_body(10);
+            Some(true)
+        }
+        // Message-jump scrolls. Alt+Up/Down jumps to prev/next message.
+        // Ctrl+Up/Down jumps to prev/next user message.
+        KeyCode::Up if modifiers.contains(KeyModifiers::ALT) && !has_shift => {
+            renderer.scroll_to_prev_message();
+            Some(true)
+        }
+        KeyCode::Down if modifiers.contains(KeyModifiers::ALT) && !has_shift => {
+            renderer.scroll_to_next_message();
+            Some(true)
+        }
+        KeyCode::Up if modifiers.contains(KeyModifiers::CONTROL) && !has_shift => {
+            renderer.scroll_to_prev_user_message();
+            Some(true)
+        }
+        KeyCode::Down if modifiers.contains(KeyModifiers::CONTROL) && !has_shift => {
+            renderer.scroll_to_next_user_message();
             Some(true)
         }
         // Line-step. Shift+Up / Shift+Down is the cross-keyboard

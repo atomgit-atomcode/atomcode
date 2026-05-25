@@ -12,6 +12,7 @@ crossterm = "0.29"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 libc = "0.2"
@@ -55,3 +56,4 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 [dev-dependencies]
 tempfile = "3"
 vte = "0.15.0"
+serial_test = "3"

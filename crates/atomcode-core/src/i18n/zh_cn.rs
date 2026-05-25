@@ -181,6 +181,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Up                               上一条输入
     Down                             下一条输入
 
+  ── 翻看输出 ──
+    PageUp / PageDown                上下翻一页（10 行）
+    Shift+↑ / Shift+↓                上下翻一行
+    Alt+↑ / Alt+↓                    跳到上/下一条消息 ***
+    Ctrl+↑ / Ctrl+↓                  跳到上/下一条自己发的消息
+    Home / End                       跳到最顶 / 跳回最新
+    鼠标滚轮                          上下滚（atomcode 接管）
+    Shift+拖鼠标                      用宿主终端选择文本（绕过 atomcode）
+
+  ── 显示 ──
+    /scrollbar                       切换右侧滚动条显示
+
   ── 会话 ──
     Ctrl+C                           取消当前轮 / 关闭弹层
     Ctrl+D                           退出 atomcode
@@ -202,6 +214,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
      Windows Terminal / Ghostty / Warp。其他终端（包括 macOS
      Apple Terminal、默认 xterm、GNOME Terminal、VS Code 集成
      终端）不区分 Shift+Enter 与 Enter，请用 Ctrl+J 或 \ + Enter。
+  *** Alt+↑/↓ macOS Apple Terminal 需在
+      Settings → Profiles → Keyboard 启用 "Use Option as Meta key"
+      才会发送修饰键。其他终端默认即可。
 
   提示：输入 /help 查看完整斜杠命令列表。
 "#.into(),
@@ -720,6 +735,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
+        Msg::CmdDescScrollbar => "切换右侧滚动条显示".into(),
+
+        // ── Scrollbar UI 状态 ──
+        Msg::ScrollbarOn => "Scrollbar: ON".into(),
+        Msg::ScrollbarOff => "Scrollbar: OFF".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>
