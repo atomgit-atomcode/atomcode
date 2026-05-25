@@ -11,6 +11,8 @@ use std::borrow::Cow;
 use std::io::Write;
 use unicode_width::UnicodeWidthChar;
 
+use crate::render::cell::Cell;
+
 /// A single (row, col) cursor position in body_lines coordinates.
 /// `row` is the index into body_lines; `col` is display-column.
 pub type BodyPos = (usize, u16);
@@ -39,6 +41,18 @@ impl BodyLineView for Vec<String> {
     fn line_count(&self) -> usize { self.len() }
     fn line_text(&self, idx: usize) -> Cow<'_, str> {
         Cow::Borrowed(self.get(idx).map(|s| s.as_str()).unwrap_or(""))
+    }
+}
+
+// Impl for the retained body_lines type.
+impl BodyLineView for Vec<Vec<Cell>> {
+    fn line_count(&self) -> usize { self.len() }
+    fn line_text(&self, idx: usize) -> Cow<'_, str> {
+        let Some(row) = self.get(idx) else { return Cow::Borrowed(""); };
+        // Build a visible-text string from cells; skip continuation cells
+        // (width == 0) which are placeholders for the 2nd column of a wide glyph.
+        let s: String = row.iter().filter(|c| c.width > 0).map(|c| c.ch).collect();
+        Cow::Owned(s)
     }
 }
 
@@ -559,5 +573,23 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         // RFC 4648 vector.
         assert_eq!(base64_encode(b"hello world"), "aGVsbG8gd29ybGQ=");
+    }
+
+    /// `BodyLineView` impl for `Vec<Vec<Cell>>` extracts visible text,
+    /// skipping continuation cells (width == 0). Wide characters (e.g. CJK)
+    /// take 2 columns; the 2nd column is represented by a continuation cell
+    /// with width == 0. Only cells with width > 0 contribute to visible text.
+    #[test]
+    fn vec_vec_cell_line_text_extracts_visible_chars() {
+        use crate::render::cell::CellStyle;
+
+        let row = vec![
+            Cell { ch: 'h', style: CellStyle::default(), width: 1 },
+            Cell { ch: 'i', style: CellStyle::default(), width: 1 },
+            Cell { ch: '中', style: CellStyle::default(), width: 2 },
+            Cell { ch: ' ', style: CellStyle::default(), width: 0 }, // continuation
+        ];
+        let body: Vec<Vec<Cell>> = vec![row];
+        assert_eq!(body.line_text(0), "hi中");
     }
 }
