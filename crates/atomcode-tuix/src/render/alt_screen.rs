@@ -31,56 +31,17 @@
 use std::io::{self, BufWriter, Stdout, Write};
 
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
+use super::selection::{
+    self, extract_line_selection_text, line_display_width_sgr_aware,
+    render_line_with_selection, selection_col_range_for_line,
+    truncate_to_width_sgr_aware,
+};
 use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
 use crate::width::{display_width, truncate_to_width};
 use unicode_width::UnicodeWidthChar;
 
-/// Truncate `s` to `max_cols` display columns, treating ANSI CSI
-/// escape sequences (`\x1b[...{letter}`) as zero-width spans so SGR
-/// styling doesn't eat budget that should belong to visible text.
-///
-/// `truncate_to_width` from `crate::width` counts each character of an
-/// SGR sequence (`[`, digits, `m`) as width 1, which under-budgets the
-/// visible content — a 79-display-col line decorated with one SGR pair
-/// would lose 5+ trailing visible chars even though the line fits the
-/// terminal exactly. This helper skips the entire CSI sequence in one
-/// go, matching how the terminal interprets it.
-///
-/// Final SGR reset (`\x1b[0m`) preservation: if truncation cut into an
-/// open span, the caller still appends a reset; this fn just guarantees
-/// the visible-text count is right.
-fn truncate_to_width_sgr_aware(s: &str, max_cols: usize) -> String {
-    if max_cols == 0 {
-        return String::new();
-    }
-    let mut acc = String::with_capacity(s.len());
-    let mut cols = 0usize;
-    let mut iter = s.chars().peekable();
-    while let Some(c) = iter.next() {
-        // CSI sequence: ESC `[` {params} {final letter A-Z/a-z}.
-        // Append the whole span verbatim (zero visible cost).
-        if c == '\x1b' && iter.peek() == Some(&'[') {
-            acc.push(c);
-            acc.push(iter.next().unwrap()); // consume `[`
-            for nc in iter.by_ref() {
-                acc.push(nc);
-                if nc.is_ascii_alphabetic() {
-                    break; // final byte ends the CSI sequence
-                }
-            }
-            continue;
-        }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
-        if cols + w > max_cols {
-            break;
-        }
-        acc.push(c);
-        cols += w;
-    }
-    acc
-}
 
 /// Soft-wrap `s` into chunks each ≤ `max_cols` display columns, using
 /// the same CSI-aware parser as `truncate_to_width_sgr_aware`. Used by
@@ -131,174 +92,6 @@ fn wrap_to_width_sgr_aware(s: &str, max_cols: usize) -> Vec<String> {
     chunks
 }
 
-/// Walk `s` and return the visible-text display width, treating CSI
-/// escape sequences as zero-width spans (same parser as
-/// `truncate_to_width_sgr_aware`). Used to clamp selection columns
-/// against the actual painted content of a body line — clicks past the
-/// end of the visible row should select nothing in the gap, not extend
-/// to the column the user happened to drop on.
-fn line_display_width_sgr_aware(s: &str) -> usize {
-    let mut cols = 0usize;
-    let mut iter = s.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\x1b' && iter.peek() == Some(&'[') {
-            iter.next(); // consume `[`
-            for nc in iter.by_ref() {
-                if nc.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            continue;
-        }
-        cols += UnicodeWidthChar::width(c).unwrap_or(0);
-    }
-    cols
-}
-
-/// Walk `line` and emit it clipped to `max_cols` display columns, with
-/// chars whose display column falls in `[sel_start, sel_end)` wrapped
-/// in reverse-video (`\x1b[7m` … `\x1b[0m`). CSI escapes outside the
-/// selection pass through verbatim so existing colours render; CSI
-/// escapes INSIDE the selection are dropped so reverse-video stays
-/// solid (otherwise an inline `\x1b[0m` from markdown styling would
-/// reset the highlight mid-span).
-///
-/// Wide chars (CJK, emoji): a single char that straddles `sel_start`
-/// or `sel_end` is treated as fully inside if its first column is in
-/// range — matches what the user expects when they click on the left
-/// half of a wide char.
-fn render_line_with_selection(
-    line: &str,
-    max_cols: usize,
-    sel_start: usize,
-    sel_end: usize,
-) -> String {
-    if max_cols == 0 || sel_end <= sel_start {
-        return truncate_to_width_sgr_aware(line, max_cols);
-    }
-    let mut out = String::with_capacity(line.len() + 16);
-    let mut cols = 0usize;
-    let mut in_sel = false;
-    let mut iter = line.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\x1b' && iter.peek() == Some(&'[') {
-            // Capture the full CSI span first so we can decide whether
-            // to drop it (inside selection) or keep it (outside).
-            let mut csi = String::with_capacity(8);
-            csi.push(c);
-            csi.push(iter.next().unwrap());
-            for nc in iter.by_ref() {
-                csi.push(nc);
-                if nc.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            if !in_sel {
-                out.push_str(&csi);
-            }
-            continue;
-        }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
-        if cols >= max_cols {
-            break;
-        }
-        let want_in_sel = cols >= sel_start && cols < sel_end;
-        if want_in_sel && !in_sel {
-            // Reset existing colours then enable reverse video so the
-            // selection highlight is visually consistent regardless of
-            // the underlying line styling.
-            out.push_str("\x1b[0m\x1b[7m");
-            in_sel = true;
-        } else if !want_in_sel && in_sel {
-            out.push_str("\x1b[0m");
-            in_sel = false;
-        }
-        if cols + w > max_cols {
-            break;
-        }
-        out.push(c);
-        cols += w;
-    }
-    if in_sel {
-        out.push_str("\x1b[0m");
-    }
-    out
-}
-
-/// Extract the plain-text characters of `line` whose display column
-/// falls in `[sel_start, sel_end)`, dropping all CSI escapes. Used by
-/// `extract_selection_text` to assemble what gets written to the
-/// clipboard. Wide-char rule matches `render_line_with_selection`.
-fn extract_line_selection_text(
-    line: &str,
-    sel_start: usize,
-    sel_end: usize,
-) -> String {
-    if sel_end <= sel_start {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut cols = 0usize;
-    let mut iter = line.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\x1b' && iter.peek() == Some(&'[') {
-            iter.next(); // `[`
-            for nc in iter.by_ref() {
-                if nc.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            continue;
-        }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
-        if cols >= sel_end {
-            break;
-        }
-        if cols >= sel_start {
-            out.push(c);
-        }
-        cols += w;
-    }
-    out
-}
-
-/// Standard-alphabet base64 encoder. Inline implementation (~30 lines)
-/// instead of pulling in the `base64` crate just for OSC 52: the
-/// payload is one user-selected text blob per drag-release, kilobytes
-/// at most, and the alphabet is fixed.
-fn base64_encode(input: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
-        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
-        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
-        out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
-        out.push(ALPHA[(n & 0x3f) as usize] as char);
-    }
-    let rem = chunks.remainder();
-    match rem.len() {
-        0 => {}
-        1 => {
-            let n = (rem[0] as u32) << 16;
-            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
-            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
-            out.push('=');
-            out.push('=');
-        }
-        2 => {
-            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
-            out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
-            out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
-            out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
-            out.push('=');
-        }
-        _ => unreachable!(),
-    }
-    out
-}
 
 // SGR sequences used inline in body strings. Same set PlainRenderer
 // already uses; keeping them duplicated rather than re-exported because
@@ -945,21 +738,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         parts.join("\n")
     }
 
-    /// Emit OSC 52 (`\x1b]52;c;<base64>\x07`) carrying `text` so the
-    /// host terminal copies it to the system clipboard. Empty text is
-    /// a no-op to avoid clearing whatever the user previously had.
-    /// Best-effort — terminals that don't honour OSC 52 (Terminal.app
-    /// without explicit opt-in) silently ignore the sequence.
-    fn write_osc52_clipboard(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let encoded = base64_encode(text.as_bytes());
-        let _ = write!(self.out, "\x1b]52;c;{}\x07", encoded);
-        let _ = self.out.flush();
-    }
-
-    /// Paint the footer strip. Layout (top to bottom, 1-indexed rows
+/// Paint the footer strip. Layout (top to bottom, 1-indexed rows
     /// computed from the bottom of the viewport):
     ///   spinner       (1 row, blank when no streaming)
     ///   top rule      (1 row, full-width cyan ─)
@@ -1869,42 +1648,6 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     }
 }
 
-/// Compute the half-open column range `[start, end)` of `line` that
-/// falls inside the ordered selection bounds `(lo, hi)`. Returns
-/// `None` if the line is outside the row range. Bounds within the
-/// line are clamped to the visible display width so a click past the
-/// end doesn't extend selection into thin air.
-///
-/// Free function (rather than a method) so the body-paint loop can
-/// call it while holding a borrow of `self.body_lines[i]` without
-/// re-borrowing `self`.
-fn selection_col_range_for_line(
-    line_idx: usize,
-    lo: (usize, usize),
-    hi: (usize, usize),
-    line: &str,
-) -> Option<(usize, usize)> {
-    if line_idx < lo.0 || line_idx > hi.0 {
-        return None;
-    }
-    let line_w = line_display_width_sgr_aware(line);
-    let start_col = if line_idx == lo.0 { lo.1 } else { 0 };
-    // Line containing the head: include the cell under the head —
-    // half-open `end_col` = head_col + 1. Middle lines select to
-    // end of line; the bottom line of a multi-line selection uses
-    // the same `hi.1 + 1` rule as a same-line selection.
-    let end_col_exclusive = if line_idx == hi.0 {
-        hi.1.saturating_add(1)
-    } else {
-        line_w
-    };
-    let s = start_col.min(line_w);
-    let e = end_col_exclusive.min(line_w);
-    if e <= s {
-        return None;
-    }
-    Some((s, e))
-}
 
 impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
     fn render(&mut self, line: UiLine) {
@@ -2394,7 +2137,7 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         // a fresh selection (or deselects on footer/empty hit).
         self.selection_active = false;
         let text = self.extract_selection_text();
-        self.write_osc52_clipboard(&text);
+        selection::emit_osc52(&mut self.out, &text);
     }
 
     fn copy_selection(&mut self) -> bool {
@@ -2421,7 +2164,7 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         }
         // arboard failed (e.g. another process holds the clipboard) —
         // fall back to OSC 52 as a best-effort retry.
-        self.write_osc52_clipboard(&text);
+        selection::emit_osc52(&mut self.out, &text);
         self.selection = None;
         self.body_dirty = true;
         self.paint_frame();
@@ -3882,143 +3625,10 @@ mod tests {
     }
 
     // ── selection / clipboard ──
-
-    /// `line_display_width_sgr_aware` returns the visible-width of a
-    /// styled line. SGR escapes are zero-cost; CJK chars are 2 cols.
-    /// Sanity check that the helpers used by the selection paint
-    /// don't double-count colour escapes.
-    #[test]
-    fn line_display_width_skips_sgr() {
-        assert_eq!(line_display_width_sgr_aware("hello"), 5);
-        assert_eq!(line_display_width_sgr_aware("\x1b[31mhello\x1b[0m"), 5);
-        assert_eq!(line_display_width_sgr_aware("中文"), 4);
-        assert_eq!(line_display_width_sgr_aware("\x1b[1m中\x1b[0m文"), 4);
-    }
-
-    /// `extract_line_selection_text` should return only the chars
-    /// whose display column falls in `[start, end)`, with all CSI
-    /// escapes dropped — that's what gets written to the clipboard.
-    /// Visible cols of `"\x1b[31mhello\x1b[0m world"` are
-    /// `h=0 e=1 l=2 l=3 o=4 ' '=5 w=6 o=7 r=8 l=9 d=10`.
-    #[test]
-    fn extract_line_selection_strips_sgr_and_clips_to_range() {
-        let line = "\x1b[31mhello\x1b[0m world";
-        assert_eq!(extract_line_selection_text(line, 0, 5), "hello");
-        assert_eq!(extract_line_selection_text(line, 6, 11), "world");
-        // crosses the SGR boundary: cols 3..8 = "lo wo"
-        assert_eq!(extract_line_selection_text(line, 3, 8), "lo wo");
-        // empty range
-        assert_eq!(extract_line_selection_text(line, 5, 5), "");
-        // out-of-bounds end clips to last visible col
-        assert_eq!(extract_line_selection_text(line, 7, 100), "orld");
-    }
-
-    /// `render_line_with_selection` wraps the selected range in
-    /// reverse-video and ends it with a reset. CSI escapes outside
-    /// the selection pass through verbatim; CSI escapes inside the
-    /// selection are dropped so the highlight stays solid.
-    #[test]
-    fn render_line_with_selection_emits_reverse_video() {
-        let line = "hello world";
-        let out = render_line_with_selection(line, 80, 0, 5);
-        assert!(out.starts_with("\x1b[0m\x1b[7m"), "should open with reset+reverse. got: {:?}", out);
-        assert!(out.contains("hello"), "selected text missing. got: {:?}", out);
-        assert!(out.contains("\x1b[0m world"), "post-selection plain text missing. got: {:?}", out);
-    }
-
-    /// A CSI escape *inside* the selection range must be dropped
-    /// (otherwise an inline `\x1b[0m` from markdown styling would
-    /// tear a hole in the highlight by closing the reverse-video
-    /// span mid-selection).
-    ///
-    /// Visible cols of `"he\x1b[31mre\x1b[0m"` are `h=0 e=1 r=2 e=3`.
-    /// Select [0, 4) — both interior CSI escapes (`\x1b[31m` between
-    /// cols 1-2 and `\x1b[0m` after col 3) must be stripped.
-    #[test]
-    fn render_line_with_selection_drops_inline_csi_inside_range() {
-        let line = "he\x1b[31mre\x1b[0m";
-        let out = render_line_with_selection(line, 80, 0, 4);
-        assert!(
-            !out.contains("\x1b[31m"),
-            "inline red CSI inside selection should be dropped. got: {:?}",
-            out
-        );
-        // Reset count: open-reset at selection start + close-reset
-        // at selection end. The interior `\x1b[0m` from the source
-        // line MUST be dropped; if it leaked through we'd see 3.
-        let resets = out.matches("\x1b[0m").count();
-        assert_eq!(resets, 2, "expected open-reset + close-reset only. got: {:?}", out);
-    }
-
-    /// Empty selection range collapses to a plain SGR-aware truncate.
-    /// Guards `selection_col_range_for_line` returning `None` from
-    /// upstream — the path that calls `render_line_with_selection`
-    /// shouldn't, but if it ever did the visual would just be the
-    /// unhighlighted line.
-    #[test]
-    fn render_line_with_empty_selection_is_plain_truncate() {
-        let line = "hello world";
-        assert_eq!(render_line_with_selection(line, 80, 5, 5), "hello world");
-    }
-
-    /// `selection_col_range_for_line` clamps to the visible width
-    /// of the line — clicking past EOL on a one-line selection
-    /// shouldn't extend the range past the last visible col.
-    #[test]
-    fn selection_range_clamps_to_line_width() {
-        // 5-col line. Anchor at col 0, head at col 100 → [0, 5).
-        let r = selection_col_range_for_line(0, (0, 0), (0, 100), "hello");
-        assert_eq!(r, Some((0, 5)));
-        // Anchor past EOL → None.
-        let r = selection_col_range_for_line(0, (0, 50), (0, 100), "hello");
-        assert_eq!(r, None);
-    }
-
-    /// Multi-line selection: first line covers [start_col, EOL],
-    /// middle lines fully selected, last line covers [0, head_col+1].
-    #[test]
-    fn selection_range_multi_line_shape() {
-        // Three lines, anchor at (0, 3), head at (2, 2). Lines are
-        // "first", "middle", "last".
-        let lo = (0, 3);
-        let hi = (2, 2);
-        assert_eq!(
-            selection_col_range_for_line(0, lo, hi, "first"),
-            Some((3, 5)),
-            "first line [3, 5) — from col 3 to EOL",
-        );
-        assert_eq!(
-            selection_col_range_for_line(1, lo, hi, "middle"),
-            Some((0, 6)),
-            "middle line fully selected",
-        );
-        assert_eq!(
-            selection_col_range_for_line(2, lo, hi, "last"),
-            Some((0, 3)),
-            "last line [0, head+1) = [0, 3)",
-        );
-        // Lines outside [lo.0, hi.0] return None.
-        assert_eq!(selection_col_range_for_line(3, lo, hi, "outside"), None);
-    }
-
-    /// Base64 round-trip on the standard alphabet, including padding
-    /// for non-multiple-of-3 inputs. OSC 52 expects exactly this
-    /// encoding (the `c` selector is the system clipboard).
-    #[test]
-    fn base64_encode_matches_standard_alphabet() {
-        // Empty.
-        assert_eq!(base64_encode(b""), "");
-        // 1 byte → 2 chars + 2 pad.
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        // 2 bytes → 3 chars + 1 pad.
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        // 3 bytes → no pad.
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        // 4 bytes → 6 chars + 2 pad.
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        // RFC 4648 vector.
-        assert_eq!(base64_encode(b"hello world"), "aGVsbG8gd29ybGQ=");
-    }
+    // Note: pure-helper unit tests (line_display_width_skips_sgr,
+    // extract_line_selection_strips_sgr_and_clips_to_range, etc.) live
+    // in render::selection::tests — they test functions that now belong
+    // to the shared selection module.
 
     /// Begin → drag → end emits OSC 52 with the selected text.
     ///
@@ -4037,7 +3647,10 @@ mod tests {
         r.flush();
         drop(r);
         let s = String::from_utf8_lossy(&buf);
-        let expected = format!("\x1b]52;c;{}\x07", base64_encode(b"hello"));
+        let expected = format!(
+            "\x1b]52;c;{}\x07",
+            super::selection::base64_encode(b"hello")
+        );
         assert!(
             s.contains(&expected),
             "OSC 52 with base64('hello') missing. got: {:?}",
