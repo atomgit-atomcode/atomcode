@@ -251,3 +251,218 @@ impl SystemPromptHook for ScriptHook {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hook::Hook;
+
+    // ── ScriptHookConfig defaults ──
+
+    #[test]
+    fn config_default_script_type() {
+        let config = ScriptHookConfig {
+            name: "test".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("test.sh"),
+            script_type: Default::default(),
+            enabled: Default::default(),
+            timeout_secs: Default::default(),
+            description: Default::default(),
+        };
+        assert_eq!(config.script_type, "shell");
+    }
+
+    #[test]
+    fn config_default_enabled() {
+        let config = ScriptHookConfig {
+            name: "test".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("test.sh"),
+            script_type: Default::default(),
+            enabled: Default::default(),
+            timeout_secs: Default::default(),
+            description: Default::default(),
+        };
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn config_default_timeout() {
+        let config = ScriptHookConfig {
+            name: "test".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("test.sh"),
+            script_type: Default::default(),
+            enabled: Default::default(),
+            timeout_secs: Default::default(),
+            description: Default::default(),
+        };
+        assert_eq!(config.timeout_secs, 2);
+    }
+
+    // ── ScriptHook construction and trait methods ──
+
+    #[test]
+    fn script_hook_new_and_trait_methods() {
+        let config = ScriptHookConfig {
+            name: "my-hook".into(),
+            trigger: "post_tool".into(),
+            script: PathBuf::from("/tmp/dummy.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 5,
+            description: "My test hook".into(),
+        };
+        let hook = ScriptHook::new(config);
+
+        assert_eq!(hook.name(), "my-hook");
+        assert_eq!(hook.description(), "My test hook");
+        assert!(hook.is_enabled());
+    }
+
+    #[test]
+    fn script_hook_disabled() {
+        let config = ScriptHookConfig {
+            name: "disabled-hook".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("ignored.sh"),
+            script_type: "shell".into(),
+            enabled: false,
+            timeout_secs: 2,
+            description: String::new(),
+        };
+        let hook = ScriptHook::new(config);
+        assert!(!hook.is_enabled());
+    }
+
+    // ── parse_output ──
+
+    #[test]
+    fn parse_output_empty() {
+        let config = ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        };
+        let hook = ScriptHook::new(config);
+        assert!(matches!(hook.parse_output(""), HookResult::Ok));
+    }
+
+    #[test]
+    fn parse_output_ok() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        assert!(matches!(hook.parse_output("ok"), HookResult::Ok));
+    }
+
+    #[test]
+    fn parse_output_warning() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output("warning: something");
+        assert!(matches!(result, HookResult::Warning(msg) if msg == "something"));
+    }
+
+    #[test]
+    fn parse_output_deny() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output("deny: access denied");
+        assert!(matches!(result, HookResult::Denied(msg) if msg == "access denied"));
+    }
+
+    #[test]
+    fn parse_output_modify() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output("modify: new_args");
+        assert!(matches!(result, HookResult::Modified(msg) if msg == "new_args"));
+    }
+
+    #[test]
+    fn parse_output_json_ok() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output(r#"{"result":"ok"}"#);
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    #[test]
+    fn parse_output_json_warning() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output(r#"{"result":"warning","message":"be careful"}"#);
+        assert!(matches!(result, HookResult::Warning(msg) if msg == "be careful"));
+    }
+
+    #[test]
+    fn parse_output_unrecognized_fallback_to_ok() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        // Unrecognized text should fall back to Ok
+        let result = hook.parse_output("some random output");
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    // ── ScriptHook implements Hook trait ──
+
+    #[test]
+    fn script_hook_impl_hook_trait() {
+        fn require_hook<T: Hook>() {}
+        require_hook::<ScriptHook>;
+    }
+}
