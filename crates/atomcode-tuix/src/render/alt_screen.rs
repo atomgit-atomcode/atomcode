@@ -166,6 +166,11 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// Message boundary markers for "jump to prev/next message" navigation.
     /// Tracks which line_idx marks the start of a User / Assistant / ToolCall / ToolResult message.
     message_marks: Vec<crate::render::MessageMark>,
+    /// True if the last mark pushed was `MarkKind::Assistant`. Used to de-duplicate
+    /// marks for multi-chunk `UiLine::AssistantText` streams — only the first chunk
+    /// of a turn gets a new mark; subsequent chunks within the same assistant turn are silent.
+    /// Cleared whenever a User / ToolCall / ToolCallInFlight / TurnSeparator fires.
+    last_mark_was_assistant: bool,
     /// Raw (unwrapped) body rows — mirrors `body_lines` but stores each
     /// logical line *before* soft-wrapping. Used by `reflow_body_lines`
     /// on resize so that widening the terminal re-merges previously
@@ -350,6 +355,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             height: h,
             body_lines: Vec::new(),
             message_marks: Vec::new(),
+            last_mark_was_assistant: false,
             raw_body_lines: Vec::new(),
             viewport_top: 0,
             sticky_bottom: true,
@@ -502,6 +508,10 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // to bottom; oldest content is least relevant).
         while self.body_lines.len() > self.max_scrollback_rows {
             self.body_lines.remove(0);
+            self.message_marks.retain(|m| m.line_idx > 0);
+            for m in self.message_marks.iter_mut() {
+                m.line_idx -= 1;
+            }
         }
         self.body_dirty = true;
     }
@@ -522,6 +532,17 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         }
     }
 
+    /// Record the start of a new logical message in `message_marks`.
+    /// The mark's `line_idx` is set to the CURRENT length of `body_lines`
+    /// (i.e. the index the NEXT `push_body_row` will occupy).
+    /// Called before any push in the render arm that starts a new message.
+    fn mark_message(&mut self, kind: crate::render::MarkKind) {
+        self.message_marks.push(crate::render::MessageMark {
+            line_idx: self.body_lines.len(),
+            kind,
+        });
+    }
+
     /// Re-flow `body_lines` from `raw_body_lines` at the current
     /// terminal width. Called by `on_resize` so that widening the
     /// terminal re-merges previously split short rows back into fewer
@@ -538,6 +559,10 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // Bound the buffer (same cap as push_body_row).
         while self.body_lines.len() > self.max_scrollback_rows {
             self.body_lines.remove(0);
+            self.message_marks.retain(|m| m.line_idx > 0);
+            for m in self.message_marks.iter_mut() {
+                m.line_idx -= 1;
+            }
         }
         // Also bound raw_body_lines to the same cap so the two buffers
         // don't drift over time.
@@ -1617,9 +1642,12 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 self.push_welcome(&model, &working_dir);
             }
             UiLine::User(text) => {
+                self.mark_message(crate::render::MarkKind::User);
+                self.last_mark_was_assistant = false;
                 self.push_user(&text);
             }
             UiLine::TurnSeparator { label } => {
+                self.last_mark_was_assistant = false;
                 let row = self.build_turn_separator(&label);
                 self.push_body_row(String::new());
                 self.push_body_row(row);
@@ -1634,6 +1662,10 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
 
             // ── body: streaming assistant ──
             UiLine::AssistantText(text) => {
+                if !self.last_mark_was_assistant {
+                    self.mark_message(crate::render::MarkKind::Assistant);
+                    self.last_mark_was_assistant = true;
+                }
                 self.append_assistant_text(&text);
             }
             UiLine::ReasoningText(text) => {
@@ -1653,6 +1685,8 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             // ── body: tools & diffs ──
             UiLine::ToolCall { name, detail }
             | UiLine::ToolCallInFlight { name, detail, .. } => {
+                self.mark_message(crate::render::MarkKind::ToolCall);
+                self.last_mark_was_assistant = false;
                 self.push_tool_call(&name, &detail);
             }
             UiLine::ToolCallCommit { .. } => {
@@ -1694,6 +1728,8 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 self.push_styled_command_output(&text, SGR_BOLD);
             }
             UiLine::ToolResult { success, summary } => {
+                self.mark_message(crate::render::MarkKind::ToolResult);
+                self.last_mark_was_assistant = false;
                 self.push_tool_result(success, &summary);
             }
             UiLine::DiffLine { added, text } => {
@@ -3867,5 +3903,33 @@ mod tests {
             "re-merged row should contain original text, got: {:?}",
             r.body_lines[0]
         );
+    }
+
+    #[test]
+    fn alt_message_marks_tracked_on_user_push() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::User("hi".into()));
+        assert_eq!(r.message_marks.len(), 1);
+        assert_eq!(r.message_marks[0].kind, crate::render::MarkKind::User);
+    }
+
+    #[test]
+    fn alt_message_marks_decremented_on_drain() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // Each UiLine::User("line N") pushes 2 body rows (user text + blank spacer):
+        //   push_body_row_raw(chevron + text)  → 1 row at width=80
+        //   push_body_row(String::new())        → 1 blank row
+        // 5005 users → 10010 body rows. The scrollback cap is 5000, so
+        // drain = 10010 - 5000 = 5010 rows removed from the front.
+        // Marks at line_idx < 5010 are dropped; the first surviving mark
+        // was at original idx=5010, which normalises to 0 after subtraction.
+        // 5010 / 2 = 2505 marks dropped; 5005 - 2505 = 2500 survive.
+        for i in 0..5005 {
+            r.render(UiLine::User(format!("line {}", i)));
+        }
+        assert_eq!(r.message_marks.len(), 2500);
+        assert_eq!(r.message_marks[0].line_idx, 0, "first surviving mark should point at body_lines[0] after drain");
     }
 }
