@@ -388,6 +388,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// as they were (not "approximated" by crossterm's snapshot).
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
+    /// Mouse text-selection state: anchor, head, and drag-active flag.
+    /// Driven by `begin_selection` / `update_selection` / `end_selection`
+    /// / `copy_selection` trait methods wired in P5.2.
+    selection: crate::render::selection::SelectionState,
 }
 
 /// Tracking state for an active multi-row live group. Populated by
@@ -457,6 +461,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_group: None,
             #[cfg(windows)]
             prior_console_in_mode,
+            selection: Default::default(),
         }
     }
 
@@ -2185,6 +2190,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.screen.invalidate();
     }
 
+    /// Convert terminal coordinates `(col, row)` (1-indexed row, 0-indexed col
+    /// matching mouse event coordinates) to body_lines coordinates
+    /// `(body_row_idx, col)`. Returns `None` when the position falls outside
+    /// the body region (row 0 is above the body, row > body_bottom is the
+    /// footer, body_row past body_lines end is empty space).
+    fn screen_to_body(&self, col: u16, row: u16) -> Option<crate::render::selection::BodyPos> {
+        let bottom = self.body_bottom_row();
+        if row == 0 || row > bottom {
+            return None;
+        }
+        let body_height = bottom as usize;
+        let total = self.body_lines.len();
+        let viewport_start = if self.view_mode {
+            self.viewport_top
+        } else {
+            total.saturating_sub(body_height)
+        };
+        let body_row = viewport_start + (row - 1) as usize;
+        if body_row >= total {
+            return None;
+        }
+        Some((body_row, col))
+    }
+
     /// Exit view_mode unconditionally, restoring sticky-bottom state.
     /// Call at the start of any operation that invalidates the current
     /// viewport (reset, clear, resize, approval prompt).
@@ -3418,6 +3447,36 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // Exiting view: repaint body tail without LF (Task 3.5).
             self.repaint_body_region();
         }
+    }
+
+    fn begin_selection(&mut self, col: u16, row: u16) {
+        if let Some(pos) = self.screen_to_body(col, row) {
+            self.selection.begin(pos);
+            self.repaint_body_region();
+        } else {
+            self.selection.clear();
+        }
+    }
+
+    fn update_selection(&mut self, col: u16, row: u16) {
+        if let Some(pos) = self.screen_to_body(col, row) {
+            self.selection.update(pos);
+            self.repaint_body_region();
+        }
+    }
+
+    fn end_selection(&mut self) {
+        if let Some(text) = self.selection.end(&self.body_lines) {
+            crate::render::selection::emit_osc52(&mut self.out, &text);
+        }
+    }
+
+    fn copy_selection(&mut self) -> bool {
+        let copied = self.selection.copy(&self.body_lines);
+        if copied {
+            self.repaint_body_region();
+        }
+        copied
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16) {
@@ -7985,5 +8044,25 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("\x1b[?1002l"), "shutdown must disable button-event: {:?}", s);
         assert!(s.contains("\x1b[?1006l"), "shutdown must disable SGR coords: {:?}", s);
+    }
+
+    #[test]
+    fn retained_begin_selection_records_anchor() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        for i in 0..5 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.begin_selection(3, 1);
+        assert!(r.selection.selection.is_some());
+    }
+
+    #[test]
+    fn retained_copy_selection_writes_clipboard() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::User("hello world".into()));
+        // Anchor at body row 0 col 0, head at col 5.
+        r.selection.begin((0, 0));
+        r.selection.update((0, 5));
+        assert!(r.copy_selection(), "expected non-empty selection to copy");
     }
 }
