@@ -189,6 +189,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Up                               Previous input
     Down                             Next input
 
+  ── Scrollback ──
+    PageUp / PageDown                Page up / down (10 lines)
+    Shift+↑ / Shift+↓                Line up / down
+    Alt+↑ / Alt+↓                    Jump to prev / next message ***
+    Ctrl+↑ / Ctrl+↓                  Jump to prev / next user message
+    Home / End                       Jump to top / back to latest
+    Mouse wheel                      Scroll body (atomcode captures)
+    Shift+drag mouse                 Use host terminal selection (bypass)
+
+  ── Display ──
+    /scrollbar                       Toggle right-side scrollbar
+
   ── Session ──
     Ctrl+C                           Cancel current turn / dismiss modal
     Ctrl+D                           Exit AtomCode
@@ -211,6 +223,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
      (macOS Apple Terminal, default xterm, GNOME Terminal, VS Code's
      integrated terminal) collapse Shift+Enter into plain Enter —
      use Ctrl+J or \ + Enter instead.
+  *** Alt+↑/↓ on macOS Apple Terminal requires enabling "Use Option as
+      Meta key" under Settings → Profiles → Keyboard. Other terminals
+      send the modifier by default.
 
   Tip: run /help for the full slash command list.
 "#.into(),
