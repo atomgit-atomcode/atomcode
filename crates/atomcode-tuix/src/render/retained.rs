@@ -2520,6 +2520,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // Muted (dim gray) for the result prefix — visually subordinate
                 // to the tool-call header above (● ToolName).
                 let prefix_style = self.style_for(Role::Muted);
+                // `└` is a leaf marker for the whole result block, not
+                // a per-line bullet — emit it on the FIRST visual row
+                // only. Continuation rows (both wrap chunks of one
+                // physical line and subsequent `\n`-separated lines)
+                // use 4 spaces, same column width as `"  └ "`, so the
+                // text stays aligned under the head text.
+                let mut first_visual = true;
                 for (line_idx, phys) in body_str.split('\n').enumerate() {
                     // First physical line of a failure body is the
                     // header. Wrapped continuation chunks of that same
@@ -2541,9 +2548,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     };
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        push_str_cells(&mut row, "  └ ", &prefix_style);
+                        let prefix = if first_visual { "  └ " } else { "    " };
+                        push_str_cells(&mut row, prefix, &prefix_style);
                         push_str_cells(&mut row, &chunk, line_style);
                         self.push_body_row(row);
+                        first_visual = false;
                     }
                 }
                 // No trailing spacer — tool chains stay compact. A
@@ -5174,6 +5183,74 @@ mod tests {
             "continuation row must NOT be red (would alias visually with diff-remove): {:?}",
             cont_cell,
         );
+    }
+
+    /// `└` is a leaf marker for the whole tool-result block, not a
+    /// per-line bullet. When the body wraps to multiple visual rows
+    /// (narrow terminal, long summary, or `\n`-separated lines) only
+    /// the FIRST visual row carries `└`; continuation rows align under
+    /// the text via 4 spaces. Without this, every wrapped chunk shows
+    /// a redundant `└` at col 2 — the bug fixed alongside this test.
+    #[test]
+    fn retained_tool_result_wrap_continuation_has_no_arrow() {
+        // 40-col width → row_w = 40 - PAD_COL(2) - prefix(4) = 34.
+        // Summary is > 34 cols so it must wrap to at least 2 visual rows.
+        let (mut r, buf) = new_capturing(40, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
+        let status = status_basic();
+        let long_summary =
+            "Created new file /tmp/atomcode-smoke-temp-check.txt (15 bytes, 1 line)";
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: long_summary.into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let arrow_rows: Vec<usize> = (0..vterm.height() as usize)
+            .filter(|&i| vterm.row_text(i).contains('└'))
+            .collect();
+        assert_eq!(
+            arrow_rows.len(),
+            1,
+            "`└` must appear on exactly one row (the first), found {} rows. dump:\n{}",
+            arrow_rows.len(),
+            vterm.dump()
+        );
+        let first_row = arrow_rows[0];
+        // The text just after `└ ` should appear on the first row.
+        assert!(
+            vterm.row_text(first_row).contains("Created new file"),
+            "first row must carry the head of the body, got: {:?}",
+            vterm.row_text(first_row)
+        );
+
+        // A continuation row exists (the body wrapped) and it must
+        // start with 4 spaces (cols 0..4) — same width as `"  └ "` —
+        // so the text aligns under the head text, not under the `└`.
+        let cont_row = first_row + 1;
+        assert!(
+            (cont_row as u16) < vterm.height(),
+            "expected at least one continuation row, vterm height = {}",
+            vterm.height()
+        );
+        for c in 0..4 {
+            assert_eq!(
+                vterm.cell_at(cont_row, c).ch,
+                ' ',
+                "continuation row col {} must be blank, got {:?} (row text: {:?})",
+                c,
+                vterm.cell_at(cont_row, c).ch,
+                vterm.row_text(cont_row),
+            );
+        }
     }
 
     /// DiffBlock: multiple added/removed lines, each with its own
