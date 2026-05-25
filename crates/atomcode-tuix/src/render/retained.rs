@@ -279,6 +279,9 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// `PAD_COL` indent. `paint_body` just `draw_row`s the last N
     /// directly.
     body_lines: Vec<Vec<Cell>>,
+    /// Message boundary markers for "jump to prev/next message" navigation.
+    /// Tracks which line_idx marks the start of a User / Assistant / ToolCall / ToolResult message.
+    message_marks: Vec<crate::render::MessageMark>,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
@@ -410,6 +413,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             status: StatusLine::default(),
             input_attachments: Vec::new(),
             body_lines: Vec::new(),
+            message_marks: Vec::new(),
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             dirty: false,

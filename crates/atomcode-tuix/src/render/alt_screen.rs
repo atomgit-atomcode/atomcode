@@ -163,6 +163,9 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// no terminal-side scrollback is involved (alt-screen owns the
     /// whole viewport, host terminal's scrollback is unreachable).
     body_lines: Vec<String>,
+    /// Message boundary markers for "jump to prev/next message" navigation.
+    /// Tracks which line_idx marks the start of a User / Assistant / ToolCall / ToolResult message.
+    message_marks: Vec<crate::render::MessageMark>,
     /// Raw (unwrapped) body rows — mirrors `body_lines` but stores each
     /// logical line *before* soft-wrapping. Used by `reflow_body_lines`
     /// on resize so that widening the terminal re-merges previously
@@ -346,6 +349,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             width: w,
             height: h,
             body_lines: Vec::new(),
+            message_marks: Vec::new(),
             raw_body_lines: Vec::new(),
             viewport_top: 0,
             sticky_bottom: true,

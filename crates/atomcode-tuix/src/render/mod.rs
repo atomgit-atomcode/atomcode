@@ -11,6 +11,23 @@ pub mod worker;
 
 use std::time::Duration;
 
+/// Boundary marker for an originated message in the body buffer. Drives
+/// "jump to prev/next message" navigation keys. Marked at push time;
+/// kept in sync when body_lines drains from the front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    User,
+    Assistant,
+    ToolCall,
+    ToolResult,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MessageMark {
+    pub line_idx: usize,
+    pub kind: MarkKind,
+}
+
 /// Semantic line to render. Renderer implementations translate this to bytes.
 ///
 /// Permanent lines (User, Assistant, ToolCall, ToolResult, Diff, Approval,
