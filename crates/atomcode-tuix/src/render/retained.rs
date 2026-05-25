@@ -2158,6 +2158,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// In view_mode: paint body_lines[viewport_top..viewport_top+body_height].
     /// Out of view_mode (just exited): paint body_lines tail.
     /// Always uses CUP+EL+content per row; never emits LF.
+    /// Rows that fall within the active selection are rendered with reverse-video
+    /// highlight via `render_line_with_selection`.
     fn repaint_body_region(&mut self) {
         let bottom = self.body_bottom_row();
         if bottom == 0 || self.body_lines.is_empty() {
@@ -2171,14 +2173,39 @@ impl<W: Write + Send> RetainedRenderer<W> {
             total.saturating_sub(body_height)
         };
         let end = (start + body_height).min(total);
+        // Extract selection bounds before the loop to avoid borrow conflicts.
+        use crate::render::selection::selection_col_range_for_line;
+        let sel = self.selection.selection.map(|s| {
+            if s.anchor < s.head {
+                (s.anchor, s.head)
+            } else {
+                (s.head, s.anchor)
+            }
+        });
+        let screen_width = self.screen.width() as usize;
         // Clone the slice to avoid simultaneous borrow of self.
         let rows: Vec<Vec<Cell>> = self.body_lines[start..end].to_vec();
         for (i, row) in rows.iter().enumerate() {
             let target_row = 1 + i as u16;
             let seq = format!("\x1b[{};1H\x1b[K", target_row);
             let _ = self.out.write_all(seq.as_bytes());
-            let bytes = serialize_row(row);
-            let _ = self.out.write_all(&bytes);
+            let body_idx = start + i;
+            let row_text: String = row.iter().filter(|c| c.width > 0).map(|c| c.ch).collect();
+            // If selection covers this row, emit with reverse-video highlight.
+            let sel_range = sel.and_then(|(lo, hi)| {
+                let lo_us = (lo.0, lo.1 as usize);
+                let hi_us = (hi.0, hi.1 as usize);
+                selection_col_range_for_line(body_idx, lo_us, hi_us, &row_text)
+            });
+            if let Some((sel_start, sel_end)) = sel_range {
+                let highlighted = crate::render::selection::render_line_with_selection(
+                    &row_text, screen_width, sel_start, sel_end,
+                );
+                let _ = self.out.write_all(highlighted.as_bytes());
+            } else {
+                let bytes = serialize_row(row);
+                let _ = self.out.write_all(&bytes);
+            }
         }
         // Clear any rows below content (when body_lines is short).
         for i in (end - start)..body_height {
@@ -8064,5 +8091,32 @@ mod tests {
         r.selection.begin((0, 0));
         r.selection.update((0, 5));
         assert!(r.copy_selection(), "expected non-empty selection to copy");
+    }
+
+    #[test]
+    fn retained_selection_highlight_emits_reverse_video() {
+        let (mut r, buf) = new_capturing(80, 24);
+        // Push enough lines so body overflows the 24-row terminal → scroll enters view_mode.
+        for i in 0..30 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        // Scroll up: with 30 body lines and ~23-row body this reliably enters view_mode.
+        r.scroll_body(-5);
+        assert!(r.view_mode, "precondition: scroll_body(-5) must enter view_mode");
+        // Determine which body rows are visible: viewport_top .. viewport_top + body_height.
+        let viewport_top = r.viewport_top;
+        // Clear captured bytes so we only inspect repaint_body_region output.
+        buf.lock().unwrap().clear();
+        // Select the first visible row (viewport_top) — guaranteed to be in the painted range.
+        r.selection.begin((viewport_top, 0));
+        r.selection.update((viewport_top, 5));
+        r.repaint_body_region();
+        let output = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&output);
+        assert!(
+            s.contains("\x1b[7m"),
+            "selection paint must include reverse-video SGR \\x1b[7m: {:?}",
+            s
+        );
     }
 }
