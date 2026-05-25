@@ -1468,6 +1468,17 @@ async fn run() -> Result<i32> {
                 spawn_detached_upgrade_prep();
             }
 
+            // Redirect fd 2 → $ATOMCODE_HOME/stderr.log before the TUI takes
+            // ownership of the terminal. NSPasteboard deprecation warnings
+            // (arboard clipboard polling, ~1.5 s interval) and any other
+            // rogue C-lib stderr writes would otherwise land at the raw-mode
+            // cursor position, painting into the input box.
+            //
+            // Only fires here — the TUI branch. Headless (-p/--prompt-file)
+            // leaves stderr pointing at the real terminal so the user sees
+            // actual errors in their shell/CI output.
+            redirect_stderr_to_log_file();
+
             let ctx = atomcode_telemetry::CurrentContext::current();
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
@@ -1482,6 +1493,73 @@ async fn run() -> Result<i32> {
     .await;
 
     result
+}
+
+/// On macOS the NSPasteboard runtime prints deprecation warnings to
+/// stderr when arboard calls into AppKit (via clipboard polling for
+/// the "ctrl+v to paste image" hint). In raw mode, stderr shares the
+/// TTY with the TUI paint stream, so those warnings paint into the
+/// input box at whatever cursor row happens to be active. Other libs
+/// (LSP, MCP shells) can leak the same way.
+///
+/// Redirect fd 2 to `$ATOMCODE_HOME/stderr.log` once we know we're
+/// entering interactive TUI mode. plain / headless / piped paths
+/// don't call this — they want stderr to reach the terminal so the
+/// user sees real errors.
+///
+/// Best-effort: if the home dir can't be created or the file can't
+/// be opened, do nothing and let stderr leak (the original bug); we
+/// don't want to take down atomcode startup because logging failed.
+#[cfg(unix)]
+fn redirect_stderr_to_log_file() {
+    use std::os::unix::io::AsRawFd;
+    let Some(home) = std::env::var_os("ATOMCODE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".atomcode")))
+    else {
+        return;
+    };
+    if std::fs::create_dir_all(&home).is_err() {
+        return;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.join("stderr.log"))
+    else {
+        return;
+    };
+    // Write a session marker so users can see in stderr.log where
+    // each atomcode session starts — helps separate one run's noise
+    // from another's when grepping for actual problems.
+    // Use epoch seconds (std::time only — no chrono dep needed).
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let marker = format!("\n--- atomcode session start (unix={epoch_secs}) ---\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::BufWriter::new(&file),
+        marker.as_bytes(),
+    );
+    // SAFETY: dup2 swaps the file descriptor table entry for fd 2
+    // to point at `file`'s underlying fd. This is a standard, safe
+    // operation; the worst case (dup2 fails) is the redirect doesn't
+    // happen and we log nothing — same as the no-redirect baseline.
+    unsafe {
+        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+    }
+    // Intentionally keep `file` alive via the dup2 — the kernel
+    // holds a reference to the underlying inode, so even after
+    // `file` is dropped, fd 2 stays pointing at the same file.
+    // No need to std::mem::forget.
+}
+
+#[cfg(not(unix))]
+fn redirect_stderr_to_log_file() {
+    // Windows: NSPasteboard is mac-only; arboard on Windows uses
+    // OpenClipboard which doesn't NSLog. Not a known leak path.
+    // No-op for now; revisit if a similar Windows issue surfaces.
 }
 
 /// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
