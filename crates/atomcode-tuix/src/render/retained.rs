@@ -392,6 +392,10 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// Driven by `begin_selection` / `update_selection` / `end_selection`
     /// / `copy_selection` trait methods wired in P5.2.
     selection: crate::render::selection::SelectionState,
+    /// Whether to paint the right-side vertical scrollbar. Persisted to
+    /// ui-state.toml so the setting survives restarts. Toggled via
+    /// `toggle_scrollbar()`. P6.5 uses this field in repaint_body_region.
+    pub show_scrollbar: bool,
 }
 
 /// Tracking state for an active multi-row live group. Populated by
@@ -432,6 +436,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let _ = out.flush();
         #[cfg(windows)]
         let prior_console_in_mode = crate::render::conhost::enable_conhost_mouse_capture();
+        let show_scrollbar = crate::render::ui_state::load().ui.show_scrollbar;
         Self {
             out,
             caps,
@@ -462,6 +467,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             #[cfg(windows)]
             prior_console_in_mode,
             selection: Default::default(),
+            show_scrollbar,
         }
     }
 
@@ -3592,6 +3598,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
         self.last_painted_footer_rows = self.current_footer_rows();
         self.dirty = false;
+    }
+
+    fn toggle_scrollbar(&mut self) -> bool {
+        self.show_scrollbar = !self.show_scrollbar;
+        let mut state = crate::render::ui_state::load();
+        state.ui.show_scrollbar = self.show_scrollbar;
+        crate::render::ui_state::save(&state);
+        // Body width changes — force repaint of body region tail
+        self.repaint_body_region();
+        self.show_scrollbar
     }
 }
 

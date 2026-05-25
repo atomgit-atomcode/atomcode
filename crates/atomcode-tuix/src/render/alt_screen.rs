@@ -264,6 +264,10 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// instead as flicker — we leave cursor visible the whole time
     /// and only reposition it via a CUP at frame end.
     slow_paint_terminal: bool,
+    /// Whether to paint the right-side vertical scrollbar. Persisted to
+    /// ui-state.toml so the setting survives restarts. Toggled via
+    /// `toggle_scrollbar()`. P6.4 uses this field in paint_body.
+    pub show_scrollbar: bool,
 }
 
 impl AltScreenRenderer<BufWriter<Stdout>> {
@@ -277,6 +281,7 @@ impl AltScreenRenderer<BufWriter<Stdout>> {
 
 impl<W: Write + Send> AltScreenRenderer<W> {
     pub fn with_writer(out: W, caps: TerminalCaps, w: u16, h: u16) -> Self {
+        let show_scrollbar = crate::render::ui_state::load().ui.show_scrollbar;
         let mut r = Self {
             out,
             caps,
@@ -304,6 +309,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             selection: crate::render::selection::SelectionState::default(),
             cursor_shown: true,
             slow_paint_terminal: false,
+            show_scrollbar,
         };
         r.enter_alt_screen();
         r
@@ -2050,6 +2056,18 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             self.paint_frame();
         }
         copied
+    }
+
+    fn toggle_scrollbar(&mut self) -> bool {
+        self.show_scrollbar = !self.show_scrollbar;
+        let mut state = crate::render::ui_state::load();
+        state.ui.show_scrollbar = self.show_scrollbar;
+        crate::render::ui_state::save(&state);
+        // Body width changes — force reflow + repaint
+        self.reflow_body_lines();
+        self.body_dirty = true;
+        self.paint_frame();
+        self.show_scrollbar
     }
 }
 

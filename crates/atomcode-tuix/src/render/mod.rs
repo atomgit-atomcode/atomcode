@@ -316,6 +316,10 @@ pub trait Renderer: Send {
     /// Default no-op: renderers without a retained body buffer can't
     /// edit already-emitted rows in place.
     fn refresh_welcome_banner(&mut self, _model: &str, _working_dir: &str) {}
+
+    /// Toggle the right-side visible scrollbar. Default: no-op for renderers
+    /// that don't have a body region (Plain). Returns the new state — true = now shown.
+    fn toggle_scrollbar(&mut self) -> bool { false }
 }
 
 /// Visual style for the menu popup. Drives whether the renderer prefixes
