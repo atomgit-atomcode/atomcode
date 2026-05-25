@@ -2122,29 +2122,41 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
     }
 
     fn scroll_to_prev_message(&mut self) {
+        let body_height = self.body_height() as usize;
+        let max_top = self.body_lines.len().saturating_sub(body_height);
+        let effective_top = if self.sticky_bottom { max_top } else { self.viewport_top };
         let target = self.message_marks.iter().rev()
-            .find(|m| m.line_idx < self.viewport_top)
+            .find(|m| m.line_idx < effective_top)
             .map(|m| m.line_idx);
         if let Some(t) = target { self.scroll_body_to(t); }
     }
 
     fn scroll_to_next_message(&mut self) {
+        let body_height = self.body_height() as usize;
+        let max_top = self.body_lines.len().saturating_sub(body_height);
+        let effective_top = if self.sticky_bottom { max_top } else { self.viewport_top };
         let target = self.message_marks.iter()
-            .find(|m| m.line_idx > self.viewport_top)
+            .find(|m| m.line_idx > effective_top)
             .map(|m| m.line_idx);
         if let Some(t) = target { self.scroll_body_to(t); }
     }
 
     fn scroll_to_prev_user_message(&mut self) {
+        let body_height = self.body_height() as usize;
+        let max_top = self.body_lines.len().saturating_sub(body_height);
+        let effective_top = if self.sticky_bottom { max_top } else { self.viewport_top };
         let target = self.message_marks.iter().rev()
-            .find(|m| m.line_idx < self.viewport_top && m.kind == crate::render::MarkKind::User)
+            .find(|m| m.line_idx < effective_top && m.kind == crate::render::MarkKind::User)
             .map(|m| m.line_idx);
         if let Some(t) = target { self.scroll_body_to(t); }
     }
 
     fn scroll_to_next_user_message(&mut self) {
+        let body_height = self.body_height() as usize;
+        let max_top = self.body_lines.len().saturating_sub(body_height);
+        let effective_top = if self.sticky_bottom { max_top } else { self.viewport_top };
         let target = self.message_marks.iter()
-            .find(|m| m.line_idx > self.viewport_top && m.kind == crate::render::MarkKind::User)
+            .find(|m| m.line_idx > effective_top && m.kind == crate::render::MarkKind::User)
             .map(|m| m.line_idx);
         if let Some(t) = target { self.scroll_body_to(t); }
     }
@@ -3984,6 +3996,18 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(!s.contains("█"), "thumb should not appear when disabled: {:?}", s);
+    }
+
+    #[test]
+    fn alt_scroll_to_prev_message_works_from_sticky_bottom() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        for i in 0..30 { r.render(UiLine::User(format!("u{}", i))); }
+        assert!(r.sticky_bottom);
+        r.scroll_to_prev_message();
+        assert!(!r.sticky_bottom, "alt+up at sticky bottom should leave sticky");
+        let max_top = r.body_lines.len().saturating_sub(r.body_height() as usize);
+        assert!(r.viewport_top < max_top, "viewport_top should be less than max_top after jumping back");
     }
 
     #[test]
