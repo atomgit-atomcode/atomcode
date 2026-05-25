@@ -2269,6 +2269,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let _ = self.out.flush();
         self.screen.invalidate();
+        // Re-anchor the terminal cursor at the input prompt — our row-by-row
+        // CUP+EL emit above left the cursor parked on the last body row.
+        // Run the standard footer paint + render_diff so screen.set_cursor()
+        // (called inside paint_footer) emits the correct CUP back to the
+        // input column. invalidate() above guarantees the diff redraws the
+        // full footer region against blank prev_cells, so any visual the
+        // user previously had stays consistent.
+        self.paint_frame();
+        let bytes = self.screen.render_diff();
+        let _ = self.out.write_all(&bytes);
+        let _ = self.out.flush();
+        self.dirty = false;
     }
 
     /// Convert terminal coordinates `(col, row)` (1-indexed row, 0-indexed col
@@ -2536,6 +2548,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 header,
                 children,
             } => {
+                // Mark the batch header as a ToolCall anchor — Alt+↑/↓
+                // (message-jump) walks `message_marks`; without this
+                // the whole "● Running N calls in parallel" header +
+                // child rows would be invisible to jump navigation,
+                // skipping the entire batch.
+                self.mark_message(crate::render::MarkKind::ToolCall);
+                self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
                 // Push header + N child rows as single-line rows so
                 // body_lines indices map 1:1 with terminal positions.
@@ -2660,6 +2679,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let _ = self.out.write_all(&bytes);
             }
             UiLine::ToolGroupSummary { text } => {
+                // Mark the batch summary as a ToolResult anchor —
+                // counterpart to the ToolGroupRender header above, so
+                // Alt+↑/↓ can land on the closing line of a parallel
+                // batch instead of skipping past the whole group.
+                self.mark_message(crate::render::MarkKind::ToolResult);
+                self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
                 // Terminal default fg, NOT bold — distinguishable from
                 // the muted children (which apply faint), but quieter
@@ -8318,6 +8343,57 @@ mod tests {
             s.contains("\x1b[7m"),
             "selection paint must include reverse-video SGR \\x1b[7m: {:?}",
             s
+        );
+    }
+
+    #[test]
+    fn retained_scroll_body_re_anchors_cursor_to_input() {
+        let (mut r, buf) = new_capturing(80, 24);
+        // Push enough lines to force overflow + show the input box
+        for i in 0..40 { r.render(UiLine::User(format!("L{}", i))); }
+        // Establish a known input prompt so paint_footer has something to anchor against
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        buf.lock().unwrap().clear();
+        r.scroll_body(-3);
+        let bytes = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&bytes);
+        // After scroll, the LAST cursor positioning escape in the output
+        // should target a row inside the footer region (i.e., > body_bottom_row).
+        // Find the last CUP escape: \x1b[{row};{col}H
+        let mut last_cup_row: Option<u16> = None;
+        let mut idx = 0;
+        while idx < s.len() {
+            if let Some(esc_at) = s[idx..].find("\x1b[") {
+                let after = idx + esc_at + 2;
+                // Parse {row};{col}H or {row};{col}{letter}
+                let tail = &s[after..];
+                if let Some(h_pos) = tail.find('H') {
+                    let inner = &tail[..h_pos];
+                    if let Some((row_s, _)) = inner.split_once(';') {
+                        if let Ok(row) = row_s.parse::<u16>() {
+                            last_cup_row = Some(row);
+                        }
+                    }
+                    idx = after + h_pos + 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        let body_bottom = r.body_bottom_row();
+        let last_row = last_cup_row.unwrap_or(0);
+        assert!(
+            last_row > body_bottom,
+            "after scroll, last cursor CUP should land in footer (> body_bottom={}), got row={}; bytes tail: {:?}",
+            body_bottom,
+            last_row,
+            &s[s.len().saturating_sub(200)..]
         );
     }
 }

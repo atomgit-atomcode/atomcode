@@ -1693,6 +1693,10 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // there's nothing to freeze yet.
             }
             UiLine::ToolGroupRender { batch_id: _, header, children } => {
+                // Mark batch header as ToolCall anchor for Alt+↑/↓
+                // message-jump (parity with retained).
+                self.mark_message(crate::render::MarkKind::ToolCall);
+                self.last_mark_was_assistant = false;
                 // alt-screen mirrors retained's append-style without
                 // the in-place ✓ rewrite (alt-screen layout is
                 // virtual-buffer based; live-group rewrite would need
@@ -1720,6 +1724,10 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 self.push_styled_command_output(&new_text, SGR_GREY);
             }
             UiLine::ToolGroupSummary { text } => {
+                // Mark batch summary as ToolResult anchor (parity with
+                // retained). Without it Alt+↑/↓ skips the whole batch.
+                self.mark_message(crate::render::MarkKind::ToolResult);
+                self.last_mark_was_assistant = false;
                 // Summary mirrors header: bold default-fg anchor row
                 // closing the group. Matches retained's
                 // `style_bold(Role::Secondary)` choice.
