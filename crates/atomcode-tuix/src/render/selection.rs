@@ -256,6 +256,79 @@ pub fn selection_col_range_for_line(
     Some((s, e))
 }
 
+// ── SelectionState methods ────────────────────────────────────────────
+
+impl SelectionState {
+    /// Start a new selection at body coordinates `pos`.
+    pub fn begin(&mut self, pos: BodyPos) {
+        self.selection = Some(Selection { anchor: pos, head: pos });
+        self.active = true;
+    }
+
+    /// Extend selection head to `pos` while button held.
+    pub fn update(&mut self, pos: BodyPos) {
+        if !self.active { return; }
+        if let Some(sel) = self.selection.as_mut() {
+            sel.head = pos;
+        }
+    }
+
+    /// Finalise selection. Returns the selected text if non-empty, so the
+    /// caller can emit OSC 52 to the host terminal. Selection state is
+    /// preserved so the highlight stays drawn until the next click.
+    /// Does NOT call emit_osc52 — that's the caller's responsibility.
+    pub fn end<B: BodyLineView>(&mut self, body: &B) -> Option<String> {
+        self.active = false;
+        let sel = self.selection.as_ref()?;
+        let text = extract_text(body, sel);
+        if text.is_empty() { None } else { Some(text) }
+    }
+
+    /// Copy current selection to system clipboard via arboard. Returns
+    /// true iff a non-empty selection was copied. Clears highlight.
+    pub fn copy<B: BodyLineView>(&mut self, body: &B) -> bool {
+        let Some(sel) = self.selection else { return false };
+        let text = extract_text(body, &sel);
+        if text.is_empty() { return false; }
+        let copied = match arboard::Clipboard::new() {
+            Ok(mut cb) => cb.set_text(text).is_ok(),
+            Err(_) => false,
+        };
+        if copied {
+            self.selection = None;
+            self.active = false;
+        }
+        copied
+    }
+
+    pub fn clear(&mut self) {
+        self.selection = None;
+        self.active = false;
+    }
+}
+
+/// Concatenate the selected text across (possibly multiple) body lines,
+/// using the existing per-line range helpers.
+fn extract_text<B: BodyLineView>(body: &B, sel: &Selection) -> String {
+    let (lo, hi) = ord(sel.anchor, sel.head);
+    let lo_us = (lo.0, lo.1 as usize);
+    let hi_us = (hi.0, hi.1 as usize);
+    let mut out = String::new();
+    for row in lo.0..=hi.0 {
+        let line = body.line_text(row);
+        let Some((start, end)) = selection_col_range_for_line(row, lo_us, hi_us, &line) else {
+            continue;
+        };
+        if row > lo.0 { out.push('\n'); }
+        out.push_str(&extract_line_selection_text(&line, start, end));
+    }
+    out
+}
+
+fn ord(a: BodyPos, b: BodyPos) -> (BodyPos, BodyPos) {
+    if a < b { (a, b) } else { (b, a) }
+}
+
 // ── Base64 + OSC 52 ───────────────────────────────────────────────────
 
 /// Standard-alphabet base64 encoder. Inline implementation (~30 lines)
@@ -436,6 +509,37 @@ mod tests {
         );
         // Lines outside [lo.0, hi.0] return None.
         assert_eq!(selection_col_range_for_line(3, lo, hi, "outside"), None);
+    }
+
+    #[test]
+    fn selection_state_begin_sets_anchor_and_active() {
+        let mut s = SelectionState::default();
+        s.begin((2, 5));
+        assert_eq!(s.selection, Some(Selection { anchor: (2, 5), head: (2, 5) }));
+        assert!(s.active);
+    }
+
+    #[test]
+    fn selection_state_update_only_while_active() {
+        let mut s = SelectionState::default();
+        s.begin((0, 0));
+        s.update((1, 4));
+        assert_eq!(s.selection.unwrap().head, (1, 4));
+        s.active = false;
+        s.update((2, 9));
+        // head shouldn't change after active = false
+        assert_eq!(s.selection.unwrap().head, (1, 4));
+    }
+
+    #[test]
+    fn selection_state_end_returns_concatenated_text() {
+        let body: Vec<String> = vec!["first".into(), "second".into(), "third".into()];
+        let mut s = SelectionState::default();
+        s.begin((0, 3));
+        s.update((2, 2));
+        let text = s.end(&body).expect("non-empty");
+        // Selection spans (0,3) → (2,2)
+        assert_eq!(text, "st\nsecond\nthi");
     }
 
     /// Base64 round-trip on the standard alphabet, including padding
