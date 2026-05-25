@@ -186,11 +186,24 @@ impl AutoCommitHook {
             .args(&["add", "-A"])
             .output();
 
+        // 统计实际 stage 的文件数（git add -A 可能添加了比系统追踪更多的文件）
+        let file_count = match std::process::Command::new("git")
+            .args(&["diff", "--cached", "--name-only"])
+            .output()
+        {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let count = stdout.lines().filter(|l| !l.is_empty()).count();
+                if count > 0 { count } else { ctx.edited_files.len() }
+            }
+            Err(_) => ctx.edited_files.len(),
+        };
+
         // git commit
         let commit_msg = format!(
             "Auto-commit at turn #{} ({} files changed)",
             ctx.turn_number,
-            ctx.edited_files.len()
+            file_count
         );
 
         match std::process::Command::new("git")
