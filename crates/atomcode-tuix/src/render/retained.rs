@@ -282,6 +282,11 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// Message boundary markers for "jump to prev/next message" navigation.
     /// Tracks which line_idx marks the start of a User / Assistant / ToolCall / ToolResult message.
     message_marks: Vec<crate::render::MessageMark>,
+    /// True if the last mark pushed was `MarkKind::Assistant`. Used to de-duplicate
+    /// marks for multi-chunk `UiLine::AssistantText` streams — only the first chunk
+    /// of a turn gets a new mark; subsequent chunks within the same assistant turn are silent.
+    /// Cleared whenever a User / ToolCall / ToolCallInFlight / TurnSeparator fires.
+    last_mark_was_assistant: bool,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
@@ -414,6 +419,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             input_attachments: Vec::new(),
             body_lines: Vec::new(),
             message_marks: Vec::new(),
+            last_mark_was_assistant: false,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             dirty: false,
@@ -1432,7 +1438,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.body_lines.len() > MAX_SCROLLBACK_ROWS {
             let drain = self.body_lines.len() - MAX_SCROLLBACK_ROWS;
             self.body_lines.drain(0..drain);
+            self.message_marks.retain(|m| m.line_idx >= drain);
+            for m in self.message_marks.iter_mut() {
+                m.line_idx -= drain;
+            }
         }
+    }
+
+    /// Record the start of a new logical message in `message_marks`.
+    /// The mark's `line_idx` is set to the CURRENT length of `body_lines`
+    /// (i.e. the index the NEXT `push_body_row` will occupy).
+    /// Called before any push in the render arm that starts a new message.
+    fn mark_message(&mut self, kind: crate::render::MarkKind) {
+        self.message_marks.push(crate::render::MessageMark {
+            line_idx: self.body_lines.len(),
+            kind,
+        });
     }
 
     /// Push or update the live spinner body row. On the first call of a
@@ -2163,6 +2184,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_welcome(&model_scrubbed, &wd_scrubbed);
             }
             UiLine::User(text) => {
+                self.mark_message(crate::render::MarkKind::User);
+                self.last_mark_was_assistant = false;
                 let safe = scrub_controls(&text);
                 let accent = self.style_bold(Role::Accent);
                 let plain = CellStyle::default();
@@ -2174,6 +2197,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.md_state.reset();
             }
             UiLine::TurnSeparator { label } => {
+                self.last_mark_was_assistant = false;
                 let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
                 let safe = scrub_controls(&label);
                 let lw = crate::width::display_width(&safe);
@@ -2217,6 +2241,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: streaming assistant ──
             UiLine::AssistantText(text) => {
+                if !self.last_mark_was_assistant {
+                    self.mark_message(crate::render::MarkKind::Assistant);
+                    self.last_mark_was_assistant = true;
+                }
                 self.assistant_line_buf.push_str(&scrub_controls(&text));
                 self.flush_assistant_lines();
             }
@@ -2252,6 +2280,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: tools & diffs ──
             UiLine::ToolCallInFlight { id, name, detail } => {
+                self.mark_message(crate::render::MarkKind::ToolCall);
+                self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
                 // Parallel tool calls are rare but not impossible. If
                 // one is already animating, freeze it before starting
@@ -2422,6 +2452,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_row(row);
             }
             UiLine::ToolCall { name, detail } => {
+                self.mark_message(crate::render::MarkKind::ToolCall);
+                self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
                 let muted = self.style_for(Role::Muted);
                 let tool_name_style = self.style_bold(Role::ToolName);
@@ -2458,6 +2490,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 );
             }
             UiLine::ToolResult { success, summary } => {
+                self.mark_message(crate::render::MarkKind::ToolResult);
+                self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
                 // Defense in depth: if the event loop didn't send
                 // ToolCallCommit before this Result (error path /
@@ -7493,5 +7527,28 @@ mod tests {
             r.render(UiLine::User(format!("line {}", i)));
         }
         assert_eq!(r.body_lines.len(), 5000, "body_lines should cap at 5000, got {}", r.body_lines.len());
+    }
+
+    #[test]
+    fn retained_message_marks_tracked_on_user_push() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::User("hi".into()));
+        assert_eq!(r.message_marks.len(), 1);
+        assert_eq!(r.message_marks[0].kind, crate::render::MarkKind::User);
+    }
+
+    #[test]
+    fn retained_message_marks_decremented_on_drain() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        // Each UiLine::User pushes 2 body rows (user text + blank spacer).
+        // 5005 users → 10010 body rows. drain = 10010 - 5000 = 5010 rows from front.
+        // Marks at line_idx < 5010 are dropped; the first surviving mark is at
+        // original idx=5010, which normalises to 0 after subtracting the drain.
+        for i in 0..5005 {
+            r.render(UiLine::User(format!("line {}", i)));
+        }
+        // 5010 / 2 = 2505 marks dropped; 5005 - 2505 = 2500 survive.
+        assert_eq!(r.message_marks.len(), 2500);
+        assert_eq!(r.message_marks[0].line_idx, 0, "first surviving mark should point at body_lines[0] after drain");
     }
 }
