@@ -716,6 +716,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
+        Msg::CmdDescScrollbar => "切换右侧滚动条显示".into(),
+
+        // ── Scrollbar UI 状态 ──
+        Msg::ScrollbarOn => "Scrollbar: ON".into(),
+        Msg::ScrollbarOff => "Scrollbar: OFF".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>

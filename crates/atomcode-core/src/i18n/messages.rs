@@ -505,6 +505,13 @@ pub enum Msg<'a> {
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.
     CmdPasteNoImage,
+    /// Description for the `/scrollbar` slash command — toggles the
+    /// right-side scrollbar visibility.
+    CmdDescScrollbar,
+
+    // ── Scrollbar UI status ──
+    ScrollbarOn,
+    ScrollbarOff,
 
     // ── config save failed ──
     ConfigSaveFailed { error: &'a str },

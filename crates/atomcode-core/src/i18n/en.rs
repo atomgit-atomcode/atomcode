@@ -727,6 +727,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
+        Msg::CmdDescScrollbar => "Toggle the right-side scrollbar".into(),
+
+        // ── Scrollbar UI status ──
+        Msg::ScrollbarOn => "Scrollbar: ON".into(),
+        Msg::ScrollbarOff => "Scrollbar: OFF".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>
