@@ -4153,10 +4153,10 @@ fn handle_input(
 ///     cursor instead)
 ///   - `None`        → not a scroll key at all
 ///
-/// AltScreenRenderer is the only renderer that does anything with
-/// these calls; the trait defaults are no-op so retained / plain
-/// silently fall through and let the existing phase dispatch handle
-/// the key (e.g. End-of-line cursor movement during input).
+/// Both AltScreenRenderer and RetainedRenderer implement these scroll
+/// methods (unified-scroll feature, Phase 3+7); PlainRenderer uses the
+/// trait no-op defaults and silently falls through to the existing
+/// phase dispatch (e.g. End-of-line cursor movement during input).
 fn handle_scroll_key(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
