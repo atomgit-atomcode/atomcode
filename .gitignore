@@ -2,6 +2,9 @@
 /target
 /runs
 
+# npm package downloaded binaries (platform-specific, not committed)
+packages/npm/bin/
+
 .env/
 
 # Git worktrees (used by superpowers:using-git-worktrees)
