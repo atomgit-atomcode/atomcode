@@ -34,8 +34,8 @@ use super::{MenuPayload, Renderer, StatusLine, UiLine};
 use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
-use crate::width::{display_width, truncate_to_width};
-use unicode_width::UnicodeWidthChar;
+use crate::width::{cluster_width, display_width, truncate_to_width};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Truncate `s` to `max_cols` display columns, treating ANSI CSI
 /// escape sequences (`\x1b[...{letter}`) as zero-width spans so SGR
@@ -57,27 +57,38 @@ fn truncate_to_width_sgr_aware(s: &str, max_cols: usize) -> String {
     }
     let mut acc = String::with_capacity(s.len());
     let mut cols = 0usize;
-    let mut iter = s.chars().peekable();
-    while let Some(c) = iter.next() {
-        // CSI sequence: ESC `[` {params} {final letter A-Z/a-z}.
-        // Append the whole span verbatim (zero visible cost).
-        if c == '\x1b' && iter.peek() == Some(&'[') {
-            acc.push(c);
-            acc.push(iter.next().unwrap()); // consume `[`
-            for nc in iter.by_ref() {
-                acc.push(nc);
-                if nc.is_ascii_alphabetic() {
-                    break; // final byte ends the CSI sequence
+    // Byte-cursor walk so CSI escapes (multi-byte but each ASCII-char
+    // grapheme) can be slurped as one zero-width unit while non-SGR
+    // content advances grapheme-by-grapheme for cluster_width accuracy.
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < s.len() {
+        if bytes[i] == 0x1b && i + 1 < s.len() && bytes[i + 1] == b'[' {
+            let start = i;
+            i += 2;
+            while i < s.len() {
+                let c = bytes[i];
+                i += 1;
+                if c.is_ascii_alphabetic() {
+                    break;
                 }
             }
+            acc.push_str(&s[start..i]);
             continue;
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        let next = s[i..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(idx, _)| idx + i)
+            .unwrap_or(s.len());
+        let g = &s[i..next];
+        let w = cluster_width(g);
         if cols + w > max_cols {
             break;
         }
-        acc.push(c);
+        acc.push_str(g);
         cols += w;
+        i = next;
     }
     acc
 }
@@ -105,27 +116,36 @@ fn wrap_to_width_sgr_aware(s: &str, max_cols: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut acc = String::new();
     let mut cols = 0usize;
-    let mut iter = s.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\x1b' && iter.peek() == Some(&'[') {
-            // CSI: zero visible width, copy verbatim into current chunk.
-            acc.push(c);
-            acc.push(iter.next().unwrap());
-            for nc in iter.by_ref() {
-                acc.push(nc);
-                if nc.is_ascii_alphabetic() {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < s.len() {
+        if bytes[i] == 0x1b && i + 1 < s.len() && bytes[i + 1] == b'[' {
+            let start = i;
+            i += 2;
+            while i < s.len() {
+                let c = bytes[i];
+                i += 1;
+                if c.is_ascii_alphabetic() {
                     break;
                 }
             }
+            acc.push_str(&s[start..i]);
             continue;
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        let next = s[i..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(idx, _)| idx + i)
+            .unwrap_or(s.len());
+        let g = &s[i..next];
+        let w = cluster_width(g);
         if w > 0 && cols + w > max_cols {
             chunks.push(std::mem::take(&mut acc));
             cols = 0;
         }
-        acc.push(c);
+        acc.push_str(g);
         cols += w;
+        i = next;
     }
     chunks.push(acc);
     chunks
@@ -139,18 +159,27 @@ fn wrap_to_width_sgr_aware(s: &str, max_cols: usize) -> Vec<String> {
 /// to the column the user happened to drop on.
 fn line_display_width_sgr_aware(s: &str) -> usize {
     let mut cols = 0usize;
-    let mut iter = s.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\x1b' && iter.peek() == Some(&'[') {
-            iter.next(); // consume `[`
-            for nc in iter.by_ref() {
-                if nc.is_ascii_alphabetic() {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < s.len() {
+        if bytes[i] == 0x1b && i + 1 < s.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < s.len() {
+                let c = bytes[i];
+                i += 1;
+                if c.is_ascii_alphabetic() {
                     break;
                 }
             }
             continue;
         }
-        cols += UnicodeWidthChar::width(c).unwrap_or(0);
+        let next = s[i..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(idx, _)| idx + i)
+            .unwrap_or(s.len());
+        cols += cluster_width(&s[i..next]);
+        i = next;
     }
     cols
 }
@@ -179,29 +208,36 @@ fn render_line_with_selection(
     let mut out = String::with_capacity(line.len() + 16);
     let mut cols = 0usize;
     let mut in_sel = false;
-    let mut iter = line.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\x1b' && iter.peek() == Some(&'[') {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < line.len() {
+        if bytes[i] == 0x1b && i + 1 < line.len() && bytes[i + 1] == b'[' {
             // Capture the full CSI span first so we can decide whether
             // to drop it (inside selection) or keep it (outside).
-            let mut csi = String::with_capacity(8);
-            csi.push(c);
-            csi.push(iter.next().unwrap());
-            for nc in iter.by_ref() {
-                csi.push(nc);
-                if nc.is_ascii_alphabetic() {
+            let start = i;
+            i += 2;
+            while i < line.len() {
+                let c = bytes[i];
+                i += 1;
+                if c.is_ascii_alphabetic() {
                     break;
                 }
             }
             if !in_sel {
-                out.push_str(&csi);
+                out.push_str(&line[start..i]);
             }
             continue;
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
         if cols >= max_cols {
             break;
         }
+        let next = line[i..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(idx, _)| idx + i)
+            .unwrap_or(line.len());
+        let g = &line[i..next];
+        let w = cluster_width(g);
         let want_in_sel = cols >= sel_start && cols < sel_end;
         if want_in_sel && !in_sel {
             // Reset existing colours then enable reverse video so the
@@ -216,8 +252,9 @@ fn render_line_with_selection(
         if cols + w > max_cols {
             break;
         }
-        out.push(c);
+        out.push_str(g);
         cols += w;
+        i = next;
     }
     if in_sel {
         out.push_str("\x1b[0m");
@@ -239,25 +276,35 @@ fn extract_line_selection_text(
     }
     let mut out = String::new();
     let mut cols = 0usize;
-    let mut iter = line.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\x1b' && iter.peek() == Some(&'[') {
-            iter.next(); // `[`
-            for nc in iter.by_ref() {
-                if nc.is_ascii_alphabetic() {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < line.len() {
+        if bytes[i] == 0x1b && i + 1 < line.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < line.len() {
+                let c = bytes[i];
+                i += 1;
+                if c.is_ascii_alphabetic() {
                     break;
                 }
             }
             continue;
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
         if cols >= sel_end {
             break;
         }
+        let next = line[i..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(idx, _)| idx + i)
+            .unwrap_or(line.len());
+        let g = &line[i..next];
+        let w = cluster_width(g);
         if cols >= sel_start {
-            out.push(c);
+            out.push_str(g);
         }
         cols += w;
+        i = next;
     }
     out
 }
