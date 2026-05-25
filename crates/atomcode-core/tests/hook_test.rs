@@ -672,3 +672,286 @@ async fn test_disabled_hook_not_registered() {
     assert!(result.is_ok());
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
+
+// ============================================================================
+// HookResult::Warning 全覆盖测试 — 所有 11 个 trigger 方法
+// ============================================================================
+
+/// 返回 Warning 的通用 hook
+struct WarningHook {
+    msg: String,
+    count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Hook for WarningHook {
+    fn name(&self) -> &str {
+        "warning-hook"
+    }
+}
+
+#[async_trait]
+impl PreToolExecutionHook for WarningHook {
+    async fn on_pre_execute(&self, _ctx: &HookCtx) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl PostToolExecutionHook for WarningHook {
+    async fn on_post_execute(&self, _ctx: &HookCtx, _result_ctx: &ToolResultContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl PostTurnHook for WarningHook {
+    async fn on_post_turn(&self, _ctx: &HookCtx, _turn_result: &str) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl OnMessageReceivedHook for WarningHook {
+    async fn on_message_received(&self, _ctx: &UserMessageContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl OnTurnStartHook for WarningHook {
+    async fn on_turn_start(&self, _ctx: &TurnStartContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl OnToolCallStartHook for WarningHook {
+    async fn on_tool_call_start(&self, _ctx: &ToolCallStartContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl OnTurnCompleteHook for WarningHook {
+    async fn on_turn_complete(&self, _ctx: &TurnCompleteContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl OnSessionStartHook for WarningHook {
+    async fn on_session_start(&self, _ctx: &SessionContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl OnSessionEndHook for WarningHook {
+    async fn on_session_end(&self, _ctx: &SessionContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl OnErrorHook for WarningHook {
+    async fn on_error(&self, _ctx: &ErrorContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+#[async_trait]
+impl OnModelResponseHook for WarningHook {
+    async fn on_model_response(&self, _response: &str, _turn_ctx: &TurnStartContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Warning(self.msg.clone())
+    }
+}
+
+/// Warning 应被所有 trigger 方法静默处理（不 panic、不返回 Err），且钩子仍然继续执行
+#[tokio::test]
+async fn test_warning_pre_tool() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_pre_tool_hook(Arc::new(WarningHook { msg: "pre warn".into(), count: count.clone() }));
+    let ctx = HookCtx::new("test".into(), "{}".into(), "/tmp".into());
+    let result = registry.trigger_pre_tool_hooks(&ctx).await;
+    assert!(result.is_ok()); // Warning 不阻止执行
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_post_tool() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_post_tool_hook(Arc::new(WarningHook { msg: "post warn".into(), count: count.clone() }));
+    let ctx = HookCtx::new("test".into(), "{}".into(), "/tmp".into());
+    let rctx = ToolResultContext { tool_name: "a".into(), tool_args: "b".into(), result: "ok".into(), success: true, duration_ms: 0 };
+    registry.trigger_post_tool_hooks(&ctx, &rctx).await; // no panic
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_post_turn() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_post_turn_hook(Arc::new(WarningHook { msg: "turn warn".into(), count: count.clone() }));
+    let ctx = HookCtx::new("test".into(), "{}".into(), "/tmp".into());
+    registry.trigger_post_turn_hooks(&ctx, "done").await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_on_message_received() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_on_message_received_hook(Arc::new(WarningHook { msg: "msg warn".into(), count: count.clone() }));
+    let ctx = UserMessageContext { content: "hi".into(), session_id: None, attached_files: vec![], timestamp: "t".into() };
+    let result = registry.trigger_on_message_received(&ctx).await;
+    assert_eq!(result, None); // Warning 不修改消息
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_on_turn_start() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_on_turn_start_hook(Arc::new(WarningHook { msg: "ts warn".into(), count: count.clone() }));
+    let ctx = TurnStartContext { turn_number: 1, session_id: None, working_dir: "/tmp".into(), phase: "e".into(), has_file_context: false };
+    registry.trigger_on_turn_start(&ctx).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_on_tool_call_start() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_on_tool_call_start_hook(Arc::new(WarningHook { msg: "tc warn".into(), count: count.clone() }));
+    let ctx = ToolCallStartContext { tool_name: "b".into(), tool_args: "{}".into(), call_id: "c1".into(), turn_number: 1 };
+    let result = registry.trigger_on_tool_call_start(&ctx).await;
+    assert!(result.is_ok()); // Warning 不阻止
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_on_turn_complete() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_on_turn_complete_hook(Arc::new(WarningHook { msg: "tc warn".into(), count: count.clone() }));
+    let ctx = TurnCompleteContext { turn_number: 1, result_type: "OK".into(), tokens_used: 0, tool_calls: 0, duration_ms: 0, truncated: false, edited_files: vec![] };
+    registry.trigger_on_turn_complete(&ctx).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_on_session_start() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_on_session_start_hook(Arc::new(WarningHook { msg: "ss warn".into(), count: count.clone() }));
+    let ctx = SessionContext { session_id: "s1".into(), working_dir: "/tmp".into(), model_name: "m".into(), provider_name: "p".into() };
+    registry.trigger_on_session_start(&ctx).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_on_session_end() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_on_session_end_hook(Arc::new(WarningHook { msg: "se warn".into(), count: count.clone() }));
+    let ctx = SessionContext { session_id: "s1".into(), working_dir: "/tmp".into(), model_name: "m".into(), provider_name: "p".into() };
+    registry.trigger_on_session_end(&ctx).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_on_error() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_on_error_hook(Arc::new(WarningHook { msg: "err warn".into(), count: count.clone() }));
+    let ctx = ErrorContext { error_type: "E".into(), error_message: "msg".into(), phase: "exec".into(), turn_number: Some(1) };
+    registry.trigger_on_error(&ctx).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_warning_on_model_response() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_on_model_response_hook(Arc::new(WarningHook { msg: "mr warn".into(), count: count.clone() }));
+    let turn_ctx = TurnStartContext { turn_number: 1, session_id: None, working_dir: "/tmp".into(), phase: "e".into(), has_file_context: false };
+    registry.trigger_on_model_response("resp", &turn_ctx).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+// ============================================================================
+// HookResult::Modified 额外测试 — 补充 PostToolExecutionHook + PostTurnHook
+// ============================================================================
+
+struct ModifiedPostToolHook {
+    count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Hook for ModifiedPostToolHook {
+    fn name(&self) -> &str {
+        "modified-post-tool-hook"
+    }
+}
+
+#[async_trait]
+impl PostToolExecutionHook for ModifiedPostToolHook {
+    async fn on_post_execute(&self, _ctx: &HookCtx, _result_ctx: &ToolResultContext) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Modified("post-modified".into())
+    }
+}
+
+#[tokio::test]
+async fn test_modified_post_tool() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_post_tool_hook(Arc::new(ModifiedPostToolHook { count: count.clone() }));
+    let ctx = HookCtx::new("test".into(), "{}".into(), "/tmp".into());
+    let rctx = ToolResultContext { tool_name: "a".into(), tool_args: "b".into(), result: "ok".into(), success: true, duration_ms: 0 };
+    registry.trigger_post_tool_hooks(&ctx, &rctx).await; // post-tool 静默吞掉 Modified
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+struct ModifiedPostTurnHook {
+    count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Hook for ModifiedPostTurnHook {
+    fn name(&self) -> &str {
+        "modified-post-turn-hook"
+    }
+}
+
+#[async_trait]
+impl PostTurnHook for ModifiedPostTurnHook {
+    async fn on_post_turn(&self, _ctx: &HookCtx, _turn_result: &str) -> HookResult {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        HookResult::Modified("post-turn-modified".into())
+    }
+}
+
+#[tokio::test]
+async fn test_modified_post_turn() {
+    let mut registry = HookRegistry::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    registry.register_post_turn_hook(Arc::new(ModifiedPostTurnHook { count: count.clone() }));
+    let ctx = HookCtx::new("test".into(), "{}".into(), "/tmp".into());
+    registry.trigger_post_turn_hooks(&ctx, "done").await; // post-turn 静默吞掉 Modified
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
