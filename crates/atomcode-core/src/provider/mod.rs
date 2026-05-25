@@ -321,6 +321,21 @@ mod format_http_error_tests {
 /// (with token refresh if expired).
 pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
     let mut config = if config.api_key.is_none() && config.provider_type != "ollama" {
+        // Security: only fall back to the OAuth access_token when the
+        // provider talks to a trusted AtomGit gateway. Sending the
+        // platform credential to an attacker-controlled base_url would
+        // leak the user's AtomGit identity.
+        let base_url = config.base_url.as_deref().unwrap_or("");
+        if !crate::coding_plan::crypto::is_atomgit_gateway(base_url) {
+            anyhow::bail!(
+                "Provider '{}' has no api_key and base_url '{base_url}' is not \
+                 a trusted AtomGit gateway.\n\
+                 Either set an explicit api_key in your config.toml, or use the \
+                 AtomGit OAuth flow by setting base_url to \
+                 https://llm-api.atomgit.com/v1",
+                config.provider_type,
+            );
+        }
         let mut c = config.clone();
         c.api_key = Some(load_auth_token()?);
         c
