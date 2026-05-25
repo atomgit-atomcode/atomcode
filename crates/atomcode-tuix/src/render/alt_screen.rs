@@ -32,10 +32,12 @@ use std::io::{self, BufWriter, Stdout, Write};
 
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
 use super::selection::{
-    self, extract_line_selection_text, line_display_width_sgr_aware,
+    line_display_width_sgr_aware,
     render_line_with_selection, selection_col_range_for_line,
     truncate_to_width_sgr_aware,
 };
+#[cfg(test)]
+use super::selection::extract_line_selection_text;
 use crate::i18n::{t, Msg};
 use crate::sanitize::scrub_controls;
 use crate::terminal::TerminalCaps;
@@ -227,24 +229,14 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// True when footer state changed since the last paint. Same role
     /// as `body_dirty` but for the footer strip.
     footer_dirty: bool,
-    /// Active mouse-drag selection, or completed selection still
-    /// visible until the next interaction. `anchor` is the press
-    /// point, `head` is the current drag (or release) point. Both
-    /// reference `body_lines` directly: `(line_idx, display_col)` —
-    /// so a viewport scroll doesn't desync the selection from its
-    /// underlying text. None means no selection rendered. Cleared
-    /// on `reset` / `clear_screen` / `on_resize` since each can
+    /// Shared selection state — tracks the active drag anchor/head and
+    /// whether a drag is in progress. Delegates to
+    /// `crate::render::selection::SelectionState` so the selection
+    /// logic is shared with the retained renderer. Cleared on
+    /// `reset` / `clear_screen` / `on_resize` since each can
     /// invalidate either the line indices (reset) or the display
     /// columns (resize → re-flow at paint time).
-    selection: Option<Selection>,
-    /// True only between `begin_selection` and `end_selection`. Used
-    /// to gate `update_selection` so a stray drag event after the
-    /// user already released doesn't move a stale selection. Some
-    /// terminals (notably JediTerm) emit a final coalesced motion
-    /// event right after Up; without this flag that event would
-    /// shift `head` to wherever the cursor was when the buffered
-    /// frame arrived.
-    selection_active: bool,
+    selection: crate::render::selection::SelectionState,
     /// Tracks whether the terminal cursor is currently shown (`?25h`
     /// last emitted) or hidden (`?25l`). Used to dedupe visibility
     /// toggles per frame: re-emitting `?25h` at streaming framerate
@@ -264,31 +256,6 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// instead as flicker — we leave cursor visible the whole time
     /// and only reposition it via a CUP at frame end.
     slow_paint_terminal: bool,
-}
-
-/// Mouse-drag selection range. See `AltScreenRenderer::selection` for
-/// semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Selection {
-    /// (body_line_idx, display_col) anchor — where the press landed.
-    anchor: (usize, usize),
-    /// (body_line_idx, display_col) head — current drag point.
-    /// Equal to anchor immediately after `begin_selection` (zero-
-    /// width selection); diverges as drag events extend the range.
-    head: (usize, usize),
-}
-
-impl Selection {
-    /// Return (low, high) where `low <= high` lexicographically. Used
-    /// when computing per-line column ranges so paint and copy don't
-    /// have to care which way the user dragged.
-    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
-        if self.anchor <= self.head {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
 }
 
 impl AltScreenRenderer<BufWriter<Stdout>> {
@@ -392,8 +359,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             pending_menu: None,
             pending_attachments: Vec::new(),
             footer_dirty: true,
-            selection: None,
-            selection_active: false,
+            selection: crate::render::selection::SelectionState::default(),
             cursor_shown: true,
             slow_paint_terminal: false,
         };
@@ -619,8 +585,13 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // Snapshot the ordered selection bounds once so the per-row
         // loop doesn't re-borrow `self.selection` while we hold a
         // reference to `self.body_lines[i]`. Cheap (Copy) and only
-        // computed when a selection exists.
-        let sel_bounds = self.selection.as_ref().map(|s| s.ordered());
+        // computed when a selection exists. `SelectionState.selection`
+        // is `Option<Selection>` with `BodyPos = (usize, u16)`; convert
+        // cols to usize for `selection_col_range_for_line`.
+        let sel_bounds = self.selection.selection.map(|s| {
+            let (lo, hi) = if s.anchor <= s.head { (s.anchor, s.head) } else { (s.head, s.anchor) };
+            ((lo.0, lo.1 as usize), (hi.0, hi.1 as usize))
+        });
         for row_idx in 0..body_height {
             let abs_row = (row_idx + 1) as u16;
             let cup_el = format!("\x1b[{};1H\x1b[K", abs_row);
@@ -663,13 +634,12 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     }
 
     /// Map a screen-cell `(col, row)` (0-indexed) to a body-line
-    /// position `(line_idx, display_col)`. Returns `None` when the
-    /// row falls past the last body line (footer area, or the empty
-    /// strip below content in early-session views) — used by
-    /// `begin_selection` to refuse to anchor a selection in the
-    /// footer. `update_selection` calls `screen_to_body_clamped`
-    /// instead so dragging past the body still extends the head.
-    fn screen_to_body(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+    /// position `(line_idx, display_col)` as a `BodyPos`. Returns
+    /// `None` when the row falls past the last body line (footer
+    /// area, or the empty strip below content in early-session
+    /// views) — used by `begin_selection` to refuse to anchor a
+    /// selection in the footer.
+    fn screen_to_body(&self, col: u16, row: u16) -> Option<crate::render::selection::BodyPos> {
         let body_height = self.body_height() as usize;
         if (row as usize) >= body_height {
             return None;
@@ -687,39 +657,25 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         if line_idx >= total {
             return None;
         }
-        Some((line_idx, col as usize))
+        Some((line_idx, col))
     }
 
-    /// Same as `screen_to_body` but clamps `(col, row)` to the
-    /// nearest valid body cell instead of returning `None`. Used by
-    /// `update_selection` so a drag that overshoots into the footer
-    /// or past the last row still extends the head sensibly.
-    fn screen_to_body_clamped(&self, col: u16, row: u16) -> Option<(usize, usize)> {
-        let body_height = self.body_height() as usize;
-        let total = self.body_lines.len();
-        if total == 0 {
-            return None;
-        }
-        let viewport_start = if self.sticky_bottom {
-            total.saturating_sub(body_height)
-        } else {
-            self.viewport_top.min(total.saturating_sub(body_height))
-        };
-        let row_clamped = (row as usize).min(body_height.saturating_sub(1));
-        let line_idx = (viewport_start + row_clamped).min(total.saturating_sub(1));
-        Some((line_idx, col as usize))
-    }
-
-    /// Walk the active selection from `start.line` to `end.line` (both
-    /// inclusive) and return the concatenated plain text — CSI escapes
-    /// stripped, lines joined with `\n`. Returns an empty string when
-    /// no selection or when the selection covers no visible chars
-    /// (e.g. clicked past end-of-line on a single-line selection).
+    /// Return the selected text (CSI-stripped, lines joined with `\n`),
+    /// or an empty string when no selection exists or covers no visible
+    /// chars. Delegates to the shared selection module's helpers rather
+    /// than duplicating the walk logic here. Used only by tests.
+    #[cfg(test)]
     fn extract_selection_text(&self) -> String {
-        let Some(sel) = self.selection else {
+        let Some(sel) = self.selection.selection else {
             return String::new();
         };
-        let (lo, hi) = sel.ordered();
+        let (lo_pos, hi_pos) = if sel.anchor <= sel.head {
+            (sel.anchor, sel.head)
+        } else {
+            (sel.head, sel.anchor)
+        };
+        let lo = (lo_pos.0, lo_pos.1 as usize);
+        let hi = (hi_pos.0, hi_pos.1 as usize);
         let total = self.body_lines.len();
         if lo.0 >= total {
             return String::new();
@@ -1961,8 +1917,7 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         // Selection indices reference `body_lines`, which we just
         // wiped — keep them around and they'd point past end-of-
         // buffer on the next paint.
-        self.selection = None;
-        self.selection_active = false;
+        self.selection.clear();
         let _ = self.out.write_all(b"\x1b[2J\x1b[H");
         self.paint_frame();
     }
@@ -2085,8 +2040,7 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         // width; after a resize they'd land in the wrong spot of the
         // re-flowed line. Cleanest is to drop the selection entirely
         // — the user can drag-select again at the new geometry.
-        self.selection = None;
-        self.selection_active = false;
+        self.selection.clear();
         let _ = self.out.write_all(b"\x1b[2J\x1b[H");
         self.body_dirty = true;
         self.footer_dirty = true;
@@ -2094,81 +2048,36 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
     }
 
     fn begin_selection(&mut self, col: u16, row: u16) {
-        // Only anchor a selection when the press lands inside the
-        // body region. Footer / blank-area presses clear any prior
-        // selection (so a stray click also acts as "deselect").
-        match self.screen_to_body(col, row) {
-            Some(pos) => {
-                self.selection = Some(Selection { anchor: pos, head: pos });
-                self.selection_active = true;
-            }
-            None => {
-                self.selection = None;
-                self.selection_active = false;
-            }
+        if let Some(pos) = self.screen_to_body(col, row) {
+            self.selection.begin(pos);
+        } else {
+            self.selection.clear();
         }
         self.body_dirty = true;
         self.paint_frame();
     }
 
     fn update_selection(&mut self, col: u16, row: u16) {
-        // Guard against terminals that emit a coalesced motion event
-        // right after Up — without this, that stale motion would
-        // shift `head` of an already-finalised selection.
-        if !self.selection_active {
-            return;
-        }
-        let Some(pos) = self.screen_to_body_clamped(col, row) else {
-            return;
-        };
-        if let Some(sel) = self.selection.as_mut() {
-            if sel.head == pos {
-                return; // no-op move (cell-granularity, drag jitter)
-            }
-            sel.head = pos;
+        if let Some(pos) = self.screen_to_body(col, row) {
+            self.selection.update(pos);
             self.body_dirty = true;
             self.paint_frame();
         }
     }
 
     fn end_selection(&mut self) {
-        // Mark the selection as finalised but keep it visible so the
-        // user can see what they captured. A subsequent press starts
-        // a fresh selection (or deselects on footer/empty hit).
-        self.selection_active = false;
-        let text = self.extract_selection_text();
-        selection::emit_osc52(&mut self.out, &text);
+        if let Some(text) = self.selection.end(&self.body_lines) {
+            crate::render::selection::emit_osc52(&mut self.out, &text);
+        }
     }
 
     fn copy_selection(&mut self) -> bool {
-        let text = self.extract_selection_text();
-        if text.is_empty() {
-            return false;
+        let copied = self.selection.copy(&self.body_lines);
+        if copied {
+            self.body_dirty = true;
+            self.paint_frame();
         }
-        // Use arboard to write the system clipboard directly. OSC 52
-        // is unreliable on Windows (Windows Terminal / conhost ignore
-        // it), so this is the primary copy path on that platform.
-        // macOS and Linux terminals that honour OSC 52 already got the
-        // text via end_selection, but copy_selection is still useful
-        // when the user re-selects or the OSC 52 write failed silently.
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            if clipboard.set_text(&text).is_ok() {
-                // Clear the visual selection so the user sees feedback
-                // that the copy was consumed (mirrors how most editors
-                // deselect after Ctrl+C).
-                self.selection = None;
-                self.body_dirty = true;
-                self.paint_frame();
-                return true;
-            }
-        }
-        // arboard failed (e.g. another process holds the clipboard) —
-        // fall back to OSC 52 as a best-effort retry.
-        selection::emit_osc52(&mut self.out, &text);
-        self.selection = None;
-        self.body_dirty = true;
-        self.paint_frame();
-        true // text was non-empty, selection existed
+        copied
     }
 }
 
@@ -3649,7 +3558,7 @@ mod tests {
         let s = String::from_utf8_lossy(&buf);
         let expected = format!(
             "\x1b]52;c;{}\x07",
-            super::selection::base64_encode(b"hello")
+            crate::render::selection::base64_encode(b"hello")
         );
         assert!(
             s.contains(&expected),
@@ -3693,8 +3602,8 @@ mod tests {
         // body_height = 5, footer starts at row 5. Press at row 7
         // (in the input box / status area).
         r.begin_selection(0, 7);
-        assert!(r.selection.is_none(), "footer press must not start a selection");
-        assert!(!r.selection_active);
+        assert!(r.selection.selection.is_none(), "footer press must not start a selection");
+        assert!(!r.selection.active);
         drop(r);
     }
 
@@ -3709,11 +3618,11 @@ mod tests {
         r.render(UiLine::User("hello there".into()));
         r.begin_selection(0, 0);
         r.update_selection(4, 0);
-        let head_before_end = r.selection.unwrap().head;
+        let head_before_end = r.selection.selection.unwrap().head;
         r.end_selection();
         // Stray motion after release.
         r.update_selection(10, 0);
-        let head_after_stray = r.selection.unwrap().head;
+        let head_after_stray = r.selection.selection.unwrap().head;
         assert_eq!(
             head_before_end, head_after_stray,
             "post-end motion must not move head",
@@ -3733,9 +3642,9 @@ mod tests {
         r.begin_selection(0, 0);
         r.update_selection(3, 0);
         r.end_selection();
-        assert!(r.selection.is_some());
+        assert!(r.selection.selection.is_some());
         r.reset();
-        assert!(r.selection.is_none(), "reset should clear selection");
+        assert!(r.selection.selection.is_none(), "reset should clear selection");
         drop(r);
     }
 
@@ -3749,9 +3658,9 @@ mod tests {
         r.render(UiLine::User("hello".into()));
         r.begin_selection(0, 0);
         r.update_selection(3, 0);
-        assert!(r.selection.is_some());
+        assert!(r.selection.selection.is_some());
         r.on_resize(40, 10);
-        assert!(r.selection.is_none(), "resize should clear selection");
+        assert!(r.selection.selection.is_none(), "resize should clear selection");
         drop(r);
     }
 
