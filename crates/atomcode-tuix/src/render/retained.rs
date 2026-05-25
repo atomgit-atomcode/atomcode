@@ -2285,6 +2285,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.viewport_top = 0;
         }
     }
+
+    /// Jump the body viewport to an absolute line index, clamping to
+    /// max_top. Used by the scroll_to_prev/next_message family.
+    fn scroll_body_to(&mut self, target: usize) {
+        let body_height = self.body_bottom_row() as usize;
+        let max_top = self.body_lines.len().saturating_sub(body_height);
+        self.viewport_top = target.min(max_top);
+        self.sticky_bottom = self.viewport_top >= max_top;
+        self.view_mode = !self.sticky_bottom;
+        self.repaint_body_region();
+    }
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -3508,6 +3519,34 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // Exiting view: repaint body tail without LF (Task 3.5).
             self.repaint_body_region();
         }
+    }
+
+    fn scroll_to_prev_message(&mut self) {
+        let target = self.message_marks.iter().rev()
+            .find(|m| m.line_idx < self.viewport_top)
+            .map(|m| m.line_idx);
+        if let Some(t) = target { self.scroll_body_to(t); }
+    }
+
+    fn scroll_to_next_message(&mut self) {
+        let target = self.message_marks.iter()
+            .find(|m| m.line_idx > self.viewport_top)
+            .map(|m| m.line_idx);
+        if let Some(t) = target { self.scroll_body_to(t); }
+    }
+
+    fn scroll_to_prev_user_message(&mut self) {
+        let target = self.message_marks.iter().rev()
+            .find(|m| m.line_idx < self.viewport_top && m.kind == crate::render::MarkKind::User)
+            .map(|m| m.line_idx);
+        if let Some(t) = target { self.scroll_body_to(t); }
+    }
+
+    fn scroll_to_next_user_message(&mut self) {
+        let target = self.message_marks.iter()
+            .find(|m| m.line_idx > self.viewport_top && m.kind == crate::render::MarkKind::User)
+            .map(|m| m.line_idx);
+        if let Some(t) = target { self.scroll_body_to(t); }
     }
 
     fn begin_selection(&mut self, col: u16, row: u16) {

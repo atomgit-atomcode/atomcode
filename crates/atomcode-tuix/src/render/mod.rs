@@ -320,6 +320,13 @@ pub trait Renderer: Send {
     /// Toggle the right-side visible scrollbar. Default: no-op for renderers
     /// that don't have a body region (Plain). Returns the new state — true = now shown.
     fn toggle_scrollbar(&mut self) -> bool { false }
+
+    /// Jump body viewport to the prev/next message boundary. No-op when no
+    /// such boundary exists in the configured direction.
+    fn scroll_to_prev_message(&mut self) {}
+    fn scroll_to_next_message(&mut self) {}
+    fn scroll_to_prev_user_message(&mut self) {}
+    fn scroll_to_next_user_message(&mut self) {}
 }
 
 /// Visual style for the menu popup. Drives whether the renderer prefixes

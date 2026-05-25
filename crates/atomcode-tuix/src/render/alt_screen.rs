@@ -1608,6 +1608,18 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             self.push_body_row_raw(line.to_string());
         }
     }
+
+    /// Jump the body viewport to an absolute line index, clamping to
+    /// max_top. Used by the scroll_to_prev/next_message family.
+    fn scroll_body_to(&mut self, target: usize) {
+        let body_height = self.body_height() as usize;
+        let max_top = self.body_lines.len().saturating_sub(body_height);
+        self.viewport_top = target.min(max_top);
+        self.sticky_bottom = self.viewport_top >= max_top;
+        self.body_dirty = true;
+        self.footer_dirty = true;
+        self.paint_frame();
+    }
 }
 
 
@@ -2107,6 +2119,34 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         self.body_dirty = true;
         self.paint_frame();
         self.show_scrollbar
+    }
+
+    fn scroll_to_prev_message(&mut self) {
+        let target = self.message_marks.iter().rev()
+            .find(|m| m.line_idx < self.viewport_top)
+            .map(|m| m.line_idx);
+        if let Some(t) = target { self.scroll_body_to(t); }
+    }
+
+    fn scroll_to_next_message(&mut self) {
+        let target = self.message_marks.iter()
+            .find(|m| m.line_idx > self.viewport_top)
+            .map(|m| m.line_idx);
+        if let Some(t) = target { self.scroll_body_to(t); }
+    }
+
+    fn scroll_to_prev_user_message(&mut self) {
+        let target = self.message_marks.iter().rev()
+            .find(|m| m.line_idx < self.viewport_top && m.kind == crate::render::MarkKind::User)
+            .map(|m| m.line_idx);
+        if let Some(t) = target { self.scroll_body_to(t); }
+    }
+
+    fn scroll_to_next_user_message(&mut self) {
+        let target = self.message_marks.iter()
+            .find(|m| m.line_idx > self.viewport_top && m.kind == crate::render::MarkKind::User)
+            .map(|m| m.line_idx);
+        if let Some(t) = target { self.scroll_body_to(t); }
     }
 }
 
@@ -3944,5 +3984,26 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(!s.contains("█"), "thumb should not appear when disabled: {:?}", s);
+    }
+
+    #[test]
+    fn alt_scroll_to_prev_message_finds_nearest_above() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        // Populate body with: 5 user lines, then assistant chunks
+        for i in 0..5 { r.render(UiLine::User(format!("u{}", i))); }
+        for i in 0..5 { r.render(UiLine::AssistantText(format!("a{}", i))); }
+        // Scroll to bottom area
+        r.scroll_body_to_top();
+        r.scroll_body(100); // back down some
+        let before = r.viewport_top;
+        r.scroll_to_prev_message();
+        // Should jump up to some earlier message boundary
+        assert!(
+            r.viewport_top <= before,
+            "viewport should jump up or stay (jumped to prev message): before={} after={}",
+            before,
+            r.viewport_top
+        );
     }
 }

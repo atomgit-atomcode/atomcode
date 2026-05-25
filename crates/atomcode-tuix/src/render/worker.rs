@@ -62,6 +62,12 @@ enum RenderCmd {
     /// Jump body viewport to absolute top / bottom of scrollback.
     ScrollBodyToTop,
     ScrollBodyToBottom,
+    /// Jump body viewport to the prev/next message boundary.
+    /// Fire-and-forget — no ACK needed.
+    ScrollToPrevMessage,
+    ScrollToNextMessage,
+    ScrollToPrevUserMessage,
+    ScrollToNextUserMessage,
     /// Mouse-drag selection lifecycle. Forwarded to the inner renderer;
     /// only AltScreenRenderer acts on these. `(col, row)` are 0-indexed
     /// terminal cells.
@@ -197,6 +203,22 @@ impl Renderer for TaskRenderer {
         let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToBottom);
     }
 
+    fn scroll_to_prev_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToPrevMessage);
+    }
+
+    fn scroll_to_next_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToNextMessage);
+    }
+
+    fn scroll_to_prev_user_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToPrevUserMessage);
+    }
+
+    fn scroll_to_next_user_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToNextUserMessage);
+    }
+
     fn begin_selection(&mut self, col: u16, row: u16) {
         let _ = self.cmd_tx.send(RenderCmd::BeginSelection(col, row));
     }
@@ -289,6 +311,18 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             }
             RenderCmd::ScrollBodyToBottom => {
                 inner.scroll_body_to_bottom();
+            }
+            RenderCmd::ScrollToPrevMessage => {
+                inner.scroll_to_prev_message();
+            }
+            RenderCmd::ScrollToNextMessage => {
+                inner.scroll_to_next_message();
+            }
+            RenderCmd::ScrollToPrevUserMessage => {
+                inner.scroll_to_prev_user_message();
+            }
+            RenderCmd::ScrollToNextUserMessage => {
+                inner.scroll_to_next_user_message();
             }
             RenderCmd::BeginSelection(col, row) => {
                 inner.begin_selection(col, row);
