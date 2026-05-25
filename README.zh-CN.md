@@ -129,37 +129,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 ## 安装
 
-### 快速安装
-
-选择最适合你的方式：
-
-<table>
-<tr>
-<th>npm</th>
-<th>Shell 脚本</th>
-</tr>
-<tr>
-<td>
-
-```bash
-npm install -g @atomgit.com/atomcode
-```
-
-</td>
-<td>
-
-```bash
-curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.sh | sh
-```
-
-</td>
-</tr>
-</table>
-
-> **npm**：自动下载对应平台的预编译二进制。
-> **Shell 脚本**：通用安装器，支持所有平台。
-
-### 从源码构建（推荐给开发者）
+### 从源码构建（推荐）
 
 ```bash
 git clone https://atomgit.com/atomgit_atomcode/atomcode.git

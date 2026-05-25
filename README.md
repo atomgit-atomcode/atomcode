@@ -128,37 +128,7 @@ See [Permission Model](./docs/security/permission-model.md) for the full design 
 
 ## Installation
 
-### Quick Install
-
-Choose the method that works best for you:
-
-<table>
-<tr>
-<th>npm</th>
-<th>Shell</th>
-</tr>
-<tr>
-<td>
-
-```bash
-npm install -g @atomgit.com/atomcode
-```
-
-</td>
-<td>
-
-```bash
-curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.sh | sh
-```
-
-</td>
-</tr>
-</table>
-
-> **npm**: Automatically downloads the pre-compiled binary for your platform.
-> **Shell**: Universal installer for any platform.
-
-### From Source (recommended for developers)
+### From Source (recommended)
 
 ```bash
 git clone https://atomgit.com/atomgit_atomcode/atomcode.git
