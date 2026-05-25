@@ -1540,8 +1540,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// (i.e. the index the NEXT `push_body_row` will occupy).
     /// Called before any push in the render arm that starts a new message.
     fn mark_message(&mut self, kind: crate::render::MarkKind) {
+        // retained doesn't soft-wrap into multiple body rows (each
+        // build_one_row produces exactly one Vec<Cell>), so raw_idx
+        // mirrors line_idx. The field exists for alt_screen's reflow
+        // path — see render/mod.rs MessageMark doc.
+        let line_idx = self.body_lines.len();
         self.message_marks.push(crate::render::MessageMark {
-            line_idx: self.body_lines.len(),
+            line_idx,
+            raw_idx: line_idx,
             kind,
         });
     }
@@ -2295,16 +2301,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let _ = self.out.flush();
         self.screen.invalidate();
-        // Re-anchor the terminal cursor at the input prompt — our row-by-row
-        // CUP+EL emit above left the cursor parked on the last body row.
-        // Run the standard footer paint + render_diff so screen.set_cursor()
-        // (called inside paint_footer) emits the correct CUP back to the
-        // input column. invalidate() above guarantees the diff redraws the
-        // full footer region against blank prev_cells, so any visual the
-        // user previously had stays consistent.
+        // Re-anchor the terminal cursor at the input prompt. Three-step
+        // belt-and-suspenders:
+        //   (1) paint_frame writes footer cells (incl. screen.set_cursor)
+        //   (2) render_diff emits patches + cursor CUP + visibility toggle
+        //   (3) explicit final CUP to wherever set_cursor parked
+        // The explicit final CUP exists because real-world iTerm2 was
+        // observed to leave the cursor above the input even though the
+        // test sees the correct last-CUP row; suspect is render_diff's
+        // trailing `\x1b[?25h` somehow obscuring the position on certain
+        // terminal versions. Re-emitting the CUP as the very last write
+        // sidesteps the ambiguity at the cost of one harmless duplicate
+        // escape sequence.
         self.paint_frame();
         let bytes = self.screen.render_diff();
         let _ = self.out.write_all(&bytes);
+        if let Some((r, c)) = self.screen.peek_cursor() {
+            let cup = format!("\x1b[{};{}H", r, c);
+            let _ = self.out.write_all(cup.as_bytes());
+        }
         let _ = self.out.flush();
         self.dirty = false;
     }
@@ -8466,6 +8481,55 @@ mod tests {
             body_bottom,
             last_row,
             &s[s.len().saturating_sub(200)..]
+        );
+    }
+
+    #[test]
+    fn retained_scroll_body_emits_trailing_cursor_cup() {
+        let (mut r, buf) = new_capturing(80, 24);
+        for i in 0..40 { r.render(UiLine::User(format!("L{}", i))); }
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        buf.lock().unwrap().clear();
+        r.scroll_body(-3);
+        let bytes = buf.lock().unwrap().clone();
+        // The very last CUP-shaped sequence (\x1b[N;MH) in the output should
+        // target a row > body_bottom_row (i.e., inside the footer region).
+        // We assert by scanning from the END backwards for the first CUP.
+        let s = String::from_utf8_lossy(&bytes);
+        let body_bottom = r.body_bottom_row();
+        let mut found_cup_row: Option<u16> = None;
+        let mut idx = s.len();
+        // Walk backwards searching for "\x1b[" then ";...H".
+        while idx > 2 {
+            if let Some(pos) = s[..idx].rfind("\x1b[") {
+                let tail = &s[pos+2..];
+                if let Some(h_pos) = tail.find('H') {
+                    let inner = &tail[..h_pos];
+                    if let Some((row_s, _col_s)) = inner.split_once(';') {
+                        if let Ok(row) = row_s.parse::<u16>() {
+                            found_cup_row = Some(row);
+                            break;
+                        }
+                    }
+                }
+                idx = pos;
+            } else {
+                break;
+            }
+        }
+        let last_cup_row = found_cup_row.unwrap_or(0);
+        assert!(
+            last_cup_row > body_bottom,
+            "trailing CUP after scroll must point inside footer (>{}); got row={}; tail bytes: {:?}",
+            body_bottom,
+            last_cup_row,
+            &s[s.len().saturating_sub(120)..]
         );
     }
 }

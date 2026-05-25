@@ -126,6 +126,14 @@ impl Screen {
         self.cursor_visible = visible;
     }
 
+    /// Read the currently-set cursor position (if any). Used by callers
+    /// that emitted out-of-band writes after the last render_diff and
+    /// want to re-anchor the terminal cursor without doing another full
+    /// diff cycle.
+    pub fn peek_cursor(&self) -> Option<(u16, u16)> {
+        self.cursor
+    }
+
     /// Scroll the top `bottom` rows up by `n`. Rows `[0..n)` are
     /// dropped; rows `[n..bottom)` slide to `[0..bottom-n)`; rows
     /// `[bottom-n..bottom)` become blank, ready for new content.
