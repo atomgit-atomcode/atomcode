@@ -61,11 +61,9 @@ impl EnvSnapshot {
             return Self::default();
         }
 
-        let branch = run_git(wd, &["branch", "--show-current"])
-            .filter(|s| !s.is_empty());
+        let branch = run_git(wd, &["branch", "--show-current"]).filter(|s| !s.is_empty());
 
-        let head_oneline = run_git(wd, &["log", "-1", "--format=%h %s"])
-            .filter(|s| !s.is_empty());
+        let head_oneline = run_git(wd, &["log", "-1", "--format=%h %s"]).filter(|s| !s.is_empty());
 
         let status_raw = run_git(wd, &["status", "--short"]).unwrap_or_default();
         let is_dirty = !status_raw.trim().is_empty();
@@ -108,9 +106,7 @@ impl EnvSnapshot {
             return String::new();
         };
 
-        let mut out = String::from(
-            "\n=== GIT STATUS (snapshot at session start, not live) ===\n",
-        );
+        let mut out = String::from("\n=== GIT STATUS (snapshot at session start, not live) ===\n");
 
         if let Some(branch) = git.branch.as_deref() {
             out.push_str(&format!("Branch: {}\n", branch));
@@ -156,14 +152,14 @@ fn is_git_repo(wd: &Path) -> bool {
 /// intentionally discarded — this is best-effort context enrichment and
 /// error spam doesn't help the user.
 fn run_git(wd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(wd)
         // Suppress paging in case user has `pager.*` configured.
         .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .output()
-        .ok()?;
+        .env("PAGER", "cat");
+    crate::process_utils::suppress_console_window_sync(&mut cmd);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -229,7 +225,7 @@ mod tests {
     fn detached_head_shown_explicitly() {
         let snap = EnvSnapshot {
             git: Some(GitSnapshot {
-                branch: None,  // detached
+                branch: None, // detached
                 head_oneline: Some("deadbee detached state".into()),
                 status_short: String::new(),
                 is_dirty: false,

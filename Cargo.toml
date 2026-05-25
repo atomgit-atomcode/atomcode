@@ -1,11 +1,21 @@
 [workspace]
 resolver = "2"
-members = [
+# Glob picks up the closed-source `atomcode-codingplan-crypto` overlay
+# the official build pipeline drops into `crates/` (see the stub at
+# `crates/atomcode-codingplan-crypto/`). Adding any future crate is also
+# a no-toml-edit operation.
+members = ["crates/*"]
+# `atomcode-codingplan-crypto` is intentionally absent from default-members:
+# the stub is wired into atomcode-core via an optional dep behind the
+# `codingplan-crypto` feature, so a default `cargo build` from the
+# workspace root has no reason to compile it. The official build picks
+# it up explicitly via `--features atomcode-core/codingplan-crypto`.
+default-members = [
     "crates/atomcode-core",
-    "crates/atomcode-tui",
-    "crates/atomcode-tuix",
     "crates/atomcode-cli",
     "crates/atomcode-daemon",
+    "crates/atomcode-telemetry",
+    "crates/atomcode-tuix",
 ]
 
 [profile.release]
@@ -19,8 +29,11 @@ panic = "abort"        # Remove panic unwinding code — saves ~200-500KB
 debug = "line-tables-only" # Smaller binaries, faster linker
 
 [workspace.package]
-version = "4.20.0"
+version = "4.23.1"
 edition = "2021"
 license = "MIT"
 repository = "https://atomgit.com/atomgit_atomcode/atomcode"
 description = "Open-source terminal AI coding agent"
+
+[workspace.dependencies]
+anyhow = "1"

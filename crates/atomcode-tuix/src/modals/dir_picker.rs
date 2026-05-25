@@ -5,10 +5,6 @@
 // Lists the up-to-5 most recently visited project directories from
 // `ctx.recent_dirs` (backed by `~/.atomcode/recent_dirs.txt`). Up/Down
 // navigates, Enter commits the cd via `apply_cd`, Esc cancels.
-//
-// This replaces the equivalent `dir_selector` flow that existed in the
-// legacy `atomcode-tui` crate — porting the feature was missed when the
-// new tuix TUI was introduced.
 
 use std::path::PathBuf;
 
@@ -93,18 +89,18 @@ impl Modal for DirPicker {
                     return Ok(ModalAction::Close);
                 }
                 if !path.is_dir() {
-                    renderer.render(UiLine::Error(format!(
-                        "directory no longer exists: {}",
-                        path.display()
-                    )));
+                    let p = path.display().to_string();
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::DirNotExists { path: &p }).into_owned(),
+                    ));
                     renderer.flush();
                     return Ok(ModalAction::Close);
                 }
                 apply_cd(ctx, path.clone());
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  Changed to: {}\n",
-                    path.display()
-                )));
+                let p = path.display().to_string();
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::DirChanged { path: &p }).into_owned(),
+                ));
                 renderer.flush();
                 Ok(ModalAction::Close)
             }
@@ -120,6 +116,7 @@ impl Modal for DirPicker {
             cursor_byte: buf.cursor,
             menu: Some(payload),
             status: build_status(state, ctx),
+            attachments: Vec::new(),
         });
         renderer.flush();
     }
@@ -132,7 +129,7 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
         .map(|d| {
             let name = crate::platform::collapse_home(&d.to_string_lossy());
             let desc = if d == &p.current {
-                "current".to_string()
+                crate::i18n::t(crate::i18n::Msg::DirCurrent).into_owned()
             } else {
                 String::new()
             };
@@ -142,6 +139,7 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
+            kind: crate::render::MenuKind::SlashCommand,
     }
 }
 

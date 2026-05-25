@@ -78,7 +78,9 @@ impl GraphIndexer {
             return;
         }
 
-        if cancel.is_cancelled() { return; }
+        if cancel.is_cancelled() {
+            return;
+        }
 
         // Walk + stat the tree on the blocking-thread pool rather than on
         // an async worker. `WalkBuilder` is pure sync I/O; leaving it on
@@ -130,7 +132,9 @@ impl GraphIndexer {
         const CPU_BREATHE_MS: u64 = 5;
         let mut all_results: Vec<(PathBuf, u64, FileParseResult)> = Vec::new();
         for (i, (path, mtime)) in dirty_files.into_iter().enumerate() {
-            if cancel.is_cancelled() { return; }
+            if cancel.is_cancelled() {
+                return;
+            }
             if let Some(result) = self.parse_file(&path) {
                 all_results.push((path, mtime, result));
             }
@@ -147,7 +151,9 @@ impl GraphIndexer {
         // Final cancel check: skip the write-lock critical section if
         // a newer indexer has been spawned. Contention on graph.write()
         // would otherwise delay the new indexer's own write.
-        if cancel.is_cancelled() { return; }
+        if cancel.is_cancelled() {
+            return;
+        }
 
         // Single write lock for ALL mutations — atomic from readers' perspective.
         // Grep/trace_callees will block briefly here but never see partial state.
@@ -249,14 +255,6 @@ impl GraphIndexer {
                 }
             }
         }
-    }
-
-    /// Walk the project directory, returning (path, mtime) for indexable files.
-    /// Kept as a method for legacy callers / tests; dispatches to the free
-    /// function so `index_all` can run the same logic on a blocking thread.
-    #[allow(dead_code)]
-    fn collect_files(&self) -> Vec<(PathBuf, u64)> {
-        collect_files_sync(&self.project_dir)
     }
 
     /// Parse a single file: extract symbols and raw calls.
@@ -488,7 +486,7 @@ fn is_home_or_root(path: &Path) -> bool {
     if path == Path::new("/") {
         return true;
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::tool::real_home_dir() {
         if path == home.as_path() {
             return true;
         }
@@ -506,7 +504,9 @@ fn is_home_or_root(path: &Path) -> bool {
 /// Scan is capped at 200 immediate entries so the guard itself stays
 /// cheap. Returns on the third match.
 fn is_umbrella_dir(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else { return false; };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
     let mut project_children = 0;
     for entry in entries.flatten().take(200) {
         let p = entry.path();
@@ -618,8 +618,10 @@ mod tests {
         mk(tmp.path(), "b", &[".git"]);
         mk(tmp.path(), "c", &["package.json"]);
         mk(tmp.path(), "d", &["Cargo.toml"]);
-        assert!(!should_index(tmp.path()),
-            "umbrella of 4 projects without own marker must be skipped");
+        assert!(
+            !should_index(tmp.path()),
+            "umbrella of 4 projects without own marker must be skipped"
+        );
     }
 
     #[test]
@@ -632,8 +634,10 @@ mod tests {
         mk(tmp.path(), "a", &[".git"]);
         mk(tmp.path(), "b", &[".git"]);
         mk(tmp.path(), "c", &[".git"]);
-        assert!(should_index(tmp.path()),
-            "user-placed marker must override umbrella detection");
+        assert!(
+            should_index(tmp.path()),
+            "user-placed marker must override umbrella detection"
+        );
     }
 
     /// Regression: `.atomcode` is atomcode's own storage dir (it gets
@@ -668,8 +672,10 @@ mod tests {
         mk(tmp.path(), "a", &[".git"]);
         mk(tmp.path(), "b", &[".git"]);
         mk(tmp.path(), "other", &[]); // not a project
-        assert!(should_index(tmp.path()),
-            "2 child projects < umbrella threshold");
+        assert!(
+            should_index(tmp.path()),
+            "2 child projects < umbrella threshold"
+        );
     }
 
     /// Regression: a pre-cancelled token must cause index_all to bail

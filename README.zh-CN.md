@@ -22,12 +22,13 @@
   <a href="#功能特性">功能</a> ·
   <a href="#架构">架构</a> ·
   <a href="#开发">开发</a> ·
-  <a href="#贡献指南">贡献</a>
+  <a href="#贡献指南">贡献</a> ·
+  <a href="#社区交流">社区</a>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
-  <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
     <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">
@@ -102,10 +103,10 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 
 - **实时流式输出** —— Markdown 渲染 + 语法高亮
 - **代码块** —— 语言标签、行号、`base16-ocean.dark` 主题
-- **多行输入** —— Shift+Enter 换行、高度自适应、历史记录
+- **多行输入** —— Shift+Enter 或 `\` + Enter 换行、高度自适应、历史记录
 - **任务完成通知** —— 长任务结束后优先走终端原生通知协议，必要时回退到系统通知
 - **文本选择** —— 鼠标拖选、自动滚动、复制到剪贴板
-- **斜杠命令** —— `/model`、`/provider`、`/resume`、`/diff`、`/undo`、`/cost`、`/clear`、`/compact` 等（完整列表见下）
+- **斜杠命令** —— `/model`、`/provider`、`/resume`、`/bg`、`/diff`、`/undo`、`/cost`、`/clear`、`/compact` 等（完整列表见下）
 - **文件附加** —— 粘贴文件路径即可把内容作为上下文带入
 - **Bracketed paste** —— 长文本粘贴自动折叠为紧凑的指示器
 - **Skills** —— 从 skill 目录加载的用户自定义命令，像普通斜杠命令一样调用
@@ -121,6 +122,10 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **撤销** —— `/undo` 通过文件历史快照回滚上一轮的所有文件编辑
 
 完整设计与当前边界见 [权限模型](./docs/security/permission-model.md)。
+
+### 隐私
+
+- 📊 匿名遥测（默认开启，可关闭）— 详见 [docs/telemetry.md](docs/telemetry.md)
 
 ## 安装
 
@@ -146,8 +151,29 @@ cargo build --release
 
 ### 依赖
 
-- Rust 1.75+（用于构建）
+- Rust 1.88+（用于构建；更旧的 Cargo 无法解析当前 lock 文件）
 - 任一支持的模型提供方的 API Key（或使用 `/login` 的 AtomGit 账号）
+
+### 卸载
+
+移除 AtomCode 及（可选）其数据：
+
+```bash
+atomcode uninstall                # 交互模式：分组询问
+atomcode uninstall --keep-data    # 仅删除二进制 + PATH 配置
+atomcode uninstall --purge        # 一并删除 ~/.atomcode/
+atomcode uninstall --dry-run      # 仅打印计划，不实际删除
+```
+
+二进制已损坏或丢失时使用兜底脚本：
+
+```bash
+curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.sh | sh
+# Windows:
+irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.ps1 | iex
+```
+
+默认保留凭据（`auth.toml`、`mcp.json`、`config.toml`、`ATOMCODE.md`），传 `--purge` 才会一起清除。
 
 ## 快速开始
 
@@ -233,13 +259,30 @@ atomcode --prompt-file task.md
 | 键位 | 动作 |
 |-----|--------|
 | `Enter` | 发送消息 |
-| `Shift+Enter` | 换行 |
+| `Shift+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
+| `Ctrl+Enter` | 换行（需要终端支持 Kitty 键盘协议） |
+| `Ctrl+J` | 换行（需要终端支持 Kitty 键盘协议） |
+| `Alt+Enter` | 换行（多数终端可用，见下方兼容性说明） |
+| `\` + `Enter` | 换行（所有终端通用——输入一个 `\` 后按回车，`\` 会被自动删除） |
 | `Esc` | 清空输入 / 取消流式输出 |
 | `Up/Down` | 浏览输入历史 |
 | `Tab` | 接受补全 |
 | `Ctrl+U` | 清空当前行 |
 | `Ctrl+W` | 删除一个单词 |
 | `Ctrl+K` | 删除到行尾 |
+| `Ctrl+V` | 从剪贴板粘贴图片（Windows 下请改用 `/paste`，见下方说明） |
+
+> **换行快捷键的终端兼容性：**
+> - `Shift+Enter`、`Ctrl+Enter`、`Ctrl+J` 都需要终端支持 Kitty 键盘协议 — kitty、WezTerm、Alacritty、iTerm2 ≥3.5、Windows Terminal ≥1.21。不支持的终端会把它们都退化成普通 `Enter`（直接发送消息）。
+> - `Alt+Enter` 在多数终端的字节层面就能工作，但 **Windows Terminal 默认把它绑给"切换全屏"** — 在 设置 → 操作 中删掉那条绑定即可释放。
+> - Xshell 不支持 Kitty 协议；可在键盘映射设置中把某个空闲组合映射为发送 `ESC, Enter`（`\x1b\r`）达到同样效果，或直接从剪贴板粘贴多行文本（已启用 bracketed paste）。
+
+> **Windows 下粘贴图片：**
+> Windows Terminal 和 conhost 默认把 `Ctrl+V` 绑给它们自己的 `paste` action — 这个 action 只会从剪贴板读 `CF_UNICODETEXT`，剪贴板上只有图片时它什么都不会发，应用里的 `Ctrl+V` 处理器根本收不到事件。两种解法：
+> 1. 使用 **`/paste`** —— 这个斜杠命令直接读取剪贴板图片并以 `[Image #N]` 的形式附加到输入框，在 Windows Terminal、PowerShell 7、conhost、git bash 等所有终端里都能正常工作。Windows 版的 TUI 右下角会自动显示 `剪贴板有图片 · /paste 粘贴` 作为提示。
+> 2. 若想保留 `Ctrl+V` 的肌肉记忆：打开 Windows Terminal 的 `settings.json`（`Ctrl+,` → 右下角"打开 JSON 文件"），在 `"actions"` 数组里删掉 `{ "command": "paste", "keys": "ctrl+v" }`，或把它改绑到 `ctrl+shift+v`。重启 Windows Terminal 后，`Ctrl+V` 就能透传给 atomcode 了。
+>
+> Git Bash（MinTTY）不拦截 `Ctrl+V`，开箱即用。
 
 ### 导航
 
@@ -257,10 +300,13 @@ atomcode --prompt-file task.md
 |---------|--------|
 | `/resume` | 恢复或切换会话 |
 | `/session` | 创建新会话 |
+| `/bg` | 将当前会话放到后台；子命令：`/bg list`、`/bg <N>`、`/bg drop <N>`、`/bg help` |
+| `/background <task>` | 兼容入口：在 `/bg` 槽位中启动一次性后台任务 |
 | `/provider` | 管理 provider |
 | `/model` | 切换模型 / provider |
 | `/login` | 通过 AtomGit OAuth 登录 |
 | `/cd` | 切换工作目录 |
+| `/paste` | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
 | `/undo` | 撤销上一轮的文件编辑 |
 | `/diff` | 显示当前修改的 git diff |
 | `/cost` | 显示本次会话的 token 消耗 |
@@ -290,9 +336,10 @@ atomcode/
       session/         # 持久化会话
       skill.rs         # 用户自定义 skill
 
-    atomcode-tui/      # 终端 UI（ratatui + crossterm）
-      app.rs           # App 状态机
-      ui/              # 渲染：聊天、输入、状态栏、Markdown
+    atomcode-tuix/     # 终端 UI — retained-mode 渲染器（CC 风格 normal mode）
+      event_loop/      # App 状态机、命令分发
+      render/          # cell-level 渲染器、diff、retained-mode 帧循环
+      modals/          # 各种 picker（dir、model、session、provider、issue）
 
     atomcode-cli/      # 可执行入口（TUI + headless -p 模式）
       main.rs          # CLI 参数、首次运行向导、启动
@@ -331,7 +378,7 @@ AtomCode 会自动读取这个文件并注入到系统提示中。
 
 ### 前置条件
 
-- **Rust 1.75+** —— 通过 [rustup](https://rustup.rs/) 安装
+- **Rust 1.88+** —— 通过 [rustup](https://rustup.rs/) 安装
 - **Git**
 - 任一支持的模型 API Key（用于运行时测试）
 
@@ -373,7 +420,7 @@ cargo test
 
 # 运行指定 crate 的测试
 cargo test -p atomcode-core
-cargo test -p atomcode-tui
+cargo test -p atomcode-tuix
 
 # 运行指定的用例
 cargo test -p atomcode-core test_name
@@ -447,8 +494,16 @@ cargo install --path crates/atomcode-cli
 
 - **新增工具** —— 在 `crates/atomcode-core/src/tool/` 下实现 `Tool` trait
 - **新增模型提供方** —— 在 `crates/atomcode-core/src/provider/` 下实现 `LlmProvider`
-- **改进 UI** —— 渲染相关代码在 `crates/atomcode-tui/src/ui/`
+- **改进 UI** —— 渲染相关代码在 `crates/atomcode-tuix/src/render/`
 - **修 Bug** —— 到 [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) 上挑一个
+
+## 社区交流
+
+用微信扫描下方二维码加入 AtomCode 用户群，反馈问题、分享使用心得，和其他用户、维护者一起交流：
+
+<p align="center">
+  <img src="https://cdn-news.gitcode.com/news/AtomCode_qun.png" alt="AtomCode 微信用户群二维码" width="220">
+</p>
 
 ## 许可证
 

@@ -6,17 +6,24 @@ api_key = "sk-..."
 model = "deepseek-chat"
 base_url = "https://api.deepseek.com/v1"
 context_window = 64000
+# Override the reasoning_content history-echo policy. Unset = auto-detect
+# from model name (deepseek-v4* → include, deepseek-reasoner/r1 → exclude,
+# kimi-* / moonshot → include, rest → exclude). Set explicitly when hitting
+# a 400 like "reasoning_content ... must be passed back to the API" or
+# "reasoning_content is missing in assistant tool call message".
+# reasoning_history = "include"  # or "exclude"
 
-# Per-turn datalog settings. Each turn writes a markdown file
-# (plus a .jsonl of raw LLM requests) into `dir`.
+# Per-turn datalog. Each turn writes a markdown summary; each LLM
+# round writes a JSON request/response pair under `<dir>/<project>/llm/`.
+# A per-project subdirectory is always appended under `dir` so multiple
+# projects never share a bucket.
 # - enabled = false        -> disable logging entirely
-# - dir unset (default)    -> writes to <working_dir>/datalog/ (follows /cd)
+# - dir = "~/.atomcode/datalog" -> default (follows $HOME, ignores /cd)
 # - dir = "/abs/path"      -> absolute, fixed (unaffected by /cd)
-# - dir = "~/sub"          -> expanded from $HOME, fixed
 # - dir = "rel/path"       -> joined with current working_dir, follows /cd
 [datalog]
 enabled = true
-# dir = "~/.atomcode/datalog"  # example: uncomment to redirect
+dir = "~/.atomcode/datalog"
 
 # Long-running task completion notifications.
 # Strategy: terminal-native notifications first (kitty / WezTerm / iTerm2),

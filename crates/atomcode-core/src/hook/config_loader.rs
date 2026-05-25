@@ -3,10 +3,10 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::async_batcher::{AsyncWebhookConfig, AsyncWebhookRegistry};
-use super::script_runner::{ScriptHook, ScriptHookConfig};
-use super::webhook::{WebhookConfig, WebhookHook};
 use crate::hook::HookRegistry;
+use super::script_runner::{ScriptHook, ScriptHookConfig};
+use super::webhook::{WebhookHook, WebhookConfig};
+use super::async_batcher::{AsyncWebhookRegistry, AsyncWebhookConfig};
 
 /// Hooks 配置结构
 #[derive(Debug, Deserialize)]
@@ -63,10 +63,7 @@ impl HooksConfig {
             };
 
             if !script_path.exists() {
-                eprintln!(
-                    "[Hook] Warning: Script not found: {}",
-                    script_path.display()
-                );
+                eprintln!("[Hook] Warning: Script not found: {}", script_path.display());
                 continue;
             }
 
@@ -152,10 +149,7 @@ impl HooksConfig {
 
         // 存储异步注册表以便后续关闭
         if !async_registry.batchers.is_empty() {
-            eprintln!(
-                "[AsyncWebhook] Registered {} async batchers",
-                async_registry.batchers.len()
-            );
+            eprintln!("[AsyncWebhook] Registered {} async batchers", async_registry.batchers.len());
         }
     }
 }
@@ -180,10 +174,7 @@ pub fn load_hooks(registry: &mut HookRegistry) {
         if project_hooks_dir.exists() {
             if let Ok(config) = HooksConfig::from_dir(&project_hooks_dir) {
                 config.register_hooks(registry, &project_hooks_dir);
-                eprintln!(
-                    "[Hook] Loaded project hooks from {}",
-                    project_hooks_dir.display()
-                );
+                eprintln!("[Hook] Loaded project hooks from {}", project_hooks_dir.display());
             }
         }
     }
@@ -196,5 +187,289 @@ pub fn load_hooks_from_dir(registry: &mut HookRegistry, dir: &Path) {
             config.register_hooks(registry, dir);
             eprintln!("[Hook] Loaded hooks from {}", dir.display());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use crate::hook::HookRegistry;
+
+    // ── HooksConfig deserialization ──────────────────────────────────
+
+    #[test]
+    fn test_hooks_config_deserialize_toml() {
+        let toml_str = r#"
+[[hooks]]
+name = "pre-check"
+trigger = "pre_tool"
+script = "check.sh"
+enabled = true
+timeout_secs = 5
+
+[[hooks]]
+name = "post-check"
+trigger = "post_tool"
+script = "report.sh"
+script_type = "python"
+enabled = true
+
+[[webhooks]]
+name = "notify"
+trigger = "post_turn"
+url = "https://example.com/hook"
+
+[[async_webhooks]]
+name = "batch-logger"
+trigger = "pre_tool"
+url = "https://example.com/batch"
+batch_size = 20
+"#;
+
+        let config: HooksConfig = toml::from_str(toml_str).expect("Should parse TOML");
+        assert_eq!(config.hooks.len(), 2);
+        assert_eq!(config.webhooks.len(), 1);
+        assert_eq!(config.async_webhooks.len(), 1);
+
+        // Check first hook
+        assert_eq!(config.hooks[0].name, "pre-check");
+        assert_eq!(config.hooks[0].trigger, "pre_tool");
+        assert_eq!(config.hooks[0].script.to_string_lossy(), "check.sh");
+        assert!(config.hooks[0].enabled);
+        assert_eq!(config.hooks[0].timeout_secs, 5);
+        assert_eq!(config.hooks[0].script_type, "shell");
+
+        // Check second hook
+        assert_eq!(config.hooks[1].name, "post-check");
+        assert_eq!(config.hooks[1].trigger, "post_tool");
+        assert_eq!(config.hooks[1].script_type, "python");
+
+        // Check webhook
+        assert_eq!(config.webhooks[0].name, "notify");
+        assert_eq!(config.webhooks[0].url, "https://example.com/hook");
+
+        // Check async webhook
+        assert_eq!(config.async_webhooks[0].name, "batch-logger");
+        assert_eq!(config.async_webhooks[0].batch_size, 20);
+    }
+
+    #[test]
+    fn test_hooks_config_empty() {
+        let config: HooksConfig = toml::from_str("").expect("Should parse empty TOML");
+        assert!(config.hooks.is_empty());
+        assert!(config.webhooks.is_empty());
+        assert!(config.async_webhooks.is_empty());
+    }
+
+    // ── HooksConfig::from_file ───────────────────────────────────────
+
+    #[test]
+    fn test_from_file_valid_toml() {
+        let dir = std::env::temp_dir().join(format!("hook_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let config_path = dir.join("hooks.toml");
+        fs::write(&config_path, r#"
+[[hooks]]
+name = "test-hook"
+trigger = "pre_tool"
+script = "test.sh"
+enabled = true
+timeout_secs = 3
+"#).expect("Should write test file");
+
+        let config = HooksConfig::from_file(&config_path).expect("Should load from file");
+        assert_eq!(config.hooks.len(), 1);
+        assert_eq!(config.hooks[0].name, "test-hook");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_from_file_nonexistent() {
+        let result = HooksConfig::from_file(Path::new("/tmp/nonexistent_hooks_file_12345.toml"));
+        assert!(result.is_err());
+    }
+
+    // ── HooksConfig::from_dir ───────────────────────────────────────
+
+    #[test]
+    fn test_from_dir_with_existing_config() {
+        let dir = std::env::temp_dir().join(format!("hook_test_dir_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join("hooks.toml"), r#"
+[[hooks]]
+name = "dir-hook"
+trigger = "post_turn"
+script = "report.sh"
+"#).expect("Should write test file");
+
+        let config = HooksConfig::from_dir(&dir).expect("Should load from dir");
+        assert_eq!(config.hooks.len(), 1);
+        assert_eq!(config.hooks[0].name, "dir-hook");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_from_dir_without_config() {
+        let dir = std::env::temp_dir().join(format!("hook_test_empty_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+
+        let config = HooksConfig::from_dir(&dir).expect("Should return empty config");
+        assert!(config.hooks.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── register_hooks ─────────────────────────────────────────────
+
+    fn make_script_config(name: &str, trigger: &str, script: &str) -> ScriptHookConfig {
+        ScriptHookConfig {
+            name: name.to_string(),
+            trigger: trigger.to_string(),
+            script: PathBuf::from(script),
+            script_type: "shell".to_string(),
+            enabled: true,
+            timeout_secs: 5,
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_register_hooks_pre_tool() {
+        let config = HooksConfig {
+            hooks: vec![make_script_config("pre", "pre_tool", "/bin/echo")],
+            webhooks: vec![],
+            async_webhooks: vec![],
+        };
+        let mut registry = HookRegistry::new();
+        config.register_hooks(&mut registry, Path::new("/tmp"));
+
+        let stats = registry.stats();
+        assert_eq!(stats.pre_tool_hooks, 1);
+    }
+
+    #[test]
+    fn test_register_hooks_post_tool() {
+        let config = HooksConfig {
+            hooks: vec![make_script_config("post", "post_tool", "/bin/echo")],
+            webhooks: vec![],
+            async_webhooks: vec![],
+        };
+        let mut registry = HookRegistry::new();
+        config.register_hooks(&mut registry, Path::new("/tmp"));
+
+        let stats = registry.stats();
+        assert_eq!(stats.post_tool_hooks, 1);
+    }
+
+    #[test]
+    fn test_register_hooks_post_turn() {
+        let config = HooksConfig {
+            hooks: vec![make_script_config("turn", "post_turn", "/bin/echo")],
+            webhooks: vec![],
+            async_webhooks: vec![],
+        };
+        let mut registry = HookRegistry::new();
+        config.register_hooks(&mut registry, Path::new("/tmp"));
+
+        let stats = registry.stats();
+        assert_eq!(stats.post_turn_hooks, 1);
+    }
+
+    #[test]
+    fn test_register_hooks_system_prompt() {
+        let config = HooksConfig {
+            hooks: vec![make_script_config("sys", "system_prompt", "/bin/echo")],
+            webhooks: vec![],
+            async_webhooks: vec![],
+        };
+        let mut registry = HookRegistry::new();
+        config.register_hooks(&mut registry, Path::new("/tmp"));
+
+        let stats = registry.stats();
+        assert_eq!(stats.system_prompt_hooks, 1);
+    }
+
+    #[test]
+    fn test_register_hooks_unknown_trigger() {
+        let config = HooksConfig {
+            hooks: vec![make_script_config("bad", "unknown_trigger", "/bin/echo")],
+            webhooks: vec![],
+            async_webhooks: vec![],
+        };
+        let mut registry = HookRegistry::new();
+        config.register_hooks(&mut registry, Path::new("/tmp"));
+
+        let stats = registry.stats();
+        // Should not be registered under any known trigger
+        assert_eq!(stats.pre_tool_hooks, 0);
+        assert_eq!(stats.post_tool_hooks, 0);
+        assert_eq!(stats.post_turn_hooks, 0);
+        assert_eq!(stats.system_prompt_hooks, 0);
+    }
+
+    #[test]
+    fn test_register_hooks_disabled_skipped() {
+        let mut config = make_script_config("disabled", "pre_tool", "/bin/echo");
+        config.enabled = false;
+        let hooks_config = HooksConfig {
+            hooks: vec![config],
+            webhooks: vec![],
+            async_webhooks: vec![],
+        };
+        let mut registry = HookRegistry::new();
+        hooks_config.register_hooks(&mut registry, Path::new("/tmp"));
+
+        let stats = registry.stats();
+        assert_eq!(stats.pre_tool_hooks, 0);
+    }
+
+    #[test]
+    fn test_register_hooks_nonexistent_script() {
+        let config = HooksConfig {
+            hooks: vec![make_script_config("missing", "pre_tool", "/tmp/nonexistent_script_12345.sh")],
+            webhooks: vec![],
+            async_webhooks: vec![],
+        };
+        let mut registry = HookRegistry::new();
+        config.register_hooks(&mut registry, Path::new("/tmp"));
+
+        let stats = registry.stats();
+        assert_eq!(stats.pre_tool_hooks, 0);
+    }
+
+    // ── load_hooks_from_dir ─────────────────────────────────────────
+
+    #[test]
+    fn test_load_hooks_from_dir_valid() {
+        let dir = std::env::temp_dir().join(format!("hook_load_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join("hooks.toml"), r#"
+[[hooks]]
+name = "loaded-hook"
+trigger = "pre_tool"
+script = "/bin/echo"
+"#).expect("Should write test file");
+
+        let mut registry = HookRegistry::new();
+        load_hooks_from_dir(&mut registry, &dir);
+
+        let stats = registry.stats();
+        assert_eq!(stats.pre_tool_hooks, 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_hooks_from_dir_nonexistent() {
+        let mut registry = HookRegistry::new();
+        load_hooks_from_dir(&mut registry, Path::new("/tmp/nonexistent_hooks_dir_12345"));
+
+        let stats = registry.stats();
+        assert_eq!(stats.pre_tool_hooks, 0);
     }
 }

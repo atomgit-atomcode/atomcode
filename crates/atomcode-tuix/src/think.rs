@@ -287,7 +287,10 @@ mod tests {
         // Apply the fix.
         s.reset();
         // Turn 3: now the stripper is pristine and plain text passes.
-        assert_eq!(s.feed("hello from the next model"), "hello from the next model");
+        assert_eq!(
+            s.feed("hello from the next model"),
+            "hello from the next model"
+        );
     }
 
     #[test]

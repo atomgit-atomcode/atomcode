@@ -61,7 +61,7 @@ impl Modal for IssueWizard {
     ) -> Result<ModalAction> {
         match code {
             KeyCode::Esc => {
-                push(renderer, "(cancelled)");
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::IssueCancelled));
                 buf.text.clear();
                 buf.cursor = 0;
                 Ok(ModalAction::Close)
@@ -72,8 +72,7 @@ impl Modal for IssueWizard {
             // would look wrong on AtomGit anyway.
             KeyCode::Enter
                 if self.step == Step::Description
-                    && (mods.contains(KeyModifiers::SHIFT)
-                        || mods.contains(KeyModifiers::ALT)) =>
+                    && (mods.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::ALT)) =>
             {
                 buf.text.push('\n');
                 buf.cursor = buf.text.len();
@@ -87,7 +86,10 @@ impl Modal for IssueWizard {
                         Step::Title => "title",
                         Step::Description => "description",
                     };
-                    push(renderer, &format!("(required — type a {} or Esc to cancel)", what));
+                    push(
+                        renderer,
+                        &crate::i18n::t(crate::i18n::Msg::IssueRequiredField { field: what }),
+                    );
                     return Ok(ModalAction::Continue);
                 }
                 buf.text.clear();
@@ -140,18 +142,13 @@ impl Modal for IssueWizard {
         }
     }
 
-    fn draw(
-        &self,
-        buf: &Buffer,
-        state: &UiState,
-        ctx: &LoopCtx,
-        renderer: &mut dyn Renderer,
-    ) {
+    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         renderer.render(UiLine::InputPrompt {
             buf: buf.text.clone(),
             cursor_byte: buf.cursor,
             menu: None,
             status: build_status(state, ctx),
+            attachments: Vec::new(),
         });
         renderer.flush();
     }
@@ -168,9 +165,12 @@ impl IssueWizard {
         self.prompt_shown = true;
         push(
             renderer,
-            &format!("New issue on atomgit.com/{}/{}", self.owner, self.repo),
+            &crate::i18n::t(crate::i18n::Msg::IssueNewOn { owner: &self.owner, repo: &self.repo }),
         );
-        push(renderer, "Step 1/2 — enter title (required, Esc to cancel):");
+        push(
+            renderer,
+            &crate::i18n::t(crate::i18n::Msg::IssueStep1),
+        );
     }
 
     fn emit_description_prompt(&mut self, renderer: &mut dyn Renderer) {
@@ -181,11 +181,11 @@ impl IssueWizard {
         push(renderer, "");
         push(
             renderer,
-            &format!("✓ title: {}", abbreviate(&self.title, 80)),
+            &crate::i18n::t(crate::i18n::Msg::IssueTitleConfirmed { title: &abbreviate(&self.title, 80) }),
         );
         push(
             renderer,
-            "Step 2/2 — enter description (Shift+Enter = newline, Enter to submit, Esc to cancel):",
+            &crate::i18n::t(crate::i18n::Msg::IssueStep2),
         );
     }
 }

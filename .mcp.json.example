@@ -1,0 +1,73 @@
+// =============================================================================
+// AtomCode MCP 配置模板（JSONC：允许 // 与 /* */ 注释，便于阅读）
+//
+// 重要：复制为项目根目录的 `.mcp.json` 时，必须先删掉本文件里所有注释行，
+//       再保存。AtomCode 使用标准 JSON 解析，带 // 的 `.mcp.json` 会解析失败。
+//
+// 简要原理
+//   · MCP（Model Context Protocol）：把外部程序或 HTTP 服务提供的「工具」
+//     接到 AtomCode，像内置工具一样调用（通常需审批）。
+//   · 顶层键为 mcpServers（与 Cursor 等工具一致；旧键 servers 仍被程序接受）。
+//   · 本文件内含两套完整示例：「stdio」与「HTTP」各一。实际用时通常只保留
+//     其一，或把键名改成你喜欢的名字；同一 server 不可同时写 command 与 url。
+//   · 配置来源：项目根 `.mcp.json` 与用户目录 `~/.atomcode/mcp.json` 可都有；
+//     同名 server 以项目级为准（覆盖用户级）。
+//   · 字符串里可写 ${环境变量名} 或 ${名:-默认值}，启动时由程序展开。
+// =============================================================================
+
+{
+  "mcpServers": {
+    // -------------------------------------------------------------------------
+    // 模板 A — stdio：启动本地子进程，经标准输入输出走 MCP（不要写 url）
+    // server 键名会出现在工具名里：mcp__<键名>__<远端工具名>
+    //
+    // 注意：stdio 传输的所有请求是串行的（MCP 协议限制，单通道通信）。
+    // 如果某个工具调用耗时较长（如代码分析），其他工具调用会排队等待。
+    // 对于耗时操作，建议使用 HTTP 传输（模板 B）以获得更好的并发性能。
+    // -------------------------------------------------------------------------
+    "test-echo": {
+      "command": "cargo",
+      "args": ["run", "--release", "--bin", "mcp-test-server", "--manifest-path", "."],
+      "disabled": true
+      // 启用前改为 false，并把 manifest-path 指到正确 Cargo.toml（如本仓库
+      // crates/atomcode-core/Cargo.toml），否则从错误目录执行会找不到包。
+      //
+      // 常用可选（与 command 同级，按需取消注释；不要尾逗号）：
+      // "env": { "KEY": "value" },
+      // "timeout_ms": 30000
+    },
+
+    // -------------------------------------------------------------------------
+    // 模板 B — HTTP：连接远程 MCP 端点（不要写 command / args）
+    // url / headers 里同样支持 ${VAR}；令牌勿写死，用环境变量。
+    // -------------------------------------------------------------------------
+    "example-http": {
+      "url": "https://your-mcp-host.example/mcp",
+      "headers": {
+        "Authorization": "Bearer ${YOUR_TOKEN}"
+      },
+      "timeout_ms": 30000,
+      "disabled": true
+      // 把 url 换成真实端点；不需要鉴权时可删掉整个 headers 对象。
+      // 启用前改为 false。
+    },
+
+    // -------------------------------------------------------------------------
+    // 模板 C — GitHub remote MCP + OAuth：无需把 PAT 写进配置。
+    // 先注册配置：
+    //   atomcode mcp add-github-oauth --global
+    // 再完成登录：
+    //   ATOMCODE_GITHUB_MCP_CLIENT_ID=<client_id> atomcode mcp login github
+    // 或在 TUI 中设置环境变量后运行：
+    //   /mcp login github
+    // -------------------------------------------------------------------------
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "auth": {
+        "type": "oauth",
+        "provider": "github"
+      },
+      "disabled": true
+    }
+  }
+}

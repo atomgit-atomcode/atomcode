@@ -141,10 +141,22 @@ pub fn spawn_check(
         // Blocking HTTP client lives in a spawn_blocking thread so we
         // don't stall the tokio runtime's worker pool.
         let fetch: Result<Vec<String>, ()> = tokio::task::spawn_blocking(move || {
-            let client = atomcode_core::coding_plan::client::Client::from_stored_auth()
+            let client =
+                atomcode_core::coding_plan::client::Client::from_stored_auth().map_err(|_| ())?;
+            // Pass `Max` so the response covers every CodingPlan-eligible
+            // model regardless of the user's actual tier; we filter the
+            // user's reachable subset by `plan_available` below. This
+            // sidesteps having to persist the cascade-landed plan_type
+            // anywhere — the drift check just needs the available set
+            // for the current user, which `plan_available=true` is.
+            let models = client
+                .list_models_v2(atomcode_core::coding_plan::PlanType::Max)
                 .map_err(|_| ())?;
-            let models = client.list_models().map_err(|_| ())?;
-            Ok(models.into_iter().map(|m| m.display_model_name).collect())
+            Ok(models
+                .into_iter()
+                .filter(|m| m.plan_available)
+                .map(|m| m.display_model_name)
+                .collect())
         })
         .await
         .unwrap_or(Err(()));

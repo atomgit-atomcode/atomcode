@@ -10,8 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
-atomcode-tui = { path = "../atomcode-tui" }
 atomcode-tuix = { path = "../atomcode-tuix" }
+atomcode-telemetry = { path = "../atomcode-telemetry" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
@@ -20,10 +20,14 @@ url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+toml_edit = "0.22"
+serde_json = "1"
 dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+is-terminal = "0.4"
 
 # setsid() for the detached upgrade-prep subprocess. Unix-only — Windows
-# uses DETACHED_PROCESS creation flags instead (see main.rs).
+# uses CREATE_NO_WINDOW creation flags instead (see main.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -40,5 +44,11 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Glo
 # case. Needs `*-w64-mingw32-windres` on PATH (already required by the
 # existing mingw-w64 cross-compile toolchain). The crate is tiny and pure
 # Rust, so pulling it in unconditionally on the host side costs ~nothing.
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+which = "7"
+
 [build-dependencies]
 winresource = "0.1"

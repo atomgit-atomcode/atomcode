@@ -3,7 +3,7 @@
 pub struct Command {
     pub name: &'static str,
     pub desc: &'static str,
-    /// Commands that are *useless* without an argument (e.g. `/fixissue <url>`).
+    /// Commands that are *useless* without an argument (e.g. `/background <task>`).
     /// When the slash-menu Enter handler sees one, it auto-completes the name
     /// with a trailing space and leaves the cursor parked for the user to
     /// type the argument — instead of firing a bad invocation immediately.
@@ -18,7 +18,9 @@ pub struct CommandRegistry {
 
 impl CommandRegistry {
     pub fn builtin() -> Self {
-        Self { commands: BUILTIN_COMMANDS }
+        Self {
+            commands: BUILTIN_COMMANDS,
+        }
     }
 
     pub fn all(&self) -> &'static [Command] {
@@ -46,13 +48,20 @@ impl CommandRegistry {
     }
 
     pub fn help_text(&self) -> String {
-        let max_name = self.commands.iter().map(|c| c.name.len()).max().unwrap_or(6);
-        let mut out = String::from("  Available commands:\n");
+        use crate::i18n::{t, Msg};
+        let max_name = self
+            .commands
+            .iter()
+            .map(|c| c.name.len())
+            .max()
+            .unwrap_or(6);
+        let mut out = t(Msg::HelpAvailableCommands).into_owned();
         for c in self.commands {
+            let desc = cmd_desc_i18n(c.name).unwrap_or_else(|| c.desc.into());
             out.push_str(&format!(
                 "    /{:<width$}  {}\n",
                 c.name,
-                c.desc,
+                desc,
                 width = max_name
             ));
         }
@@ -62,7 +71,9 @@ impl CommandRegistry {
 
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
+    Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
+    Command { name: "rename",  desc: "Rename current session", needs_args: true },
     Command { name: "login",   desc: "Sign in with AtomGit OAuth", needs_args: false },
     Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false },
     Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false },
@@ -72,19 +83,142 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "config",  desc: "Show config path", needs_args: false },
     Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false },
     Command { name: "cd",      desc: "Change working directory", needs_args: false },
+    Command { name: "init",    desc: "Generate .atomcode.md project instructions from the working directory", needs_args: false },
+    Command { name: "bg",      desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>", needs_args: false },
+    Command { name: "background", desc: "Compatibility alias: start a one-shot task in a /bg slot", needs_args: true },
     Command { name: "diff",    desc: "Show git diff", needs_args: false },
     Command { name: "clear",   desc: "Clear screen", needs_args: false },
     Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false },
     Command { name: "cost",    desc: "Show token cost", needs_args: false },
     Command { name: "context", desc: "Show context budget breakdown", needs_args: false },
     Command { name: "compact", desc: "Compact conversation history", needs_args: false },
+    Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true },
+    Command { name: "forget", desc: "Remove matching memories", needs_args: true },
+    Command { name: "memory", desc: "Show all saved memories", needs_args: false },
+    Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout)", needs_args: false },
     Command { name: "undo",    desc: "Undo last change (not yet supported)", needs_args: false },
+    Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true },
     Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false },
-    Command { name: "fixissue", desc: "Fetch an AtomGit issue (must be assigned to you) and let the agent fix it", needs_args: true },
-    Command { name: "issue",   desc: "Interactive wizard — prompts for issue URL, then runs fixissue", needs_args: false },
+    Command { name: "issue",   desc: "Report a bug / request a feature for AtomCode itself (interactive wizard)", needs_args: false },
+    Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false },
+    Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
+    Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
+    Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
+    Command { name: "language", desc: "Switch display language", needs_args: false },
+    Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
+    // Gateway entry that opens a second-level palette listing all
+    // user-invocable skills. needs_args=true so Enter rewrites the
+    // buffer to `/skills ` and lets the sub-mode menu render the
+    // skill list. Selecting a skill commits as `/skills <name>` →
+    // dispatched by the `skills` arm in execute_slash_command.
+    Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
+    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
+    // Windows fallback for Ctrl+V: Windows Terminal / conhost
+    // intercept Ctrl+V as their own `paste` action (which forwards
+    // only `CF_UNICODETEXT`) before the keystroke reaches atomcode,
+    // so an image-only clipboard never triggers the in-app handler.
+    // `/paste` calls the same `try_paste_clipboard_image` →
+    // `attach_image_to_input` pipeline directly so the user has a
+    // terminal-agnostic way to attach an image. Works on every OS.
+    Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false },
 ];
+
+/// Look up the i18n translation for a built-in command description.
+/// Returns `None` for unknown command names (callers fall back to
+/// the static `desc` field).
+pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
+    use crate::i18n::{t, Msg};
+    let msg = match name {
+        "setup" => Msg::CmdDescSetup,
+        "codingplan" => Msg::CmdDescCodingplan,
+        "resume" => Msg::CmdDescResume,
+        "rename" => Msg::CmdDescRename,
+        "login" => Msg::CmdDescLogin,
+        "logout" => Msg::CmdDescLogout,
+        "whoami" => Msg::CmdDescWhoami,
+        "model" => Msg::CmdDescModel,
+        "provider" => Msg::CmdDescProvider,
+        "status" => Msg::CmdDescStatus,
+        "config" => Msg::CmdDescConfig,
+        "reload" => Msg::CmdDescReload,
+        "cd" => Msg::CmdDescCd,
+        "init" => Msg::CmdDescInit,
+        "bg" => Msg::CmdDescBg,
+        "background" => Msg::CmdDescBackground,
+        "diff" => Msg::CmdDescDiff,
+        "clear" => Msg::CmdDescClear,
+        "session" => Msg::CmdDescSession,
+        "cost" => Msg::CmdDescCost,
+        "context" => Msg::CmdDescContext,
+        "compact" => Msg::CmdDescCompact,
+        "remember" => Msg::CmdDescRemember,
+        "forget" => Msg::CmdDescForget,
+        "memory" => Msg::CmdDescMemory,
+        "mcp" => Msg::CmdDescMcp,
+        "undo" => Msg::CmdDescUndo,
+        "worktree" => Msg::CmdDescWorktree,
+        "upgrade" => Msg::CmdDescUpgrade,
+        "issue" => Msg::CmdDescIssue,
+        "plan" => Msg::CmdDescPlan,
+        "build" => Msg::CmdDescBuild,
+        "think" => Msg::CmdDescThink,
+        "help" => Msg::CmdDescHelp,
+        "keys" => Msg::CmdDescKeys,
+        "language" => Msg::CmdDescLanguage,
+        "welcome" => Msg::CmdWelcomeDescription,
+        "quit" => Msg::CmdDescQuit,
+        "skills" => Msg::CmdDescSkills,
+        "plugin" => Msg::CmdDescPlugin,
+        "paste" => Msg::CmdDescPaste,
+        _ => return None,
+    };
+    Some(t(msg))
+}
+
+/// A completion candidate for slash-command Tab completion, merging built-in
+/// and user-defined custom commands.
+#[derive(Debug, Clone)]
+pub struct CompletionCandidate {
+    pub name: String,
+    pub description: String,
+    pub is_custom: bool,
+}
+
+/// Merge built-in and custom command completions for a given prefix.
+/// Results are sorted with built-ins first, then custom commands, each
+/// group sorted by name. Custom commands whose names collide with a
+/// built-in are suppressed.
+pub fn complete_commands(
+    prefix: &str,
+    custom_names: &[(String, String)],
+) -> Vec<CompletionCandidate> {
+    let prefix = prefix.strip_prefix('/').unwrap_or(prefix);
+    let mut candidates = Vec::new();
+    for cmd in BUILTIN_COMMANDS {
+        if cmd.name.starts_with(prefix) {
+            candidates.push(CompletionCandidate {
+                name: cmd.name.to_string(),
+                description: cmd_desc_i18n(cmd.name)
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|| cmd.desc.to_string()),
+                is_custom: false,
+            });
+        }
+    }
+    for (name, desc) in custom_names {
+        if name.starts_with(prefix) && !candidates.iter().any(|c| c.name == *name) {
+            candidates.push(CompletionCandidate {
+                name: name.clone(),
+                description: desc.clone(),
+                is_custom: true,
+            });
+        }
+    }
+    candidates.sort_by_key(|c| (c.is_custom, c.name.clone()));
+    candidates
+}
 
 /// Parse `"/cmd args..."` into `(cmd, args)` when the leading `/` is a
 /// command invocation. Returns `None` when the `/` is actually part of a
@@ -97,8 +231,13 @@ const BUILTIN_COMMANDS: &[Command] = &[
 /// agent dispatch.
 pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
     let rest = s.strip_prefix('/')?;
+    // Allow `:` in command names so namespaced skills like
+    // `/skills:brainstorming` (loose skill, atomcode prefix) and
+    // `/superpowers:writing-plans` (Claude Code plugin convention)
+    // parse as a single command name. Paths like `/Users/me/...` are
+    // still rejected by the non-whitespace follow-on check below.
     let name_end = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':'))
         .unwrap_or(rest.len());
     if name_end == 0 {
         return None;
@@ -108,7 +247,7 @@ pub fn parse_slash_line(s: &str) -> Option<(&str, &str)> {
     match after.chars().next() {
         None => Some((name, "")),
         Some(c) if c.is_whitespace() => Some((name, after.trim_start())),
-        // Non-space follow-on (`/`, `.`, `:`, etc.) means the `/` was
+        // Non-space follow-on (`/`, `.`, etc.) means the `/` was
         // a literal character in a path / URL — not a command.
         _ => None,
     }
@@ -126,10 +265,61 @@ mod tests {
     }
 
     #[test]
+    fn builtin_contains_bg_command() {
+        let registry = CommandRegistry::builtin();
+        let cmd = registry.find("bg").unwrap();
+        assert_eq!(cmd.name, "bg");
+        assert!(!cmd.needs_args);
+    }
+
+    #[test]
     fn tab_completion_finds_prefix_matches() {
         let reg = CommandRegistry::builtin();
         let matches = reg.matching_prefix("h");
         assert!(matches.iter().any(|c| c.name == "help"));
+    }
+
+    #[test]
+    fn keys_command_is_registered_with_i18n_description_in_both_locales() {
+        // `/keys` should appear in the built-in completion list and
+        // resolve a non-empty description in every shipped locale —
+        // if a translator misses one, the slash menu shows the bare
+        // English fallback (CmdDescKeys default) and we want that to
+        // be a test failure, not a UI regression.
+        use crate::i18n::{Locale, Msg};
+        let reg = CommandRegistry::builtin();
+        let keys_cmd = reg
+            .matching_prefix("keys")
+            .into_iter()
+            .find(|c| c.name == "keys")
+            .expect("/keys must be a built-in command");
+        assert!(!keys_cmd.needs_args);
+
+        // i18n round-trip per locale: both the slash-menu description
+        // and the KeybindingsHelp body must produce non-empty text
+        // and carry the canonical keystroke labels. Snapshot the
+        // current locale up front and restore at the end so we don't
+        // poison parallel tests / future tests by leaving a side
+        // effect behind. `set_locale` is process-global.
+        let prev = crate::i18n::current_locale();
+        for locale in [Locale::En, Locale::ZhCn] {
+            crate::i18n::set_locale(locale);
+            let desc = cmd_desc_i18n("keys").expect("CmdDescKeys translation");
+            assert!(
+                !desc.trim().is_empty(),
+                "CmdDescKeys ({locale:?}) must not be empty"
+            );
+            let body = crate::i18n::t(Msg::KeybindingsHelp);
+            assert!(
+                body.contains("Ctrl+C"),
+                "KeybindingsHelp ({locale:?}) must list Ctrl+C — got:\n{body}"
+            );
+            assert!(
+                body.contains("Enter"),
+                "KeybindingsHelp ({locale:?}) must list Enter — got:\n{body}"
+            );
+        }
+        crate::i18n::set_locale(prev);
     }
 
     #[test]
@@ -165,6 +355,23 @@ mod tests {
         assert!(parse_slash_line("/Users/me/file.txt").is_none());
         assert!(parse_slash_line("/tmp/x").is_none());
         assert!(parse_slash_line("/path/with/中文/pic.png").is_none());
+    }
+
+    #[test]
+    fn parse_accepts_colon_namespaced_command() {
+        // Skills load under a `skills:` namespace; plugins (future) use
+        // their manifest name. The parser must keep the colon segment as
+        // part of the command name, not split on it.
+        let (cmd, arg) = parse_slash_line("/skills:brainstorming").unwrap();
+        assert_eq!(cmd, "skills:brainstorming");
+        assert_eq!(arg, "");
+
+        let (cmd, arg) = parse_slash_line("/skills:brainstorming why is X").unwrap();
+        assert_eq!(cmd, "skills:brainstorming");
+        assert_eq!(arg, "why is X");
+
+        let (cmd, _) = parse_slash_line("/superpowers:writing-plans").unwrap();
+        assert_eq!(cmd, "superpowers:writing-plans");
     }
 
     #[test]
@@ -208,6 +415,74 @@ mod tests {
         let help = reg.help_text();
         for c in reg.all() {
             assert!(help.contains(c.name), "help missing {}", c.name);
+        }
+    }
+
+    #[test]
+    fn complete_builtin_commands() {
+        let candidates = complete_commands("mo", &[]);
+        assert!(
+            candidates.iter().any(|c| c.name == "model"),
+            "\"mo\" should match built-in \"model\""
+        );
+        assert!(
+            candidates.iter().all(|c| !c.is_custom),
+            "built-in-only query should have no custom candidates"
+        );
+    }
+
+    #[test]
+    fn complete_custom_commands() {
+        let custom = vec![("review".to_string(), "Code review".to_string())];
+        let candidates = complete_commands("rev", &custom);
+        assert!(
+            candidates.iter().any(|c| c.name == "review" && c.is_custom),
+            "\"rev\" should match custom \"review\""
+        );
+    }
+
+    #[test]
+    fn builtin_takes_precedence() {
+        // Custom "help" should NOT appear because built-in "help" exists.
+        let custom = vec![("help".to_string(), "Custom help".to_string())];
+        let candidates = complete_commands("help", &custom);
+        let help_count = candidates.iter().filter(|c| c.name == "help").count();
+        assert_eq!(
+            help_count, 1,
+            "custom \"help\" must not duplicate built-in \"help\""
+        );
+        assert!(
+            !candidates.iter().any(|c| c.name == "help" && c.is_custom),
+            "the surviving \"help\" must be the built-in, not custom"
+        );
+    }
+
+    #[test]
+    fn empty_prefix_returns_all() {
+        let custom = vec![
+            ("review".to_string(), "Code review".to_string()),
+            ("deploy".to_string(), "Deploy app".to_string()),
+        ];
+        let candidates = complete_commands("", &custom);
+        // At least all 25 built-in commands + 2 custom
+        assert!(
+            candidates.len() >= 20,
+            "empty prefix should return at least 20 results, got {}",
+            candidates.len()
+        );
+        // Custom commands should be present
+        assert!(candidates.iter().any(|c| c.name == "review"));
+        assert!(candidates.iter().any(|c| c.name == "deploy"));
+    }
+
+    #[test]
+    fn complete_commands_strips_leading_slash() {
+        // Calling with "/mo" should behave identically to "mo".
+        let with_slash = complete_commands("/mo", &[]);
+        let without_slash = complete_commands("mo", &[]);
+        assert_eq!(with_slash.len(), without_slash.len());
+        for (a, b) in with_slash.iter().zip(without_slash.iter()) {
+            assert_eq!(a.name, b.name);
         }
     }
 }

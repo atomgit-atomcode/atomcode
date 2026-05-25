@@ -6,8 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
 use crate::hook::{
-    Hook, HookContext, HookResult, PostToolExecutionHook, PostTurnHook, PreToolExecutionHook,
-    SystemPromptHook, ToolResultContext,
+    Hook, HookCtx, HookResult, PreToolExecutionHook, PostToolExecutionHook,
+    PostTurnHook, SystemPromptHook, ToolResultContext,
 };
 
 /// 脚本 Hook 配置
@@ -58,7 +58,7 @@ impl ScriptHook {
     /// 执行脚本并获取结果
     async fn run_script(&self, input_json: &str) -> Result<String, String> {
         let script_path = &self.config.script;
-
+        
         // 检查脚本是否存在
         if !script_path.exists() {
             return Err(format!("Script not found: {}", script_path.display()));
@@ -69,20 +69,12 @@ impl ScriptHook {
             "python" => ("python", vec![script_path.to_string_lossy().to_string()]),
             "shell" | "bash" => {
                 if cfg!(windows) {
-                    (
-                        "cmd",
-                        vec!["/C".to_string(), script_path.to_string_lossy().to_string()],
-                    )
+                    ("cmd", vec!["/C".to_string(), script_path.to_string_lossy().to_string()])
                 } else {
                     ("sh", vec![script_path.to_string_lossy().to_string()])
                 }
             }
-            _ => {
-                return Err(format!(
-                    "Unsupported script type: {}",
-                    self.config.script_type
-                ))
-            }
+            _ => return Err(format!("Unsupported script type: {}", self.config.script_type)),
         };
 
         // 启动子进程
@@ -178,34 +170,13 @@ impl ScriptHook {
 
         // 解析简单字符串格式
         if output.starts_with("warning:") || output.starts_with("WARN:") {
-            return HookResult::Warning(
-                output
-                    .splitn(2, ':')
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
+            return HookResult::Warning(output.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
         }
         if output.starts_with("deny:") || output.starts_with("DENY:") {
-            return HookResult::Denied(
-                output
-                    .splitn(2, ':')
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
+            return HookResult::Denied(output.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
         }
         if output.starts_with("modify:") || output.starts_with("MODIFY:") {
-            return HookResult::Modified(
-                output
-                    .splitn(2, ':')
-                    .nth(1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
+            return HookResult::Modified(output.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
         }
 
         // 默认：视为成功
@@ -229,7 +200,7 @@ impl Hook for ScriptHook {
 
 #[async_trait]
 impl PreToolExecutionHook for ScriptHook {
-    async fn on_pre_execute(&self, ctx: &HookContext) -> HookResult {
+    async fn on_pre_execute(&self, ctx: &HookCtx) -> HookResult {
         let input = serde_json::to_string(ctx).unwrap_or_default();
         match self.run_script(&input).await {
             Ok(output) => self.parse_output(&output),
@@ -240,21 +211,11 @@ impl PreToolExecutionHook for ScriptHook {
 
 #[async_trait]
 impl PostToolExecutionHook for ScriptHook {
-    async fn on_post_execute(
-        &self,
-        ctx: &HookContext,
-        result_ctx: &ToolResultContext,
-    ) -> HookResult {
+    async fn on_post_execute(&self, ctx: &HookCtx, result_ctx: &ToolResultContext) -> HookResult {
         let mut combined = serde_json::Map::new();
-        combined.insert(
-            "hook_context".to_string(),
-            serde_json::to_value(ctx).unwrap_or_default(),
-        );
-        combined.insert(
-            "result_context".to_string(),
-            serde_json::to_value(result_ctx).unwrap_or_default(),
-        );
-
+        combined.insert("hook_context".to_string(), serde_json::to_value(ctx).unwrap_or_default());
+        combined.insert("result_context".to_string(), serde_json::to_value(result_ctx).unwrap_or_default());
+        
         let input = serde_json::to_string(&combined).unwrap_or_default();
         match self.run_script(&input).await {
             Ok(output) => self.parse_output(&output),
@@ -265,17 +226,11 @@ impl PostToolExecutionHook for ScriptHook {
 
 #[async_trait]
 impl PostTurnHook for ScriptHook {
-    async fn on_post_turn(&self, ctx: &HookContext, turn_result: &str) -> HookResult {
+    async fn on_post_turn(&self, ctx: &HookCtx, turn_result: &str) -> HookResult {
         let mut combined = serde_json::Map::new();
-        combined.insert(
-            "hook_context".to_string(),
-            serde_json::to_value(ctx).unwrap_or_default(),
-        );
-        combined.insert(
-            "turn_result".to_string(),
-            serde_json::Value::String(turn_result.to_string()),
-        );
-
+        combined.insert("hook_context".to_string(), serde_json::to_value(ctx).unwrap_or_default());
+        combined.insert("turn_result".to_string(), serde_json::Value::String(turn_result.to_string()));
+        
         let input = serde_json::to_string(&combined).unwrap_or_default();
         match self.run_script(&input).await {
             Ok(output) => self.parse_output(&output),
@@ -287,12 +242,207 @@ impl PostTurnHook for ScriptHook {
 #[async_trait]
 impl SystemPromptHook for ScriptHook {
     async fn extend_system_prompt(&self) -> Option<String> {
-        let empty_ctx = HookContext::new("".to_string(), "".to_string(), "".to_string());
+        let empty_ctx = HookCtx::new("".to_string(), "".to_string(), "".to_string());
         let input = serde_json::to_string(&empty_ctx).unwrap_or_default();
-
+        
         match self.run_script(&input).await {
             Ok(output) if !output.is_empty() => Some(output),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hook::Hook;
+
+    // ── ScriptHookConfig defaults ──
+
+    #[test]
+    fn config_default_script_type() {
+        // Test serde defaults by deserializing from minimal JSON
+        let json = r#"{"name":"test","trigger":"pre_tool","script":"test.sh"}"#;
+        let config: ScriptHookConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.script_type, "shell");
+    }
+
+    #[test]
+    fn config_default_enabled() {
+        let json = r#"{"name":"test","trigger":"pre_tool","script":"test.sh"}"#;
+        let config: ScriptHookConfig = serde_json::from_str(json).unwrap();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn config_default_timeout() {
+        let json = r#"{"name":"test","trigger":"pre_tool","script":"test.sh"}"#;
+        let config: ScriptHookConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.timeout_secs, 2);
+    }
+
+    // ── ScriptHook construction and trait methods ──
+
+    #[test]
+    fn script_hook_new_and_trait_methods() {
+        let config = ScriptHookConfig {
+            name: "my-hook".into(),
+            trigger: "post_tool".into(),
+            script: PathBuf::from("/tmp/dummy.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 5,
+            description: "My test hook".into(),
+        };
+        let hook = ScriptHook::new(config);
+
+        assert_eq!(hook.name(), "my-hook");
+        assert_eq!(hook.description(), "My test hook");
+        assert!(hook.is_enabled());
+    }
+
+    #[test]
+    fn script_hook_disabled() {
+        let config = ScriptHookConfig {
+            name: "disabled-hook".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("ignored.sh"),
+            script_type: "shell".into(),
+            enabled: false,
+            timeout_secs: 2,
+            description: String::new(),
+        };
+        let hook = ScriptHook::new(config);
+        assert!(!hook.is_enabled());
+    }
+
+    // ── parse_output ──
+
+    #[test]
+    fn parse_output_empty() {
+        let config = ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        };
+        let hook = ScriptHook::new(config);
+        assert!(matches!(hook.parse_output(""), HookResult::Ok));
+    }
+
+    #[test]
+    fn parse_output_ok() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        assert!(matches!(hook.parse_output("ok"), HookResult::Ok));
+    }
+
+    #[test]
+    fn parse_output_warning() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output("warning: something");
+        assert!(matches!(result, HookResult::Warning(msg) if msg == "something"));
+    }
+
+    #[test]
+    fn parse_output_deny() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output("deny: access denied");
+        assert!(matches!(result, HookResult::Denied(msg) if msg == "access denied"));
+    }
+
+    #[test]
+    fn parse_output_modify() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output("modify: new_args");
+        assert!(matches!(result, HookResult::Modified(msg) if msg == "new_args"));
+    }
+
+    #[test]
+    fn parse_output_json_ok() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output(r#"{"result":"ok"}"#);
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    #[test]
+    fn parse_output_json_warning() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        let result = hook.parse_output(r#"{"result":"warning","message":"be careful"}"#);
+        assert!(matches!(result, HookResult::Warning(msg) if msg == "be careful"));
+    }
+
+    #[test]
+    fn parse_output_unrecognized_fallback_to_ok() {
+        let hook = ScriptHook::new(ScriptHookConfig {
+            name: "t".into(),
+            trigger: "pre_tool".into(),
+            script: PathBuf::from("t.sh"),
+            script_type: "shell".into(),
+            enabled: true,
+            timeout_secs: 2,
+            description: String::new(),
+        });
+        // Unrecognized text should fall back to Ok
+        let result = hook.parse_output("some random output");
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    // ── ScriptHook implements Hook trait ──
+
+    #[test]
+    fn script_hook_impl_hook_trait() {
+        fn require_hook<T: Hook>() {}
+        require_hook::<ScriptHook>;
     }
 }

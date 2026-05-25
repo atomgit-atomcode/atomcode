@@ -250,7 +250,6 @@ impl VirtualTerminal {
 
     /// Handy multi-line dump of the whole grid — useful inside
     /// assertion error messages so failures show what was painted.
-    #[allow(dead_code)]
     pub fn dump(&self) -> String {
         self.grid
             .iter()
@@ -398,33 +397,66 @@ impl Perform for VirtualTerminal {
                 self.cursor_row = (row.saturating_sub(1) as u16).min(self.height.saturating_sub(1));
                 self.cursor_col = (col.saturating_sub(1) as u16).min(self.width.saturating_sub(1));
             }
-            // ED: erase in display. `\x1b[2J` = whole screen.
+            // ED: erase in display. `\x1b[2J` = whole screen,
+            // `\x1b[J` / `\x1b[0J` = cursor to end of display,
+            // `\x1b[1J` = start of display to cursor.
             'J' => {
                 let mode = params
                     .iter()
                     .next()
                     .and_then(|p| p.first().copied())
                     .unwrap_or(0);
-                if mode == 2 {
-                    if self.ed_promotes_to_scrollback {
-                        // Terminal.app / iTerm2 style: copy every
-                        // non-blank visible row into scrollback before
-                        // blanking. Preserves oldest-first order.
-                        for row in &self.grid {
-                            let non_blank =
-                                row.iter().any(|c| c.ch != ' ');
-                            if non_blank {
-                                self.scrollback.push(row.clone());
+                let blank = GridCell::default();
+                let blank_row = vec![blank; self.width as usize];
+                match mode {
+                    0 => {
+                        // Cursor to end of display: erase from cursor to
+                        // end of current row, then blank every row below.
+                        let row_idx = self.cursor_row as usize;
+                        let col_idx = self.cursor_col as usize;
+                        if let Some(row) = self.grid.get_mut(row_idx) {
+                            for col in col_idx..row.len() {
+                                row[col] = GridCell::default();
+                            }
+                        }
+                        for row in self.grid.iter_mut().skip(row_idx + 1) {
+                            *row = blank_row.clone();
+                        }
+                    }
+                    1 => {
+                        // Start to cursor: blank every row above, then
+                        // erase from start of current row up to and
+                        // including the cursor column.
+                        let row_idx = self.cursor_row as usize;
+                        let col_idx = self.cursor_col as usize;
+                        for row in self.grid.iter_mut().take(row_idx) {
+                            *row = blank_row.clone();
+                        }
+                        if let Some(row) = self.grid.get_mut(row_idx) {
+                            let end = (col_idx + 1).min(row.len());
+                            for col in 0..end {
+                                row[col] = GridCell::default();
                             }
                         }
                     }
-                    let blank_row = vec![GridCell::default(); self.width as usize];
-                    for row in &mut self.grid {
-                        *row = blank_row.clone();
+                    2 => {
+                        if self.ed_promotes_to_scrollback {
+                            // Terminal.app / iTerm2 style: copy every
+                            // non-blank visible row into scrollback before
+                            // blanking. Preserves oldest-first order.
+                            for row in &self.grid {
+                                let non_blank = row.iter().any(|c| c.ch != ' ');
+                                if non_blank {
+                                    self.scrollback.push(row.clone());
+                                }
+                            }
+                        }
+                        for row in &mut self.grid {
+                            *row = blank_row.clone();
+                        }
                     }
+                    _ => {}
                 }
-                // Modes 0/1 (partial erase) — retained doesn't emit,
-                // no-op is fine.
             }
             // EL: erase in line.
             'K' => {

@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src 'nonce-{{nonce}}'; font-src {{cspSource}}; img-src {{cspSource}} https:;">
+  <link rel="stylesheet" href="{{webviewCssUri}}">
+  <title>AtomCode</title>
+</head>
+<body data-view-mode="{{viewMode}}">
+  <div id="root"></div>
+  <script nonce="{{nonce}}" src="{{webviewJsUri}}"></script>
+</body>
+</html>

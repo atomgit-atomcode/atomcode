@@ -121,7 +121,10 @@ fn expand_shell_injections(template: &str) -> String {
 }
 
 fn run_shell_command(cmd: &str) -> String {
-    match Command::new("sh").arg("-c").arg(cmd).output() {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd);
+    crate::process_utils::suppress_console_window_sync(&mut command);
+    match command.output() {
         Ok(out) => {
             let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
             if !out.status.success() {
@@ -177,12 +180,7 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
 
     let after_open = &content[if content.starts_with("---\r\n") { 5 } else { 4 }..];
 
-    let close = after_open
-        .find("\n---\n")
-        .map(|p| (p, 5usize))
-        .or_else(|| after_open.find("\n---\r\n").map(|p| (p, 6)));
-
-    let (close_pos, skip) = match close {
+    let (close_pos, skip) = match find_frontmatter_close(after_open) {
         Some(v) => v,
         None => return (fm, content.to_string()),
     };
@@ -218,6 +216,32 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
     }
 
     (fm, template)
+}
+
+fn find_frontmatter_close(after_open: &str) -> Option<(usize, usize)> {
+    if after_open == "---" {
+        return Some((0, 3));
+    }
+    if after_open == "---\r" {
+        return Some((0, 4));
+    }
+    if after_open.starts_with("---\n") {
+        return Some((0, 4));
+    }
+    if after_open.starts_with("---\r\n") {
+        return Some((0, 5));
+    }
+
+    after_open
+        .find("\n---\n")
+        .map(|p| (p, 5usize))
+        .or_else(|| after_open.find("\n---\r\n").map(|p| (p, 6)))
+        .or_else(|| after_open.strip_suffix("\n---").map(|_| (after_open.len() - 4, 4)))
+        .or_else(|| {
+            after_open
+                .strip_suffix("\n---\r")
+                .map(|_| (after_open.len() - 5, 5))
+        })
 }
 
 /// Extract a description from the first non-empty paragraph of the template,
@@ -313,10 +337,10 @@ fn validate_skill_name(name: &str) -> anyhow::Result<()> {
     }
     if !name
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     {
         anyhow::bail!(
-            "skill name '{}' must contain only lowercase letters, digits, and hyphens",
+            "skill name '{}' must contain only lowercase letters, digits, hyphens, and underscores",
             name
         );
     }
@@ -374,36 +398,54 @@ impl SkillRegistry {
     /// Note: If ATOMCODE_HOME env var is set, it overrides the default home directory
     /// for atomcode-specific paths (.atomcode/commands and .atomcode/skills).
     /// Claude Code compat paths (.claude/*) always use the system home directory.
-    pub fn reload(&mut self, working_dir: &Path) {
+    /// Reload skills. Returns a list of "skipped" diagnostics (one per
+    /// rejected skill on disk). Callers in interactive contexts (TUI) can
+    /// surface these gated behind verbose mode; non-interactive callers
+    /// (agent bootstrap, /cd) drop them.
+    pub fn reload(&mut self, working_dir: &Path) -> Vec<String> {
         self.skills.clear();
+        let mut warnings: Vec<String> = Vec::new();
 
         // System home directory (for Claude Code compat paths)
-        let system_home = dirs::home_dir();
-        
-        // AtomCode home directory (respects ATOMCODE_HOME env var)
-        let atomcode_home: Option<PathBuf> = std::env::var("ATOMCODE_HOME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| system_home.clone());
+        let system_home = crate::tool::real_home_dir();
+
+        // AtomCode config dir (respects ATOMCODE_HOME env var; defaults to
+        // ~/.atomcode). This is the SAME root used by config.toml, history,
+        // plugins/, etc. — see Config::config_dir() for the single source of
+        // truth.
+        let atomcode_config_dir = crate::config::Config::config_dir();
+
+        // All "loose" skills (i.e. not loaded through a plugin manifest)
+        // share the synthetic `skills:` namespace so they're visually
+        // distinguishable from built-in slash commands in the `/` menu —
+        // e.g. `/skills:brainstorming`. Plugin loaders (future) will pass
+        // their own namespace derived from the plugin manifest, matching
+        // Claude Code's `<plugin>:<skill>` convention (`superpowers:foo`).
+        const LOOSE_NS: Option<&str> = Some("skills");
 
         // Load Claude Code compat paths from system home (always)
         if let Some(ref home) = system_home {
-            self.load_flat_commands(&home.join(".claude").join("commands"), None);
-            self.load_skills_dir(&home.join(".claude").join("skills"), None);
+            self.load_flat_commands(&home.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
+            self.load_skills_dir(&home.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
         }
 
-        // Load atomcode native paths from ATOMCODE_HOME (or system home as fallback)
-        if let Some(ref home) = atomcode_home {
-            self.load_flat_commands(&home.join(".atomcode").join("commands"), None);
-            self.load_skills_dir(&home.join(".atomcode").join("skills"), None);
-        }
+        // Load atomcode native paths from the unified config dir.
+        self.load_flat_commands(&atomcode_config_dir.join("commands"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(&atomcode_config_dir.join("skills"), LOOSE_NS, &mut warnings);
 
         // Project-level skills (always from working dir)
-        self.load_flat_commands(&working_dir.join(".claude").join("commands"), None);
-        self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), None);
-        self.load_skills_dir(&working_dir.join(".claude").join("skills"), None);
-        self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), None);
+        self.load_flat_commands(&working_dir.join(".claude").join("commands"), LOOSE_NS, &mut warnings);
+        self.load_flat_commands(&working_dir.join(".atomcode").join("commands"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(&working_dir.join(".claude").join("skills"), LOOSE_NS, &mut warnings);
+        self.load_skills_dir(&working_dir.join(".atomcode").join("skills"), LOOSE_NS, &mut warnings);
+
+        // Plugin layer — installed plugins contribute namespaced skills.
+        for assets in crate::plugin::loader::iter_installed_plugin_assets() {
+            for skills_dir in assets.skills_dirs() {
+                self.load_skills_dir(&skills_dir, Some(&assets.plugin), &mut warnings);
+            }
+        }
+        warnings
     }
 
     /// Register a pre-built skill directly (used by plugin system).
@@ -411,8 +453,35 @@ impl SkillRegistry {
         self.skills.insert(skill.name.clone(), skill);
     }
 
+    /// Look up a skill by name. Falls back to a unique `*:name` suffix
+    /// match when the exact name misses AND the request is unqualified —
+    /// covers the case where a hook-injected workflow plan or other
+    /// external material refers to a plugin skill by its bare name
+    /// (`ascend-model-verification`) instead of the registered fully
+    /// qualified key (`ascend-model-agent-plugin:ascend-model-verification`).
+    ///
+    /// Discipline: returns `None` when more than one namespace would match
+    /// the bare name. Silent-pick-the-first would mask real ambiguity (and
+    /// the LLM would invoke the wrong plugin) — better to error out so the
+    /// caller surfaces the candidates.
     pub fn get(&self, name: &str) -> Option<&Skill> {
-        self.skills.get(name)
+        if let Some(s) = self.skills.get(name) {
+            return Some(s);
+        }
+        // Only run the fallback when the request is unqualified. A
+        // qualified-but-missing lookup (`foo:bar` typo'd as `foo:baz`)
+        // should fail loudly, not silently rebind to some other plugin.
+        if name.contains(':') {
+            return None;
+        }
+        let suffix = format!(":{}", name);
+        let mut hits = self.skills.iter().filter(|(k, _)| k.ends_with(&suffix));
+        let first = hits.next()?;
+        if hits.next().is_some() {
+            // Ambiguous — the bare name maps to multiple plugins. Refuse.
+            return None;
+        }
+        Some(first.1)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -437,7 +506,7 @@ impl SkillRegistry {
     // -----------------------------------------------------------------------
 
     /// Load all `.md` files from a flat `commands/` directory.
-    fn load_flat_commands(&mut self, dir: &Path, namespace: Option<&str>) {
+    fn load_flat_commands(&mut self, dir: &Path, namespace: Option<&str>, warnings: &mut Vec<String>) {
         if !dir.is_dir() {
             return;
         }
@@ -455,18 +524,43 @@ impl SkillRegistry {
                     self.skills.insert(skill.name.clone(), skill);
                 }
                 Err(e) => {
-                    eprintln!("[skill] skipping {}: {}", path.display(), e);
+                    warnings.push(format!("[skill] skipping {}: {}", path.display(), e));
                 }
             }
         }
     }
 
     /// Load directory-style skills from a `skills/` directory.
-    /// Each subdirectory that contains a `SKILL.md` becomes one skill.
-    fn load_skills_dir(&mut self, dir: &Path, namespace: Option<&str>) {
+    ///
+    /// Two layouts are supported:
+    ///
+    /// 1. **AtomCode / parent-directory layout**: `dir/` contains subdirectories
+    ///    each with a `SKILL.md` — e.g. `dir/brainstorming/SKILL.md`.
+    /// 2. **Claude Code array layout**: `dir/` itself contains a `SKILL.md`,
+    ///    meaning `dir` *is* the skill directory. This happens when `plugin.json`
+    ///    declares `skills: ["./skills/foo"]` — each entry points directly to a
+    ///    skill directory rather than to a parent of skill directories.
+    ///
+    /// Both layouts can coexist: if `dir/SKILL.md` exists it is loaded first,
+    /// then any `dir/*/SKILL.md` subdirectory skills are loaded after (and win
+    /// on name collision, matching the higher-priority-wins convention).
+    fn load_skills_dir(&mut self, dir: &Path, namespace: Option<&str>, warnings: &mut Vec<String>) {
         if !dir.is_dir() {
             return;
         }
+        // CC array layout: the directory itself is a skill directory.
+        let self_md = dir.join("SKILL.md");
+        if self_md.exists() {
+            match parse_skill_dir(dir, &self_md, namespace) {
+                Ok(skill) => {
+                    self.skills.insert(skill.name.clone(), skill);
+                }
+                Err(e) => {
+                    warnings.push(format!("[skill] skipping {}: {}", dir.display(), e));
+                }
+            }
+        }
+        // AtomCode / parent-directory layout: each subdirectory with a SKILL.md.
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -485,7 +579,7 @@ impl SkillRegistry {
                     self.skills.insert(skill.name.clone(), skill);
                 }
                 Err(e) => {
-                    eprintln!("[skill] skipping {}: {}", skill_dir.display(), e);
+                    warnings.push(format!("[skill] skipping {}: {}", skill_dir.display(), e));
                 }
             }
         }
@@ -602,6 +696,23 @@ mod tests {
     }
 
     #[test]
+    fn test_frontmatter_closing_delimiter_at_eof() {
+        let content = "---\nname: eof-skill\ndescription: EOF skill\n---";
+        let (fm, tmpl) = parse_frontmatter(content);
+        assert_eq!(fm.name.as_deref(), Some("eof-skill"));
+        assert_eq!(fm.description, "EOF skill");
+        assert_eq!(tmpl, "");
+    }
+
+    #[test]
+    fn test_empty_frontmatter_before_body() {
+        let content = "---\n---\nBody.\n";
+        let (fm, tmpl) = parse_frontmatter(content);
+        assert_eq!(fm.description, "");
+        assert_eq!(tmpl, "Body.\n");
+    }
+
+    #[test]
     fn test_frontmatter_unclosed() {
         let content = "---\ndescription: broken\nno closing delimiter";
         let (fm, tmpl) = parse_frontmatter(content);
@@ -626,5 +737,258 @@ mod tests {
     fn test_replace_positional_short_boundary() {
         // $1 should not touch $10
         assert_eq!(replace_positional_short("$10 $1", 1, "Y"), "$10 Y");
+    }
+
+    // --- namespace prefix on disk-loaded skills ---
+
+    #[test]
+    fn test_load_skills_dir_applies_namespace() {
+        // A skill loaded with namespace = Some("skills") must be stored
+        // under the prefixed name `skills:<base>` and lookup by the bare
+        // base name must miss. This pins the loader contract that the
+        // TUI relies on for the visual `/skills:foo` distinction.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("brainstorming");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: \"Test\"\n---\nTemplate body.\n",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        reg.load_skills_dir(tmp.path(), Some("skills"), &mut warnings);
+
+        assert!(
+            reg.get("skills:brainstorming").is_some(),
+            "namespaced lookup must succeed"
+        );
+        // Bare-name lookup falls back to a unique `:name` suffix match —
+        // a deliberate accommodation for hook-injected workflow plans
+        // that reference plugin skills without their plugin prefix.
+        assert!(
+            reg.get("brainstorming").is_some(),
+            "bare name must resolve via suffix fallback when unambiguous"
+        );
+        // Verify storage key actually IS the prefixed form (the loader
+        // contract; the fallback above could otherwise mask a regression
+        // where the prefix wasn't applied).
+        assert!(
+            reg.skills.contains_key("skills:brainstorming"),
+            "storage must use prefixed key"
+        );
+        assert!(
+            !reg.skills.contains_key("brainstorming"),
+            "storage must not duplicate under bare key"
+        );
+    }
+
+    #[test]
+    fn test_get_suffix_fallback_ambiguous_misses() {
+        // When two plugins each contribute a skill named "verify", a bare
+        // lookup must NOT silently pick one — that would invoke the wrong
+        // plugin's tool. Caller must use the qualified form.
+        let mut reg = SkillRegistry::new();
+        for ns in ["plugin-a", "plugin-b"] {
+            let key = format!("{}:verify", ns);
+            reg.skills.insert(
+                key.clone(),
+                Skill {
+                    name: key,
+                    description: "v".into(),
+                    template: "body".into(),
+                    disable_model_invocation: false,
+                    user_invocable: true,
+                    argument_hint: None,
+                    allowed_tools: vec![],
+                    skill_dir: PathBuf::new(),
+                    source_path: PathBuf::new(),
+                },
+            );
+        }
+        assert!(
+            reg.get("verify").is_none(),
+            "ambiguous bare name must miss (forces qualified lookup)"
+        );
+        assert!(reg.get("plugin-a:verify").is_some());
+        assert!(reg.get("plugin-b:verify").is_some());
+    }
+
+    #[test]
+    fn test_get_qualified_miss_does_not_fallback() {
+        // A qualified-but-typo'd name must not silently rebind to a
+        // suffix match — that would mask plugin name typos.
+        let mut reg = SkillRegistry::new();
+        reg.skills.insert(
+            "real-plugin:verify".into(),
+            Skill {
+                name: "real-plugin:verify".into(),
+                description: "v".into(),
+                template: "body".into(),
+                disable_model_invocation: false,
+                user_invocable: true,
+                argument_hint: None,
+                allowed_tools: vec![],
+                skill_dir: PathBuf::new(),
+                source_path: PathBuf::new(),
+            },
+        );
+        assert!(reg.get("typo-plugin:verify").is_none());
+    }
+
+    #[test]
+    fn test_load_flat_commands_applies_namespace() {
+        // Same contract for flat `.md` commands (legacy layout).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("commit.md"),
+            "---\ndescription: \"Commit\"\n---\nDo a commit.\n",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        reg.load_flat_commands(tmp.path(), Some("skills"), &mut warnings);
+
+        assert!(reg.get("skills:commit").is_some());
+        // Suffix fallback: unambiguous bare name resolves.
+        assert!(reg.get("commit").is_some());
+        assert!(reg.skills.contains_key("skills:commit"));
+        assert!(!reg.skills.contains_key("commit"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reload_picks_up_installed_plugin_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+
+        // Fake a registered + installed plugin on disk.
+        // Under unified ATOMCODE_HOME semantics, plugins live at $HOME/plugins
+        // (not $HOME/.atomcode/plugins) — see plugin/paths.rs.
+        let plugins_root = tmp.path().join("plugins");
+        let plugin_dir = plugins_root.join("marketplaces/p");
+        let skill_dir = plugin_dir.join("skills/hello");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: hello\ndescription: hi\n---\nhi",
+        )
+        .unwrap();
+        std::fs::write(
+            plugins_root.join("installed_plugins.json"),
+            r#"{"version":1,"plugins":{"p@p":{"marketplace":"p","plugin":"p","plugin_dir":"marketplaces/p","installed_at":"x"}}}"#,
+        )
+        .unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let mut reg = SkillRegistry::new();
+        reg.reload(working.path());
+        assert!(reg.get("p:hello").is_some(), "expected namespaced plugin skill");
+
+        std::env::remove_var("ATOMCODE_HOME");
+    }
+
+    /// Regression test: when `load_skills_dir` is given a directory that
+    /// *directly* contains `SKILL.md` (CC array layout where the `skills`
+    /// field points at the skill directory itself, not a parent), the skill
+    /// must still be loaded.
+    #[test]
+    fn test_load_skills_dir_cc_array_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Create a skill directory that contains SKILL.md directly
+        // (CC-style: skills: ["./skills/karpathy-guidelines"])
+        let skill_dir = tmp.path().join("skills/karpathy-guidelines");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: karpathy-guidelines\ndescription: Guidelines\n---\nBe simple.",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        // Pass the skill directory itself, not the parent "skills/" dir
+        reg.load_skills_dir(&skill_dir, Some("karpathy-skills"), &mut warnings);
+
+        assert!(
+            reg.get("karpathy-skills:karpathy-guidelines").is_some(),
+            "CC array layout: skill directory containing SKILL.md should be loaded"
+        );
+        assert!(warnings.is_empty(), "no warnings expected");
+    }
+
+    /// When a directory both contains SKILL.md itself and has subdirectories
+    /// with SKILL.md, both are loaded (subdirectory skills win on collision).
+    #[test]
+    fn test_load_skills_dir_hybrid_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Self-SKILL.md
+        std::fs::write(
+            tmp.path().join("SKILL.md"),
+            "---\nname: hybrid\ndescription: self\n---\nself body",
+        )
+        .unwrap();
+
+        // Subdirectory SKILL.md
+        let sub = tmp.path().join("sub-skill");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("SKILL.md"),
+            "---\nname: sub-skill\ndescription: sub\n---\nsub body",
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        let mut warnings = Vec::new();
+        reg.load_skills_dir(tmp.path(), Some("test"), &mut warnings);
+
+        assert!(reg.get("test:hybrid").is_some(), "self SKILL.md should load");
+        assert!(reg.get("test:sub-skill").is_some(), "subdirectory SKILL.md should load");
+    }
+
+    /// Regression test for the full plugin install path with CC-style
+    /// `skills: ["./skills/karpathy-guidelines"]` in plugin.json.
+    #[test]
+    #[serial_test::serial]
+    fn reload_picks_up_cc_array_plugin_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", tmp.path());
+
+        // Fake a plugin whose plugin.json uses CC array format.
+        // Plugins live directly under ATOMCODE_HOME (unified semantics).
+        let plugins_root = tmp.path().join("plugins");
+        let plugin_dir = plugins_root.join("marketplaces/karpathy-skills");
+        let skill_dir = plugin_dir.join("skills/karpathy-guidelines");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: karpathy-guidelines\ndescription: Guidelines\n---\nBe simple.",
+        )
+        .unwrap();
+        // CC-style plugin.json with skills as an array of individual skill dirs
+        std::fs::create_dir_all(plugin_dir.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            plugin_dir.join(".claude-plugin/plugin.json"),
+            r#"{"name":"andrej-karpathy-skills","skills":["./skills/karpathy-guidelines"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugins_root.join("installed_plugins.json"),
+            r#"{"version":1,"plugins":{"andrej-karpathy-skills@karpathy-skills":{"marketplace":"karpathy-skills","plugin":"andrej-karpathy-skills","plugin_dir":"marketplaces/karpathy-skills","installed_at":"x"}}}"#,
+        )
+        .unwrap();
+
+        let working = tempfile::tempdir().unwrap();
+        let mut reg = SkillRegistry::new();
+        reg.reload(working.path());
+        assert!(
+            reg.get("andrej-karpathy-skills:karpathy-guidelines").is_some(),
+            "CC array plugin: skill should be loaded from direct skill directory"
+        );
+
+        std::env::remove_var("ATOMCODE_HOME");
     }
 }

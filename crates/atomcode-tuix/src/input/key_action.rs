@@ -19,6 +19,7 @@ pub enum Action {
     HistoryNext,
     Backspace,
     DeleteForward,
+    ToggleToolOutput,
     NoOp,
 }
 
@@ -28,8 +29,13 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
     let alt = modifiers.contains(KeyModifiers::ALT);
 
     match (code, ctrl) {
-        (KeyCode::Enter, false) if shift || alt => Action::InsertNewline,
-        (KeyCode::Enter, false) => Action::Submit,
+        (KeyCode::Enter, ctrl) if ctrl || shift || alt => Action::InsertNewline,
+        (KeyCode::Enter, _) => Action::Submit,
+        // Ctrl+J = ASCII LF. On Kitty-aware terminals it arrives disambiguated
+        // from Enter and gives users another newline chord when their primary
+        // one is intercepted by the host terminal (e.g. Windows Terminal binds
+        // Alt+Enter to toggleFullscreen by default).
+        (KeyCode::Char('j'), true) => Action::InsertNewline,
         (KeyCode::Char('c'), true) => Action::Cancel,
         (KeyCode::Char('u'), true) => Action::ClearLine,
         (KeyCode::Char('w'), true) => Action::DeleteWordBackward,
@@ -38,6 +44,8 @@ pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
         // promise these in site/docs/keybindings.html.
         (KeyCode::Char('a'), true) => Action::LineStart,
         (KeyCode::Char('e'), true) => Action::LineEnd,
+        // Ctrl+O toggles real-time tool output visibility.
+        (KeyCode::Char('o'), true) => Action::ToggleToolOutput,
         // Ctrl+H is the POSIX / readline alias for Backspace. MobaXterm,
         // PuTTY and other Windows SSH clients often ship with "Backspace
         // sends ^H" turned on by default, so the physical Backspace key
@@ -100,6 +108,21 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_j_inserts_newline() {
+        // Ctrl+J = ASCII 0x0A (LF). On terminals that negotiate the Kitty
+        // keyboard protocol, crossterm reports it as `Char('j'), CONTROL`
+        // — give it the same role as Shift/Ctrl/Alt+Enter so users on
+        // Kitty-aware terminals (kitty, wezterm, alacritty, WT ≥1.21) have
+        // an extra fallback when their main chord is intercepted by the
+        // host terminal (e.g. Windows Terminal eats Alt+Enter for full-
+        // screen toggle by default).
+        assert_eq!(
+            k(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            Action::InsertNewline
+        );
+    }
+
+    #[test]
     fn ctrl_c_cancels() {
         assert_eq!(k(KeyCode::Char('c'), KeyModifiers::CONTROL), Action::Cancel);
     }
@@ -130,19 +153,28 @@ mod tests {
 
     #[test]
     fn ctrl_a_jumps_to_line_start() {
-        assert_eq!(k(KeyCode::Char('a'), KeyModifiers::CONTROL), Action::LineStart);
+        assert_eq!(
+            k(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            Action::LineStart
+        );
     }
 
     #[test]
     fn ctrl_e_jumps_to_line_end() {
-        assert_eq!(k(KeyCode::Char('e'), KeyModifiers::CONTROL), Action::LineEnd);
+        assert_eq!(
+            k(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            Action::LineEnd
+        );
     }
 
     #[test]
     fn ctrl_h_acts_as_backspace() {
         // MobaXterm / PuTTY default: Backspace key sends ^H. Must delete
         // a char, not be a silent no-op.
-        assert_eq!(k(KeyCode::Char('h'), KeyModifiers::CONTROL), Action::Backspace);
+        assert_eq!(
+            k(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            Action::Backspace
+        );
     }
 
     #[test]

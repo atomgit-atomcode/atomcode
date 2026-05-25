@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::json;
@@ -57,6 +58,15 @@ impl Tool for SearchReplaceTool {
         }
     }
 
+    fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
+        serde_json::from_str::<SearchReplaceArgs>(args)
+            .map(|_| ())
+            .map_err(|e| format!(
+                "{} (could not parse search_replace arguments; check `search` and `replace` are present)",
+                e
+            ))
+    }
+
     fn approval(&self, _args: &str) -> ApprovalRequirement {
         // Bulk replacement across files is potentially destructive
         // Auto-approve: search_replace is safe (literal/regex matching, respects .gitignore).
@@ -83,16 +93,17 @@ impl Tool for SearchReplaceTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: SearchReplaceArgs = serde_json::from_str(args)?;
         let wd = ctx.working_dir.read().await.clone();
-        let search_dir = match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &wd) {
-            Ok(access) => access.path,
-            Err(err) => {
-                return Ok(ToolResult {
-                    call_id: String::new(),
-                    output: err.to_string(),
-                    success: false,
-                });
-            }
-        };
+        let search_dir =
+            match super::inspect_path_access(parsed.path.as_deref().unwrap_or("."), &wd) {
+                Ok(access) => access.path,
+                Err(err) => {
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: err.to_string(),
+                        success: false,
+                    });
+                }
+            };
 
         if !search_dir.exists() {
             return Ok(ToolResult {
@@ -119,6 +130,20 @@ impl Tool for SearchReplaceTool {
             regex::Regex::new(&regex::escape(&parsed.search)).unwrap()
         };
 
+        let glob_filter = match parsed.glob.as_deref() {
+            Some(pattern) => match FileGlob::new(pattern) {
+                Ok(filter) => Some(filter),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: format!("Invalid glob '{}': {}", pattern, e),
+                        success: false,
+                    });
+                }
+            },
+            None => None,
+        };
+
         // Walk files
         let mut walker = WalkBuilder::new(&search_dir);
         walker.hidden(true).git_ignore(true);
@@ -140,10 +165,8 @@ impl Tool for SearchReplaceTool {
 
             let file_path = entry.path();
 
-            // Apply glob filter
-            if let Some(ref glob_pat) = parsed.glob {
-                let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !glob_match(glob_pat, name) {
+            if let Some(ref filter) = glob_filter {
+                if !filter.is_match(file_path, &search_dir) {
                     continue;
                 }
             }
@@ -182,6 +205,19 @@ impl Tool for SearchReplaceTool {
                         success: false,
                     });
                 }
+                // Canonicalize once so downstream by-path lookups
+                // (FileStore, LSP) match what read.rs originally
+                // stored — `entry.path()` from the directory walk
+                // can be the un-resolved symlink form (e.g. macOS
+                // `/var/...` vs `/private/var/...`), which would
+                // miss the FileStore key inserted by read_file.
+                let canon = std::fs::canonicalize(file_path)
+                    .unwrap_or_else(|_| file_path.to_path_buf());
+                // Notify LSP that file changed (if LSP is enabled).
+                ctx.notify_lsp_file_changed(&canon, &new_content).await;
+                // D3: drop any FileStore entry — peek_file against an
+                // old store_id reports stale, forcing fresh read_file.
+                ctx.file_store.write().await.invalidate(&canon);
                 total_replacements += count;
                 files_modified.push(format!(
                     "  {} ({} replacements)",
@@ -221,20 +257,83 @@ impl Tool for SearchReplaceTool {
     }
 }
 
-/// Simple glob matching: supports *.ext and exact match.
-fn glob_match(pattern: &str, filename: &str) -> bool {
-    if pattern.starts_with("*.") {
-        let ext = &pattern[1..]; // ".vue", ".css"
-        filename.ends_with(ext)
-    } else if pattern.contains('*') {
-        // Basic wildcard: convert to simple check
-        let parts: Vec<&str> = pattern.split('*').collect();
-        if parts.len() == 2 {
-            filename.starts_with(parts[0]) && filename.ends_with(parts[1])
+struct FileGlob {
+    pattern_has_path: bool,
+    matcher: GlobMatcher,
+}
+
+impl FileGlob {
+    fn new(pattern: &str) -> std::result::Result<Self, globset::Error> {
+        let normalized = pattern.replace('\\', "/");
+        Ok(Self {
+            pattern_has_path: normalized.contains('/'),
+            matcher: Glob::new(&normalized)?.compile_matcher(),
+        })
+    }
+
+    fn is_match(&self, file_path: &std::path::Path, search_dir: &std::path::Path) -> bool {
+        let candidate = if self.pattern_has_path {
+            file_path.strip_prefix(search_dir).unwrap_or(file_path)
         } else {
-            filename == pattern
-        }
-    } else {
-        filename == pattern
+            match file_path.file_name().and_then(|name| name.to_str()) {
+                Some(name) => return self.matcher.is_match(name),
+                None => return false,
+            }
+        };
+
+        let normalized = candidate.to_string_lossy().replace('\\', "/");
+        self.matcher.is_match(normalized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::{Tool, ToolContext};
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn search_replace_path_glob_matches_relative_paths() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("src/app.ts"), "const v = 'needle';\n").unwrap();
+        std::fs::write(dir.path().join("tests/app.ts"), "const v = 'needle';\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = r#"{"search":"needle","replace":"replaced","glob":"src/**/*.ts"}"#;
+        let result = SearchReplaceTool.execute(args, &ctx).await.unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app.ts")).unwrap(),
+            "const v = 'replaced';\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tests/app.ts")).unwrap(),
+            "const v = 'needle';\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_replace_filename_glob_still_matches_nested_files() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/app.ts"), "const v = 'needle';\n").unwrap();
+        std::fs::write(dir.path().join("src/app.md"), "needle\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = r#"{"search":"needle","replace":"replaced","glob":"*.ts"}"#;
+        let result = SearchReplaceTool.execute(args, &ctx).await.unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app.ts")).unwrap(),
+            "const v = 'replaced';\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app.md")).unwrap(),
+            "needle\n"
+        );
     }
 }

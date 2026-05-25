@@ -1,5 +1,12 @@
+// `Write::write_all` and `PathBuf` only appear inside `#[cfg(unix)]`
+// blocks below (the atomic-rename + chmod-600 path uses them; the
+// Windows fallback at line 49 just calls `std::fs::write`). Gate the
+// imports so a Windows build doesn't fire unused_imports.
+#[cfg(unix)]
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
@@ -24,7 +31,9 @@ pub fn write_auth_file_secure(path: &Path, content: &str) -> Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(&tmp_path)
-            .with_context(|| format!("Failed to create temp auth file at {}", tmp_path.display()))?;
+            .with_context(|| {
+                format!("Failed to create temp auth file at {}", tmp_path.display())
+            })?;
 
         file.write_all(content.as_bytes())
             .context("Failed to write auth content")?;
@@ -121,11 +130,7 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        let file_mode = std::fs::metadata(&auth_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let file_mode = std::fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777;
 
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
@@ -153,11 +158,7 @@ mod tests {
 
         write_auth_file_secure(&auth_path, "access_token = \"new\"\n").unwrap();
 
-        let file_mode = std::fs::metadata(&auth_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let file_mode = std::fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600);
     }
 }

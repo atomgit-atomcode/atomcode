@@ -3,12 +3,12 @@
 //! Each session represents an independent conversation with its own message history,
 //! associated with a specific working directory.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::conversation::message::Message;
+use crate::conversation::message::{Message, Role};
 
 /// Unique identifier for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -18,8 +18,8 @@ impl SessionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())
     }
-    
-pub fn as_str(&self) -> &str {
+
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 
@@ -56,6 +56,15 @@ pub struct Session {
     pub updated_at: u64,
     /// Conversation messages.
     pub messages: Vec<Message>,
+    /// True once the user has explicitly run `/rename`. Drives the
+    /// session-name badge above the input box: auto-named sessions
+    /// (default / session-* / first-message-derived) stay badge-less
+    /// so the chrome doesn't get noisy on every fresh conversation —
+    /// the badge is reserved for names the user deliberately chose.
+    /// `#[serde(default)]` so sessions saved before this field exists
+    /// load as `false` (i.e., behave like auto-named).
+    #[serde(default)]
+    pub user_renamed: bool,
 }
 
 impl Session {
@@ -69,9 +78,10 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            user_renamed: false,
         }
     }
-    
+
     /// Create a default session (used on first launch).
     pub fn default_session(working_dir: PathBuf) -> Self {
         Self {
@@ -81,24 +91,60 @@ impl Session {
             created_at: current_timestamp(),
             updated_at: current_timestamp(),
             messages: Vec::new(),
+            user_renamed: false,
         }
     }
-    
-    /// Update the session's name.
+
+    /// Update the session's name in response to an explicit user
+    /// `/rename`. Also flips `user_renamed` so the session-name badge
+    /// becomes visible — auto_name_from_messages must NOT call this.
     pub fn rename(&mut self, name: String) {
         self.name = name;
+        self.user_renamed = true;
         self.touch();
     }
-    
+
+    /// Auto-name an untouched session from the first real user message.
+    ///
+    /// This mirrors the TUI persistence behavior: default names are replaced
+    /// by the first non-synthetic user turn, while user-renamed sessions are
+    /// left alone.
+    pub fn auto_name_from_messages(&mut self) {
+        if !should_auto_name_session(&self.name) {
+            return;
+        }
+
+        let first_real_user = self
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .find_map(|m| m.text().filter(|t| !is_synthetic_user_text(t)));
+
+        if let Some(text) = first_real_user {
+            let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
+            if !name.is_empty() {
+                self.name = name;
+            }
+        }
+    }
+
     /// Update the last modified timestamp.
     pub fn touch(&mut self) {
         self.updated_at = current_timestamp();
     }
-    
+
     /// Get a short display ID (first 8 chars of UUID).
     pub fn short_id(&self) -> &str {
         &self.id.0[..8]
     }
+}
+
+fn should_auto_name_session(name: &str) -> bool {
+    name == "default" || name.starts_with("session-") || name.trim_start().starts_with('[')
+}
+
+fn is_synthetic_user_text(text: &str) -> bool {
+    text.trim_start().starts_with('[')
 }
 
 /// Metadata for a session (without full message history).
@@ -139,14 +185,11 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    /// Get the root directory for all sessions (~/.atomcode/sessions/).
+    /// Get the root directory for all sessions ($ATOMCODE_HOME/sessions/).
     pub fn sessions_root_dir() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".atomcode")
-            .join("sessions")
+        crate::config::Config::config_dir().join("sessions")
     }
-    
+
     /// Get the legacy sessions directory (used on macOS before v4.16).
     /// Returns None on non-macOS platforms.
     fn legacy_sessions_dir() -> Option<PathBuf> {
@@ -156,7 +199,7 @@ impl SessionManager {
             None
         }
     }
-    
+
     /// Migrate sessions from legacy location to new location.
     /// This is a no-op if:
     /// - Not on macOS
@@ -166,22 +209,23 @@ impl SessionManager {
         let Some(legacy_dir) = Self::legacy_sessions_dir() else {
             return; // Not macOS, no migration needed
         };
-        
+
         if !legacy_dir.exists() {
             return; // No legacy data
         }
-        
+
         let new_dir = Self::sessions_root_dir();
-        if new_dir.exists() && std::fs::read_dir(&new_dir).map_or(false, |mut d| d.next().is_some()) {
+        if new_dir.exists() && std::fs::read_dir(&new_dir).map_or(false, |mut d| d.next().is_some())
+        {
             return; // New location already has data, skip migration
         }
-        
+
         // Perform migration
         if let Err(e) = std::fs::create_dir_all(&new_dir) {
             eprintln!("[session] Failed to create sessions dir: {}", e);
             return;
         }
-        
+
         match std::fs::read_dir(&legacy_dir) {
             Ok(entries) => {
                 let mut migrated = 0;
@@ -207,7 +251,10 @@ impl SessionManager {
                     }
                 }
                 if migrated > 0 {
-                    eprintln!("[session] Migrated {} session(s) from legacy location", migrated);
+                    eprintln!(
+                        "[session] Migrated {} session(s) from legacy location",
+                        migrated
+                    );
                 }
             }
             Err(e) => {
@@ -215,31 +262,31 @@ impl SessionManager {
             }
         }
     }
-    
+
     /// Create a new session manager for the given working directory.
     pub fn new(working_dir: &Path) -> Self {
         // Auto-migrate from legacy location on first use
         Self::migrate_from_legacy();
-        
+
         let sessions_dir = Self::sessions_root_dir();
         let project_hash = hash_path(working_dir);
-        
+
         Self {
             sessions_dir,
             project_hash,
         }
     }
-    
+
     /// Get the directory for this project's sessions.
     fn project_dir(&self) -> PathBuf {
         self.sessions_dir.join(&self.project_hash)
     }
-    
+
     /// Ensure the project session directory exists.
     fn ensure_dir(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.project_dir())
     }
-    
+
     /// Save a session to disk.
     pub fn save(&self, session: &Session) -> std::io::Result<()> {
         self.ensure_dir()?;
@@ -248,22 +295,21 @@ impl SessionManager {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(path, json)
     }
-    
+
     /// Load a session by ID.
     pub fn load(&self, id: &SessionId) -> std::io::Result<Session> {
         let path = self.project_dir().join(format!("{}.json", id));
         let json = std::fs::read_to_string(path)?;
-        serde_json::from_str(&json)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
-    
+
     /// List all sessions for this project (metadata only).
     pub fn list(&self) -> std::io::Result<Vec<SessionMeta>> {
         let project_dir = self.project_dir();
         if !project_dir.exists() {
             return Ok(Vec::new());
         }
-        
+
         let mut sessions = Vec::new();
         for entry in std::fs::read_dir(project_dir)? {
             let entry = entry?;
@@ -279,24 +325,25 @@ impl SessionManager {
                 }
             }
         }
-        
+
         // Sort by updated_at descending (most recent first)
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(sessions)
     }
-    
+
     /// Delete a session by ID.
     pub fn delete(&self, id: &SessionId) -> std::io::Result<()> {
         let path = self.project_dir().join(format!("{}.json", id));
         std::fs::remove_file(path)
     }
-    
+
     /// Check if any sessions exist for this project.
     pub fn has_sessions(&self) -> bool {
         let project_dir = self.project_dir();
-        project_dir.exists() && std::fs::read_dir(project_dir).map_or(false, |mut d| d.next().is_some())
+        project_dir.exists()
+            && std::fs::read_dir(project_dir).map_or(false, |mut d| d.next().is_some())
     }
-    
+
     /// Get the most recently updated session.
     pub fn latest(&self) -> std::io::Result<Option<Session>> {
         let metas = self.list()?;
@@ -308,7 +355,7 @@ impl SessionManager {
 }
 
 /// Generate a hash for a path (used as directory name).
-/// 
+///
 /// Normalizes the path before hashing to ensure consistent results across:
 /// - Different path separators (Windows: `\` vs `/`)
 /// - Case sensitivity (Windows paths are case-insensitive)
@@ -358,28 +405,77 @@ fn current_timestamp() -> u64 {
 /// Format timestamp as YYYYMMDD-HHMMSS.
 fn format_timestamp(ts: u64) -> String {
     use chrono::{TimeZone, Utc};
-    let dt = Utc.timestamp_opt(ts as i64, 0).single().unwrap_or_else(|| Utc::now());
+    let dt = Utc
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .unwrap_or_else(|| Utc::now());
     dt.format("%Y%m%d-%H%M%S").to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_session_id_is_unique() {
         let id1 = SessionId::new();
         let id2 = SessionId::new();
         assert_ne!(id1, id2);
     }
-    
+
     #[test]
     fn test_session_new() {
         let session = Session::new(PathBuf::from("/tmp/test"));
         assert!(!session.id.0.is_empty());
         assert!(session.name.starts_with("session-"));
     }
-    
+
+    #[test]
+    fn auto_name_uses_first_real_user_message() {
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        session
+            .messages
+            .push(Message::new(Role::User, "[System meta · not a user message]\nignored"));
+        session
+            .messages
+            .push(Message::new(Role::User, "帮我修复 VS Code 会话标题自动命名的问题\n更多内容"));
+
+        session.auto_name_from_messages();
+
+        assert_eq!(session.name, "帮我修复 VS Code 会话标题自动命名的问题");
+    }
+
+    #[test]
+    fn auto_name_preserves_user_renamed_session() {
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        session.rename("手动命名".to_string());
+        session.messages.push(Message::new(Role::User, "新的用户消息"));
+
+        session.auto_name_from_messages();
+
+        assert_eq!(session.name, "手动命名");
+    }
+
+    #[test]
+    fn rename_sets_user_renamed_flag() {
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        assert!(!session.user_renamed, "fresh session must not be flagged as user-renamed");
+        session.rename("我的会话".to_string());
+        assert!(session.user_renamed, "rename() must mark the session as user-renamed");
+    }
+
+    #[test]
+    fn auto_name_does_not_set_user_renamed_flag() {
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        session.messages.push(Message::new(Role::User, "first message body"));
+        session.auto_name_from_messages();
+        assert_eq!(session.name, "first message body");
+        assert!(
+            !session.user_renamed,
+            "auto_name_from_messages must NOT flag the session as user-renamed; only /rename should"
+        );
+    }
+
     #[test]
     fn test_hash_path_consistent() {
         let path = Path::new("/Users/test/project");
@@ -388,28 +484,37 @@ mod tests {
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 16);
     }
-    
+
     #[test]
     fn test_hash_path_normalized() {
         // Same path with different representations should produce the same hash
         // Note: on non-Windows, case sensitivity is preserved
-        
+
         // Test trailing slash normalization
         let path1 = Path::new("/Users/test/project");
         let path2 = Path::new("/Users/test/project/");
-        assert_eq!(hash_path(path1), hash_path(path2), 
-            "Trailing slash should not affect hash");
-        
+        assert_eq!(
+            hash_path(path1),
+            hash_path(path2),
+            "Trailing slash should not affect hash"
+        );
+
         // Test backslash normalization (Windows-style paths)
         let path3 = Path::new("C:\\Users\\test\\project");
         let path4 = Path::new("C:/Users/test/project");
-        assert_eq!(hash_path(path3), hash_path(path4),
-            "Backslashes should be normalized to forward slashes");
-        
+        assert_eq!(
+            hash_path(path3),
+            hash_path(path4),
+            "Backslashes should be normalized to forward slashes"
+        );
+
         // Test combined: backslash + trailing slash
         let path5 = Path::new("C:\\Users\\test\\project\\");
-        assert_eq!(hash_path(path4), hash_path(path5),
-            "Backslashes and trailing slash should both be normalized");
+        assert_eq!(
+            hash_path(path4),
+            hash_path(path5),
+            "Backslashes and trailing slash should both be normalized"
+        );
     }
 
     #[test]

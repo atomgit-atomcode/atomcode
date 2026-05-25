@@ -64,7 +64,15 @@ impl Tool for UseSkillTool {
                 .registry
                 .read()
                 .map_err(|e| anyhow::anyhow!("registry lock: {}", e))?;
-            match registry.get(&parsed.name) {
+            let skill = registry.get(&parsed.name).or_else(|| {
+                if parsed.name.contains(':') {
+                    None
+                } else {
+                    registry.get(&format!("skills:{}", parsed.name))
+                }
+            });
+
+            match skill {
                 Some(skill) => {
                     if skill.disable_model_invocation {
                         return Ok(ToolResult {
@@ -113,5 +121,80 @@ impl Tool for UseSkillTool {
             output: expanded,
             success: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skill::Skill;
+    use std::path::PathBuf;
+
+    fn test_skill(name: &str, template: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: "test skill".into(),
+            template: template.into(),
+            disable_model_invocation: false,
+            user_invocable: true,
+            argument_hint: None,
+            allowed_tools: vec![],
+            skill_dir: PathBuf::new(),
+            source_path: PathBuf::new(),
+        }
+    }
+
+    fn tool_with_skills(skills: Vec<Skill>) -> UseSkillTool {
+        let mut registry = SkillRegistry::new();
+        for skill in skills {
+            registry.register(skill);
+        }
+        UseSkillTool {
+            registry: Arc::new(RwLock::new(registry)),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_bare_name_to_loose_skills_namespace() {
+        let tool = tool_with_skills(vec![test_skill("skills:brainstorming", "Do $ARGUMENTS")]);
+        let ctx = ToolContext::new(PathBuf::from("/tmp"));
+
+        let result = tool
+            .execute(r#"{"name":"brainstorming","arguments":"ideas"}"#, &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output, "Do ideas");
+    }
+
+    #[tokio::test]
+    async fn keeps_explicit_namespace_lookup_working() {
+        let tool = tool_with_skills(vec![test_skill("skills:brainstorming", "Namespaced")]);
+        let ctx = ToolContext::new(PathBuf::from("/tmp"));
+
+        let result = tool
+            .execute(r#"{"name":"skills:brainstorming"}"#, &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output, "Namespaced");
+    }
+
+    #[tokio::test]
+    async fn does_not_fallback_for_other_namespaces() {
+        let tool = tool_with_skills(vec![test_skill("skills:brainstorming", "Namespaced")]);
+        let ctx = ToolContext::new(PathBuf::from("/tmp"));
+
+        let result = tool
+            .execute(r#"{"name":"plugin:brainstorming"}"#, &ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .output
+            .contains("Skill 'plugin:brainstorming' not found"));
     }
 }

@@ -48,7 +48,11 @@ impl Tool for ReadSymbolTool {
             Ok(wd) => wd.clone(),
             Err(_) => return self.approval(args),
         };
-        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Read) {
+        match super::approval_for_path(
+            &parsed.file_path,
+            &working_dir,
+            super::ExternalPathAction::Read,
+        ) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }

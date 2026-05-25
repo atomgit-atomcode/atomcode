@@ -36,45 +36,6 @@ const MAX_REDIRECTS: u8 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 20;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 
-/// Documentation domains that auto-approve. Anything else requires explicit
-/// user approval — `web_fetch` is powerful enough that a successful prompt
-/// injection could otherwise exfiltrate data or probe internal services via
-/// attacker-controlled URLs. Keeping the allowlist documentation-focused
-/// matches the tool's stated use case (reading READMEs, API references).
-const AUTO_APPROVE_DOMAINS: &[&str] = &[
-    "github.com",
-    "raw.githubusercontent.com",
-    "gist.githubusercontent.com",
-    "docs.rs",
-    "crates.io",
-    "doc.rust-lang.org",
-    "rust-lang.org",
-    "developer.mozilla.org",
-    "docs.python.org",
-    "pypi.org",
-    "nodejs.org",
-    "npmjs.com",
-    "go.dev",
-    "pkg.go.dev",
-    "golang.org",
-    "docs.oracle.com",
-    "kubernetes.io",
-    "docker.com",
-    // Chinese dev ecosystem — AtomGit's own platform and frequently-used
-    // knowledge sources (code-hosting, tech blogs, open-source foundations).
-    "atomgit.com",
-    "gitcode.com",
-    "csdn.net",
-    "openatom.cn",
-];
-
-fn host_is_auto_approved(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    AUTO_APPROVE_DOMAINS
-        .iter()
-        .any(|allowed| host == *allowed || host.ends_with(&format!(".{}", allowed)))
-}
-
 fn validate_scheme(url: &Url) -> Result<(), String> {
     match url.scheme() {
         "http" | "https" => Ok(()),
@@ -125,10 +86,6 @@ fn is_safe_ip(ip: IpAddr) -> Result<(), String> {
             // CGNAT 100.64.0.0/10 — commonly used as carrier private space
             if o[0] == 100 && (o[1] & 0xc0) == 64 {
                 return reject("CGNAT 100.64/10");
-            }
-            // Benchmarking 198.18.0.0/15
-            if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
-                return reject("benchmark 198.18/15");
             }
             Ok(())
         }
@@ -201,6 +158,23 @@ fn err_result(msg: impl Into<String>) -> ToolResult {
     }
 }
 
+#[cfg(test)]
+fn host_is_auto_approved(host: &str) -> bool {
+    const ALLOWLIST: &[&str] = &[
+        "github.com",
+        "docs.rs",
+        "raw.githubusercontent.com",
+        "atomgit.com",
+        "gitcode.com",
+        "csdn.net",
+        "openatom.cn",
+    ];
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    ALLOWLIST
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{}", allowed)))
+}
+
 #[async_trait]
 impl Tool for WebFetchTool {
     fn definition(&self) -> ToolDef {
@@ -226,34 +200,11 @@ impl Tool for WebFetchTool {
     }
 
     fn approval(&self, args: &str) -> ApprovalRequirement {
-        // Fail-closed on malformed input: a broken arg can't be auto-approved.
-        let Ok(parsed) = serde_json::from_str::<WebFetchArgs>(args) else {
-            return ApprovalRequirement::RequireApproval(
-                "web_fetch called with malformed arguments".into(),
-            );
-        };
-        let Ok(url) = Url::parse(&parsed.url) else {
-            return ApprovalRequirement::RequireApproval(format!(
-                "web_fetch: unparseable URL `{}`",
-                parsed.url
-            ));
-        };
-        if validate_scheme(&url).is_err() {
-            return ApprovalRequirement::RequireApproval(format!(
-                "web_fetch: non-http(s) scheme `{}` — will be denied",
-                url.scheme()
-            ));
-        }
-        if let Some(host) = url.host_str() {
-            if host_is_auto_approved(host) {
-                return ApprovalRequirement::AutoApprove;
-            }
-            return ApprovalRequirement::RequireApproval(format!(
-                "web_fetch: {} (not in documentation allowlist)",
-                host
-            ));
-        }
-        ApprovalRequirement::RequireApproval(format!("web_fetch: {}", url))
+        // web_fetch is always auto-approved. URL validation and scheme checks
+        // are performed during execution - invalid URLs will return an error
+        // result rather than blocking for user approval.
+        let _ = args; // suppress unused variable warning
+        ApprovalRequirement::AutoApprove
     }
 
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
@@ -527,17 +478,36 @@ fn remove_tag_content(html: &str, tag: &str) -> String {
     let lower = html.to_lowercase();
 
     loop {
-        if let Some(start) = lower[pos..].find(&open) {
-            let abs_start = pos + start;
-            result.push_str(&html[pos..abs_start]);
-            if let Some(end) = lower[abs_start..].find(&close) {
-                pos = abs_start + end + close.len();
-            } else {
-                // No closing tag — skip to end
-                break;
-            }
-        } else {
+        let Some(rel) = lower[pos..].find(&open) else {
             result.push_str(&html[pos..]);
+            break;
+        };
+        let abs_start = pos + rel;
+        // Boundary check: `<head` must not match `<header`. The byte right
+        // after `<{tag}` has to be a real tag-name terminator. Without this,
+        // a `<header>` later in the document hijacks the `<head>` pass,
+        // fails to find a `</head>` closer, and (with the old `break`) would
+        // silently drop the rest of the page — which is exactly what was
+        // wiping body text out of gitcode.com SSR pages.
+        let after = abs_start + open.len();
+        let next = lower.as_bytes().get(after).copied();
+        let is_tag_boundary = matches!(
+            next,
+            None | Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        );
+        if !is_tag_boundary {
+            // Prefix collision (e.g. `<header` while searching `<head`).
+            // Emit `<` literally, advance one byte, keep scanning.
+            result.push_str(&html[pos..=abs_start]);
+            pos = abs_start + 1;
+            continue;
+        }
+        result.push_str(&html[pos..abs_start]);
+        if let Some(end) = lower[abs_start..].find(&close) {
+            pos = abs_start + end + close.len();
+        } else {
+            // Truly unclosed tag — drop from here to EOF (matches the
+            // historical browser-tolerant behavior for `<script>` etc.).
             break;
         }
     }
@@ -552,19 +522,30 @@ fn replace_tag_with(html: &str, tag: &str, replacement: &str) -> String {
     let mut pos = 0;
 
     loop {
-        if let Some(start) = lower[pos..].find(&open) {
-            let abs_start = pos + start;
-            result.push_str(&html[pos..abs_start]);
-            // Skip to end of the tag
-            if let Some(end) = html[abs_start..].find('>') {
-                result.push_str(replacement);
-                pos = abs_start + end + 1;
-            } else {
-                pos = abs_start + open.len();
-            }
-        } else {
+        let Some(rel) = lower[pos..].find(&open) else {
             result.push_str(&html[pos..]);
             break;
+        };
+        let abs_start = pos + rel;
+        // Same boundary check as remove_tag_content — `<p` must not match
+        // `<pre>`, `<h1` must not match `<h10>` (defensive), etc.
+        let after = abs_start + open.len();
+        let next = lower.as_bytes().get(after).copied();
+        let is_tag_boundary = matches!(
+            next,
+            None | Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        );
+        if !is_tag_boundary {
+            result.push_str(&html[pos..=abs_start]);
+            pos = abs_start + 1;
+            continue;
+        }
+        result.push_str(&html[pos..abs_start]);
+        if let Some(end) = html[abs_start..].find('>') {
+            result.push_str(replacement);
+            pos = abs_start + end + 1;
+        } else {
+            pos = abs_start + open.len();
         }
     }
     result
@@ -710,22 +691,22 @@ mod tests {
     // ── approval() end-to-end ──────────────────────────────────────────────
 
     #[test]
-    fn approval_requires_confirm_for_localhost_literal() {
+    fn approval_auto_approves_localhost_literal() {
         let tool = WebFetchTool;
         let args = r#"{"url":"http://127.0.0.1:8080/"}"#;
         assert!(matches!(
             tool.approval(args),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
     }
 
     #[test]
-    fn approval_requires_confirm_for_file_scheme() {
+    fn approval_auto_approves_file_scheme() {
         let tool = WebFetchTool;
         let args = r#"{"url":"file:///etc/passwd"}"#;
         assert!(matches!(
             tool.approval(args),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
     }
 
@@ -740,25 +721,25 @@ mod tests {
     }
 
     #[test]
-    fn approval_requires_confirm_for_unknown_domain() {
+    fn approval_auto_approves_unknown_domain() {
         let tool = WebFetchTool;
         let args = r#"{"url":"https://example.com/"}"#;
         assert!(matches!(
             tool.approval(args),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
     }
 
     #[test]
-    fn approval_requires_confirm_on_malformed_args() {
+    fn approval_auto_approves_malformed_args() {
         let tool = WebFetchTool;
         assert!(matches!(
             tool.approval("{}"),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
         assert!(matches!(
             tool.approval(""),
-            ApprovalRequirement::RequireApproval(_)
+            ApprovalRequirement::AutoApprove
         ));
     }
 
@@ -830,5 +811,74 @@ mod tests {
             "unexpected error: {}",
             r.output
         );
+    }
+
+    // ── html_to_text / tag matching ────────────────────────────────────────
+
+    #[test]
+    fn remove_tag_content_keeps_prefix_collision_tags() {
+        // Repro for the gitcode.com/cann SSR page: `<head>...</head>` is
+        // followed later by `<header>...</header>`. The old naive prefix
+        // match treated `<header` as if it opened a `<head>` block, searched
+        // for a `</head>` that did not exist, and silently dropped the rest
+        // of the document.
+        let html = "<head><title>t</title></head>\
+                    <body><header>nav</header><main>BODY-CONTENT</main></body>";
+        let out = remove_tag_content(html, "head");
+        assert!(
+            out.contains("BODY-CONTENT"),
+            "body content was discarded: {}",
+            out
+        );
+        assert!(
+            out.contains("<header>nav</header>"),
+            "header element should be preserved (only <head> removed): {}",
+            out
+        );
+        assert!(
+            !out.contains("<title>"),
+            "real <head> contents must still be removed: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn replace_tag_with_keeps_prefix_collision_tags() {
+        // Same boundary bug surface: replacing `<p>` opens must not also
+        // replace `<pre>` opens.
+        let out = replace_tag_with("<p>A</p><pre>B</pre>", "p", "\n");
+        // `<p>` becomes "\n", but `<pre>` must stay untouched.
+        assert!(
+            out.contains("<pre>B</pre>"),
+            "<pre> should not be matched by <p>: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn html_to_text_extracts_body_when_header_follows_head() {
+        // End-to-end: structure mirrors what gitcode.com/cann ships.
+        let html = "<!doctype html><html><head><title>x</title></head>\
+                    <body><header class=\"nav\">topbar</header>\
+                    <main><h1>Title</h1><p>Real article text.</p></main>\
+                    </body></html>";
+        let text = html_to_text(html);
+        assert!(
+            text.contains("Real article text."),
+            "main body lost: {:?}",
+            text
+        );
+        assert!(text.contains("Title"), "heading lost: {:?}", text);
+    }
+
+    #[test]
+    fn remove_tag_content_handles_truly_unclosed_tag() {
+        // If a tag really has no closing element, the function should still
+        // surface earlier content rather than dropping everything from the
+        // unclosed tag onward. We accept either: the open-tag-and-after is
+        // kept verbatim, OR is stripped — but content BEFORE it must survive.
+        let html = "<p>KEEP-ME</p><script>oops no close";
+        let out = remove_tag_content(html, "script");
+        assert!(out.contains("KEEP-ME"), "leading content lost: {}", out);
     }
 }

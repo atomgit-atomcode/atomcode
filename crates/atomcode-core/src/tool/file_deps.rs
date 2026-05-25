@@ -68,7 +68,11 @@ impl Tool for FileDependenciesTool {
             Ok(wd) => wd.clone(),
             Err(_) => return self.approval(args),
         };
-        match super::approval_for_path(&parsed.file, &working_dir, super::ExternalPathAction::Enumerate) {
+        match super::approval_for_path(
+            &parsed.file,
+            &working_dir,
+            super::ExternalPathAction::Enumerate,
+        ) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }

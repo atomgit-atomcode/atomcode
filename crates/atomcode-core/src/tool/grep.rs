@@ -71,7 +71,8 @@ impl Tool for GrepTool {
             Err(_) => return self.approval(args),
         };
         let raw_path = parsed.path.as_deref().unwrap_or(".");
-        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read) {
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read)
+        {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -287,10 +288,16 @@ impl Tool for GrepTool {
             }
         };
 
+        // success=true even on zero matches: empty result IS the answer
+        // (matches glob's "No files matching" semantics — same screenshot
+        // showed glob's empty-result line rendering normally while grep's
+        // identical-meaning line painted red ✗ as if the search failed).
+        // Real failures (bad path / bad regex) take the early-return
+        // branches above with their own success=false.
         Ok(ToolResult {
             call_id: String::new(),
             output,
-            success: !matches.is_empty(),
+            success: true,
         })
     }
 }
@@ -408,6 +415,98 @@ fn extract_graph_candidates(pattern: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::extract_graph_candidates;
+    use super::GrepTool;
+    use crate::tool::{ApprovalRequirement, Tool, ToolContext};
+    use tempfile::TempDir;
+
+    #[test]
+    fn grep_outside_workspace_non_sensitive_requires_approval() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = format!(
+            r#"{{"pattern":"foo","path":"{}"}}"#,
+            outside.path().display()
+        );
+        assert!(matches!(
+            GrepTool.approval_with_context(&args, &ctx),
+            ApprovalRequirement::RequireApproval(_)
+        ));
+    }
+
+    #[test]
+    fn grep_sensitive_path_still_requires_always() {
+        let workspace = TempDir::new().unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        // /etc is in the system-protected prefixes list.
+        let args = r#"{"pattern":"PermitRoot","path":"/etc"}"#;
+        assert!(matches!(
+            GrepTool.approval_with_context(args, &ctx),
+            ApprovalRequirement::RequireApprovalAlways(_)
+        ));
+    }
+
+    // Regression: zero-match grep used to return success=false, which
+    // made the TUI render the result row red ✗ as if the search itself
+    // failed (screenshot 43.png had two such red rows next to genuine
+    // path-not-found errors, making the agent's normal exploration look
+    // like a wall of failures). "No matches" is a valid answer — it's
+    // the *path* / *regex* errors that are real failures (those still
+    // return success=false via the early-return branches). Pin the
+    // semantics so future churn doesn't regress.
+    #[tokio::test]
+    async fn grep_zero_matches_reports_success_true() {
+        let workspace = TempDir::new().unwrap();
+        // Seed a file so the search has something to walk; the pattern
+        // intentionally won't match.
+        std::fs::write(
+            workspace.path().join("a.rs"),
+            "fn alpha() {}\nfn beta() {}\n",
+        )
+        .unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = r#"{"pattern":"definitely_not_in_file_xyz"}"#;
+        let result = GrepTool.execute(args, &ctx).await.unwrap();
+        assert!(
+            result.success,
+            "zero-match grep must return success=true so TUI doesn't \
+             paint it red. Output was: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("No matches found"),
+            "zero-match output should explain what happened, got: {}",
+            result.output
+        );
+    }
+
+    // Real failure modes (bad regex / missing path) MUST still be
+    // success=false — those genuinely indicate the model needs to
+    // change inputs, not just learn that "no rows match".
+    #[tokio::test]
+    async fn grep_path_not_found_reports_success_false() {
+        let workspace = TempDir::new().unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = r#"{"pattern":"foo","path":"/nonexistent/path/xyz123"}"#;
+        let result = GrepTool.execute(args, &ctx).await.unwrap();
+        assert!(
+            !result.success,
+            "path-not-found must remain success=false — output: {}",
+            result.output
+        );
+    }
+
+    // Default path "." resolves to the workspace itself — must auto-approve.
+    #[test]
+    fn grep_default_path_auto_approves() {
+        let workspace = TempDir::new().unwrap();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let args = r#"{"pattern":"foo"}"#;
+        assert!(matches!(
+            GrepTool.approval_with_context(args, &ctx),
+            ApprovalRequirement::AutoApprove
+        ));
+    }
 
     #[test]
     fn snake_case_identifier() {

@@ -34,12 +34,14 @@ fn fixtures_dir() -> PathBuf {
 /// history.
 fn load_last_event(name: &str) -> Value {
     let path = fixtures_dir().join(name);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-    let last = text.lines().filter(|l| !l.trim().is_empty()).last()
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    let last = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .last()
         .unwrap_or_else(|| panic!("fixture {} is empty", name));
-    serde_json::from_str(last)
-        .unwrap_or_else(|e| panic!("parse {}: {}", path.display(), e))
+    serde_json::from_str(last).unwrap_or_else(|e| panic!("parse {}: {}", path.display(), e))
 }
 
 /// Extract every Assistant message's text + every ToolResult output into
@@ -47,7 +49,10 @@ fn load_last_event(name: &str) -> Value {
 /// bad patterns.
 fn collect_agent_output(event: &Value) -> String {
     let mut out = String::new();
-    let messages = event.get("messages").and_then(|v| v.as_array()).expect("messages array");
+    let messages = event
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
     for m in messages {
         if let Some(c) = m.get("content") {
             // Assistant text
@@ -107,7 +112,9 @@ fn assert_no_removed_patterns(fixture_name: &str) {
         assert!(
             !all.contains(pat),
             "fixture {} contains `{}` — {}",
-            fixture_name, pat, reason,
+            fixture_name,
+            pat,
+            reason,
         );
     }
 }
@@ -116,9 +123,15 @@ fn assert_no_removed_patterns(fixture_name: &str) {
 /// session. Searches tool_call arguments specifically.
 fn collect_tool_call_args(event: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    let messages = event.get("messages").and_then(|v| v.as_array()).expect("messages array");
+    let messages = event
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
     for m in messages {
-        if let Some(a) = m.get("content").and_then(|c| c.get("AssistantWithToolCalls")) {
+        if let Some(a) = m
+            .get("content")
+            .and_then(|c| c.get("AssistantWithToolCalls"))
+        {
             if let Some(tcs) = a.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tcs {
                     if let Some(args) = tc.get("arguments").and_then(|v| v.as_str()) {
@@ -143,11 +156,7 @@ fn assert_no_shell_workaround_calls(fixture_name: &str) {
     //
     // Exact substring checks — no shell grammar parsing. A legitimate
     // `sed pattern` with no `-i` is fine; `sed -i` is not.
-    let bypass_markers = &[
-        "sed -i",
-        "perl -pi",
-        "awk -i inplace",
-    ];
+    let bypass_markers = &["sed -i", "perl -pi", "awk -i inplace"];
     for args in &args_list {
         for bad in bypass_markers {
             assert!(
@@ -155,7 +164,9 @@ fn assert_no_shell_workaround_calls(fixture_name: &str) {
                 "fixture {} has a tool call with `{}` — shell workaround \
                  pattern (see 426-atom 2026-04-21 session regression). \
                  args: {}",
-                fixture_name, bad, args,
+                fixture_name,
+                bad,
+                args,
             );
         }
     }
@@ -166,13 +177,20 @@ fn assert_bash_has_exit_markers(fixture_name: &str) {
     // `killed:` marker from the P0 #3 fix. Absence would indicate the
     // exit-code-in-marker change was reverted.
     let ev = load_last_event(fixture_name);
-    let messages = ev.get("messages").and_then(|v| v.as_array()).expect("messages");
+    let messages = ev
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages");
 
     // Identify which indices are bash tool results by looking at the
     // preceding Assistant message's tool call name.
-    let mut tool_name_of: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut tool_name_of: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     for (i, m) in messages.iter().enumerate() {
-        if let Some(a) = m.get("content").and_then(|c| c.get("AssistantWithToolCalls")) {
+        if let Some(a) = m
+            .get("content")
+            .and_then(|c| c.get("AssistantWithToolCalls"))
+        {
             if let Some(tcs) = a.get("tool_calls").and_then(|v| v.as_array()) {
                 // The ToolResults follow this Assistant message, one per call,
                 // in order.
@@ -188,7 +206,8 @@ fn assert_bash_has_exit_markers(fixture_name: &str) {
     let mut bash_results_checked = 0;
     for (i, m) in messages.iter().enumerate() {
         if tool_name_of.get(&i).map(|n| n == "bash").unwrap_or(false) {
-            if let Some(out) = m.get("content")
+            if let Some(out) = m
+                .get("content")
                 .and_then(|c| c.get("ToolResult"))
                 .and_then(|tr| tr.get("output"))
                 .and_then(|v| v.as_str())
@@ -235,6 +254,16 @@ fn p0_sprint_clean_session_bash_has_exit_markers() {
 }
 
 #[test]
+fn p0_sprint_clean_session_tool_call_result_parity() {
+    assert_tool_call_result_parity("session_p0_sprint_clean.jsonl");
+}
+
+#[test]
+fn path_404_recovery_session_tool_call_result_parity() {
+    assert_tool_call_result_parity("session_404_recovery.jsonl");
+}
+
+#[test]
 fn path_404_recovery_session_is_free_of_removed_patterns() {
     // hermes 2026-04-22_20-12-44 — 4-turn session proving #4 path-prefix
     // ranking works: read_file `/hermes/hermes-tauri/src/main.rs` 404'd,
@@ -245,6 +274,54 @@ fn path_404_recovery_session_is_free_of_removed_patterns() {
 #[test]
 fn path_404_recovery_session_has_no_shell_workarounds() {
     assert_no_shell_workaround_calls("session_404_recovery.jsonl");
+}
+
+/// Every `AssistantWithToolCalls` message must be followed by exactly the
+/// same number of `ToolResult` messages. If `merge_edit_calls` runs AFTER
+/// `finalize_stream_with_tool_calls`, the assistant message declares N
+/// tool calls but only M < N results are appended — this poisons the
+/// next provider request (the bug fixed in runner.rs 2026-04-30).
+fn assert_tool_call_result_parity(fixture_name: &str) {
+    let ev = load_last_event(fixture_name);
+    let messages = ev
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+
+    let mut i = 0;
+    while i < messages.len() {
+        if let Some(a) = messages[i]
+            .get("content")
+            .and_then(|c| c.get("AssistantWithToolCalls"))
+        {
+            if let Some(tcs) = a.get("tool_calls").and_then(|v| v.as_array()) {
+                let expected = tcs.len();
+                // Count consecutive ToolResult messages after this assistant message.
+                let mut actual = 0;
+                let mut j = i + 1;
+                while j < messages.len() {
+                    if messages[j]
+                        .get("content")
+                        .and_then(|c| c.get("ToolResult"))
+                        .is_some()
+                    {
+                        actual += 1;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    expected, actual,
+                    "fixture {} msg[{}]: assistant declares {} tool calls but \
+                     followed by {} ToolResult messages — tool_call/tool_result \
+                     mismatch poisons the next provider request",
+                    fixture_name, i, expected, actual,
+                );
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Meta-test: make sure the fixture loader + collector actually visit

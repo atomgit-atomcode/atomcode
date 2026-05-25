@@ -10,16 +10,50 @@ impl AgentLoop {
                 self.discipline_state.model_produced_text = true;
                 let _ = self.event_tx.send(AgentEvent::TextDelta(text));
             }
+            TurnEvent::ReasoningDelta(text) => {
+                let _ = self.event_tx.send(AgentEvent::ReasoningDelta(text));
+            }
             TurnEvent::ToolCallStreaming { name, hint } => {
                 let _ = self
                     .event_tx
                     .send(AgentEvent::ToolCallStreaming { name, hint });
+            }
+            TurnEvent::ToolBatchStarted { batch_id, calls } => {
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolBatchStarted { batch_id, calls });
+            }
+            TurnEvent::ToolBatchCompleted {
+                batch_id,
+                ok,
+                total,
+                elapsed_ms,
+            } => {
+                let _ = self.event_tx.send(AgentEvent::ToolBatchCompleted {
+                    batch_id,
+                    ok,
+                    total,
+                    elapsed_ms,
+                });
+            }
+            TurnEvent::ToolOutputChunk { call_id, chunk } => {
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolOutputChunk { call_id, chunk });
             }
             TurnEvent::ToolCallStarted {
                 ref id,
                 ref name,
                 ref arguments,
             } => {
+                // Dedupe across retries — see the matching guard in
+                // `agent/mod.rs` inline forward path. Same id arriving
+                // twice means the previous attempt's stream got cut off
+                // (429 / timeout) and was retried; we've already painted
+                // a row for it.
+                if !self.emitted_tool_ids.insert(id.clone()) {
+                    return;
+                }
                 self.datalog.log_tool_call(name, arguments);
 
                 self.current_tool_name = name.clone();
@@ -84,16 +118,18 @@ impl AgentLoop {
                     if !full_path_str.is_empty() {
                         self.active_file = Some(PathBuf::from(full_path_str));
                     }
-                    if let Some(end) = rest.find(|c: char| c == '\n' || c == '.') {
-                        let file = short_path(&rest[..end]);
+                    if !full_path_str.is_empty() {
+                        let file = full_path_str.to_string();
                         if !self.files_edited_this_turn.contains(&file) {
                             self.files_edited_this_turn.push(file);
                         }
                     }
                 }
-                if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")) {
+                if let Some(pos) = output.find("Wrote ").or_else(|| output.find("Overwrote ")).or_else(|| output.find("Created new file ")) {
                     let keyword_len = if output[pos..].starts_with("Overwrote ") {
                         10
+                    } else if output[pos..].starts_with("Created new file ") {
+                        17
                     } else {
                         6
                     };
@@ -105,12 +141,20 @@ impl AgentLoop {
                     if !full_path_str.is_empty() {
                         self.active_file = Some(PathBuf::from(full_path_str));
                     }
-                    if let Some(end) = rest.find(|c: char| c == '\n' || c == ' ') {
-                        let file = short_path(&rest[..end]);
+                    if !full_path_str.is_empty() {
+                        let file = full_path_str.to_string();
                         if !self.files_edited_this_turn.contains(&file) {
                             self.files_edited_this_turn.push(file);
                         }
                     }
+                }
+                if success {
+                    track_tool_modified_files(
+                        &name,
+                        &self.discipline_state.last_bash_cmd,
+                        &output,
+                        &mut self.files_edited_this_turn,
+                    );
                 }
                 if matches!(
                     name.as_str(),
@@ -190,7 +234,14 @@ impl AgentLoop {
                 });
             }
             TurnEvent::Error(e) => {
-                let _ = self.event_tx.send(AgentEvent::Error(e));
+                let _ = self.event_tx.send(AgentEvent::Error {
+                    error: e,
+                    messages: self.conversation.messages.clone(),
+                });
+            }
+            TurnEvent::Warning(w) => {
+                self.datalog.log_warning(&w);
+                let _ = self.event_tx.send(AgentEvent::Warning(w));
             }
             TurnEvent::WorkingDirChanged(new_dir) => {
                 // The tool itself (change_dir / bash cd) already mutated
@@ -201,6 +252,13 @@ impl AgentLoop {
                 // graph, spawning a new indexer) — those are destructive
                 // mid-turn; the LLM expects its context to survive a cd.
                 let _ = self.event_tx.send(AgentEvent::WorkingDirChanged(new_dir));
+            }
+            TurnEvent::ApprovalRequested { .. } => {
+                // ApprovalRequested is handled inline in the `select!`
+                // loop inside `run_turn_loop`, not through this dispatch
+                // method.  The event carries conversation.messages for
+                // mid-turn persistence; the approval flow itself is
+                // managed by the `approval_req_rx` channel.
             }
         }
     }
@@ -277,277 +335,6 @@ impl AgentLoop {
             }
         }
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn resolve_args(&self, call: &ToolCall) -> String {
-        let wd: PathBuf = self
-            .turn_runner
-            .context
-            .working_dir
-            .try_read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-
-        // Try parsing JSON directly, then repair, then specialized extractors
-        let args_str = &call.arguments;
-        let parsed = serde_json::from_str::<serde_json::Value>(args_str)
-            .or_else(|_| {
-                serde_json::from_str::<serde_json::Value>(&crate::turn::json_repair::repair_json(
-                    args_str,
-                ))
-            })
-            .or_else(|_| {
-                // For edit_file: specialized parser that handles unescaped source code
-                if call.name == "edit_file" {
-                    if let Some(v) = crate::turn::json_repair::extract_edit_file_args(args_str) {
-                        return Ok(v);
-                    }
-                }
-                Ok::<serde_json::Value, serde_json::Error>(
-                    crate::turn::json_repair::extract_json_fields(args_str),
-                )
-            });
-
-        if let Ok(mut args) = parsed {
-            // Resolve relative paths for ALL path-like fields
-            for field in &["file_path", "path"] {
-                if let Some(fp) = args.get(*field).and_then(|v| v.as_str()) {
-                    let p = std::path::Path::new(fp);
-                    if !fp.is_empty() && !p.is_absolute() && fp != "." {
-                        let resolved = wd.join(p);
-                        args[*field] = serde_json::json!(resolved.to_string_lossy().to_string());
-                    }
-                }
-            }
-
-            // Glob pattern resolution is handled inside the glob tool itself.
-            // Do NOT resolve here — it breaks patterns containing `**/`.
-
-            // read_file: first read of a file → force full read (ignore offset/limit).
-            // Prevents the model from doing 4-7 partial reads of a file it hasn't seen yet.
-            // Subsequent re-reads are allowed to use offset/limit.
-            if call.name == "read_file" {
-                if let Some(fp) = args.get("file_path").and_then(|v| v.as_str()) {
-                    let short = short_path(fp);
-                    // `file_read_counts` key is `(basename, offset_bucket)`; this
-                    // dead-code path only needs the per-file total, so fold over
-                    // all buckets for this filename.
-                    let read_count = self
-                        .discipline_state
-                        .file_read_counts
-                        .iter()
-                        .filter_map(|((f, _), c)| (f == &short).then_some(*c))
-                        .sum::<usize>();
-                    if read_count == 0
-                        && (args.get("offset").is_some() || args.get("limit").is_some())
-                    {
-                        // First read — remove offset/limit to get the full file.
-                        if let Some(obj) = args.as_object_mut() {
-                            obj.remove("offset");
-                            obj.remove("limit");
-                        }
-                    }
-                }
-            }
-
-            return serde_json::to_string(&args).unwrap_or(call.arguments.clone());
-        }
-        call.arguments.clone()
-    }
-
-    /// Intercept tool calls that are provably redundant — returns a short message
-    /// instead of executing the tool. Historically this also intercepted
-    /// `list_directory(".")` because the system prompt used to carry the full
-    /// working-directory tree; that tree injection was removed in commit
-    /// 1e9936f8 ("refactor: 移除 system prompt 中的 PROJECT STRUCTURE 段") so
-    /// the `list_directory` interception below is now a no-op — the model needs
-    /// to actually be able to see the top-level layout when it asks.
-    /// Does NOT intercept duplicate reads (the model may re-read with different params).
-    #[allow(dead_code)]
-    pub(crate) fn intercept_redundant_call(
-        &mut self,
-        tool_name: &str,
-        args: &str,
-    ) -> Option<String> {
-        // Pre-read cache hit: if a file was already pre-read, return its content
-        // directly from disk (zero overhead — the file is in OS cache).
-        // This is better than saying "SKIPPED" because the model needs the actual
-        // content to construct edit_file calls, and it can't access the system prompt
-        // content mid-conversation with limited context windows.
-        // We still avoid counting this as a "real" read for budget purposes.
-
-        // Hard block: 5+ reads of the same file → stop executing, force the model to act.
-        // Prevents infinite read loops when context is near-full and model can't generate edits.
-        if tool_name == "read_file" {
-            if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(args) {
-                if let Some(fp) = args_val.get("file_path").and_then(|v| v.as_str()) {
-                    let short = std::path::Path::new(fp)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| fp.to_string());
-                    // Dead-code path; key shape is `(basename, offset_bucket)`,
-                    // fold over buckets to get the per-file total.
-                    let count = self
-                        .discipline_state
-                        .file_read_counts
-                        .iter()
-                        .filter_map(|((f, _), c)| (f == &short).then_some(*c))
-                        .sum::<usize>();
-                    if count >= 5 {
-                        return Some(format!(
-                            "BLOCKED: You have read {} {} times. You already have the content. \
-                             Use edit_file to make changes NOW, or explain to the user what's wrong.",
-                            short, count
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Loop detection: if the same (tool, args) appears 3+ times in recent calls, block it.
-        // EXCEPTION: if there was an edit_file/write_file between repeats, the model is
-        // retrying after a fix — that's legitimate, not a loop. Reset the counter on edits.
-        // For read_file: hash only file_path (ignore offset/limit) to catch
-        // re-reading the same file with different pagination params.
-        let args_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            if tool_name == "read_file" {
-                // Only hash file_path — different offset/limit is still the same file
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                    if let Some(fp) = v.get("file_path").and_then(|v| v.as_str()) {
-                        fp.hash(&mut h);
-                    } else {
-                        args.hash(&mut h);
-                    }
-                } else {
-                    args.hash(&mut h);
-                }
-            } else {
-                args.hash(&mut h);
-            }
-            h.finish()
-        };
-        let sig = (tool_name.to_string(), args_hash);
-        self.discipline_state.recent_calls.push(sig.clone());
-        if self.discipline_state.recent_calls.len() > 20 {
-            self.discipline_state.recent_calls.remove(0);
-        }
-
-        // Count consecutive repeats of this exact call.
-        // For read_file: only reset if the SAME file was edited between reads.
-        // Editing app.js should not reset the read count for app.py.
-        let mut repeat_count = 0usize;
-        for entry in self.discipline_state.recent_calls.iter().rev() {
-            if tool_name == "read_file" {
-                // For read_file: only an edit on the same file resets the counter
-                if matches!(entry.0.as_str(), "edit_file" | "write_file" | "create_file")
-                    && entry.1 == args_hash
-                {
-                    repeat_count += 1;
-                    break;
-                }
-            } else {
-                // For other tools: any edit resets the counter (original behavior)
-                if matches!(entry.0.as_str(), "edit_file" | "write_file" | "create_file") {
-                    repeat_count += 1;
-                    break;
-                }
-            }
-            if *entry == sig {
-                repeat_count += 1;
-            }
-        }
-
-        if repeat_count >= 3 {
-            return Some(format!(
-                "[BLOCKED: You have called {} with the same arguments {} times without making changes. \
-                 This is a loop. STOP. If the command failed, the error message tells you why — \
-                 fix the underlying issue instead of retrying. \
-                 If you cannot fix it, summarize what you completed and what failed for the user.]",
-                tool_name, repeat_count
-            ));
-        }
-
-        // ── Same-file multi-edit detection ──
-        // Track consecutive edits to the same file. On the 3rd+ edit without
-        // reading the file in between, block and force a re-read.
-        if tool_name == "edit_file" || tool_name == "create_file" {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
-                if let Some(fp) = parsed.get("file_path").and_then(|v| v.as_str()) {
-                    let short = short_path(fp);
-                    if self.discipline_state.consecutive_edits_file.as_deref() == Some(&short) {
-                        self.discipline_state.consecutive_edits_count += 1;
-                    } else {
-                        self.discipline_state.consecutive_edits_file = Some(short.clone());
-                        self.discipline_state.consecutive_edits_count = 1;
-                    }
-                    // Auto-refresh and edit blocking: REMOVED.
-                    // Auto-refresh is redundant with view replacement.
-                    // View replacement already updates stale reads in context.
-                }
-            }
-        } else if tool_name == "read_file" {
-            // Only reading a DIFFERENT file resets the counter.
-            // Reading the SAME file you just edited (to check your work) should NOT
-            // reset — otherwise edit→read_same→edit→read_same bypasses the limit.
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
-                let read_file = parsed
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .map(|fp| fp.rsplit('/').next().unwrap_or(fp).to_string());
-                let is_same_file = match (&read_file, &self.discipline_state.consecutive_edits_file)
-                {
-                    (Some(rf), Some(ef)) => rf == ef,
-                    _ => false,
-                };
-                if !is_same_file {
-                    self.discipline_state.consecutive_edits_file = None;
-                    self.discipline_state.consecutive_edits_count = 0;
-                }
-            }
-        }
-
-        // `list_directory` used to be intercepted here (see doc comment above).
-        // After 1e9936f8 removed the prompt-level tree injection, blocking the
-        // model's `list_directory(".")` call is actively harmful — it reports
-        // "tree already in your system prompt" (false) and forces the model to
-        // guess sibling paths. Let every tool through.
-        let _ = (tool_name, args);
-        None
-    }
-}
-
-/// Normalize a bash command for repeated-execution detection.
-/// Strips: env var prefixes (FOO=bar), stderr redirects (2>&1, 2>/dev/null),
-/// sleep prefixes (sleep N &&), and leading/trailing whitespace.
-/// Returns a stable key so that semantically identical commands match.
-#[allow(dead_code)]
-pub(crate) fn normalize_bash_cmd(cmd: &str) -> String {
-    let mut s = cmd.trim().to_string();
-
-    // Strip leading "sleep N && " or "sleep N; " — these are just wait wrappers.
-    while let Some(rest) = s.strip_prefix("sleep ") {
-        // Find the next "&&" or ";"
-        if let Some(pos) = rest.find("&&") {
-            s = rest[pos + 2..].trim().to_string();
-        } else if let Some(pos) = rest.find(';') {
-            s = rest[pos + 1..].trim().to_string();
-        } else {
-            break; // bare "sleep N" — keep as-is
-        }
-    }
-
-    // Strip leading env var assignments (KEY=VALUE ...)
-    let words: Vec<&str> = s.split_whitespace().collect();
-    let start = words.iter().position(|w| !w.contains('=')).unwrap_or(0);
-    s = words[start..].join(" ");
-
-    // Strip stderr redirects
-    s = s.replace("2>&1", "").replace("2>/dev/null", "");
-
-    // Collapse whitespace
-    s.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
 /// Extract file paths from error output. Language-agnostic: finds tokens

@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>会话与撤销 · AtomCode 文档</title>
+<meta name="description" content="会话与撤销 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="sessions">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>会话与撤销</h1>
+      <p class="lede">AtomCode 默认持久化每一次对话,允许你随时恢复、继续、清空或压缩。同时文件编辑会被记录进 file-history,一条 <code>/undo</code> 就能回滚上一轮的所有改动。</p>
+
+      <h2>会话的生命周期</h2>
+      <p>每次启动 atomcode 都会自动创建一个会话,会话包含:</p>
+      <ul>
+        <li>完整消息历史(用户 prompt、AI 回复、工具调用)</li>
+        <li>关联的工作目录</li>
+        <li>关联的 provider / 模型</li>
+        <li>Token 消耗统计</li>
+        <li>该会话中所有文件编辑的 file-history 快照</li>
+      </ul>
+      <p>会话数据落盘在 <code>~/.atomcode/sessions/</code> 下,按项目(工作目录 hash)分组存储。</p>
+
+      <h2>恢复会话</h2>
+      <h3>命令行继续上次</h3>
+      <pre><code>atomcode -c        # 或 atomcode --continue</code></pre>
+      <p>最常见的需求:接着昨天停下来的地方继续。</p>
+
+      <h3>TUI 内切换会话</h3>
+      <pre><code>/resume</code></pre>
+      <p>弹出会话选择器,按时间倒序显示当前项目的历史会话,可以快速跳到任一会话。每一条都带有最近的用户提问作为标题,便于识别。</p>
+
+      <h3>新开一个干净会话</h3>
+      <pre><code>/session</code></pre>
+      <p>在不切换工作目录的前提下开启全新的上下文。适合"刚刚那个任务已经收尾,我要开始完全不相关的另一件事"。</p>
+
+      <h2 id="bg">后台会话(<code>/bg</code>)</h2>
+      <p>需要同时跟进多条任务、又不想丢失当前对话上下文?<code>/bg</code> 把当前会话挪到后台、打开一个全新前台,随时可以切回去。最多 <strong>16 个并行后台槽位</strong>。</p>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/bg</code></td><td>把当前会话送到后台,打开新的前台</td></tr>
+          <tr><td><code>/bg list</code>(别名 <code>/bg ls</code>)</td><td>列出所有后台会话:编号、ID、状态、创建时间、摘要</td></tr>
+          <tr><td><code>/bg &lt;N&gt;</code></td><td>恢复第 N 号后台为前台(当前前台会被换下到后台)</td></tr>
+          <tr><td><code>/bg drop &lt;N&gt;</code></td><td>丢弃第 N 号后台会话</td></tr>
+          <tr><td><code>/bg help</code>(别名 <code>-h</code>、<code>--help</code>)</td><td>显示内置帮助</td></tr>
+        </tbody>
+      </table>
+
+      <h3>会话状态</h3>
+      <p><code>/bg list</code> 的"状态"列对应会话在后台时的运行情况:</p>
+      <ul>
+        <li><strong>运行中</strong> —— 模型还在执行,工具调用 / 输出在后台继续推进</li>
+        <li><strong>空闲</strong> —— 模型轮次跑完,等你的下一条 prompt</li>
+        <li><strong>已完成</strong> —— 会话已经显式结束</li>
+        <li><strong>已取消 / 错误</strong> —— 被中断或后台运行时出错</li>
+      </ul>
+      <p>所以 <code>/bg</code> 后台并不只是"挂起"——模型真的会在后台继续干活,切回来时直接拿到结果。</p>
+
+      <h3><code>/background &lt;任务&gt;</code> —— 一次性后台派发</h3>
+      <p>如果你不想专门切换前后台、只是"顺手让它跑一下查个东西",用 <code>/background</code> 兼容入口:</p>
+      <pre><code>/background 列出 src 下未使用的依赖</code></pre>
+      <p>会在一个 <code>/bg</code> 槽位里启动一次性任务(默认配置为只读工具子集,不污染主对话上下文)。跑完后用 <code>/bg list</code> 看状态,<code>/bg &lt;N&gt;</code> 切过去读结果,<code>/bg drop &lt;N&gt;</code> 丢弃。</p>
+
+      <div class="callout callout-tip">
+        <strong>典型场景</strong>
+        <p>主前台正在调试 A 模块,模型一边改一边跑 <code>cargo check</code>(耗时)。这时想到要顺便重构 B 模块——直接 <code>/bg</code> 切到新前台开始 B;A 那边的 build 在后台跑完状态切到"已完成",<code>/bg 1</code> 切回去拿结果。</p>
+      </div>
+
+      <h2>清空 vs 压缩 vs 新建</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>保留历史</th><th>保留会话 ID</th><th>何时使用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/clear</code></td><td>否</td><td>是</td><td>想在同一会话里"重置对话",保留会话条目便于以后 <code>/resume</code></td></tr>
+          <tr><td><code>/compact</code></td><td>部分(摘要)</td><td>是</td><td>上下文快撑爆,但不想丢失之前的脉络</td></tr>
+          <tr><td><code>/session</code></td><td>另起一段</td><td>否(新 ID)</td><td>开始完全不相关的新任务</td></tr>
+        </tbody>
+      </table>
+
+      <h2>文件编辑与 <code>/undo</code></h2>
+      <p>AtomCode 的所有文件编辑工具(<code>write_file</code>、<code>edit_file</code>、<code>search_replace</code> 等)在写入前都会把原始内容快照到 file-history。执行:</p>
+      <pre><code>/undo</code></pre>
+      <p>会把上一轮 AI 执行的全部文件编辑一次性回滚到工具调用前的状态。</p>
+
+      <div class="callout callout-warn">
+        <strong>注意边界</strong>
+        <p><code>/undo</code> 只回滚文件编辑,<em>不</em>回滚 bash 命令的副作用。比如模型执行了 <code>rm -rf</code> 或者把数据库 drop 了,<code>/undo</code> 帮不了你——那些操作本身在执行前应该已经触发过权限确认。</p>
+      </div>
+
+      <h2>查看和清理成本</h2>
+      <pre><code>/cost</code></pre>
+      <p>显示当前会话累计输入 / 输出 tokens。当数字逼近 provider 的 <code>context_window</code> 时:</p>
+      <ul>
+        <li>用 <code>/compact</code> 压缩历史,让早期消息变成摘要</li>
+        <li>或者直接 <code>/session</code> 开新会话</li>
+        <li>不想用上下文窗口中的工具调用结果,可以让模型在 prompt 里明确"别再读那些大文件"</li>
+      </ul>
+
+      <h2>多项目工作流</h2>
+      <p>AtomCode 的会话是按工作目录分组的。切换目录的推荐方式:</p>
+      <ul>
+        <li>从命令行启动时用 <code>-C</code> 指定</li>
+        <li>运行中用 <code>/cd</code> 切换,<code>default_workdir</code> 会自动落盘</li>
+      </ul>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./project-instructions.html">项目指令文件</a> —— 用 <code>.atomcode.md</code> 为每个项目固化上下文</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

@@ -1,4 +1,34 @@
 // crates/atomcode-tuix/src/state.rs
+
+/// Plan vs Build execution mode. Plan is read-only exploration (no file
+/// writes, no shell commands); Build is full execution with all tools.
+/// Toggled by the Tab key (when the input buffer is empty) or the
+/// `/plan` and `/build` slash commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentMode {
+    #[default]
+    Build,
+    Plan,
+}
+
+impl AgentMode {
+    /// Human-readable label for status bar display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Build => "Build",
+            Self::Plan => "Plan",
+        }
+    }
+
+    /// Return the opposite mode.
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Build => Self::Plan,
+            Self::Plan => Self::Build,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiPhase {
     Idle,
@@ -79,19 +109,55 @@ pub struct ContextSnapshot {
     pub system_prompt: String,
 }
 
+/// One entry in `message_queue`. Replaces the prior `String`-only
+/// representation so queued messages can carry their pasted images +
+/// markers — otherwise queueing a message during streaming silently
+/// drops attachments.
+#[derive(Debug, Clone)]
+pub struct QueuedMessage {
+    pub text: String,
+    pub images: Vec<atomcode_core::conversation::message::ImagePart>,
+    pub image_markers: Vec<usize>,
+}
+
 pub struct UiState {
     pub phase: UiPhase,
+    pub agent_mode: AgentMode,
     pub spinner_label: String,
     pub spinner_frame: usize,
+    /// Mirrors `TerminalCaps::unicode_symbols` — frozen at construction.
+    /// When false, `tick_spinner` and the spinner-label ellipsis fall
+    /// back to ASCII so terminals whose font lacks `◐` / `…` (notably
+    /// Windows legacy conhost) don't show `□` tofu.
+    pub unicode_symbols: bool,
     pub total_tokens: usize,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub cached_tokens: usize,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
+    /// While waiting on a tool approval, holds the `"Running {Tool}"`
+    /// label that was active before the prompt opened. `on_approval_needed`
+    /// stashes it here and swaps `spinner_label` to "Waiting approval";
+    /// `on_approval_resolved` restores it. Without this, the spinner kept
+    /// saying "Running Bash… · 273s" while the agent was actually blocked
+    /// on `permission.decide().await` — looked identical to a real tool
+    /// hang.
+    pub prior_spinner_label: Option<String>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
-    /// turn-complete / turn-cancelled / error. Used by the spinner to
-    /// display live elapsed time.
+    /// turn-complete / turn-cancelled / error. Used to surface the
+    /// total wall-clock duration in the TurnComplete event payload.
     pub turn_started_at: Option<std::time::Instant>,
+    /// When the current phase began. Reset on every phase transition
+    /// (on_submit, on_thinking, on_tool_call_streaming,
+    /// on_tool_call_started) so the spinner shows time spent on the
+    /// CURRENT operation — `Pondering… 12s`, `Running ReadFile… 4s`
+    /// — instead of accumulating over the whole turn. Cleared on
+    /// turn-complete / turn-cancelled / error so the idle spinner
+    /// (rare) doesn't tick a stale duration.
+    pub phase_started_at: Option<std::time::Instant>,
     /// Last observed context breakdown. Populated from
     /// `AgentEvent::ContextStats` — `/context` renders this. `None`
     /// before the first turn completes.
@@ -103,6 +169,101 @@ pub struct UiState {
     /// can be edited + resent without re-typing. `None` between
     /// turns and after any successful completion.
     pub last_submitted_message: Option<String>,
+    /// `/context` dispatched a `RefreshContextStats` command and is
+    /// waiting for the resulting rich ContextStats event to render the
+    /// report. `Some(show_prompt)` until the next rich emission lands;
+    /// cleared after the render fires. Prevents stale-cache renders
+    /// without forcing /context to block synchronously on the agent
+    /// loop. The bool is the `prompt` sub-arg (include full system
+    /// prompt body).
+    pub pending_context_render: Option<bool>,
+    /// Images pasted from clipboard (Ctrl+V) waiting to be sent with
+    /// the next user message. Drained on submit.
+    pub pending_images: Vec<atomcode_core::conversation::message::ImagePart>,
+    /// Parallel to `pending_images` — content fingerprint of each pasted
+    /// image's raw RGBA bytes. Used by the right-aligned status hint to
+    /// suppress `Image in clipboard · ctrl+v to paste` once the clipboard
+    /// content matches an already-attached image (avoids dup paste prompts),
+    /// while still surfacing the hint when the user copies a new image
+    /// after pasting an earlier one. Cleared together with `pending_images`
+    /// on submit.
+    pub pending_image_hashes: Vec<u64>,
+    /// Parallel to `pending_images` — the marker number `N` originally
+    /// printed for each image at paste time. Submit-time matching does
+    /// `line.contains("[Image #N]")` against this number to decide
+    /// whether the image survived editing. Must NOT be `i + 1` from the
+    /// vec position — once `session_image_count` became monotonic across
+    /// turns, paste-time numbers diverge from positional indices, and
+    /// using the index dropped images on every retry that wasn't the
+    /// first paste of the session.
+    pub pending_image_markers: Vec<usize>,
+    /// Image attachments to re-attach when the user submits a recalled
+    /// history entry. Populated by the up-arrow handler from the
+    /// recalled `HistoryEntry::images`; drained on submit by the
+    /// hydrate prelude in `event_loop/mod.rs`. Lazy by design — disk
+    /// reads happen at submit time, not on every navigation.
+    pub pending_recalled_attachments: Vec<crate::input::history::HistoryImageRef>,
+    /// Monotonic counter for the `[Image #N]` marker shown in the input
+    /// buffer + scrollback. Incremented on every paste and NEVER reset
+    /// across turns — so two images pasted in different turns get
+    /// distinct labels (e.g. `[Image #1]` in turn 1, `[Image #2]` in
+    /// turn 2). Without this, both turns' first paste would both render
+    /// as `[Image #1]`, making it ambiguous which image a later
+    /// reference points at when scrolling back.
+    pub session_image_count: usize,
+    /// Whether to show real-time tool output (e.g., bash stdout/stderr).
+    /// Toggled by Ctrl+O. When false (default), tool output is hidden
+    /// during execution and only shown in the final result.
+    pub show_tool_output: bool,
+    /// Whether to show LLM reasoning/thinking content (e.g., DeepSeek-R1,
+    /// MiniMax-M2.7). Toggled by Ctrl+O together with `show_tool_output`.
+    /// When false (default), reasoning content is hidden during streaming.
+    pub show_reasoning: bool,
+    /// Number of fork sub-agents currently dispatched. While > 0, the
+    /// foreground turn is blocked awaiting `pool.execute_all` — there's
+    /// no fresh tool / think event to update the spinner, so without an
+    /// override the label stays frozen on the last tool name (e.g.
+    /// "Running ReadFile… 82s") for the entire pool duration. Cleared
+    /// on `SubAgentDispatchEnd`.
+    pub sub_agent_total: usize,
+    /// How many sub-agents in the current dispatch have reported a
+    /// terminal status (done / failed / timeout). Updated by
+    /// `on_sub_agent_settled`. Reset to 0 on each new dispatch.
+    pub sub_agent_done: usize,
+    /// Per-task descriptors (path + dedup suffix) for the active
+    /// dispatch. Indexed identically to the `tasks` field on
+    /// `AgentEvent::SubAgentDispatchStart` so the UI can look up a
+    /// child's display path from the `index` field on Started/Done/
+    /// Failed events. Cleared on `on_sub_agent_dispatch_end`.
+    pub sub_agent_tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+    /// Number of failed sub-agents in the current dispatch — tracked
+    /// separately from `sub_agent_done` so the aggregate summary can
+    /// distinguish "6/7 ok · 1 fail" from "7/7 ok". Reset on each new
+    /// dispatch.
+    pub sub_agent_failed: usize,
+    /// Wall-clock start of the current dispatch. Used to render the
+    /// elapsed-time figure on the `SubAgentDispatchEnd` aggregate
+    /// summary line. Cleared with the rest of the dispatch state.
+    pub sub_agent_started_at: Option<std::time::Instant>,
+
+    /// Active tool batches, keyed by `batch_id`. Populated on
+    /// `ToolBatchStarted` and cleared on `ToolBatchCompleted`. Used by
+    /// per-call event handlers to detect "this ToolCallStarted/Result
+    /// belongs to an active batch" and skip the standalone row render
+    /// (the batch header already represents it).
+    pub active_tool_batches: std::collections::HashMap<String, ActiveToolBatch>,
+    /// Reverse map call_id → batch_id for O(1) lookup when a per-call
+    /// event arrives. Mirrors `active_tool_batches` membership; cleared
+    /// together.
+    pub call_id_to_batch: std::collections::HashMap<String, String>,
+}
+
+/// Per-batch state for an active `ToolBatchStarted`. Tracks how many
+/// children have completed so the UI can emit the final `· N/M ok`
+/// summary on `ToolBatchCompleted`.
+#[derive(Debug, Clone)]
+pub struct ActiveToolBatch {
+    pub call_ids: Vec<String>,
 }
 
 impl Default for UiState {
@@ -113,16 +274,56 @@ impl Default for UiState {
 
 impl UiState {
     pub fn new() -> Self {
+        Self::with_unicode(true)
+    }
+
+    /// Construct a `UiState` with an explicit Unicode capability.
+    /// Production code calls this from `App::new` with the value the
+    /// terminal-capability probe produced; tests stick with `new()`.
+    pub fn with_unicode(unicode_symbols: bool) -> Self {
         Self {
             phase: UiPhase::Idle,
+            agent_mode: AgentMode::default(),
             spinner_label: String::new(),
             spinner_frame: 0,
+            unicode_symbols,
             total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
             prior_phase: None,
+            prior_spinner_label: None,
             thinking_idx: 0,
             turn_started_at: None,
+            phase_started_at: None,
             last_context: None,
             last_submitted_message: None,
+            pending_context_render: None,
+            pending_images: Vec::new(),
+            pending_image_hashes: Vec::new(),
+            pending_image_markers: Vec::new(),
+            pending_recalled_attachments: Vec::new(),
+            session_image_count: 0,
+            show_tool_output: false,
+            show_reasoning: false,
+            sub_agent_total: 0,
+            sub_agent_done: 0,
+            sub_agent_tasks: Vec::new(),
+            sub_agent_failed: 0,
+            sub_agent_started_at: None,
+            active_tool_batches: std::collections::HashMap::new(),
+            call_id_to_batch: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Single-character horizontal ellipsis (`…`, U+2026) when Unicode
+    /// is available, three ASCII dots (`...`) otherwise. Used by the
+    /// spinner label and any other "still working…" suffix.
+    pub fn ellipsis(&self) -> &'static str {
+        if self.unicode_symbols {
+            "…"
+        } else {
+            "..."
         }
     }
 
@@ -142,28 +343,64 @@ impl UiState {
         ctx_name: &str,
         system_prompt: &str,
     ) {
-        let snap = self.last_context.get_or_insert_with(ContextSnapshot::default);
-        if system_tokens > 0 { snap.system_tokens = system_tokens; }
-        if sent_tokens > 0 { snap.sent_tokens = sent_tokens; }
-        if tool_defs_tokens > 0 { snap.tool_defs_tokens = tool_defs_tokens; }
+        let is_rich = ctx_window > 0;
+        let snap = self
+            .last_context
+            .get_or_insert_with(ContextSnapshot::default);
+        if is_rich {
+            snap.system_tokens = system_tokens;
+            snap.sent_tokens = sent_tokens;
+            snap.tool_defs_tokens = tool_defs_tokens;
+            snap.cold_zone_tokens = cold_zone_tokens;
+            snap.total_messages = total_messages;
+            snap.ctx_window = ctx_window;
+            if !ctx_name.is_empty() {
+                snap.ctx_name = ctx_name.to_string();
+            }
+            snap.system_prompt = system_prompt.to_string();
+            return;
+        }
+        if system_tokens > 0 {
+            snap.system_tokens = system_tokens;
+        }
+        if sent_tokens > 0 {
+            snap.sent_tokens = sent_tokens;
+        }
+        if tool_defs_tokens > 0 {
+            snap.tool_defs_tokens = tool_defs_tokens;
+        }
         // cold_zone can be 0 legitimately (no compression yet) — the rich
         // emission always sends an accurate value, so only overwrite when
         // the emission carries the ctx_window signal (rich path).
-        if ctx_window > 0 {
-            snap.cold_zone_tokens = cold_zone_tokens;
-            snap.ctx_window = ctx_window;
+        if total_messages > 0 {
+            snap.total_messages = total_messages;
         }
-        if total_messages > 0 { snap.total_messages = total_messages; }
-        if !ctx_name.is_empty() { snap.ctx_name = ctx_name.to_string(); }
+        if !ctx_name.is_empty() {
+            snap.ctx_name = ctx_name.to_string();
+        }
         // system_prompt — only the rich path sends non-empty bytes;
         // narrow path passes "" and we keep whatever was cached last.
-        if !system_prompt.is_empty() { snap.system_prompt = system_prompt.to_string(); }
+        if !system_prompt.is_empty() {
+            snap.system_prompt = system_prompt.to_string();
+        }
     }
 
     /// Elapsed wall time since the current turn began, if a turn is
     /// active. Returns None when idle.
     pub fn turn_elapsed(&self) -> Option<std::time::Duration> {
         self.turn_started_at.map(|t| t.elapsed())
+    }
+
+    /// Elapsed wall time since the current phase began. The spinner
+    /// uses this so its `· 12s` suffix shows time on the current
+    /// operation (LLM round-trip / tool execution), not cumulative
+    /// turn time. Falls back to `turn_elapsed()` when no phase
+    /// transition has fired yet — defensive, should not normally
+    /// happen since `on_submit` seeds both.
+    pub fn phase_elapsed(&self) -> Option<std::time::Duration> {
+        self.phase_started_at
+            .map(|t| t.elapsed())
+            .or_else(|| self.turn_elapsed())
     }
 
     fn current_thinking(&self) -> &'static str {
@@ -175,13 +412,16 @@ impl UiState {
         self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
         self.thinking_idx = self.thinking_idx.wrapping_add(1);
-        self.turn_started_at = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.turn_started_at = Some(now);
+        self.phase_started_at = Some(now);
     }
 
     pub fn on_turn_complete(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        self.phase_started_at = None;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -194,23 +434,28 @@ impl UiState {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        self.phase_started_at = None;
     }
 
     pub fn on_error(&mut self) {
         self.phase = UiPhase::Idle;
         self.spinner_label.clear();
         self.turn_started_at = None;
+        self.phase_started_at = None;
     }
 
     /// Set the spinner label to `"Running {name}"` (no trailing ellipsis —
     /// the renderer appends `...` uniformly so it looks right even when
-    /// the elapsed-time suffix is appended).
+    /// the elapsed-time suffix is appended). Resets the phase clock so
+    /// the spinner timer starts fresh on this tool execution.
     pub fn on_tool_call_started(&mut self, name: &str) {
         self.spinner_label = format!("Running {}", name);
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_tool_call_streaming(&mut self, name: &str) {
         self.spinner_label = format!("Preparing {}", name);
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_thinking(&mut self) {
@@ -218,14 +463,104 @@ impl UiState {
         // on submit, one rotation per turn not per state transition).
         let idx = self.thinking_idx.saturating_sub(1) % THINKING_LABELS.len();
         self.spinner_label = THINKING_LABELS[idx].to_string();
+        // New LLM round-trip → new phase clock. Without this reset the
+        // displayed time keeps growing across consecutive thinks/tools
+        // and ends up showing "Noodling… 1301s" mid-turn.
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
-    pub fn on_approval_needed(&mut self, _tool: &str) {
+    /// Begin a fork dispatch. Stores the per-task descriptors so the UI
+    /// can look up each child's display path + dedup-suffix by index
+    /// when a `SubAgentTaskStarted/Done/Failed` event arrives — the
+    /// previous flow flattened identical basenames (`tunnel.rs` × 3)
+    /// into indistinguishable rows. Also overrides the foreground
+    /// spinner label since `pool.execute_all` blocks the loop.
+    pub fn on_sub_agent_dispatch_start(
+        &mut self,
+        tasks: Vec<atomcode_core::agent::SubAgentTaskInfo>,
+    ) {
+        self.sub_agent_total = tasks.len();
+        self.sub_agent_done = 0;
+        self.sub_agent_failed = 0;
+        self.spinner_label = format!("Sub-agents 0/{}", tasks.len());
+        self.phase_started_at = Some(std::time::Instant::now());
+        self.sub_agent_started_at = Some(std::time::Instant::now());
+        self.sub_agent_tasks = tasks;
+    }
+
+    /// Mark one sub-agent as completed (success). Late events after
+    /// `on_sub_agent_dispatch_end` are no-ops — `sub_agent_total == 0`
+    /// is the gate.
+    pub fn on_sub_agent_task_done(&mut self) {
+        if self.sub_agent_total == 0 {
+            return;
+        }
+        self.sub_agent_done = self.sub_agent_done.saturating_add(1);
+        self.refresh_sub_agent_label();
+    }
+
+    /// Mark one sub-agent as failed (error / timeout / no-edit).
+    /// Increments BOTH the done and failed counters — for the spinner
+    /// label `done` is "settled" regardless of outcome, but the
+    /// aggregate emitted on dispatch_end needs the success/fail split.
+    pub fn on_sub_agent_task_failed(&mut self) {
+        if self.sub_agent_total == 0 {
+            return;
+        }
+        self.sub_agent_done = self.sub_agent_done.saturating_add(1);
+        self.sub_agent_failed = self.sub_agent_failed.saturating_add(1);
+        self.refresh_sub_agent_label();
+    }
+
+    fn refresh_sub_agent_label(&mut self) {
+        self.spinner_label = format!("Sub-agents {}/{}", self.sub_agent_done, self.sub_agent_total);
+    }
+
+    /// End the dispatch — clears descriptors so subsequent thinks/tools
+    /// resume normal label behaviour. The next `on_thinking` /
+    /// `on_tool_call_started` will overwrite `spinner_label`; we leave it
+    /// alone here so the final "N/N" stays visible until the next phase.
+    /// The success/fail split is preserved long enough for the event
+    /// loop to render the aggregate summary line, then cleared.
+    pub fn on_sub_agent_dispatch_end(&mut self) {
+        self.sub_agent_total = 0;
+        self.sub_agent_done = 0;
+        self.sub_agent_failed = 0;
+        self.sub_agent_tasks.clear();
+        self.sub_agent_started_at = None;
+    }
+
+    /// `display_tool` is the already-PascalCased name (e.g. `"Bash"`,
+    /// `"ReadFile"`) — same form `on_tool_call_started` writes into
+    /// `spinner_label`. Stashed so `on_approval_resolved` can put the
+    /// label back when execution resumes.
+    pub fn on_approval_needed(&mut self, display_tool: &str) {
         self.phase = UiPhase::Approval;
+        // Stash the running-tool label so we can restore it after the
+        // user answers. Fall back to inferring from `display_tool` if no
+        // ToolCallStarted ran first (defensive — should not normally
+        // happen, since runner emits ToolCallStarted before approval).
+        if !self.spinner_label.is_empty() {
+            self.prior_spinner_label = Some(self.spinner_label.clone());
+        } else {
+            self.prior_spinner_label = Some(format!("Running {}", display_tool));
+        }
+        self.spinner_label = "Waiting approval".to_string();
+        // Reset the phase clock so the elapsed suffix tracks how long
+        // we've been waiting on the user, not how long the prior phase
+        // (often the just-emitted ToolCallStarted) had been running.
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_approval_resolved(&mut self) {
         self.phase = UiPhase::Streaming;
+        if let Some(prior) = self.prior_spinner_label.take() {
+            self.spinner_label = prior;
+            // The tool is about to actually start running now (hook +
+            // bash_execute). Restart the clock so the spinner suffix
+            // reflects that, not the cumulative wait-then-run time.
+            self.phase_started_at = Some(std::time::Instant::now());
+        }
     }
 
     pub fn on_suspend(&mut self) {
@@ -248,13 +583,35 @@ impl UiState {
         DONE_LABELS[idx]
     }
 
+    /// Toggle real-time tool output and reasoning visibility.
+    /// Both are controlled by Ctrl+O (verbose mode).
+    pub fn toggle_tool_output(&mut self) {
+        self.show_tool_output = !self.show_tool_output;
+        self.show_reasoning = !self.show_reasoning;
+    }
+
+    /// Toggle verbose mode (alias for toggle_tool_output).
+    /// Shows/hides both tool output and reasoning content.
+    pub fn toggle_verbose(&mut self) {
+        self.toggle_tool_output();
+    }
+
     pub fn tick_spinner(&mut self) -> &'static str {
-        // Half-moon rotation — renders cleanly in almost every terminal font.
-        // Previously used Braille U+28xx, which fonts without that block
-        // fall back to ":" or similar visible garbage.
-        const FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
-        self.spinner_frame = (self.spinner_frame + 1) % FRAMES.len();
-        FRAMES[self.spinner_frame]
+        // Two frame sets, picked once at construction:
+        //   Unicode → half-moon rotation; Braille was prettier but
+        //   Windows fonts often lack that block and fall back to ":".
+        //   ASCII   → classic `|/-\` for terminals whose font also
+        //   lacks the Geometric Shapes block (notably Windows legacy
+        //   conhost with NSimSun / Consolas variants).
+        const UNICODE_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
+        const ASCII_FRAMES: &[&str] = &["|", "/", "-", "\\"];
+        let frames = if self.unicode_symbols {
+            UNICODE_FRAMES
+        } else {
+            ASCII_FRAMES
+        };
+        self.spinner_frame = (self.spinner_frame + 1) % frames.len();
+        frames[self.spinner_frame]
     }
 }
 
@@ -262,10 +619,80 @@ impl UiState {
 mod tests {
     use super::*;
 
+    // Regression: terminals whose font lacks `◐` / `…` (Windows legacy
+    // conhost with default Consolas) used to show `□` tofu for both.
+    // ASCII fallback gives them readable `|/-\` and `...` instead.
+    #[test]
+    fn ascii_spinner_uses_pipe_slash_dash_backslash() {
+        let mut s = UiState::with_unicode(false);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(s.tick_spinner());
+        }
+        // Order is implementation detail; the SET must match.
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["-", "/", "\\", "|"]);
+    }
+
+    #[test]
+    fn unicode_spinner_uses_half_moons() {
+        let mut s = UiState::with_unicode(true);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(s.tick_spinner());
+        }
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["◐", "◑", "◒", "◓"]);
+    }
+
+    #[test]
+    fn ellipsis_falls_back_to_three_ascii_dots() {
+        assert_eq!(UiState::with_unicode(false).ellipsis(), "...");
+        assert_eq!(UiState::with_unicode(true).ellipsis(), "…");
+    }
+
     #[test]
     fn new_state_is_idle() {
         let s = UiState::new();
         assert_eq!(s.phase, UiPhase::Idle);
+    }
+
+    /// Regression for the cross-turn `[Image #N]` ambiguity: the marker
+    /// counter must NOT reset when `pending_images` drains on submit —
+    /// otherwise turn 1's first paste and turn 2's first paste would
+    /// both render as `[Image #1]` in scrollback. The counter lives on
+    /// `session_image_count`, monotonically increasing for the whole
+    /// session.
+    #[test]
+    fn session_image_count_starts_at_zero_on_new_state() {
+        let s = UiState::new();
+        assert_eq!(s.session_image_count, 0);
+    }
+
+    /// Simulate two-turn paste flow: paste image in turn 1, drain
+    /// `pending_images` on submit, paste image in turn 2. The second
+    /// paste must get marker `#2`, not `#1`.
+    #[test]
+    fn session_image_count_survives_pending_images_drain() {
+        let mut s = UiState::new();
+        // Turn 1: simulate paste sites' increment-then-push pattern.
+        s.session_image_count += 1;
+        let n1 = s.session_image_count;
+        s.pending_images.push(atomcode_core::conversation::message::ImagePart {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        });
+        s.pending_image_hashes.push(0xdead_beef);
+        // Submit drains pending_images / hashes (mirrors event_loop logic).
+        let _ = std::mem::take(&mut s.pending_images);
+        let _ = std::mem::take(&mut s.pending_image_hashes);
+        // Turn 2: another paste.
+        s.session_image_count += 1;
+        let n2 = s.session_image_count;
+        assert_eq!(n1, 1, "first paste of session is #1");
+        assert_eq!(n2, 2, "first paste of next turn must be #2, not #1");
     }
 
     #[test]
@@ -300,7 +727,7 @@ mod tests {
     fn approval_needed_transitions_to_approval() {
         let mut s = UiState::new();
         s.on_submit();
-        s.on_approval_needed("bash");
+        s.on_approval_needed("Bash");
         assert_eq!(s.phase, UiPhase::Approval);
     }
 
@@ -308,9 +735,61 @@ mod tests {
     fn approval_resolved_back_to_streaming() {
         let mut s = UiState::new();
         s.on_submit();
-        s.on_approval_needed("bash");
+        s.on_approval_needed("Bash");
         s.on_approval_resolved();
         assert_eq!(s.phase, UiPhase::Streaming);
+    }
+
+    // Without this, the spinner shows "Running Bash… · 273s" while the
+    // agent is actually blocked on `permission.decide().await` — looks
+    // identical to a real hang. Fixed by stashing/restoring the label
+    // around the prompt.
+    #[test]
+    fn approval_needed_swaps_spinner_label_to_waiting() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("Bash");
+        assert_eq!(s.spinner_label, "Running Bash");
+        s.on_approval_needed("Bash");
+        assert_eq!(s.spinner_label, "Waiting approval");
+    }
+
+    #[test]
+    fn approval_resolved_restores_running_label() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("Bash");
+        s.on_approval_needed("Bash");
+        s.on_approval_resolved();
+        assert_eq!(s.spinner_label, "Running Bash");
+    }
+
+    // Spinner suffix is `· {phase_elapsed}` — if we don't reset the clock
+    // on the Approval transition, the user sees the cumulative
+    // ToolCallStarted-to-now time and can't tell wait from work.
+    #[test]
+    fn approval_needed_resets_phase_clock() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("Bash");
+        let started = s.phase_started_at.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        s.on_approval_needed("Bash");
+        let after = s.phase_started_at.unwrap();
+        assert!(after > started, "phase_started_at should advance");
+    }
+
+    #[test]
+    fn approval_resolved_resets_phase_clock() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("Bash");
+        s.on_approval_needed("Bash");
+        let waiting_started = s.phase_started_at.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        s.on_approval_resolved();
+        let resumed = s.phase_started_at.unwrap();
+        assert!(resumed > waiting_started, "phase_started_at should advance");
     }
 
     #[test]
@@ -337,5 +816,153 @@ mod tests {
         s.on_submit();
         s.on_error();
         assert_eq!(s.phase, UiPhase::Idle);
+    }
+
+    #[test]
+    fn agent_mode_default_is_build() {
+        assert_eq!(AgentMode::default(), AgentMode::Build);
+    }
+
+    fn task_info(path: &str, dedup: &str) -> atomcode_core::agent::SubAgentTaskInfo {
+        atomcode_core::agent::SubAgentTaskInfo {
+            path: path.to_string(),
+            dedup_suffix: dedup.to_string(),
+        }
+    }
+
+    #[test]
+    fn sub_agent_dispatch_overrides_stale_tool_label() {
+        // Reproduces the user's "Running ReadFile… 82s" stale-spinner
+        // problem: the foreground turn was waiting on pool.execute_all and
+        // the last tool name (read_file) stayed pinned. After dispatch_start
+        // the label must reflect the sub-agent counter, not the dead tool.
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("read_file");
+        assert!(s.spinner_label.contains("read_file"));
+        let tasks = (0..6).map(|i| task_info(&format!("a{}.rs", i), "")).collect();
+        s.on_sub_agent_dispatch_start(tasks);
+        assert_eq!(s.spinner_label, "Sub-agents 0/6");
+    }
+
+    #[test]
+    fn sub_agent_task_done_increments_counter() {
+        let mut s = UiState::new();
+        let tasks = vec![
+            task_info("a.rs", ""),
+            task_info("b.rs", ""),
+            task_info("c.rs", ""),
+        ];
+        s.on_sub_agent_dispatch_start(tasks);
+        s.on_sub_agent_task_done();
+        assert_eq!(s.spinner_label, "Sub-agents 1/3");
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_done();
+        assert_eq!(s.spinner_label, "Sub-agents 3/3");
+        assert_eq!(s.sub_agent_failed, 0);
+    }
+
+    #[test]
+    fn sub_agent_task_failed_counts_toward_done_and_failed() {
+        // `sub_agent_done` is "settled" — done OR failed. The aggregate
+        // line emitted on dispatch_end uses `sub_agent_failed` to split
+        // them apart for "6 ok · 1 fail" rendering.
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(vec![task_info("x.rs", ""), task_info("y.rs", "")]);
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_failed();
+        assert_eq!(s.sub_agent_done, 2);
+        assert_eq!(s.sub_agent_failed, 1);
+    }
+
+    #[test]
+    fn sub_agent_task_event_outside_dispatch_is_noop() {
+        // A late event after DispatchEnd must not bring the counter
+        // label back from the dead.
+        let mut s = UiState::new();
+        s.on_thinking();
+        let pre = s.spinner_label.clone();
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_failed();
+        assert_eq!(s.spinner_label, pre);
+    }
+
+    #[test]
+    fn sub_agent_dispatch_end_clears_descriptors() {
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(vec![task_info("a.rs", ""), task_info("b.rs", "")]);
+        assert_eq!(s.sub_agent_tasks.len(), 2);
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_task_done();
+        s.on_sub_agent_dispatch_end();
+        assert_eq!(s.sub_agent_total, 0);
+        assert_eq!(s.sub_agent_done, 0);
+        assert_eq!(s.sub_agent_failed, 0);
+        assert!(s.sub_agent_tasks.is_empty());
+        assert!(s.sub_agent_started_at.is_none());
+        s.on_thinking();
+        assert!(!s.spinner_label.starts_with("Sub-agents"));
+    }
+
+    #[test]
+    fn sub_agent_dispatch_preserves_dedup_suffix() {
+        // Three tasks against tunnel.rs must come through as #1/#2/#3
+        // suffixes from the dispatcher, and `state.sub_agent_tasks`
+        // must carry that data so a `SubAgentTaskStarted { index: 2 }`
+        // event renders the right disambiguator.
+        let mut s = UiState::new();
+        s.on_sub_agent_dispatch_start(vec![
+            task_info("src/server/tunnel.rs", " (#1)"),
+            task_info("src/client/tunnel.rs", ""),
+            task_info("src/server/tunnel.rs", " (#2)"),
+        ]);
+        assert_eq!(s.sub_agent_tasks[0].dedup_suffix, " (#1)");
+        assert_eq!(s.sub_agent_tasks[1].dedup_suffix, "");
+        assert_eq!(s.sub_agent_tasks[2].dedup_suffix, " (#2)");
+    }
+
+    #[test]
+    fn agent_mode_build_label() {
+        assert_eq!(AgentMode::Build.label(), "Build");
+    }
+
+    #[test]
+    fn agent_mode_plan_label() {
+        assert_eq!(AgentMode::Plan.label(), "Plan");
+    }
+
+    #[test]
+    fn agent_mode_build_toggles_to_plan() {
+        assert_eq!(AgentMode::Build.toggle(), AgentMode::Plan);
+    }
+
+    #[test]
+    fn agent_mode_plan_toggles_to_build() {
+        assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
+    }
+
+    #[test]
+    fn agent_mode_double_toggle_returns_to_original() {
+        assert_eq!(AgentMode::Build.toggle().toggle(), AgentMode::Build);
+    }
+
+    #[test]
+    fn pending_recalled_attachments_starts_empty() {
+        let s = UiState::new();
+        assert!(s.pending_recalled_attachments.is_empty());
+    }
+
+    #[test]
+    fn queued_message_carries_images() {
+        let q = QueuedMessage {
+            text: "hi".into(),
+            images: vec![atomcode_core::conversation::message::ImagePart {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+            image_markers: vec![1],
+        };
+        assert_eq!(q.images.len(), 1);
+        assert_eq!(q.image_markers, vec![1]);
     }
 }

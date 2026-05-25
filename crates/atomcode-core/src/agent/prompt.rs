@@ -29,14 +29,9 @@ impl AgentLoop {
             .map(|g| g.clone())
             .unwrap_or_default();
 
-        // Load project-level instructions (.atomcode.md or ATOMCODE.md)
-        let project_instructions = [".atomcode.md", "ATOMCODE.md"]
-            .iter()
-            .find_map(|name| {
-                let path = wd.join(name);
-                std::fs::read_to_string(&path).ok()
-            })
-            .unwrap_or_default();
+        // Load layered instructions (global → project → user)
+        let instructions = crate::config::instructions::LayeredInstructions::load(&wd);
+        let merged_instructions = instructions.merged();
 
         // Stable environment metadata (no date — changes every day, breaks cache)
         let shell = if cfg!(target_os = "windows") {
@@ -61,12 +56,82 @@ impl AgentLoop {
             model_display, wd = wd.display(), env_info = env_info,
         );
 
-        // Project instructions (if any)
-        if !project_instructions.is_empty() {
-            prompt.push_str(&format!(
-                "\n=== PROJECT INSTRUCTIONS (.atomcode.md) ===\n{}\n",
-                project_instructions
-            ));
+        // Git commit attribution. Mirrors Claude Code's convention:
+        // when the agent runs git commit on the user's behalf, append
+        // a Co-Authored-By trailer naming AtomCode + the model so
+        // history reflects which AI did the work. Hardcoded into the
+        // prompt rather than enforced via a bash wrapper because:
+        //
+        // 1. wrapping `git commit` would also catch revert/amend/cherry-
+        //    pick paths that the user may not want tagged;
+        // 2. the LLM constructs commit messages anyway, so injecting at
+        //    the prompt layer is sufficient and keeps the bash tool
+        //    transparent;
+        // 3. users who want a different attribution can override this
+        //    with `[providers.<name>] system_prompt = "..."` since that
+        //    short-circuits the entire prompt assembly above.
+        //
+        // The trailer is consistent with GitHub / GitLab co-author
+        // convention (case-insensitive `co-authored-by:` recognised by
+        // both for "Co-authored" attribution display).
+        prompt.push_str(&format!(
+            "\n=== GIT COMMITS ===\n\
+             When you create a git commit on the user's behalf, end the commit \
+             message with this trailer (preceded by a blank line):\n\
+             \n\
+             Co-Authored-By: AtomCode ({}) <noreply@atomgit.com>\n\
+             \n\
+             Use a HEREDOC for `git commit -m` so the trailer's blank line is \
+             preserved verbatim. Skip this trailer for `git commit --amend` \
+             and `git revert` (those operate on existing commits whose \
+             attribution shouldn't change).\n",
+            model_display
+        ));
+
+        // Opening files in the GUI is a user-visible side effect — a
+        // browser window popping up uninvited is jarring. Tell the
+        // model to ASK first rather than auto-open after every HTML
+        // write. The `open_file` tool handles cross-platform dispatch
+        // (open / xdg-open / start / wslview) and refuses cleanly on
+        // SSH / CI / headless so the model never has to second-guess
+        // whether a window will actually appear.
+        prompt.push_str(
+            "\n=== OPENING FILES (PREVIEW) ===\n\
+             After you create or edit an HTML / PDF / image / SVG file, DO NOT \
+             automatically open it in the user's browser or viewer. The file \
+             existing on disk is enough — opening a window is a visible side \
+             effect the user may not want.\n\
+             \n\
+             Ask first. Phrasing like \"Want me to open it for preview?\" is \
+             plenty. Only call the `open_file` tool when:\n\
+             - the user explicitly asks (\"preview it\", \"open in browser\", \
+             \"show me\"), OR\n\
+             - the user has just confirmed they want a preview after you asked.\n\
+             \n\
+             `open_file` handles the OS / WSL / SSH / CI dispatch itself — \
+             prefer it over raw `bash open`, `bash xdg-open`, etc. so the \
+             behaviour stays consistent and headless sessions refuse cleanly.\n",
+        );
+
+        // Layered instructions (global / project / user)
+        if !merged_instructions.is_empty() {
+            prompt.push_str(&format!("\n{}\n", merged_instructions));
+        }
+
+        // Persistent memory
+        {
+            use crate::config::memory::MemoryStore;
+            let wd = self.turn_runner.context.working_dir.try_read()
+                .map(|g| g.clone()).unwrap_or_default();
+            let project_name = wd.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            let global = MemoryStore::global();
+            let project = MemoryStore::project(&wd);
+            let memory_block = MemoryStore::merged_for_prompt(&global, &project, &project_name);
+            if !memory_block.is_empty() {
+                prompt.push_str(&format!("\n{}\n", memory_block));
+            }
         }
 
         // Available skills — inject skill descriptions so LLM knows what skills exist.
@@ -75,7 +140,8 @@ impl AgentLoop {
             let skills: Vec<String> = registry
                 .invocable_by_llm()
                 .map(|s| {
-                    let hint = s.argument_hint
+                    let hint = s
+                        .argument_hint
                         .as_ref()
                         .map(|h| format!(" {}", h))
                         .unwrap_or_default();
@@ -84,7 +150,9 @@ impl AgentLoop {
                 .collect();
             if !skills.is_empty() {
                 prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
-                prompt.push_str("Use the `use_skill` tool to invoke a skill when relevant to the task.\n");
+                prompt.push_str(
+                    "Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
+                );
                 prompt.push_str(&skills.join("\n"));
                 prompt.push('\n');
             }

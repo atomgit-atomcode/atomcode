@@ -1,0 +1,73 @@
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, sans-serif);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--app-primary-foreground);
+  background: var(--app-primary-background);
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+#root {
+  display: flex;
+  flex: 1;
+  max-width: 100%;
+  height: 100%;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+.app-sidebar {
+  background: var(--app-primary-background);
+}
+
+.session-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 4px rgba(76, 175, 80, 0.5); }
+  50% { opacity: 0.35; box-shadow: 0 0 10px rgba(76, 175, 80, 0.8); }
+}
+
+@keyframes selectionConfirm {
+  0% { background-color: var(--app-input-secondary-background); }
+  50% { background-color: var(--app-button-background); opacity: 0.3; }
+  to { background-color: var(--app-input-secondary-background); }
+}

@@ -27,8 +27,8 @@
 
 use super::CtxBuilder;
 use crate::config::provider::ProviderConfig;
-use crate::conversation::{ContextStats, Conversation};
 use crate::conversation::message::Message;
+use crate::conversation::{ContextStats, Conversation};
 use crate::tool::ToolResult;
 
 /// 本地 Ollama 模型的上下文策略。
@@ -76,19 +76,13 @@ impl CtxBuilder for OllamaCtx {
         crate::ctx::render::build_messages(conv, &sys, self.ctx_window, turn_reminder)
     }
 
-    /// 更早触发压缩:35% 阈值,而非 Default 的 50%。
+    /// 复用 ctx::render::needs_compression — 它的绝对 headroom 公式
+    /// `ctx_window - min(13K, ctx_window/4)` 在小窗口下天然偏紧
+    /// (8K Ollama → 6K threshold = 75% 触发, 比之前的 35% 晚但更接近"撑爆前一刻"的真实 headroom)。
+    /// 之前的 35% hardcoded 阈值是为 4-8K Ollama 量身的早触发, 但在
+    /// 16K-32K Ollama 上反而过早。新公式自适应窗口大小, 不再需要单独的 Ollama tier。
     fn needs_compression(&self, conv: &Conversation, system_tokens: usize) -> bool {
-        // 消息少于 12 条不压,和 ctx::render::needs_compression 保持一致
-        if conv.messages.len() < 12 {
-            return false;
-        }
-        let total: usize = system_tokens
-            + conv
-                .messages
-                .iter()
-                .map(|m| m.estimate_tokens())
-                .sum::<usize>();
-        total > self.ctx_window * 35 / 100
+        crate::ctx::render::needs_compression(conv, system_tokens, self.ctx_window)
     }
 
     fn compression_plan(&self, conv: &Conversation) -> Option<(String, usize)> {
@@ -151,8 +145,13 @@ mod tests {
             max_tokens: None,
             thinking_type: None,
             thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
             ephemeral: false,
-        }
+
+}
     }
 
     #[test]
@@ -181,7 +180,10 @@ mod tests {
     #[test]
     fn tool_output_cap_follows_spec() {
         // ctx=8K → 8000/8=1000, 被 max(2000) 抬到 2000
-        assert_eq!(OllamaCtx::new(&ollama_provider(8_000)).tool_output_cap(), 2_000);
+        assert_eq!(
+            OllamaCtx::new(&ollama_provider(8_000)).tool_output_cap(),
+            2_000
+        );
         // ctx=16K → 16000/8=2000, 正好等于下限
         assert_eq!(
             OllamaCtx::new(&ollama_provider(16_000)).tool_output_cap(),
@@ -243,7 +245,11 @@ mod tests {
         let mut conv = Conversation::new();
         for i in 0..8 {
             conv.add_user_message(&format!("user turn {} with moderate content", i));
-            conv.add_assistant_tool_calls(Some(&format!("some assistant reasoning for turn {}", i)), vec![], None);
+            conv.add_assistant_tool_calls(
+                Some(&format!("some assistant reasoning for turn {}", i)),
+                vec![],
+                None,
+            );
         }
         // 16 条消息,每条 ~10-15 tokens → 总 ~200 tokens,低于 35%,不压
         assert!(!o.needs_compression(&conv, 50));
@@ -251,15 +257,13 @@ mod tests {
         // 再填大量长消息让总 tokens 超过 2800
         for _ in 0..20 {
             conv.add_user_message(&"lorem ipsum ".repeat(50).repeat(2)); // 每条 ~250 tokens
-            conv.add_assistant_tool_calls(
-                Some(&"dolor sit amet ".repeat(50)),
-                vec![],
-                None,
-            );
+            conv.add_assistant_tool_calls(Some(&"dolor sit amet ".repeat(50)), vec![], None);
         }
         // 此时总 tokens 远超 2800
-        assert!(o.needs_compression(&conv, 50),
-            "大对话下 OllamaCtx 应触发压缩(35% threshold)");
+        assert!(
+            o.needs_compression(&conv, 50),
+            "大对话下 OllamaCtx 应触发压缩(35% threshold)"
+        );
     }
 
     #[test]

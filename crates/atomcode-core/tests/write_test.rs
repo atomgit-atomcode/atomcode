@@ -1,5 +1,5 @@
 use atomcode_core::tool::write::WriteFileTool;
-use atomcode_core::tool::{Tool, ToolContext, ToolResult};
+use atomcode_core::tool::{Tool, ToolContext};
 use serde_json::json;
 
 fn make_ctx(dir: &std::path::Path) -> ToolContext {

@@ -7,39 +7,53 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
-/// Deserialize an ID that may be a string or a number into a String.
-fn deserialize_id_as_string<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<String, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrNum {
-        Str(String),
-        Int(i64),
-    }
-    match StringOrNum::deserialize(deserializer)? {
-        StringOrNum::Str(s) => Ok(s),
-        StringOrNum::Int(n) => Ok(n.to_string()),
-    }
+use atomcode_telemetry::{Event, Telemetry};
+
+/// Default Platform server base URL (client_secret is kept on the broker).
+/// Override with the `ATOMCODE_PLATFORM_SERVER` environment variable.
+const DEFAULT_PLATFORM_SERVER: &str = "https://acs.atomgit.com";
+
+/// Sanitize a user-supplied base URL: add `http://` if no scheme is present,
+/// and strip trailing `/` so path concatenation never produces `//`.
+fn sanitize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+    with_scheme.trim_end_matches('/').to_string()
 }
 
-/// URL encode a string
-fn urlencoding_encode(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+/// Return the Platform server base URL, reading `ATOMCODE_PLATFORM_SERVER` once
+/// at first call and caching the result for the process lifetime. This ensures
+/// all URL-derived functions within a single login/session flow target the
+/// same server even if the env var changes mid-flight.
+fn platform_base_url() -> &'static str {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<String> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let raw = std::env::var("ATOMCODE_PLATFORM_SERVER")
+            .unwrap_or_else(|_| DEFAULT_PLATFORM_SERVER.to_string());
+        sanitize_base_url(&raw)
+    })
 }
 
-/// AtomGit OAuth configuration
-pub const CLIENT_ID: &str = "b9956e5327e544578128af8979ba3ccb";
-pub const CLIENT_SECRET: &str = "756ef00061884c7aa1ac64bd4eae3be7";
-pub const REDIRECT_PORT: u16 = 8765;
-pub const REDIRECT_URI: &str = "http://127.0.0.1:8765/callback";
-
-/// AtomGit OAuth endpoints
-pub const AUTHORIZE_URL: &str = "https://atomgit.com/oauth/authorize";
-pub const TOKEN_URL: &str = "https://atomgit.com/oauth/token";
-pub const USER_URL: &str = "https://atomgit.com/api/v5/user";
+/// Platform server URLs (derived from `ATOMCODE_PLATFORM_SERVER`).
+pub fn platform_broker_url() -> String { platform_base_url().to_string() }
+pub fn platform_login_url() -> String { format!("{}/auth/login", platform_base_url()) }
+pub fn platform_check_url() -> String { format!("{}/auth/check", platform_base_url()) }
+pub fn platform_token_url() -> String { format!("{}/auth/token", platform_base_url()) }
+pub fn platform_exchange_url() -> String { format!("{}/oauth/exchange", platform_base_url()) }
+pub fn platform_refresh_url() -> String { format!("{}/oauth/refresh", platform_base_url()) }
+#[allow(dead_code)]
+pub fn authorize_url() -> String { format!("{}/oauth/authorize", platform_base_url()) }
+#[allow(dead_code)]
+pub fn token_url() -> String { format!("{}/oauth/token", platform_base_url()) }
+#[allow(dead_code)]
+pub fn user_url() -> String { format!("{}/api/v5/user", platform_base_url()) }
 
 /// Blocking HTTP client pre-configured with `ATOMCODE_USER_AGENT`. Every
 /// OAuth-side request must carry the token or AtomGit's gate rejects it.
@@ -59,9 +73,6 @@ fn blocking_client() -> reqwest::blocking::Client {
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
-
-/// OAuth scopes needed
-pub const SCOPES: &str = "user_info projects";
 
 /// Stored authentication data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,101 +96,397 @@ pub struct UserInfo {
     pub avatar_url: Option<String>,
 }
 
+// ============================================================================
+// Platform API types
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: Option<String>,
-    token_type: Option<String>,
-    expires_in: Option<i64>,
+struct PlatformLoginResponse {
+    login_url: String,
+    state: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct UserResponse {
-    #[serde(deserialize_with = "deserialize_id_as_string")]
+struct PlatformCheckResponse {
+    valid: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlatformUserInfo {
     id: String,
-    login: String,
+    username: String,
     name: Option<String>,
     email: Option<String>,
     avatar_url: Option<String>,
 }
 
-/// Perform OAuth login flow
-pub fn login() -> Result<AuthInfo> {
-    println!("\n  AtomCode Login");
-    println!("  ==============\n");
+#[derive(Debug, Deserialize)]
+struct PlatformTokenResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: Option<i64>,
+    refresh_token: Option<String>,
+    user: PlatformUserInfo,
+}
 
-    // Generate random state for CSRF protection
-    let state = generate_state();
+// ============================================================================
+// ESC-cancel support for the OAuth poll loop
+// ============================================================================
+//
+// The poll loop in `login()` historically did `loop { http_check; sleep(2s) }`
+// with no input handling — Linux/WSL users with broken `xdg-open` had no way
+// to exit short of Ctrl+C (which kills the whole CLI/TUI). We now print the
+// auth URL up-front for those users and accept ESC during the wait.
+//
+// Cooked mode (set by `suspend_for_external` in the TUI, default everywhere
+// in CLI mode) line-buffers stdin — ESC alone won't reach `read()` until the
+// user hits Enter. So while waiting, we temporarily switch stdin to cbreak
+// (non-canonical, no echo) via an RAII `CbreakGuard`, restoring the original
+// termios on every drop path. If `tcgetattr`/`tcsetattr` fail (non-tty stdin
+// from a pipe or CI), the guard returns `None` and the loop falls back to a
+// plain sleep — login still works, ESC just has no effect.
+//
+// Windows has no `poll(2)` over stdin and the existing
+// `read_callback_from_stdin_until_stopped` path is already gated off there
+// for the same reason. We follow the same pattern: `CbreakGuard` is a
+// zero-sized stub that always returns `None`, and `wait_for_esc_or_timeout`
+// degrades to `thread::sleep`.
 
-    // Build authorization URL
-    let auth_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&state={}&scope={}",
-        AUTHORIZE_URL,
-        urlencoding_encode(CLIENT_ID),
-        urlencoding_encode(REDIRECT_URI),
-        state,
-        urlencoding_encode(SCOPES),
-    );
+/// Outcome of waiting for stdin activity during the OAuth poll loop.
+//
+// On Windows `wait_for_esc_or_timeout` always returns `Timeout` (no
+// poll(2) over stdin), so `Cancelled` and `OtherInput` are constructed
+// only on Unix. The variants must still exist on Windows because
+// `classify_input` and its tests reference them — `cargo test` runs on
+// every platform. Suppress the dead-code warning rather than gate the
+// type, so the test surface stays portable.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscOutcome {
+    /// Bare ESC keypress — user cancelled.
+    Cancelled,
+    /// poll(2) timed out, or `read` returned 0 / error.
+    Timeout,
+    /// Some bytes arrived but it wasn't a bare ESC (escape sequence,
+    /// stray letter / Enter, paste). Treated identically to Timeout
+    /// at the call site — fall through to the HTTP check.
+    OtherInput,
+}
 
-    println!("  Opening browser for authorization...");
-    println!("  If browser doesn't open, visit this URL:\n");
-    println!("  {}\n", auth_url);
+/// Classify a freshly-read stdin buffer as cancel / timeout / ignore.
+///
+/// Bare ESC = single 0x1B byte. Anything else (escape sequence, normal
+/// keystroke, pasted text) is `OtherInput`. Empty buffer = `Timeout`.
+///
+/// Terminals batch escape sequences (e.g. arrow up = `\x1B[A`) into a
+/// single write to the master pty, so a 32-byte non-blocking read sees
+/// the whole sequence at once and we never mistake its prefix for bare
+/// ESC. See spec `2026-04-28-show-oauth-url-design.md` §5.
+//
+// Only called from the Unix `wait_for_esc_or_timeout`. Kept callable on
+// Windows because the unit-test module exercises it on every platform —
+// the logic is byte-pattern matching, no platform deps. `dead_code`
+// suppression scoped to Windows so Unix still gets the warning if a
+// future change makes it genuinely unused there.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn classify_input(bytes: &[u8]) -> EscOutcome {
+    match bytes {
+        [] => EscOutcome::Timeout,
+        [0x1B] => EscOutcome::Cancelled,
+        _ => EscOutcome::OtherInput,
+    }
+}
 
-    // Open browser (best-effort — paste path below covers headless / WSL).
-    if let Err(e) = open_browser(&auth_url) {
-        println!("  Failed to open browser: {}", e);
-        println!("  (paste path below will still work)\n");
+#[cfg(not(target_os = "windows"))]
+struct CbreakGuard {
+    fd: std::os::unix::io::RawFd,
+    orig: libc::termios,
+}
+
+#[cfg(target_os = "windows")]
+struct CbreakGuard;
+
+impl CbreakGuard {
+    /// Try to switch stdin to cbreak. Returns `None` if stdin isn't a
+    /// tty (ENOTTY) or if `tcsetattr` fails. On Windows always returns
+    /// `None` — no equivalent of the Unix poll-based path.
+    #[cfg(not(target_os = "windows"))]
+    fn new() -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        let fd = io::stdin().as_raw_fd();
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
+            return None;
+        }
+        let mut new = orig;
+        new.c_lflag &= !(libc::ICANON | libc::ECHO);
+        new.c_cc[libc::VMIN] = 0;
+        new.c_cc[libc::VTIME] = 0;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &new) } != 0 {
+            return None;
+        }
+        Some(Self { fd, orig })
     }
 
-    let (code, returned_state) = await_callback(REDIRECT_PORT)?;
-
-    // Verify state. Most common cause of mismatch in practice is the user
-    // pasting a callback URL left over from an earlier /login attempt;
-    // re-running /login regenerates state and fixes it.
-    if returned_state != state {
-        anyhow::bail!(
-            "OAuth state mismatch — the pasted URL likely came from an earlier \
-            /login attempt. Re-run /login and paste the newly-authorized URL."
-        );
+    #[cfg(target_os = "windows")]
+    fn new() -> Option<Self> {
+        None
     }
+}
 
-    println!("  Authorization received, exchanging token...\n");
+#[cfg(not(target_os = "windows"))]
+impl Drop for CbreakGuard {
+    fn drop(&mut self) {
+        // Best-effort restore. If this somehow fails the terminal is
+        // stuck in cbreak — `stty sane` recovers it. Drop runs on every
+        // exit path including panic so the common case is always clean.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
+        }
+    }
+}
 
-    // Exchange code for token
-    let token = exchange_code_for_token(&code)?;
-
-    // Get user info
-    let user = get_user_info(&token.access_token)?;
-
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-
-    let auth_info = AuthInfo {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        token_type: token.token_type.unwrap_or_else(|| "Bearer".to_string()),
-        expires_in: token.expires_in,
-        created_at,
-        user: UserInfo {
-            id: user.id,
-            username: user.login,
-            name: user.name,
-            email: user.email,
-            avatar_url: user.avatar_url,
-        },
+/// Wait up to `timeout` for stdin activity (ESC keypress) or sleep
+/// until the timeout expires. Used to interleave ESC-cancel checks
+/// with the OAuth `/auth/check` poll cadence.
+///
+/// On Windows or when the cbreak guard couldn't be established, this
+/// just sleeps and returns `Timeout` — ESC never fires but login still
+/// works.
+#[cfg(not(target_os = "windows"))]
+fn wait_for_esc_or_timeout(guard: &Option<CbreakGuard>, timeout: Duration) -> EscOutcome {
+    let Some(g) = guard.as_ref() else {
+        thread::sleep(timeout);
+        return EscOutcome::Timeout;
     };
 
-    println!(
-        "  Logged in as: {} ({})\n",
-        auth_info.user.username, auth_info.user.id
-    );
+    let mut pfd = libc::pollfd {
+        fd: g.fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if rc <= 0 {
+        // 0 = timeout (no data); <0 = poll error (EINTR etc.). Either
+        // way the right move is "fall through to HTTP check"; the
+        // outer loop's HTTP round-trip is the natural rate limit.
+        return EscOutcome::Timeout;
+    }
+    let mut buf = [0u8; 32];
+    let n = unsafe { libc::read(g.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n <= 0 {
+        return EscOutcome::Timeout;
+    }
+    classify_input(&buf[..n as usize])
+}
 
-    Ok(auth_info)
+#[cfg(target_os = "windows")]
+fn wait_for_esc_or_timeout(_guard: &Option<CbreakGuard>, timeout: Duration) -> EscOutcome {
+    thread::sleep(timeout);
+    EscOutcome::Timeout
+}
+
+/// Outcome of one `LoginSession::poll_once` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollOutcome {
+    /// User hasn't completed the browser sign-in yet — wait and retry.
+    Pending,
+    /// `/auth/check` reported `valid=true`. Caller should call `finish()`.
+    Authorized,
+}
+
+/// In-flight OAuth session. Returned by `start_login()`. The caller
+/// drives the flow:
+///
+/// 1. Display `session.url()` and (best-effort) `open_browser()`.
+/// 2. Loop `poll_once()` until `Authorized`, sleeping between calls
+///    AT THE CALLER'S CADENCE — this lets the TUI interleave UI events
+///    (ESC for cancel) and the CLI use a simple `thread::sleep`.
+/// 3. Call `finish()` to exchange `state` → token.
+pub struct LoginSession {
+    state: String,
+    login_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl LoginSession {
+    /// Authorization URL the user must visit. Stable for the lifetime
+    /// of the session — safe to show once and reuse.
+    pub fn url(&self) -> &str {
+        &self.login_url
+    }
+
+    /// Best-effort browser launch. Always silent — failures are expected
+    /// on Linux/WSL where the URL on screen is the user's actual path.
+    pub fn open_browser_best_effort(&self) {
+        let _ = open_browser(&self.login_url);
+    }
+
+    /// One non-blocking HTTP check against `/auth/check`. Returns
+    /// `Pending` until the user finishes the browser flow, then
+    /// `Authorized`. Errors only on transport/parse failures; a
+    /// "not yet" answer is `Ok(Pending)`, never `Err`.
+    pub fn poll_once(&self) -> Result<PollOutcome> {
+        let resp = self
+            .client
+            .get(platform_check_url())
+            .query(&[("state", &self.state)])
+            .send()
+            .context("Failed to call /auth/check")?;
+        if resp.status().is_success() {
+            if let Ok(check) = resp.json::<PlatformCheckResponse>() {
+                if check.valid {
+                    return Ok(PollOutcome::Authorized);
+                }
+            }
+        }
+        Ok(PollOutcome::Pending)
+    }
+
+    /// Final step: `/auth/token` exchange + `LoginSuccess` telemetry.
+    /// Consumes the session — only call after `poll_once` returned
+    /// `Authorized`.
+    pub fn finish(self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
+        let token_resp: PlatformTokenResponse = self
+            .client
+            .get(platform_token_url())
+            .query(&[("state", &self.state)])
+            .send()
+            .context("Failed to call /auth/token")?
+            .json()
+            .context("Failed to parse /auth/token response")?;
+
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let auth_info = AuthInfo {
+            access_token: token_resp.access_token,
+            refresh_token: token_resp.refresh_token,
+            token_type: token_resp.token_type,
+            expires_in: token_resp.expires_in,
+            created_at,
+            user: UserInfo {
+                id: token_resp.user.id,
+                username: token_resp.user.username,
+                name: token_resp.user.name,
+                email: token_resp.user.email,
+                avatar_url: token_resp.user.avatar_url,
+            },
+        };
+
+        if let Some(t) = tel {
+            // Push account_id onto the telemetry handle BEFORE emitting
+            // login_success so the event itself — and every subsequent event in
+            // this process — carries the id. The handle-level setter outlives
+            // any task-local scope, so events emitted outside the main scope
+            // (e.g. before scope is entered, or from spawned tasks) inherit it.
+            t.set_account_id(Some(auth_info.user.id.to_string()));
+            t.track(Event::LoginSuccess);
+        }
+
+        Ok(auth_info)
+    }
+}
+
+/// Begin OAuth login: call `/auth/login`, return a session containing
+/// the auth URL + state. Cheap (one HTTP round-trip), never blocks on
+/// user action — separated from polling so callers can render the URL
+/// before yielding control to the wait loop.
+pub fn start_login() -> Result<LoginSession> {
+    let client = reqwest::blocking::Client::new();
+    let resp: PlatformLoginResponse = client
+        .get(platform_login_url())
+        .query(&[("provider", "atomgit")])
+        .send()
+        .context("Failed to call /auth/login")?
+        .json()
+        .context("Failed to parse /auth/login response")?;
+    Ok(LoginSession {
+        state: resp.state,
+        login_url: strip_force_login(&resp.login_url),
+        client,
+    })
+}
+
+/// Drop `force_login=true` from the broker-supplied OAuth URL. The
+/// broker emits this flag to force re-authentication on every login;
+/// stripping it lets users already signed in to atomgit.com
+/// auto-authorize and skip the consent page. State binding via the
+/// `state` parameter is unchanged, so the request is still anchored
+/// to this specific login attempt.
+fn strip_force_login(url: &str) -> String {
+    url.replace("&force_login=true", "")
+        .replace("?force_login=true&", "?")
+        .replace("?force_login=true", "")
+}
+
+/// Stdout-driven OAuth login: prints the URL, opens the browser,
+/// polls `/auth/check` with stdin-driven ESC cancel. Used by the CLI
+/// (`atomcode login`, `atomcode codingplan`) and by `setup.rs`'s
+/// `step_login` when the TUI hasn't already pre-flighted login.
+///
+/// TUI callers should NOT use this — render via `start_login()` +
+/// `LoginSession::poll_once()` so the input box stays visible and ESC
+/// is captured through `input_rx` (no termios manipulation needed).
+///
+/// `tel` is optional so non-CLI callers (tests, coding_plan setup) can
+/// pass `None` when they don't hold a telemetry handle.
+pub fn login(tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
+    let session = start_login()?;
+
+    // Always print the URL — `xdg-open` on Linux/WSL silently fails
+    // often enough that we can't rely on it. On the desktop happy path
+    // the browser opens *and* the URL stays in scrollback as a backup.
+    println!("  Browser didn't open? Open the URL below in any browser to sign in:");
+    println!("  {}", session.url());
+
+    // Try to enter cbreak so we can detect a bare-ESC keypress. None
+    // (non-tty stdin / tcsetattr failure) → fall back to plain sleep,
+    // and don't advertise an ESC affordance that wouldn't work.
+    let cbreak = CbreakGuard::new();
+    if cbreak.is_some() {
+        println!();
+        println!("  Press ESC to cancel");
+    }
+
+    session.open_browser_best_effort();
+
+    loop {
+        match session.poll_once()? {
+            PollOutcome::Authorized => break,
+            PollOutcome::Pending => {}
+        }
+        match wait_for_esc_or_timeout(&cbreak, Duration::from_secs(2)) {
+            EscOutcome::Cancelled => anyhow::bail!("login cancelled by user"),
+            EscOutcome::Timeout | EscOutcome::OtherInput => {}
+        }
+    }
+
+    session.finish(tel)
+}
+
+/// Extract state from a pasted callback URL (kept for potential future fallback use)
+#[allow(dead_code)]
+fn pasted_state(url: &str) -> Option<String> {
+    url.split('?')
+        .nth(1)?
+        .split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            if parts.next()? == "state" {
+                Some(urlencoding_decode(parts.next()?))
+            } else {
+                None
+            }
+        })
+        .next()
 }
 
 /// Generate random state string for CSRF protection
+#[allow(dead_code)]
 fn generate_state() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
@@ -189,9 +496,15 @@ fn generate_state() -> String {
     format!("atomcode_{}", timestamp)
 }
 
-/// Open browser with the authorization URL
+/// Open browser with the authorization URL.
+///
+/// `pub` because TUI modals (e.g. the QR-login onboarding step) need to
+/// invoke the same platform browser launch the CLI flow already does via
+/// `LoginSession::open_browser_best_effort` — callers without a live
+/// `LoginSession` only carry the URL string, so they go through this
+/// free function directly.
 #[cfg(target_os = "macos")]
-fn open_browser(url: &str) -> Result<()> {
+pub fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("open")
         .arg(url)
         .spawn()
@@ -200,7 +513,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_browser(url: &str) -> Result<()> {
+pub fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(url)
         .spawn()
@@ -209,7 +522,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn open_browser(url: &str) -> Result<()> {
+pub fn open_browser(url: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
     std::process::Command::new("cmd")
         .raw_arg(format!("/C start \"\" \"{}\"", url))
@@ -219,7 +532,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn open_browser(_url: &str) -> Result<()> {
+pub fn open_browser(_url: &str) -> Result<()> {
     anyhow::bail!("Unsupported platform for browser auto-open");
 }
 
@@ -228,6 +541,10 @@ fn open_browser(_url: &str) -> Result<()> {
 /// where the browser hits `127.0.0.1:8765`; stdin path handles WSL /
 /// headless Linux where the user copies the callback URL from their
 /// browser's address bar and pastes it in.
+///
+/// Kept for potential future fallback use — the platform-broker flow in
+/// `login()` is the active callback path now.
+#[allow(dead_code)]
 fn await_callback(port: u16) -> Result<(String, String)> {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => Some(l),
@@ -333,9 +650,8 @@ fn await_callback(port: u16) -> Result<(String, String)> {
 /// the same terminal device; whichever syscall lands on a byte first
 /// gets it, and a blocked `read_line` stays in line for the next input.
 #[cfg(not(target_os = "windows"))]
-fn read_callback_from_stdin_until_stopped(
-    stop: &AtomicBool,
-) -> Result<(String, String)> {
+#[allow(dead_code)]
+fn read_callback_from_stdin_until_stopped(stop: &AtomicBool) -> Result<(String, String)> {
     use std::os::unix::io::AsRawFd;
 
     let stdin = io::stdin();
@@ -391,8 +707,7 @@ fn read_callback_from_stdin_until_stopped(
         }
         // Data available; drain what's there. read(2) in non-blocking
         // mode returns up to one pipe buffer in a single call.
-        let n =
-            unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::Interrupted {
@@ -414,6 +729,7 @@ fn read_callback_from_stdin_until_stopped(
 
 /// `stop` flag every 200ms so the caller can cancel (e.g. when the paste
 /// path won the race).
+#[allow(dead_code)]
 fn accept_callback_until_stopped(
     listener: TcpListener,
     stop: &AtomicBool,
@@ -521,59 +837,8 @@ fn urlencoding_decode(s: &str) -> String {
     result
 }
 
-/// Exchange authorization code for access token
-fn exchange_code_for_token(code: &str) -> Result<TokenResponse> {
-    let client = blocking_client();
-
-    let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
-        ("code", code),
-        ("redirect_uri", REDIRECT_URI),
-        ("grant_type", "authorization_code"),
-    ];
-
-    let response = client
-        .post(TOKEN_URL)
-        .form(&params)
-        .send()
-        .context("Failed to send token request")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!("Token request failed ({}): {}", status, body);
-    }
-
-    response
-        .json::<TokenResponse>()
-        .context("Failed to parse token response")
-}
-
-/// Get user information using access token
-fn get_user_info(access_token: &str) -> Result<UserResponse> {
-    let client = blocking_client();
-
-    let response = client
-        .get(USER_URL)
-        .bearer_auth(access_token)
-        .send()
-        .context("Failed to get user info")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!("User info request failed ({}): {}", status, body);
-    }
-
-    response
-        .json::<UserResponse>()
-        .context("Failed to parse user response")
-}
-
-/// Refresh the access token using the stored refresh_token.
+/// Refresh the access token using the stored refresh_token via Platform Broker.
 /// Returns updated AuthInfo with new tokens, and saves it to disk.
-#[allow(dead_code)]
 pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
     let refresh_token = auth
         .refresh_token
@@ -581,18 +846,13 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         .context("No refresh_token available — please /login again")?;
 
     let client = blocking_client();
-    let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
-        ("refresh_token", refresh_token),
-        ("grant_type", "refresh_token"),
-    ];
 
+    // Call Platform Broker API for refresh
     let response = client
-        .post(TOKEN_URL)
-        .form(&params)
+        .post(platform_refresh_url())
+        .json(&serde_json::json!({ "refresh_token": refresh_token }))
         .send()
-        .context("Failed to send refresh token request")?;
+        .context("Failed to send refresh token request to broker")?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -604,9 +864,16 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         );
     }
 
-    let token: TokenResponse = response
-        .json()
-        .context("Failed to parse refresh token response")?;
+    #[derive(Deserialize)]
+    struct BrokerResponse {
+        access_token: String,
+        token_type: Option<String>,
+        expires_in: Option<i64>,
+        refresh_token: Option<String>,
+        user: Option<PlatformUserInfo>,
+    }
+
+    let broker_resp: BrokerResponse = response.json().context("Failed to parse broker response")?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -614,12 +881,25 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
         .as_secs() as i64;
 
     let new_auth = AuthInfo {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token.or_else(|| auth.refresh_token.clone()),
-        token_type: token.token_type.unwrap_or_else(|| auth.token_type.clone()),
-        expires_in: token.expires_in.or(auth.expires_in),
+        access_token: broker_resp.access_token,
+        refresh_token: broker_resp
+            .refresh_token
+            .or_else(|| auth.refresh_token.clone()),
+        token_type: broker_resp
+            .token_type
+            .unwrap_or_else(|| auth.token_type.clone()),
+        expires_in: broker_resp.expires_in.or(auth.expires_in),
         created_at,
-        user: auth.user.clone(),
+        user: broker_resp
+            .user
+            .map(|u| UserInfo {
+                id: u.id,
+                username: u.username,
+                name: u.name,
+                email: u.email,
+                avatar_url: u.avatar_url,
+            })
+            .unwrap_or_else(|| auth.user.clone()),
     };
 
     save_auth(&new_auth)?;
@@ -628,7 +908,6 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
 
 /// Get a valid access token, refreshing automatically if expired.
 /// Returns the access token string ready to use.
-#[allow(dead_code)]
 pub fn get_valid_token() -> Result<String> {
     let auth = get_stored_auth().context("Not logged in — please use /login first")?;
 
@@ -691,30 +970,49 @@ pub fn get_stored_auth() -> Option<AuthInfo> {
 /// Save auth info to file
 pub fn save_auth(auth: &AuthInfo) -> Result<()> {
     let auth_path = auth_file_path();
+
+    // Ensure parent directory exists
+    if let Some(parent) = auth_path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create auth directory")?;
+        // Set directory permissions to 0o700 (owner only) on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
     let content = toml::to_string_pretty(auth).context("Failed to serialize auth info")?;
     super::write_auth_file_secure(&auth_path, &content).context("Failed to write auth file")?;
 
-    println!("  Auth saved to: {}\n", auth_path.display());
+    // Set file permissions to 0o600 (owner read/write only) on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .context("Failed to set auth file permissions")?;
+    }
 
+    // No stdout output here. `save_auth` is called from CLI flows, TUI
+    // slash commands, the daemon, AND the silent in-chat 401 → refresh
+    // path. Printing here would corrupt the TUI input box on the silent
+    // refresh path (the cursor sits in the prompt and `println!` bypasses
+    // the renderer). CLI callers print their own user-facing success
+    // message right after calling this.
     Ok(())
 }
 
 /// Get path to auth file
 pub fn auth_file_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".atomcode")
-        .join("auth.toml")
+    crate::config::Config::config_dir().join("auth.toml")
 }
 
 /// Check if user is logged in
-#[allow(dead_code)]
 pub fn is_logged_in() -> bool {
     get_stored_auth().is_some()
 }
 
 /// Get current user info (if logged in)
-#[allow(dead_code)]
 pub fn current_user() -> Option<UserInfo> {
     get_stored_auth().map(|auth| auth.user)
 }
@@ -724,6 +1022,7 @@ pub fn current_user() -> Option<UserInfo> {
 /// Accepts any URL with a query string containing `code` and `state`.
 /// Rejects raw `code` without URL context — state validation is CSRF
 /// protection and we want the full round-trip, not a manually typed code.
+#[allow(dead_code)]
 fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
     // Defensively strip bracketed-paste markers. The TUI disables DECSET
     // 2004 before calling us, but a user pasting into a terminal we didn't
@@ -775,6 +1074,48 @@ fn parse_pasted_callback(input: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_force_login_removes_trailing_param() {
+        let url = "https://atomgit.com/oauth/authorize?client_id=abc&state=xyz&force_login=true";
+        assert_eq!(
+            strip_force_login(url),
+            "https://atomgit.com/oauth/authorize?client_id=abc&state=xyz"
+        );
+    }
+
+    #[test]
+    fn strip_force_login_removes_middle_param() {
+        let url = "https://atomgit.com/oauth/authorize?client_id=abc&force_login=true&state=xyz";
+        assert_eq!(
+            strip_force_login(url),
+            "https://atomgit.com/oauth/authorize?client_id=abc&state=xyz"
+        );
+    }
+
+    #[test]
+    fn strip_force_login_removes_only_param() {
+        let url = "https://atomgit.com/oauth/authorize?force_login=true";
+        assert_eq!(
+            strip_force_login(url),
+            "https://atomgit.com/oauth/authorize"
+        );
+    }
+
+    #[test]
+    fn strip_force_login_removes_first_of_many() {
+        let url = "https://atomgit.com/oauth/authorize?force_login=true&state=xyz";
+        assert_eq!(
+            strip_force_login(url),
+            "https://atomgit.com/oauth/authorize?state=xyz"
+        );
+    }
+
+    #[test]
+    fn strip_force_login_passthrough_when_absent() {
+        let url = "https://atomgit.com/oauth/authorize?client_id=abc&state=xyz";
+        assert_eq!(strip_force_login(url), url);
+    }
 
     #[test]
     fn parse_happy_path_loopback_url() {
@@ -850,5 +1191,79 @@ mod tests {
                 .unwrap();
         assert_eq!(code, "abc");
         assert_eq!(state, "xyz");
+    }
+
+    // ----- classify_input (ESC vs escape-sequence disambiguation) -----
+
+    #[test]
+    fn classify_input_bare_esc_cancels() {
+        assert_eq!(classify_input(&[0x1B]), EscOutcome::Cancelled);
+    }
+
+    #[test]
+    fn classify_input_arrow_key_ignored() {
+        // Up arrow = ESC [ A — three bytes arriving in a single read.
+        assert_eq!(classify_input(b"\x1B[A"), EscOutcome::OtherInput);
+    }
+
+    #[test]
+    fn classify_input_alt_letter_ignored() {
+        // Alt+a delivered as ESC + 'a' on most terminals.
+        assert_eq!(classify_input(b"\x1Ba"), EscOutcome::OtherInput);
+    }
+
+    #[test]
+    fn classify_input_normal_byte_ignored() {
+        assert_eq!(classify_input(b"q"), EscOutcome::OtherInput);
+    }
+
+    #[test]
+    fn classify_input_empty_is_timeout() {
+        assert_eq!(classify_input(&[]), EscOutcome::Timeout);
+    }
+
+    #[test]
+    fn classify_input_pasted_text_ignored() {
+        assert_eq!(classify_input(b"hello\n"), EscOutcome::OtherInput);
+    }
+
+    #[test]
+    fn classify_input_csi_color_code_ignored() {
+        // Bracketed-paste / OSC sequences and other CSI fragments must
+        // not be mistaken for ESC. `\x1B[31m` = SGR red.
+        assert_eq!(classify_input(b"\x1B[31m"), EscOutcome::OtherInput);
+    }
+
+    // ----- sanitize_base_url -----
+
+    #[test]
+    fn sanitize_adds_http_if_no_scheme() {
+        assert_eq!(sanitize_base_url("127.0.0.1:8765"), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn sanitize_preserves_http_scheme() {
+        assert_eq!(sanitize_base_url("http://127.0.0.1:8765"), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn sanitize_preserves_https_scheme() {
+        assert_eq!(sanitize_base_url("https://acs.example.com"), "https://acs.example.com");
+    }
+
+    #[test]
+    fn sanitize_strips_trailing_slash() {
+        assert_eq!(sanitize_base_url("http://127.0.0.1:8765/"), "http://127.0.0.1:8765");
+        assert_eq!(sanitize_base_url("http://127.0.0.1:8765///"), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn sanitize_trims_whitespace() {
+        assert_eq!(sanitize_base_url("  http://127.0.0.1:8765  "), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn sanitize_no_scheme_with_trailing_slash() {
+        assert_eq!(sanitize_base_url("127.0.0.1:8765/"), "http://127.0.0.1:8765");
     }
 }

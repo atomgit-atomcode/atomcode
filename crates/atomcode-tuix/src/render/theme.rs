@@ -1,6 +1,7 @@
 // crates/atomcode-tuix/src/render/theme.rs
 use crossterm::style::Color;
 
+use crate::highlight::theme as md_theme;
 use crate::terminal::TerminalCaps;
 
 /// Basic 16-color palette — SGR 30-37/90-97 only, no truecolor RGB.
@@ -31,7 +32,31 @@ impl Palette {
     // light themes (most terminals give them enough contrast with the
     // default background).
     pub const BRAND: Color = Color::Magenta; // bright magenta (95)
-    pub const MUTED: Color = Color::DarkGrey; // bright black / mid-gray (90)
+
+    /// Muted text on **light** backgrounds. SGR 90 ("bright black") maps
+    /// to a mid-gray on most light themes — contrast against `#FFFFFF`
+    /// lands around 4.5–5:1, comfortably above AA.
+    pub const MUTED_LIGHT: Color = Color::DarkGrey; // SGR 90
+
+    /// Muted text on **dark** backgrounds. SGR 37 ("regular white") maps
+    /// to a soft light-gray on dark themes — contrast against `#1B1B1B`
+    /// to `#303030` lands around 8–10:1.
+    ///
+    /// Earlier this was `Color::DarkGrey` (SGR 90) for both modes on the
+    /// theory that the terminal's palette would adapt. Reality from
+    /// Warp / iTerm2 / Mac Terminal screenshots: most dark themes map
+    /// SGR 90 to ~`#3F3F3F` (≈ 3:1 against the dark bg) — child rows
+    /// under a tool-batch header rendered almost invisible. Splitting
+    /// MUTED into light/dark variants and switching via
+    /// `is_light_for_render` recovers readable contrast on both.
+    pub const MUTED_DARK: Color = Color::White; // SGR 37
+
+    /// Back-compat alias — same value as `MUTED_LIGHT` so old call sites
+    /// that pre-date the dark-mode split keep compiling. New code should
+    /// call [`muted_for_current_theme`] instead so the shade tracks the
+    /// active palette.
+    pub const MUTED: Color = Self::MUTED_LIGHT;
+
     pub const ACCENT: Color = Color::Cyan; // bright cyan (96)
     pub const BORDER: Color = Color::Cyan; // bright cyan (96) — 蓝绿色边框，和 Accent/prompt glyph 视觉呼应，对比度高于 DarkGrey 不易被背景吞掉
     pub const WARNING: Color = Color::Yellow; // bright yellow (93)
@@ -39,6 +64,22 @@ impl Palette {
     pub const DIFF_ADD: Color = Color::Green; // bright green (92)
     pub const DIFF_REMOVE: Color = Color::Red; // bright red (91) — paired with Error
     pub const CODE: Color = Color::Cyan; // bright cyan (96)
+}
+
+/// Resolve the muted shade for the active palette.
+///
+/// Light theme → `MUTED_LIGHT` (SGR 90, dark gray on white).
+/// Dark theme  → `MUTED_DARK`  (SGR 37, light gray on dark).
+///
+/// Routed through this fn rather than a `const` so role lookups
+/// pick up live theme switches (auto-detect at startup + future
+/// `/theme` slash command) without restart.
+pub fn muted_for_current_theme() -> Color {
+    if md_theme::is_light_for_render() {
+        Palette::MUTED_LIGHT
+    } else {
+        Palette::MUTED_DARK
+    }
 }
 
 /// Semantic colour role → concrete Color, honouring NO_COLOR etc.
@@ -51,9 +92,9 @@ pub fn role(caps: TerminalCaps, role: Role) -> Option<Color> {
     }
     match role {
         Role::Brand => Some(Palette::BRAND),
-        Role::Muted => Some(Palette::MUTED),
+        Role::Muted => Some(muted_for_current_theme()),
         Role::Accent => Some(Palette::ACCENT),
-        Role::AccentDim => Some(Palette::MUTED),
+        Role::AccentDim => Some(muted_for_current_theme()),
         // Secondary = default terminal foreground. Using None means
         // "don't emit a colour SGR"; text shows in whatever colour the
         // terminal's theme chose for regular output.
@@ -98,9 +139,8 @@ mod tests {
             no_color: !colors,
             term: Some("xterm".to_string()),
             colorterm: Some("truecolor".to_string()),
-            force_ascii: false,
             lang: Some("en_US.UTF-8".to_string()),
-            lc_all: None,
+            ..Default::default()
         })
     }
 
@@ -112,6 +152,49 @@ mod tests {
     #[test]
     fn role_returns_palette_when_colors_enabled() {
         assert_eq!(role(caps(true), Role::Brand), Some(Palette::BRAND));
+    }
+
+    #[test]
+    fn muted_switches_with_theme() {
+        // Take the theme lock so we don't race other theme-switching
+        // tests in the highlight module — `MODE` is a process-wide
+        // AtomicU8 and parallel test runs would interleave reads.
+        use crate::highlight::theme as md_theme;
+        md_theme::set_theme_mode(false); // dark
+        assert_eq!(
+            role(caps(true), Role::Muted),
+            Some(Palette::MUTED_DARK),
+            "dark theme must use SGR 37 (regular white) for muted — \
+             SGR 90 reads invisible on Warp / iTerm2 / Mac Terminal dark"
+        );
+        assert_eq!(
+            role(caps(true), Role::AccentDim),
+            Some(Palette::MUTED_DARK),
+            "AccentDim must track the same muted shade as Role::Muted"
+        );
+
+        md_theme::set_theme_mode(true); // light
+        assert_eq!(
+            role(caps(true), Role::Muted),
+            Some(Palette::MUTED_LIGHT),
+            "light theme must use SGR 90 (bright black) — `white` would \
+             be invisible against the white background"
+        );
+        assert_eq!(
+            role(caps(true), Role::AccentDim),
+            Some(Palette::MUTED_LIGHT)
+        );
+
+        // Restore default (dark) so subsequent tests see the legacy state.
+        md_theme::set_theme_mode(false);
+    }
+
+    #[test]
+    fn back_compat_muted_alias_is_light_variant() {
+        // `Palette::MUTED` predates the dark-mode split. Pin that it
+        // continues to mean the light-mode shade so any caller that
+        // still references the bare constant doesn't silently break.
+        assert_eq!(Palette::MUTED, Palette::MUTED_LIGHT);
     }
 
     #[test]

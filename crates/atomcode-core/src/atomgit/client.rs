@@ -21,9 +21,7 @@ impl Client {
     /// user hasn't logged in.
     pub fn from_stored_auth() -> Result<Self> {
         if !auth::is_logged_in() {
-            return Err(anyhow!(
-                "not logged in — run `atomcode login` first"
-            ));
+            return Err(anyhow!("not logged in — run `atomcode login` first"));
         }
         let token = auth::get_valid_token()
             .context("failed to load OAuth token (try `atomcode login` again)")?;
@@ -61,9 +59,7 @@ impl Client {
                 r.number
             ));
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(anyhow!(
                 "authentication failed ({}) — run `atomcode login` again",
                 status.as_u16()

@@ -6,21 +6,24 @@
 //! - 自动重试
 //! - 自定义 Header（如认证 Token）
 
-use std::sync::Arc;
 use std::time::Duration;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::async_batcher::{AsyncWebhookBatcher, AsyncWebhookConfig, WebhookEvent};
 use crate::hook::{
-    ErrorContext, Hook, HookContext, HookResult, OnErrorHook, OnMessageReceivedHook,
-    OnModelResponseHook, OnSessionEndHook, OnSessionStartHook, OnToolCallStartHook,
-    OnTurnCompleteHook, OnTurnStartHook, PostToolExecutionHook, PostTurnHook, PreToolExecutionHook,
-    SessionContext, SystemPromptHook, ToolCallStartContext, ToolResultContext, TurnCompleteContext,
-    TurnStartContext, UserMessageContext,
+    Hook, HookResult,
+    OnMessageReceivedHook, OnTurnStartHook, OnTurnCompleteHook,
+    OnToolCallStartHook, OnModelResponseHook,
+    OnSessionStartHook, OnSessionEndHook, OnErrorHook,
+    PreToolExecutionHook, PostToolExecutionHook, PostTurnHook, SystemPromptHook,
+    UserMessageContext, TurnStartContext, TurnCompleteContext,
+    ToolCallStartContext, ToolResultContext, HookCtx,
+    ErrorContext, SessionContext,
 };
+use super::async_batcher::{AsyncWebhookBatcher, AsyncWebhookConfig, WebhookEvent};
 
 /// Webhook 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,13 +87,9 @@ impl WebhookHook {
             .unwrap_or_else(|_| Client::new());
 
         // 如果配置了批量处理，创建异步批处理器
-        let async_batcher = None; // 默认使用同步模式
+        let async_batcher = None;  // 默认使用同步模式
 
-        Self {
-            config,
-            client,
-            async_batcher,
-        }
+        Self { config, client, async_batcher }
     }
 
     /// 创建带异步批处理器的 WebhookHook
@@ -113,11 +112,7 @@ impl WebhookHook {
         // 如果启用了异步批处理，使用异步模式
         if let Some(ref batcher) = self.async_batcher {
             let event = WebhookEvent {
-                event: payload
-                    .get("event")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
+                event: payload.get("event").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                 hook_name: self.config.name.clone(),
                 trigger: self.config.trigger.clone(),
                 context: payload.clone(),
@@ -144,9 +139,7 @@ impl WebhookHook {
 
         // 构建请求
         let mut request = self.client.request(
-            method
-                .parse()
-                .map_err(|e| format!("Invalid HTTP method: {}", e))?,
+            method.parse().map_err(|e| format!("Invalid HTTP method: {}", e))?,
             url,
         );
 
@@ -165,9 +158,7 @@ impl WebhookHook {
         // 发送请求（带重试）
         let mut last_error = None;
         for attempt in 0..=self.config.retries {
-            let req = request
-                .try_clone()
-                .ok_or_else(|| "Failed to clone request".to_string())?;
+            let req = request.try_clone().ok_or_else(|| "Failed to clone request".to_string())?;
 
             match req.json(payload).send().await {
                 Ok(response) => {
@@ -187,9 +178,7 @@ impl WebhookHook {
                     } else {
                         last_error = Some(format!(
                             "HTTP {} at attempt {}: {}",
-                            status,
-                            attempt + 1,
-                            body
+                            status, attempt + 1, body
                         ));
                     }
                 }
@@ -301,9 +290,8 @@ impl OnToolCallStartHook for WebhookHook {
 
 #[async_trait]
 impl PreToolExecutionHook for WebhookHook {
-    async fn on_pre_execute(&self, ctx: &HookContext) -> HookResult {
-        if !self.config.trigger.contains("pre_tool") && !self.config.trigger.contains("before_tool")
-        {
+    async fn on_pre_execute(&self, ctx: &HookCtx) -> HookResult {
+        if !self.config.trigger.contains("pre_tool") && !self.config.trigger.contains("before_tool") {
             return HookResult::Ok;
         }
 
@@ -323,13 +311,8 @@ impl PreToolExecutionHook for WebhookHook {
 
 #[async_trait]
 impl PostToolExecutionHook for WebhookHook {
-    async fn on_post_execute(
-        &self,
-        ctx: &HookContext,
-        result_ctx: &ToolResultContext,
-    ) -> HookResult {
-        if !self.config.trigger.contains("post_tool") && !self.config.trigger.contains("after_tool")
-        {
+    async fn on_post_execute(&self, ctx: &HookCtx, result_ctx: &ToolResultContext) -> HookResult {
+        if !self.config.trigger.contains("post_tool") && !self.config.trigger.contains("after_tool") {
             return HookResult::Ok;
         }
 
@@ -351,9 +334,7 @@ impl PostToolExecutionHook for WebhookHook {
 #[async_trait]
 impl OnTurnCompleteHook for WebhookHook {
     async fn on_turn_complete(&self, ctx: &TurnCompleteContext) -> HookResult {
-        if !self.config.trigger.contains("turn_complete")
-            && !self.config.trigger.contains("after_turn")
-        {
+        if !self.config.trigger.contains("turn_complete") && !self.config.trigger.contains("after_turn") {
             return HookResult::Ok;
         }
 
@@ -373,7 +354,7 @@ impl OnTurnCompleteHook for WebhookHook {
 
 #[async_trait]
 impl PostTurnHook for WebhookHook {
-    async fn on_post_turn(&self, ctx: &HookContext, turn_result: &str) -> HookResult {
+    async fn on_post_turn(&self, ctx: &HookCtx, turn_result: &str) -> HookResult {
         if !self.config.trigger.contains("post_turn") {
             return HookResult::Ok;
         }
@@ -515,5 +496,250 @@ fn parse_webhook_response(response: &WebhookResponse) -> HookResult {
         "deny" => HookResult::Denied(response.message.clone().unwrap_or_default()),
         "modify" => HookResult::Modified(response.modified_content.clone().unwrap_or_default()),
         _ => HookResult::Warning(format!("Unknown webhook result: {}", response.result)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    // -----------------------------------------------------------------------
+    // WebhookConfig defaults
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_webhook_config_defaults() {
+        let json = r#"{
+            "name": "test-hook",
+            "trigger": "message",
+            "url": "https://example.com/hook"
+        }"#;
+
+        let config: WebhookConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.name, "test-hook");
+        assert_eq!(config.trigger, "message");
+        assert_eq!(config.url, "https://example.com/hook");
+        assert_eq!(config.method, "POST");
+        assert_eq!(config.timeout_secs, 10);
+        assert_eq!(config.retries, 2);
+        assert!(config.enabled);
+        assert!(config.description.is_empty());
+        assert!(config.headers.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // WebhookConfig serialization roundtrip
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_webhook_config_roundtrip() {
+        let config = WebhookConfig {
+            name: "roundtrip-hook".to_string(),
+            trigger: "error".to_string(),
+            url: "http://localhost:9999/hook".to_string(),
+            method: "PUT".to_string(),
+            headers: [("X-Auth".to_string(), "token123".to_string())].into(),
+            timeout_secs: 30,
+            retries: 5,
+            enabled: false,
+            description: "My hook".to_string(),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: WebhookConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.name, config.name);
+        assert_eq!(deserialized.trigger, config.trigger);
+        assert_eq!(deserialized.url, config.url);
+        assert_eq!(deserialized.method, config.method);
+        assert_eq!(deserialized.headers.get("X-Auth").unwrap(), "token123");
+        assert_eq!(deserialized.timeout_secs, 30);
+        assert_eq!(deserialized.retries, 5);
+        assert!(!deserialized.enabled);
+        assert_eq!(deserialized.description, "My hook");
+    }
+
+    // -----------------------------------------------------------------------
+    // WebhookResponse serialization roundtrip
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_webhook_response_roundtrip_ok() {
+        let resp = WebhookResponse {
+            result: "ok".to_string(),
+            message: None,
+            modified_content: None,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: WebhookResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.result, "ok");
+        assert!(deserialized.message.is_none());
+        assert!(deserialized.modified_content.is_none());
+    }
+
+    #[test]
+    fn test_webhook_response_roundtrip_warning() {
+        let resp = WebhookResponse {
+            result: "warning".to_string(),
+            message: Some("be careful".to_string()),
+            modified_content: None,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: WebhookResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.result, "warning");
+        assert_eq!(deserialized.message.unwrap(), "be careful");
+    }
+
+    #[test]
+    fn test_webhook_response_roundtrip_deny() {
+        let resp = WebhookResponse {
+            result: "deny".to_string(),
+            message: Some("blocked".to_string()),
+            modified_content: None,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: WebhookResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.result, "deny");
+        assert_eq!(deserialized.message.unwrap(), "blocked");
+    }
+
+    #[test]
+    fn test_webhook_response_roundtrip_modify() {
+        let resp = WebhookResponse {
+            result: "modify".to_string(),
+            message: Some("updated".to_string()),
+            modified_content: Some("new content".to_string()),
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: WebhookResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.result, "modify");
+        assert_eq!(deserialized.message.unwrap(), "updated");
+        assert_eq!(deserialized.modified_content.unwrap(), "new content");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_webhook_response
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_webhook_response_ok() {
+        let resp = WebhookResponse {
+            result: "ok".to_string(),
+            message: None,
+            modified_content: None,
+        };
+        let result = parse_webhook_response(&resp);
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    #[test]
+    fn test_parse_webhook_response_warning() {
+        let resp = WebhookResponse {
+            result: "warning".to_string(),
+            message: Some("caution".to_string()),
+            modified_content: None,
+        };
+        let result = parse_webhook_response(&resp);
+        assert!(matches!(result, HookResult::Warning(_)));
+        if let HookResult::Warning(msg) = result {
+            assert_eq!(msg, "caution");
+        }
+    }
+
+    #[test]
+    fn test_parse_webhook_response_deny() {
+        let resp = WebhookResponse {
+            result: "deny".to_string(),
+            message: Some("forbidden".to_string()),
+            modified_content: None,
+        };
+        let result = parse_webhook_response(&resp);
+        assert!(matches!(result, HookResult::Denied(_)));
+        if let HookResult::Denied(msg) = result {
+            assert_eq!(msg, "forbidden");
+        }
+    }
+
+    #[test]
+    fn test_parse_webhook_response_modify() {
+        let resp = WebhookResponse {
+            result: "modify".to_string(),
+            message: None,
+            modified_content: Some("altered".to_string()),
+        };
+        let result = parse_webhook_response(&resp);
+        assert!(matches!(result, HookResult::Modified(_)));
+        if let HookResult::Modified(content) = result {
+            assert_eq!(content, "altered");
+        }
+    }
+
+    #[test]
+    fn test_parse_webhook_response_unknown() {
+        let resp = WebhookResponse {
+            result: "unknown_value".to_string(),
+            message: None,
+            modified_content: None,
+        };
+        let result = parse_webhook_response(&resp);
+        assert!(matches!(result, HookResult::Warning(_)));
+        if let HookResult::Warning(msg) = result {
+            assert!(msg.contains("unknown_value"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WebhookHook::new
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_webhook_hook_new() {
+        let config = WebhookConfig {
+            name: "my-hook".to_string(),
+            trigger: "message".to_string(),
+            url: "http://localhost:1234/hook".to_string(),
+            method: "POST".to_string(),
+            headers: std::collections::HashMap::new(),
+            timeout_secs: 5,
+            retries: 1,
+            enabled: true,
+            description: "Test hook".to_string(),
+        };
+
+        let hook = WebhookHook::new(config);
+
+        assert_eq!(hook.name(), "my-hook");
+        assert_eq!(hook.description(), "Test hook");
+        assert!(hook.is_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // Hook trait
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_webhook_hook_trait() {
+        let config = WebhookConfig {
+            name: "trait-test".to_string(),
+            trigger: "error".to_string(),
+            url: "http://localhost:5678/hook".to_string(),
+            method: "POST".to_string(),
+            headers: std::collections::HashMap::new(),
+            timeout_secs: 3,
+            retries: 0,
+            enabled: false,
+            description: "Disabled hook".to_string(),
+        };
+
+        let hook = WebhookHook::new(config);
+
+        // Hook trait methods
+        assert_eq!(hook.name(), "trait-test");
+        assert_eq!(hook.description(), "Disabled hook");
+        assert!(!hook.is_enabled());
     }
 }

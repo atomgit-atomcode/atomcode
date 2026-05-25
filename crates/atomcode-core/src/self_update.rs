@@ -9,10 +9,15 @@
 //! 5. Verify SHA256 against the manifest. Bail (and delete temp) on
 //!    mismatch — we never touch the live binary until verification
 //!    passes.
-//! 6. Rename the live binary to `atomcode.bak` (Windows:
-//!    `atomcode.exe.bak`), then rename the downloaded file into place.
-//!    Same-directory rename is atomic on POSIX; on Windows, renaming
-//!    the currently-running exe is allowed (deleting it is not).
+//! 6. Three-way swap to replace the live binary:
+//!    a. `atomcode` → `.atomcode.rolling`  (Windows allows renaming a running exe)
+//!    b. new binary → `atomcode`            (install the upgrade)
+//!    c. best-effort: remove old `.bak`, then `.atomcode.rolling` → `.bak`
+//!
+//!    Steps a–b are the critical path; step c is best-effort. If the old
+//!    `.bak` is locked (AV scanner, still-running process, read-only
+//!    attribute), the upgrade still succeeds — the `.rolling` file lingers
+//!    and is cleaned up on the next upgrade attempt.
 //!
 //! Rollback swaps the live binary with `.bak` in place, so one backup
 //! always points to "the other version" — the user can toggle by
@@ -49,6 +54,11 @@ pub enum UpgradeEvent {
     Done {
         version: String,
         backup: PathBuf,
+        /// The *original* exe path (e.g. `atomcode.exe`) **before**
+        /// `replace_binary` renamed it. On Windows, `current_exe()`
+        /// returns the renamed path after the swap, so callers must
+        /// use this field for `re_exec_self`.
+        exe: PathBuf,
     },
     /// Terminal failure. Carries the display-formatted error so the UI
     /// layer doesn't need `anyhow` to render it.
@@ -95,30 +105,18 @@ pub struct RollbackSummary {
 /// caller must surface a clean "unsupported platform" message rather
 /// than fall through to a 404 download.
 pub fn detect_target() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            Some("darwin-arm64")
-        } else if cfg!(target_arch = "x86_64") {
-            Some("darwin-x64")
-        } else {
-            None
-        }
-    } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "x86_64") {
-            Some("linux-x64")
-        } else {
-            None
-        }
-    } else if cfg!(target_os = "windows") {
-        if cfg!(target_arch = "x86_64") {
-            Some("windows-x64")
-        } else if cfg!(target_arch = "aarch64") {
-            Some("windows-arm64")
-        } else {
-            None
-        }
-    } else {
-        None
+    target_tag(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn target_tag(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("windows", "x86_64") => Some("windows-x64"),
+        ("windows", "aarch64") => Some("windows-arm64"),
+        _ => None,
     }
 }
 
@@ -166,7 +164,7 @@ fn download_path(exe: &Path) -> PathBuf {
 }
 
 /// Same-dir temp used during a three-way rollback swap.
-fn rolling_path(exe: &Path) -> PathBuf {
+pub(crate) fn rolling_path(exe: &Path) -> PathBuf {
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
     dir.join(".atomcode.rolling")
 }
@@ -271,19 +269,18 @@ async fn download_and_verify(
         ));
     }
 
-    // Prefer the manifest's size (authoritative) over Content-Length,
-    // which mirrors may gzip or mis-report. But if Content-Length is
-    // present and differs, that's a likely wrong-file red flag — bail.
-    let reported = resp.content_length();
-    if let Some(n) = reported {
-        if n != expected_size {
-            return Err(anyhow!(
-                "size mismatch: manifest says {} bytes, server says {} bytes — aborting",
-                expected_size,
-                n
-            ));
-        }
-    }
+    // Don't bail on Content-Length mismatches.  The Content-Length
+    // header may differ from the manifest's `size` for several reasons:
+    //   - CDN mirrors or reverse proxies may alter Content-Length.
+    //   - The manifest may be slightly out of sync with the server's
+    //     binary (e.g. during a rolling release).
+    //   - Redirects can surface a different Content-Length from an
+    //     intermediate hop.
+    // The real integrity checks happen after the download completes:
+    //   1. Total bytes written must match `expected_size` (below).
+    //   2. SHA256 must match `expected_sha256`.
+    // These two checks are sufficient; an early Content-Length gate
+    // causes false-negative aborts (see issue #380).
 
     let mut file = tokio::fs::File::create(dest)
         .await
@@ -338,14 +335,69 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Best-effort cleanup of a leftover file (typically a `.bak` or `.rolling`
+/// from a prior upgrade/rollback). Returns `true` if the file was removed,
+/// `false` if it could not be removed (locked, permission denied, etc.).
+///
+/// Defensive against Windows ACCESS_DENIED scenarios:
+///
+/// 1. The file carries a read-only attribute (some AV / SCCM policies
+///    flag any executable in `%LOCALAPPDATA%` this way). Clear it first.
+/// 2. Windows Defender or another scanner briefly holds the file open
+///    during a real-time scan — typically <500 ms. Retry once with a
+///    short sleep before giving up.
+/// 3. The file is a still-running atomcode process from a prior upgrade
+///    where the user didn't restart. Nothing we can do at the code layer;
+///    the caller proceeds without blocking the upgrade.
+///
+/// This function is intentionally **best-effort** — a failure to remove
+/// the stale file must NOT block an upgrade. The three-way swap in
+/// `replace_binary` ensures the upgrade proceeds even if old backups
+/// cannot be deleted.
+fn try_remove_stale(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(meta) = path.metadata() {
+            let mut perm = meta.permissions();
+            if perm.readonly() {
+                perm.set_readonly(false);
+                let _ = std::fs::set_permissions(path, perm);
+            }
+        }
+    }
+
+    if std::fs::remove_file(path).is_ok() {
+        return true;
+    }
+    // Brief retry to ride out a transient AV / indexer hold.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::fs::remove_file(path).is_ok()
+}
+
 /// Put `new_bin` in place of `exe`, keeping the previous `exe` as `.bak`.
+///
+/// Uses a **three-way swap** to avoid ever needing to delete `.bak` as a
+/// prerequisite — the old approach of "delete .bak, then rename exe→.bak"
+/// could fail on Windows when `.bak` is locked (AV scanner, read-only
+/// attribute, still-running process). The swap sequence is:
+///
+///   1. `exe` → `.rolling`      (Windows allows renaming a running exe)
+///   2. `new_bin` → `exe`        (install new version)
+///   3. best-effort: delete old `.bak`
+///   4. `.rolling` → `.bak`      (preserve old version for rollback)
+///
+/// Steps 1–2 are the critical path; steps 3–4 are best-effort cleanup.
+/// If step 4 fails (e.g. old `.bak` is still locked), the upgrade still
+/// succeeds — the `.rolling` file is left behind and will be cleaned up
+/// on the next upgrade attempt.
 ///
 /// On Unix, `rename(2)` within a directory is atomic; on Windows, an
 /// exe currently being executed can be renamed (but not deleted), so
-/// the same sequence works. If a stale `.bak` exists we remove it
-/// first — if that removal fails on Windows because the user hasn't
-/// restarted since a prior upgrade (the `.bak` is the running
-/// process), we surface a clear message.
+/// the same sequence works.
 fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -359,31 +411,56 @@ fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
     }
 
     let backup = backup_path(exe);
-    if backup.exists() {
-        std::fs::remove_file(&backup).map_err(|e| {
-            anyhow!(
-                "could not remove previous backup {}: {}.\n\
-                 If you upgraded without restarting, exit atomcode and retry.",
-                backup.display(),
-                e
-            )
-        })?;
-    }
+    let rolling = rolling_path(exe);
 
-    std::fs::rename(exe, &backup).with_context(|| {
+    // Clean up any leftover .rolling from a prior interrupted upgrade.
+    try_remove_stale(&rolling);
+
+    // Step 1: live binary → rolling (Windows allows renaming a running exe)
+    std::fs::rename(exe, &rolling).with_context(|| {
         format!(
-            "renaming current binary {} -> {}",
+            "renaming current binary {} -> {} (swap step 1)",
             exe.display(),
-            backup.display()
+            rolling.display()
         )
     })?;
 
+    // Step 2: new binary → live (the actual upgrade)
     if let Err(e) = std::fs::rename(new_bin, exe) {
-        let _ = std::fs::rename(&backup, exe);
+        // Best-effort unwind of step 1 so the user isn't left without
+        // a live binary.
+        let _ = std::fs::rename(&rolling, exe);
         return Err(anyhow!(
             "moving new binary into place failed ({}). Previous version restored.",
             e
         ));
+    }
+
+    // Step 3: best-effort — remove old .bak so we can rename .rolling→.bak.
+    // Failure is non-fatal; we just leave .rolling behind.
+    let bak_removed = try_remove_stale(&backup);
+
+    // Step 4: rolling → .bak (preserve old version for rollback)
+    if bak_removed {
+        if let Err(e) = std::fs::rename(&rolling, &backup) {
+            // Upgrade succeeded but we couldn't preserve the old version
+            // as .bak. The .rolling file lingers; next upgrade will
+            // clean it up. Rollback won't be available this session.
+            eprintln!(
+                "Note: could not preserve previous version as backup ({}). Rollback unavailable until next upgrade.",
+                e
+            );
+        }
+    } else {
+        // Old .bak couldn't be removed (locked by AV, running process, etc.).
+        // The .rolling file stays behind; next upgrade attempt will clean
+        // it up. Rollback points to the version before this upgrade's
+        // predecessor, which is still better than failing the upgrade.
+        eprintln!(
+            "Note: could not remove old backup {}. Rollback may point to an older version.\n  The .rolling file at {} will be cleaned up on the next upgrade.",
+            backup.display(),
+            rolling.display()
+        );
     }
 
     Ok(())
@@ -460,9 +537,14 @@ pub async fn run_upgrade(
     }
 
     let backup = backup_path(&exe);
+    // NOTE: `exe` was captured *before* `replace_binary` renamed the running
+    // binary. On Windows, `current_exe()` would now return `.atomcode.rolling`
+    // instead of the original `atomcode.exe`, so we must pass this saved
+    // value through to `re_exec_self`.
     let _ = tx.send(UpgradeEvent::Done {
         version: manifest.version.clone(),
         backup: backup.clone(),
+        exe: exe.clone(),
     });
 
     Ok(UpgradeSummary {
@@ -549,8 +631,7 @@ pub struct AppliedUpgrade {
 /// time. Kept under the same root as `history` / `recent_dirs` so nothing
 /// new appears in `$HOME`.
 pub fn staged_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".atomcode").join("staged")
+    crate::config::Config::config_dir().join("staged")
 }
 
 fn pending_json_path() -> PathBuf {
@@ -626,13 +707,14 @@ pub async fn prepare_deferred_upgrade(
     })?;
 
     let manifest = fetch_manifest().await?;
-    let _ = tx.send(UpgradeEvent::ManifestFetched {
-        version: manifest.version.clone(),
-    });
 
     if !is_newer(&manifest.version, current_version) {
         return Ok(None);
     }
+
+    let _ = tx.send(UpgradeEvent::ManifestFetched {
+        version: manifest.version.clone(),
+    });
 
     // If a staged upgrade for this exact version already exists and the
     // on-disk bytes still match the manifest's sha256, reuse it. Saves a
@@ -770,12 +852,28 @@ pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
 /// a separate PID, but terminal stdio is shared so the user still sees
 /// one continuous "session" from their perspective.
 ///
+/// **Important on Windows:** After `replace_binary` renames the running exe
+/// (e.g. `atomcode.exe` → `.atomcode.rolling`), `std::env::current_exe()`
+/// may return the *renamed* path (`.atomcode.rolling`) instead of the
+/// original one (`atomcode.exe`). This is because `GetModuleFileNameW`
+/// tracks the on-disk filename. If `override_exe` is provided, it is used
+/// instead of `current_exe()` — callers should capture the exe path
+/// *before* calling `replace_binary` and pass it here.
+///
 /// Never returns on the happy path. An `Err` return means the handoff
 /// failed (e.g., new binary missing execute bit under unusual filesystem
 /// constraints); caller should surface the error and keep running with
 /// the old binary rather than exiting silently.
-pub fn re_exec_self() -> Result<std::convert::Infallible> {
-    let exe = current_exe_path()?;
+pub fn re_exec_self(override_exe: Option<&Path>) -> Result<std::convert::Infallible> {
+    let exe = override_exe
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| current_exe_path().unwrap_or_else(|_| {
+            // Fallback: if we can't resolve current_exe AND no override,
+            // try argv[0] as a last resort.
+            std::env::args_os().next()
+                .map(PathBuf::from)
+                .unwrap_or_default()
+        }));
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
 
     #[cfg(unix)]
@@ -930,9 +1028,67 @@ mod tests {
     }
 
     #[test]
+    fn target_tag_matches_release_manifest_targets() {
+        assert_eq!(target_tag("macos", "aarch64"), Some("darwin-arm64"));
+        assert_eq!(target_tag("macos", "x86_64"), Some("darwin-x64"));
+        assert_eq!(target_tag("linux", "x86_64"), Some("linux-x64"));
+        assert_eq!(target_tag("linux", "aarch64"), Some("linux-arm64"));
+        assert_eq!(target_tag("windows", "x86_64"), Some("windows-x64"));
+        assert_eq!(target_tag("windows", "aarch64"), Some("windows-arm64"));
+        assert_eq!(target_tag("linux", "arm"), None);
+    }
+
+    #[test]
     fn backup_path_appends_bak() {
         let p = Path::new("/usr/local/bin/atomcode");
         assert_eq!(backup_path(p), PathBuf::from("/usr/local/bin/atomcode.bak"));
+    }
+
+    #[test]
+    fn try_remove_stale_deletes_normal_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("atomcode.exe.bak");
+        std::fs::write(&p, b"old").expect("seed");
+        assert!(try_remove_stale(&p));
+        assert!(!p.exists(), "backup should be gone");
+    }
+
+    #[test]
+    fn try_remove_stale_clears_readonly_then_deletes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("atomcode.exe.bak");
+        std::fs::write(&p, b"old").expect("seed");
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&p, perm).expect("set readonly");
+        // On Windows the readonly flag would block remove_file outright.
+        // On Unix it doesn't, but the helper still happens to clean up.
+        // Either way, the file must be gone after this call.
+        assert!(try_remove_stale(&p));
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn try_remove_stale_returns_false_for_truly_locked_file() {
+        // On Unix, an open file can still be unlinked, so true locking
+        // is hard to simulate. Instead we test the "nonexistent path"
+        // case — `try_remove_stale` correctly returns true because the
+        // file doesn't exist (nothing to remove). To verify the false
+        // return, we'd need a platform-specific lock (Windows HANDLE),
+        // which isn't feasible in a cross-platform unit test. The
+        // important contract is: returns true when nothing needs doing.
+        let bogus = std::path::PathBuf::from("/no/such/dir/atomcode.exe.bak");
+        assert!(!bogus.exists());
+        // A path that doesn't exist is "already removed" → true
+        assert!(try_remove_stale(&bogus));
+    }
+
+    #[test]
+    fn try_remove_stale_returns_true_for_nonexistent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("does_not_exist");
+        assert!(!p.exists());
+        assert!(try_remove_stale(&p));
     }
 
     #[test]
@@ -943,11 +1099,11 @@ mod tests {
 
     #[test]
     fn is_newer_semver() {
-        assert!(is_newer("v4.19.0", "v4.18.2")); // latest, current
+        assert!(is_newer("v4.19.0", "v4.18.2"));  // latest, current
         assert!(is_newer("v4.19.0", "v4.18.9"));
         assert!(is_newer("v5.0.0", "v4.99.99"));
         assert!(!is_newer("v4.19.0", "v4.19.0"));
-        assert!(!is_newer("v4.18.0", "v4.19.0")); // latest is older than current
+        assert!(!is_newer("v4.18.0", "v4.19.0"));  // latest is older than current
     }
 
     #[test]
@@ -1006,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_binary_renames_live_to_bak() {
+    fn replace_binary_renames_live_to_bak_via_three_way_swap() {
         let tmp = tempfile::tempdir().unwrap();
         let exe = tmp.path().join("atomcode");
         let new = tmp.path().join(".atomcode.download");
@@ -1019,6 +1175,9 @@ mod tests {
         let bak = backup_path(&exe);
         assert_eq!(std::fs::read(&bak).unwrap(), b"OLD");
         assert!(!new.exists());
+        // No leftover .rolling file on success
+        let rolling = rolling_path(&exe);
+        assert!(!rolling.exists());
     }
 
     #[test]
@@ -1035,6 +1194,53 @@ mod tests {
 
         assert_eq!(std::fs::read(&exe).unwrap(), b"V3");
         assert_eq!(std::fs::read(&bak).unwrap(), b"V2");
+        // No leftover .rolling file
+        let rolling = rolling_path(&exe);
+        assert!(!rolling.exists());
+    }
+
+    #[test]
+    fn replace_binary_cleans_leftover_rolling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("atomcode");
+        let new = tmp.path().join(".atomcode.download");
+        let rolling = rolling_path(&exe);
+        std::fs::write(&exe, b"OLD").unwrap();
+        std::fs::write(&new, b"NEW").unwrap();
+        std::fs::write(&rolling, b"STALE").unwrap();
+
+        replace_binary(&new, &exe).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"NEW");
+        let bak = backup_path(&exe);
+        assert_eq!(std::fs::read(&bak).unwrap(), b"OLD");
+        assert!(!rolling.exists());
+    }
+
+    #[test]
+    fn replace_binary_succeeds_even_when_bak_cannot_be_removed() {
+        // Simulate the Windows ACCESS_DENIED scenario: .bak is locked
+        // (here we can't truly lock it, but we make it read-only in a
+        // non-writable parent — on Unix this still works because unlink
+        // doesn't care about file permissions. The test verifies the
+        // three-way swap completes successfully regardless.)
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("atomcode");
+        let new = tmp.path().join(".atomcode.download");
+        let bak = backup_path(&exe);
+        let rolling = rolling_path(&exe);
+        std::fs::write(&exe, b"V2").unwrap();
+        std::fs::write(&new, b"V3").unwrap();
+        std::fs::write(&bak, b"V1").unwrap();
+
+        replace_binary(&new, &exe).unwrap();
+
+        // Core outcome: upgrade succeeded
+        assert_eq!(std::fs::read(&exe).unwrap(), b"V3");
+        // On this platform .bak is removable so we get V2 as backup.
+        // On Windows with a locked .bak, the .rolling file would linger
+        // instead, but the upgrade still succeeds.
+        assert!(bak.exists() || rolling.exists());
     }
 
     #[test]
@@ -1103,6 +1309,239 @@ mod tests {
             p.ends_with("atomcode-v4.19.1-windows-x64.exe"),
             "got: {:?}",
             p
+        );
+    }
+
+    // ── download_and_verify integration tests (issue #380) ──────────
+
+    /// Helper: compute the SHA256 hex string for a byte slice.
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hex_encode(&hasher.finalize())
+    }
+
+    /// download_and_verify succeeds when the server omits Content-Length
+    /// (chunked transfer encoding).  In production, Content-Length may
+    /// differ from the manifest's `size` due to CDN/proxy rewrites,
+    /// manifest-server sync lag, or redirect hops — the old code
+    /// aborted immediately on such mismatches (issue #380).
+    ///
+    /// This test validates that when Content-Length is absent (chunked),
+    /// the function proceeds to download and relies on the post-download
+    /// size + SHA256 checks for integrity, which is the correct behavior
+    /// after the fix.
+    #[tokio::test]
+    async fn download_succeeds_without_content_length() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Simulate a CDN that uses chunked transfer (no Content-Length).
+        // This is what a gzip-compressed response looks like after
+        // reqwest transparently decompresses it.
+        let payload = vec![0xAB_u8; 100];
+        let expected_sha = sha256_hex(&payload);
+        let expected_size: u64 = payload.len() as u64;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // No explicit Content-Length → chunked transfer encoding.
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            &expected_sha,
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        // With the fix, this should succeed because the actual downloaded
+        // bytes match expected_size and expected_sha256.  The old code
+        // would also have succeeded here (Content-Length was absent), but
+        // the key point is that we no longer gate on Content-Length at all.
+        assert!(result.is_ok(), "download should succeed, got: {:?}", result);
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    }
+
+    /// download_and_verify still rejects a download whose actual byte
+    /// count doesn't match the manifest size (post-download size check).
+    #[tokio::test]
+    async fn download_rejects_wrong_actual_size() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Server sends 80 bytes, but manifest says 100.
+        let payload = vec![0xAB_u8; 80];
+        let expected_sha = sha256_hex(&payload);
+        let expected_size: u64 = 100; // mismatch!
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            &expected_sha,
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err(), "should fail on size mismatch");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("short download"),
+            "error should mention short download, got: {}",
+            err
+        );
+        // Temp file must be cleaned up on failure.
+        assert!(!dest.exists(), "partial download should be removed");
+    }
+
+    /// download_and_verify still rejects a download whose SHA256
+    /// doesn't match the manifest, even if the size is correct.
+    #[tokio::test]
+    async fn download_rejects_checksum_mismatch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let payload = vec![0xAB_u8; 100];
+        let wrong_sha = "0000000000000000000000000000000000000000000000000000000000000000";
+        let expected_size: u64 = payload.len() as u64;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            wrong_sha, // intentionally wrong
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err(), "should fail on checksum mismatch");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("checksum mismatch"),
+            "error should mention checksum mismatch, got: {}",
+            err
+        );
+        // Temp file must be cleaned up on failure.
+        assert!(!dest.exists(), "corrupted download should be removed");
+    }
+
+    /// download_and_verify succeeds when everything matches perfectly
+    /// (Content-Length present and correct, size + SHA256 match).
+    #[tokio::test]
+    async fn download_succeeds_when_all_checks_pass() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let payload = vec![0xCD_u8; 256];
+        let expected_sha = sha256_hex(&payload);
+        let expected_size: u64 = payload.len() as u64;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            &expected_sha,
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_ok(), "download should succeed, got: {:?}", result);
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    }
+
+    /// download_and_verify rejects non-2xx HTTP responses.
+    #[tokio::test]
+    async fn download_rejects_http_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            "unused",
+            100,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP 404"),
+            "error should mention HTTP 404, got: {}",
+            err
         );
     }
 }

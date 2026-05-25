@@ -52,7 +52,8 @@ impl Tool for ListDirTool {
             Err(_) => return self.approval(args),
         };
         let raw_path = parsed.path.as_deref().unwrap_or(".");
-        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Enumerate) {
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Enumerate)
+        {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -78,6 +79,13 @@ impl Tool for ListDirTool {
             return Ok(ToolResult {
                 call_id: String::new(),
                 output: format!("Directory not found: {}", dir.display()),
+                success: false,
+            });
+        }
+        if !dir.is_dir() {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: format!("Not a directory: {}", dir.display()),
                 success: false,
             });
         }
@@ -124,5 +132,35 @@ fn scan_dir(lines: &mut Vec<String>, dir: &std::path::Path, depth: usize, max_de
         } else {
             lines.push(format!("{}{}", indent, name));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn rejects_file_path_instead_of_returning_empty_listing() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("README.md");
+        std::fs::write(&file, "# notes\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ListDirTool;
+        let args = r#"{"path":"README.md"}"#;
+
+        let result = tool.execute(args, &ctx).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("Not a directory:"),
+            "unexpected output: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("README.md"),
+            "output should name the file path: {}",
+            result.output
+        );
     }
 }

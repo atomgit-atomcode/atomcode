@@ -180,7 +180,14 @@ emit_entry() {
         return 1
     fi
     local sha
-    sha=$(shasum -a 256 "$file" | awk '{print $1}')
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha=$(sha256sum "$file" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        sha=$(shasum -a 256 "$file" | awk '{print $1}')
+    else
+        echo "ERROR: sha256sum or shasum not found" >&2
+        return 1
+    fi
     local size
     if stat -f%z "$file" >/dev/null 2>&1; then
         size=$(stat -f%z "$file")        # macOS / BSD
@@ -201,6 +208,7 @@ emit_entry() {
         "darwin-x64:atomcode-${VERSION}-darwin-x64" \
         "linux-x64:atomcode-${VERSION}-linux-x64" \
         "linux-arm64:atomcode-${VERSION}-linux-arm64" \
+        "ohos-arm64:atomcode-${VERSION}-ohos-arm64" \
         "windows-x64:atomcode-${VERSION}-windows-x64.exe" \
         "windows-arm64:atomcode-${VERSION}-windows-arm64.exe"
     do

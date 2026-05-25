@@ -39,6 +39,13 @@ pub struct CellStyle {
     /// SGR reverse video (`\x1b[7m` / `\x1b[27m`). Used for the
     /// highlighted menu row.
     pub reverse: bool,
+    /// SGR faint / decreased intensity (`\x1b[2m`). Renders the current
+    /// fg at ~50% intensity — terminal-theme-aware muting that adapts
+    /// to both light and dark schemes (unlike a fixed DarkGrey which
+    /// vanishes on some palettes). Toggled off via SGR 22, which is the
+    /// shared "normal intensity" reset for both bold and faint, so the
+    /// transition path goes through full reset when faint→off.
+    pub faint: bool,
 }
 
 /// One screen cell: glyph + its visual attributes. Cell equality is
@@ -144,6 +151,139 @@ pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
         });
         for _ in 1..w {
             row.push(Cell::continuation());
+        }
+    }
+}
+
+/// Like [`push_str_cells`] but parses embedded SGR escape sequences
+/// (`\x1b[...m`) inline, mutating a working `CellStyle` so subsequent
+/// cells pick up the colour / bold / faint / reverse attributes the
+/// terminal would otherwise paint via raw ANSI. Returns the style
+/// state at end-of-input so a caller wrapping a single physical line
+/// into multiple chunks can carry attributes across chunk boundaries
+/// (e.g. `\x1b[31m` on one chunk and `\x1b[39m` on the next).
+///
+/// Why this exists: the retained renderer paints from a cell grid
+/// rather than streaming raw bytes to stdout, so SGR sequences that
+/// survive [`crate::sanitize::scrub_controls_keep_sgr`] would
+/// otherwise land as literal `^[[31m` characters in cells. This
+/// function is the cell-pipeline equivalent of alt-screen's
+/// `truncate_to_width_sgr_aware` — it understands SGR enough to
+/// translate it into `CellStyle` mutations on the way in.
+///
+/// Non-SGR CSI sequences (cursor moves, DSR, etc.) are silently
+/// dropped — they should have been scrubbed upstream; this is
+/// belt-and-suspenders.
+pub fn push_str_cells_sgr(
+    row: &mut Vec<Cell>,
+    s: &str,
+    mut working_style: CellStyle,
+) -> CellStyle {
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                let mut params = String::new();
+                let mut final_byte: Option<char> = None;
+                while let Some(&p) = chars.peek() {
+                    chars.next();
+                    if ('\x40'..='\x7E').contains(&p) {
+                        final_byte = Some(p);
+                        break;
+                    }
+                    params.push(p);
+                }
+                if final_byte == Some('m') {
+                    apply_sgr_params(&params, &mut working_style);
+                }
+            }
+            continue;
+        }
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        if ch == '\t' {
+            for _ in 0..SOFT_TAB_WIDTH {
+                row.push(Cell {
+                    ch: ' ',
+                    style: working_style.clone(),
+                    width: 1,
+                });
+            }
+            continue;
+        }
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if w == 0 {
+            continue;
+        }
+        row.push(Cell {
+            ch,
+            style: working_style.clone(),
+            width: w as u8,
+        });
+        for _ in 1..w {
+            row.push(Cell::continuation());
+        }
+    }
+    working_style
+}
+
+/// Parse a `;`-separated SGR parameter list and fold each recognised
+/// code into `style`. The crossterm colour variants chosen here mirror
+/// the SGR-to-name mapping that `serialize_row` uses to emit cells
+/// back to the terminal — so a row built from `\x1b[31m…` round-trips
+/// to `\x1b[31m…` on output, and the terminal's theme palette gets to
+/// pick the actual shade rather than us hard-coding RGB.
+///
+/// Unknown / unsupported codes (256-colour `38;5;N`, RGB `38;2;R;G;B`,
+/// background colours, italic, underline) are silently skipped —
+/// they're outside the cosmetic surface `CellStyle` currently
+/// represents, so picking up an LLM-emitted underline would just be
+/// lost on the retained path. Adding fields to `CellStyle` is the
+/// trigger for extending this match.
+fn apply_sgr_params(params: &str, style: &mut CellStyle) {
+    // `\x1b[m` (empty params) means "reset" — same as `\x1b[0m`.
+    if params.is_empty() {
+        *style = CellStyle::default();
+        return;
+    }
+    for code in params.split(';') {
+        // `\x1b[;31m` (leading empty) also resets before applying.
+        if code.is_empty() {
+            *style = CellStyle::default();
+            continue;
+        }
+        let Ok(n) = code.parse::<u16>() else { continue };
+        match n {
+            0 => *style = CellStyle::default(),
+            1 => style.bold = true,
+            2 => style.faint = true,
+            7 => style.reverse = true,
+            22 => {
+                // SGR 22 = normal intensity, clears BOTH bold and faint.
+                style.bold = false;
+                style.faint = false;
+            }
+            27 => style.reverse = false,
+            30 => style.fg = Some(Color::Black),
+            31 => style.fg = Some(Color::DarkRed),
+            32 => style.fg = Some(Color::DarkGreen),
+            33 => style.fg = Some(Color::DarkYellow),
+            34 => style.fg = Some(Color::DarkBlue),
+            35 => style.fg = Some(Color::DarkMagenta),
+            36 => style.fg = Some(Color::DarkCyan),
+            37 => style.fg = Some(Color::Grey),
+            39 => style.fg = None,
+            90 => style.fg = Some(Color::DarkGrey),
+            91 => style.fg = Some(Color::Red),
+            92 => style.fg = Some(Color::Green),
+            93 => style.fg = Some(Color::Yellow),
+            94 => style.fg = Some(Color::Blue),
+            95 => style.fg = Some(Color::Magenta),
+            96 => style.fg = Some(Color::Cyan),
+            97 => style.fg = Some(Color::White),
+            _ => {}
         }
     }
 }
@@ -307,15 +447,25 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
     // additive, use targeted enables.
     let bold_off = from.bold && !to.bold;
     let reverse_off = from.reverse && !to.reverse;
+    // SGR 22 ("normal intensity") clears both bold AND faint — there is
+    // no per-attribute toggle for faint. So a faint→off transition
+    // always goes through full reset to avoid clobbering bold state.
+    let faint_off = from.faint && !to.faint;
     let fg_change = from.fg != to.fg;
 
-    let needs_reset = bold_off || reverse_off || (from.fg.is_some() && to.fg.is_none());
+    let needs_reset = bold_off
+        || reverse_off
+        || faint_off
+        || (from.fg.is_some() && to.fg.is_none());
 
     if needs_reset {
         out.extend_from_slice(b"\x1b[0m");
         // After reset, nothing is on — apply `to`'s positive attrs.
         if to.bold {
             out.extend_from_slice(b"\x1b[1m");
+        }
+        if to.faint {
+            out.extend_from_slice(b"\x1b[2m");
         }
         if to.reverse {
             out.extend_from_slice(b"\x1b[7m");
@@ -328,6 +478,9 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
         // `to` adds.
         if !from.bold && to.bold {
             out.extend_from_slice(b"\x1b[1m");
+        }
+        if !from.faint && to.faint {
+            out.extend_from_slice(b"\x1b[2m");
         }
         if !from.reverse && to.reverse {
             out.extend_from_slice(b"\x1b[7m");
@@ -356,6 +509,7 @@ mod tests {
             fg: Some(cyan()),
             bold: true,
             reverse: false,
+            faint: false,
         }
     }
 
@@ -542,6 +696,7 @@ mod tests {
                     fg: None,
                     bold: true,
                     reverse: false,
+                    faint: false,
                 },
                 width: 1,
             },
@@ -549,6 +704,74 @@ mod tests {
         let bytes = serialize_patches(&[p1, p2]);
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.contains("\x1b[1m"), "expected bold SGR, got: {:?}", s);
+    }
+
+    /// Faint cells emit SGR 2 — theme-aware muting for hint/status text.
+    /// Final reset must close the run because faint is "sticky" until
+    /// SGR 22 / SGR 0 clears it.
+    #[test]
+    fn serialize_faint_emits_sgr_two_and_final_reset() {
+        let p = Patch {
+            row: 1,
+            col: 1,
+            cell: Cell {
+                ch: 'h',
+                style: CellStyle {
+                    fg: None,
+                    bold: false,
+                    reverse: false,
+                    faint: true,
+                },
+                width: 1,
+            },
+        };
+        let bytes = serialize_patches(std::slice::from_ref(&p));
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(s.contains("\x1b[2m"), "expected faint SGR, got: {:?}", s);
+        assert!(s.ends_with("\x1b[0m"), "faint cell must close with reset");
+    }
+
+    /// Faint→non-faint transition routes through full reset (SGR 0)
+    /// rather than per-attribute toggle, because SGR 22 ("normal
+    /// intensity") would also clobber bold if present. Reset path is
+    /// what `emit_sgr_transition` already uses for bold-off and
+    /// reverse-off — extending to faint-off keeps the invariant.
+    #[test]
+    fn serialize_faint_off_goes_through_reset() {
+        let faint = Patch {
+            row: 1,
+            col: 1,
+            cell: Cell {
+                ch: 'a',
+                style: CellStyle {
+                    fg: None,
+                    bold: false,
+                    reverse: false,
+                    faint: true,
+                },
+                width: 1,
+            },
+        };
+        let plain = Patch {
+            row: 1,
+            col: 2,
+            cell: Cell {
+                ch: 'b',
+                style: CellStyle::default(),
+                width: 1,
+            },
+        };
+        let bytes = serialize_patches(&[faint, plain]);
+        let s = String::from_utf8(bytes).unwrap();
+        // \x1b[2m for faint cell → \x1b[0m before the plain cell.
+        assert!(s.contains("\x1b[2m"));
+        // The plain cell must be preceded by a reset, not just \x1b[22m.
+        let reset_idx = s
+            .match_indices("\x1b[0m")
+            .map(|(i, _)| i)
+            .find(|&i| i < s.find('b').unwrap())
+            .expect("expected mid-stream reset before plain cell");
+        let _ = reset_idx;
     }
 
     // ── Unicode edge-case regression tests ─────────────────────────

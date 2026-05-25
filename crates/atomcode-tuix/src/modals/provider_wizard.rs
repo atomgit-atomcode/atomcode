@@ -110,8 +110,13 @@ impl DraftProvider {
             max_tokens: None,
             thinking_type: None,
             thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
             ephemeral: false,
-        }
+
+}
     }
 }
 
@@ -149,7 +154,7 @@ fn handle_key(
     if matches!(code, KeyCode::Esc) {
         buf.text.clear();
         buf.cursor = 0;
-        push(renderer, "(cancelled)");
+        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderWizardCancelled));
         return Ok(ModalAction::Close);
     }
 
@@ -195,7 +200,7 @@ fn handle_key(
                             *wizard = new;
                         }
                         "edit" | "delete" | "set-default" if providers.is_empty() => {
-                            push(renderer, "No providers configured yet.");
+                            push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderNoProviders));
                             return Ok(ModalAction::Close);
                         }
                         "edit" => {
@@ -290,7 +295,7 @@ fn handle_key(
                 }
                 KeyCode::Enter => {
                     let target = providers[selected].clone();
-                    push(renderer, &format!("Delete \"{}\"? [y/N]", target));
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleteConfirm { name: &target }));
                     *wizard = ProviderWizard::DeleteConfirm { target };
                     redraw(buf, state, ctx, wizard, renderer);
                     return Ok(ModalAction::Continue);
@@ -323,7 +328,7 @@ fn handle_key(
                         ctx.model_name = p.model.clone();
                     }
                     save_and_reload(ctx, renderer);
-                    push(renderer, &format!("Default set to {}.", chosen));
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDefaultSet { name: &chosen }));
                     return Ok(ModalAction::Close);
                 }
                 _ => {}
@@ -352,10 +357,10 @@ fn handle_key(
                             .unwrap_or_default();
                     }
                     save_and_reload(ctx, renderer);
-                    push(renderer, &format!("Removed \"{}\".", target));
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &target }));
                 }
                 _ => {
-                    push(renderer, "(kept)");
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleteKept));
                 }
             }
             Ok(ModalAction::Close)
@@ -390,17 +395,14 @@ fn handle_key(
                         save_and_reload(ctx, renderer);
                         push(
                             renderer,
-                            &format!(
-                                "Added provider \"{}\" and switched to {} · {}.",
-                                name, name, model
-                            ),
+                            &crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: &name, model: &model }),
                         );
                         return Ok(ModalAction::Close);
                     }
                 }
             }
             // Forward other keys to the buffer so typing / editing works.
-            forward_to_buffer(code, _mods, buf, ctx);
+            forward_to_buffer(code, _mods, buf, state, ctx);
             *wizard = ProviderWizard::Add { step, draft };
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
@@ -418,9 +420,9 @@ fn handle_key(
                     &format!(
                         "  ↳ {}",
                         if answer.is_empty() {
-                            "(keep)"
+                            crate::i18n::t(crate::i18n::Msg::ProviderEditKeep).into_owned()
                         } else {
-                            answer.as_str()
+                            answer.clone()
                         }
                     ),
                 );
@@ -444,12 +446,12 @@ fn handle_key(
                             draft.apply_onto(existing);
                         }
                         save_and_reload(ctx, renderer);
-                        push(renderer, &format!("Updated \"{}\".", target));
+                        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &target }));
                         return Ok(ModalAction::Close);
                     }
                 }
             }
-            forward_to_buffer(code, _mods, buf, ctx);
+            forward_to_buffer(code, _mods, buf, state, ctx);
             *wizard = ProviderWizard::Edit {
                 target,
                 step,
@@ -474,12 +476,17 @@ fn redraw(
     let menu = match wizard {
         ProviderWizard::MainMenu { selected } => Some(MenuPayload {
             items: vec![
-                ("add".into(), "Add a new provider".into()),
-                ("edit".into(), "Edit an existing provider".into()),
-                ("delete".into(), "Remove a provider".into()),
-                ("set-default".into(), "Switch the default provider".into()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuAdd).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuAddDesc).into_owned()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuEdit).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuEditDesc).into_owned()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuDelete).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuDeleteDesc).into_owned()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefault).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefaultDesc).into_owned()),
             ],
             selected: *selected,
+            kind: crate::render::MenuKind::SlashCommand,
         }),
         ProviderWizard::EditPick {
             providers,
@@ -508,6 +515,7 @@ fn redraw(
             Some(MenuPayload {
                 items,
                 selected: *selected,
+            kind: crate::render::MenuKind::SlashCommand,
             })
         }
         // Q&A steps: plain input box, no overlay menu.
@@ -520,6 +528,7 @@ fn redraw(
         cursor_byte: buf.cursor,
         menu,
         status: build_status(state, ctx),
+        attachments: Vec::new(),
     });
     renderer.flush();
 }
@@ -535,31 +544,31 @@ fn push(renderer: &mut dyn Renderer, text: &str) {
 /// Prompt string for the given wizard step; includes the existing value
 /// as a hint in Edit mode so the user sees what empty-Enter will keep.
 fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> String {
+    use crate::i18n::{t, Msg};
     match (step, existing) {
-        (WizardStep::Name, _) => "Provider name?".into(),
-        (WizardStep::ProviderType, None) => "Type? (openai / claude / ollama)".into(),
+        (WizardStep::Name, _) => t(Msg::ProviderStepName).into_owned(),
+        (WizardStep::ProviderType, None) => t(Msg::ProviderStepType).into_owned(),
         (WizardStep::ProviderType, Some(p)) => {
-            format!(
-                "Type? [{}] (openai / claude / ollama, blank to keep)",
-                p.provider_type
-            )
+            t(Msg::ProviderStepTypeWithHint { current: &p.provider_type }).into_owned()
         }
-        (WizardStep::BaseUrl, None) => "Base URL? (blank to use provider default)".into(),
+        (WizardStep::BaseUrl, None) => t(Msg::ProviderStepBaseUrl).into_owned(),
         (WizardStep::BaseUrl, Some(p)) => {
-            let hint = p.base_url.as_deref().unwrap_or("provider default");
-            format!("Base URL? [{}] (blank to keep)", hint)
+            let default_hint = t(Msg::ProviderDefaultHint);
+            let hint = p.base_url.as_deref().unwrap_or(&default_hint);
+            t(Msg::ProviderStepBaseUrlWithHint { current: hint }).into_owned()
         }
-        (WizardStep::ApiKey, None) => "API key? (blank to leave unset)".into(),
+        (WizardStep::ApiKey, None) => t(Msg::ProviderStepApiKey).into_owned(),
         (WizardStep::ApiKey, Some(p)) => {
             let hint = if p.api_key.is_some() {
-                "set — blank to keep"
+                t(Msg::ProviderStepApiKeySet)
             } else {
-                "unset"
+                t(Msg::ProviderStepApiKeyUnset)
             };
-            format!("API key? [{}]", hint)
+            t(Msg::ProviderStepApiKeyWithHint { hint: &hint }).into_owned()
         }
-        (WizardStep::Model, None) => "Model?".into(),
-        (WizardStep::Model, Some(p)) => format!("Model? [{}] (blank to keep)", p.model),
+        (WizardStep::Model, None) => t(Msg::ProviderStepModel).into_owned(),
+        (WizardStep::Model, Some(p)) =>
+            t(Msg::ProviderStepModelWithHint { current: &p.model }).into_owned(),
     }
 }
 
@@ -589,7 +598,7 @@ fn advance_add(
     match step {
         WizardStep::Name => {
             if ans.is_empty() {
-                push(renderer, "Name cannot be empty.");
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderNameEmpty));
                 return Some(WizardStep::Name);
             }
             draft.name = ans.to_string();
@@ -597,7 +606,7 @@ fn advance_add(
         }
         WizardStep::ProviderType => {
             if !["openai", "claude", "ollama"].contains(&ans) {
-                push(renderer, "Unknown type. Choose openai / claude / ollama.");
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType));
                 return Some(WizardStep::ProviderType);
             }
             draft.provider_type = ans.to_string();
@@ -613,7 +622,7 @@ fn advance_add(
         }
         WizardStep::Model => {
             if ans.is_empty() {
-                push(renderer, "Model cannot be empty.");
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderModelEmpty));
                 return Some(WizardStep::Model);
             }
             draft.model = ans.to_string();
@@ -641,7 +650,7 @@ fn advance_edit(
             if !ans.is_empty() && !["openai", "claude", "ollama"].contains(&ans) {
                 push(
                     renderer,
-                    "Unknown type. Choose openai / claude / ollama or leave blank.",
+                    &crate::i18n::t(crate::i18n::Msg::ProviderUnknownTypeEdit),
                 );
                 return Some(WizardStep::ProviderType);
             }
@@ -665,7 +674,8 @@ fn advance_edit(
 
 /// Route a keystroke into `Buffer::apply` so text-input wizard steps
 /// support the usual editing shortcuts (Backspace / Left / Right / etc).
-fn forward_to_buffer(code: KeyCode, modifiers: KeyModifiers, buf: &mut Buffer, ctx: &LoopCtx) {
+fn forward_to_buffer(code: KeyCode, modifiers: KeyModifiers, buf: &mut Buffer, state: &mut UiState, ctx: &LoopCtx) {
     let action = classify(code, modifiers);
     let _ = buf.apply(action, ctx.history.entries(), &ctx.commands);
+    crate::event_loop::sync_recalled_attachments(state, buf, ctx.history.entries());
 }

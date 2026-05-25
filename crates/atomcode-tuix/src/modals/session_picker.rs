@@ -6,6 +6,7 @@
 // with type-to-filter search. Up/Down navigates, Enter loads + replays
 // into scrollback + syncs the agent via `AgentCommand::SetMessages`,
 // Esc cancels, printable chars + Backspace edit the filter query.
+// F2 renames the selected session.
 
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
@@ -13,7 +14,9 @@ use atomcode_core::session::{Session, SessionMeta};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::{Modal, ModalAction};
-use crate::event_loop::{build_status, format_tool_detail, summarise, Buffer, LoopCtx};
+use crate::event_loop::{
+    build_status, format_tool_detail, perform_session_rename, summarise, Buffer, LoopCtx,
+};
 use crate::render::{MenuPayload, Renderer, UiLine};
 use crate::state::UiState;
 
@@ -26,6 +29,10 @@ pub struct SessionPicker {
     pub filtered: Vec<usize>,
     /// Index into `filtered`.
     pub selected: usize,
+    /// Whether we are in rename editing mode.
+    pub rename_editing: bool,
+    /// The new name being edited for rename.
+    pub rename_buffer: String,
 }
 
 impl SessionPicker {
@@ -36,6 +43,8 @@ impl SessionPicker {
             query: String::new(),
             filtered,
             selected: 0,
+            rename_editing: false,
+            rename_buffer: String::new(),
         }
     }
 
@@ -52,6 +61,10 @@ impl SessionPicker {
     }
 
     pub fn up(&mut self) {
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            return;
+        }
         self.selected = self.selected.saturating_sub(1);
     }
 
@@ -60,7 +73,7 @@ impl SessionPicker {
             self.selected = 0;
             return;
         }
-        let max = self.filtered.len() - 1;
+        let max = self.filtered.len().saturating_sub(1);
         if self.selected < max {
             self.selected += 1;
         }
@@ -82,6 +95,78 @@ impl Modal for SessionPicker {
         ctx: &mut LoopCtx,
         renderer: &mut dyn Renderer,
     ) -> Result<ModalAction> {
+        // Handle rename editing mode
+        if self.rename_editing {
+            match code {
+                KeyCode::Esc => {
+                    // Cancel rename editing
+                    self.rename_editing = false;
+                    self.rename_buffer.clear();
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+                KeyCode::Enter => {
+                    if let Some(idx) = self.filtered.get(self.selected).copied() {
+                        if let Some(session_meta) = self.sessions.get(idx) {
+                            let id = session_meta.id.clone();
+                            match perform_session_rename(
+                                &ctx.session_manager,
+                                &id,
+                                &self.rename_buffer,
+                            ) {
+                                Ok((old_name, new_name)) => {
+                                    // Update the session name in our local list
+                                    if let Some(s) = self.sessions.get_mut(idx) {
+                                        s.name = new_name.clone();
+                                    }
+                                    // Recompute filtered list since new name may no longer match query
+                                    let prev_id = id.clone();
+                                    self.update_filter();
+                                    // Try to keep the same session selected
+                                    self.selected = self
+                                        .filtered
+                                        .iter()
+                                        .position(|&fi| self.sessions[fi].id == prev_id)
+                                        .unwrap_or(0);
+                                    // Show success feedback
+                                    renderer.render(UiLine::CommandOutput(
+                                        crate::i18n::t(crate::i18n::Msg::SessionRenamed {
+                                            old: &old_name,
+                                            new: &new_name,
+                                        }).into_owned(),
+                                    ));
+                                    renderer.flush();
+                                }
+                                Err(err) => {
+                                    renderer.render(UiLine::Error(err));
+                                    renderer.flush();
+                                }
+                            }
+                        }
+                    }
+                    self.rename_editing = false;
+                    self.rename_buffer.clear();
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+                KeyCode::Backspace => {
+                    self.rename_buffer.pop();
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                    self.rename_buffer.push(c);
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+                _ => {
+                    self.draw(buf, state, ctx, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+            }
+        }
+
+        // Normal mode handling
         match code {
             KeyCode::Up => {
                 self.up();
@@ -105,6 +190,22 @@ impl Modal for SessionPicker {
                 self.draw(buf, state, ctx, renderer);
                 Ok(ModalAction::Continue)
             }
+            KeyCode::F(2) => {
+                // F2 to start rename editing for selected session
+                if let Some(idx) = self.filtered.get(self.selected).copied() {
+                    if let Some(session) = self.sessions.get(idx) {
+                        self.rename_buffer = session.name.clone();
+                        self.rename_editing = true;
+                        self.draw(buf, state, ctx, renderer);
+                    }
+                } else {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::SessionNoneSelected).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Ok(ModalAction::Continue)
+            }
             KeyCode::Enter => {
                 let Some(id) = self.chosen_id() else {
                     // Filter matched nothing — ignore Enter, stay open.
@@ -112,7 +213,8 @@ impl Modal for SessionPicker {
                 };
                 match ctx.session_manager.load(&id) {
                     Ok(session) => {
-                        replay_session(renderer, &session);
+                        ctx.current_session_id = Some(id);
+                        replay_session(renderer, &session, true);
                         ctx.agent
                             .cmd_tx
                             .send(AgentCommand::SetMessages(session.messages.clone()))
@@ -121,12 +223,25 @@ impl Modal for SessionPicker {
                         // file — future TurnComplete saves overwrite it
                         // instead of leaving the old snapshot + creating
                         // a new one beside it.
+                        // Bind telemetry session_id to the resumed session's UUID.
+                        if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
+                            ctx.telemetry.set_session_id(uuid);
+                        }
                         ctx.current_session = session;
+                        ctx.bg_manager
+                            .set_foreground_session(ctx.current_session.clone());
                         state.on_turn_complete();
                         Ok(ModalAction::Close)
                     }
                     Err(e) => {
-                        renderer.render(UiLine::Error(format!("load session failed: {}", e)));
+                        ctx.current_session_id = None;
+                        state.total_tokens = 0;
+                        state.thinking_idx = 0;
+                        state.on_turn_complete();
+                        let msg = format!("{}", e);
+                        renderer.render(UiLine::Error(
+                            crate::i18n::t(crate::i18n::Msg::SessionLoadFailed { error: &msg }).into_owned(),
+                        ));
                         renderer.flush();
                         Ok(ModalAction::Close)
                     }
@@ -144,28 +259,60 @@ impl Modal for SessionPicker {
             cursor_byte: buf.cursor,
             menu: Some(payload),
             status: build_status(state, ctx),
+            attachments: Vec::new(),
         });
         renderer.flush();
     }
 }
 
 fn build_menu_payload(p: &SessionPicker) -> MenuPayload {
+    // Empty state: surface a hint row so the user can tell the filter is
+    // active and which query is excluding everything (otherwise the menu
+    // renders as blank space and looks like the modal hung).
+    if p.filtered.is_empty() {
+        let label = if p.sessions.is_empty() {
+            "(no sessions in this project yet)".to_string()
+        } else if p.query.is_empty() {
+            "(no sessions match)".to_string()
+        } else {
+            format!("(no sessions match \"{}\" — Backspace to clear)", p.query)
+        };
+        return MenuPayload {
+            items: vec![(label, String::new())],
+            selected: 0,
+            kind: crate::render::MenuKind::SlashCommand,
+        };
+    }
     let items: Vec<(String, String)> = p
         .filtered
         .iter()
-        .map(|&i| {
-            let s = &p.sessions[i];
-            let desc = format!("{} msgs · {}", s.message_count, humanize_age(s.updated_at));
-            (s.name.clone(), desc)
+        .enumerate()
+        .map(|(filter_idx, &session_idx)| {
+            let s = &p.sessions[session_idx];
+            let msgs = crate::i18n::t(crate::i18n::Msg::SessionMsgCount { count: s.message_count });
+            let desc = format!("{} · {}", msgs, humanize_age(s.updated_at));
+            // If in rename editing mode and this is the selected item, show the editing buffer
+            if p.rename_editing && filter_idx == p.selected {
+                (
+                    crate::i18n::t(crate::i18n::Msg::SessionRenameEditing {
+                        buffer: &p.rename_buffer,
+                    }).into_owned(),
+                    desc,
+                )
+            } else {
+                (s.name.clone(), desc)
+            }
         })
         .collect();
     MenuPayload {
         items,
         selected: p.selected,
+        kind: crate::render::MenuKind::SlashCommand,
     }
 }
 
 fn humanize_age(ts: u64) -> String {
+    use crate::i18n::{t, Msg};
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -173,31 +320,33 @@ fn humanize_age(ts: u64) -> String {
         .unwrap_or(ts);
     let d = now.saturating_sub(ts);
     if d < 60 {
-        "just now".into()
+        t(Msg::SessionTimeJustNow).into_owned()
     } else if d < 3600 {
-        format!("{}m ago", d / 60)
+        t(Msg::SessionTimeMinAgo { n: d / 60 }).into_owned()
     } else if d < 86400 {
-        format!("{}h ago", d / 3600)
+        t(Msg::SessionTimeHourAgo { n: d / 3600 }).into_owned()
     } else {
-        format!("{}d ago", d / 86400)
+        t(Msg::SessionTimeDayAgo { n: d / 86400 }).into_owned()
     }
 }
 
 /// Emit historical session messages into scrollback as semantic UiLines,
 /// so the user sees the prior conversation before continuing.
 ///
-/// Resets the renderer first so each /resume starts from a blank terminal.
-/// Without this, prior sessions' replayed content stacks up — after several
-/// switches, `body_lines` + the worker's render-cmd backlog both balloon,
-/// which manifests as dropped keystrokes ("吞字") and sluggish menu nav:
-/// each keystroke enqueues a `Line(InputPrompt)` behind the still-draining
-/// flood of `Line(User/Assistant/…)` commands from replay, adding 50-150 ms
-/// of visible latency per character. Mirrors what `/session` already does.
-fn replay_session(renderer: &mut dyn Renderer, session: &Session) {
+/// `reset = true` clears the screen first (used by `/resume` mid-session
+/// — without this, repeated switches stack body_lines and the worker's
+/// render-cmd backlog, manifesting as dropped keystrokes "吞字" + 50-150ms
+/// per-keystroke latency). `reset = false` appends to existing scrollback
+/// — used by the CLI auto-continue path at startup, which has the welcome
+/// banner above the replay and shouldn't wipe it.
+pub(crate) fn replay_session(renderer: &mut dyn Renderer, session: &Session, reset: bool) {
     use atomcode_core::conversation::message::{MessageContent, Role};
-    renderer.reset();
+    if reset {
+        renderer.reset();
+    }
+    let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel { name: &session.name }).into_owned();
     renderer.render(UiLine::TurnSeparator {
-        label: format!("resumed: {}", session.name),
+        label: resumed.clone(),
     });
     for m in &session.messages {
         match (&m.role, &m.content) {
@@ -210,7 +359,12 @@ fn replay_session(renderer: &mut dyn Renderer, session: &Session) {
                     renderer.render(UiLine::AssistantLineBreak);
                 }
             }
-            (Role::Assistant, MessageContent::AssistantWithToolCalls { text, tool_calls, .. }) => {
+            (
+                Role::Assistant,
+                MessageContent::AssistantWithToolCalls {
+                    text, tool_calls, ..
+                },
+            ) => {
                 if let Some(t) = text {
                     if !t.is_empty() {
                         renderer.render(UiLine::AssistantText(t.clone()));
@@ -227,19 +381,22 @@ fn replay_session(renderer: &mut dyn Renderer, session: &Session) {
             (Role::Tool, MessageContent::ToolResult(r)) => {
                 renderer.render(UiLine::ToolResult {
                     success: r.success,
-                    summary: summarise(&r.output),
+                    summary: summarise(&r.output, r.success),
                 });
             }
             (Role::Tool, MessageContent::ToolResultRef(r)) => {
                 renderer.render(UiLine::ToolResult {
                     success: true,
-                    summary: summarise(&r.summary),
+                    summary: summarise(&r.summary, true),
                 });
             }
             _ => {}
         }
     }
     renderer.render(UiLine::TurnComplete);
+    renderer.render(UiLine::TurnSeparator {
+        label: resumed,
+    });
     renderer.flush();
 }
 
@@ -336,5 +493,38 @@ mod tests {
         p.query = "xyz".to_string();
         p.update_filter();
         assert!(p.chosen_id().is_none());
+    }
+
+    #[test]
+    fn build_menu_payload_shows_hint_when_filter_matches_nothing() {
+        // Regression: typing a query that excludes every session used to
+        // render a blank menu (items.len() == 0), so the user couldn't
+        // tell whether /resume hung, the filter was active, or what.
+        // Now we surface a single non-interactive hint row so the empty
+        // state is visible.
+        let mut p = SessionPicker::open(vec![meta("alpha", 1), meta("beta", 1)]);
+        p.query = "zz".to_string();
+        p.update_filter();
+        assert_eq!(p.filtered.len(), 0);
+        let payload = build_menu_payload(&p);
+        assert_eq!(
+            payload.items.len(),
+            1,
+            "empty filter should produce a single hint row, got: {:?}",
+            payload.items
+        );
+        let (label, _) = &payload.items[0];
+        assert!(
+            label.contains("zz"),
+            "hint should echo the user's query so they know which filter is active: {}",
+            label
+        );
+    }
+
+    #[test]
+    fn build_menu_payload_shows_hint_when_no_sessions_at_all() {
+        let p = SessionPicker::open(vec![]);
+        let payload = build_menu_payload(&p);
+        assert_eq!(payload.items.len(), 1, "must show some empty-state hint");
     }
 }

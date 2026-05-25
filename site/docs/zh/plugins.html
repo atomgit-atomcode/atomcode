@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Plugin 系统 · AtomCode 文档</title>
+<meta name="description" content="Plugin 系统 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="plugins">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Plugin 系统</h1>
+      <p class="lede">Plugin 是一组 skill / 命令 / hook 的集合,通过 git 仓库分发。一行 <code>/plugin install</code> 就能把别人写好的工作流装到 AtomCode 里,装完即用。AtomCode 的 plugin 协议与 Claude Code 兼容,CC 生态的 plugin 仓库可以直接安装运行。</p>
+
+      <h2>核心概念</h2>
+      <ul>
+        <li><strong>Marketplace</strong> —— 一个 git 仓库,根目录有 <code>.atomcode-plugin/marketplace.json</code> 或 <code>.claude-plugin/marketplace.json</code>,声明它包含哪些 plugin。</li>
+        <li><strong>Plugin</strong> —— marketplace 里的一个条目,可以是同仓库的子目录,也可以指向**外部 git 仓库**(<code>url</code> / <code>github</code> / <code>git</code>)或**本地路径**(<code>local</code>)。</li>
+        <li><strong>Skill / 命令 / Hook</strong> —— plugin 安装后会贡献的三类资产。skill 与命令带 <code>plugin-name:</code> 命名空间(避免冲突),hook 按事件触发。</li>
+      </ul>
+
+      <h2>装一个 plugin</h2>
+
+      <h3>方式 1:TUI 内</h3>
+      <pre><code># 1. 注册 marketplace(克隆其 git 仓库到本地)
+/plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
+
+# 2. 装其中的 plugin
+/plugin install ascend-model-agent-plugin@ascend-model-agent-plugin
+
+# 3. 列出已装
+/plugin list</code></pre>
+
+      <h3>方式 2:CLI</h3>
+      <pre><code>atomcode plugin marketplace add &lt;git-url&gt;
+atomcode plugin install &lt;plugin&gt;@&lt;marketplace&gt;
+atomcode plugin list
+atomcode plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;
+atomcode plugin marketplace remove|update|list</code></pre>
+      <p>CLI 与 TUI 共享 <code>~/.atomcode/plugins/</code> 目录,任意一边装的另一边立即可见。</p>
+
+      <h3>装完之后</h3>
+      <ul>
+        <li>plugin 贡献的 skill 出现在 <code>/</code> 菜单,带 <code>&lt;plugin-name&gt;:</code> 前缀。例如 <code>/ascend-model-agent-plugin:ascend-model-verification</code>。</li>
+        <li>模型也能通过 <code>UseSkill</code> 工具自动调用这些 skill。</li>
+        <li>Hook 立即激活 —— v4.21.1 起 <code>/plugin install</code> 完成后自动重建 hook executor,不再需要 <code>/cd</code> 或重启。</li>
+      </ul>
+
+      <h2>目录布局</h2>
+      <pre><code>~/.atomcode/plugins/
+├── marketplaces.json              # 注册的 marketplace 元数据
+├── installed_plugins.json         # 已装 plugin 的状态记录
+├── marketplaces/
+│   └── &lt;marketplace-name&gt;/        # marketplace 仓库克隆
+│       ├── .claude-plugin/marketplace.json
+│       └── &lt;plugin-subdir&gt;/        # inline plugin
+└── installed/
+    └── &lt;marketplace&gt;/&lt;plugin&gt;/    # 外部 source 的 plugin 克隆</code></pre>
+
+      <h2>plugin.json 内嵌结构</h2>
+      <p>每个 plugin 根目录(或 <code>.claude-plugin/</code> / <code>.atomcode-plugin/</code> 子目录)下的 <code>plugin.json</code>:</p>
+      <pre><code>{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "description": "干啥用的",
+  "skills": ["./skills"],          // 也接受字符串 "skills"
+  "commands": ["./commands"],
+  "hooks": {                        // 也接受路径字符串 "hooks.json"
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python \"${CLAUDE_PLUGIN_ROOT}/hook.py\"",
+        "timeout": 5
+      }]
+    }]
+  }
+}</code></pre>
+
+      <h2>Hook 事件</h2>
+      <p>plugin 可以挂以下事件(与 CC 一致):</p>
+      <table>
+        <thead>
+          <tr><th>事件</th><th>触发时机</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>UserPromptSubmit</code></td><td>用户消息提交后,LLM 调用前</td><td>注入额外上下文 / 路由 / 阻断</td></tr>
+          <tr><td><code>PreToolUse</code></td><td>工具调用前</td><td>校验、阻断、改参</td></tr>
+          <tr><td><code>PostToolUse</code></td><td>工具调用后</td><td>审计、副作用</td></tr>
+          <tr><td><code>SessionStart</code></td><td>session 启动</td><td>预热、记录</td></tr>
+          <tr><td><code>SessionEnd</code></td><td>session 结束</td><td>清理、归档</td></tr>
+          <tr><td><code>Notification</code></td><td>系统通知</td><td>转发外部告警通道</td></tr>
+        </tbody>
+      </table>
+
+      <h3>UserPromptSubmit IO 协议</h3>
+      <p>Hook 通过 stdin 拿到 JSON,通过 stdout 决定如何处理:</p>
+      <pre><code>{
+  "session_id": "...",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "用户输入的文本",
+  "cwd": "/工作目录"
+}</code></pre>
+      <p>Hook 可以用以下方式响应(优先级由高到低):</p>
+      <ul>
+        <li><strong>退出码非零</strong> —— 阻断 prompt,reason 取自 stderr。</li>
+        <li><strong>stdout 输出 JSON</strong> <code>{"decision": "block", "reason": "..."}</code> —— 阻断,显式给原因。</li>
+        <li><strong>stdout 输出 JSON</strong> <code>{"hookSpecificOutput": {"additionalContext": "..."}}</code> —— 把 <code>additionalContext</code> 追加到用户消息后,作为 LLM 的额外上下文。</li>
+        <li><strong>stdout 输出纯文本</strong> —— 整段作为 <code>additionalContext</code> 注入。</li>
+        <li><strong>空 stdout / 不可解析 JSON</strong> —— 放行,prompt 原样进入 LLM。</li>
+      </ul>
+      <p>AtomCode 解析 stdout 时,优先用<strong>最后一个非空行</strong>试 JSON;失败再回退到整段文本注入 —— 让 hook 脚本可以前置打印 debug 输出而不影响最终决策。</p>
+
+      <h3>路径变量</h3>
+      <p>Hook 命令字符串中可以引用以下环境变量(由 executor 注入):</p>
+      <ul>
+        <li><code>${CLAUDE_PLUGIN_ROOT}</code> —— plugin 安装目录绝对路径(CC 兼容)。</li>
+        <li><code>${ATOMCODE_PLUGIN_ROOT}</code> —— 同上,atomcode 别名。</li>
+      </ul>
+      <p>这些是<strong>真实环境变量</strong>由 shell 自身展开,不是字符串替换 —— 安装路径含空格、引号、<code>$</code>、<code>;</code> 都不会破命令。</p>
+
+      <h2>Marketplace 管理</h2>
+      <pre><code># 列出已注册的 marketplace
+/plugin marketplace list
+
+# 拉最新提交(更新该 marketplace 包含的 plugin 列表)
+/plugin marketplace update &lt;name&gt;
+
+# 移除(若该 marketplace 下还有 plugin 装着,会拒绝)
+/plugin marketplace remove &lt;name&gt;</code></pre>
+
+      <h2>实战:装昇腾插件</h2>
+      <pre><code>/plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
+# &gt; cloning marketplace from https://gitcode.com/...
+# &gt; marketplace `ascend-model-agent-plugin` added at 7a59537 (1 plugins)
+
+/plugin install ascend-model-agent-plugin@ascend-model-agent-plugin
+# &gt; installing `...`...
+# &gt; installed `ascend-model-agent-plugin@ascend-model-agent-plugin` — 23 skills loaded, 5 skipped
+
+# 这个 plugin 装了一个 UserPromptSubmit hook(workflow_planner_hook.py),
+# 当你说"帮我验证 Qwen3 在昇腾上的适配"时,它会注入一份 workflow JSON,
+# 让模型按照 ascend-model-verification skill 链路执行。
+帮我验证 Qwen3 在昇腾上的适配</code></pre>
+
+      <h2>已知限制</h2>
+      <ul>
+        <li><strong>不支持的 CC 事件</strong>:<code>Stop</code> / <code>PreCompact</code> / <code>SubagentStop</code> 当前会被静默跳过。</li>
+        <li><strong>多行 indent JSON 输出</strong>:hook 用 <code>print(json.dumps(..., indent=2))</code> 输出多行 JSON 时,最后一行是 <code>}</code>,我们的最后一行 JSON parser 会失败,回退到纯文本注入。功能上没问题(LLM 仍能读到内容),但不是结构化路径。建议 hook 作者用单行 <code>json.dumps(...)</code> 输出。</li>
+        <li><strong>Skill 名校验严格</strong>:<code>[a-z0-9_-]</code>,与 CC 一致。带 <code>/</code> 或大小写混合的 skill 名会被 skip。</li>
+      </ul>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./skills.html">Skills 扩展</a> —— 写自己的 skill,plugin 里也能用。</li>
+        <li><a href="./slash-commands.html">斜杠命令</a> —— 完整的 <code>/plugin</code> 命令列表。</li>
+        <li><a href="./mcp.html">MCP 集成</a> —— 接入外部工具的另一条路径,与 plugin 互补。</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

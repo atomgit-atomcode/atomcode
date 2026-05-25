@@ -1,0 +1,85 @@
+html {
+  /* Brand */
+  --app-brand: #7c3aed;
+  --app-brand-button: #6d28d9;
+  --app-brand-ivory: #faf9f5;
+  --app-brand-slate: #141413;
+
+  /* Foreground / Background */
+  --app-primary-foreground: var(--vscode-foreground);
+  --app-primary-background: var(--vscode-sideBar-background);
+  --app-secondary-foreground: var(--vscode-descriptionForeground);
+  --app-secondary-background: var(--vscode-editor-background);
+
+  /* Input */
+  --app-input-foreground: var(--vscode-input-foreground);
+  --app-input-background: var(--vscode-input-background);
+  --app-input-border: var(--vscode-inlineChatInput-border, var(--vscode-input-border));
+  --app-input-active-border: var(--vscode-inputOption-activeBorder);
+  --app-input-placeholder-foreground: var(--vscode-input-placeholderForeground);
+  --app-input-secondary-background: var(--vscode-menu-background, var(--vscode-input-background));
+
+  /* Button */
+  --app-button-foreground: var(--vscode-button-foreground);
+  --app-button-background: var(--vscode-button-background);
+  --app-button-hover-background: var(--vscode-button-hoverBackground);
+  --app-ghost-button-hover-background: var(--vscode-toolbar-hoverBackground);
+
+  /* Tool / Header */
+  --app-tool-background: var(--vscode-editor-background);
+  --app-header-background: var(--vscode-sideBar-background);
+  --app-primary-border-color: var(--vscode-sideBarActivityBarTop-border, var(--vscode-panel-border));
+  --app-accent-color: var(--vscode-inputOption-activeBorder);
+
+  /* List / Menu */
+  --app-list-hover-background: var(--vscode-list-hoverBackground);
+  --app-list-active-background: var(--vscode-list-activeSelectionBackground);
+  --app-list-active-foreground: var(--vscode-list-activeSelectionForeground);
+  --app-menu-background: var(--vscode-menu-background, var(--vscode-dropdown-background));
+  --app-menu-border: var(--vscode-menu-border, var(--vscode-dropdown-border));
+  --app-menu-foreground: var(--vscode-menu-foreground, var(--vscode-dropdown-foreground));
+  --app-menu-selection-background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+
+  /* Status */
+  --app-success-foreground: var(--vscode-gitDecoration-addedResourceForeground, #74c991);
+  --app-error-foreground: var(--vscode-errorForeground, #c74e39);
+  --app-warning-accent: #e5a54b;
+  --app-timeline-end-dot: var(--app-warning-accent);
+  --app-spinner-foreground: var(--app-brand);
+  --app-disabled-foreground: var(--vscode-disabledForeground);
+
+  /* Diff */
+  --app-diff-addition-foreground: var(--vscode-gitDecoration-addedResourceForeground, #74c991);
+  --app-diff-deletion-foreground: var(--vscode-gitDecoration-deletedResourceForeground, #c74e39);
+
+  /* Mention Chip */
+  --app-mention-chip-background: var(--vscode-chat-slashCommandBackground, var(--vscode-badge-background, #26477866));
+  --app-mention-chip-foreground: var(--vscode-chat-slashCommandForeground, var(--vscode-badge-foreground, #85b6ff));
+
+  /* Misc */
+  --app-transparent-inner-border: #ffffff1a;
+  --app-modal-background: #000000bf;
+  --app-link-color: var(--vscode-textLink-foreground, #3794ff);
+
+  /* Spacing */
+  --app-spacing-small: 4px;
+  --app-spacing-medium: 8px;
+  --app-spacing-large: 12px;
+  --app-spacing-xlarge: 16px;
+
+  /* Corner Radius */
+  --corner-radius-small: 4px;
+  --corner-radius-medium: 6px;
+  --corner-radius-large: 8px;
+
+  /* Font */
+  --app-monospace-font-family: var(--vscode-editor-font-family, 'Menlo', 'Monaco', 'Courier New', monospace);
+  --app-monospace-font-size: var(--vscode-editor-font-size, 12px);
+  --app-monospace-font-size-small: calc(var(--vscode-editor-font-size, 12px) - 2px);
+}
+
+/* Light theme overrides */
+.vscode-light {
+  --app-transparent-inner-border: #00000012;
+  --app-spinner-foreground: var(--app-brand-button);
+}

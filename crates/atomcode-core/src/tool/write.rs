@@ -7,44 +7,6 @@ use super::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 
 pub struct WriteFileTool;
 
-/// Check if a file path is a sensitive system location that should require user approval.
-fn is_sensitive_path(path: &str) -> bool {
-    let expanded = if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            home.join(&path[2..]).to_string_lossy().to_string()
-        } else {
-            path.to_string()
-        }
-    } else {
-        path.to_string()
-    };
-
-    let sensitive_prefixes = ["/etc/", "/usr/", "/var/", "/System/"];
-    for prefix in &sensitive_prefixes {
-        if expanded.starts_with(prefix) {
-            return true;
-        }
-    }
-
-    // Check ~/.ssh (expanded)
-    if let Some(home) = dirs::home_dir() {
-        let ssh_dir = home.join(".ssh");
-        let bashrc = home.join(".bashrc");
-        let bash_profile = home.join(".bash_profile");
-        let zshrc = home.join(".zshrc");
-        let p = std::path::Path::new(&expanded);
-        if p.starts_with(&ssh_dir)
-            || p == bashrc
-            || p == bash_profile
-            || p == zshrc
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
 #[derive(Deserialize)]
 struct WriteFileArgs {
     file_path: String,
@@ -56,10 +18,12 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "write_file",
-            description: "Write content to a file. Creates new files or overwrites existing ones.\n\
+            description:
+                "Write content to a file. Creates new files or overwrites existing ones.\n\
                 Use this for: creating new files, or rewriting an entire file from scratch.\n\
                 For small edits to existing files, prefer edit_file instead.\n\
-                Parent directories are auto-created if they don't exist.".to_string(),
+                Parent directories are auto-created if they don't exist."
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -69,6 +33,29 @@ impl Tool for WriteFileTool {
                 "required": ["file_path", "content"]
             }),
         }
+    }
+
+    fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
+        // Surface a model-friendly diagnostic (provided/missing keys + a
+        // one-line example) instead of the raw serde "line 1 column N"
+        // error which weak models read as a parser-position complaint and
+        // try to "fix" by switching to positional arguments. See
+        // `diagnose_args` doc for the failure mode this replaces.
+        super::diagnose_args(
+            "write_file",
+            args,
+            &[&["file_path", "content"]],
+            "write_file({\"file_path\": \"<absolute path>\", \"content\": \"<file body>\"})",
+        )?;
+        // Strict struct parse only AFTER the keys are known to be present
+        // — catches type mismatches (e.g. content sent as an array).
+        serde_json::from_str::<WriteFileArgs>(args)
+            .map(|_| ())
+            .map_err(|e| {
+                format!(
+                    "write_file: {e}. Re-issue with file_path as a string and content as a string."
+                )
+            })
     }
 
     fn approval(&self, args: &str) -> ApprovalRequirement {
@@ -81,7 +68,7 @@ impl Tool for WriteFileTool {
                 );
             }
         };
-        if is_sensitive_path(&parsed.file_path) {
+        if super::is_sensitive_input_path(&parsed.file_path) {
             return ApprovalRequirement::RequireApproval(
                 format!("Writing to sensitive system path: {}", parsed.file_path),
             );
@@ -101,11 +88,21 @@ impl Tool for WriteFileTool {
             Ok(wd) => wd.clone(),
             Err(_) => return base,
         };
-        match super::approval_for_path(&parsed.file_path, &working_dir, super::ExternalPathAction::Write) {
-            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => ApprovalRequirement::RequireApprovalAlways(reason),
-            Ok(ApprovalRequirement::RequireApproval(reason)) => ApprovalRequirement::RequireApproval(reason),
+        match super::approval_for_path(
+            &parsed.file_path,
+            &working_dir,
+            super::ExternalPathAction::Write,
+        ) {
+            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                ApprovalRequirement::RequireApprovalAlways(reason)
+            }
+            Ok(ApprovalRequirement::RequireApproval(reason)) => {
+                ApprovalRequirement::RequireApproval(reason)
+            }
             Ok(ApprovalRequirement::AutoApprove) => match base {
-                ApprovalRequirement::RequireApproval(reason) => ApprovalRequirement::RequireApprovalAlways(reason),
+                ApprovalRequirement::RequireApproval(reason) => {
+                    ApprovalRequirement::RequireApprovalAlways(reason)
+                }
                 other => other,
             },
             Err(_) => base,
@@ -113,26 +110,30 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
-        // Parse args defensively. Providers occasionally emit empty ({}) or
-        // truncated tool-call arguments on max_tokens cutoff; surfacing the raw
-        // serde error ("missing field `file_path` at line 1 column 2") tells
-        // the model nothing actionable. Return a success=false result with a
-        // recovery hint instead, so the next turn can re-issue the call properly.
+        // Defense-in-depth: validate_args runs at the runner gate, but if
+        // it's bypassed (or args mutated between gate and execute), we fall
+        // back to the same diagnose_args path so the model sees a uniform
+        // recovery hint instead of a raw serde error.
+        if let Err(msg) = super::diagnose_args(
+            "write_file",
+            args,
+            &[&["file_path", "content"]],
+            "write_file({\"file_path\": \"<absolute path>\", \"content\": \"<file body>\"})",
+        ) {
+            return Ok(ToolResult {
+                call_id: String::new(),
+                output: msg,
+                success: false,
+            });
+        }
         let parsed: WriteFileArgs = match serde_json::from_str(args) {
             Ok(p) => p,
             Err(e) => {
-                let hint = if args.trim().is_empty() || args.trim() == "{}" {
-                    "tool call arrived with no arguments — likely truncated by max_tokens. \
-                     Re-issue write_file with both `file_path` (absolute) and `content`, \
-                     or switch to edit_file for targeted changes."
-                } else {
-                    "could not parse write_file arguments. Re-issue with a valid JSON object \
-                     containing `file_path` (absolute) and `content`. For large files, \
-                     prefer edit_file to avoid hitting the output token limit."
-                };
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output: format!("Error: {}. {}", e, hint),
+                    output: format!(
+                        "write_file: {e}. Re-issue with file_path as a string and content as a string."
+                    ),
                     success: false,
                 });
             }
@@ -150,7 +151,11 @@ impl Tool for WriteFileTool {
         };
 
         // Backup before write (git checkpoint + file-level backup)
-        ctx.file_history.lock().await.backup_before_write(&path.to_string_lossy()).await;
+        ctx.file_history
+            .lock()
+            .await
+            .backup_before_write(&path.to_string_lossy())
+            .await;
 
         // Check if overwriting existing file — build appropriate output message
         let overwrite_info = if path.exists() {
@@ -170,12 +175,36 @@ impl Tool for WriteFileTool {
         let bytes = parsed.content.len();
         tokio::fs::write(&path, &parsed.content).await?;
 
+        // D3: drop any FileStore entry for this path. The next peek_file
+        // against the old store_id will report "stale" and route the
+        // model toward a fresh read_file. Without this invalidation a
+        // peek_file could hand the model pre-write content that no
+        // longer matches what just landed on disk.
+        ctx.file_store.write().await.invalidate(&path);
+        // Defense-in-depth: read_cache mtime gate is normally sufficient
+        // because tokio::fs::write bumps mtime, but on FS with coarse
+        // mtime granularity (ext4 1-second precision, NFS) a write within
+        // the same tick as the prior read keeps the same mtime and the
+        // gate stops protecting us. Explicit purge eliminates that
+        // corner case for any path we just wrote.
+        ctx.read_cache
+            .write()
+            .await
+            .retain(|(p, _, _), _| p != &path);
+
+        // Notify LSP that file changed (if LSP is enabled).
+        ctx.notify_lsp_file_changed(&path, &parsed.content).await;
+
         let output = if let Some(old_lines) = overwrite_info {
             let diff = new_lines as i64 - old_lines as i64;
             let sign = if diff >= 0 { "+" } else { "" };
             let mut msg = format!(
                 "Overwrote {} (was {} lines, now {} lines, {}{})",
-                path.display(), old_lines, new_lines, sign, diff
+                path.display(),
+                old_lines,
+                new_lines,
+                sign,
+                diff
             );
             // Warn if significant content reduction (might have lost code)
             if old_lines > 20 && new_lines < old_lines / 2 {
@@ -186,7 +215,12 @@ impl Tool for WriteFileTool {
             }
             msg
         } else {
-            format!("Created new file {} ({} bytes, {} lines)", path.display(), bytes, new_lines)
+            format!(
+                "Created new file {} ({} bytes, {} lines)",
+                path.display(),
+                bytes,
+                new_lines
+            )
         };
 
         Ok(ToolResult {

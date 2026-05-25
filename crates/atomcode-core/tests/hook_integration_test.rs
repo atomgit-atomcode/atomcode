@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,10 +17,6 @@ use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::message::Message;
 use atomcode_core::conversation::Conversation;
-use atomcode_core::hook::{
-    Hook, HookContext, HookRegistry, HookResult, PostToolExecutionHook, PreToolExecutionHook,
-    ToolResultContext,
-};
 use atomcode_core::provider::LlmProvider;
 use atomcode_core::stream::StreamEvent;
 use atomcode_core::tool::{
@@ -29,6 +25,7 @@ use atomcode_core::tool::{
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
 use atomcode_core::turn::runner::TurnRunner;
+use atomcode_core::hook::{Hook, HookContext, HookRegistry, HookResult, PreToolExecutionHook, PostToolExecutionHook, ToolResultContext};
 
 // ===========================================================================
 // Mock Provider
@@ -106,11 +103,8 @@ impl Tool for MockEchoTool {
 
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
         let args_val: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        let msg = args_val
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("empty");
-
+        let msg = args_val.get("message").and_then(|m| m.as_str()).unwrap_or("empty");
+        
         Ok(ToolResult {
             call_id: String::new(),
             output: format!("Echo: {}", msg),
@@ -158,11 +152,7 @@ impl Hook for TrackingPostHook {
 
 #[async_trait]
 impl PostToolExecutionHook for TrackingPostHook {
-    async fn on_post_execute(
-        &self,
-        _ctx: &HookContext,
-        result_ctx: &ToolResultContext,
-    ) -> HookResult {
+    async fn on_post_execute(&self, _ctx: &HookContext, result_ctx: &ToolResultContext) -> HookResult {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         *self.last_result.lock().unwrap() = result_ctx.result.clone();
         HookResult::Ok
@@ -186,8 +176,6 @@ fn test_config() -> Config {
             user_agent: None,
             context_window: 16000,
             max_tokens: None,
-            thinking_type: None,
-            thinking_keep: None,
             ephemeral: false,
         },
     );
@@ -196,9 +184,7 @@ fn test_config() -> Config {
         default_workdir: None,
         providers,
         datalog: Default::default(),
-        notifications: Default::default(),
         auto_update: false,
-        reflection_cadence: 0,
     }
 }
 
@@ -206,32 +192,18 @@ fn test_context() -> ToolContext {
     ToolContext::new(PathBuf::from("/tmp/test"))
 }
 
-fn create_test_runner(provider: MockProvider, hook_registry: HookRegistry) -> TurnRunner {
+fn create_test_runner(
+    provider: MockProvider,
+    hook_registry: HookRegistry,
+) -> TurnRunner {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(MockEchoTool));
-
-    let test_provider = atomcode_core::config::provider::ProviderConfig {
-        provider_type: "mock".to_string(),
-        api_key: None,
-        model: "mock-model".to_string(),
-        base_url: None,
-        system_prompt: None,
-        user_agent: None,
-        context_window: 16000,
-        max_tokens: None,
-        thinking_type: None,
-        thinking_keep: None,
-        ephemeral: false,
-    };
-    let test_ctx: std::sync::Arc<dyn atomcode_core::ctx::CtxBuilder> =
-        std::sync::Arc::new(atomcode_core::ctx::DefaultCtx::new(&test_provider));
-
+    
     TurnRunner {
         provider: Arc::new(provider),
         tools: Arc::new(registry),
         context: test_context(),
         config: test_config(),
-        ctx: test_ctx,
         permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
         hook_registry,
         recently_edited_files: Vec::new(),
@@ -250,7 +222,7 @@ async fn test_hooks_fire_during_turn() {
     let post_count = Arc::new(AtomicUsize::new(0));
     let last_tool = Arc::new(std::sync::Mutex::new(String::new()));
     let last_result = Arc::new(std::sync::Mutex::new(String::new()));
-
+    
     let mut hooks = HookRegistry::new();
     hooks.register_pre_tool_hook(Arc::new(TrackingPreHook {
         call_count: pre_count.clone(),
@@ -260,31 +232,24 @@ async fn test_hooks_fire_during_turn() {
         call_count: post_count.clone(),
         last_result: last_result.clone(),
     }));
-
-    let provider = MockProvider::with_tool_call("echo", r#"{"message": "hello hooks"}"#);
+    
+    let provider = MockProvider::with_tool_call(
+        "echo",
+        r#"{"message": "hello hooks"}"#,
+    );
     let mut runner = create_test_runner(provider, hooks);
-
+    
     let mut conv = Conversation::new();
     conv.add_user_message("Test the echo tool");
     let (tx, _rx) = mpsc::unbounded_channel();
-
-    let result = runner
-        .run(&mut conv, "system", &tx, CancellationToken::new())
-        .await;
-
+    
+    let result = runner.run(&mut conv, "system", &tx, CancellationToken::new()).await;
+    
     match result {
         TurnResult::UsedTools { tool_count, .. } => {
             assert_eq!(tool_count, 1);
-            assert_eq!(
-                pre_count.load(Ordering::SeqCst),
-                1,
-                "Pre-hook should be called once"
-            );
-            assert_eq!(
-                post_count.load(Ordering::SeqCst),
-                1,
-                "Post-hook should be called once"
-            );
+            assert_eq!(pre_count.load(Ordering::SeqCst), 1, "Pre-hook should be called once");
+            assert_eq!(post_count.load(Ordering::SeqCst), 1, "Post-hook should be called once");
             assert_eq!(*last_tool.lock().unwrap(), "echo");
             assert!(last_result.lock().unwrap().contains("Echo: hello hooks"));
         }

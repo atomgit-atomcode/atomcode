@@ -59,7 +59,7 @@ fn default_batch_size() -> usize {
 }
 
 fn default_flush_interval() -> u64 {
-    1000 // 1 秒
+    1000  // 1 秒
 }
 
 fn default_timeout() -> u64 {
@@ -129,7 +129,11 @@ impl AsyncWebhookBatcher {
         // 启动后台任务
         let client_clone = client.clone();
         let config_clone = config.clone();
-        let handle = tokio::spawn(Self::background_task(client_clone, config_clone, receiver));
+        let handle = tokio::spawn(Self::background_task(
+            client_clone,
+            config_clone,
+            receiver,
+        ));
 
         Self {
             config,
@@ -233,10 +237,7 @@ impl AsyncWebhookBatcher {
         let mut last_error = None;
         for attempt in 0..=config.retries {
             let request = client.request(
-                config
-                    .method
-                    .parse()
-                    .map_err(|e| format!("Invalid HTTP method: {}", e))?,
+                config.method.parse().map_err(|e| format!("Invalid HTTP method: {}", e))?,
                 &config.url,
             );
 
@@ -267,9 +268,7 @@ impl AsyncWebhookBatcher {
                     } else {
                         last_error = Some(format!(
                             "HTTP {} at attempt {}: {}",
-                            status,
-                            attempt + 1,
-                            body
+                            status, attempt + 1, body
                         ));
                     }
                 }
@@ -362,5 +361,174 @@ impl AsyncWebhookRegistry {
 impl Default for AsyncWebhookRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Helper to create a test config with mininal fields
+    fn test_config(name: &str, url: &str) -> AsyncWebhookConfig {
+        AsyncWebhookConfig {
+            name: name.to_string(),
+            url: url.to_string(),
+            method: "POST".to_string(),
+            headers: HashMap::new(),
+            batch_size: 10,
+            flush_interval_ms: 1000,
+            timeout_secs: 10,
+            retries: 2,
+            enabled: true,
+            description: String::new(),
+        }
+    }
+
+    // ── AsyncWebhookConfig ─────────────────────────────────────────────
+
+    #[test]
+    fn test_config_defaults() {
+        let config = test_config("test", "https://example.com/hook");
+        assert_eq!(config.method, "POST");
+        assert_eq!(config.batch_size, 10);
+        assert_eq!(config.flush_interval_ms, 1000);
+        assert_eq!(config.timeout_secs, 10);
+        assert_eq!(config.retries, 2);
+        assert!(config.enabled);
+        assert!(config.headers.is_empty());
+        assert!(config.description.is_empty());
+    }
+
+    #[test]
+    fn test_config_serde_roundtrip() {
+        let config = test_config("serde-test", "https://example.com/serde");
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: AsyncWebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "serde-test");
+        assert_eq!(deserialized.url, "https://example.com/serde");
+    }
+
+    #[test]
+    fn test_default_functions() {
+        assert_eq!(default_method(), "POST");
+        assert_eq!(default_batch_size(), 10);
+        assert_eq!(default_flush_interval(), 1000);
+        assert_eq!(default_timeout(), 10);
+        assert_eq!(default_retries(), 2);
+        assert!(default_true());
+    }
+
+    // ── WebhookEvent ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_webhook_event_serialization_roundtrip() {
+        let event = WebhookEvent {
+            event: "pre_tool".into(),
+            hook_name: "test-hook".into(),
+            trigger: "pre_tool_execution".into(),
+            context: serde_json::json!({"tool": "bash", "args": "echo hi"}),
+            timestamp_ms: 1234567890,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: WebhookEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.event, "pre_tool");
+        assert_eq!(deserialized.hook_name, "test-hook");
+        assert_eq!(deserialized.trigger, "pre_tool_execution");
+        assert_eq!(deserialized.timestamp_ms, 1234567890);
+        assert_eq!(
+            deserialized.context.get("tool").and_then(|v| v.as_str()),
+            Some("bash")
+        );
+    }
+
+    // ── BatchRequest ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_batch_request_serialization() {
+        let events = vec![WebhookEvent {
+            event: "post_tool".into(),
+            hook_name: "my-hook".into(),
+            trigger: "post_tool_execution".into(),
+            context: serde_json::json!({"result": "ok"}),
+            timestamp_ms: 987654321,
+        }];
+
+        let req = BatchRequest {
+            url: "https://example.com/batch".into(),
+            method: "POST".into(),
+            headers: HashMap::from([("Authorization".into(), "Bearer token123".into())]),
+            events,
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["url"], "https://example.com/batch");
+        assert_eq!(json["method"], "POST");
+        assert_eq!(json["headers"]["Authorization"], "Bearer token123");
+        assert!(json["events"].is_array());
+        assert_eq!(json["events"].as_array().unwrap().len(), 1);
+    }
+
+    // ── AsyncWebhookRegistry ──────────────────────────────────────────
+
+    #[test]
+    fn test_registry_new_and_default() {
+        let registry = AsyncWebhookRegistry::new();
+        assert!(registry.batchers.is_empty());
+
+        let registry_default = AsyncWebhookRegistry::default();
+        assert!(registry_default.batchers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_registry_register_and_get() {
+        let mut registry = AsyncWebhookRegistry::new();
+
+        let config = test_config("test-batcher", "https://example.com/batch");
+
+        registry.register(config);
+        assert_eq!(registry.batchers.len(), 1);
+        assert!(registry.get("test-batcher").is_some());
+        assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_registry_iter() {
+        let mut registry = AsyncWebhookRegistry::new();
+
+        registry.register(test_config("b1", "https://example.com/1"));
+        registry.register(test_config("b2", "https://example.com/2"));
+
+        let names: Vec<&String> = registry.iter().map(|(name, _)| name).collect();
+        assert!(names.contains(&&"b1".to_string()));
+        assert!(names.contains(&&"b2".to_string()));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_registry_shutdown_all_does_not_panic() {
+        let mut registry = AsyncWebhookRegistry::new();
+        registry.register(test_config("shutdown-test", "https://example.com/shutdown"));
+        registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_registry_flush_all_does_not_panic() {
+        let mut registry = AsyncWebhookRegistry::new();
+        registry.register(test_config("flush-test", "https://example.com/flush"));
+        registry.flush_all().await;
+    }
+
+    // ── AsyncWebhookBatcher ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_batcher_new_and_drop() {
+        let mut config = test_config("drop-test", "https://example.com/drop");
+        config.batch_size = 5;
+
+        let batcher = AsyncWebhookBatcher::new(config);
+        drop(batcher);
     }
 }

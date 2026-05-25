@@ -21,6 +21,8 @@ pub struct ClaudeProvider {
     model: String,
     base_url: String,
     max_tokens: usize,
+    thinking_enabled: bool,
+    thinking_budget: u32,
 }
 
 impl ClaudeProvider {
@@ -29,8 +31,10 @@ impl ClaudeProvider {
             .api_key
             .clone()
             .context("Claude provider requires an api_key")?;
+        let thinking_enabled = config.thinking_enabled.unwrap_or(false);
+        let thinking_budget = config.thinking_budget.unwrap_or(10_000);
         Ok(Self {
-            client: super::build_http_client(config.user_agent.as_deref()),
+            client: super::build_http_client(config.user_agent.as_deref(), config.skip_tls_verify),
             api_key,
             model: config.model.clone(),
             base_url: config
@@ -40,6 +44,8 @@ impl ClaudeProvider {
             max_tokens: config
                 .max_tokens
                 .unwrap_or((config.context_window / 4).clamp(8_000, 16_384)),
+            thinking_enabled,
+            thinking_budget,
         })
     }
 
@@ -59,6 +65,23 @@ impl ClaudeProvider {
                 Role::User => {
                     let content = match &m.content {
                         MessageContent::Text(s) => json!(s),
+                        MessageContent::MultiPart { text, images } => {
+                            let mut parts: Vec<serde_json::Value> = Vec::new();
+                            for img in images {
+                                parts.push(json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": &img.media_type,
+                                        "data": &img.data,
+                                    }
+                                }));
+                            }
+                            if let Some(t) = text {
+                                parts.push(json!({"type": "text", "text": t}));
+                            }
+                            json!(parts)
+                        }
                         _ => json!(""),
                     };
                     msgs.push(json!({"role": "user", "content": content}));
@@ -71,8 +94,26 @@ impl ClaudeProvider {
                                 "content": [{"type": "text", "text": s}]
                             }));
                         }
-                        MessageContent::AssistantWithToolCalls { text, tool_calls, .. } => {
+                        MessageContent::AssistantWithToolCalls {
+                            text,
+                            tool_calls,
+                            thinking_blocks,
+                            ..
+                        } => {
                             let mut parts: Vec<serde_json::Value> = Vec::new();
+                            // Thinking blocks must come BEFORE text/tool_use
+                            // per Anthropic's spec; the API rejects requests
+                            // that interleave or trail thinking. Each block
+                            // carries the server-issued `signature` we
+                            // captured at receive time — required for echo
+                            // verification on the next turn.
+                            for tb in thinking_blocks {
+                                parts.push(json!({
+                                    "type": "thinking",
+                                    "thinking": tb.text,
+                                    "signature": tb.signature,
+                                }));
+                            }
                             if let Some(t) = text {
                                 if !t.is_empty() {
                                     parts.push(json!({"type": "text", "text": t}));
@@ -90,7 +131,9 @@ impl ClaudeProvider {
                             }
                             msgs.push(json!({"role": "assistant", "content": parts}));
                         }
-                        MessageContent::ToolResult(_) | MessageContent::ToolResultRef(_) => {
+                        MessageContent::ToolResult(_)
+                        | MessageContent::ToolResultRef(_)
+                        | MessageContent::MultiPart { .. } => {
                             // Should not appear on assistant role; skip.
                         }
                     }
@@ -127,8 +170,6 @@ impl ClaudeProvider {
 struct ClaudeSSE {
     #[serde(rename = "type")]
     event_type: String,
-    #[allow(dead_code)]
-    index: Option<usize>,
     content_block: Option<ContentBlock>,
     delta: Option<ClaudeDelta>,
     usage: Option<ClaudeUsage>,
@@ -156,15 +197,23 @@ struct ContentBlock {
     block_type: String,
     id: Option<String>,
     name: Option<String>,
-    #[allow(dead_code)]
-    text: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ClaudeDelta {
     #[serde(rename = "type")]
     delta_type: String,
+    /// Set by `text_delta`. Some Anthropic-compatible proxies (notably
+    /// the deepseek-v4-pro Anthropic-style endpoint) also stash
+    /// thinking text here instead of in the spec-correct `thinking`
+    /// field — `thinking_delta` falls back to this to stay compatible.
     text: Option<String>,
+    /// Set by `thinking_delta` (Anthropic spec field name; not `text`).
+    thinking: Option<String>,
+    /// Set by `signature_delta`. Anthropic emits the cryptographic
+    /// signature for a thinking block as one or more signature_delta
+    /// chunks during streaming; we concatenate them per content block.
+    signature: Option<String>,
     partial_json: Option<String>,
 }
 
@@ -179,6 +228,8 @@ impl ClaudeProvider {
         system: Option<String>,
         msgs: Vec<serde_json::Value>,
         tools: Option<&[ToolDef]>,
+        thinking_enabled: bool,
+        thinking_budget: u32,
     ) -> serde_json::Value {
         let mut body = json!({
             "model": model,
@@ -186,6 +237,18 @@ impl ClaudeProvider {
             "max_tokens": max_tokens,
             "stream": true,
         });
+
+        if thinking_enabled {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": thinking_budget
+            });
+            // Anthropic requires max_tokens >= budget when thinking enabled
+            let min_max = thinking_budget as usize + 4096;
+            if max_tokens < min_max {
+                body["max_tokens"] = json!(min_max);
+            }
+        }
 
         if let Some(sys) = system {
             // System prompt as array with cache_control breakpoint.
@@ -234,7 +297,15 @@ impl LlmProvider for ClaudeProvider {
         tools: Option<&[ToolDef]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let (system, msgs) = Self::format_messages(messages);
-        let body = Self::build_request_body(&self.model, self.max_tokens, system, msgs, tools);
+        let body = Self::build_request_body(
+            &self.model,
+            self.max_tokens,
+            system,
+            msgs,
+            tools,
+            self.thinking_enabled,
+            self.thinking_budget,
+        );
 
         let url = normalize_claude_base_url(&self.base_url);
         // Local Claude-compatible servers (e.g. oMLX) sometimes authenticate via
@@ -266,20 +337,31 @@ impl LlmProvider for ClaudeProvider {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
+                let msg = super::extract_error_message(&body);
                 let _ = tx.send(Ok(StreamEvent::Error(format!(
                     "Claude API error ({}): {}",
-                    status, body
+                    status, msg
                 ))));
                 return;
             }
 
             let mut buffer = String::new();
             let mut byte_stream = response.bytes_stream();
+            // Use byte buffer to properly handle UTF-8 characters that span chunk boundaries
+            let mut byte_buffer: Vec<u8> = Vec::with_capacity(4096);
 
             // Per-message state for the current tool_use content block.
             let mut tc_id = String::new();
             let mut tc_name = String::new();
             let mut tc_json = String::new();
+            // Per-message state for the current thinking content block.
+            // `in_thinking_block` gates which content_block_stop emits a
+            // ThinkingBlock event. text/signature buffers accumulate
+            // across `thinking_delta` / `signature_delta` chunks within
+            // one block and reset at content_block_stop.
+            let mut in_thinking_block = false;
+            let mut thinking_text = String::new();
+            let mut thinking_signature = String::new();
 
             loop {
                 let chunk = match tokio::time::timeout(
@@ -298,11 +380,30 @@ impl LlmProvider for ClaudeProvider {
                     }
                 };
 
-                let text = match chunk {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                match chunk {
+                    Ok(bytes) => {
+                        byte_buffer.extend_from_slice(&bytes);
+                    }
                     Err(e) => {
                         let _ = tx.send(Ok(StreamEvent::Error(e.to_string())));
                         return;
+                    }
+                }
+
+                // Convert bytes to string, keeping incomplete UTF-8 sequences for next chunk
+                let text = match String::from_utf8(byte_buffer.clone()) {
+                    Ok(s) => {
+                        byte_buffer.clear();
+                        s
+                    }
+                    Err(e) => {
+                        let valid_len = e.utf8_error().valid_up_to();
+                        if valid_len == 0 {
+                            continue;
+                        }
+                        let valid = String::from_utf8_lossy(&byte_buffer[..valid_len]).to_string();
+                        byte_buffer = byte_buffer[valid_len..].to_vec();
+                        valid
                     }
                 };
 
@@ -333,6 +434,10 @@ impl LlmProvider for ClaudeProvider {
                                         id: tc_id.clone(),
                                         name: tc_name.clone(),
                                     }));
+                                } else if block.block_type == "thinking" {
+                                    in_thinking_block = true;
+                                    thinking_text.clear();
+                                    thinking_signature.clear();
                                 }
                             }
                         }
@@ -342,6 +447,26 @@ impl LlmProvider for ClaudeProvider {
                                     "text_delta" => {
                                         if let Some(text) = &delta.text {
                                             let _ = tx.send(Ok(StreamEvent::Delta(text.clone())));
+                                        }
+                                    }
+                                    "thinking_delta" => {
+                                        // Spec field is `thinking`; some
+                                        // Anthropic-compat proxies put it
+                                        // in `text` instead — accept either.
+                                        let chunk = delta
+                                            .thinking
+                                            .as_deref()
+                                            .or(delta.text.as_deref());
+                                        if let Some(text) = chunk {
+                                            thinking_text.push_str(text);
+                                            let _ = tx.send(Ok(StreamEvent::Reasoning(
+                                                text.to_string(),
+                                            )));
+                                        }
+                                    }
+                                    "signature_delta" => {
+                                        if let Some(sig) = &delta.signature {
+                                            thinking_signature.push_str(sig);
                                         }
                                     }
                                     "input_json_delta" => {
@@ -366,6 +491,18 @@ impl LlmProvider for ClaudeProvider {
                                 tc_id.clear();
                                 tc_name.clear();
                                 tc_json.clear();
+                            }
+                            if in_thinking_block {
+                                // Emit even when text is empty: Anthropic
+                                // sometimes sends a thinking block with
+                                // only signature (redacted thinking). The
+                                // signature still has to be echoed back
+                                // or the next request 400s.
+                                let _ = tx.send(Ok(StreamEvent::ThinkingBlock {
+                                    text: std::mem::take(&mut thinking_text),
+                                    signature: std::mem::take(&mut thinking_signature),
+                                }));
+                                in_thinking_block = false;
                             }
                         }
                         "message_start" => {
@@ -482,6 +619,8 @@ mod tests {
             Some("You are a helpful assistant.".to_string()),
             vec![json!({"role": "user", "content": "hello"})],
             None,
+            false,
+            10000,
         );
 
         let system = &body["system"];
@@ -513,6 +652,8 @@ mod tests {
             Some("sys".to_string()),
             vec![],
             Some(&tools),
+            false,
+            10000,
         );
 
         let tools_json = &body["tools"];
@@ -541,7 +682,7 @@ mod tests {
             parameters: json!({"type": "object"}),
         }];
 
-        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools));
+        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools), false, 10000);
 
         let arr = body["tools"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -551,7 +692,7 @@ mod tests {
     #[test]
     fn test_empty_tools_no_tools_field() {
         let tools: Vec<ToolDef> = vec![];
-        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools));
+        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools), false, 10000);
         assert!(
             body.get("tools").is_none(),
             "Empty tools should not add tools field"
@@ -560,10 +701,214 @@ mod tests {
 
     #[test]
     fn test_no_system_no_system_field() {
-        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], None);
+        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], None, false, 10000);
         assert!(
             body.get("system").is_none(),
             "No system prompt should not add system field"
         );
+    }
+
+    #[test]
+    fn build_request_body_with_thinking() {
+        let body = ClaudeProvider::build_request_body(
+            "claude-sonnet-4", 16384,
+            Some("system".into()), vec![json!({"role":"user","content":"hi"})],
+            None, true, 10000,
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 10000);
+        assert_eq!(body["max_tokens"], 16384); // 16384 > 10000+4096, no adjustment
+    }
+
+    #[test]
+    fn build_request_body_adjusts_max_tokens_for_thinking() {
+        let body = ClaudeProvider::build_request_body(
+            "claude-sonnet-4", 8000,
+            None, vec![], None, true, 10000,
+        );
+        assert_eq!(body["max_tokens"], 14096); // bumped: 10000+4096 > 8000
+    }
+
+    #[test]
+    fn build_request_body_without_thinking() {
+        let body = ClaudeProvider::build_request_body(
+            "claude-sonnet-4", 16384,
+            None, vec![], None, false, 10000,
+        );
+        assert!(body.get("thinking").is_none());
+    }
+
+    /// Regression: AssistantWithToolCalls turns must emit recorded
+    /// thinking blocks (with their server-issued `signature`) as the
+    /// FIRST elements of the assistant `content` array. Anthropic
+    /// rejects requests with `400 The content[].thinking in the
+    /// thinking mode must be passed back to the API` whenever the
+    /// thinking blocks from a prior turn are missing or trail the
+    /// text/tool_use blocks. Previously claude.rs dropped them via
+    /// `..` destructuring of MessageContent.
+    #[test]
+    fn format_messages_assistant_with_tool_calls_emits_thinking_first() {
+        use crate::conversation::message::ThinkingBlock;
+        use crate::tool::ToolCall;
+
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: Some("running ls".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "tu_1".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: vec![
+                    ThinkingBlock {
+                        text: "Let me think...".to_string(),
+                        signature: "sig_abc123".to_string(),
+                    },
+                    ThinkingBlock {
+                        text: "Running the command".to_string(),
+                        signature: "sig_def456".to_string(),
+                    },
+                ],
+            },
+        }];
+
+        let (_system, msgs) = ClaudeProvider::format_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        let content = msgs[0]["content"]
+            .as_array()
+            .expect("content should be array");
+        // Order: thinking, thinking, text, tool_use.
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "Let me think...");
+        assert_eq!(content[0]["signature"], "sig_abc123");
+        assert_eq!(content[1]["type"], "thinking");
+        assert_eq!(content[1]["thinking"], "Running the command");
+        assert_eq!(content[1]["signature"], "sig_def456");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "running ls");
+        assert_eq!(content[3]["type"], "tool_use");
+        assert_eq!(content[3]["id"], "tu_1");
+    }
+
+    /// AssistantWithToolCalls with no thinking blocks (older session,
+    /// non-Anthropic provider) must still serialise cleanly without
+    /// an empty leading element.
+    #[test]
+    fn format_messages_assistant_without_thinking_unchanged() {
+        use crate::tool::ToolCall;
+
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::AssistantWithToolCalls {
+                text: Some("ok".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "tu_1".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                reasoning_content: None,
+                thinking_blocks: Vec::new(),
+            },
+        }];
+
+        let (_system, msgs) = ClaudeProvider::format_messages(&messages);
+        let content = msgs[0]["content"]
+            .as_array()
+            .expect("content should be array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn format_messages_multipart_produces_image_blocks() {
+        use crate::conversation::message::ImagePart;
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("What is in this image?".to_string()),
+                images: vec![ImagePart {
+                    media_type: "image/png".to_string(),
+                    data: "aWdub3JlLXRoaXM=".to_string(),
+                }],
+            },
+        }];
+
+        let (_system, msgs) = ClaudeProvider::format_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+
+        let user_msg = &msgs[0];
+        assert_eq!(user_msg["role"], "user");
+
+        let content = user_msg["content"].as_array().expect("content should be array");
+        assert_eq!(content.len(), 2); // 1 image + 1 text
+
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["type"], "base64");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["data"], "aWdub3JlLXRoaXM=");
+
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "What is in this image?");
+    }
+
+    #[test]
+    fn format_messages_multipart_images_only_no_text_block() {
+        use crate::conversation::message::ImagePart;
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: None,
+                images: vec![ImagePart {
+                    media_type: "image/jpeg".to_string(),
+                    data: "c29tZS1kYXRh".to_string(),
+                }],
+            },
+        }];
+
+        let (_system, msgs) = ClaudeProvider::format_messages(&messages);
+        let content = msgs[0]["content"].as_array().expect("content should be array");
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["media_type"], "image/jpeg");
+    }
+
+    #[test]
+    fn format_messages_multipart_multiple_images() {
+        use crate::conversation::message::ImagePart;
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::MultiPart {
+                text: Some("compare".to_string()),
+                images: vec![
+                    ImagePart {
+                        media_type: "image/png".to_string(),
+                        data: "aW1nMQ==".to_string(),
+                    },
+                    ImagePart {
+                        media_type: "image/jpeg".to_string(),
+                        data: "aW1nMg==".to_string(),
+                    },
+                ],
+            },
+        }];
+
+        let (_system, msgs) = ClaudeProvider::format_messages(&messages);
+        let content = msgs[0]["content"].as_array().expect("content should be array");
+
+        assert_eq!(content.len(), 3); // 2 images + 1 text
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["data"], "aW1nMQ==");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["data"], "aW1nMg==");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "compare");
     }
 }

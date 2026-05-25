@@ -22,12 +22,13 @@
   <a href="#features">Features</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#development">Development</a> ·
-  <a href="#contributing">Contributing</a>
+  <a href="#contributing">Contributing</a> ·
+  <a href="#community">Community</a>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
-  <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="rust">
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
   <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">
@@ -102,9 +103,9 @@ Connect to any LLM that supports OpenAI's function-calling API:
 
 - **Real-time streaming** with markdown rendering and syntax highlighting
 - **Code blocks** with language labels, line numbers, and `base16-ocean.dark` theme
-- **Multi-line input** with Shift+Enter, auto-growing height, input history
+- **Multi-line input** with Shift+Enter (or `\` + Enter), auto-growing height, input history
 - **Text selection** with mouse drag, auto-scroll, and clipboard copy
-- **Slash commands** — `/model`, `/provider`, `/resume`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
+- **Slash commands** — `/model`, `/provider`, `/resume`, `/bg`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
 - **File attachment** — paste file paths to attach content as context
 - **Bracketed paste** — long paste content collapsed to a compact indicator
 - **Skills** — user-defined commands loaded from your skill directory, invoked like any slash command
@@ -120,6 +121,10 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Undo** — `/undo` rolls back the last turn's file edits via file-history snapshots
 
 See [Permission Model](./docs/security/permission-model.md) for the full design and current boundaries.
+
+### Privacy
+
+- 📊 Anonymous telemetry (opt-out) — see [docs/telemetry.md](docs/telemetry.md)
 
 ## Installation
 
@@ -146,8 +151,29 @@ and the binary will be generated at `target/release/atomcode`.
 
 ### Requirements
 
-- Rust 1.75+ (for building)
+- Rust 1.88+ (for building; older Cargo versions cannot parse the current lockfile)
 - An API key from any supported provider (or an AtomGit account for `/login`)
+
+### Uninstall
+
+Remove AtomCode and (optionally) its data:
+
+```bash
+atomcode uninstall                # interactive: per-group prompts
+atomcode uninstall --keep-data    # only remove binary + PATH edit
+atomcode uninstall --purge        # remove everything, including ~/.atomcode
+atomcode uninstall --dry-run      # show plan, change nothing
+```
+
+If the binary is already broken or missing:
+
+```bash
+curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.sh | sh
+# Windows:
+irm https://atomgit.com/atomgit_atomcode/atomcode/raw/main/uninstall.ps1 | iex
+```
+
+By default credentials (`auth.toml`, `mcp.json`, `config.toml`, `ATOMCODE.md`) are kept; pass `--purge` to remove them too.
 
 ## Quick Start
 
@@ -236,13 +262,30 @@ Then just type what you want:
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message |
-| `Shift+Enter` | New line |
+| `Shift+Enter` | New line (requires Kitty keyboard protocol) |
+| `Ctrl+Enter` | New line (requires Kitty keyboard protocol) |
+| `Ctrl+J` | New line (requires Kitty keyboard protocol) |
+| `Alt+Enter` | New line (most terminals; see compatibility note below) |
+| `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
 | `Esc` | Clear input / Cancel stream |
 | `Up/Down` | Browse input history |
 | `Tab` | Accept suggestion |
 | `Ctrl+U` | Clear line |
 | `Ctrl+W` | Delete word |
 | `Ctrl+K` | Delete to end of line |
+| `Ctrl+V` | Paste image from clipboard (Windows: use `/paste`, see below) |
+
+> **Terminal compatibility for newline chords:**
+> - `Shift+Enter`, `Ctrl+Enter`, and `Ctrl+J` all need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals collapse them to plain `Enter` (which sends the message).
+> - `Alt+Enter` works at the byte level on most terminals, but **Windows Terminal binds it to "toggle full screen" by default** — remove that binding under Settings → Actions to free it up.
+> - Xshell does not support the Kitty protocol; in its keymap settings, map a free chord to send `ESC, Enter` (`\x1b\r`) to get the same effect, or paste multi-line text via the clipboard (bracketed paste is enabled).
+
+> **Pasting images on Windows:**
+> Windows Terminal and conhost bind `Ctrl+V` to their own `paste` action, which only forwards `CF_UNICODETEXT` from the clipboard — an image-only clipboard sends nothing, so the in-app `Ctrl+V` handler never fires. Two ways out:
+> 1. Use **`/paste`** — the slash command pulls the clipboard image and attaches it as `[Image #N]`. Works in every terminal, including Windows Terminal, PowerShell 7, conhost, and git bash. The TUI's bottom-right hint on Windows says `Image in clipboard · /paste` automatically.
+> 2. If you want `Ctrl+V` muscle memory: open Windows Terminal `settings.json` (`Ctrl+,` → "Open JSON file") and either delete the `{ "command": "paste", "keys": "ctrl+v" }` entry under `"actions"`, or rebind it to `ctrl+shift+v`. After a restart, `Ctrl+V` passes through to atomcode.
+>
+> Git Bash (MinTTY) doesn't intercept `Ctrl+V`, so it works there out of the box.
 
 ### Navigation
 
@@ -260,10 +303,13 @@ Then just type what you want:
 |---------|--------|
 | `/resume` | Resume or switch session |
 | `/session` | Create a new session |
+| `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
+| `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
 | `/provider` | Manage providers |
 | `/model` | Switch model / provider |
 | `/login` | Login with AtomGit OAuth |
 | `/cd` | Change working directory |
+| `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
 | `/undo` | Undo last turn's edits |
 | `/diff` | Show git diff of current changes |
 | `/cost` | Show token usage for this session |
@@ -293,9 +339,10 @@ atomcode/
       session/         # Persistent sessions
       skill.rs         # User-defined skills
 
-    atomcode-tui/      # Terminal UI — ratatui + crossterm
-      app.rs           # App state machine
-      ui/              # Render: chat, input, status bar, markdown
+    atomcode-tuix/     # Terminal UI — retained-mode renderer (CC-style normal mode)
+      event_loop/      # App state machine, command dispatch
+      render/          # Cell-based renderer, diff, retained-mode frame loop
+      modals/          # Picker UIs (dir, model, session, provider, issue)
 
     atomcode-cli/      # Binary entry point (TUI + headless -p mode)
       main.rs          # CLI args, first-run wizard, launch
@@ -334,7 +381,7 @@ AtomCode reads this file automatically and includes it in the system prompt.
 
 ### Prerequisites
 
-- **Rust 1.75+** — install via [rustup](https://rustup.rs/)
+- **Rust 1.88+** — install via [rustup](https://rustup.rs/)
 - **Git**
 - A supported LLM provider API key (for runtime testing)
 
@@ -376,7 +423,7 @@ cargo test
 
 # Run tests for a specific crate
 cargo test -p atomcode-core
-cargo test -p atomcode-tui
+cargo test -p atomcode-tuix
 
 # Run a specific test
 cargo test -p atomcode-core test_name
@@ -450,8 +497,16 @@ Contributions are welcome! AtomCode is in active development.
 
 - **Add a new tool** — implement the `Tool` trait in `crates/atomcode-core/src/tool/`
 - **Add a new provider** — implement `LlmProvider` in `crates/atomcode-core/src/provider/`
-- **Improve the UI** — rendering lives in `crates/atomcode-tui/src/ui/`
+- **Improve the UI** — rendering lives in `crates/atomcode-tuix/src/render/`
 - **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/atomcode/issues) for open bugs
+
+## Community
+
+Scan the QR code below with WeChat to join the AtomCode community group — share feedback, report issues, and talk to other users and maintainers:
+
+<p align="center">
+  <img src="https://cdn-news.gitcode.com/news/AtomCode_qun.png" alt="AtomCode WeChat community QR code" width="220">
+</p>
 
 ## License
 
