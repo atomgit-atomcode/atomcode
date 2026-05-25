@@ -21,6 +21,8 @@ export class DaemonProcess {
   private readonly defaultPort: number;
   private readonly configBinaryPath: string;
   private readonly autoStart: boolean;
+  /** In-process lock: prevents concurrent ensureRunning() calls from spawning multiple daemons */
+  private _ensureRunningPromise: Promise<boolean> | null = null;
 
   constructor(client: DaemonClient, extensionUri: vscode.Uri, opts?: { defaultPort?: number; binaryPath?: string; autoStart?: boolean }) {
     this.client = client;
@@ -31,6 +33,18 @@ export class DaemonProcess {
   }
 
   async ensureRunning(): Promise<boolean> {
+    // Deduplicate concurrent calls within the same extension host process.
+    // Multiple commands firing at startup would otherwise each try to spawn a daemon.
+    if (this._ensureRunningPromise) {
+      return this._ensureRunningPromise;
+    }
+    this._ensureRunningPromise = this._ensureRunningImpl().finally(() => {
+      this._ensureRunningPromise = null;
+    });
+    return this._ensureRunningPromise;
+  }
+
+  private async _ensureRunningImpl(): Promise<boolean> {
     const health = await this.tryGetHealth();
 
     if (health) {
@@ -46,6 +60,14 @@ export class DaemonProcess {
       const shutdownOk = await this.shutdownDaemon();
       if (shutdownOk) {
         console.log('[AtomCode] Old daemon stopped successfully');
+      } else {
+        console.warn(
+          `[AtomCode] Refusing to start daemon because old daemon ${health.version} is still running; expected ${expected}`
+        );
+        vscode.window.showWarningMessage(
+          `AtomCode daemon version mismatch: running ${health.version}, expected ${expected}. AtomCode could not stop the old daemon. Please stop the old AtomCode daemon or reload VS Code.`
+        );
+        return false;
       }
 
       const started = await this.start();
@@ -70,7 +92,7 @@ export class DaemonProcess {
       if (newHealth) {
         console.warn(`[AtomCode] New daemon version ${newHealth.version} does not match expected ${expected}`);
       }
-      return true;
+      return false;
     }
 
     // Daemon not running
@@ -115,8 +137,11 @@ export class DaemonProcess {
       // Old daemon may not support /shutdown, or already exiting — ignore
     }
 
-    // Step 2: Poll until daemon exits or timeout (3s for graceful)
-    const deadline = Date.now() + 3000;
+    // Step 2: Poll until daemon exits or timeout (5s for graceful)
+    // We only wait for the daemon we own (tracked by this.process) or the
+    // HTTP endpoint to stop responding. We do NOT kill arbitrary processes
+    // on the port — that would be unsafe for other users' services.
+    const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
       await sleep(100);
       if (!(await this.client.isRunning())) {
@@ -124,69 +149,40 @@ export class DaemonProcess {
       }
     }
 
-    // Step 3: Graceful shutdown failed — force kill the process on the port
-    console.warn('[AtomCode] Graceful shutdown timed out, attempting force kill');
-    try {
-      if (process.platform === 'win32') {
-        // Windows: find and kill process on port
-        child_process.execSync(
-          `for /f "tokens=5" %a in ('netstat -aon ^| findstr :${this.defaultPort} ^| findstr LISTENING') do taskkill /F /PID %a`,
-          { stdio: 'ignore', shell: 'cmd.exe' }
-        );
-      } else {
-        // macOS/Linux: lsof to find PID(s), then kill
-        const output = child_process.execSync(
-          `lsof -ti tcp:${this.defaultPort} -sTCP:LISTEN`,
-          { encoding: 'utf-8' }
-        ).trim();
-        if (output) {
-          for (const line of output.split('\n')) {
-            const pid = parseInt(line.trim(), 10);
-            if (pid > 0) {
-              try { process.kill(pid, 'SIGTERM'); } catch { /* already exited */ }
-            }
-          }
-        }
-      }
-    } catch {
-      // kill failed — process may have already exited or we lack permissions
-    }
-
-    // Step 4: Wait briefly for SIGTERM to take effect
-    const forceDeadline = Date.now() + 2000;
-    while (Date.now() < forceDeadline) {
-      await sleep(100);
-      if (!(await this.client.isRunning())) {
-        return true;
-      }
-    }
-
-    // Step 5: SIGTERM didn't work — escalate to SIGKILL (Unix only)
-    if (process.platform !== 'win32') {
-      console.warn('[AtomCode] SIGTERM failed, sending SIGKILL');
+    // Step 3: If we spawned the daemon ourselves, send SIGTERM to our own child.
+    // This is safe because we own the process reference.
+    if (this.process && !this.process.killed) {
+      console.warn('[AtomCode] Graceful shutdown timed out, sending SIGTERM to owned daemon process');
       try {
-        const output = child_process.execSync(
-          `lsof -ti tcp:${this.defaultPort} -sTCP:LISTEN`,
-          { encoding: 'utf-8' }
-        ).trim();
-        if (output) {
-          for (const line of output.split('\n')) {
-            const pid = parseInt(line.trim(), 10);
-            if (pid > 0) {
-              try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
-            }
-          }
-        }
-      } catch { /* ignore */ }
+        this.process.kill('SIGTERM');
+      } catch {
+        // Process may have already exited
+      }
 
-      // Brief wait for SIGKILL to take effect
-      await sleep(500);
-      if (!(await this.client.isRunning())) {
-        return true;
+      // Wait for our child process to exit
+      const termDeadline = Date.now() + 2000;
+      while (Date.now() < termDeadline) {
+        await sleep(100);
+        if (!(await this.client.isRunning())) {
+          return true;
+        }
+      }
+
+      // Last resort: SIGKILL our own child process only
+      if (!this.process.killed) {
+        console.warn('[AtomCode] SIGTERM failed, sending SIGKILL to owned daemon process');
+        try {
+          this.process.kill('SIGKILL');
+        } catch { /* already exited */ }
+        await sleep(300);
       }
     }
 
-    console.warn('[AtomCode] Daemon did not exit after force kill. Manual intervention may be needed.');
+    if (!(await this.client.isRunning())) {
+      return true;
+    }
+
+    console.warn('[AtomCode] Daemon did not exit. It may have been started by another process.');
     return false;
   }
 
@@ -287,12 +283,26 @@ export class DaemonProcess {
       path.join(home, '.atomcode', 'bin', 'atomcode-daemon'),
       path.join(home, '.cargo', 'bin', 'atomcode-daemon'),
       '/usr/local/bin/atomcode-daemon',
-      // Developer build outputs — these paths are expected to fail in production
-      path.join(workspaceRoot, 'target', 'release', 'atomcode-daemon'),
-      path.join(workspaceRoot, 'target', 'debug', 'atomcode-daemon'),
     ];
     for (const p of daemonPaths) {
       if (fs.existsSync(p)) {
+        return { path: p, args: portArgs };
+      }
+    }
+
+    // Developer build outputs — only meaningful when running from source.
+    // Warn the user so they know a dev build is being used instead of the
+    // bundled daemon that should have shipped with the extension.
+    const devPaths = [
+      path.join(workspaceRoot, 'target', 'release', 'atomcode-daemon'),
+      path.join(workspaceRoot, 'target', 'debug', 'atomcode-daemon'),
+    ];
+    for (const p of devPaths) {
+      if (fs.existsSync(p)) {
+        console.warn(`[AtomCode] Using dev build daemon: ${p}. The bundled daemon was not found — the extension package may be missing resources/bin/<platform>/atomcode-daemon.`);
+        vscode.window.showWarningMessage(
+          `AtomCode is using a development build of the daemon (${p}). The bundled daemon was not found. Reinstall the extension or set atomcode.daemon.binaryPath in settings.`
+        );
         return { path: p, args: portArgs };
       }
     }
@@ -346,6 +356,9 @@ export class DaemonProcess {
   }
 
   dispose(): void {
-    // Don't kill daemon on extension deactivate — it may be shared with other windows
+    // Don't kill daemon on extension deactivate — it may be shared with other windows.
+    // We intentionally do NOT kill the process here; the daemon has its own idle
+    // timeout and will exit on its own when no longer needed.
+    this.process = undefined;
   }
 }

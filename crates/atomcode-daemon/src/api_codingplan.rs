@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use atomcode_core::auth;
 use atomcode_core::coding_plan;
-use atomcode_telemetry::{CodingplanResult, Event};
+use atomcode_telemetry::{CodingplanErrorKind, CodingplanResult, Event};
 
 use crate::{
     api_auth::{poll_login_session, LoginPollStep},
@@ -68,6 +68,11 @@ pub(crate) async fn codingplan_setup(
                 None => {
                     state.telemetry.track(Event::TakeCodingplan {
                         type_: CodingplanResult::Fail,
+                        error_kind: Some(CodingplanErrorKind::AuthError),
+                        error_data: Some(serde_json::json!({
+                            "step": "login",
+                            "message": "Not logged in. Call /auth/login/start first.",
+                        }).to_string()),
                     });
                     return json_error(
                         StatusCode::UNAUTHORIZED,
@@ -80,6 +85,11 @@ pub(crate) async fn codingplan_setup(
                         Ok(LoginPollStep::Pending) => {
                             state.telemetry.track(Event::TakeCodingplan {
                                 type_: CodingplanResult::Fail,
+                                error_kind: Some(CodingplanErrorKind::AuthError),
+                                error_data: Some(serde_json::json!({
+                                    "step": "login",
+                                    "message": "Login still pending",
+                                }).to_string()),
                             });
                             return (
                                 StatusCode::CONFLICT,
@@ -100,6 +110,11 @@ pub(crate) async fn codingplan_setup(
                         Err((status, message)) => {
                             state.telemetry.track(Event::TakeCodingplan {
                                 type_: CodingplanResult::Fail,
+                                error_kind: Some(CodingplanErrorKind::AuthError),
+                                error_data: Some(serde_json::json!({
+                                    "step": "login",
+                                    "message": message,
+                                }).to_string()),
                             });
                             return json_error(status, message).into_response();
                         }
@@ -114,6 +129,11 @@ pub(crate) async fn codingplan_setup(
             Err(e) => {
                 state.telemetry.track(Event::TakeCodingplan {
                     type_: CodingplanResult::Fail,
+                    error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                    error_data: Some(serde_json::json!({
+                        "step": "config_save",
+                        "message": e,
+                    }).to_string()),
                 });
                 return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
             }
@@ -134,6 +154,11 @@ pub(crate) async fn codingplan_setup(
             Ok(Err(e)) => {
                 state.telemetry.track(Event::TakeCodingplan {
                     type_: CodingplanResult::Fail,
+                    error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                    error_data: Some(serde_json::json!({
+                        "step": "claim",
+                        "message": format!("CodingPlan setup failed: {:#}", e),
+                    }).to_string()),
                 });
                 return json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -144,6 +169,11 @@ pub(crate) async fn codingplan_setup(
             Err(e) => {
                 state.telemetry.track(Event::TakeCodingplan {
                     type_: CodingplanResult::Fail,
+                    error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                    error_data: Some(serde_json::json!({
+                        "step": "claim",
+                        "message": format!("CodingPlan setup task failed: {:#}", e),
+                    }).to_string()),
                 });
                 return json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -165,12 +195,22 @@ pub(crate) async fn codingplan_setup(
             if let Err(e) = save_config(&config) {
                 state.telemetry.track(Event::TakeCodingplan {
                     type_: result_type,
+                    error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                    error_data: Some(serde_json::json!({
+                        "step": "config_save",
+                        "message": e,
+                    }).to_string()),
                 });
                 return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
             }
             if let Err(e) = coding_plan::write_last_sync_now() {
                 state.telemetry.track(Event::TakeCodingplan {
                     type_: result_type,
+                    error_kind: Some(CodingplanErrorKind::ExecutionFailed),
+                    error_data: Some(serde_json::json!({
+                        "step": "sync_marker",
+                        "message": format!("Failed to write CodingPlan sync marker: {:#}", e),
+                    }).to_string()),
                 });
                 return json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -183,6 +223,14 @@ pub(crate) async fn codingplan_setup(
         // Emit TakeCodingplan exactly once on the success path
         state.telemetry.track(Event::TakeCodingplan {
             type_: result_type,
+            error_kind: None,
+            error_data: if result_type == CodingplanResult::Success {
+                Some(serde_json::json!({
+                    "step": null,
+                }).to_string())
+            } else {
+                None
+            },
         });
 
         // Build response

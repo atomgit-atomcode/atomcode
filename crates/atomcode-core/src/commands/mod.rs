@@ -3,7 +3,7 @@
 // Custom slash-command registry. Users define commands as `.md` files with
 // YAML-style frontmatter in two locations:
 //
-//   1. `~/.atomcode/commands/`          — global (apply to every project)
+//   1. `$ATOMCODE_HOME/commands/`          — global (apply to every project)
 //   2. `<project>/.atomcode/commands/`  — project-level (override global
 //                                          when names collide)
 //
@@ -54,7 +54,7 @@ pub struct CustomCommandRegistry {
 }
 
 impl CustomCommandRegistry {
-    /// Scan both global (`~/.atomcode/commands/`) and project-level
+    /// Scan both global (`$ATOMCODE_HOME/commands/`) and project-level
     /// (`<project_root>/.atomcode/commands/`) directories, merging results.
     /// Project entries win on name collision.
     pub fn load(project_root: &Path) -> Self {
@@ -403,7 +403,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMCODE_HOME", tmp.path());
 
-        let plugin_dir = tmp.path().join(".atomcode/plugins/marketplaces/p");
+        let plugin_dir = tmp.path().join("plugins/marketplaces/p");
         let cmd_dir = plugin_dir.join("commands");
         std::fs::create_dir_all(&cmd_dir).unwrap();
         std::fs::write(
@@ -412,7 +412,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            tmp.path().join(".atomcode/plugins/installed_plugins.json"),
+            tmp.path().join("plugins/installed_plugins.json"),
             r#"{"version":1,"plugins":{"p@p":{"marketplace":"p","plugin":"p","plugin_dir":"marketplaces/p","installed_at":"x"}}}"#,
         )
         .unwrap();

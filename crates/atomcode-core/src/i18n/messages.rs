@@ -11,6 +11,22 @@ pub enum Msg<'a> {
 
     // ── /codingplan ──
     CodingPlanSetupFailed { error: &'a str },
+    /// Emitted inline by /codingplan and `atomcode codingplan` when the
+    /// stored OAuth token comes back 401 from the CodingPlan API
+    /// mid-flow. We re-run the same OAuth dance `/login` uses, save the
+    /// fresh token, and retry the whole setup once — this line tells
+    /// the user that's what's about to happen so the second
+    /// "Open this URL in any browser…" block isn't a surprise.
+    CpReauthAfter401,
+    /// Emitted by the OpenAI provider when an AtomGit-gateway chat
+    /// request returns 401 and our one automatic refresh_token attempt
+    /// either failed or the retried request still came back 401. The
+    /// raw server message ("Gitcode auth: token rejected") is not
+    /// useful to end users — this replaces it with an actionable hint
+    /// pointing at `/login`. Non-atomgit gateways still surface the
+    /// verbatim server error so user-supplied API keys (sk-...) get
+    /// the diagnostic detail.
+    ChatAuthExpired,
     // SetupReport renderer (core/coding_plan/setup.rs)
     CpSetupHeader,
     CpLoggedIn { who: &'a str, username: &'a str, email: &'a str },
@@ -20,9 +36,24 @@ pub enum Msg<'a> {
     CpClaimSuccessFallback,
     CpAlreadyClaimed { reason: &'a str },
     CpClaimFailed { error: &'a str },
+    /// Per-tier cascade row — winning tier, fresh claim.
+    /// Example (zh-CN): `  ✓ CodingPlan Lite 领取成功`
+    CpClaimTierSucceeded { tier: &'a str },
+    /// Per-tier cascade row — winning tier, server reported the user
+    /// already holds this tier or higher (`duplicate=true`).
+    CpClaimTierAlreadyHeld { tier: &'a str },
+    /// Per-tier cascade row — tier was refused (2xx with success=
+    /// false / 5xx / transport). `reason` is the server's human-
+    /// readable message (e.g. `额度已满`, `暂无开放`) or a short
+    /// rendering of the transport error.
+    CpClaimTierFailed { tier: &'a str, reason: &'a str },
     CpAddedProviders { count: usize, plural_s: &'a str },
-    CpLockedJediterm { name: &'a str },
-    CpLockedAnsi { name: &'a str },
+    /// Locked-model row. `name` is expected to be pre-decorated with
+    /// U+0336 combining strikethrough by the caller (see
+    /// `coding_plan::setup::strikethrough`), so the template itself
+    /// stays a plain `format!` and survives every renderer's CSI
+    /// scrubber without needing SGR escapes.
+    CpLocked { name: &'a str },
     CpProviderRow { provider: &'a str, model: &'a str, default_suffix: &'a str },
     CpDefaultSuffix,
     CpVisionAuto { kind: &'a str },
@@ -43,6 +74,34 @@ pub enum Msg<'a> {
     CpWindowQuotaHint { hint: &'a str },
     CpStatusFetchSkipped { reason: &'a str },
     CpStatusFetchFailed { error: &'a str },
+    /// Open-source build attempted to use a CodingPlan provider. The
+    /// signing capability is not present in this build, so the request
+    /// can't reach the AtomGit LLM gateway. Surface a clear hint
+    /// pointing to the official Releases page.
+    CpOfficialBuildRequired,
+    /// Official build, but no stored auth (or auth has empty
+    /// `user.id` / `access_token`). The signing path needs these
+    /// fields to derive a per-user key; without them the request
+    /// can't be signed. Surface a "please run `/codingplan` to log
+    /// in" hint instead of the misleading "official build required"
+    /// message — the user IS on an official build.
+    CpAuthRequired,
+    /// Server returned `ATOMCODE_SIG_STALE` — the request's signed
+    /// timestamp is outside the ±5min window the gateway accepts.
+    /// Typically caused by an unsynced local clock.
+    CpSignStaleClockSkew,
+    /// Server returned `ATOMCODE_SIG_REPLAY` even after the client's
+    /// one automatic retry with a fresh nonce. Surface a "please retry
+    /// the command" hint — usually self-heals on the next attempt.
+    CpSignReplayPersisted,
+    /// Server returned `ATOMCODE_SIG_INVALID` AND the alg_version is
+    /// no longer in the server's `accepted_versions` set — the client
+    /// binary is too old. Force-upgrade hint.
+    CpSignVersionTooOld,
+    /// Server returned `426 Upgrade Required` — emergency rotation
+    /// playbook in progress; this build cannot continue without
+    /// upgrading.
+    CpUpgradeRequired,
 
     // i18n self-errors
     ErrUnsupportedLocale { input: &'a str },
@@ -51,7 +110,15 @@ pub enum Msg<'a> {
     StatusNoProvider,
     StatusUpgradeHint { version: &'a str },
     StatusModelNotConfigured,
+    /// macOS / Linux variant: "Image in clipboard · ctrl+v to paste".
+    /// Ctrl+V is intercepted by Windows Terminal / conhost before
+    /// reaching atomcode, so Windows builds emit
+    /// `StatusClipboardImageHintSlash` instead.
     StatusClipboardImageHint,
+    /// Windows variant: "Image in clipboard · /paste". Tells the
+    /// user to fall back on the `/paste` slash command, which works
+    /// in every terminal regardless of host keybinds.
+    StatusClipboardImageHintSlash,
 
     // ── /status command body ──
     StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
@@ -76,6 +143,11 @@ pub enum Msg<'a> {
 
     // ── Help / commands ──
     HelpAvailableCommands,
+    /// Full keyboard-shortcuts reference dumped to scrollback by the
+    /// `/keys` slash command. Carries every line of the panel as a
+    /// single multi-line string so translators can adjust column
+    /// alignment per locale without rebuilding rows in Rust.
+    KeybindingsHelp,
 
     // ── Provider wizard ──
     ProviderWizardHeader,
@@ -129,6 +201,7 @@ pub enum Msg<'a> {
     SessionNameControlChars,
     SessionListFailed { error: &'a str },
     SessionRenamed { old: &'a str, new: &'a str },
+    SessionSaveFailed { error: &'a str },
     SessionNoneSelected,
     SessionRenameEditing { buffer: &'a str },
 
@@ -171,6 +244,12 @@ pub enum Msg<'a> {
     IdleHintProviderSuffix,
     /// Complete plain-text version: "/provider  to add a custom model"
     IdleHintProviderFull,
+    /// "/codingplan" command label
+    IdleHintCodingplan,
+    /// "to claim a free token quota" (text after /codingplan)
+    IdleHintCodingplanSuffix,
+    /// Complete plain-text version: "/codingplan  to claim a free token quota"
+    IdleHintCodingplanFull,
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,
@@ -219,9 +298,6 @@ pub enum Msg<'a> {
     // ── JediTerm / conhost fallback ──
     JediTermFallback,
     LegacyConhostFallback,
-
-    // ── Session replay ──
-    SessionReplayHint,
 
     // ── Background task ──
     BackgroundComplete { turns: usize },
@@ -332,6 +408,35 @@ pub enum Msg<'a> {
     HelpSourceGlobal,
     HelpSourceProject,
 
+    // ── /setup ──
+    /// Header line: "✅ Setup complete — 3 installed, 1 skipped, 0 failed · 120ms"
+    SetupHeader { installed: usize, skipped: usize, failed: usize, duration_ms: u64 },
+    /// "Installed:" section label in setup report.
+    SetupInstalledLabel,
+    /// "Skipped:" section label in setup report.
+    SetupSkippedLabel,
+    /// "Failed:" section label in setup report.
+    SetupFailedLabel,
+    /// Per-item installed row: "  ✓ skill:atomcode-automation-recommender → /path"
+    SetupInstalledRow { kind: &'a str, slug: &'a str, path: &'a str },
+    /// Per-item skipped row: "  - skill:xyz (hash match)"
+    SetupSkippedRow { kind: &'a str, slug: &'a str, reason: &'a str },
+    /// Per-item failed row: "  ✗ mcp:xyz — error message"
+    SetupFailedRow { kind: &'a str, slug: &'a str, error: &'a str },
+    /// "💡 Tip: Run /setup …" — first-run hint shown above the prompt
+    /// when the project has no setup state yet.
+    CmdSetupTip,
+    /// "Running atomcode setup..." — shown while setup is in progress.
+    CmdSetupRunning,
+    /// "Skills reloaded — N available" — after setup completes and skills are reloaded.
+    CmdSetupSkillsReloaded { count: usize },
+    /// "setup error: {e}" — when setup::run returns an error.
+    CmdSetupError { error: &'a str },
+    /// "Running setup skill..." — after seeds installed and skill is auto-invoked.
+    CmdSetupRunningSkill,
+    /// "Setup skill not found..." — when the setup skill cannot be resolved or expanded.
+    CmdSetupSkillMissing,
+
     // ── /plugin ──
     PluginUsage,
     PluginMarketplaceUsage,
@@ -352,6 +457,7 @@ pub enum Msg<'a> {
     PluginListFailed { error: &'a str },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
+    CmdDescSetup,
     CmdDescCodingplan,
     CmdDescResume,
     CmdDescRename,
@@ -365,6 +471,7 @@ pub enum Msg<'a> {
     CmdDescReload,
     CmdDescCd,
     CmdDescInit,
+    CmdDescBg,
     CmdDescBackground,
     CmdDescDiff,
     CmdDescClear,
@@ -384,10 +491,20 @@ pub enum Msg<'a> {
     CmdDescBuild,
     CmdDescThink,
     CmdDescHelp,
+    CmdDescKeys,
     CmdDescLanguage,
     CmdDescQuit,
     CmdDescSkills,
     CmdDescPlugin,
+    /// Description for the `/paste` slash command — pulls a clipboard
+    /// image and attaches it as `[Image #N]`. Exists for Windows
+    /// users whose Ctrl+V is swallowed by Windows Terminal / conhost
+    /// before reaching the app, but works on every platform.
+    CmdDescPaste,
+    /// `/paste` failed because the clipboard holds no image. Shown
+    /// in scrollback as an error line so the user isn't left
+    /// wondering whether the command did anything.
+    CmdPasteNoImage,
 
     // ── config save failed ──
     ConfigSaveFailed { error: &'a str },
@@ -497,4 +614,67 @@ pub enum Msg<'a> {
     /// guaranteed-works `\<Enter>` multi-line trick. Multi-line
     /// payload with leading indent + trailing paragraph break.
     HintMultiLineInput,
+
+    // ── /bg (background sessions) ──
+    /// Help text for `/bg help`. Multi-line string with leading indent
+    /// and trailing newlines baked in.
+    BgHelp,
+    /// Empty state for `/bg list`.
+    BgListEmpty,
+    /// Table header for `/bg list`. Trailing newline baked in.
+    BgListHeader,
+    /// Row format for `/bg list`. `state` is the localised state label,
+    /// `age` is the humanised age string, `summary` is the session name.
+    BgListRow { slot: usize, short_id: &'a str, state: &'a str, age: &'a str, summary: &'a str },
+    /// Localised label for `RuntimeState::Running`.
+    BgStateRunning,
+    /// Localised label for `RuntimeState::Idle`.
+    BgStateIdle,
+    /// Localised label for `RuntimeState::Done`.
+    BgStateDone,
+    /// Localised label for `RuntimeState::Cancelled`.
+    BgStateCancelled,
+    /// Localised label for `RuntimeState::Error`.
+    BgStateError,
+    /// Age string: less than 60 seconds.
+    BgAgeNow,
+    /// Age string: minutes. `n` is the number of minutes.
+    BgAgeMinutes { n: u64 },
+    /// Age string: hours. `n` is the number of hours.
+    BgAgeHours { n: u64 },
+    /// Age string: days. `n` is the number of days.
+    BgAgeDays { n: u64 },
+    /// Error: too many background slots. `max` is the slot limit.
+    BgSlotLimitReached { max: usize },
+    /// Output after `/bg` sends the current session to background.
+    /// `new_id` is the new foreground session short id,
+    /// `slot` is the background slot number,
+    /// `old_id` is the backgrounded session short id,
+    /// `state` is the localised runtime state.
+    BgBackgroundCurrent { new_id: &'a str, slot: usize, old_id: &'a str, state: &'a str },
+    /// Error: invalid slot number. `slot` is the requested slot,
+    /// `available` is the number of available slots.
+    BgInvalidSlot { slot: usize, available: usize },
+    /// Error: background slot has no runtime client.
+    BgNoRuntimeClient,
+    /// Output after `/bg <N>` resumes a background session.
+    /// `slot` is the resumed slot, `short_id` is the session short id.
+    BgResumed { slot: usize, short_id: &'a str },
+    /// When resuming moves the previous foreground into a background slot.
+    /// `slot` is the new background slot number.
+    BgPreviousForegroundMoved { slot: usize },
+    /// Output after `/bg drop <N>`. `slot` is the dropped slot,
+    /// `short_id` is the session short id.
+    BgDropped { slot: usize, short_id: &'a str },
+    /// Output after `/background <task>` starts a one-shot task.
+    /// `slot` is the background slot, `short_id` is the session short id.
+    BgTaskStarted { slot: usize, short_id: &'a str },
+    /// Background task timed out. `secs` is the timeout in seconds.
+    BgTaskTimedOut { secs: u64 },
+    /// Background task internal error. `error` is the error message.
+    BgTaskError { error: &'a str },
+    /// Background task was cancelled.
+    BgTaskCancelled,
+    /// Background task finished but produced no summary text.
+    BgTaskNoSummary,
 }

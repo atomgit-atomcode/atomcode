@@ -3,6 +3,7 @@
 
 // Public API surface (per spec §10): the high-level entry points used by
 // the TUI dispatcher and downstream registries.
+pub mod bootstrap;
 pub mod installer;
 pub mod loader;
 pub mod marketplace;

@@ -82,11 +82,22 @@ pub enum TurnEvent {
     /// or a `bash` call starting with `cd`). Lets the TUI footer track
     /// the current cwd without polling the shared `Arc<RwLock<PathBuf>>`.
     WorkingDirChanged(PathBuf),
+    /// A tool requires user approval. Carries a snapshot of
+    /// `conversation.messages` so the TUI can persist mid-turn
+    /// session state (e.g. for `/bg`). The approval itself is
+    /// handled by `PermissionDecider`; this event is purely
+    /// informational.
+    ApprovalRequested {
+        tool_name: String,
+        reason: String,
+        call: crate::tool::ToolCall,
+        messages: Vec<crate::conversation::message::Message>,
+    },
 }
 
 /// One call inside a `ToolBatchStarted` payload. Carries everything the UI
 /// needs to render a child row in the group block (name + abbreviated detail).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolBatchCall {
     pub id: String,
     pub name: String,

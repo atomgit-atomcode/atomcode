@@ -10,7 +10,7 @@ function ChatApp() {
   const { state } = useChatContext();
   const hasMessages = state.messages.length > 0 || state.isGenerating;
 
-  if (state.viewMode === 'sidebar') {
+  if (state.isSessionList) {
     return (
       <div className="app app-sidebar">
         <SessionList variant="sidebar" />

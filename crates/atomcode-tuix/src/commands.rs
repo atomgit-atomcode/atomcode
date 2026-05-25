@@ -71,6 +71,7 @@ impl CommandRegistry {
 
 const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
+    Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true },
     Command { name: "login",   desc: "Sign in with AtomGit OAuth", needs_args: false },
@@ -83,7 +84,8 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false },
     Command { name: "cd",      desc: "Change working directory", needs_args: false },
     Command { name: "init",    desc: "Generate .atomcode.md project instructions from the working directory", needs_args: false },
-    Command { name: "background", desc: "Run a one-shot task in an isolated background context (read-only-ish tool subset)", needs_args: true },
+    Command { name: "bg",      desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>", needs_args: false },
+    Command { name: "background", desc: "Compatibility alias: start a one-shot task in a /bg slot", needs_args: true },
     Command { name: "diff",    desc: "Show git diff", needs_args: false },
     Command { name: "clear",   desc: "Clear screen", needs_args: false },
     Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false },
@@ -102,6 +104,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
+    Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
     Command { name: "language", desc: "Switch display language", needs_args: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
@@ -112,6 +115,14 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // dispatched by the `skills` arm in execute_slash_command.
     Command { name: "skills",  desc: "Browse loaded skills", needs_args: true },
     Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: true },
+    // Windows fallback for Ctrl+V: Windows Terminal / conhost
+    // intercept Ctrl+V as their own `paste` action (which forwards
+    // only `CF_UNICODETEXT`) before the keystroke reaches atomcode,
+    // so an image-only clipboard never triggers the in-app handler.
+    // `/paste` calls the same `try_paste_clipboard_image` →
+    // `attach_image_to_input` pipeline directly so the user has a
+    // terminal-agnostic way to attach an image. Works on every OS.
+    Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false },
 ];
 
 /// Look up the i18n translation for a built-in command description.
@@ -120,6 +131,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
 pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
     use crate::i18n::{t, Msg};
     let msg = match name {
+        "setup" => Msg::CmdDescSetup,
         "codingplan" => Msg::CmdDescCodingplan,
         "resume" => Msg::CmdDescResume,
         "rename" => Msg::CmdDescRename,
@@ -133,6 +145,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "reload" => Msg::CmdDescReload,
         "cd" => Msg::CmdDescCd,
         "init" => Msg::CmdDescInit,
+        "bg" => Msg::CmdDescBg,
         "background" => Msg::CmdDescBackground,
         "diff" => Msg::CmdDescDiff,
         "clear" => Msg::CmdDescClear,
@@ -152,11 +165,13 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "build" => Msg::CmdDescBuild,
         "think" => Msg::CmdDescThink,
         "help" => Msg::CmdDescHelp,
+        "keys" => Msg::CmdDescKeys,
         "language" => Msg::CmdDescLanguage,
         "welcome" => Msg::CmdWelcomeDescription,
         "quit" => Msg::CmdDescQuit,
         "skills" => Msg::CmdDescSkills,
         "plugin" => Msg::CmdDescPlugin,
+        "paste" => Msg::CmdDescPaste,
         _ => return None,
     };
     Some(t(msg))
@@ -250,10 +265,61 @@ mod tests {
     }
 
     #[test]
+    fn builtin_contains_bg_command() {
+        let registry = CommandRegistry::builtin();
+        let cmd = registry.find("bg").unwrap();
+        assert_eq!(cmd.name, "bg");
+        assert!(!cmd.needs_args);
+    }
+
+    #[test]
     fn tab_completion_finds_prefix_matches() {
         let reg = CommandRegistry::builtin();
         let matches = reg.matching_prefix("h");
         assert!(matches.iter().any(|c| c.name == "help"));
+    }
+
+    #[test]
+    fn keys_command_is_registered_with_i18n_description_in_both_locales() {
+        // `/keys` should appear in the built-in completion list and
+        // resolve a non-empty description in every shipped locale —
+        // if a translator misses one, the slash menu shows the bare
+        // English fallback (CmdDescKeys default) and we want that to
+        // be a test failure, not a UI regression.
+        use crate::i18n::{Locale, Msg};
+        let reg = CommandRegistry::builtin();
+        let keys_cmd = reg
+            .matching_prefix("keys")
+            .into_iter()
+            .find(|c| c.name == "keys")
+            .expect("/keys must be a built-in command");
+        assert!(!keys_cmd.needs_args);
+
+        // i18n round-trip per locale: both the slash-menu description
+        // and the KeybindingsHelp body must produce non-empty text
+        // and carry the canonical keystroke labels. Snapshot the
+        // current locale up front and restore at the end so we don't
+        // poison parallel tests / future tests by leaving a side
+        // effect behind. `set_locale` is process-global.
+        let prev = crate::i18n::current_locale();
+        for locale in [Locale::En, Locale::ZhCn] {
+            crate::i18n::set_locale(locale);
+            let desc = cmd_desc_i18n("keys").expect("CmdDescKeys translation");
+            assert!(
+                !desc.trim().is_empty(),
+                "CmdDescKeys ({locale:?}) must not be empty"
+            );
+            let body = crate::i18n::t(Msg::KeybindingsHelp);
+            assert!(
+                body.contains("Ctrl+C"),
+                "KeybindingsHelp ({locale:?}) must list Ctrl+C — got:\n{body}"
+            );
+            assert!(
+                body.contains("Enter"),
+                "KeybindingsHelp ({locale:?}) must list Enter — got:\n{body}"
+            );
+        }
+        crate::i18n::set_locale(prev);
     }
 
     #[test]

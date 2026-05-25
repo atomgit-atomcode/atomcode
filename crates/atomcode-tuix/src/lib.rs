@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod event_loop;
+pub mod highlight;
 pub mod i18n;
 pub mod input;
 pub mod markdown;
@@ -11,6 +12,7 @@ pub mod render;
 pub mod sanitize;
 pub mod state;
 pub mod terminal;
+pub mod terminal_bg;
 #[cfg(test)]
 pub mod test_term;
 pub mod think;
@@ -18,9 +20,8 @@ pub mod trace;
 pub mod width;
 
 use anyhow::Result;
-use atomcode_core::agent::AgentHandle;
+use atomcode_core::agent::{AgentHandle, AgentRuntimeFactory};
 use atomcode_core::config::Config;
-use atomcode_core::tool::ToolContext;
 use crossterm::{
     event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
@@ -169,7 +170,7 @@ pub async fn run(
     config: Config,
     model_name: String,
     agent_handle: AgentHandle,
-    _tool_context: ToolContext,
+    runtime_factory: AgentRuntimeFactory,
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
@@ -262,9 +263,7 @@ pub async fn run(
     // Phase 5 upgrades the auto-fallback to alt-screen so users
     // get the full UI).
     let force_plain = force_plain_env;
-    let auto_alt_screen = !force_plain_env
-        && !force_retain
-        && (is_jediterm || is_legacy_conhost);
+    let auto_alt_screen = !force_plain_env && !force_retain && (is_jediterm || is_legacy_conhost);
 
     // Marker env vars so the event loop can render a one-line hint
     // explaining what just happened and how to recover. Only set
@@ -303,8 +302,7 @@ pub async fn run(
     // setting any env var. Manual `ATOMCODE_RETAIN=1` still bypasses
     // (lets the curious try retained on those terminals despite the
     // known DECSTBM issues).
-    let want_alt_screen =
-        (force_alt_env || auto_alt_screen) && !force_plain_env && was_real_tty;
+    let want_alt_screen = (force_alt_env || auto_alt_screen) && !force_plain_env && was_real_tty;
 
     // When force_plain wins, strip raw-mode-related capabilities so
     // every downstream branch (TerminalGuard activate, reader spawn,
@@ -321,6 +319,34 @@ pub async fn run(
     }
 
     let (_guard, kbd_enhanced) = TerminalGuard::activate(caps)?;
+
+    // Pick the colour palette now that raw mode is on (OSC 11 detection
+    // requires it — otherwise the response is line-buffered and never
+    // reaches us before timeout).
+    //
+    // - `Light` / `Dark`: explicit, skip detection.
+    // - `Auto`: query the terminal background; fall back to `dark` if
+    //   it doesn't reply within 100ms. Responsive emulators (iTerm2,
+    //   WezTerm, Alacritty, Kitty, Windows Terminal, VSCode integrated)
+    //   reply on first byte well under the budget; non-responsive
+    //   terminals (macOS Terminal.app, Windows conhost, SSH through
+    //   relays that strip OSC) silently default to dark — matches the
+    //   legacy behaviour, never makes things worse.
+    let theme_light = match config.ui.theme {
+        atomcode_core::config::UiTheme::Light => true,
+        atomcode_core::config::UiTheme::Dark => false,
+        atomcode_core::config::UiTheme::Auto => {
+            if caps.colors {
+                crate::terminal_bg::detect_light(
+                    std::time::Duration::from_millis(100),
+                )
+                .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    };
+    crate::highlight::theme::set_theme_mode(theme_light);
 
     // If the terminal doesn't support Kitty keyboard protocol (CSI u),
     // set an env var so the event loop can show a hint on startup.
@@ -440,6 +466,13 @@ pub async fn run(
     // instead of waiting for the user's next keystroke.
     let update_hint = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Background OAuth poll → event-loop channel. Unbounded so the
+    // poll thread never blocks waiting for the consumer (poll thread
+    // is std::thread, can't `await`). One event per spawned task,
+    // capacity is irrelevant — even an unbounded channel is essentially
+    // empty here.
+    let (oauth_event_tx, oauth_event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::event_loop::oauth_poll::OauthEvent>();
 
     // Seed the hint from any prior-session staged upgrade so the user
     // sees the pending status on the very first frame rather than
@@ -500,18 +533,36 @@ pub async fn run(
         dirs
     };
 
-    let custom_commands =
-        atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
+    let custom_commands = atomcode_core::commands::CustomCommandRegistry::load(&working_dir);
     // Same Arc the agent loop holds — reload() calls there propagate
     // here automatically, so the slash menu reflects newly-installed
     // skills without re-plumbing.
-    let skill_registry = agent_handle.skill_registry.clone();
+    let foreground_runtime_id = event_loop::bg_runtime::RuntimeId::new(1);
+    let agent_client = agent_handle.client.clone();
+    let skill_registry = agent_client.skill_registry.clone();
+    let (runtime_event_tx, runtime_event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<event_loop::bg_runtime::RuntimeEvent>();
+    event_loop::bg_runtime::spawn_event_forwarder(
+        foreground_runtime_id,
+        agent_handle.event_rx,
+        runtime_event_tx.clone(),
+    );
+    let bg_manager = event_loop::bg_runtime::BgRuntimeManager::new(
+        current_session.clone(),
+        foreground_runtime_id,
+        agent_client.clone(),
+    );
 
     let file_index_root = working_dir.clone();
     let ctx = LoopCtx {
         config,
         model_name,
-        agent: agent_handle,
+        agent: agent_client,
+        runtime_factory,
+        bg_manager,
+        foreground_runtime_id,
+        runtime_event_tx,
+        runtime_event_rx,
         working_dir,
         previous_dir: None,
         recent_dirs,
@@ -531,6 +582,8 @@ pub async fn run(
         monitor_last_sync_seen: atomcode_core::coding_plan::read_last_sync(),
         wake_rx,
         wake_tx: wake_tx.clone(),
+        oauth_event_rx,
+        oauth_event_tx,
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,

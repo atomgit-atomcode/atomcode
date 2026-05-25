@@ -234,7 +234,10 @@ impl AgentLoop {
                 });
             }
             TurnEvent::Error(e) => {
-                let _ = self.event_tx.send(AgentEvent::Error(e));
+                let _ = self.event_tx.send(AgentEvent::Error {
+                    error: e,
+                    messages: self.conversation.messages.clone(),
+                });
             }
             TurnEvent::Warning(w) => {
                 self.datalog.log_warning(&w);
@@ -249,6 +252,13 @@ impl AgentLoop {
                 // graph, spawning a new indexer) — those are destructive
                 // mid-turn; the LLM expects its context to survive a cd.
                 let _ = self.event_tx.send(AgentEvent::WorkingDirChanged(new_dir));
+            }
+            TurnEvent::ApprovalRequested { .. } => {
+                // ApprovalRequested is handled inline in the `select!`
+                // loop inside `run_turn_loop`, not through this dispatch
+                // method.  The event carries conversation.messages for
+                // mid-turn persistence; the approval flow itself is
+                // managed by the `approval_req_rx` channel.
             }
         }
     }

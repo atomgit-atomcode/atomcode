@@ -301,6 +301,8 @@ fn test_config() -> Config {
         subagent: Default::default(),
         vision_preprocessor_provider: None,
         language: None,
+        ui: Default::default(),
+            plugin: Default::default(),
     }
 }
 
@@ -434,7 +436,7 @@ async fn test_turn_runner_emits_text_delta_events() {
 
 #[tokio::test]
 async fn test_turn_runner_executes_tool_call() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
@@ -464,7 +466,7 @@ async fn test_turn_runner_executes_tool_call() {
 
 #[tokio::test]
 async fn test_turn_runner_emits_tool_events() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
@@ -614,7 +616,7 @@ async fn test_turn_runner_cancellation() {
 
 #[tokio::test]
 async fn test_turn_runner_auto_deny_blocks_dangerous_tool() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
@@ -644,7 +646,7 @@ async fn test_turn_runner_auto_deny_blocks_dangerous_tool() {
 
 #[tokio::test]
 async fn test_turn_runner_auto_bypass_allows_dangerous_tool() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
@@ -673,7 +675,7 @@ async fn test_turn_runner_auto_bypass_allows_dangerous_tool() {
 
 #[tokio::test]
 async fn test_turn_runner_interactive_approval_allow() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let (req_tx, mut req_rx) = mpsc::unbounded_channel();
@@ -713,7 +715,7 @@ async fn test_turn_runner_interactive_approval_allow() {
 
 #[tokio::test]
 async fn test_turn_runner_interactive_approval_deny() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let (req_tx, mut req_rx) = mpsc::unbounded_channel();
@@ -754,7 +756,7 @@ async fn test_turn_runner_interactive_approval_deny() {
 
 #[tokio::test]
 async fn test_turn_runner_uses_context_aware_approval() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(ContextDangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("context_dangerous", "{}");
@@ -936,7 +938,7 @@ async fn test_turn_runner_adds_assistant_message_on_text_response() {
 
 #[tokio::test]
 async fn test_turn_runner_adds_tool_call_and_result_messages() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", "{}");
@@ -971,7 +973,7 @@ async fn test_turn_runner_adds_tool_call_and_result_messages() {
 /// conversation (AssistantWithToolCalls → matching ToolResult).
 #[tokio::test]
 async fn test_tool_result_content_in_llm_context() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
 
     let provider = MockProvider::with_tool_call("grep", r#"{"pattern":"foo"}"#);
@@ -1047,7 +1049,7 @@ async fn test_tool_result_content_in_llm_context() {
 /// with correct call_id linkage in the conversation.
 #[tokio::test]
 async fn test_multiple_tool_calls_results_in_context() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(EchoTool { name: "grep" })).await;
     tools.register(Box::new(EchoTool { name: "read_file" })).await;
 
@@ -1138,7 +1140,7 @@ async fn test_multiple_tool_calls_results_in_context() {
 /// (with success=false), so the LLM knows the tool was denied and can adjust.
 #[tokio::test]
 async fn test_denied_tool_result_in_llm_context() {
-    let mut tools = ToolRegistry::new();
+    let tools = ToolRegistry::new();
     tools.register(Box::new(DangerousTool)).await;
 
     let provider = MockProvider::with_tool_call("dangerous", "{}");
@@ -1233,7 +1235,7 @@ async fn test_empty_turn_reminder_is_noop() {
 /// ToolRegistry should return definitions in stable (sorted) order.
 #[tokio::test]
 async fn test_tool_registry_stable_order() {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     // Register in reverse alphabetical order
     registry.register(Box::new(EchoTool { name: "write_file" })).await;
     registry.register(Box::new(EchoTool { name: "bash" })).await;
@@ -1341,9 +1343,17 @@ async fn malformed_write_file_args_short_circuit_without_approval() {
         async fn decide(
             &self,
             _call: &crate::tool::ToolCall,
-            _reason: &str,
+            _approval: &crate::tool::ApprovalRequirement,
         ) -> crate::tool::PermissionDecision {
             panic!("validate_args gate must short-circuit before approval is requested");
+        }
+
+        fn will_auto_approve(
+            &self,
+            _call: &crate::tool::ToolCall,
+            _approval: &crate::tool::ApprovalRequirement,
+        ) -> bool {
+            false
         }
     }
     let mut runner = make_runner(provider, tools, Box::new(PanicOnApproval));
@@ -1445,7 +1455,7 @@ fn search_replace_validate_args_rejects_missing_fields() {
 mod telemetry_tests {
     use super::*;
     use crate::tool::ToolContext;
-    use atomcode_telemetry::{Event, Telemetry};
+    use atomcode_telemetry::{Event, Telemetry, ToolErrorKind};
     use std::path::PathBuf;
 
     /// Build a TurnRunner wired to a real in-memory Telemetry handle so we can
@@ -1550,8 +1560,8 @@ mod telemetry_tests {
 
     #[tokio::test]
     async fn turn_emits_llm_chat_with_tool_calls_count() {
-        let mut tools = ToolRegistry::new();
-        tools.register(Box::new(EchoTool { name: "echo" }));
+        let tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool { name: "echo" })).await;
 
         let (mut runner, captured) = make_runner_with_telemetry(
             MockProvider::with_tool_call("echo", r#"{"msg":"hi"}"#),
@@ -1611,6 +1621,187 @@ mod telemetry_tests {
         assert_eq!(llm_chats.len(), 1, "even failed turns emit one LlmChat");
         if let Event::LlmChat { had_error, .. } = llm_chats[0].event {
             assert!(had_error, "failed turn must set had_error=true");
+        }
+    }
+
+    /// A mock tool that always fails (simulates a command that exits non-zero).
+    struct FailingTool;
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn definition(&self) -> ToolDef {
+            ToolDef {
+                name: "bash",
+                description: "Always-failing bash mock".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+            }
+        }
+        fn approval(&self, _args: &str) -> ApprovalRequirement {
+            ApprovalRequirement::AutoApprove
+        }
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+            Ok(ToolResult {
+                call_id: String::new(),
+                output: "[elapsed: 0.0s, exit: 1]\ncat: /nonexistent_file.txt: No such file or directory\n\n[IMPORTANT: Command failed. Read the error above and fix the root cause. Do NOT retry the same command.]".to_string(),
+                success: false,
+            })
+        }
+    }
+
+    /// A mock tool that succeeds but produces stderr (simulates rm on nonexistent file).
+    struct WarningTool;
+
+    #[async_trait]
+    impl Tool for WarningTool {
+        fn definition(&self) -> ToolDef {
+            ToolDef {
+                name: "bash",
+                description: "Warning bash mock (exit 0 + stderr)".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+            }
+        }
+        fn approval(&self, _args: &str) -> ApprovalRequirement {
+            ApprovalRequirement::AutoApprove
+        }
+        async fn execute(&self, _args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
+            Ok(ToolResult {
+                call_id: String::new(),
+                output: "[elapsed: 0.0s, exit: 0]\nSTDERR:\nrm: /tmp/test.txt: No such file or directory".to_string(),
+                success: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_failure_emits_execution_failed_error_kind() {
+        let tools = {
+            let mut t = ToolRegistry::new();
+            t.register(Box::new(FailingTool)).await;
+            t
+        };
+
+        let (mut runner, captured) = make_runner_with_telemetry(
+            MockProvider::with_tool_call("bash", r#"{"command":"cat /nonexistent_file.txt"}"#),
+            tools,
+        );
+        let mut conv = Conversation::new();
+        conv.add_user_message("cat a missing file");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runner
+            .run(&mut conv, "system", &tx, CancellationToken::new())
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().await;
+        let tool_calls: Vec<_> = events
+            .iter()
+            .filter(|r| matches!(r.event, Event::ToolCall { .. }))
+            .collect();
+
+        assert_eq!(tool_calls.len(), 1, "expected one ToolCall event, got {}", tool_calls.len());
+
+        if let Event::ToolCall { name, success, error_kind, error_data, .. } = &tool_calls[0].event {
+            assert_eq!(name, "bash");
+            assert!(!success, "ToolCall.success must be false for failing tool");
+            assert!(error_kind.is_some(), "error_kind must be Some for failing tool, got None");
+            assert_eq!(error_kind.unwrap(), ToolErrorKind::ExecutionFailed,
+                "error_kind must be ExecutionFailed for failing tool");
+
+            assert!(error_data.is_some(), "error_data must be Some for failing tool, got None");
+            let ed: serde_json::Value = serde_json::from_str(error_data.as_ref().unwrap()).unwrap();
+            assert_eq!(ed["reason"], "Tool execution returned an error");
+            assert!(ed["output_tail"].as_str().unwrap().contains("No such file"),
+                "error_data.output_tail must contain the stderr, got: {}", ed["output_tail"]);
+        } else {
+            panic!("Expected ToolCall event");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_warning_with_stderr_emits_warning_error_kind() {
+        let tools = {
+            let mut t = ToolRegistry::new();
+            t.register(Box::new(WarningTool)).await;
+            t
+        };
+
+        let (mut runner, captured) = make_runner_with_telemetry(
+            MockProvider::with_tool_call("bash", r#"{"command":"rm -rf /tmp/test.txt"}"#),
+            tools,
+        );
+        let mut conv = Conversation::new();
+        conv.add_user_message("rm a missing file");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runner
+            .run(&mut conv, "system", &tx, CancellationToken::new())
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().await;
+        let tool_calls: Vec<_> = events
+            .iter()
+            .filter(|r| matches!(r.event, Event::ToolCall { .. }))
+            .collect();
+
+        assert_eq!(tool_calls.len(), 1, "expected one ToolCall event, got {}", tool_calls.len());
+
+        if let Event::ToolCall { name, success, error_kind, error_data, .. } = &tool_calls[0].event {
+            assert_eq!(name, "bash");
+            assert!(success, "ToolCall.success must be true for warning tool (exit 0)");
+            assert!(error_kind.is_some(), "error_kind must be Some for warning tool, got None");
+            assert_eq!(error_kind.unwrap(), ToolErrorKind::Warning,
+                "error_kind must be Warning when exit 0 + stderr");
+
+            assert!(error_data.is_some(), "error_data must be Some for warning tool, got None");
+            let ed: serde_json::Value = serde_json::from_str(error_data.as_ref().unwrap()).unwrap();
+            assert_eq!(ed["reason"], "Command succeeded (exit 0) but produced stderr output");
+            assert!(ed.get("resolution").is_some(), "warning error_data must contain resolution");
+        } else {
+            panic!("Expected ToolCall event");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_success_without_stderr_emits_no_error_fields() {
+        let tools = {
+            let mut t = ToolRegistry::new();
+            t.register(Box::new(EchoTool { name: "bash" })).await;
+            t
+        };
+
+        let (mut runner, captured) = make_runner_with_telemetry(
+            MockProvider::with_tool_call("bash", r#"{"command":"echo hello"}"#),
+            tools,
+        );
+        let mut conv = Conversation::new();
+        conv.add_user_message("say hello");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runner
+            .run(&mut conv, "system", &tx, CancellationToken::new())
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().await;
+        let tool_calls: Vec<_> = events
+            .iter()
+            .filter(|r| matches!(r.event, Event::ToolCall { .. }))
+            .collect();
+
+        assert_eq!(tool_calls.len(), 1, "expected one ToolCall event, got {}", tool_calls.len());
+
+        if let Event::ToolCall { name, success, error_kind, error_data, .. } = &tool_calls[0].event {
+            assert_eq!(name, "bash");
+            assert!(success, "ToolCall.success must be true");
+            assert!(error_kind.is_none(), "error_kind must be None for successful tool without stderr, got Some");
+            assert!(error_data.is_none(), "error_data must be None for successful tool without stderr, got Some");
+        } else {
+            panic!("Expected ToolCall event");
         }
     }
 }

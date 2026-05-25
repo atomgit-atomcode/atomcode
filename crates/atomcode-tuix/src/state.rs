@@ -136,6 +136,14 @@ pub struct UiState {
     pub cached_tokens: usize,
     /// When Suspended, holds the phase to restore on resume.
     pub prior_phase: Option<UiPhase>,
+    /// While waiting on a tool approval, holds the `"Running {Tool}"`
+    /// label that was active before the prompt opened. `on_approval_needed`
+    /// stashes it here and swaps `spinner_label` to "Waiting approval";
+    /// `on_approval_resolved` restores it. Without this, the spinner kept
+    /// saying "Running Bash… · 273s" while the agent was actually blocked
+    /// on `permission.decide().await` — looked identical to a real tool
+    /// hang.
+    pub prior_spinner_label: Option<String>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
     /// When the current turn started. Set by on_submit, cleared on
@@ -284,6 +292,7 @@ impl UiState {
             completion_tokens: 0,
             cached_tokens: 0,
             prior_phase: None,
+            prior_spinner_label: None,
             thinking_idx: 0,
             turn_started_at: None,
             phase_started_at: None,
@@ -521,12 +530,37 @@ impl UiState {
         self.sub_agent_started_at = None;
     }
 
-    pub fn on_approval_needed(&mut self, _tool: &str) {
+    /// `display_tool` is the already-PascalCased name (e.g. `"Bash"`,
+    /// `"ReadFile"`) — same form `on_tool_call_started` writes into
+    /// `spinner_label`. Stashed so `on_approval_resolved` can put the
+    /// label back when execution resumes.
+    pub fn on_approval_needed(&mut self, display_tool: &str) {
         self.phase = UiPhase::Approval;
+        // Stash the running-tool label so we can restore it after the
+        // user answers. Fall back to inferring from `display_tool` if no
+        // ToolCallStarted ran first (defensive — should not normally
+        // happen, since runner emits ToolCallStarted before approval).
+        if !self.spinner_label.is_empty() {
+            self.prior_spinner_label = Some(self.spinner_label.clone());
+        } else {
+            self.prior_spinner_label = Some(format!("Running {}", display_tool));
+        }
+        self.spinner_label = "Waiting approval".to_string();
+        // Reset the phase clock so the elapsed suffix tracks how long
+        // we've been waiting on the user, not how long the prior phase
+        // (often the just-emitted ToolCallStarted) had been running.
+        self.phase_started_at = Some(std::time::Instant::now());
     }
 
     pub fn on_approval_resolved(&mut self) {
         self.phase = UiPhase::Streaming;
+        if let Some(prior) = self.prior_spinner_label.take() {
+            self.spinner_label = prior;
+            // The tool is about to actually start running now (hook +
+            // bash_execute). Restart the clock so the spinner suffix
+            // reflects that, not the cumulative wait-then-run time.
+            self.phase_started_at = Some(std::time::Instant::now());
+        }
     }
 
     pub fn on_suspend(&mut self) {
@@ -693,7 +727,7 @@ mod tests {
     fn approval_needed_transitions_to_approval() {
         let mut s = UiState::new();
         s.on_submit();
-        s.on_approval_needed("bash");
+        s.on_approval_needed("Bash");
         assert_eq!(s.phase, UiPhase::Approval);
     }
 
@@ -701,9 +735,61 @@ mod tests {
     fn approval_resolved_back_to_streaming() {
         let mut s = UiState::new();
         s.on_submit();
-        s.on_approval_needed("bash");
+        s.on_approval_needed("Bash");
         s.on_approval_resolved();
         assert_eq!(s.phase, UiPhase::Streaming);
+    }
+
+    // Without this, the spinner shows "Running Bash… · 273s" while the
+    // agent is actually blocked on `permission.decide().await` — looks
+    // identical to a real hang. Fixed by stashing/restoring the label
+    // around the prompt.
+    #[test]
+    fn approval_needed_swaps_spinner_label_to_waiting() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("Bash");
+        assert_eq!(s.spinner_label, "Running Bash");
+        s.on_approval_needed("Bash");
+        assert_eq!(s.spinner_label, "Waiting approval");
+    }
+
+    #[test]
+    fn approval_resolved_restores_running_label() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("Bash");
+        s.on_approval_needed("Bash");
+        s.on_approval_resolved();
+        assert_eq!(s.spinner_label, "Running Bash");
+    }
+
+    // Spinner suffix is `· {phase_elapsed}` — if we don't reset the clock
+    // on the Approval transition, the user sees the cumulative
+    // ToolCallStarted-to-now time and can't tell wait from work.
+    #[test]
+    fn approval_needed_resets_phase_clock() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("Bash");
+        let started = s.phase_started_at.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        s.on_approval_needed("Bash");
+        let after = s.phase_started_at.unwrap();
+        assert!(after > started, "phase_started_at should advance");
+    }
+
+    #[test]
+    fn approval_resolved_resets_phase_clock() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_tool_call_started("Bash");
+        s.on_approval_needed("Bash");
+        let waiting_started = s.phase_started_at.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        s.on_approval_resolved();
+        let resumed = s.phase_started_at.unwrap();
+        assert!(resumed > waiting_started, "phase_started_at should advance");
     }
 
     #[test]

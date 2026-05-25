@@ -105,7 +105,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **Code blocks** with language labels, line numbers, and `base16-ocean.dark` theme
 - **Multi-line input** with Shift+Enter (or `\` + Enter), auto-growing height, input history
 - **Text selection** with mouse drag, auto-scroll, and clipboard copy
-- **Slash commands** — `/model`, `/provider`, `/resume`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
+- **Slash commands** — `/model`, `/provider`, `/resume`, `/bg`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
 - **File attachment** — paste file paths to attach content as context
 - **Bracketed paste** — long paste content collapsed to a compact indicator
 - **Skills** — user-defined commands loaded from your skill directory, invoked like any slash command
@@ -273,11 +273,19 @@ Then just type what you want:
 | `Ctrl+U` | Clear line |
 | `Ctrl+W` | Delete word |
 | `Ctrl+K` | Delete to end of line |
+| `Ctrl+V` | Paste image from clipboard (Windows: use `/paste`, see below) |
 
 > **Terminal compatibility for newline chords:**
 > - `Shift+Enter`, `Ctrl+Enter`, and `Ctrl+J` all need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals collapse them to plain `Enter` (which sends the message).
 > - `Alt+Enter` works at the byte level on most terminals, but **Windows Terminal binds it to "toggle full screen" by default** — remove that binding under Settings → Actions to free it up.
 > - Xshell does not support the Kitty protocol; in its keymap settings, map a free chord to send `ESC, Enter` (`\x1b\r`) to get the same effect, or paste multi-line text via the clipboard (bracketed paste is enabled).
+
+> **Pasting images on Windows:**
+> Windows Terminal and conhost bind `Ctrl+V` to their own `paste` action, which only forwards `CF_UNICODETEXT` from the clipboard — an image-only clipboard sends nothing, so the in-app `Ctrl+V` handler never fires. Two ways out:
+> 1. Use **`/paste`** — the slash command pulls the clipboard image and attaches it as `[Image #N]`. Works in every terminal, including Windows Terminal, PowerShell 7, conhost, and git bash. The TUI's bottom-right hint on Windows says `Image in clipboard · /paste` automatically.
+> 2. If you want `Ctrl+V` muscle memory: open Windows Terminal `settings.json` (`Ctrl+,` → "Open JSON file") and either delete the `{ "command": "paste", "keys": "ctrl+v" }` entry under `"actions"`, or rebind it to `ctrl+shift+v`. After a restart, `Ctrl+V` passes through to atomcode.
+>
+> Git Bash (MinTTY) doesn't intercept `Ctrl+V`, so it works there out of the box.
 
 ### Navigation
 
@@ -295,10 +303,13 @@ Then just type what you want:
 |---------|--------|
 | `/resume` | Resume or switch session |
 | `/session` | Create a new session |
+| `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
+| `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
 | `/provider` | Manage providers |
 | `/model` | Switch model / provider |
 | `/login` | Login with AtomGit OAuth |
 | `/cd` | Change working directory |
+| `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
 | `/undo` | Undo last turn's edits |
 | `/diff` | Show git diff of current changes |
 | `/cost` | Show token usage for this session |

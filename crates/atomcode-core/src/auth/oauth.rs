@@ -11,18 +11,49 @@ use serde::{Deserialize, Serialize};
 
 use atomcode_telemetry::{Event, Telemetry};
 
-/// Platform OAuth Broker URL (client_secret is kept on the broker)
-pub const PLATFORM_BROKER_URL: &str = "https://acs.atomgit.com";
-pub const PLATFORM_LOGIN_URL: &str = "https://acs.atomgit.com/auth/login";
-pub const PLATFORM_CHECK_URL: &str = "https://acs.atomgit.com/auth/check";
-pub const PLATFORM_TOKEN_URL: &str = "https://acs.atomgit.com/auth/token";
-pub const PLATFORM_EXCHANGE_URL: &str = "https://acs.atomgit.com/oauth/exchange";
-pub const PLATFORM_REFRESH_URL: &str = "https://acs.atomgit.com/oauth/refresh";
+/// Default Platform server base URL (client_secret is kept on the broker).
+/// Override with the `ATOMCODE_PLATFORM_SERVER` environment variable.
+const DEFAULT_PLATFORM_SERVER: &str = "https://acs.atomgit.com";
 
-/// AtomGit OAuth endpoints
-pub const AUTHORIZE_URL: &str = "https://atomgit.com/oauth/authorize";
-pub const TOKEN_URL: &str = "https://atomgit.com/oauth/token";
-pub const USER_URL: &str = "https://atomgit.com/api/v5/user";
+/// Sanitize a user-supplied base URL: add `http://` if no scheme is present,
+/// and strip trailing `/` so path concatenation never produces `//`.
+fn sanitize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+    with_scheme.trim_end_matches('/').to_string()
+}
+
+/// Return the Platform server base URL, reading `ATOMCODE_PLATFORM_SERVER` once
+/// at first call and caching the result for the process lifetime. This ensures
+/// all URL-derived functions within a single login/session flow target the
+/// same server even if the env var changes mid-flight.
+fn platform_base_url() -> &'static str {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<String> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let raw = std::env::var("ATOMCODE_PLATFORM_SERVER")
+            .unwrap_or_else(|_| DEFAULT_PLATFORM_SERVER.to_string());
+        sanitize_base_url(&raw)
+    })
+}
+
+/// Platform server URLs (derived from `ATOMCODE_PLATFORM_SERVER`).
+pub fn platform_broker_url() -> String { platform_base_url().to_string() }
+pub fn platform_login_url() -> String { format!("{}/auth/login", platform_base_url()) }
+pub fn platform_check_url() -> String { format!("{}/auth/check", platform_base_url()) }
+pub fn platform_token_url() -> String { format!("{}/auth/token", platform_base_url()) }
+pub fn platform_exchange_url() -> String { format!("{}/oauth/exchange", platform_base_url()) }
+pub fn platform_refresh_url() -> String { format!("{}/oauth/refresh", platform_base_url()) }
+#[allow(dead_code)]
+pub fn authorize_url() -> String { format!("{}/oauth/authorize", platform_base_url()) }
+#[allow(dead_code)]
+pub fn token_url() -> String { format!("{}/oauth/token", platform_base_url()) }
+#[allow(dead_code)]
+pub fn user_url() -> String { format!("{}/api/v5/user", platform_base_url()) }
 
 /// Blocking HTTP client pre-configured with `ATOMCODE_USER_AGENT`. Every
 /// OAuth-side request must carry the token or AtomGit's gate rejects it.
@@ -299,7 +330,7 @@ impl LoginSession {
     pub fn poll_once(&self) -> Result<PollOutcome> {
         let resp = self
             .client
-            .get(PLATFORM_CHECK_URL)
+            .get(platform_check_url())
             .query(&[("state", &self.state)])
             .send()
             .context("Failed to call /auth/check")?;
@@ -319,7 +350,7 @@ impl LoginSession {
     pub fn finish(self, tel: Option<&Arc<Telemetry>>) -> Result<AuthInfo> {
         let token_resp: PlatformTokenResponse = self
             .client
-            .get(PLATFORM_TOKEN_URL)
+            .get(platform_token_url())
             .query(&[("state", &self.state)])
             .send()
             .context("Failed to call /auth/token")?
@@ -367,7 +398,7 @@ impl LoginSession {
 pub fn start_login() -> Result<LoginSession> {
     let client = reqwest::blocking::Client::new();
     let resp: PlatformLoginResponse = client
-        .get(PLATFORM_LOGIN_URL)
+        .get(platform_login_url())
         .query(&[("provider", "atomgit")])
         .send()
         .context("Failed to call /auth/login")?
@@ -465,9 +496,15 @@ fn generate_state() -> String {
     format!("atomcode_{}", timestamp)
 }
 
-/// Open browser with the authorization URL
+/// Open browser with the authorization URL.
+///
+/// `pub` because TUI modals (e.g. the QR-login onboarding step) need to
+/// invoke the same platform browser launch the CLI flow already does via
+/// `LoginSession::open_browser_best_effort` — callers without a live
+/// `LoginSession` only carry the URL string, so they go through this
+/// free function directly.
 #[cfg(target_os = "macos")]
-fn open_browser(url: &str) -> Result<()> {
+pub fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("open")
         .arg(url)
         .spawn()
@@ -476,7 +513,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_browser(url: &str) -> Result<()> {
+pub fn open_browser(url: &str) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(url)
         .spawn()
@@ -485,7 +522,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn open_browser(url: &str) -> Result<()> {
+pub fn open_browser(url: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
     std::process::Command::new("cmd")
         .raw_arg(format!("/C start \"\" \"{}\"", url))
@@ -495,7 +532,7 @@ fn open_browser(url: &str) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn open_browser(_url: &str) -> Result<()> {
+pub fn open_browser(_url: &str) -> Result<()> {
     anyhow::bail!("Unsupported platform for browser auto-open");
 }
 
@@ -812,7 +849,7 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
 
     // Call Platform Broker API for refresh
     let response = client
-        .post(PLATFORM_REFRESH_URL)
+        .post(platform_refresh_url())
         .json(&serde_json::json!({ "refresh_token": refresh_token }))
         .send()
         .context("Failed to send refresh token request to broker")?;
@@ -956,8 +993,12 @@ pub fn save_auth(auth: &AuthInfo) -> Result<()> {
             .context("Failed to set auth file permissions")?;
     }
 
-    println!("  Auth saved to: {}\n", auth_path.display());
-
+    // No stdout output here. `save_auth` is called from CLI flows, TUI
+    // slash commands, the daemon, AND the silent in-chat 401 → refresh
+    // path. Printing here would corrupt the TUI input box on the silent
+    // refresh path (the cursor sits in the prompt and `println!` bypasses
+    // the renderer). CLI callers print their own user-facing success
+    // message right after calling this.
     Ok(())
 }
 
@@ -1191,5 +1232,38 @@ mod tests {
         // Bracketed-paste / OSC sequences and other CSI fragments must
         // not be mistaken for ESC. `\x1B[31m` = SGR red.
         assert_eq!(classify_input(b"\x1B[31m"), EscOutcome::OtherInput);
+    }
+
+    // ----- sanitize_base_url -----
+
+    #[test]
+    fn sanitize_adds_http_if_no_scheme() {
+        assert_eq!(sanitize_base_url("127.0.0.1:8765"), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn sanitize_preserves_http_scheme() {
+        assert_eq!(sanitize_base_url("http://127.0.0.1:8765"), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn sanitize_preserves_https_scheme() {
+        assert_eq!(sanitize_base_url("https://acs.example.com"), "https://acs.example.com");
+    }
+
+    #[test]
+    fn sanitize_strips_trailing_slash() {
+        assert_eq!(sanitize_base_url("http://127.0.0.1:8765/"), "http://127.0.0.1:8765");
+        assert_eq!(sanitize_base_url("http://127.0.0.1:8765///"), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn sanitize_trims_whitespace() {
+        assert_eq!(sanitize_base_url("  http://127.0.0.1:8765  "), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn sanitize_no_scheme_with_trailing_slash() {
+        assert_eq!(sanitize_base_url("127.0.0.1:8765/"), "http://127.0.0.1:8765");
     }
 }

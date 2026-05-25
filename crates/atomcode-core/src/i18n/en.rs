@@ -17,42 +17,59 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── /codingplan ──
         Msg::CodingPlanSetupFailed { error } =>
             format!("codingplan setup failed: {error}").into(),
+        Msg::CpReauthAfter401 =>
+            "  ⚠ Stored login expired — re-authenticating...\n".into(),
+        Msg::ChatAuthExpired =>
+            "Authentication expired — please run /login to sign in again".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan setup:\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
-            format!("  ✔ Logged in as {} ({}, {})\n", who, username, email).into(),
+            format!("  ✓ Logged in as {} ({}, {})\n", who, username, email).into(),
         Msg::CpStepSkipped { reason } =>
-            format!("  ✔ {}\n", reason).into(),
+            format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✘ Login failed — {}\n", error).into(),
+            format!("  ✗ Login failed — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
-            format!("  ✔ CodingPlan claimed — {} (CodingPlan {})\n", message, plan_type).into(),
+            format!("  ✓ CodingPlan claimed — {} (CodingPlan {})\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "success".into(),
         Msg::CpAlreadyClaimed { reason } =>
-            format!("  ✔ CodingPlan already claimed — {}\n", reason).into(),
+            format!("  ✓ CodingPlan already claimed — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✘ CodingPlan claim failed — {}\n", error).into(),
+            format!("  ✗ CodingPlan claim failed — {}\n", error).into(),
+        Msg::CpClaimTierSucceeded { tier } =>
+            format!("  ✓ CodingPlan {} claimed\n", tier).into(),
+        Msg::CpClaimTierAlreadyHeld { tier } =>
+            format!("  ✓ CodingPlan {} already claimed\n", tier).into(),
+        Msg::CpClaimTierFailed { tier, reason } =>
+            format!("  ✗ CodingPlan {} claim failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>
-            format!("  ✔ Added {} provider{}:\n", count, plural_s).into(),
-        Msg::CpLockedJediterm { name } =>
-            format!("      ✗ {}  (Locked: require plan upgrade)\n", name).into(),
-        Msg::CpLockedAnsi { name } =>
-            format!("      • \x1b[9m{}\x1b[29m  (require plan upgrade)\n", name).into(),
+            format!("  ✓ Added {} provider{}:\n", count, plural_s).into(),
+        Msg::CpLocked { name } =>
+            // SGR 31 = standard red foreground, SGR 39 = reset to
+            // default fg. Standard (not bright) so the terminal's
+            // theme palette decides the exact shade — Solarized,
+            // Dracula, light-mode, etc. all map this onto their
+            // own "red" rather than a hard-coded RGB the user can't
+            // tune. The `✗ … (requires Pro plan or higher)` text inside is
+            // a redundant signal so retained-mode terminals (which
+            // strip SGR via the strict sanitizer path) still get
+            // the meaning, just without the colour.
+            format!("      \x1b[31m✗ {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  (default)".into(),
         Msg::CpVisionAuto { kind } =>
-            format!("  ✔ Vision preprocessor → {}  (auto-detected)\n", kind).into(),
+            format!("  ✓ Vision preprocessor → {}  (auto-detected)\n", kind).into(),
         Msg::CpVisionUserSupplied { kind } =>
-            format!("  ✔ Vision preprocessor → {}  (user setting kept)\n", kind).into(),
+            format!("  ✓ Vision preprocessor → {}  (user setting kept)\n", kind).into(),
         Msg::CpVisionCleared =>
             "  ⚠ Vision preprocessor cleared — no VL/OCR model in current list\n".into(),
         Msg::CpModelsSkipped { reason } =>
-            format!("  ✔ Models step skipped — {}\n", reason).into(),
+            format!("  ✓ Models step skipped — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✘ Models step failed — {}\n", error).into(),
+            format!("  ✗ Models step failed — {}\n", error).into(),
         Msg::CpStatusHeader =>
-            "  ✔ CodingPlan status:\n".into(),
+            "  ✓ CodingPlan status:\n".into(),
         Msg::CpPlanPending { plan } =>
             format!("      Plan: {}  ·  pending activation\n", plan).into(),
         Msg::CpPlanActive { plan, expires_at, remaining_days, total_days } =>
@@ -70,6 +87,29 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ⚠ Status fetch skipped — {}\n", reason).into(),
         Msg::CpStatusFetchFailed { error } =>
             format!("  ⚠ Status fetch failed (non-fatal) — {}\n", error).into(),
+        Msg::CpOfficialBuildRequired => Cow::Borrowed(
+            "This feature requires the official AtomCode build. Download it from \
+             https://atomgit.com/atomgit_atomcode/atomcode/releases.",
+        ),
+        Msg::CpAuthRequired => Cow::Borrowed(
+            "Not signed in to AtomCode CodingPlan. Run /codingplan to log in \
+             before sending a request.",
+        ),
+        Msg::CpSignStaleClockSkew => Cow::Borrowed(
+            "Request rejected: signed timestamp outside the accepted window. \
+             Please check your system clock (NTP sync) and retry.",
+        ),
+        Msg::CpSignReplayPersisted => Cow::Borrowed(
+            "Request was repeatedly flagged as a replay. Please try the command again.",
+        ),
+        Msg::CpSignVersionTooOld => Cow::Borrowed(
+            "AtomCode is out of date and no longer compatible with CodingPlan. \
+             Please upgrade AtomCode to continue.",
+        ),
+        Msg::CpUpgradeRequired => Cow::Borrowed(
+            "An upgrade is required to continue using CodingPlan. \
+             Please install the latest AtomCode from the official releases.",
+        ),
 
         Msg::ErrUnsupportedLocale { input } =>
             format!("unsupported locale: {input}").into(),
@@ -83,6 +123,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "(not configured)".into(),
         Msg::StatusClipboardImageHint =>
             "Image in clipboard · ctrl+v to paste".into(),
+        Msg::StatusClipboardImageHintSlash =>
+            "Image in clipboard · /paste".into(),
 
         // ── /status command body ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -124,6 +166,54 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── Help ──
         Msg::HelpAvailableCommands =>
             "  Available commands:\n".into(),
+        Msg::KeybindingsHelp => r#"  Keyboard shortcuts
+
+  ── Input ──
+    Enter                            Send message
+    Ctrl+J                           Insert newline (universal)
+    \ then Enter                     Insert newline (atomcode fallback, universal)
+    Alt+Enter                        Insert newline *
+    Shift+Enter                      Insert newline **
+    /                                Open slash command menu
+    Tab                              Autocomplete
+    Backspace / Ctrl+H               Delete previous char
+    Delete / Ctrl+?                  Delete next char
+    Ctrl+W                           Delete word backward
+    Ctrl+U                           Clear current line
+    Ctrl+K                           Delete to end of line
+    Ctrl+A / Home                    Jump to line start
+    Ctrl+E / End                     Jump to line end
+    Left / Right                     Move cursor
+
+  ── History ──
+    Up                               Previous input
+    Down                             Next input
+
+  ── Session ──
+    Ctrl+C                           Cancel current turn / dismiss modal
+    Ctrl+D                           Exit AtomCode
+    Ctrl+L                           Clear screen
+    Ctrl+O                           Toggle tool real-time output
+    Ctrl+V                           Paste (text + image)
+
+  ── Slash menu / modal navigation ──
+    Up / Down                        Move selection
+    Enter                            Confirm
+    Esc                              Cancel / close modal
+    Tab                              Insert highlighted command
+
+  * Alt+Enter works in most terminals; macOS Apple Terminal users
+    must enable "Use Option as Meta key" under Settings → Profiles
+    → Keyboard for the keystroke to register as a newline.
+  ** Shift+Enter requires a terminal that disambiguates the modifier.
+     Known-supported: Kitty / WezTerm / iTerm2 (with Report Modifiers
+     enabled) / Windows Terminal / Ghostty / Warp. Other terminals
+     (macOS Apple Terminal, default xterm, GNOME Terminal, VS Code's
+     integrated terminal) collapse Shift+Enter into plain Enter —
+     use Ctrl+J or \ + Enter instead.
+
+  Tip: run /help for the full slash command list.
+"#.into(),
 
         // ── Provider wizard ──
         Msg::ProviderWizardHeader =>
@@ -202,6 +292,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list sessions failed: {error}").into(),
         Msg::SessionRenamed { old, new } =>
             format!("  Renamed: '{old}' -> '{new}'").into(),
+        Msg::SessionSaveFailed { error } =>
+            format!("Failed to save session: {error}. The name was not persisted.").into(),
         Msg::SessionNoneSelected =>
             "No session selected".into(),
         Msg::SessionRenameEditing { buffer } =>
@@ -227,7 +319,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueTitleConfirmed { title } =>
             format!("✓ title: {title}").into(),
         Msg::IssueCreated { number, title, url } =>
-            format!("  [issue] ✔ created #{number}: {title}\n  {url}\n").into(),
+            format!("  [issue] ✓ created #{number}: {title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
             format!("  [issue] ✗ create failed: {error}\n").into(),
         Msg::IssueRequiredField { field } =>
@@ -250,6 +342,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "to add a custom model".into(),
         Msg::IdleHintProviderFull =>
             "/provider  to add a custom model".into(),
+        Msg::IdleHintCodingplan => "/codingplan".into(),
+        Msg::IdleHintCodingplanSuffix =>
+            "to claim a free token quota".into(),
+        Msg::IdleHintCodingplanFull =>
+            "/codingplan  to claim a free token quota".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
@@ -345,11 +442,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
             bypass this fallback (may show duplicated content on scroll).\n\n".into(),
 
-        // ── Session replay ──
-        Msg::SessionReplayHint =>
-            "  ⓘ Showing previous session — model context starts fresh.\n    \
-            Use /resume to fully restore the conversation including model memory.\n\n".into(),
-
         // ── Background task ──
         Msg::BackgroundComplete { turns } =>
             format!("  Background task complete ({} turn{}):\n",
@@ -404,7 +496,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::InitAlreadyExists { path } =>
             format!("  {} already exists. Use `/init --force` to overwrite.\n", path).into(),
         Msg::InitWrote { path, bytes } =>
-            format!("  Wrote {} ({} bytes). Edit to customise; takes effect on next session.\n", path, bytes).into(),
+            format!("  Wrote {} ({} bytes). Edit to customise; takes effect on next message.\n", path, bytes).into(),
         Msg::InitFailed { error } =>
             format!("  /init failed: {}\n", error).into(),
 
@@ -450,7 +542,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServersHeader =>
             "  MCP Servers:\n".into(),
         Msg::McpReloadFailed { error } =>
-            format!("mcp reload failed: failed to load .mcp.json / ~/.atomcode/mcp.json: {:#}", error).into(),
+            format!("mcp reload failed: failed to load .mcp.json / $ATOMCODE_HOME/mcp.json: {:#}", error).into(),
         // /mcp login / logout
         Msg::McpOAuthLoginUsage =>
             "  Usage: /mcp login <server>\n  Example: /mcp login github\n".into(),
@@ -527,6 +619,34 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HelpSourceGlobal => "global".into(),
         Msg::HelpSourceProject => "project".into(),
 
+        // ── /setup ──
+        Msg::SetupHeader { installed, skipped, failed, duration_ms } =>
+            format!("\n✅ Setup complete — {} installed, {} skipped, {} failed  · {}ms\n\n", installed, skipped, failed, duration_ms).into(),
+        Msg::SetupInstalledLabel =>
+            "Installed:\n".into(),
+        Msg::SetupSkippedLabel =>
+            "\nSkipped:\n".into(),
+        Msg::SetupFailedLabel =>
+            "\nFailed:\n".into(),
+        Msg::SetupInstalledRow { kind, slug, path } =>
+            format!("  ✓ {}:{} → {}\n", kind, slug, path).into(),
+        Msg::SetupSkippedRow { kind, slug, reason } =>
+            format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
+        Msg::SetupFailedRow { kind, slug, error } =>
+            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+        Msg::CmdSetupTip =>
+            "\u{1f4a1} Tip: Run \x1b[1;96m/setup\x1b[0m to auto-configure hooks, skills, and MCP for this project.".into(),
+        Msg::CmdSetupRunning =>
+            "Running atomcode setup...".into(),
+        Msg::CmdSetupSkillsReloaded { count } =>
+            format!("  🔄 Skills reloaded — {} available", count).into(),
+        Msg::CmdSetupError { error } =>
+            format!("setup error: {error}").into(),
+        Msg::CmdSetupRunningSkill =>
+            "  🚀 Running setup skill — analyzing project and generating recommendations...".into(),
+        Msg::CmdSetupSkillMissing =>
+            "setup skill not found — try running /setup again to reinstall".into(),
+
         // ── /plugin ──
         Msg::PluginUsage =>
             "usage: /plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),
@@ -564,6 +684,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list plugins: {error}").into(),
 
         // ── Command descriptions ──
+Msg::CmdDescSetup =>
+"Scan project, install seeds, and run setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescCodingplan =>
             "Claim CodingPlan + set up models from the plan's model list".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),
@@ -575,10 +697,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescProvider => "Manage providers (add / edit / delete)".into(),
         Msg::CmdDescStatus => "Show session status".into(),
         Msg::CmdDescConfig => "Show config path".into(),
-        Msg::CmdDescReload => "Reload ~/.atomcode/config.toml from disk".into(),
+        Msg::CmdDescReload => "Reload $ATOMCODE_HOME/config.toml from disk".into(),
         Msg::CmdDescCd => "Change working directory".into(),
-        Msg::CmdDescInit => "Generate .atomcode.md project instructions from the working directory".into(),
-        Msg::CmdDescBackground => "Run a one-shot task in an isolated background context (read-only-ish tool subset)".into(),
+Msg::CmdDescInit => "Generate .atomcode.md project instructions from the working directory".into(),
+Msg::CmdDescBg => "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>".into(),
+Msg::CmdDescBackground => "Run a one-shot task in an isolated background context (read-only-ish tool subset)".into(),
         Msg::CmdDescDiff => "Show git diff".into(),
         Msg::CmdDescClear => "Clear screen".into(),
         Msg::CmdDescSession => "Start a new session (clears conversation)".into(),
@@ -597,10 +720,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
         Msg::CmdDescHelp => "Show this help".into(),
+        Msg::CmdDescKeys => "Show keyboard shortcuts".into(),
         Msg::CmdDescLanguage => "Switch display language".into(),
         Msg::CmdDescQuit => "Exit AtomCode".into(),
         Msg::CmdDescSkills => "Browse loaded skills".into(),
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, list)".into(),
+        Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
+        Msg::CmdPasteNoImage => "No image in clipboard.".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>
@@ -688,5 +814,80 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             Works in every terminal. (Shift / Alt / Ctrl + Enter may also work\n    \
             depending on the terminal's keyboard protocol — try them out.)\n\n"
                 .into(),
+
+        // ── /bg (background sessions) ──
+        Msg::BgHelp =>
+            "  /bg                 Send current session to background and open a new foreground\n  /bg list            List background sessions\n  /bg <N>             Resume background slot N\n  /bg drop <N>        Drop background slot N\n  /bg help            Show this help\n".into(),
+        Msg::BgListEmpty => "  No background sessions.\n".into(),
+        Msg::BgListHeader => "  #   ID        State      Created   Summary\n".into(),
+        Msg::BgListRow { slot, short_id, state, age, summary } =>
+            format!("  {:<3} {:<8}  {:<9}  {:<8}  {}\n", slot, short_id, state, age, summary).into(),
+        Msg::BgStateRunning => "running".into(),
+        Msg::BgStateIdle => "idle".into(),
+        Msg::BgStateDone => "done".into(),
+        Msg::BgStateCancelled => "cancelled".into(),
+        Msg::BgStateError => "error".into(),
+        Msg::BgAgeNow => "now".into(),
+        Msg::BgAgeMinutes { n } => format!("{n}m").into(),
+        Msg::BgAgeHours { n } => format!("{n}h").into(),
+        Msg::BgAgeDays { n } => format!("{n}d").into(),
+        Msg::BgSlotLimitReached { max } =>
+            format!("background slot limit reached ({max})").into(),
+        Msg::BgBackgroundCurrent { new_id, slot, old_id, state } =>
+            format!("  New foreground session [{new_id}]\n  Background: [#{slot}] {old_id} (state: {state})\n").into(),
+        Msg::BgInvalidSlot { slot, available } =>
+            format!("invalid background slot {slot} (available: {available})").into(),
+        Msg::BgNoRuntimeClient => "background slot has no runtime client".into(),
+        Msg::BgResumed { slot, short_id } =>
+            format!("  Resumed background [#{slot}] {short_id}\n").into(),
+        Msg::BgPreviousForegroundMoved { slot } =>
+            format!("  Previous foreground moved to [#{slot}]\n").into(),
+        Msg::BgDropped { slot, short_id } =>
+            format!("  Dropped background [#{slot}] {short_id}\n").into(),
+        Msg::BgTaskStarted { slot, short_id } =>
+            format!("  Background: [#{slot}] {short_id} (state: running)\n").into(),
+        Msg::BgTaskTimedOut { secs } =>
+            format!("Background task timed out after {secs}s.").into(),
+        Msg::BgTaskError { error } =>
+            format!("Error: {error}").into(),
+        Msg::BgTaskCancelled => "Cancelled.".into(),
+        Msg::BgTaskNoSummary => "Task completed (no summary text).".into(),
+    }
+}
+
+#[cfg(test)]
+mod codingplan_crypto_tests {
+    use super::*;
+    use crate::i18n::Msg;
+
+    #[test]
+    fn en_official_build_required_mentions_releases() {
+        let s = en(Msg::CpOfficialBuildRequired);
+        assert!(s.contains("official"));
+        assert!(s.contains("releases"));
+    }
+
+    #[test]
+    fn en_stale_clock_mentions_system_time() {
+        let s = en(Msg::CpSignStaleClockSkew);
+        assert!(s.to_lowercase().contains("clock") || s.to_lowercase().contains("time"));
+    }
+
+    #[test]
+    fn en_replay_persisted_is_non_empty() {
+        let s = en(Msg::CpSignReplayPersisted);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn en_version_too_old_mentions_upgrade() {
+        let s = en(Msg::CpSignVersionTooOld);
+        assert!(s.to_lowercase().contains("upgrade") || s.to_lowercase().contains("update"));
+    }
+
+    #[test]
+    fn en_upgrade_required_is_non_empty() {
+        let s = en(Msg::CpUpgradeRequired);
+        assert!(!s.is_empty());
     }
 }

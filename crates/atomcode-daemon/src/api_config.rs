@@ -39,6 +39,8 @@ fn empty_config() -> Config {
         subagent: Default::default(),
         vision_preprocessor_provider: None,
         language: None,
+        ui: Default::default(),
+            plugin: Default::default(),
     }
 }
 

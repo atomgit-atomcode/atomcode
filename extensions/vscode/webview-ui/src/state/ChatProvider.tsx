@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useReducer, useEffect, useCallback, useRef } from 'react';
 import { ChatState, ChatAction, ExtensionMessage } from './types';
 import { chatReducer, initialState } from './reducer';
-import { postMessage } from '../vscode';
+import { postMessage, getVSCodeApi } from '../vscode';
 
 // ─── Context ────────────────────────────────────────────────────
 
@@ -13,8 +13,11 @@ interface ChatContextValue {
   newConversation: () => void;
   selectModel: (provider: string, model?: string) => void;
   loadSession: (sessionId: string, projectHash?: string) => void;
+  openSidebar: () => void;
+  openSessionInTab: (sessionId?: string, projectHash?: string) => void;
   renameSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
   deleteSession: (session: { id: string; project_hash?: string; name?: string; title?: string }) => void;
+  deleteSessions: (sessions: Array<{ id: string; project_hash?: string; name?: string }>) => void;
   startLogin: () => void;
   cancelLogin: () => void;
   setupCodingPlan: () => void;
@@ -51,7 +54,13 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
             currentModel: msg.currentModel,
             viewMode: msg.viewMode,
             activeSessionId: msg.activeSessionId,
+            projectHash: msg.projectHash,
+            isSessionList: msg.isSessionList,
           });
+          // Persist session binding so tabs survive VS Code restart
+          if (msg.activeSessionId) {
+            getVSCodeApi().setState({ sessionId: msg.activeSessionId, projectHash: msg.projectHash });
+          }
           break;
         case 'userMessage':
           dispatch({ type: 'ADD_USER_MESSAGE', text: msg.text });
@@ -67,6 +76,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'text':
           dispatch({ type: 'APPEND_TEXT', content: msg.content });
+          break;
+        case 'toolBatchStart':
+          dispatch({ type: 'TOOL_BATCH_START', calls: msg.calls });
           break;
         case 'toolStart':
           dispatch({
@@ -114,6 +126,9 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           break;
         case 'clearChat':
           dispatch({ type: 'CLEAR_CHAT' });
+          break;
+        case 'resumeStreaming':
+          dispatch({ type: 'RESUME_STREAMING' });
           break;
         case 'sessions':
           dispatch({ type: 'SET_SESSIONS', sessions: msg.sessions });
@@ -213,7 +228,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
       } else {
         dispatch({ type: 'ADD_USER_MESSAGE', text, contextFiles });
       }
-      postMessage({ type: 'send', text, context: ctx, clientMessageId: isQueued ? clientMessageId : undefined });
+      postMessage({ type: 'send', text, context: ctx, clientMessageId: isQueued ? clientMessageId : undefined, sessionId: state.activeSessionId });
       // Clear context after sending
       dispatch({ type: 'CLEAR_CONTEXT' });
     },
@@ -237,6 +252,14 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     postMessage({ type: 'loadSession', sessionId, projectHash });
   }, []);
 
+  const openSidebar = useCallback(() => {
+    postMessage({ type: 'openSidebar' });
+  }, []);
+
+  const openSessionInTab = useCallback((sessionId?: string, projectHash?: string) => {
+    postMessage({ type: 'openSessionInTab', sessionId, projectHash });
+  }, []);
+
   const renameSession = useCallback((session: { id: string; project_hash?: string; name?: string; title?: string }) => {
     postMessage({
       type: 'renameSession',
@@ -252,6 +275,17 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
       sessionId: session.id,
       projectHash: session.project_hash,
       name: session.name || session.title || '',
+    });
+  }, []);
+
+  const deleteSessions = useCallback((sessions: Array<{ id: string; project_hash?: string; name?: string }>) => {
+    postMessage({
+      type: 'deleteSessions',
+      sessions: sessions.map((s) => ({
+        sessionId: s.id,
+        projectHash: s.project_hash,
+        name: s.name || '',
+      })),
     });
   }, []);
 
@@ -280,11 +314,14 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     dispatch,
     send,
     stop,
+    openSidebar,
     newConversation,
     selectModel,
     loadSession,
+    openSessionInTab,
     renameSession,
     deleteSession,
+    deleteSessions,
     startLogin,
     cancelLogin,
     setupCodingPlan,

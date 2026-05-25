@@ -368,6 +368,14 @@ pub struct AltScreenRenderer<W: Write + Send> {
     /// no terminal-side scrollback is involved (alt-screen owns the
     /// whole viewport, host terminal's scrollback is unreachable).
     body_lines: Vec<String>,
+    /// Raw (unwrapped) body rows — mirrors `body_lines` but stores each
+    /// logical line *before* soft-wrapping. Used by `reflow_body_lines`
+    /// on resize so that widening the terminal re-merges previously
+    /// split short rows back into their original long form. Each entry
+    /// corresponds 1:1 with one call to `push_body_row_raw`; rows that
+    /// were already short enough to not need wrapping appear identically
+    /// in both `raw_body_lines` and `body_lines`.
+    raw_body_lines: Vec<String>,
     /// Index into `body_lines` for the FIRST visible body row. Auto-
     /// tracks the tail when `sticky_bottom` is true (most common case);
     /// only diverges from "tail" when the user is actively scrolled up
@@ -578,6 +586,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             width: w,
             height: h,
             body_lines: Vec::new(),
+            raw_body_lines: Vec::new(),
             viewport_top: 0,
             sticky_bottom: true,
             max_scrollback_rows: scrollback_rows_from_env(),
@@ -732,6 +741,46 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             self.body_lines.remove(0);
         }
         self.body_dirty = true;
+    }
+
+    /// Push a **raw** (not yet soft-wrapped) body row. The raw line is
+    /// stored in `raw_body_lines` for later re-flow on resize, while
+    /// the soft-wrapped chunks are pushed to `body_lines` for immediate
+    /// rendering. Callers that produce logical lines longer than the
+    /// terminal width should use this instead of `push_body_row` so
+    /// `on_resize` can re-wrap at the new width without losing content.
+    fn push_body_row_raw(&mut self, raw_line: String) {
+        // Store raw line for re-flow on resize.
+        self.raw_body_lines.push(raw_line.clone());
+        // Soft-wrap at the current terminal width and push each chunk.
+        let max_w = self.width as usize;
+        for chunk in wrap_to_width_sgr_aware(&raw_line, max_w) {
+            self.push_body_row(chunk);
+        }
+    }
+
+    /// Re-flow `body_lines` from `raw_body_lines` at the current
+    /// terminal width. Called by `on_resize` so that widening the
+    /// terminal re-merges previously split short rows back into fewer
+    /// longer rows, and narrowing splits long rows instead of
+    /// truncating them (issue #363).
+    fn reflow_body_lines(&mut self) {
+        self.body_lines.clear();
+        let max_w = self.width as usize;
+        for raw in &self.raw_body_lines {
+            for chunk in wrap_to_width_sgr_aware(raw, max_w) {
+                self.body_lines.push(chunk);
+            }
+        }
+        // Bound the buffer (same cap as push_body_row).
+        while self.body_lines.len() > self.max_scrollback_rows {
+            self.body_lines.remove(0);
+        }
+        // Also bound raw_body_lines to the same cap so the two buffers
+        // don't drift over time.
+        while self.raw_body_lines.len() > self.max_scrollback_rows {
+            self.raw_body_lines.remove(0);
+        }
     }
 
     /// Render the current state of body_lines into the viewport area.
@@ -997,6 +1046,79 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let _ = self.out.write_all(rule.as_bytes());
         }
 
+        // Session-name pill overlay: ` {name} ` painted in reverse +
+        // cyan (cyan bg, terminal default fg) over the right end of
+        // the top rule. Mirrors CC's per-conversation badge so the
+        // user can tell which session they're typing into at a
+        // glance. Only emitted when `session_name` is Some — populated
+        // by build_status iff `Session::user_renamed`, so auto-named
+        // sessions stay badge-less.
+        //
+        // Layout budget:
+        //   right_margin   = 2 cells (don't hug the rightmost column —
+        //                    legacy conhost wraps when writing into the
+        //                    last cell of a row)
+        //   pill_padding   = 2 cells (one space each side of the name)
+        //   min_rule_left  = 8 cells (keep enough ━ on the left so the
+        //                    box still reads as bordered; without this
+        //                    a very long name eats the entire rule and
+        //                    the input box loses its visual anchor)
+        // Available for the name: width - right_margin - pill_padding
+        //                         - min_rule_left = width - 12.
+        // If the terminal is too narrow for even 1 cell of name + the
+        // surrounding chrome, skip the badge entirely.
+        if let Some(name_raw) = self.pending_status.session_name.as_ref() {
+            let name_scrubbed = scrub_controls(name_raw);
+            const RIGHT_MARGIN: usize = 2;
+            const PILL_PADDING: usize = 2;
+            const MIN_RULE_LEFT: usize = 8;
+            let total_w = self.width as usize;
+            let chrome = RIGHT_MARGIN + PILL_PADDING + MIN_RULE_LEFT;
+            if total_w > chrome {
+                let max_name_w = total_w - chrome;
+                let name_w = crate::width::display_width(&name_scrubbed);
+                // Truncate with `…` when over budget. `…` is one cell;
+                // `truncate_to_width(name, max_name_w - 1) + "…"` keeps
+                // the total under max_name_w. If max_name_w == 1, just
+                // emit a single `…` (no room for any name char).
+                let name_for_pill = if name_w <= max_name_w {
+                    name_scrubbed
+                } else if max_name_w <= 1 {
+                    "…".to_string()
+                } else {
+                    let truncated = crate::width::truncate_to_width(&name_scrubbed, max_name_w - 1);
+                    format!("{}…", truncated)
+                };
+                let pill_content_w = crate::width::display_width(&name_for_pill) + PILL_PADDING;
+                // Start column (1-indexed) so the pill ends RIGHT_MARGIN
+                // cells from the rightmost column. e.g. width=80,
+                // pill_content_w=12, margin=2 → start col = 80-2-12+1 = 67.
+                let start_col = total_w.saturating_sub(RIGHT_MARGIN + pill_content_w) + 1;
+                let cup = format!("\x1b[{};{}H", top_rule_row, start_col);
+                let _ = self.out.write_all(cup.as_bytes());
+                if self.caps.colors {
+                    // SGR for the pill differs by theme. Dark: reverse +
+                    // bright cyan (SGR 7;96) — bright cyan as background
+                    // pops against the dark default fg. Light: bold +
+                    // standard magenta (SGR 1;35), no reverse — standard
+                    // magenta maps to a dark, readable shade on light
+                    // profiles, where bright-cyan reverse turned into
+                    // pale-aqua-on-white and the chip vanished into the
+                    // surrounding background.
+                    let sgr = if crate::highlight::theme::is_light_for_render() {
+                        "\x1b[1;35m"
+                    } else {
+                        "\x1b[7;96m"
+                    };
+                    let _ = write!(self.out, "{} {} \x1b[0m", sgr, name_for_pill);
+                } else {
+                    // No colors: surround with spaces so the name stays
+                    // legible against the ━ rule on either side.
+                    let _ = write!(self.out, " {} ", name_for_pill);
+                }
+            }
+        }
+
         // Input row: `❯ {buf}` flush-left at col 0. matches retained's
         // `build_middle_row`.
         let cup = format!("\x1b[{};1H\x1b[K", input_row);
@@ -1171,11 +1293,31 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             .mode_indicator
             .as_ref()
             .map(|s| scrub_controls(s));
-        let status_text = if !self.pending_status.model.is_empty()
-            || !self.pending_status.cwd.is_empty()
+        // Pre-truncate cwd so it does not overflow the terminal width.
+        // Compute a budget for cwd that accounts for model name, " · "
+        // separators, and mode badge — same logic as retained's
+        // build_status_row.
+        let model = scrub_controls(&self.pending_status.model);
+        let cwd_full = scrub_controls(&self.pending_status.cwd);
+        let mode_badge_w = mode_badge
+            .as_ref()
+            .map(|s| crate::width::display_width(s) + 1)
+            .unwrap_or(0);
+        let sep_w = if !model.is_empty() && !cwd_full.is_empty() { 3 } else { 0 };
+        let left_max = (self.width as usize).saturating_sub(mode_badge_w);
+        let cwd_budget = left_max
+            .saturating_sub(crate::width::display_width(&model))
+            .saturating_sub(sep_w);
+        let cwd = if !cwd_full.is_empty() && cwd_budget > 0
+            && crate::width::display_width(&cwd_full) > cwd_budget
         {
-            let model = scrub_controls(&self.pending_status.model);
-            let cwd = scrub_controls(&self.pending_status.cwd);
+            crate::width::truncate_path(&cwd_full, cwd_budget)
+        } else if !cwd_full.is_empty() && cwd_budget == 0 {
+            crate::width::truncate_path(&cwd_full, left_max)
+        } else {
+            cwd_full
+        };
+        let status_text = if !model.is_empty() || !cwd.is_empty() {
             if model.is_empty() {
                 format!("  {}", cwd)
             } else if cwd.is_empty() {
@@ -1354,10 +1496,12 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         {
             // `rendered` may itself contain `\n` when it includes a
             // table flush prefix from a prior buffered block. Split
-            // so each physical line becomes its own body_lines entry
-            // — paint_body assumes one entry == one terminal row.
+            // so each physical line becomes its own raw_body_lines entry
+            // — `push_body_row_raw` handles soft-wrapping at terminal
+            // width and stores the raw line for re-flow on resize
+            // (issue #363).
             for sub in rendered.split('\n') {
-                self.push_body_row(sub.to_string());
+                self.push_body_row_raw(sub.to_string());
             }
         }
     }
@@ -1380,7 +1524,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             crate::markdown::finalize_with_width(&mut self.md_state, self.caps, md_width)
         {
             for sub in tail.split('\n') {
-                self.push_body_row(sub.to_string());
+                self.push_body_row_raw(sub.to_string());
             }
         }
     }
@@ -1465,39 +1609,76 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         self.push_body_row(format!("{} {}", bullet, scrub_controls(working_dir)));
         self.push_body_row(format!("{} {}", bullet, scrub_controls(model)));
         self.push_body_row(String::new());
-        // Onboarding hints — first thing a new user reads. Slash
-        // shortcuts in cyan accent; surrounding prose in dim text so
-        // it reads as subordinate to primary content.
-        let hint_a = if self.caps.colors {
-            format!(
-                "{}{}{}{}{}{}{}{}",
-                SGR_DIM,
-                t(Msg::IdleHintPrefix),
-                SGR_RESET,
-                SGR_CYAN,
-                t(Msg::IdleHintSlash),
-                SGR_RESET,
-                SGR_DIM,
-                t(Msg::IdleHintSuffix),
-            ) + SGR_RESET
+        // Onboarding hints: combine onto one row when the terminal is
+        // wide enough; otherwise emit three rows. Mirrors the same
+        // decision the retained renderer makes — push_body_row can't
+        // reflow, so on narrow widths we'd otherwise overflow off the
+        // right edge.
+        let idle_full_w = display_width(&t(Msg::IdleHintFull));
+        let provider_full_w = display_width(&t(Msg::IdleHintProviderFull));
+        let codingplan_full_w = display_width(&t(Msg::IdleHintCodingplanFull));
+        let combined_w = idle_full_w + 3 + provider_full_w + 3 + codingplan_full_w;
+        if combined_w <= self.width as usize {
+            let hint_line = if self.caps.colors {
+                let hint_a = format!(
+                    "{}{}{}{}{}{}{}{}{}",
+                    SGR_DIM, t(Msg::IdleHintPrefix), SGR_RESET,
+                    SGR_CYAN, t(Msg::IdleHintSlash), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintSuffix), SGR_RESET,
+                );
+                let hint_b = format!(
+                    "{}{}{}  {}{}{}",
+                    SGR_CYAN, t(Msg::IdleHintProvider), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintProviderSuffix), SGR_RESET,
+                );
+                let hint_c = format!(
+                    "{}{}{}  {}{}{}",
+                    SGR_CYAN, t(Msg::IdleHintCodingplan), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintCodingplanSuffix), SGR_RESET,
+                );
+                format!("{}   {}   {}", hint_a, hint_b, hint_c)
+            } else {
+                format!(
+                    "{}   {}   {}",
+                    t(Msg::IdleHintFull),
+                    t(Msg::IdleHintProviderFull),
+                    t(Msg::IdleHintCodingplanFull),
+                )
+            };
+            self.push_body_row(hint_line);
         } else {
-            t(Msg::IdleHintFull).into_owned()
-        };
-        self.push_body_row(hint_a);
-        let hint_b = if self.caps.colors {
-            format!(
-                "{}{}{}  {}{}{}",
-                SGR_CYAN,
-                t(Msg::IdleHintProvider),
-                SGR_RESET,
-                SGR_DIM,
-                t(Msg::IdleHintProviderSuffix),
-                SGR_RESET
-            )
-        } else {
-            t(Msg::IdleHintProviderFull).into_owned()
-        };
-        self.push_body_row(hint_b);
+            let hint_a = if self.caps.colors {
+                format!(
+                    "{}{}{}{}{}{}{}{}{}",
+                    SGR_DIM, t(Msg::IdleHintPrefix), SGR_RESET,
+                    SGR_CYAN, t(Msg::IdleHintSlash), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintSuffix), SGR_RESET,
+                )
+            } else {
+                t(Msg::IdleHintFull).into_owned()
+            };
+            self.push_body_row(hint_a);
+            let hint_b = if self.caps.colors {
+                format!(
+                    "{}{}{}  {}{}{}",
+                    SGR_CYAN, t(Msg::IdleHintProvider), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintProviderSuffix), SGR_RESET,
+                )
+            } else {
+                t(Msg::IdleHintProviderFull).into_owned()
+            };
+            self.push_body_row(hint_b);
+            let hint_c = if self.caps.colors {
+                format!(
+                    "{}{}{}  {}{}{}",
+                    SGR_CYAN, t(Msg::IdleHintCodingplan), SGR_RESET,
+                    SGR_DIM, t(Msg::IdleHintCodingplanSuffix), SGR_RESET,
+                )
+            } else {
+                t(Msg::IdleHintCodingplanFull).into_owned()
+            };
+            self.push_body_row(hint_c);
+        }
         self.push_body_row(String::new());
     }
 
@@ -1532,7 +1713,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             } else {
                 format!("{}{}", cont_pad, line)
             };
-            self.push_body_row(row);
+            // Use push_body_row_raw so long user lines are soft-wrapped
+            // and can be re-flowed on resize (issue #363).
+            self.push_body_row_raw(row);
         }
         self.push_body_row(String::new());
     }
@@ -1560,7 +1743,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             (false, true) => format!("{} {}", arrow, name_safe),
             (false, false) => format!("{} {}({})", arrow, name_safe, detail_safe),
         };
-        self.push_body_row(row);
+        // Use push_body_row_raw so long tool-call lines are soft-wrapped
+        // and can be re-flowed on resize (issue #363).
+        self.push_body_row_raw(row);
     }
 
     /// `✓ summary` (green) or `✗ summary` (red) row. PlainRenderer-style.
@@ -1574,7 +1759,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         } else {
             format!("    {} {}", icon, safe)
         };
-        self.push_body_row(row);
+        // Use push_body_row_raw so long tool-result lines are soft-wrapped
+        // and can be re-flowed on resize (issue #363).
+        self.push_body_row_raw(row);
     }
 
     /// `[Error: ...]` row. Red when colours on. Mirrors PlainRenderer.
@@ -1587,7 +1774,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         } else {
             label.into_owned()
         };
-        self.push_body_row(row);
+        // Use push_body_row_raw so long error lines are soft-wrapped
+        // and can be re-flowed on resize (issue #363).
+        self.push_body_row_raw(row);
     }
 
     fn push_warning(&mut self, msg: &str) {
@@ -1601,7 +1790,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         } else {
             format!("! {}", safe)
         };
-        self.push_body_row(row);
+        // Use push_body_row_raw so long warning lines are soft-wrapped
+        // and can be re-flowed on resize (issue #363).
+        self.push_body_row_raw(row);
     }
 
     /// Push `text` as command-output rows wrapped in `sgr_open` (e.g.
@@ -1614,17 +1805,16 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     fn push_styled_command_output(&mut self, text: &str, sgr_open: &str) {
         self.flush_assistant_remainder();
         let safe = scrub_controls(text);
-        let max_w = (self.width as usize).max(1);
         let style_on = self.caps.colors && !sgr_open.is_empty();
         for line in safe.split('\n') {
-            for chunk in wrap_to_width_sgr_aware(line, max_w) {
-                let row = if style_on {
-                    format!("{}{}{}", sgr_open, chunk, SGR_RESET)
-                } else {
-                    chunk
-                };
-                self.push_body_row(row);
-            }
+            let row = if style_on {
+                format!("{}{}{}", sgr_open, line, SGR_RESET)
+            } else {
+                line.to_string()
+            };
+            // Use push_body_row_raw so long styled output lines are
+            // soft-wrapped and can be re-flowed on resize (issue #363).
+            self.push_body_row_raw(row);
         }
     }
 
@@ -1637,7 +1827,10 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         } else {
             label.into_owned()
         };
-        self.push_body_row(row);
+        // Soft-wrap at terminal width (issue #363) — cancelled label
+        // is typically short, but wrap for consistency and re-flow on
+        // resize.
+        self.push_body_row_raw(row);
     }
 
     /// Diff line: `+ added` (green) or `- removed` (red). Per-row sign.
@@ -1649,24 +1842,27 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             (false, true) => format!("    + {}", safe),
             (false, false) => format!("    - {}", safe),
         };
-        self.push_body_row(row);
+        // Use push_body_row_raw so long diff lines are soft-wrapped
+        // and can be re-flowed on resize (issue #363).
+        self.push_body_row_raw(row);
     }
 
     /// Push CommandOutput verbatim, splitting on newlines so each
     /// physical line is its own body row.
     fn push_command_output(&mut self, text: &str) {
         self.flush_assistant_remainder();
-        let safe = scrub_controls(text);
-        // Soft-wrap each line at the current terminal width. Without this,
-        // `paint_body` truncates long lines (e.g. the OAuth URL in
-        // /login) at the right edge — invisible content can't be
-        // selected for copy. Wrapping splits one logical row into N body
-        // rows so every glyph stays on screen and selectable.
-        let max_w = (self.width as usize).max(1);
+        // CommandOutput is trusted internal text (slash-command
+        // responses, setup reports, status echoes) — let SGR
+        // through so things like the `/codingplan` red locked-model
+        // row reach the terminal. Cursor moves, OSC, and other
+        // potentially-dangerous escapes are still stripped. The
+        // wrap helper inside push_body_row_raw is SGR-aware so
+        // colour state survives line wrapping intact.
+        let safe = crate::sanitize::scrub_controls_keep_sgr(text);
+        // Use push_body_row_raw so long command-output lines are
+        // soft-wrapped and can be re-flowed on resize (issue #363).
         for line in safe.split('\n') {
-            for chunk in wrap_to_width_sgr_aware(line, max_w) {
-                self.push_body_row(chunk);
-            }
+            self.push_body_row_raw(line.to_string());
         }
     }
 }
@@ -1810,33 +2006,88 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // The previous alt-screen path emitted the flat
                 // `ApprovalPromptAlt` sentence — visually indistinct from
                 // a regular command-output row, so users couldn't tell at
-                // a glance that an approval was pending. tool/detail are
-                // already visible in the ToolCall row above, so we don't
-                // re-echo them here (same omission as retained).
-                let _ = (tool, detail);
+                // a glance that an approval was pending.
+                //
+                // Include the tool name and detail so the user knows which
+                // specific action they're being asked to approve. Without
+                // this, parallel batch approvals (e.g. 3 × Read) show
+                // identical prompts and the user can't tell which file
+                // they're approving (issue #439).
+                //
+                // When the label + chips fit on one line, place them
+                // together (issue #454: users reported unnecessary
+                // line-splitting). Only split when the label is too long.
                 let waiting = t(Msg::ApprovalWaitingLabel);
                 let allow = t(Msg::ApprovalAllow);
                 let always = t(Msg::ApprovalAlways);
                 let deny = t(Msg::ApprovalDeny);
-                let row = if self.caps.colors {
+                let tool_label = if detail.is_empty() {
+                    format!("{}: ", tool)
+                } else {
+                    format!("{}({}): ", tool, detail)
+                };
+                let prefix_w = crate::width::display_width(&waiting);
+                let cont_pad = " ".repeat(prefix_w);
+
+                // Build the chips text — reused for both one-line and
+                // two-line layouts.
+                let chips_plain = format!("Y {allow} A {always} N {deny}");
+                let chips_colored = format!(
+                    "{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
+                    rev = SGR_REVERSE,
+                    green = SGR_GREEN,
+                    cyan = SGR_CYAN,
+                    red = SGR_RED,
+                    reset = SGR_RESET,
+                    allow = allow,
+                    always = always,
+                    deny = deny,
+                );
+                let chips_display_w = crate::width::display_width(&chips_plain);
+                let screen_w = self.width as usize;
+
+                // Build the label row (with or without color), wrap it,
+                // and measure the last wrapped chunk's visible width.
+                // This mirrors retained.rs which measures the last
+                // build_prefixed_rows row's cell width.
+                let label_raw = if self.caps.colors {
                     format!(
-                        "{bold}{yellow}{waiting}{reset}{rev}{green} Y {reset}{allow}{rev}{cyan} A {reset}{always}{rev}{red} N {reset}{deny}",
+                        "{bold}{yellow}{waiting}{tool_label}{reset}",
                         bold = SGR_BOLD,
                         yellow = SGR_YELLOW,
-                        rev = SGR_REVERSE,
-                        green = SGR_GREEN,
-                        cyan = SGR_CYAN,
-                        red = SGR_RED,
                         reset = SGR_RESET,
-                        waiting = waiting,
-                        allow = allow,
-                        always = always,
-                        deny = deny,
                     )
                 } else {
-                    format!("{waiting} Y {allow} A {always} N {deny}")
+                    format!("{waiting}{tool_label}")
                 };
-                self.push_body_row(row);
+                let wrapped_label = wrap_to_width_sgr_aware(&label_raw, screen_w);
+                let last_label_w = wrapped_label
+                    .last()
+                    .map(|s| line_display_width_sgr_aware(s))
+                    .unwrap_or(0);
+
+                if last_label_w + chips_display_w <= screen_w {
+                    // Everything fits on one line.
+                    if self.caps.colors {
+                        let row = format!(
+                            "{label_raw}{chips}",
+                            label_raw = label_raw,
+                            chips = chips_colored,
+                        );
+                        self.push_body_row_raw(row);
+                    } else {
+                        let row = format!("{label_raw}{chips_plain}");
+                        self.push_body_row_raw(row);
+                    }
+                } else {
+                    // Label too long — keep chips on a separate line.
+                    self.push_body_row_raw(label_raw);
+                    if self.caps.colors {
+                        self.push_body_row(format!("{cont_pad}{chips_colored}"));
+                    } else {
+                        self.push_body_row(format!("{cont_pad}{chips_plain}"));
+                    }
+                }
             }
 
             // ── body: command output / errors ──
@@ -2061,19 +2312,23 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         // no DECSTBM region to renegotiate, no scroll-region edge
         // cases, no auto-wrap-into-footer issues. We just:
         //   1. update cached size
-        //   2. wipe the alt-screen with `\x1b[2J\x1b[H` so stale
+        //   2. re-flow body_lines from raw_body_lines at the new width
+        //      so narrowing the terminal wraps (not truncates) long
+        //      rows and widening re-merges previously split short rows
+        //      (issue #363)
+        //   3. wipe the alt-screen with `\x1b[2J\x1b[H` so stale
         //      pre-resize glyphs at old absolute positions can't
         //      ghost — iTerm2 / some terminals leave them visible
         //      until something overwrites them
-        //   3. mark both panes dirty + repaint
-        //
-        // body_lines are kept verbatim; on resize-narrower the next
-        // paint_body truncates each row to the new width, on
-        // resize-wider previously-clipped tails reappear from the
-        // un-truncated source. No re-flow / re-wrap needed because
-        // we trim at paint time, not at push time.
+        //   4. mark both panes dirty + repaint
         self.width = cols;
         self.height = rows;
+        // Re-flow body content at the new width. raw_body_lines
+        // preserves the original (unwrapped) logical lines so that
+        // widening the terminal re-merges previously split rows and
+        // narrowing the terminal splits long rows instead of
+        // truncating them.
+        self.reflow_body_lines();
         // Re-clamp viewport_top against the new (possibly smaller)
         // body_height, so a user who'd Page-Up'd into the buffer
         // doesn't end up with viewport_top past end-of-buffer.
@@ -2138,6 +2393,37 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         self.selection_active = false;
         let text = self.extract_selection_text();
         self.write_osc52_clipboard(&text);
+    }
+
+    fn copy_selection(&mut self) -> bool {
+        let text = self.extract_selection_text();
+        if text.is_empty() {
+            return false;
+        }
+        // Use arboard to write the system clipboard directly. OSC 52
+        // is unreliable on Windows (Windows Terminal / conhost ignore
+        // it), so this is the primary copy path on that platform.
+        // macOS and Linux terminals that honour OSC 52 already got the
+        // text via end_selection, but copy_selection is still useful
+        // when the user re-selects or the OSC 52 write failed silently.
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            if clipboard.set_text(&text).is_ok() {
+                // Clear the visual selection so the user sees feedback
+                // that the copy was consumed (mirrors how most editors
+                // deselect after Ctrl+C).
+                self.selection = None;
+                self.body_dirty = true;
+                self.paint_frame();
+                return true;
+            }
+        }
+        // arboard failed (e.g. another process holds the clipboard) —
+        // fall back to OSC 52 as a best-effort retry.
+        self.write_osc52_clipboard(&text);
+        self.selection = None;
+        self.body_dirty = true;
+        self.paint_frame();
+        true // text was non-empty, selection existed
     }
 }
 
@@ -2460,29 +2746,38 @@ mod tests {
         drop(r);
     }
 
-    /// Phase 3.5: code fences toggle md_state. A ```fenced``` block
-    /// keeps subsequent lines in code-block mode (no inline markdown
-    /// applied). The fence line itself returns None from render_line
-    /// (no body row pushed for the ```fence``` line) but `body_dirty`
-    /// is still set on subsequent content.
+    /// Phase 3.5 (updated for buffer-and-flush): a ```fenced``` block now
+    /// buffers body lines until close fence. The fence-open line and each
+    /// body line return None (no body row pushed). The close fence flushes
+    /// the whole block as a single body row containing all lines (with
+    /// per-line indent).
     #[test]
     fn fenced_code_block_state_carries_across_streaming_chunks() {
         let mut buf = Vec::new();
         let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+
         r.render(UiLine::AssistantText("```rust\n".into()));
-        // Fence line itself doesn't render — md_state.in_code_block
-        // flips to true, no body row pushed.
+        // Fence-open line doesn't render — md_state.in_code_block flips on,
+        // no body row pushed and no body_dirty for an empty fence.
         assert_eq!(r.body_lines.len(), 0, "fence-open line must not push");
         assert!(r.md_state.in_code_block, "code-block state must flip on");
 
         r.render(UiLine::AssistantText("let x = 1;\n".into()));
-        assert_eq!(r.body_lines.len(), 1, "code line pushed");
-        // Code-block state still on — next line should still be in code.
+        // Buffered — no body row pushed yet, code_buf has 1 entry, state still on.
+        assert_eq!(
+            r.body_lines.len(),
+            0,
+            "body line inside open fence must buffer, not push"
+        );
+        assert_eq!(r.md_state.code_buf.len(), 1, "code_buf must hold the body line");
         assert!(r.md_state.in_code_block);
 
         r.render(UiLine::AssistantText("```\n".into()));
-        // Fence-close, state flips back.
+        // Close fence flushes — state off, code_buf empty, at least one body row
+        // pushed containing the flushed (highlighted-or-plain) block.
         assert!(!r.md_state.in_code_block, "code-block state must flip off");
+        assert!(r.md_state.code_buf.is_empty(), "code_buf must be drained");
+        assert!(r.body_lines.len() >= 1, "close fence must flush at least one body row");
         drop(r);
     }
 
@@ -2931,6 +3226,7 @@ mod tests {
                 ctx_window: 0,
                 hint: None,
                 mode_indicator: Some("PLAN".into()),
+                session_name: None,
             },
             attachments: Vec::new(),
         });
@@ -2964,6 +3260,131 @@ mod tests {
         );
     }
 
+    /// After the user runs `/rename`, the conversation name should
+    /// appear as a right-aligned cyan-bg pill overlaid on the top
+    /// rule of the input box. Mirrors CC's per-conversation badge so
+    /// users can confirm which session they're typing into without
+    /// running `/status`.
+    #[test]
+    fn paint_footer_renders_session_name_badge_in_reverse_cyan() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                ctx_used: 0,
+                ctx_window: 0,
+                hint: None,
+                mode_indicator: None,
+                session_name: Some("atomcode加解密".into()),
+            },
+            attachments: Vec::new(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("atomcode加解密"),
+            "session name literal must appear in the rendered footer. got: {:?}",
+            s
+        );
+        // Pill style: SGR_REVERSE (7m) combined with SGR_CYAN (96m) to
+        // paint a cyan-filled chip. The exact concatenation order isn't
+        // load-bearing — only that both attributes are emitted somewhere
+        // in the same byte stream.
+        assert!(
+            s.contains("\x1b[7m") || s.contains("\x1b[7;"),
+            "session-name pill must emit reverse-video SGR (7m). got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[96m") || s.contains(";96m"),
+            "session-name pill must emit cyan SGR (96m). got: {:?}",
+            s
+        );
+    }
+
+    /// When `session_name = None` (auto-named / fresh session) the
+    /// footer must NOT emit the reverse-cyan pill on the top rule —
+    /// guards against the badge leaking onto sessions the user hasn't
+    /// explicitly renamed. We check for the exact `\x1b[7;96m` /
+    /// `\x1b[96;7m` SGR combo rather than a bare `\x1b[7;` prefix
+    /// because the buffer is full of CUP escapes like `\x1b[7;1H`
+    /// (cursor to row 7) which share that prefix but aren't SGR.
+    #[test]
+    fn paint_footer_no_session_name_emits_no_pill() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                ctx_used: 0,
+                ctx_window: 0,
+                hint: None,
+                mode_indicator: None,
+                session_name: None,
+            },
+            attachments: Vec::new(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            !s.contains("\x1b[7;96m") && !s.contains("\x1b[96;7m") && !s.contains("\x1b[7m"),
+            "no session_name must produce no reverse-cyan pill SGR. got: {:?}",
+            s
+        );
+    }
+
+    /// A name wider than the available budget gets ellipsised — the
+    /// alternative is either overflowing the terminal width (visible
+    /// wrap glitch) or swallowing the entire top rule (badge eats the
+    /// border, the input box loses its visual anchor). Budget leaves
+    /// at least 8 cells of `━` rule to the left so the box still
+    /// reads as bordered.
+    #[test]
+    fn paint_footer_truncates_overlong_session_name() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 40, 24);
+        let very_long = "这是一个非常非常非常长的会话名字应该被截断省略";
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status: crate::render::StatusLine {
+                model: "glm-5".into(),
+                cwd: "~/proj".into(),
+                ctx_used: 0,
+                ctx_window: 0,
+                hint: None,
+                mode_indicator: None,
+                session_name: Some(very_long.into()),
+            },
+            attachments: Vec::new(),
+        });
+        r.flush();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains('…'),
+            "overlong session name must be truncated with ellipsis. got: {:?}",
+            s
+        );
+        assert!(
+            !s.contains(very_long),
+            "full overlong name must NOT appear verbatim (it'd overflow the rule). got: {:?}",
+            s
+        );
+    }
+
     /// Default Build mode (`mode_indicator = None`) emits no PLAN
     /// literal — protects against accidental "PLAN" leak when the
     /// status line is rendered for a non-plan session. Mirrors the
@@ -2983,6 +3404,7 @@ mod tests {
                 ctx_window: 0,
                 hint: None,
                 mode_indicator: None,
+                session_name: None,
             },
             attachments: Vec::new(),
         });
@@ -3807,6 +4229,115 @@ mod tests {
             s.contains("Language switched to") && s.contains("简体中文"),
             "confirmation line missing from painted output: {:?}",
             s
+        );
+    }
+
+    /// Re-flow on resize: widening the terminal should re-merge previously
+    /// split short rows back into fewer longer rows. A single logical
+    /// line that was soft-wrapped into 3 chunks at width=10 should
+    /// become 1 row after widening to width=80.
+    #[test]
+    fn resize_wider_merges_split_rows() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 10, 24);
+        // Push a 25-char line via push_body_row_raw. At width=10 it
+        // wraps into 3 chunks (10 + 10 + 5 chars visible).
+        r.push_body_row_raw("abcdefghijklmnopqrstuvwxyz".to_string());
+        assert_eq!(
+            r.body_lines.len(),
+            3,
+            "narrow terminal should split 25-char line into 3 rows, got: {:?}",
+            r.body_lines
+        );
+        // Verify raw_body_lines has exactly 1 entry (the original line).
+        assert_eq!(
+            r.raw_body_lines.len(),
+            1,
+            "raw_body_lines should have 1 entry, got: {:?}",
+            r.raw_body_lines
+        );
+        // Widen to 80 cols.
+        r.on_resize(80, 24);
+        // After re-flow the line should fit in a single row.
+        assert_eq!(
+            r.body_lines.len(),
+            1,
+            "widened terminal should have 1 row for the 25-char line, got: {:?}",
+            r.body_lines
+        );
+        assert!(
+            r.body_lines[0].contains("abcdefghijklmnopqrstuvwxyz"),
+            "re-flowed row should contain the original text, got: {:?}",
+            r.body_lines[0]
+        );
+    }
+
+    /// Re-flow on resize: narrowing the terminal should split a
+    /// long row into multiple rows instead of truncating it.
+    #[test]
+    fn resize_narrower_splits_long_rows() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // Push a 40-char line at width=80 — fits in one row.
+        r.push_body_row_raw("a".repeat(40));
+        assert_eq!(
+            r.body_lines.len(),
+            1,
+            "80-col terminal should fit 40-char line in 1 row"
+        );
+        // Narrow to 20 cols.
+        r.on_resize(20, 24);
+        // After re-flow the line should be split into 2 rows
+        // (20 + 20 chars).
+        assert_eq!(
+            r.body_lines.len(),
+            2,
+            "narrowed terminal should split 40-char line into 2 rows, got: {:?}",
+            r.body_lines
+        );
+        // Each chunk should be at most 20 visible columns.
+        for (i, row) in r.body_lines.iter().enumerate() {
+            let w = line_display_width_sgr_aware(row);
+            assert!(
+                w <= 20,
+                "body row {} has display width {} > 20 after resize: {:?}",
+                i,
+                w,
+                row
+            );
+        }
+    }
+
+    /// Re-flow on resize: SGR colour codes in body rows survive
+    /// the re-wrap without bleeding into adjacent rows.
+    #[test]
+    fn resize_reflow_preserves_sgr_colours() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
+        // Push a coloured line that fits in 80 cols.
+        let coloured = format!("{}hello world{}", SGR_CYAN, SGR_RESET);
+        r.push_body_row_raw(coloured.clone());
+        // Narrow to 5 cols so it wraps.
+        r.on_resize(5, 24);
+        // Re-flow should produce multiple rows, each containing
+        // part of the text.
+        assert!(
+            r.body_lines.len() > 1,
+            "narrowed terminal should split the coloured line, got: {:?}",
+            r.body_lines
+        );
+        // Widen back — the full coloured line should re-merge.
+        r.on_resize(80, 24);
+        assert_eq!(
+            r.body_lines.len(),
+            1,
+            "widened back should re-merge into 1 row, got: {:?}",
+            r.body_lines
+        );
+        assert!(
+            r.body_lines[0].contains("hello world"),
+            "re-merged row should contain original text, got: {:?}",
+            r.body_lines[0]
         );
     }
 }

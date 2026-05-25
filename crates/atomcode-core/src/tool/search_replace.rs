@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::json;
@@ -129,6 +130,20 @@ impl Tool for SearchReplaceTool {
             regex::Regex::new(&regex::escape(&parsed.search)).unwrap()
         };
 
+        let glob_filter = match parsed.glob.as_deref() {
+            Some(pattern) => match FileGlob::new(pattern) {
+                Ok(filter) => Some(filter),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        call_id: String::new(),
+                        output: format!("Invalid glob '{}': {}", pattern, e),
+                        success: false,
+                    });
+                }
+            },
+            None => None,
+        };
+
         // Walk files
         let mut walker = WalkBuilder::new(&search_dir);
         walker.hidden(true).git_ignore(true);
@@ -150,10 +165,8 @@ impl Tool for SearchReplaceTool {
 
             let file_path = entry.path();
 
-            // Apply glob filter
-            if let Some(ref glob_pat) = parsed.glob {
-                let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !glob_match(glob_pat, name) {
+            if let Some(ref filter) = glob_filter {
+                if !filter.is_match(file_path, &search_dir) {
                     continue;
                 }
             }
@@ -244,20 +257,83 @@ impl Tool for SearchReplaceTool {
     }
 }
 
-/// Simple glob matching: supports *.ext and exact match.
-fn glob_match(pattern: &str, filename: &str) -> bool {
-    if pattern.starts_with("*.") {
-        let ext = &pattern[1..]; // ".vue", ".css"
-        filename.ends_with(ext)
-    } else if pattern.contains('*') {
-        // Basic wildcard: convert to simple check
-        let parts: Vec<&str> = pattern.split('*').collect();
-        if parts.len() == 2 {
-            filename.starts_with(parts[0]) && filename.ends_with(parts[1])
+struct FileGlob {
+    pattern_has_path: bool,
+    matcher: GlobMatcher,
+}
+
+impl FileGlob {
+    fn new(pattern: &str) -> std::result::Result<Self, globset::Error> {
+        let normalized = pattern.replace('\\', "/");
+        Ok(Self {
+            pattern_has_path: normalized.contains('/'),
+            matcher: Glob::new(&normalized)?.compile_matcher(),
+        })
+    }
+
+    fn is_match(&self, file_path: &std::path::Path, search_dir: &std::path::Path) -> bool {
+        let candidate = if self.pattern_has_path {
+            file_path.strip_prefix(search_dir).unwrap_or(file_path)
         } else {
-            filename == pattern
-        }
-    } else {
-        filename == pattern
+            match file_path.file_name().and_then(|name| name.to_str()) {
+                Some(name) => return self.matcher.is_match(name),
+                None => return false,
+            }
+        };
+
+        let normalized = candidate.to_string_lossy().replace('\\', "/");
+        self.matcher.is_match(normalized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::{Tool, ToolContext};
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn search_replace_path_glob_matches_relative_paths() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("src/app.ts"), "const v = 'needle';\n").unwrap();
+        std::fs::write(dir.path().join("tests/app.ts"), "const v = 'needle';\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = r#"{"search":"needle","replace":"replaced","glob":"src/**/*.ts"}"#;
+        let result = SearchReplaceTool.execute(args, &ctx).await.unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app.ts")).unwrap(),
+            "const v = 'replaced';\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tests/app.ts")).unwrap(),
+            "const v = 'needle';\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_replace_filename_glob_still_matches_nested_files() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/app.ts"), "const v = 'needle';\n").unwrap();
+        std::fs::write(dir.path().join("src/app.md"), "needle\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let args = r#"{"search":"needle","replace":"replaced","glob":"*.ts"}"#;
+        let result = SearchReplaceTool.execute(args, &ctx).await.unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app.ts")).unwrap(),
+            "const v = 'replaced';\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app.md")).unwrap(),
+            "needle\n"
+        );
     }
 }

@@ -58,21 +58,63 @@ pub struct ClaimResponse {
     pub message: String,
 }
 
-/// `GET /api/v5/coding-plan/models-v2` element. Wire shape per the v2
-/// spec: `is_infinity` (which gated availability in v1) is gone — the
-/// server now computes the eligibility check itself and exposes the
-/// result via `plan_available`. `id` and `is_atomcode_exclusive` map
-/// straight from `ami_chat_model.id` / `ami_chat_model.is_atomcode_exclusive`.
-#[derive(Debug, Clone, Deserialize)]
+/// `GET /api/v5/coding-plan/models-v2` element. Wire shape:
+///
+/// ```json
+/// {
+///   "id": 2052994857682014210,
+///   "is_infinity": 2,
+///   "is_atomcode_exclusive": 1,
+///   "display_model_name": "GLM-5.1",
+///   "base_url": "https://api-ai.gitcode.com/v1",
+///   "type": "openai",
+///   "context_window": 64000,
+///   "plan_available": true
+/// }
+/// ```
+///
+/// Every field is `#[serde(default)]` so an older server that
+/// omits a key still deserialises (atomcode falls back to the
+/// constants in `coding_plan::setup` — `LLM_BASE_URL`,
+/// `PROVIDER_TYPE`, `CONTEXT_WINDOW`). The eligibility check
+/// (whether the user's plan tier actually covers this model)
+/// lives in `plan_available`, the server-side decision —
+/// `is_infinity` and `is_atomcode_exclusive` are flagged
+/// for metadata / future routing.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelEntry {
     #[serde(default)]
     pub id: i64,
+    /// Unlimited-quota flag (`2` = unlimited, else gated). Server
+    /// metadata; atomcode doesn't act on it — `plan_available`
+    /// already encodes whether the current user can call this
+    /// model. Kept on the struct for forward-compat with whatever
+    /// the server eventually surfaces via this field.
+    #[serde(default)]
+    pub is_infinity: u8,
     #[serde(default)]
     pub is_atomcode_exclusive: u8,
     /// Human-readable model name, often of the form `org/model`.
     /// Used verbatim in the provider's `model` field.
     #[serde(default)]
     pub display_model_name: String,
+    /// LLM gateway base URL. `None` (key omitted on older server
+    /// builds) falls back to `coding_plan::setup::LLM_BASE_URL`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Provider type — `"openai"` / `"claude"` / `"ollama"`. Renamed
+    /// via serde because `type` is a Rust keyword. `None` falls
+    /// back to `coding_plan::setup::PROVIDER_TYPE` (`"openai"` — the
+    /// AtomGit gateway is OpenAI-compatible by default).
+    #[serde(default, rename = "type")]
+    pub provider_type: Option<String>,
+    /// Per-model context window in tokens. `None` falls back to
+    /// `coding_plan::setup::CONTEXT_WINDOW` (the 64k value the
+    /// legacy `/login` flow hard-coded). Letting the server drive
+    /// this lets bigger models (e.g. GLM-4.6 128k) avoid being
+    /// silently truncated to the historical default.
+    #[serde(default)]
+    pub context_window: Option<usize>,
     /// `true` iff the user's current plan tier (the one their `claim-v2`
     /// succeeded on) covers this model. `false` means it's a higher-tier
     /// model — show with strikethrough but DON'T register as a provider
@@ -135,15 +177,22 @@ pub struct UsageInfo {
     pub usage_percent: f64,
     #[serde(default)]
     pub window_hours: i32,
-    #[serde(default)]
+    // Backend sends JSON `null` for these four String fields when the
+    // window hasn't accumulated usage yet (freshly-claimed plan, just
+    // after a window reset, etc.). Plain `#[serde(default)]` only
+    // fires on *missing* fields — explicit `null` would still try to
+    // deserialize against `String` and blow up the whole response
+    // with `invalid type: null, expected a string`. Mirror the
+    // `PlanInfo.claimed_at` / `expires_at` pattern above.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub reset_at: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub reset_at_display: String,
     #[serde(default)]
     pub seconds_until_reset: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub reset_label: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub usage_status_desc: String,
 }
 
@@ -399,5 +448,58 @@ mod tests {
         let s: StatusResponse = serde_json::from_str(body).unwrap();
         assert!(s.codingplan_free.is_none());
         assert!(s.current_usage.is_none());
+    }
+
+    /// Multi-user report: `/codingplan` and `/status` failed with
+    /// `parse status-v2 response (...): invalid type: null, expected
+    /// a string at line 1 column 318`. Position 318 falls inside
+    /// `current_usage`; the backend sends explicit `null` for the
+    /// four `UsageInfo` String fields when the window hasn't
+    /// accumulated usage yet (freshly-claimed plan, just after a
+    /// window reset). Plain `#[serde(default)]` only covers missing
+    /// fields, so `null` against `String` blew up the whole parse
+    /// and the user saw "状态获取失败" everywhere. This pins the
+    /// `null_to_default` treatment so the regression can't sneak back.
+    #[test]
+    fn usage_info_tolerates_null_string_fields() {
+        let body = r#"{
+            "codingplan_free": {
+                "plan_name": "CodingPlan Pro",
+                "plan_type": "Pro",
+                "status": 1,
+                "claimed_at": "2026-05-12",
+                "expires_at": "2026-06-11",
+                "remaining_days": 28,
+                "total_days": 30,
+                "apply_id": 158
+            },
+            "current_usage": {
+                "placeholder": false,
+                "window_token_limit": 50000,
+                "window_tokens_used": 0,
+                "usage_percent": 0,
+                "window_hours": 1,
+                "reset_at": null,
+                "reset_at_display": null,
+                "seconds_until_reset": 0,
+                "reset_label": null,
+                "usage_status_desc": null
+            },
+            "audit_status": 1,
+            "expires_at": "2026-06-11",
+            "window_quota_exhausted": false,
+            "window_quota_hint": null
+        }"#;
+        let s: StatusResponse = serde_json::from_str(body)
+            .expect("null UsageInfo String fields must not crash parsing");
+        let u = s.current_usage.expect("usage should be present");
+        assert_eq!(u.reset_at, "");
+        assert_eq!(u.reset_at_display, "");
+        assert_eq!(u.reset_label, "");
+        assert_eq!(u.usage_status_desc, "");
+        // display_desc falls back to a computed percentage when
+        // usage_status_desc is empty — should not panic on the
+        // null-collapsed-to-"" path.
+        assert_eq!(u.display_desc(), "当前时间窗口用量约 0%");
     }
 }

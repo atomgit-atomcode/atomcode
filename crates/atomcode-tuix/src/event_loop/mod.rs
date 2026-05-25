@@ -13,9 +13,11 @@
 // Over time more subfiles should split out (agent_events, redraw helpers,
 // Buffer); modal overlays already live in `crate::modals`.
 
+pub(crate) mod bg_runtime;
 pub(crate) mod commands;
 pub(crate) mod file_index;
 pub(crate) mod monitor;
+pub(crate) mod oauth_poll;
 pub(crate) mod usage_monitor;
 use commands::execute_slash_command;
 pub use commands::{perform_session_rename, validate_session_name, MAX_SESSION_NAME_LEN};
@@ -25,7 +27,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use atomcode_core::agent::{AgentCommand, AgentEvent, AgentHandle, AgentPhase};
+use atomcode_core::agent::{
+    AgentClient, AgentCommand, AgentEvent, AgentPhase, AgentRuntimeFactory,
+};
 use atomcode_core::config::Config;
 use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -120,6 +124,21 @@ fn try_paste_clipboard_image() -> Option<(ImagePart, u64)> {
     }
 
     None
+}
+
+/// Pull plain text off the system clipboard for the Ctrl+V → text-paste
+/// fallback. Returns `None` when arboard fails to open the clipboard
+/// or the clipboard holds no text — the caller is expected to swallow
+/// the keystroke in that case rather than insert a literal `v`.
+///
+/// Why a dedicated helper instead of inlining `arboard::Clipboard::new`:
+/// the Ctrl+V branch already shells out to `try_paste_clipboard_image`,
+/// which itself opens a fresh `Clipboard` handle; symmetry keeps the
+/// two call sites readable, and the helper drops the handle promptly
+/// (some Windows clipboards lock briefly after a read).
+fn try_paste_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get_text().ok().filter(|s| !s.is_empty())
 }
 
 /// Read NSPasteboard's `public.file-url` type and return the decoded
@@ -633,7 +652,12 @@ pub struct McpReloadProgress {
 pub struct LoopCtx {
     pub config: Config,
     pub model_name: String,
-    pub agent: AgentHandle,
+    pub agent: AgentClient,
+    pub runtime_factory: AgentRuntimeFactory,
+    pub bg_manager: bg_runtime::BgRuntimeManager,
+    pub foreground_runtime_id: bg_runtime::RuntimeId,
+    pub runtime_event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
+    pub runtime_event_rx: mpsc::UnboundedReceiver<bg_runtime::RuntimeEvent>,
     pub working_dir: PathBuf,
     pub previous_dir: Option<PathBuf>,
     /// Recently visited project directories, most recent first (max 5).
@@ -699,6 +723,15 @@ pub struct LoopCtx {
     /// so `/model` switches, pre-turn triggers, and the like can wake
     /// the event loop after updating `monitor_warning`.
     pub wake_tx: mpsc::Sender<()>,
+    /// Receiver for `OauthEvent`s emitted by the QR-fast-path onboarding
+    /// poll thread (see `event_loop::oauth_poll`). One event arrives
+    /// per spawned poll task (Authorized or Failed). The `tokio::select!`
+    /// arm that reads this channel closes the wizard modal + flips
+    /// `pending_run_codingplan` on Authorized, or surfaces the failure
+    /// reason in scrollback on Failed.
+    pub oauth_event_rx: mpsc::UnboundedReceiver<oauth_poll::OauthEvent>,
+    /// Sender cloned into each spawned poll task.
+    pub oauth_event_tx: mpsc::UnboundedSender<oauth_poll::OauthEvent>,
     /// Control handle for the crossterm reader thread — `Some` in raw-mode
     /// TTY sessions, `None` in pipe mode. Used by child-process handoffs
     /// (OAuth login, future `/shell`) to pause+resume event consumption
@@ -1166,6 +1199,84 @@ impl Buffer {
             Action::ToggleToolOutput => BufferResult::NoOp,
         }
     }
+
+    /// Try to move the cursor up one logical line, preserving the
+    /// column (measured in display cells so CJK lines up). Returns
+    /// `false` only when the cursor is already at byte 0 — caller
+    /// can then fall through to history navigation. Designed for the
+    /// `Up` keystroke in multi-line composition: pressing Up walks
+    /// the cursor through the buffer's lines first, then snaps to
+    /// the start of the first line, and only the next Up after that
+    /// surfaces history. Costs one extra keystroke before history
+    /// kicks in but rescues anyone who paged Up to fix a typo on
+    /// line 1 from losing their draft.
+    pub fn cursor_line_up(&mut self) -> bool {
+        let cur_line_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if cur_line_start == 0 {
+            // Already on the first line. Snap to byte 0 first; only
+            // the next Up after that falls through to HistoryPrev.
+            if self.cursor > 0 {
+                self.cursor = 0;
+                return true;
+            }
+            return false;
+        }
+        let target_col = crate::width::display_width(&self.text[cur_line_start..self.cursor]);
+        let prev_line_end = cur_line_start - 1;
+        let prev_line_start = self.text[..prev_line_end]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.cursor =
+            prev_line_start + byte_offset_at_col(&self.text[prev_line_start..prev_line_end], target_col);
+        true
+    }
+
+    /// Mirror of [`cursor_line_up`] for `Down`. Returns `false` only
+    /// when the cursor is already at `text.len()` — caller then
+    /// falls through to HistoryNext. On the last logical line, Down
+    /// first snaps to end-of-buffer; the keystroke after that hands
+    /// off to history.
+    pub fn cursor_line_down(&mut self) -> bool {
+        let Some(rel_end) = self.text[self.cursor..].find('\n') else {
+            if self.cursor < self.text.len() {
+                self.cursor = self.text.len();
+                return true;
+            }
+            return false;
+        };
+        let cur_line_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let target_col = crate::width::display_width(&self.text[cur_line_start..self.cursor]);
+        let next_line_start = self.cursor + rel_end + 1;
+        let next_line_end = self.text[next_line_start..]
+            .find('\n')
+            .map(|i| next_line_start + i)
+            .unwrap_or(self.text.len());
+        self.cursor =
+            next_line_start + byte_offset_at_col(&self.text[next_line_start..next_line_end], target_col);
+        true
+    }
+}
+
+/// Find the byte offset within `line` at the first character whose
+/// cumulative display width meets or exceeds `target_col`. If the line
+/// is shorter than `target_col` cells, returns `line.len()` — the
+/// caller clamps the cursor to the end of that shorter line.
+fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
+    let mut acc = 0usize;
+    for (i, ch) in line.char_indices() {
+        if acc >= target_col {
+            return i;
+        }
+        acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    line.len()
 }
 
 #[cfg(test)]
@@ -1238,6 +1349,48 @@ mod buffer_tests {
         assert!(out.contains(" then "));
         assert!(out.contains("B\n"));
         assert!(!out.contains("[Pasted"));
+    }
+
+    /// Regression: `clear_pastes` then `expand_pastes` is the broken
+    /// ordering that shipped before — the agent received the bare
+    /// `[Pasted #N +M lines]` placeholder instead of the pasted body
+    /// and (correctly) responded "I don't see any pasted content".
+    /// Callers MUST expand FIRST, clear SECOND. This test pins that
+    /// contract: if someone reintroduces an early clear, the
+    /// substitution silently turns into a no-op and the
+    /// `contains("important data")` assertion below catches it.
+    #[test]
+    fn clear_before_expand_loses_paste_body() {
+        let mut b = Buffer::new();
+        let body = "important data\n".repeat(200);
+        b.insert_paste(body.clone());
+        let line = b.text.clone();
+        // Mis-ordered: clear first.
+        b.clear_pastes();
+        let expanded = b.expand_pastes(&line);
+        assert!(
+            expanded.contains("[Pasted #1"),
+            "early-clear must leave the placeholder unsubstituted: {}",
+            expanded
+        );
+        assert!(
+            !expanded.contains("important data"),
+            "early-clear must NOT magically still have the body: {}",
+            expanded
+        );
+
+        // Sanity check the correct order: expand first, then clear.
+        let mut b = Buffer::new();
+        b.insert_paste(body.clone());
+        let line = b.text.clone();
+        let expanded = b.expand_pastes(&line);
+        b.clear_pastes();
+        assert!(
+            expanded.contains("important data"),
+            "expand-before-clear must surface the body: {}",
+            &expanded[..expanded.len().min(120)]
+        );
+        assert!(b.pastes.is_empty(), "clear after expand must still empty the registry");
     }
 
     #[test]
@@ -1515,6 +1668,105 @@ mod menu_tests {
         assert_eq!(buf.text, "/session foo");
         assert_eq!(buf.cursor, 0, "cursor must park at 0 to suppress menu");
         assert!(buf.is_in_history(), "buffer must report history mode");
+    }
+
+    #[test]
+    fn cursor_line_up_walks_lines_then_signals_history_at_top() {
+        // "1\n2\n3" with cursor after the trailing "3". Up should
+        // walk: end-of-3 → end-of-2 → end-of-1 → start-of-1 → false.
+        // The start-of-1 snap is the rescue step: even on a single-
+        // line draft, Up first parks at column 0 before history nav
+        // kicks in, so a fat-fingered Up can't silently swallow what
+        // the user just typed.
+        let mut buf = Buffer::new();
+        buf.text = "1\n2\n3".into();
+        buf.cursor = buf.text.len();
+
+        assert!(buf.cursor_line_up(), "first Up moves up from line 3");
+        assert_eq!(&buf.text[..buf.cursor], "1\n2");
+        assert!(buf.cursor_line_up(), "second Up moves up from line 2");
+        assert_eq!(&buf.text[..buf.cursor], "1");
+        assert!(
+            buf.cursor_line_up(),
+            "on the first line Up snaps to byte 0 before yielding"
+        );
+        assert_eq!(buf.cursor, 0);
+        assert!(
+            !buf.cursor_line_up(),
+            "already at byte 0 → caller falls through to HistoryPrev"
+        );
+    }
+
+    #[test]
+    fn cursor_line_down_walks_lines_then_signals_history_at_bottom() {
+        let mut buf = Buffer::new();
+        buf.text = "1\n2\n3".into();
+        buf.cursor = 0;
+
+        assert!(buf.cursor_line_down(), "Down from line 1 → line 2");
+        assert_eq!(&buf.text[..buf.cursor], "1\n");
+        assert!(buf.cursor_line_down(), "Down from line 2 → line 3");
+        assert_eq!(&buf.text[..buf.cursor], "1\n2\n");
+        assert!(
+            buf.cursor_line_down(),
+            "on the last line Down snaps to end-of-buffer before yielding"
+        );
+        assert_eq!(buf.cursor, buf.text.len());
+        assert!(
+            !buf.cursor_line_down(),
+            "already at end → caller falls through to HistoryNext"
+        );
+    }
+
+    #[test]
+    fn cursor_line_up_snaps_to_start_on_single_line() {
+        // Single-line draft: Up should pull the cursor to column 0
+        // first; only the next Up after that surfaces history.
+        let mut buf = Buffer::new();
+        buf.text = "hello world".into();
+        buf.cursor = 7; // inside the word "world"
+
+        assert!(buf.cursor_line_up(), "Up snaps to byte 0 on single line");
+        assert_eq!(buf.cursor, 0);
+        assert!(!buf.cursor_line_up(), "second Up yields to history");
+    }
+
+    #[test]
+    fn cursor_line_down_snaps_to_end_on_single_line() {
+        let mut buf = Buffer::new();
+        buf.text = "hello world".into();
+        buf.cursor = 4;
+
+        assert!(buf.cursor_line_down(), "Down snaps to end on single line");
+        assert_eq!(buf.cursor, buf.text.len());
+        assert!(!buf.cursor_line_down(), "second Down yields to history");
+    }
+
+    #[test]
+    fn cursor_line_up_clamps_to_shorter_line() {
+        // Column-preservation: cursor at col 5 on line 2 ("hello"),
+        // line 1 is only "ab" — Up clamps to end of "ab".
+        let mut buf = Buffer::new();
+        buf.text = "ab\nhello".into();
+        buf.cursor = buf.text.len(); // after final 'o'
+
+        assert!(buf.cursor_line_up());
+        assert_eq!(buf.cursor, 2, "cursor clamps to end of shorter prev line");
+    }
+
+    #[test]
+    fn cursor_line_up_handles_cjk_width() {
+        // 你好 = 2 chars but 4 display cells. Target column on line
+        // 2 lands inside line 1's CJK run — should pick a char
+        // boundary (no panic) and preserve visual column.
+        let mut buf = Buffer::new();
+        buf.text = "你好world\nabcd".into();
+        // Move cursor to end of line 2 (col 4 → display width 4 →
+        // lands at "你好" exactly on line 1).
+        buf.cursor = buf.text.len();
+        assert!(buf.cursor_line_up());
+        // "你好" is the first 6 bytes (3 bytes per CJK char in UTF-8).
+        assert_eq!(buf.cursor, 6);
     }
 
     #[test]
@@ -1915,6 +2167,179 @@ mod tool_format_tests {
     }
 
     #[test]
+    fn format_tool_detail_search_replace_shows_arrow() {
+        let args = r#"{"search":"bg-blue-600","replace":"bg-violet-600","glob":"*.vue"}"#;
+        let out = format_tool_detail("search_replace", args);
+        assert!(
+            out.contains("bg-blue-600"),
+            "should contain search term: got {:?}",
+            out
+        );
+        assert!(
+            out.contains("bg-violet-600"),
+            "should contain replace term: got {:?}",
+            out
+        );
+        assert!(
+            out.contains("→"),
+            "should contain arrow separator: got {:?}",
+            out
+        );
+        assert!(
+            out.contains("glob: *.vue"),
+            "should contain glob info: got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn format_tool_detail_search_replace_without_glob() {
+        let args = r#"{"search":"oldFunc","replace":"newFunc"}"#;
+        let out = format_tool_detail("search_replace", args);
+        assert_eq!(out, "oldFunc → newFunc");
+    }
+
+    #[test]
+    fn format_tool_detail_search_replace_with_path() {
+        let args = r#"{"search":"foo","replace":"bar","path":"/some/dir"}"#;
+        let out = format_tool_detail("search_replace", args);
+        assert!(
+            out.contains("path: dir"),
+            "should contain path basename: got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn format_tool_detail_search_replace_dot_path_omitted() {
+        let args = r#"{"search":"foo","replace":"bar","path":"."}"#;
+        let out = format_tool_detail("search_replace", args);
+        assert!(
+            !out.contains("path:"),
+            "default '.' path should be omitted: got {:?}",
+            out
+        );
+    }
+
+    // ── disambiguate_batch_details tests (issue #437) ──
+
+    #[test]
+    fn disambiguate_no_duplicates_returns_as_is() {
+        let names = vec!["read_file", "read_file"];
+        let args = vec![
+            r#"{"file_path":"/a/foo.rs"}"#,
+            r#"{"file_path":"/b/bar.rs"}"#,
+        ];
+        let details = vec!["foo.rs".to_string(), "bar.rs".to_string()];
+        let result = disambiguate_batch_details(&names, &args, &details);
+        assert_eq!(result, vec!["foo.rs", "bar.rs"]);
+    }
+
+    #[test]
+    fn disambiguate_same_basename_adds_parent_dir() {
+        // Issue #437: three SKILL.md files in different directories
+        let names = vec!["read_file", "read_file", "read_file"];
+        let args = vec![
+            r#"{"file_path":"/home/.atomcode/skills/atomcode-automation-recommender/SKILL.md"}"#,
+            r#"{"file_path":"/home/.atomcode/skills/tosshub-skill/SKILL.md"}"#,
+            r#"{"file_path":"/home/.atomcode/skills/zouwu-skill/SKILL.md"}"#,
+        ];
+        let details = vec![
+            "SKILL.md".to_string(),
+            "SKILL.md".to_string(),
+            "SKILL.md".to_string(),
+        ];
+        let result = disambiguate_batch_details(&names, &args, &details);
+        // Each should include its parent directory to disambiguate
+        assert_eq!(
+            result,
+            vec![
+                "atomcode-automation-recommender/SKILL.md",
+                "tosshub-skill/SKILL.md",
+                "zouwu-skill/SKILL.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn disambiguate_partial_duplicates_only_touches_dups() {
+        // Two same-name files + one unique file
+        let names = vec!["read_file", "read_file", "read_file"];
+        let args = vec![
+            r#"{"file_path":"/a/mod.rs"}"#,
+            r#"{"file_path":"/b/mod.rs"}"#,
+            r#"{"file_path":"/c/unique.rs"}"#,
+        ];
+        let details = vec![
+            "mod.rs".to_string(),
+            "mod.rs".to_string(),
+            "unique.rs".to_string(),
+        ];
+        let result = disambiguate_batch_details(&names, &args, &details);
+        // unique.rs is left unchanged
+        assert_eq!(result[2], "unique.rs");
+        // mod.rs entries get parent dir
+        assert_eq!(result[0], "a/mod.rs");
+        assert_eq!(result[1], "b/mod.rs");
+    }
+
+    #[test]
+    fn disambiguate_no_path_uses_hash_suffix() {
+        // Non-file tools that produce duplicate details
+        let names = vec!["bash", "bash"];
+        let args = vec![r#"{"command":"echo hi"}"#, r#"{"command":"echo hi"}"#];
+        let details = vec!["echo hi".to_string(), "echo hi".to_string()];
+        let result = disambiguate_batch_details(&names, &args, &details);
+        // First stays the same, second gets #2 suffix
+        assert_eq!(result[0], "echo hi");
+        assert_eq!(result[1], "echo hi #2");
+    }
+
+    #[test]
+    fn tail_path_basic() {
+        assert_eq!(tail_path("a/b/c/SKILL.md", 0), "SKILL.md");
+        assert_eq!(tail_path("a/b/c/SKILL.md", 1), "c/SKILL.md");
+        assert_eq!(tail_path("a/b/c/SKILL.md", 2), "b/c/SKILL.md");
+        assert_eq!(tail_path("a/b/c/SKILL.md", 3), "a/b/c/SKILL.md");
+        // depth exceeding path depth returns full path
+        assert_eq!(tail_path("a/b/c/SKILL.md", 10), "a/b/c/SKILL.md");
+    }
+
+    #[test]
+    fn tail_path_no_parent() {
+        // File with no directory component
+        assert_eq!(tail_path("foo.rs", 0), "foo.rs");
+        assert_eq!(tail_path("foo.rs", 1), "foo.rs");
+    }
+
+    #[test]
+    fn disambiguate_long_path_is_truncated() {
+        // Very deep duplicate paths should be truncated to 100 display cols
+        let long_seg = "a".repeat(30); // 30 chars each
+        let path1 = format!("/x/{}/{}/mod.rs", long_seg, long_seg);
+        let path2 = format!("/y/{}/{}/mod.rs", long_seg, long_seg);
+        let names = vec!["read_file", "read_file"];
+        let args: Vec<String> = vec![
+            format!(r#"{{"file_path":"{}"}}"#, path1),
+            format!(r#"{{"file_path":"{}"}}"#, path2),
+        ];
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let details = vec!["mod.rs".to_string(), "mod.rs".to_string()];
+        let result = disambiguate_batch_details(&names, &args_refs, &details);
+        // Both entries should be truncated — no entry exceeds 100 display width
+        for entry in &result {
+            assert!(
+                crate::width::display_width(entry) <= 100,
+                "entry too wide ({} cols): {}",
+                crate::width::display_width(entry),
+                entry,
+            );
+        }
+        // And they should still be different from each other
+        assert_ne!(result[0], result[1]);
+    }
+
+    #[test]
     fn summarise_single_line_returned_as_is() {
         assert_eq!(summarise("ok", true), "ok");
     }
@@ -2015,7 +2440,7 @@ fn next_boundary(s: &str, mut p: usize) -> usize {
 /// and the call sites filled a paragraph. Now the handlers take
 /// `(&mut App, &mut LoopCtx, &mut dyn Renderer, …event)` — the LoopCtx
 /// stays separate because the tokio `select!` in `run_loop` needs to
-/// borrow `ctx.input_rx`, `ctx.agent.event_rx`, `ctx.wake_rx`
+/// borrow `ctx.input_rx`, `ctx.runtime_event_rx`, `ctx.wake_rx`
 /// independently, and bundling them into App would fight the borrow
 /// checker on every arm.
 pub struct App {
@@ -2061,6 +2486,20 @@ pub struct App {
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
+    /// Guards the one-shot `/setup` hint so it fires at most once per
+    /// session. Flipped to `true` after the first render; subsequent
+    /// redraws skip the check entirely.
+    pub setup_hint_shown: bool,
+    /// Timestamp of the last Ctrl+C that was consumed by `copy_selection()`
+    /// via the Windows OS-level signal handler. On Windows, the OS Ctrl+C
+    /// signal fires *before* the keyboard event arrives in the input
+    /// buffer (biased `tokio::select!` prioritises the signal arm), so
+    /// after the signal handler copies the selection, the keyboard event
+    /// still shows up in `handle_input` and would trigger Cancel/exit.
+    /// This timestamp lets the keyboard path detect and suppress that
+    /// stale echo within a short debounce window.
+    #[cfg(windows)]
+    pub last_ctrl_c_copy: Option<std::time::Instant>,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -2080,6 +2519,9 @@ impl App {
             fixissue_pending: None,
             fixissue_buffer: String::new(),
             reasoning_buffer: String::new(),
+            setup_hint_shown: false,
+            #[cfg(windows)]
+            last_ctrl_c_copy: None,
         }
     }
 }
@@ -2131,7 +2573,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
     // the subcommand stashes its rendered SetupReport here instead of
-    // printing to stdout, so the user sees the ✔/✘ lines in the chat
+    // printing to stdout, so the user sees the ✓/✗ lines in the chat
     // scrollback rather than scrolled off above the welcome banner.
     if let Ok(report) = std::env::var("ATOMCODE_CODINGPLAN_REPORT") {
         std::env::remove_var("ATOMCODE_CODINGPLAN_REPORT");
@@ -2251,10 +2693,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
             ctx.current_session = session;
             app.state.on_turn_complete();
-            renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::SessionReplayHint).into_owned(),
-            ));
-            renderer.flush();
         }
     }
 
@@ -2269,11 +2707,40 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         // OnboardingWizard's Modal impl owns the per-step box drawing.
         use crate::modals::Modal;
         renderer.clear_screen();
-        let wizard = crate::modals::OnboardingWizard::new()
-            .with_initial_language(ctx.config.language);
+        // First-launch fast path: single-page QR + URL. Background
+        // poll thread (PR 1b) watches `/auth/check` and auto-closes
+        // the modal the moment AtomGit reports authorisation, then
+        // the `OauthEvent::Authorized` branch in the main `select!`
+        // flips `pending_run_codingplan` so `/codingplan` claims
+        // immediately — zero keystrokes after the user finishes the
+        // browser flow. The legacy 3-step Intro / Language / Setup
+        // wizard stays intact for `/welcome` — `new_qr_fast_path` is
+        // ONLY used here. /welcome's command arm still uses `new()`
+        // / `new_with_confirm()` so users who explicitly re-run the
+        // wizard see the familiar language + setup path.
+        let mut wizard = crate::modals::OnboardingWizard::new_qr_fast_path();
+        // Pull the LoginSession out of the wizard before boxing — the
+        // background poll thread owns it from here. wizard.draw still
+        // has access to `qr_login_url` so the QR keeps rendering.
+        if let Some(session) = wizard.take_pending_session() {
+            oauth_poll::spawn_oauth_poll(
+                session,
+                Some(std::sync::Arc::clone(&ctx.telemetry)),
+                ctx.oauth_event_tx.clone(),
+                ctx.wake_tx.clone(),
+            );
+        }
         wizard.draw(&app.buf, &app.state, &ctx, renderer);
         app.active_modal = Some(Box::new(wizard));
     } else {
+        // One-shot /setup hint — only on first boot into this project,
+        // gated by preferences + setup-state presence.
+        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
+            ));
+            app.setup_hint_shown = true;
+        }
         renderer.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -2448,6 +2915,83 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
             }
 
+            // ── OAuth poll thread results ──
+            // Emitted by `event_loop::oauth_poll::spawn_oauth_poll`
+            // once per QR-fast-path session. Authorized → close the
+            // wizard + flip `pending_run_codingplan` so the existing
+            // /codingplan driver picks up the just-written auth.toml
+            // and claims the plan. Failed → close the wizard too and
+            // surface the reason in scrollback with a retry hint;
+            // leaving the modal open would require a Modal trait
+            // extension (as_any_mut + downcast) we don't yet have.
+            Some(ev) = ctx.oauth_event_rx.recv() => {
+                use oauth_poll::OauthEvent;
+                let was_modal_open = app.active_modal.is_some();
+                if was_modal_open {
+                    app.active_modal = None;
+                    renderer.clear_screen();
+                }
+                match ev {
+                    OauthEvent::Authorized => {
+                        // Banner FIRST, /codingplan output below — per
+                        // user direction: AtomCode chrome should anchor
+                        // the top of scrollback, the codingplan claim
+                        // output is verbose detail underneath. Model
+                        // bullet is blank at this point because the
+                        // claim hasn't picked a default provider yet —
+                        // refreshed below once the claim writes
+                        // ctx.model_name.
+                        crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
+                        // `pending_run_codingplan` is only drained by the
+                        // keystroke-handler path (handle_input → modal
+                        // close → drain flag). The OAuth poll path doesn't
+                        // route through there, so just call the codingplan
+                        // driver directly — same effect, runs in this
+                        // select! arm's scope where renderer + ctx are
+                        // already mutable.
+                        if let Err(e) = crate::event_loop::commands::run_codingplan_flow(renderer, &mut ctx) {
+                            renderer.render(crate::render::UiLine::Error(
+                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /codingplan 手动重试。"),
+                            ));
+                            renderer.flush();
+                        }
+                        // Splice the resolved model name into the
+                        // banner painted above. `run_codingplan_flow`
+                        // updates `ctx.model_name` from the picked
+                        // default provider (see commands.rs:2906) — at
+                        // this point the banner's cached model="" is
+                        // stale, so refresh in place.
+                        let dir_display = crate::platform::collapse_home(
+                            &ctx.working_dir.to_string_lossy(),
+                        );
+                        renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
+                        // QR-fast-path onboarding bypasses the regular
+                        // first-boot idle render (see ~line 2506), so
+                        // the one-shot /setup tip never fires for users
+                        // who land through the scan flow. Surface it
+                        // here under the same gates: in-session
+                        // once-only + `should_auto_show_setup` (no
+                        // setup-state.json or missing recommender
+                        // skill).
+                        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
+                            renderer.render(crate::render::UiLine::CommandOutput(
+                                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
+                            ));
+                            renderer.flush();
+                            app.setup_hint_shown = true;
+                        }
+                    }
+                    OauthEvent::Failed(reason) => {
+                        renderer.render(crate::render::UiLine::Error(
+                            format!(
+                                "登录失败: {reason}。运行 /codingplan 可重试。",
+                            ),
+                        ));
+                        renderer.flush();
+                    }
+                }
+            }
+
             // ── MCP connection events ──
             // Render connection success/failure into scrollback as they arrive.
             // Also register tools dynamically when servers connect.
@@ -2611,40 +3155,48 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.agent.event_rx.recv() => {
-                let Some(ev) = maybe else { break };
-                let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                if pre_phase != app.state.phase {
-                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
-                }
-                if matches!(app.state.phase, UiPhase::Streaming)
-                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
-                {
-                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    last_spinner_draw = std::time::Instant::now();
-                }
-                if matches!(app.state.phase, UiPhase::Idle) {
-                    // Turn just ended — drain the type-ahead queue.
-                    // Pop the oldest queued message, echo as a User
-                    // line, dispatch to the agent, and transition
-                    // back to Streaming. Remaining queue entries
-                    // fire in order on subsequent completions.
-                    if let Some(queued) = app.message_queue.pop_front() {
-                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.text.clone()));
-                        renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                            text: queued.text,
-                            images: queued.images,
-                            image_markers: queued.image_markers,
-                        }).ok();
-                        app.state.on_submit();
-                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    } else {
-                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
-                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            maybe = ctx.runtime_event_rx.recv() => {
+                let Some(runtime_event) = maybe else { break };
+                if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let pre_phase = app.state.phase;
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer, &app.buf);
+                    if pre_phase != app.state.phase {
+                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
+                    if matches!(app.state.phase, UiPhase::Streaming)
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    {
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        last_spinner_draw = std::time::Instant::now();
+                    }
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        // Turn just ended — drain the type-ahead queue.
+                        // Pop the oldest queued message, echo as a User
+                        // line, dispatch to the agent, and transition
+                        // back to Streaming. Remaining queue entries
+                        // fire in order on subsequent completions.
+                        if let Some(queued) = app.message_queue.pop_front() {
+                            crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
+                            renderer.render(UiLine::User(queued.text.clone()));
+                            renderer.flush();
+                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                text: queued.text,
+                                images: queued.images,
+                                image_markers: queued.image_markers,
+                            }).ok();
+                            app.state.on_submit();
+                            draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        } else {
+                            crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                } else {
+                    ctx.bg_manager.apply_background_event(
+                        runtime_event.runtime_id,
+                        runtime_event.event,
+                        &ctx.session_manager,
+                    );
                 }
             }
 
@@ -2693,9 +3245,31 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // when that path is silent. Single-press exit: skips the
             // 2-press confirm because if we got here, the user has no
             // working keyboard route to confirm with anyway.
+            //
+            // However, on Windows the OS Ctrl+C signal fires *before*
+            // the keyboard event arrives in the input buffer (and the
+            // `biased` select gives this arm priority), so when the
+            // user has a mouse selection active they expect Ctrl+C to
+            // *copy* — not exit. Try copy_selection first; only fall
+            // through to Shutdown when there's nothing selected.
             Some(()) = win_ctrl_c.recv() => {
-                crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
-                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                if renderer.copy_selection() {
+                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> copy_selection (had selection)");
+                    // Stamp so the keyboard-event echo (which arrives
+                    // shortly after via input_rx) knows to suppress
+                    // itself instead of triggering Cancel/exit.
+                    app.last_ctrl_c_copy = Some(std::time::Instant::now());
+                } else if matches!(app.state.phase, UiPhase::Streaming) {
+                    // In Streaming phase, Ctrl+C should cancel the
+                    // running turn (matching keyboard-path behaviour)
+                    // rather than shut down the whole application.
+                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> Cancel (streaming)");
+                    ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+                    restore_cancelled_message_to_buf(&mut app, renderer, &ctx);
+                } else {
+                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> Shutdown");
+                    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                }
             }
 
             // ── Deferred-render trailing edge ──
@@ -2721,6 +3295,83 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── Version-check wake ──
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
                 redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            }
+
+            // ── OAuth poll thread results ──
+            // Emitted by `event_loop::oauth_poll::spawn_oauth_poll`
+            // once per QR-fast-path session. Authorized → close the
+            // wizard + flip `pending_run_codingplan` so the existing
+            // /codingplan driver picks up the just-written auth.toml
+            // and claims the plan. Failed → close the wizard too and
+            // surface the reason in scrollback with a retry hint;
+            // leaving the modal open would require a Modal trait
+            // extension (as_any_mut + downcast) we don't yet have.
+            Some(ev) = ctx.oauth_event_rx.recv() => {
+                use oauth_poll::OauthEvent;
+                let was_modal_open = app.active_modal.is_some();
+                if was_modal_open {
+                    app.active_modal = None;
+                    renderer.clear_screen();
+                }
+                match ev {
+                    OauthEvent::Authorized => {
+                        // Banner FIRST, /codingplan output below — per
+                        // user direction: AtomCode chrome should anchor
+                        // the top of scrollback, the codingplan claim
+                        // output is verbose detail underneath. Model
+                        // bullet is blank at this point because the
+                        // claim hasn't picked a default provider yet —
+                        // refreshed below once the claim writes
+                        // ctx.model_name.
+                        crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
+                        // `pending_run_codingplan` is only drained by the
+                        // keystroke-handler path (handle_input → modal
+                        // close → drain flag). The OAuth poll path doesn't
+                        // route through there, so just call the codingplan
+                        // driver directly — same effect, runs in this
+                        // select! arm's scope where renderer + ctx are
+                        // already mutable.
+                        if let Err(e) = crate::event_loop::commands::run_codingplan_flow(renderer, &mut ctx) {
+                            renderer.render(crate::render::UiLine::Error(
+                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /codingplan 手动重试。"),
+                            ));
+                            renderer.flush();
+                        }
+                        // Splice the resolved model name into the
+                        // banner painted above. `run_codingplan_flow`
+                        // updates `ctx.model_name` from the picked
+                        // default provider (see commands.rs:2906) — at
+                        // this point the banner's cached model="" is
+                        // stale, so refresh in place.
+                        let dir_display = crate::platform::collapse_home(
+                            &ctx.working_dir.to_string_lossy(),
+                        );
+                        renderer.refresh_welcome_banner(&ctx.model_name, &dir_display);
+                        // QR-fast-path onboarding bypasses the regular
+                        // first-boot idle render (see ~line 2506), so
+                        // the one-shot /setup tip never fires for users
+                        // who land through the scan flow. Surface it
+                        // here under the same gates: in-session
+                        // once-only + `should_auto_show_setup` (no
+                        // setup-state.json or missing recommender
+                        // skill).
+                        if !app.setup_hint_shown && should_auto_show_setup(&ctx) {
+                            renderer.render(crate::render::UiLine::CommandOutput(
+                                crate::i18n::t(crate::i18n::Msg::CmdSetupTip).into_owned(),
+                            ));
+                            renderer.flush();
+                            app.setup_hint_shown = true;
+                        }
+                    }
+                    OauthEvent::Failed(reason) => {
+                        renderer.render(crate::render::UiLine::Error(
+                            format!(
+                                "登录失败: {reason}。运行 /codingplan 可重试。",
+                            ),
+                        ));
+                        renderer.flush();
+                    }
+                }
             }
 
             // ── MCP connection events ──
@@ -2884,35 +3535,43 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // which is what "得发两次你好才结束" looked like in the UI.
             // Phase-specific behaviour (spinner redraw, type-ahead queue
             // drain) lives inside the match arms on `app.state.phase`.
-            maybe = ctx.agent.event_rx.recv() => {
-                let Some(ev) = maybe else { break };
-                let pre_phase = app.state.phase;
-                handle_agent_event(ev, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer);
-                if pre_phase != app.state.phase {
-                    crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
-                }
-                if matches!(app.state.phase, UiPhase::Streaming)
-                    && last_spinner_draw.elapsed() >= Duration::from_millis(100)
-                {
-                    draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    last_spinner_draw = std::time::Instant::now();
-                }
-                if matches!(app.state.phase, UiPhase::Idle) {
-                    if let Some(queued) = app.message_queue.pop_front() {
-                        crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                        renderer.render(UiLine::User(queued.text.clone()));
-                        renderer.flush();
-                        ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                            text: queued.text,
-                            images: queued.images,
-                            image_markers: queued.image_markers,
-                        }).ok();
-                        app.state.on_submit();
-                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                    } else {
-                        crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
-                        redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+            maybe = ctx.runtime_event_rx.recv() => {
+                let Some(runtime_event) = maybe else { break };
+                if runtime_event.runtime_id == ctx.foreground_runtime_id {
+                    let pre_phase = app.state.phase;
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer, &app.buf);
+                    if pre_phase != app.state.phase {
+                        crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
+                    if matches!(app.state.phase, UiPhase::Streaming)
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    {
+                        draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        last_spinner_draw = std::time::Instant::now();
+                    }
+                    if matches!(app.state.phase, UiPhase::Idle) {
+                        if let Some(queued) = app.message_queue.pop_front() {
+                            crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
+                            renderer.render(UiLine::User(queued.text.clone()));
+                            renderer.flush();
+                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                text: queued.text,
+                                images: queued.images,
+                                image_markers: queued.image_markers,
+                            }).ok();
+                            app.state.on_submit();
+                            draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
+                        } else {
+                            crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
+                            redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
+                        }
+                    }
+                } else {
+                    ctx.bg_manager.apply_background_event(
+                        runtime_event.runtime_id,
+                        runtime_event.event,
+                        &ctx.session_manager,
+                    );
                 }
             }
         }
@@ -2963,6 +3622,7 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
     let path = atomcode_core::config::Config::default_path();
     if let Ok(fresh) = atomcode_core::config::Config::load(&path) {
         ctx.config = fresh;
+        ctx.runtime_factory.set_config(ctx.config.clone());
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
         }
@@ -3060,6 +3720,38 @@ fn attach_image_to_input(
         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     }
     Ok(true)
+}
+
+/// `/paste` slash-command handler. Exists for Windows users whose
+/// Ctrl+V is intercepted by Windows Terminal / conhost before the
+/// keystroke reaches atomcode — the terminal-layer `paste` action
+/// only forwards `CF_UNICODETEXT`, so an image-only clipboard never
+/// triggers the in-app `KeyCode::Char('v') + CONTROL` branch.
+/// `/paste` invokes the same `try_paste_clipboard_image` →
+/// `attach_image_to_input` pipeline directly, bypassing the
+/// terminal's keybinds. Works on every platform — Windows / macOS /
+/// Linux / git-bash — so it doubles as a discoverable backup
+/// regardless of how Ctrl+V is configured locally. Falls back to a
+/// scrollback error line when the clipboard has no image so the
+/// user isn't left wondering whether the command did anything.
+fn handle_paste_command(
+    app: &mut App,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+) -> Result<()> {
+    let img_hash = try_paste_clipboard_image();
+    if img_hash.is_none() {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::CmdPasteNoImage).into_owned(),
+        ));
+        renderer.flush();
+        if matches!(app.state.phase, UiPhase::Idle) {
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        }
+        return Ok(());
+    }
+    attach_image_to_input(app, ctx, renderer, img_hash)?;
+    Ok(())
 }
 
 fn handle_input(
@@ -3337,6 +4029,44 @@ fn handle_input(
             // scrollback). We intercept BEFORE phase dispatch so
             // scrolling works in Idle / Streaming alike.
 
+            // ── Ctrl+C: copy selection ──────────────────────────────
+            // On Windows, OSC 52 is not supported by Windows Terminal /
+            // conhost, so the user cannot copy text by mouse-selecting
+            // alone (end_selection's OSC 52 write is silently ignored).
+            // Ctrl+C is the user's natural instinct to copy selected
+            // text. We intercept it here: if a selection exists in the
+            // alt-screen renderer, copy its text to the system clipboard
+            // via arboard and clear the selection. If no selection exists,
+            // fall through to the normal Cancel behaviour.
+            //
+            // This also helps on macOS / Linux when the user prefers
+            // Ctrl+C / Cmd+C over the mouse-release OSC 52 auto-copy,
+            // or when the terminal ignores OSC 52 (macOS Terminal.app
+            // without the opt-in setting).
+            if code == crossterm::event::KeyCode::Char('c')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+                && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
+            {
+                // Windows: the OS Ctrl+C signal handler may have already
+                // consumed this Ctrl+C as a copy (see the `win_ctrl_c`
+                // select arm above). The keyboard event arrives shortly
+                // after via input_rx. If the signal handler stamped
+                // `last_ctrl_c_copy` within the last 500 ms, suppress
+                // the keyboard echo so it doesn't trigger Cancel/exit.
+                #[cfg(windows)]
+                if let Some(ts) = app.last_ctrl_c_copy.take() {
+                    if ts.elapsed() < Duration::from_millis(500) {
+                        crate::tuix_trace!("KEY", "ctrl+c keyboard echo suppressed (OS signal already handled copy)");
+                        return Ok(());
+                    }
+                }
+                if renderer.copy_selection() {
+                    return Ok(());
+                }
+                // No selection — fall through to Cancel below.
+            }
+
             // Ctrl+V: pull the system clipboard image and attach as
             // `[Image #N]` — independent of whether the host terminal
             // forwarded a Paste event for the keystroke. The status
@@ -3372,9 +4102,27 @@ fn handle_input(
                 if attach_image_to_input(app, ctx, renderer, img_hash)? {
                     return Ok(());
                 }
-                // No image on the clipboard — Ctrl+V has no other
-                // binding (key_action::classify maps it to NoOp), so
-                // swallow silently rather than insert a literal `v`.
+                // No image — fall back to clipboard text. Reaching this
+                // branch means the host terminal forwarded Ctrl+V as a
+                // real `\x16` key event rather than intercepting it as
+                // bracketed paste or character injection (classic
+                // conhost / older Windows Terminal configs / WT after
+                // the user removed the `paste` keybind per our Windows
+                // docs all hit this path). Without this fallback the
+                // keystroke is silently swallowed and the user's text
+                // paste disappears — a regression from before the
+                // Ctrl+V → image handler existed.
+                //
+                // Routing through `InputEvent::Paste` instead of
+                // `app.buf.insert_paste` directly so we get the modal-
+                // first dispatch, the image-from-path check, and the
+                // Streaming-vs-Idle redraw branching for free.
+                if let Some(text) = try_paste_clipboard_text() {
+                    return handle_input(app, ctx, renderer, InputEvent::Paste(text));
+                }
+                // Empty clipboard — Ctrl+V has no other binding
+                // (key_action::classify maps it to NoOp), so swallow
+                // silently rather than insert a literal `v`.
                 return Ok(());
             }
 
@@ -3541,7 +4289,8 @@ fn build_menu_items(
         let mut items: Vec<(String, String)> = Vec::new();
         if let Some(reg) = skill_registry {
             if let Ok(reg) = reg.read() {
-                for skill in reg.user_invocable() {
+                let skills: Vec<_> = reg.user_invocable().collect();
+                for skill in &skills {
                     // Match against either the bare suffix (`adapter-check…`)
                     // or the full qualified name (`ascend-model-agent-plugin:
                     // adapter-check…`). Bare match keeps the shorthand UX;
@@ -3556,11 +4305,21 @@ fn build_menu_items(
                     if bare_lower.starts_with(&prefix_lower)
                         || full_lower.starts_with(&prefix_lower)
                     {
-                        // Display the qualified name so users see which
-                        // plugin a skill belongs to. Suffix-fallback in
-                        // SkillRegistry::get still resolves the bare form
-                        // when invoked.
-                        items.push((skill.name.clone(), skill.description.clone()));
+                        let bare_is_unique = skills.iter().all(|other| {
+                            other.name == skill.name
+                                || other
+                                    .name
+                                    .split_once(':')
+                                    .map(|(_, s)| s)
+                                    .unwrap_or(other.name.as_str())
+                                    != bare
+                        });
+                        let display = if bare_is_unique {
+                            bare.to_string()
+                        } else {
+                            skill.name.clone()
+                        };
+                        items.push((display, skill.description.clone()));
                     }
                 }
             }
@@ -3805,16 +4564,24 @@ fn handle_idle_key(
                 app.buf.text.clear();
                 app.buf.cursor = 0;
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
-                    execute_slash_command(
-                        cmd,
-                        arg,
-                        &mut app.state,
-                        ctx,
-                        renderer,
-                        &mut app.active_modal,
-                        &mut app.fixissue_pending,
-                        &mut app.fixissue_buffer,
-                    )?;
+                    if cmd.eq_ignore_ascii_case("paste") {
+                        // `/paste` needs `&mut app.buf` to insert the
+                        // `[Image #N]` marker at the cursor, which the
+                        // `execute_slash_command` signature doesn't
+                        // expose; short-circuit to the local handler.
+                        handle_paste_command(app, ctx, renderer)?;
+                    } else {
+                        execute_slash_command(
+                            cmd,
+                            arg,
+                            &mut app.state,
+                            ctx,
+                            renderer,
+                            &mut app.active_modal,
+                            &mut app.fixissue_pending,
+                            &mut app.fixissue_buffer,
+                        )?;
+                    }
                     if matches!(app.state.phase, UiPhase::Idle) {
                         redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                     }
@@ -3833,11 +4600,10 @@ fn handle_idle_key(
         }
     }
 
-    // Tab on an empty buffer toggles Plan/Build mode instead of
-    // attempting slash-command completion (which has nothing to
-    // complete). When the buffer has text the normal tab-complete
-    // path runs as usual.
-    if code == KeyCode::Tab && app.buf.text.is_empty() {
+    // Tab toggles Plan/Build mode when no completion menu is visible —
+    // there is nothing to complete, so the key is repurposed for mode
+    // switching instead.
+    if code == KeyCode::Tab && menu_items.is_none() {
         app.state.agent_mode = app.state.agent_mode.toggle();
         let is_plan = matches!(app.state.agent_mode, crate::state::AgentMode::Plan);
         ctx.agent
@@ -3899,6 +4665,26 @@ fn handle_idle_key(
         // (the `v` char will be inserted as a regular character via classify).
     }
 
+    // Multi-line cursor nav (idle path). Mirror of the streaming-mode
+    // handler: in a buffer with embedded newlines, plain Up/Down walks
+    // through the lines first; only when the cursor is already on the
+    // first/last line does it surface as HistoryPrev/Next. Gated to
+    // "no modifiers" so Shift+Up (body scroll) and other compound keys
+    // still classify normally.
+    if modifiers.is_empty() {
+        match code {
+            KeyCode::Up if app.buf.cursor_line_up() => {
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            KeyCode::Down if app.buf.cursor_line_down() => {
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     let action = classify(code, modifiers);
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
@@ -3952,7 +4738,14 @@ fn handle_idle_key(
             renderer.render(UiLine::ClearTransient);
             app.buf.text.clear();
             app.buf.cursor = 0;
-            app.buf.clear_pastes();
+            // NB: `app.buf.clear_pastes()` is deferred until AFTER the
+            // submit path calls `expand_pastes(&line)` — wiping the
+            // paste Vec here used to leave `expand_pastes` with
+            // nothing to substitute, so the agent received the raw
+            // `[Pasted #N +M lines]` placeholder instead of the
+            // pasted body and answered "I don't see any pasted
+            // content". Mirrors the queue branch below which already
+            // clears AFTER expansion.
             app.menu.selected = 0;
             // Only treat `/name …` as a slash command when `name` is
             // actually registered. Unrecognised `/foo …` (e.g. the user
@@ -3974,19 +4767,39 @@ fn handle_idle_key(
                 // Slash commands carry no image markers — echo the
                 // user line as-typed, before dispatch.
                 renderer.render(UiLine::User(line.clone()));
-                execute_slash_command(
-                    cmd,
-                    arg,
-                    &mut app.state,
-                    ctx,
-                    renderer,
-                    &mut app.active_modal,
-                    &mut app.fixissue_pending,
-                    &mut app.fixissue_buffer,
-                )?;
+                if cmd.eq_ignore_ascii_case("paste") {
+                    // See `handle_paste_command` — short-circuited
+                    // here because the dispatcher signature can't
+                    // hand it `&mut app.buf`.
+                    handle_paste_command(app, ctx, renderer)?;
+                } else {
+                    execute_slash_command(
+                        cmd,
+                        arg,
+                        &mut app.state,
+                        ctx,
+                        renderer,
+                        &mut app.active_modal,
+                        &mut app.fixissue_pending,
+                        &mut app.fixissue_buffer,
+                    )?;
+                }
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
+                } else if matches!(app.state.phase, UiPhase::Approval) {
+                    // After /bg <N> resume into an approval-waiting session,
+                    // redraw the footer with an empty input box. Don't use
+                    // draw_spinner_now because spinner_label was cleared by
+                    // on_turn_complete() — it would show "◓ …" which is
+                    // misleading. The next agent event (ApprovalNeeded /
+                    // TurnComplete) will update the footer naturally.
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                 }
+                // Slash commands don't consume pastes (they take a
+                // single short arg, not a pasted body), but the submit
+                // semantically consumes the buffer — drop them so the
+                // next message starts with a clean paste registry.
+                app.buf.clear_pastes();
             } else {
                 // Hydrate recalled attachments BEFORE echoing the user
                 // line, so `[Image #N]` markers in the visible body
@@ -4004,6 +4817,12 @@ fn handle_idle_key(
                 }
                 renderer.render(UiLine::User(line.clone()));
                 let expanded = app.buf.expand_pastes(&line);
+                // Pastes have now been substituted into `expanded`;
+                // safe to drop the registry. Doing it any earlier
+                // (e.g. up at the buf.text.clear() prep) was the
+                // exact bug that made the agent see only the
+                // `[Pasted #N]` placeholder.
+                app.buf.clear_pastes();
                 // Cache the full expanded form before dispatch. If the
                 // user hits Ctrl+C / Esc mid-stream, `handle_streaming_key`
                 // takes this Option and restores it to `app.buf.text`
@@ -4184,6 +5003,25 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
     ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none()
 }
 
+/// True iff startup should show the one-shot `/setup` hint in scrollback.
+/// Returns `true` when either:
+///   - `setup-state.json` doesn't exist (never ran `/setup`), OR
+///   - the recommender skill directory is missing (user deleted it after setup).
+fn should_auto_show_setup(ctx: &LoopCtx) -> bool {
+    let state = atomcode_core::setup::state::load_setup_state(&ctx.working_dir);
+    if state.is_none() {
+        return true; // never ran setup → show hint
+    }
+
+    // setup-state.json exists but the skill may have been deleted manually.
+    // Path must match SkillRegistry::reload's scan path: the unified
+    // Config::config_dir() (== ATOMCODE_HOME when set, else ~/.atomcode).
+    let skill_dir = atomcode_core::config::Config::config_dir()
+        .join("skills")
+        .join("atomcode-automation-recommender");
+    !skill_dir.exists()
+}
+
 /// Extract current + latest version from the `ALREADY_LATEST` error
 /// body. The shape is fixed by `self_update.rs`:
 ///   `already on {current} (latest is {latest}). Pass --force to reinstall.`
@@ -4202,8 +5040,8 @@ mod parse_already_latest_versions_tests {
     use super::parse_already_latest_versions;
     #[test]
     fn extracts_both_versions() {
-        let s = "already on v4.22.0 (latest is v4.22.0). Pass --force to reinstall.";
-        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.0", "v4.22.0")));
+        let s = "already on v4.22.2 (latest is v4.22.2). Pass --force to reinstall.";
+        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.2", "v4.22.2")));
     }
     #[test]
     fn rejects_unrelated_strings() {
@@ -4269,6 +5107,7 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     let path = Config::default_path();
     match ctx.config.save(&path) {
         Ok(()) => {
+            ctx.runtime_factory.set_config(ctx.config.clone());
             let _ = ctx
                 .agent
                 .cmd_tx
@@ -4413,6 +5252,42 @@ fn handle_streaming_key(
         }
     }
 
+    // Multi-line cursor nav: in a buffer with embedded newlines, plain
+    // Up/Down should walk through the lines first; only when the
+    // cursor is already on the first/last line does it surface as
+    // HistoryPrev/Next. Matches the convention from fish / Cursor /
+    // Claude Code — losing a multi-line draft to "I was just trying
+    // to fix line 2" is far worse than the historical single-line
+    // shortcut.  Gated to "no modifiers" so Shift+Up (selection in
+    // some terminals) and other compound keys still classify normally.
+    if modifiers.is_empty() {
+        match code {
+            KeyCode::Up if app.buf.cursor_line_up() => {
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
+                return Ok(());
+            }
+            KeyCode::Down if app.buf.cursor_line_down() => {
+                draw_spinner_now(
+                    &mut app.state,
+                    &app.buf,
+                    ctx,
+                    renderer,
+                    app.message_queue.len(),
+                    app.menu.selected,
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     let action = classify(code, modifiers);
     let apply_result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
@@ -4443,6 +5318,29 @@ fn handle_streaming_key(
             // leave the buf alone. Gate strictly on *registered*
             // commands; unrecognised `/foo …` falls through to the
             // type-ahead queue as a regular message.
+            let bg_background_current = parse_slash_line(&line)
+                .map(|(cmd, arg)| cmd.eq_ignore_ascii_case("bg") && arg.trim().is_empty())
+                .unwrap_or(false);
+            if bg_background_current {
+                commands::execute_slash_command(
+                    "bg",
+                    "",
+                    &mut app.state,
+                    ctx,
+                    renderer,
+                    &mut app.active_modal,
+                    &mut app.fixissue_pending,
+                    &mut app.fixissue_buffer,
+                )?;
+                app.message_queue.clear();
+                app.pending_tools.clear();
+                app.think.reset();
+                app.reasoning_buffer.clear();
+                app.buf.text.clear();
+                app.buf.cursor = 0;
+                app.menu.selected = 0;
+                return Ok(());
+            }
             let is_known_slash = parse_slash_line(&line)
                 .map(|(cmd, _)| ctx.commands.find(cmd).is_some())
                 .unwrap_or(false);
@@ -4761,6 +5659,7 @@ fn handle_agent_event(
     fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
     fixissue_buffer: &mut String,
     reasoning_buffer: &mut String,
+    buf: &Buffer,
 ) {
     match ev {
         AgentEvent::TextDelta(text) => {
@@ -4804,8 +5703,13 @@ fn handle_agent_event(
             // line. Still record into `pending_tools` so the matching
             // ToolCallResult knows the display name + detail and skips
             // its own ▸ render too.
+            // Preserve any existing entry (from ToolBatchStarted) which
+            // carries the disambiguated detail — don't overwrite with
+            // the raw basename (issue #439).
             if state.call_id_to_batch.contains_key(&id) {
-                pending_tools.insert(id, (display.clone(), detail, true));
+                pending_tools
+                    .entry(id)
+                    .or_insert((display.clone(), detail, true));
                 state.on_tool_call_started(&display);
                 return;
             }
@@ -5010,12 +5914,28 @@ fn handle_agent_event(
             let _ = name;
         }
         AgentEvent::ApprovalNeeded {
-            tool_name, call, ..
+            tool_name, call, messages, ..
         } => {
+            // Persist mid-turn messages to session so /bg can recover
+            // the conversation even when the turn hasn't finished yet.
+            if !messages.is_empty() {
+                apply_session_messages(&mut ctx.current_session, messages);
+                ctx.bg_manager
+                    .set_foreground_session(ctx.current_session.clone());
+            }
+
             // Emit the `▸ Tool(detail)` row BEFORE the approval prompt
             // so the user sees what they're approving.
             let display = display_tool_name(&tool_name);
-            let detail = format_tool_detail(&tool_name, &call.arguments);
+            // Prefer the disambiguated detail from `pending_tools` (populated
+            // by ToolBatchStarted for parallel batches) over the raw basename
+            // from format_tool_detail. Without this, parallel batch approvals
+            // show "ReadFile(SKILL.md)" for every call, making it impossible
+            // to tell which file is being approved (issue #439).
+            let detail = pending_tools
+                .get(&call.id)
+                .map(|(_, det, _)| det.clone())
+                .unwrap_or_else(|| format_tool_detail(&tool_name, &call.arguments));
 
             // Check if ToolCallStarted already rendered this tool call as a
             // dynamic ToolCallInFlight spinner. If so, we need to freeze it
@@ -5061,7 +5981,21 @@ fn handle_agent_event(
                     },
                 ),
             );
-            state.on_approval_needed(&tool_name);
+            // `display` is the already-PascalCased name (e.g. "Bash",
+            // "ReadFile"); on_approval_needed stashes the current
+            // "Running X" label so on_approval_resolved can restore it.
+            state.on_approval_needed(&display);
+            // Redraw the footer (input box) so the user can type
+            // Y/A/N in response. Without this, a prior
+            // on_approval_resolved() transition to Streaming may
+            // have left the footer stale — especially when
+            // TurnRunner dispatches the second approval before any
+            // spinner tick fires (issue #455: "待审批输入 Y 后，
+            // 输入框没了"). Use redraw_idle_plain instead of
+            // draw_spinner_now because the spinner label may be
+            // stale/misleading in the approval phase (mirrors the
+            // /bg resume path).
+            redraw_idle_plain(buf, state, ctx, renderer);
         }
         AgentEvent::PhaseChange(AgentPhase::Thinking) => state.on_thinking(),
         AgentEvent::PhaseChange(AgentPhase::CallingTool(name)) => {
@@ -5119,7 +6053,7 @@ fn handle_agent_event(
 
             // Persist session after every completed turn so /resume can
             // find it after a clean exit — the whole point of sessions.
-            persist_current_session(ctx, messages);
+            persist_current_session(ctx, messages, renderer);
 
             // CodingPlan usage refresh — fire after each completed turn
             // (with cooldown) so the right-aligned hint reflects the
@@ -5153,7 +6087,7 @@ fn handle_agent_event(
                 } else {
                     match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &body) {
                         Ok(()) => renderer.render(UiLine::CommandOutput(format!(
-                            "  [fixissue] ✔ posted summary + applied 'fixed' label to issue #{}\n",
+                            "  [fixissue] ✓ posted summary + applied 'fixed' label to issue #{}\n",
                             issue_ref.number
                         ))),
                         Err(e) => renderer.render(UiLine::CommandOutput(format!(
@@ -5211,10 +6145,10 @@ fn handle_agent_event(
             think.reset();
             // Save what we did have — a user who Ctrl+C'd mid-stream
             // should still be able to /resume the cleaned conversation.
-            persist_current_session(ctx, messages);
+            persist_current_session(ctx, messages, renderer);
         }
-        AgentEvent::Error(e) => {
-            renderer.render(UiLine::Error(e));
+        AgentEvent::Error { error, messages } => {
+            renderer.render(UiLine::Error(error));
             renderer.flush();
             fixissue_pending.take();
             fixissue_buffer.clear();
@@ -5222,6 +6156,14 @@ fn handle_agent_event(
             // Same reset rationale as TurnComplete / TurnCancelled — an
             // aborted turn is another way to leave `<think>` half-open.
             think.reset();
+            // Persist on Error too — without this, a first-turn LLM
+            // failure (auth, rate limit, gateway 5xx, our own 5-min
+            // total-request timeout, etc.) silently drops the user's
+            // typed message from disk so the next `/resume` shows
+            // nothing for that conversation. Empty `messages` from
+            // the streaming-error forwarder is treated as a no-op
+            // by persist_current_session.
+            persist_current_session(ctx, messages, renderer);
         }
         AgentEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn
@@ -5290,6 +6232,7 @@ fn handle_agent_event(
             // restarts the session.
             if ctx.working_dir != new_dir {
                 ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, new_dir.clone()));
+                ctx.runtime_factory.set_working_dir(new_dir.clone());
                 commands::push_recent_dir(&mut ctx.recent_dirs, new_dir);
             }
         }
@@ -5394,15 +6337,29 @@ fn handle_agent_event(
             // form (Read not ReadFile); detail is wrapped in parens
             // (Tool(arg) reads as a function call, mirroring CC).
             let header_text = format!("{} {}", head_glyph, label);
+            // Build child rows with disambiguation: when multiple calls
+            // produce the same detail (e.g. 3 × Read(SKILL.md) from
+            // different directories), show enough parent path to tell
+            // them apart (issue #437).
+            let raw_details: Vec<String> = calls
+                .iter()
+                .map(|c| format_tool_detail(&c.name, &c.arguments))
+                .collect();
+            let disambiguated = disambiguate_batch_details(
+                &calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                &calls.iter().map(|c| c.arguments.as_str()).collect::<Vec<_>>(),
+                &raw_details,
+            );
             let children: Vec<crate::render::ToolGroupChild> = calls
                 .iter()
-                .map(|c| crate::render::ToolGroupChild {
+                .zip(disambiguated.iter())
+                .map(|(c, detail)| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
                     text: format!(
                         "  {} {}({})",
                         child_glyph,
                         display_tool_name_short(&c.name),
-                        format_tool_detail(&c.name, &c.arguments)
+                        detail
                     ),
                 })
                 .collect();
@@ -5419,6 +6376,18 @@ fn handle_agent_event(
                 state
                     .call_id_to_batch
                     .insert(cid.clone(), batch_id.clone());
+            }
+            // Pre-populate `pending_tools` with the disambiguated detail
+            // so that subsequent ToolCallStarted / ApprovalNeeded events
+            // use the disambiguated path (e.g. "a/SKILL.md") instead of
+            // the raw basename ("SKILL.md"). Without this, parallel batch
+            // approvals show identical "ReadFile(SKILL.md)" prompts and
+            // the user can't tell which file they're approving (issue #439).
+            for (c, detail) in calls.iter().zip(disambiguated.iter()) {
+                pending_tools.insert(
+                    c.id.clone(),
+                    (display_tool_name_short(&c.name), detail.clone(), true),
+                );
             }
             state.active_tool_batches.insert(
                 batch_id.clone(),
@@ -5557,6 +6526,16 @@ fn handle_agent_event(
             }
             renderer.flush();
         }
+        AgentEvent::MessagesSync { messages } => {
+            // Response to AgentCommand::SyncMessages. Persist the
+            // snapshot to the current session so /bg can recover
+            // the conversation state.
+            if !messages.is_empty() {
+                apply_session_messages(&mut ctx.current_session, messages);
+                ctx.bg_manager
+                    .set_foreground_session(ctx.current_session.clone());
+            }
+        }
     }
 }
 
@@ -5568,12 +6547,37 @@ fn handle_agent_event(
 fn persist_current_session(
     ctx: &mut LoopCtx,
     messages: Vec<atomcode_core::conversation::message::Message>,
+    renderer: &mut dyn Renderer,
 ) {
     if messages.is_empty() {
         return;
     }
-    ctx.current_session.messages = messages;
-    ctx.current_session.touch();
+    apply_session_messages(&mut ctx.current_session, messages);
+    ctx.bg_manager
+        .set_foreground_session(ctx.current_session.clone());
+    // Surface save failures instead of silently swallowing them.
+    // Previously this was `let _ = session_manager.save(...)`, which
+    // hid disk-full / permission / read-only / invalid-path errors —
+    // users would `/resume` on the next launch, see nothing, and
+    // assume "the session was lost" with no idea anything went wrong.
+    if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
+        renderer.render(UiLine::Error(
+            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed { error: &e.to_string() })
+                .into_owned(),
+        ));
+        renderer.flush();
+    }
+}
+
+pub(crate) fn apply_session_messages(
+    session: &mut atomcode_core::session::Session,
+    messages: Vec<atomcode_core::conversation::message::Message>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    session.messages = messages;
+    session.touch();
     // Triggers for renaming:
     //   * `default` / `session-<ts>` — never renamed yet
     //   * leading `[` — previous rename grabbed a synthetic system-meta
@@ -5582,13 +6586,12 @@ fn persist_current_session(
     //     Role::User message for plumbing reasons. Re-derive from the
     //     next non-synthetic user turn so the /resume picker stops
     //     showing those as session titles.
-    let should_rename = ctx.current_session.name == "default"
-        || ctx.current_session.name.starts_with("session-")
-        || ctx.current_session.name.trim_start().starts_with('[');
+    let should_rename = session.name == "default"
+        || session.name.starts_with("session-")
+        || session.name.trim_start().starts_with('[');
     if should_rename {
         use atomcode_core::conversation::message::Role;
-        let first_real_user = ctx
-            .current_session
+        let first_real_user = session
             .messages
             .iter()
             .filter(|m| matches!(m.role, Role::User))
@@ -5596,14 +6599,13 @@ fn persist_current_session(
         if let Some(text) = first_real_user {
             let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
             if !name.is_empty() {
-                ctx.current_session.name = name;
+                session.name = name;
             }
         }
         // Else: leave the existing default/session-<ts>/[...]-marker
         // name. Better to keep a generic placeholder than to commit to
         // a synthetic injection as the title.
     }
-    let _ = ctx.session_manager.save(&ctx.current_session);
 }
 
 /// True when `text` looks like a synthetic user-channel injection
@@ -5618,7 +6620,37 @@ fn is_synthetic_user_text(text: &str) -> bool {
 
 #[cfg(test)]
 mod session_naming_tests {
-    use super::is_synthetic_user_text;
+    use super::{apply_session_messages, is_synthetic_user_text};
+
+    #[test]
+    fn apply_session_messages_renames_from_first_real_user() {
+        use atomcode_core::conversation::message::{Message, Role};
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        let messages = vec![
+            Message::new(Role::User, "[System meta · not a user message]\nread this"),
+            Message::new(Role::User, "implement background sessions\nwith tests"),
+        ];
+
+        apply_session_messages(&mut session, messages);
+
+        assert_eq!(session.name, "implement background sessions");
+        assert_eq!(session.messages.len(), 2);
+    }
+
+    #[test]
+    fn apply_session_messages_preserves_custom_name() {
+        use atomcode_core::conversation::message::{Message, Role};
+        let mut session = atomcode_core::session::Session::default_session(
+            std::path::PathBuf::from("/tmp/project"),
+        );
+        session.name = "manual name".to_string();
+
+        apply_session_messages(&mut session, vec![Message::new(Role::User, "new task")]);
+
+        assert_eq!(session.name, "manual name");
+    }
 
     #[test]
     fn synthetic_system_meta_is_detected() {
@@ -5711,8 +6743,19 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         // just attach a dup. A NEW image (different fingerprint) appears
         // here as a fresh hint so the user can attach it too.
         let _ = h;
+        // Windows Terminal / conhost swallow Ctrl+V (they bind it to
+        // their own `paste` action that only forwards CF_UNICODETEXT,
+        // so an image-only clipboard never reaches the in-app
+        // handler). Surface the `/paste` fallback on Windows; macOS /
+        // Linux terminals pass Ctrl+V through cleanly, so they keep
+        // the snappier keybind hint.
+        let hint_msg = if cfg!(target_os = "windows") {
+            crate::i18n::Msg::StatusClipboardImageHintSlash
+        } else {
+            crate::i18n::Msg::StatusClipboardImageHint
+        };
         Some((
-            crate::i18n::t(crate::i18n::Msg::StatusClipboardImageHint).into_owned(),
+            crate::i18n::t(hint_msg).into_owned(),
             crate::render::HintSeverity::Info,
         ))
     } else {
@@ -5755,6 +6798,20 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         Some(snap) => (snap.sent_tokens, snap.ctx_window),
         None => (0, 0),
     };
+    // Session-name badge: surfaced only when the user has explicitly
+    // renamed the conversation. Auto-named sessions (default /
+    // session-* / first-message-derived) intentionally stay badge-less
+    // so the chrome stays quiet on fresh conversations.
+    let session_name = if ctx.current_session.user_renamed {
+        let name = ctx.current_session.name.trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    } else {
+        None
+    };
     crate::render::StatusLine {
         model,
         cwd,
@@ -5762,6 +6819,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         ctx_window,
         hint,
         mode_indicator,
+        session_name,
     }
 }
 
@@ -5874,6 +6932,9 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
 
     match name {
         "read_file" | "edit_file" | "write_file" | "create_file" | "list_symbols" => {
+            // Single-call path: basename only (compact). Batch disambiguation
+            // is handled by `disambiguate_batch_details` which runs after
+            // all child details are computed and can compare them.
             get_str("file_path")
                 .map(|p| basename(&p))
                 .unwrap_or_default()
@@ -5911,19 +6972,38 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             get_str("symbol").unwrap_or_default()
         }
         "blast_radius" | "file_dependencies" => {
+            // Same as above: basename for single-call; batch disambiguation
+            // handled by `disambiguate_batch_details`.
             get_str("file").map(|p| basename(&p)).unwrap_or_default()
         }
         "search_replace" => {
-            let file = get_str("file_path").or_else(|| get_str("file"));
-            let pat = get_str("pattern").or_else(|| get_str("old"));
-            match (file, pat) {
-                (Some(f), Some(p)) => format!(
-                    "{}: {}",
-                    basename(&f),
-                    crate::width::truncate_with_ellipsis(&p, 60)
-                ),
-                (Some(f), None) => basename(&f),
-                (None, Some(p)) => crate::width::truncate_with_ellipsis(&p, 100),
+            // SearchReplaceArgs uses search/replace/glob/path (not
+            // file_path/file/pattern/old). Show "search → replace" so
+            // the approval prompt tells the user WHAT will be replaced.
+            let search = get_str("search");
+            let replace = get_str("replace");
+            let glob = get_str("glob");
+            let path = get_str("path");
+            match (&search, &replace) {
+                (Some(s), Some(r)) => {
+                    let arrow = format!(
+                        "{} → {}",
+                        crate::width::truncate_with_ellipsis(s, 60),
+                        crate::width::truncate_with_ellipsis(r, 60)
+                    );
+                    let mut parts = vec![arrow];
+                    if let Some(g) = &glob {
+                        parts.push(format!("glob: {}", g));
+                    }
+                    if let Some(p) = &path {
+                        if p != "." {
+                            parts.push(format!("path: {}", basename(p)));
+                        }
+                    }
+                    parts.join(", ")
+                }
+                (None, Some(r)) => crate::width::truncate_with_ellipsis(r, 100),
+                (Some(s), None) => crate::width::truncate_with_ellipsis(s, 100),
                 _ => String::new(),
             }
         }
@@ -5948,6 +7028,149 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
             String::new()
         }
     }
+}
+
+/// Disambiguate parallel-batch child details when multiple calls produce
+/// the same short display (e.g. 3 × `Read(SKILL.md)` from different dirs).
+///
+/// For each child whose `raw_detail` duplicates another, walks up the
+/// path from basename toward the root until all duplicates are unique.
+/// Non-duplicate entries are left unchanged.
+///
+/// Example:
+///   paths: [skills/a/SKILL.md, skills/b/SKILL.md, skills/c/SKILL.md]
+///   raw_details: [SKILL.md, SKILL.md, SKILL.md]
+///   → [a/SKILL.md, b/SKILL.md, c/SKILL.md]
+///
+/// If paths can't be extracted from arguments (non-file tools), falls
+/// back to appending `#2`, `#3` suffixes.
+fn disambiguate_batch_details(
+    names: &[&str],
+    args_jsons: &[&str],
+    raw_details: &[String],
+) -> Vec<String> {
+    // Fast path: no duplicates → return as-is.
+    let mut seen = std::collections::HashMap::<&str, usize>::new();
+    let mut has_dups = false;
+    for d in raw_details {
+        let count = seen.entry(d.as_str()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            has_dups = true;
+        }
+    }
+    if !has_dups {
+        return raw_details.to_vec();
+    }
+
+    // Extract full paths from args where possible.
+    let extract_path = |name: &str, args_json: &str| -> Option<String> {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
+            return None;
+        };
+        let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        match name {
+            "read_file" | "edit_file" | "write_file" | "create_file" | "list_symbols"
+            | "blast_radius" | "file_dependencies" => get_str("file_path").or_else(|| get_str("file")),
+            "search_replace" => get_str("file_path").or_else(|| get_str("file")),
+            "read_symbol" => get_str("file_path"),
+            _ => None,
+        }
+    };
+
+    let full_paths: Vec<Option<String>> = names
+        .iter()
+        .zip(args_jsons.iter())
+        .map(|(n, a)| extract_path(n, a))
+        .collect();
+
+    // For each group of duplicates, progressively add parent path
+    // components until unique within that group.
+    let mut result = raw_details.to_vec();
+
+    // Collect groups of indices that share the same raw_detail.
+    let mut groups: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, d) in raw_details.iter().enumerate() {
+        groups.entry(d.as_str()).or_default().push(i);
+    }
+
+    for (_detail, indices) in groups {
+        if indices.len() < 2 {
+            continue; // unique, no disambiguation needed
+        }
+
+        // Check if we have full paths for all in this group.
+        let all_have_paths = indices.iter().all(|&i| full_paths[i].is_some());
+
+        if all_have_paths {
+            // Strategy: progressively add parent path components until
+            // all entries are unique. Start with 1 parent component
+            // (e.g. `a/SKILL.md`), then 2 (`b/a/SKILL.md`), etc.
+            let paths: Vec<&str> = indices.iter().map(|&i| full_paths[i].as_deref().unwrap()).collect();
+            let mut depth = 1usize;
+            let max_depth = paths.iter().map(|p| p.matches('/').count()).max().unwrap_or(0);
+
+            loop {
+                let candidates: Vec<String> = paths
+                    .iter()
+                    .map(|p| tail_path(p, depth))
+                    .collect();
+
+                let all_unique = {
+                    let mut s = std::collections::HashSet::new();
+                    candidates.iter().all(|c| s.insert(c.as_str()))
+                };
+
+                if all_unique || depth >= max_depth {
+                    for (i, &idx) in indices.iter().enumerate() {
+                        result[idx] = crate::width::truncate_with_ellipsis(
+                            &candidates[i],
+                            100,
+                        );
+                    }
+                    break;
+                }
+                depth += 1;
+            }
+        } else {
+            // Fallback: append #2, #3, … suffixes to disambiguate.
+            for (seq, &idx) in indices.iter().enumerate() {
+                if seq > 0 {
+                    let suffixed = format!("{} #{}", raw_details[idx], seq + 1);
+                    result[idx] = crate::width::truncate_with_ellipsis(&suffixed, 100);
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Return the last `depth + 1` path components of `path`.
+/// E.g. tail_path("a/b/c/SKILL.md", 1) → "c/SKILL.md"
+///      tail_path("a/b/c/SKILL.md", 2) → "b/c/SKILL.md"
+///      tail_path("a/b/c/SKILL.md", 3) → "a/b/c/SKILL.md"
+fn tail_path(path: &str, depth: usize) -> String {
+    if depth == 0 {
+        return path.rsplit('/').next().unwrap_or(path).to_string();
+    }
+    // Walk backwards counting separators. To keep `depth + 1` components,
+    // we need to find the separator that is `depth + 1`-th from the end,
+    // then return everything after it.
+    // For depth=1 in "a/b/c/SKILL.md": we need "c/SKILL.md",
+    // so find the '/' between "b" and "c" (2nd from end), return after it.
+    let mut seen = 0;
+    for (i, ch) in path.char_indices().rev() {
+        if ch == '/' {
+            seen += 1;
+            if seen == depth + 1 {
+                return path[(i + ch.len_utf8())..].to_string();
+            }
+        }
+    }
+    // Fewer than `depth + 1` separators — return the whole path.
+    path.to_string()
 }
 
 /// Render an `elapsed_ms` value as `XmYs` (over 60 s) or `Ts` (under).

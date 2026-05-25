@@ -105,30 +105,18 @@ pub struct RollbackSummary {
 /// caller must surface a clean "unsupported platform" message rather
 /// than fall through to a 404 download.
 pub fn detect_target() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            Some("darwin-arm64")
-        } else if cfg!(target_arch = "x86_64") {
-            Some("darwin-x64")
-        } else {
-            None
-        }
-    } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "x86_64") {
-            Some("linux-x64")
-        } else {
-            None
-        }
-    } else if cfg!(target_os = "windows") {
-        if cfg!(target_arch = "x86_64") {
-            Some("windows-x64")
-        } else if cfg!(target_arch = "aarch64") {
-            Some("windows-arm64")
-        } else {
-            None
-        }
-    } else {
-        None
+    target_tag(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn target_tag(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("windows", "x86_64") => Some("windows-x64"),
+        ("windows", "aarch64") => Some("windows-arm64"),
+        _ => None,
     }
 }
 
@@ -281,19 +269,18 @@ async fn download_and_verify(
         ));
     }
 
-    // Prefer the manifest's size (authoritative) over Content-Length,
-    // which mirrors may gzip or mis-report. But if Content-Length is
-    // present and differs, that's a likely wrong-file red flag — bail.
-    let reported = resp.content_length();
-    if let Some(n) = reported {
-        if n != expected_size {
-            return Err(anyhow!(
-                "size mismatch: manifest says {} bytes, server says {} bytes — aborting",
-                expected_size,
-                n
-            ));
-        }
-    }
+    // Don't bail on Content-Length mismatches.  The Content-Length
+    // header may differ from the manifest's `size` for several reasons:
+    //   - CDN mirrors or reverse proxies may alter Content-Length.
+    //   - The manifest may be slightly out of sync with the server's
+    //     binary (e.g. during a rolling release).
+    //   - Redirects can surface a different Content-Length from an
+    //     intermediate hop.
+    // The real integrity checks happen after the download completes:
+    //   1. Total bytes written must match `expected_size` (below).
+    //   2. SHA256 must match `expected_sha256`.
+    // These two checks are sufficient; an early Content-Length gate
+    // causes false-negative aborts (see issue #380).
 
     let mut file = tokio::fs::File::create(dest)
         .await
@@ -1041,6 +1028,17 @@ mod tests {
     }
 
     #[test]
+    fn target_tag_matches_release_manifest_targets() {
+        assert_eq!(target_tag("macos", "aarch64"), Some("darwin-arm64"));
+        assert_eq!(target_tag("macos", "x86_64"), Some("darwin-x64"));
+        assert_eq!(target_tag("linux", "x86_64"), Some("linux-x64"));
+        assert_eq!(target_tag("linux", "aarch64"), Some("linux-arm64"));
+        assert_eq!(target_tag("windows", "x86_64"), Some("windows-x64"));
+        assert_eq!(target_tag("windows", "aarch64"), Some("windows-arm64"));
+        assert_eq!(target_tag("linux", "arm"), None);
+    }
+
+    #[test]
     fn backup_path_appends_bak() {
         let p = Path::new("/usr/local/bin/atomcode");
         assert_eq!(backup_path(p), PathBuf::from("/usr/local/bin/atomcode.bak"));
@@ -1311,6 +1309,239 @@ mod tests {
             p.ends_with("atomcode-v4.19.1-windows-x64.exe"),
             "got: {:?}",
             p
+        );
+    }
+
+    // ── download_and_verify integration tests (issue #380) ──────────
+
+    /// Helper: compute the SHA256 hex string for a byte slice.
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hex_encode(&hasher.finalize())
+    }
+
+    /// download_and_verify succeeds when the server omits Content-Length
+    /// (chunked transfer encoding).  In production, Content-Length may
+    /// differ from the manifest's `size` due to CDN/proxy rewrites,
+    /// manifest-server sync lag, or redirect hops — the old code
+    /// aborted immediately on such mismatches (issue #380).
+    ///
+    /// This test validates that when Content-Length is absent (chunked),
+    /// the function proceeds to download and relies on the post-download
+    /// size + SHA256 checks for integrity, which is the correct behavior
+    /// after the fix.
+    #[tokio::test]
+    async fn download_succeeds_without_content_length() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Simulate a CDN that uses chunked transfer (no Content-Length).
+        // This is what a gzip-compressed response looks like after
+        // reqwest transparently decompresses it.
+        let payload = vec![0xAB_u8; 100];
+        let expected_sha = sha256_hex(&payload);
+        let expected_size: u64 = payload.len() as u64;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // No explicit Content-Length → chunked transfer encoding.
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            &expected_sha,
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        // With the fix, this should succeed because the actual downloaded
+        // bytes match expected_size and expected_sha256.  The old code
+        // would also have succeeded here (Content-Length was absent), but
+        // the key point is that we no longer gate on Content-Length at all.
+        assert!(result.is_ok(), "download should succeed, got: {:?}", result);
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    }
+
+    /// download_and_verify still rejects a download whose actual byte
+    /// count doesn't match the manifest size (post-download size check).
+    #[tokio::test]
+    async fn download_rejects_wrong_actual_size() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Server sends 80 bytes, but manifest says 100.
+        let payload = vec![0xAB_u8; 80];
+        let expected_sha = sha256_hex(&payload);
+        let expected_size: u64 = 100; // mismatch!
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            &expected_sha,
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err(), "should fail on size mismatch");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("short download"),
+            "error should mention short download, got: {}",
+            err
+        );
+        // Temp file must be cleaned up on failure.
+        assert!(!dest.exists(), "partial download should be removed");
+    }
+
+    /// download_and_verify still rejects a download whose SHA256
+    /// doesn't match the manifest, even if the size is correct.
+    #[tokio::test]
+    async fn download_rejects_checksum_mismatch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let payload = vec![0xAB_u8; 100];
+        let wrong_sha = "0000000000000000000000000000000000000000000000000000000000000000";
+        let expected_size: u64 = payload.len() as u64;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            wrong_sha, // intentionally wrong
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err(), "should fail on checksum mismatch");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("checksum mismatch"),
+            "error should mention checksum mismatch, got: {}",
+            err
+        );
+        // Temp file must be cleaned up on failure.
+        assert!(!dest.exists(), "corrupted download should be removed");
+    }
+
+    /// download_and_verify succeeds when everything matches perfectly
+    /// (Content-Length present and correct, size + SHA256 match).
+    #[tokio::test]
+    async fn download_succeeds_when_all_checks_pass() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let payload = vec![0xCD_u8; 256];
+        let expected_sha = sha256_hex(&payload);
+        let expected_size: u64 = payload.len() as u64;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(payload.clone(), "application/octet-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            &expected_sha,
+            expected_size,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_ok(), "download should succeed, got: {:?}", result);
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    }
+
+    /// download_and_verify rejects non-2xx HTTP responses.
+    #[tokio::test]
+    async fn download_rejects_http_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/binary"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let result = download_and_verify(
+            &format!("{}/binary", server.uri()),
+            "unused",
+            100,
+            &dest,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP 404"),
+            "error should mention HTTP 404, got: {}",
+            err
         );
     }
 }

@@ -268,6 +268,32 @@ pub trait Renderer: Send {
     fn begin_selection(&mut self, _col: u16, _row: u16) {}
     fn update_selection(&mut self, _col: u16, _row: u16) {}
     fn end_selection(&mut self) {}
+
+    /// Copy the current mouse-selection text to the system clipboard
+    /// (using arboard, not OSC 52) and clear the selection highlight.
+    /// Returns `true` if a non-empty selection was copied.
+    ///
+    /// This is the Ctrl+C fallback for terminals (Windows Terminal,
+    /// conhost) that ignore OSC 52 — the user selects text with the
+    /// mouse, then presses Ctrl+C to copy it. AltScreenRenderer
+    /// implements this; other backends return `false` (they use the
+    /// host terminal's native selection).
+    fn copy_selection(&mut self) -> bool {
+        false
+    }
+
+    /// Update the cached welcome banner's model / working_dir fields in
+    /// place and trigger a repaint of the banner rows. Used after the
+    /// QR-onboarding `/codingplan` claim finishes: the banner was
+    /// painted at the top of scrollback with `model=""` (the claim
+    /// hadn't picked a default provider yet) — once the claim writes
+    /// `ctx.model_name`, this hook splices the resolved model into the
+    /// existing banner rows so the user doesn't see a permanently
+    /// blank model bullet.
+    ///
+    /// Default no-op: renderers without a retained body buffer can't
+    /// edit already-emitted rows in place.
+    fn refresh_welcome_banner(&mut self, _model: &str, _working_dir: &str) {}
 }
 
 /// Visual style for the menu popup. Drives whether the renderer prefixes
@@ -334,6 +360,12 @@ pub struct StatusLine {
     /// the eye — switching modes changes whether file edits and shell
     /// run, so the user wants this prominent.
     pub mode_indicator: Option<String>,
+    /// Current session display name, shown as a right-aligned cyan
+    /// pill overlaid on the input box's top rule. `Some` only after
+    /// the user has explicitly run `/rename` (Session::user_renamed) —
+    /// auto-named / default sessions leave this `None` to keep the
+    /// chrome quiet on fresh conversations.
+    pub session_name: Option<String>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

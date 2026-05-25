@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 mod telemetry_cmd;
 mod uninstall;
 
-use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop};
+use atomcode_core::agent::{AgentCommand, AgentEvent, AgentLoop, AgentRuntimeFactory};
 use atomcode_core::config::provider::{default_context_window_for, ProviderConfig};
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
@@ -35,6 +35,7 @@ use atomcode_core::tool::edit::EditFileTool;
 use atomcode_core::tool::glob::GlobTool;
 use atomcode_core::tool::grep::GrepTool;
 use atomcode_core::tool::list_dir::ListDirTool;
+use atomcode_core::tool::open_file::OpenFileTool;
 use atomcode_core::tool::read::ReadFileTool;
 use atomcode_core::tool::search_replace::SearchReplaceTool;
 use atomcode_core::tool::web_fetch::WebFetchTool;
@@ -95,6 +96,51 @@ fn truncate_log_line(s: &str, max_chars: usize) -> String {
         format!("{}...", head)
     } else {
         single_line
+    }
+}
+
+/// Append a streaming reasoning/thinking `chunk` to `out`, maintaining a
+/// single-line `[thinking] ...` representation across many tiny deltas.
+///
+/// `open` tracks whether a `[thinking]` line is currently open (i.e. has a
+/// prefix written but no trailing newline). The first chunk gets a fresh
+/// `[thinking] ` prefix; subsequent chunks append directly. Embedded newlines
+/// inside a chunk are preserved, with each non-empty new line getting its own
+/// `[thinking] ` prefix so multi-line thinking stays readable.
+///
+/// Pulled out of `run_headless` so it can be unit-tested without spinning up
+/// the agent loop. Regression target: the old per-chunk `eprintln!` produced
+/// "one word per line" output for streaming reasoning models.
+fn format_thinking_chunk(out: &mut String, open: &mut bool, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    if !*open {
+        out.push_str("[thinking] ");
+        *open = true;
+    }
+    let mut parts = chunk.split('\n');
+    if let Some(first) = parts.next() {
+        out.push_str(first);
+    }
+    for part in parts {
+        out.push('\n');
+        *open = false;
+        if !part.is_empty() {
+            out.push_str("[thinking] ");
+            out.push_str(part);
+            *open = true;
+        }
+    }
+}
+
+/// Close any in-flight `[thinking]` line by writing a newline if one is open.
+/// Mirrors the inline `close_thinking_line` used inside `run_headless`, but
+/// writes to a buffer so it can be unit-tested.
+fn close_thinking_chunk(out: &mut String, open: &mut bool) {
+    if *open {
+        out.push('\n');
+        *open = false;
     }
 }
 
@@ -317,7 +363,7 @@ async fn run_prepare_upgrade_worker() -> i32 {
 /// and exits. "Detached" means:
 ///   * New session on Unix (`setsid`) — parent's Ctrl+C goes to parent's
 ///     foreground process group only; the child is in its own and ignores it.
-///   * `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` on Windows, same idea.
+///   * `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows, same idea
 ///   * stdin/stdout/stderr → /dev/null so the child can't scribble over the
 ///     parent's terminal and has no reason to stay attached to it.
 ///
@@ -354,8 +400,8 @@ fn spawn_detached_upgrade_prep() {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     let _ = cmd.spawn();
@@ -487,7 +533,7 @@ enum Commands {
         action: TelemetryAction,
     },
     /// Manage skill/command plugins (mirrors `claude plugin ...`).
-    /// Operates on `~/.atomcode/plugins/` shared with the TUI's `/plugin`
+    /// Operates on `$ATOMCODE_HOME/plugins/` shared with the TUI's `/plugin`
     /// slash command — anything installed via either path is visible to both.
     #[command(subcommand)]
     Plugin(PluginCli),
@@ -508,6 +554,12 @@ enum Commands {
         /// Print the plan; do nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Install seed files (skills/commands/hooks/MCP) to `~/.atomcode/`.
+    Setup {
+        /// Take over a stale lock AND force reinstall even if seeds are already present.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -809,7 +861,12 @@ async fn run() -> Result<i32> {
                 // Fall through to TUI startup below
             }
             Commands::Codingplan => {
-                // Headless: run the codingplan setup flow and exit.
+                // Run the codingplan setup flow, then fall through to TUI
+                // startup regardless of outcome — mirrors `Commands::Login`.
+                // On success the freshly saved config.toml is picked up by
+                // `Config::load` further down. On failure the TUI opens in
+                // onboarding mode (no providers) so the user can retry via
+                // `/codingplan` or `/login` without re-launching the binary.
                 // Emits open_atomcode (mode=headless) then take_codingplan
                 // (emitted internally by run_codingplan_core via coding_plan::run).
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -822,28 +879,22 @@ async fn run() -> Result<i32> {
                     mode: Some(SessionMode::Headless),
                     ..CurrentContext::current()
                 };
-                let exit_code = CurrentContext::scope(scope_ctx, || async {
+                let outcome = CurrentContext::scope(scope_ctx, || async {
                     telemetry.track(Event::OpenAtomcode);
-                    let result = run_codingplan_core(Some(&telemetry));
-                    match result {
-                        Ok(report) => {
-                            print!("{}", report);
-                            telemetry
-                                .shutdown(std::time::Duration::from_millis(500))
-                                .await;
-                            Ok::<i32, anyhow::Error>(0)
-                        }
-                        Err(e) => {
-                            eprintln!("codingplan failed: {:#}", e);
-                            telemetry
-                                .shutdown(std::time::Duration::from_millis(500))
-                                .await;
-                            Ok(1)
-                        }
-                    }
+                    run_codingplan_core(Some(&telemetry))
                 })
-                .await?;
-                return Ok(exit_code);
+                .await;
+                match outcome {
+                    Ok(report) => {
+                        print!("{}", report);
+                    }
+                    Err(e) => {
+                        eprintln!("codingplan failed: {:#}", e);
+                    }
+                }
+                println!("\n  Starting AtomCode...\n");
+                HEADLESS_MODE.store(false, Ordering::Relaxed);
+                // Fall through to TUI startup below
             }
             Commands::Fixissue { url } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -926,6 +977,14 @@ async fn run() -> Result<i32> {
                 }
                 return Ok(0);
             }
+            Commands::Setup { force } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let exit_code = run_setup_command(force);
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return Ok(exit_code);
+            }
             other => {
                 let result = handle_command(other, &telemetry).await.map(|_| 0);
                 // Flush any events emitted by the subcommand (e.g. login_success)
@@ -959,6 +1018,8 @@ async fn run() -> Result<i32> {
                 subagent: Default::default(),
                 vision_preprocessor_provider: None,
                 language: None,
+                ui: Default::default(),
+            plugin: Default::default(),
             }
         })
     } else {
@@ -976,6 +1037,8 @@ async fn run() -> Result<i32> {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
+            plugin: Default::default(),
         }
     };
 
@@ -986,13 +1049,37 @@ async fn run() -> Result<i32> {
     );
     atomcode_tuix::i18n::set_locale(locale);
 
+    // ── Plugin marketplace bootstrap + post-upgrade refresh ──
+    //
+    // Two best-effort hooks fire here (after config load, before any
+    // network-bound LLM activity):
+    //
+    //   1. First-startup auto-install of the default skills
+    //      marketplace. One-shot, marker-file gated; respects later
+    //      `/plugin uninstall`. Config: `plugin.auto_install_default_skills`.
+    //   2. Post-self-upgrade `git pull` of every installed
+    //      marketplace. Gated on `ATOMCODE_UPGRADED_FROM` being set
+    //      (which `self_update::re_exec_self` does on success), so a
+    //      plain `cargo build` invocation never triggers it. Config:
+    //      `plugin.auto_update_marketplaces`.
+    //
+    // Both are non-blocking from a UX standpoint (worst case ~1-3 s
+    // of `git` subprocess time on a warm path; longer for the first
+    // clone). Failures are logged to stderr and swallowed — the user
+    // gets a usable atomcode either way.
+    atomcode_core::plugin::bootstrap::run_startup_hooks(&config);
+
     let unavailable_reason = if config.providers.is_empty() {
         Some(atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::CmdNoActiveProvider).into_owned())
     } else {
         None
     };
 
-    let (provider_config, model_name) = if unavailable_reason.is_some() {
+    /// Build the placeholder `ProviderConfig` used when no real provider is
+    /// available.  The TUI still boots — the Welcome wizard / status-row
+    /// hints nudge the user to `/login` or `/codingplan`, and a successful
+    /// auth flow rebuilds the real provider via `rebuild_provider`.
+    fn dummy_provider_config() -> (ProviderConfig, String) {
         (
             ProviderConfig {
                 provider_type: "openai".to_string(),
@@ -1013,6 +1100,10 @@ async fn run() -> Result<i32> {
             },
             String::new(),
         )
+    }
+
+    let (provider_config, model_name) = if unavailable_reason.is_some() {
+        dummy_provider_config()
     } else {
         if let Some(ref model) = cli.model {
             let provider_name = cli.provider.as_deref().unwrap_or(&config.default_provider);
@@ -1023,9 +1114,25 @@ async fn run() -> Result<i32> {
         // Keep api_key as None here so `create_provider()` auto-loads
         // from `~/.atomcode/auth.toml`. Setting "not-configured" would
         // bypass that path and force the user to manually provide a key.
-        let pc = config.active_provider(cli.provider.as_deref())?.clone();
-        let name = pc.model.clone();
-        (pc, name)
+        //
+        // `active_provider` already falls back to the first available
+        // provider when `default_provider` points to a deleted section,
+        // but as a defence-in-depth measure we catch any remaining
+        // errors and swap in the dummy so the TUI still boots.
+        match config.active_provider(cli.provider.as_deref()) {
+            Ok(pc) => {
+                let name = pc.model.clone();
+                (pc.clone(), name)
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not resolve active provider ({}). \
+                     Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                    e
+                );
+                dummy_provider_config()
+            }
+        }
     };
 
     // `create_provider` may need to load an OAuth token from
@@ -1146,6 +1253,9 @@ async fn run() -> Result<i32> {
     if enabled("search_replace") {
         tool_registry.register_sync(Box::new(SearchReplaceTool));
     }
+    if enabled("open_file") {
+        tool_registry.register_sync(Box::new(OpenFileTool));
+    }
 
     // Determine if we're running in headless mode BEFORE loading MCP.
     // Headless mode requires MCP tools immediately; TUI can load them in background.
@@ -1233,6 +1343,7 @@ async fn run() -> Result<i32> {
         conversation,
     );
     agent_loop.set_max_turns(cli.max_turns);
+    let runtime_factory = AgentRuntimeFactory::from_initial_loop(&agent_loop, cli.max_turns);
 
     // Resolve effective prompt: --prompt-file reads from disk; -p is inline;
     // `fixissue` synthesises one from the AtomGit issue body. fixissue takes
@@ -1323,7 +1434,7 @@ async fn run() -> Result<i32> {
                     if let Some(summary) = captured.filter(|s| !s.trim().is_empty()) {
                         match atomcode_core::atomgit::fixissue::post_completion(&issue_ref, &summary) {
                             Ok(()) => eprintln!(
-                                "[fixissue] ✔ posted summary + applied 'fixed' label to issue #{}",
+                                "[fixissue] ✓ posted summary + applied 'fixed' label to issue #{}",
                                 issue_ref.number
                             ),
                             Err(e) => eprintln!(
@@ -1361,7 +1472,7 @@ async fn run() -> Result<i32> {
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
             });
-            atomcode_tuix::run(config, model_name, agent_handle, tool_context, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
+            atomcode_tuix::run(config, model_name, agent_handle, runtime_factory, working_dir, session_to_continue, mcp_registry, mcp_connect_rx, lsp_connect_rx, telemetry.clone()).await?;
             Ok(0)
         };
 
@@ -1400,7 +1511,7 @@ async fn run_headless(
     let notifications = agent_loop.config.notifications.clone();
     let (cmd_tx, mut event_rx) = {
         let handle = agent_handle;
-        (handle.cmd_tx, handle.event_rx)
+        (handle.client.cmd_tx, handle.event_rx)
     };
 
     let ctx = atomcode_telemetry::CurrentContext::current();
@@ -1416,14 +1527,32 @@ async fn run_headless(
     let mut exit_code: i32 = 0;
     let mut had_denial = false;
     let mut last_text_ended_with_newline = true;
+    // Tracks whether we're inside a streaming `[thinking]` line. When true, the
+    // next non-reasoning event must close the line with a `\n` so subsequent
+    // log lines don't glue onto the tail of the thinking text.
+    let mut thinking_line_open = false;
     // When `capture` is set, we also buffer every TextDelta the agent
     // emits so the caller (e.g. the fixissue workflow) can post the
     // full assistant output back to AtomGit as an issue comment.
     let mut captured: Option<String> = if capture { Some(String::new()) } else { None };
 
+    // Helper: close any in-flight `[thinking]` line before emitting a new log
+    // line on stderr. Avoids `[thinking] ...[tool→ ...]` mashups in verbose.
+    // Thin wrapper over the unit-tested `close_thinking_chunk` that flushes
+    // directly to stderr.
+    fn close_thinking_line(open: &mut bool) {
+        let mut buf = String::new();
+        close_thinking_chunk(&mut buf, open);
+        if !buf.is_empty() {
+            eprint!("{}", buf);
+            let _ = io::stderr().flush();
+        }
+    }
+
     while let Some(event) = event_rx.recv().await {
         match event {
             AgentEvent::TextDelta(text) => {
+                close_thinking_line(&mut thinking_line_open);
                 if !text.is_empty() {
                     last_text_ended_with_newline = text.ends_with('\n');
                 }
@@ -1434,13 +1563,22 @@ async fn run_headless(
                 io::stdout().flush()?;
             }
             AgentEvent::ReasoningDelta(text) => {
-                // In CLI verbose mode, show reasoning/thinking content
-                if verbose {
-                    eprintln!("[thinking] {}", text);
+                // In CLI verbose mode, show reasoning/thinking content.
+                // Reasoning arrives as many tiny streaming chunks (often a
+                // single token). The old implementation used `eprintln!` per
+                // chunk, producing "one word per line" output. We now stream
+                // chunks onto a single `[thinking] ...` line via the
+                // unit-tested `format_thinking_chunk` helper.
+                if verbose && !text.is_empty() {
+                    let mut buf = String::new();
+                    format_thinking_chunk(&mut buf, &mut thinking_line_open, &text);
+                    eprint!("{}", buf);
+                    let _ = io::stderr().flush();
                 }
             }
             AgentEvent::ToolCallStreaming { name, hint } => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     let detail = if hint.is_empty() {
                         String::new()
                     } else {
@@ -1455,13 +1593,16 @@ async fn run_headless(
                 arguments,
             } => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     let args = truncate_log_line(&arguments, 200);
                     eprintln!("[tool→ {} args={}]", name, args);
                 }
             }
             AgentEvent::ToolOutputChunk { call_id: _, chunk } => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     eprint!("{}", chunk);
+                    let _ = io::stderr().flush();
                 }
             }
             AgentEvent::ToolCallResult {
@@ -1472,6 +1613,7 @@ async fn run_headless(
                 duration,
             } => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     let status = if success { "OK" } else { "FAILED" };
                     let dur_ms = duration.as_millis();
                     let trimmed = output.trim_end();
@@ -1486,6 +1628,7 @@ async fn run_headless(
             AgentEvent::ApprovalNeeded {
                 tool_name, reason, ..
             } => {
+                close_thinking_line(&mut thinking_line_open);
                 if tool_name == "bash" {
                     // -p / headless cannot prompt; user opts in by using non-interactive mode.
                     eprintln!("[headless] auto-approved bash: {}", reason);
@@ -1499,6 +1642,7 @@ async fn run_headless(
             }
             AgentEvent::TokenUsage(usage) => {
                 if verbose {
+                    close_thinking_line(&mut thinking_line_open);
                     eprintln!(
                         "[tokens] prompt={} completion={}",
                         usage.prompt_tokens, usage.completion_tokens
@@ -1516,6 +1660,7 @@ async fn run_headless(
                 stop_reason,
                 messages: _,
             } => {
+                close_thinking_line(&mut thinking_line_open);
                 atomcode_core::notify::notify_turn_finished(
                     &notifications,
                     atomcode_core::notify::TurnNotification {
@@ -1555,15 +1700,17 @@ async fn run_headless(
                 break;
             }
             AgentEvent::TurnCancelled { .. } => {
+                close_thinking_line(&mut thinking_line_open);
                 // Always shown — user needs to know cancellation happened.
                 eprintln!("[cancelled]");
                 exit_code = 130;
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
             }
-            AgentEvent::Error(e) => {
+            AgentEvent::Error { error, messages: _ } => {
+                close_thinking_line(&mut thinking_line_open);
                 // Always shown — errors are not noise.
-                eprintln!("[error] {}", e);
+                eprintln!("[error] {}", error);
                 exit_code = 1;
                 let _ = cmd_tx.send(AgentCommand::Shutdown);
                 break;
@@ -1673,6 +1820,9 @@ async fn run_headless(
             AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
                 eprintln!("[vl-preprocess ok provider={} chars={}]", vl_key, char_count);
             }
+            AgentEvent::MessagesSync { .. } => {
+                // Only used by TUI for /bg session persistence; ignore in CLI.
+            }
         }
     }
 
@@ -1682,6 +1832,34 @@ async fn run_headless(
     }
 
     Ok((exit_code, captured))
+}
+
+/// Drive `atomcode_core::setup::run` end-to-end and return the CLI exit code
+/// (0 on success, 1 on any setup error). `setup::run` is synchronous; we
+/// run it directly since `Commands::Setup` already runs outside the TUI loop.
+fn run_setup_command(force: bool) -> i32 {
+    use atomcode_core::setup;
+
+    let project_root = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("setup error: cannot read current directory: {e}");
+            return 1;
+        }
+    };
+    let mut opts = setup::RunOptions::new(project_root);
+    opts.force = force;
+
+    match setup::run(opts) {
+        Ok(report) => {
+            println!("{}", report.render_cli());
+            0
+        }
+        Err(e) => {
+            eprintln!("setup error: {e}");
+            1
+        }
+    }
 }
 
 /// Handle subcommands (login, logout, status)
@@ -1752,6 +1930,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")
+        }
+        Commands::Setup { .. } => {
+            unreachable!("Setup is handled inline in run() before handle_command")
         }
         Commands::Plugin(sub) => handle_plugin_cli(sub),
         Commands::Mcp(McpCli::Add {
@@ -1857,7 +2038,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
 
 /// Dispatch `atomcode plugin ...` subcommands. Each branch calls the same
 /// `atomcode_core::plugin::*` API the TUI's `/plugin` slash command uses, so
-/// CLI installs and TUI installs share state under `~/.atomcode/plugins/`.
+    /// CLI installs and TUI installs share state under `$ATOMCODE_HOME/plugins/`.
 fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
     use atomcode_core::plugin::{installer, marketplace};
     match sub {
@@ -2070,10 +2251,38 @@ fn run_codingplan_core(
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
+            plugin: Default::default(),
         },
     };
 
-    let report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+    // If the stored token is locally valid (file present, expires_in
+    // not yet past) but the server rejects it (revoked, refresh-token
+    // dead, etc.), the orchestrator sets `report.auth_expired = true`.
+    // Run OAuth *once* on that path — same flow `atomcode login` would
+    // use — then re-run setup against the fresh token. Without this
+    // the user sees the report ending in "claim failed — run `atomcode
+    // login` again" and has to do manually what `codingplan` could
+    // do itself.
+    let mut report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+    if report.auth_expired {
+        use atomcode_core::i18n::{t, Msg};
+        print!("{}", t(Msg::CpReauthAfter401));
+        match atomcode_core::auth::login(telemetry)
+            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+        {
+            Ok(_) => {
+                report = atomcode_core::coding_plan::run(&mut config, telemetry)?;
+            }
+            Err(e) => {
+                // Re-OAuth itself failed (user pressed Ctrl+C, network
+                // dead, etc.). Print the *original* report so users
+                // still see what triggered the retry, then bail.
+                println!("{}", report.render());
+                anyhow::bail!("re-authentication failed: {:#}", e);
+            }
+        }
+    }
 
     if report.should_persist_config() {
         if let Some(parent) = path.parent() {
@@ -2129,6 +2338,13 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
             message_head: scrubbed_msg,
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
+            error_kind: Some("panic".to_string()),
+            error_data: Some(serde_json::json!({
+                "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                "turns_completed": null,
+                "last_tool_name": null,
+                "last_event": null,
+            }).to_string()),
         });
         default_hook(info);
     }));
@@ -2136,7 +2352,9 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_working_dir, truncate_log_line};
+    use super::{
+        close_thinking_chunk, format_thinking_chunk, resolve_working_dir, truncate_log_line,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -2216,5 +2434,110 @@ mod tests {
             read_back, content,
             "--prompt-file must preserve trailing newline (unlike bash $(...))"
         );
+    }
+
+    // ---- format_thinking_chunk / close_thinking_chunk ----
+    //
+    // Regression suite for the "one word per line" bug in headless verbose
+    // output. The old `eprintln!("[thinking] {}", text)` printed a fresh
+    // prefix + trailing newline for every streaming chunk, so a streaming
+    // reasoning model produced output like:
+    //
+    //   [thinking] are
+    //   [thinking] already
+    //   [thinking] configured
+    //
+    // The new formatter must keep a single line open across many tiny
+    // chunks until something else (text, tool call, turn complete, etc.)
+    // explicitly closes it.
+
+    /// Streaming many single-token chunks must produce ONE line, not N.
+    #[test]
+    fn thinking_chunks_stream_onto_single_line() {
+        let mut buf = String::new();
+        let mut open = false;
+        for tok in ["are", " already", " configured", " and", " what"] {
+            format_thinking_chunk(&mut buf, &mut open, tok);
+        }
+        assert_eq!(buf, "[thinking] are already configured and what");
+        assert!(open, "line should remain open until something closes it");
+    }
+
+    /// A non-reasoning event must close the line with a single newline.
+    #[test]
+    fn close_appends_newline_and_clears_open() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "hello");
+        close_thinking_chunk(&mut buf, &mut open);
+        assert_eq!(buf, "[thinking] hello\n");
+        assert!(!open);
+        // Closing again is a no-op (idempotent).
+        close_thinking_chunk(&mut buf, &mut open);
+        assert_eq!(buf, "[thinking] hello\n");
+    }
+
+    /// Embedded newlines inside a chunk must produce a re-prefixed next line.
+    #[test]
+    fn embedded_newline_reprefixes_next_line() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "first line\nsecond line");
+        assert_eq!(buf, "[thinking] first line\n[thinking] second line");
+        assert!(open);
+    }
+
+    /// A chunk ending with `\n` closes the line; the next chunk must
+    /// re-introduce the `[thinking] ` prefix.
+    #[test]
+    fn trailing_newline_closes_and_next_chunk_reprefixes() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "para1\n");
+        assert!(!open, "trailing newline should close the line");
+        format_thinking_chunk(&mut buf, &mut open, "para2");
+        assert_eq!(buf, "[thinking] para1\n[thinking] para2");
+        assert!(open);
+    }
+
+    /// Empty chunks must be skipped without emitting a stray prefix.
+    #[test]
+    fn empty_chunk_is_noop() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "");
+        assert_eq!(buf, "");
+        assert!(!open);
+        // Still no prefix after empty input.
+        format_thinking_chunk(&mut buf, &mut open, "x");
+        assert_eq!(buf, "[thinking] x");
+    }
+
+    /// CJK content (common in Chinese reasoning models) must not break the
+    /// single-line invariant — every char-level chunk just appends.
+    #[test]
+    fn cjk_chunks_stream_correctly() {
+        let mut buf = String::new();
+        let mut open = false;
+        for tok in ["先", "看", "看", "你", "当前的", "环境"] {
+            format_thinking_chunk(&mut buf, &mut open, tok);
+        }
+        assert_eq!(buf, "[thinking] 先看看你当前的环境");
+    }
+
+    /// Simulated end-to-end event sequence: thinking deltas, then a tool
+    /// call. The tool call must appear on its OWN line, not mashed onto
+    /// the tail of the thinking text.
+    #[test]
+    fn thinking_followed_by_tool_call_is_separated() {
+        let mut buf = String::new();
+        let mut open = false;
+        format_thinking_chunk(&mut buf, &mut open, "I should");
+        format_thinking_chunk(&mut buf, &mut open, " check");
+        format_thinking_chunk(&mut buf, &mut open, " the file");
+        // Now a non-reasoning event arrives → close, then emit it.
+        close_thinking_chunk(&mut buf, &mut open);
+        buf.push_str("[tool→ read_file]\n");
+        assert_eq!(buf, "[thinking] I should check the file\n[tool→ read_file]\n");
     }
 }

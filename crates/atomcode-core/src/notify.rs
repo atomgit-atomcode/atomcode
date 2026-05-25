@@ -35,6 +35,7 @@ pub enum NotificationEvent<'a> {
 enum TerminalApp {
     Kitty,
     WezTerm,
+    Ghostty,
     ITerm2,
     AppleTerminal,
     WindowsTerminal,
@@ -207,7 +208,7 @@ fn build_turn_terminal_notification_text(
     turn: &TurnNotification<'_>,
 ) -> (Cow<'static, str>, String) {
     let (title, mut body) = build_system_notification_text(turn);
-    if matches!(app, TerminalApp::Kitty | TerminalApp::WezTerm) {
+    if matches!(app, TerminalApp::Kitty | TerminalApp::WezTerm | TerminalApp::Ghostty) {
         if let Some(scope) = turn
             .working_dir
             .and_then(|p| p.file_name())
@@ -305,10 +306,10 @@ fn write_terminal_notification(
             write_kitty_notification(out, plan.terminal_id, plan.visibility, title, body)?;
             Ok(true)
         }
-        TerminalApp::WezTerm => {
+        TerminalApp::WezTerm | TerminalApp::Ghostty => {
             let title = &plan.title;
             let body = &plan.body;
-            write_wezterm_notification(out, title, body)?;
+            write_osc777_notification(out, title, body)?;
             Ok(true)
         }
         TerminalApp::ITerm2 => {
@@ -338,7 +339,7 @@ fn write_kitty_notification(
     Ok(())
 }
 
-fn write_wezterm_notification(out: &mut dyn Write, title: &str, body: &str) -> io::Result<()> {
+fn write_osc777_notification(out: &mut dyn Write, title: &str, body: &str) -> io::Result<()> {
     let title = sanitize_plain_text(title).replace(';', ":");
     let body = sanitize_plain_text(body).replace(';', ":");
     write!(out, "\x1b]777;notify;{title};{body}\x1b\\")?;
@@ -370,6 +371,9 @@ fn detect_terminal_app() -> Option<TerminalApp> {
     let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
     if term_program.eq_ignore_ascii_case("wezterm") {
         return Some(TerminalApp::WezTerm);
+    }
+    if term_program.eq_ignore_ascii_case("ghostty") {
+        return Some(TerminalApp::Ghostty);
     }
     if term_program == "iTerm.app" || term_program.eq_ignore_ascii_case("iTerm2") {
         return Some(TerminalApp::ITerm2);
@@ -415,6 +419,7 @@ fn macos_terminal_bundle_id(app: Option<TerminalApp>) -> Option<&'static str> {
         Some(TerminalApp::AppleTerminal) => Some("com.apple.Terminal"),
         Some(TerminalApp::ITerm2) => Some("com.googlecode.iterm2"),
         Some(TerminalApp::WezTerm) => Some("com.github.wez.wezterm"),
+        Some(TerminalApp::Ghostty) => Some("com.mitchellh.ghostty"),
         Some(TerminalApp::Kitty) => Some("net.kovidgoyal.kitty"),
         _ => None,
     }
@@ -774,6 +779,10 @@ mod tests {
         assert_eq!(
             macos_terminal_bundle_id(Some(TerminalApp::WezTerm)),
             Some("com.github.wez.wezterm")
+        );
+        assert_eq!(
+            macos_terminal_bundle_id(Some(TerminalApp::Ghostty)),
+            Some("com.mitchellh.ghostty")
         );
         assert_eq!(
             macos_terminal_bundle_id(Some(TerminalApp::Kitty)),

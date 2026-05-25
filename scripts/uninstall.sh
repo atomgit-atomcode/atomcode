@@ -61,7 +61,7 @@ if [ -z "$BIN" ]; then
 fi
 BIN_DIR=$(dirname "$BIN" 2>/dev/null || echo "")
 
-DATA="${ATOMCODE_HOME_OVERRIDE:-$HOME/.atomcode}"
+DATA="${ATOMCODE_HOME:-$HOME/.atomcode}"
 
 # ---- plan ----
 echo "Will remove (Group 1):"

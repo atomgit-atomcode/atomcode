@@ -78,6 +78,15 @@ impl Segment {
 impl Queue {
     pub fn open(dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+
+        // Recover from previous crash / kill:
+        //   1. .sending-* files are claimed segments whose HTTP POST never
+        //      completed (process died mid-send).  Rename them back to
+        //      .ndjson so the new process can retry.
+        //   2. Empty .partial files are segments created but never written
+        //      to before the process exited.  Safe to delete.
+        recover_stale_files(&dir)?;
+
         Ok(Self {
             dir,
             current: None,
@@ -259,6 +268,71 @@ fn ready_path_for_claim(path: &Path) -> Option<PathBuf> {
     Some(path.with_file_name(ready_name))
 }
 
+/// Scan the queue directory for stale artifacts left by a previous process
+/// that exited before completing its send or cleanup:
+///
+/// - `.sending-*` files → rename back to `.ndjson` so they can be re-sent.
+/// - Empty `.partial` files → delete (they contain no events).
+fn recover_stale_files(dir: &Path) -> Result<()> {
+    let entries: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("reading queue dir {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+
+    for path in entries {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        // Recover .sending-* files: these were claimed for HTTP POST but the
+        // process died before the request completed or restore_claim ran.
+        // Rename back to the original .ndjson so the sender retries them.
+        if let Some(marker_start) = name.find(SENDING_MARKER) {
+            let ready_name = &name[..marker_start];
+            let ready_path = path.with_file_name(ready_name);
+            match fs::rename(&path, &ready_path) {
+                Ok(()) => {
+                    tracing::info!(
+                        "recovered stale .sending segment -> {}",
+                        ready_path.display()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        ?e,
+                        "failed to recover stale .sending segment {}",
+                        path.display()
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Clean up empty .partial files: these were created but never
+        // received any events before the process exited.
+        if name.ends_with(PARTIAL_EXT) {
+            if let Ok(meta) = fs::metadata(&path) {
+                if meta.len() == 0 {
+                    match fs::remove_file(&path) {
+                        Ok(()) => {
+                            tracing::info!("removed empty .partial segment {}", path.display());
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                ?e,
+                                "failed to remove empty .partial segment {}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +448,67 @@ mod tests {
         let restored = q.restore_claim(&claimed).unwrap().unwrap();
         assert!(restored.exists());
         assert_eq!(q.ready_segments_sorted().unwrap(), vec![restored]);
+    }
+
+    #[test]
+    fn open_recovers_stale_sending_files() {
+        let d = TempDir::new().unwrap();
+
+        // Simulate a previous process: create a .ndjson, then "claim" it
+        // by renaming to .sending-* (as if HTTP POST was in-flight when
+        // the process crashed).
+        let mut q = Queue::open(d.path().to_path_buf()).unwrap();
+        q.append(&rec()).unwrap();
+        let rolled = q.force_roll().unwrap().unwrap();
+        let claimed = rolled.with_file_name(format!(
+            "{}{}12345-abcdef",
+            rolled.file_name().unwrap().to_str().unwrap(),
+            SENDING_MARKER
+        ));
+        fs::rename(&rolled, &claimed).unwrap();
+
+        // The .sending file should not appear in ready_segments.
+        assert!(q.ready_segments_sorted().unwrap().is_empty());
+
+        // Re-open the queue — recover_stale_files should restore it.
+        let q2 = Queue::open(d.path().to_path_buf()).unwrap();
+        let ready = q2.ready_segments_sorted().unwrap();
+        assert_eq!(ready.len(), 1, "stale .sending file should be recovered as .ndjson");
+        assert!(
+            !claimed.exists(),
+            "original .sending file should have been renamed away"
+        );
+
+        // The recovered file should contain the original event.
+        let contents = fs::read_to_string(&ready[0]).unwrap();
+        assert!(
+            contents.contains(r#""event_id":"open_atomcode""#),
+            "recovered segment should contain original event data"
+        );
+    }
+
+    #[test]
+    fn open_removes_empty_partial_files() {
+        let d = TempDir::new().unwrap();
+
+        // Simulate stale empty .partial files left by a previous crash.
+        let empty_partial = d.path().join("20260512-000000-deadbeef.partial");
+        fs::File::create(&empty_partial).unwrap();
+        assert_eq!(fs::metadata(&empty_partial).unwrap().len(), 0);
+
+        // Also create a non-empty .partial that should NOT be deleted.
+        let nonempty_partial = d.path().join("20260512-000001-alivecafe.partial");
+        fs::write(&nonempty_partial, b"some data\n").unwrap();
+
+        let _q = Queue::open(d.path().to_path_buf()).unwrap();
+
+        assert!(
+            !empty_partial.exists(),
+            "empty .partial file should be removed on Queue::open"
+        );
+        assert!(
+            nonempty_partial.exists(),
+            "non-empty .partial file should be kept"
+        );
     }
 }

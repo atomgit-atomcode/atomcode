@@ -61,6 +61,11 @@ body {
   50% { opacity: 0; }
 }
 
+@keyframes breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 4px rgba(76, 175, 80, 0.5); }
+  50% { opacity: 0.35; box-shadow: 0 0 10px rgba(76, 175, 80, 0.8); }
+}
+
 @keyframes selectionConfirm {
   0% { background-color: var(--app-input-secondary-background); }
   50% { background-color: var(--app-button-background); opacity: 0.3; }

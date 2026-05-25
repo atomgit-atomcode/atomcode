@@ -112,6 +112,24 @@ export async function activate(context: vscode.ExtensionContext) {
   ];
   context.subscriptions.push(...cmds);
 
+  // Register panel serializer for cross-restart tab restoration
+  context.subscriptions.push(
+    vscode.window.registerWebviewPanelSerializer('atomcode.chatTab', {
+      async deserializeWebviewPanel(panel: vscode.WebviewPanel, state: any) {
+        const sessionId = state?.sessionId as string | undefined;
+        const projectHash = state?.projectHash as string | undefined;
+        extensionState.chatProvider.setupPanelForRestore(panel, sessionId, projectHash);
+      },
+    })
+  );
+
+  // Register openSessionInTab command (called from webview)
+  context.subscriptions.push(
+    vscode.commands.registerCommand('atomcode.openSessionInTab', async (sessionId?: string, projectHash?: string) => {
+      await extensionState.chatProvider.openSessionInTab(sessionId, projectHash);
+    })
+  );
+
   // 7. Try to connect in the background. Activation must stay responsive for menu commands.
   void initializeDaemon();
 

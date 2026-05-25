@@ -370,7 +370,10 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
             }
             UiLine::CommandOutput(text) => {
                 self.drop_transient();
-                let safe = scrub_controls(&text);
+                // CommandOutput is trusted internal text — keep SGR so
+                // colours / bold reach the terminal. See the matching
+                // alt_screen note for why this is safe.
+                let safe = crate::sanitize::scrub_controls_keep_sgr(&text);
                 let _ = self.out.write_all(safe.as_bytes());
                 if !safe.ends_with('\n') {
                     let _ = self.out.write_all(b"\n");

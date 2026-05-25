@@ -24,6 +24,7 @@ pub mod issue_wizard;
 pub mod language_picker;
 pub mod model_picker;
 pub mod onboarding_wizard;
+mod qr;
 pub mod provider_wizard;
 pub mod session_picker;
 pub use dir_picker::DirPicker;

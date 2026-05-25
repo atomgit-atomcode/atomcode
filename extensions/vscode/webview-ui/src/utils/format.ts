@@ -55,15 +55,27 @@ export function groupSessionsByDate<T extends { updated_at?: string | number; cr
   return groups;
 }
 
-export function formatToolArgs(name: string, argsJson: string): string {
+const DISPLAY_FIELDS = ['command', 'file_path', 'pattern', 'query', 'url', 'search', 'path', 'name'];
+
+export function formatToolArgs(_name: string, argsJson: string): string {
   try {
-    const args = JSON.parse(argsJson) as Record<string, string>;
-    if (name === 'read_file' || name === 'Read') return args.file_path ?? args.path ?? '';
-    if (name === 'write_file' || name === 'Write') return args.file_path ?? args.path ?? '';
-    if (name === 'edit_file' || name === 'Edit') return args.file_path ?? args.path ?? '';
-    if (name === 'bash' || name === 'Bash') return (args.command ?? '').substring(0, 80);
-    if (name === 'grep' || name === 'Grep') return `${args.pattern ?? ''} in ${args.path ?? '.'}`;
-    if (name === 'list_dir') return args.path ?? '.';
+    const args = JSON.parse(argsJson) as Record<string, unknown>;
+    if (!args || typeof args !== 'object') return '';
+
+    for (const field of DISPLAY_FIELDS) {
+      const val = args[field];
+      if (typeof val === 'string' && val.length > 0) {
+        return val.length > 80 ? val.substring(0, 77) + '...' : val;
+      }
+    }
+
+    // Fallback: first non-trivial string value
+    for (const [, val] of Object.entries(args)) {
+      if (typeof val === 'string' && val.length > 0) {
+        return val.length > 80 ? val.substring(0, 77) + '...' : val;
+      }
+    }
+
     return '';
   } catch {
     return '';

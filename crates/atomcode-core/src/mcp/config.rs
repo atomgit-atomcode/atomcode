@@ -52,6 +52,8 @@ pub struct McpServerConfig {
     pub name: String,
     pub disabled: bool,
     pub config: McpTransportConfig,
+    /// Where this server config was loaded from (user-level or project-level).
+    pub source: McpConfigSource,
 }
 
 /// Configuration source for a server.
@@ -59,6 +61,16 @@ pub struct McpServerConfig {
 pub enum McpConfigSource {
     Project,
     User,
+}
+
+impl McpConfigSource {
+    /// Returns the string representation for telemetry JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            McpConfigSource::Project => "project",
+            McpConfigSource::User => "global",
+        }
+    }
 }
 
 /// Raw MCP config file format (for deserialization).
@@ -151,7 +163,7 @@ pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
     Ok(merged.into_values().filter(|c| !c.disabled).collect())
 }
 
-fn load_config_file(path: &Path, _source: McpConfigSource) -> Result<Vec<McpServerConfig>> {
+fn load_config_file(path: &Path, source: McpConfigSource) -> Result<Vec<McpServerConfig>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -165,7 +177,8 @@ fn load_config_file(path: &Path, _source: McpConfigSource) -> Result<Vec<McpServ
     let mut configs = Vec::new();
 
     for (name, entry) in raw.mcp_servers {
-        let config = server_entry_to_config(&name, entry)?;
+        let mut config = server_entry_to_config(&name, entry)?;
+        config.source = source;
         configs.push(config);
     }
 
@@ -218,6 +231,7 @@ fn server_entry_to_config(name: &str, entry: McpServerEntry) -> Result<McpServer
         name: name.to_string(),
         disabled: entry.disabled,
         config: transport,
+        source: McpConfigSource::Project, // default; overwritten by load_config_file
     })
 }
 
@@ -274,7 +288,7 @@ fn collect_merged_mcp_server_maps(root: &Map<String, Value>) -> Map<String, Valu
     out
 }
 
-/// Add or replace a **stdio** MCP server entry in a JSON config file (`.mcp.json` or `~/.atomcode/mcp.json`).
+/// Add or replace a **stdio** MCP server entry in a JSON config file (`.mcp.json` or `$ATOMCODE_HOME/mcp.json`).
 ///
 /// Merges existing `servers` and `mcpServers` maps, then writes a single `mcpServers` object (drops the legacy
 /// `servers` key). Other top-level JSON keys are preserved.

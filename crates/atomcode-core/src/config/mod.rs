@@ -86,7 +86,7 @@ pub struct Config {
     pub default_workdir: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
     /// Per-turn datalog settings. Missing from older configs → defaults to
-    /// enabled=true, dir="~/.atomcode/datalog" (project slug appended underneath).
+    /// enabled=true, dir="$ATOMCODE_HOME/datalog" (project slug appended underneath).
     ///
     /// `skip_serializing` intentionally suppresses serde's automatic output;
     /// `save()` writes this section manually with explanatory comments and
@@ -136,6 +136,83 @@ pub struct Config {
     /// short key defined by `Locale`'s serde rename (e.g. `"zh_CN"`).
     #[serde(default)]
     pub language: Option<crate::locale::Locale>,
+    /// UI rendering preferences. Currently exposes the light/dark theme
+    /// switch driving the TUIX colour palette (markdown headings, code
+    /// block syntax highlight, session-name pill). Missing from older
+    /// configs → defaults to `dark` (legacy behaviour).
+    #[serde(default)]
+    pub ui: UiConfig,
+    /// Plugin marketplace bootstrap + auto-update behaviour. Missing
+    /// from older configs → both knobs default to `true`, matching the
+    /// "ship batteries included" UX: first-startup auto-installs the
+    /// default `atomcode-skills` marketplace, and an in-place version
+    /// upgrade silently `git pull`s every installed marketplace so
+    /// skills track the binary.
+    #[serde(default)]
+    pub plugin: PluginConfig,
+}
+
+/// Plugin / marketplace bootstrap configuration. Persisted as the
+/// `[plugin]` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfig {
+    /// First-startup behaviour: when true (default), atomcode runs a
+    /// one-time `git clone` of the default `atomcode-skills`
+    /// marketplace into `$ATOMCODE_HOME/plugins/marketplaces/`. A marker
+    /// file (`~/.atomcode/.plugin_bootstrap_v1`) is touched after the
+    /// first attempt — set or unset — so the install fires exactly
+    /// once per user. A subsequent `/plugin uninstall` is respected;
+    /// the marker stays in place and the directory is NOT recreated.
+    /// To force a re-bootstrap, delete the marker.
+    #[serde(default = "default_true")]
+    pub auto_install_default_skills: bool,
+    /// Self-update follow-up: when true (default), after
+    /// `apply_pending_upgrade` actually applies a new atomcode binary
+    /// (`ATOMCODE_UPGRADED_FROM` env var set on re-exec), the new
+    /// session runs `git pull --ff-only` on every installed marketplace
+    /// so skills stay in lockstep with the binary. Failures (no
+    /// network, fast-forward conflict from local edits) are warned
+    /// and ignored — never block startup.
+    #[serde(default = "default_true")]
+    pub auto_update_marketplaces: bool,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            auto_install_default_skills: true,
+            auto_update_marketplaces: true,
+        }
+    }
+}
+
+/// UI section of the config — currently just the theme switch driving
+/// the TUIX colour palette. Persisted as a top-level `[ui]` table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// Colour palette to use for markdown / code-block / chrome
+    /// rendering. `dark` keeps the legacy palette (designed for dark
+    /// terminals); `light` swaps in darker saturated variants that hit
+    /// WCAG AA contrast on `#FFFFFF`. Defaults to `dark` so existing
+    /// configs see no behaviour change.
+    #[serde(default)]
+    pub theme: UiTheme,
+}
+
+/// UI colour palette selector.
+///
+/// - `Auto` (default): query the terminal's background colour via
+///   OSC 11 at startup and pick light or dark accordingly. Terminals
+///   that don't respond (macOS Terminal.app, Windows conhost) fall
+///   back to dark.
+/// - `Dark` / `Light`: skip detection, use the explicit palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiTheme {
+    #[default]
+    Auto,
+    Dark,
+    Light,
 }
 
 impl Config {
@@ -159,6 +236,27 @@ impl Config {
             _ => return false,
         };
         self.providers.contains_key(vp_key)
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            default_provider: String::new(),
+            default_workdir: None,
+            providers: HashMap::new(),
+            datalog: Default::default(),
+            notifications: Default::default(),
+            auto_update: true,
+            telemetry: Default::default(),
+            lsp: Default::default(),
+            auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: None,
+            language: None,
+            ui: UiConfig::default(),
+            plugin: PluginConfig::default(),
+        }
     }
 }
 
@@ -354,6 +452,25 @@ fn render_notifications_section(cfg: &NotificationConfig) -> String {
     out
 }
 
+fn render_telemetry_section(cfg: &TelemetryConfig) -> String {
+    if cfg.enabled.is_none() && cfg.endpoint.is_none() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("\n# Anonymous telemetry. Omit `enabled` for the default enabled behavior.\n");
+    out.push_str("# Set `enabled = false` to opt out persistently.\n");
+    out.push_str("[telemetry]\n");
+    if let Some(enabled) = cfg.enabled {
+        out.push_str(&format!("enabled = {}\n", enabled));
+    }
+    if let Some(endpoint) = cfg.endpoint.as_deref() {
+        let escaped = endpoint.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!("endpoint = \"{}\"\n", escaped));
+    }
+    out
+}
+
 /// Render a documentation comment about the layered instruction file system.
 /// Always emitted (even on first save) so users discover the feature.
 fn render_instructions_section() -> String {
@@ -362,13 +479,19 @@ fn render_instructions_section() -> String {
     out.push_str("# AtomCode loads instructions from three levels (low → high priority):\n");
     out.push_str("#\n");
     out.push_str("#   1. ~/.atomcode/ATOMCODE.md           (global — your personal defaults)\n");
-    out.push_str("#   2. <project>/.atomcode.md            (project — team-shared, commit to git)\n");
+    out.push_str(
+        "#   2. <project>/.atomcode.md            (project — team-shared, commit to git)\n",
+    );
     out.push_str("#      or <project>/ATOMCODE.md\n");
     out.push_str("#      or <project>/CLAUDE.md / claude.md (Claude Code compat)\n");
-    out.push_str("#   3. <project>/.atomcode.user.md       (user — personal per-project, .gitignore)\n");
+    out.push_str(
+        "#   3. <project>/.atomcode.user.md       (user — personal per-project, .gitignore)\n",
+    );
     out.push_str("#\n");
     out.push_str("# Higher priority files appear later in the prompt (recency effect).\n");
-    out.push_str("# Use /status to see which files are loaded. Use /init to generate a template.\n");
+    out.push_str(
+        "# Use /status to see which files are loaded. Use /init to generate a template.\n",
+    );
     out.push_str("#\n");
     out.push_str("# Example ~/.atomcode/ATOMCODE.md:\n");
     out.push_str("#   ## Global Preferences\n");
@@ -454,6 +577,7 @@ impl Config {
         let mut content = toml::to_string_pretty(&persistent)?;
         content.push_str(&render_datalog_section(&self.datalog));
         content.push_str(&render_notifications_section(&self.notifications));
+        content.push_str(&render_telemetry_section(&self.telemetry));
         content.push_str(&render_instructions_section());
         content.push_str(&render_hooks_json_section());
         std::fs::write(path, content)?;
@@ -462,27 +586,39 @@ impl Config {
 
     pub fn active_provider(&self, override_name: Option<&str>) -> Result<&ProviderConfig> {
         // Defence against an accidentally-empty `default_provider` (e.g.
-        // an older /logout path wrote "" back to config.toml). Rather
-        // than looking up the empty key and failing at startup, fall
-        // back to a lexicographically-first provider so the TUI still
-        // boots and the user can self-correct via /provider.
+        // an older /logout path wrote "" back to config.toml) OR a
+        // `default_provider` that points to a provider section the user
+        // has since deleted from config.toml.  Rather than failing at
+        // startup, fall back to a lexicographically-first provider so
+        // the TUI still boots and the user can self-correct via /provider.
         let name: &str = override_name
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.default_provider);
-        let name: &str = if name.is_empty() {
+        let fallback = || {
             self.providers
                 .keys()
                 .min()
                 .map(String::as_str)
                 .ok_or_else(|| {
                     anyhow::anyhow!("No providers configured — run /codingplan or /provider")
-                })?
+                })
+        };
+        let name: &str = if name.is_empty() {
+            fallback()?
         } else {
             name
         };
-        self.providers
-            .get(name)
-            .with_context(|| format!("Provider '{}' not found in config", name))
+        match self.providers.get(name) {
+            Some(p) => Ok(p),
+            None => {
+                // default_provider / override pointed to a key that no
+                // longer exists — fall back to the first available.
+                let fallback_name = fallback()?;
+                // SAFETY: fallback() just returned Ok from self.providers,
+                // so the key must exist.
+                Ok(self.providers.get(fallback_name).unwrap())
+            }
+        }
     }
 
     /// Resolve the atomcode config dir. Pure function for testability —
@@ -616,6 +752,8 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
+            plugin: Default::default(),
         }
     }
 
@@ -778,6 +916,8 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: None,
+            ui: Default::default(),
+            plugin: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -893,6 +1033,69 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+    #[test]
+    fn active_provider_falls_back_when_default_points_to_deleted_provider() {
+        // Regression test for https://gitcode.com/atomgit_atomcode/atomcode/issues/353
+        // User deletes a provider section from config.toml but leaves
+        // default_provider pointing at it — startup must still succeed by
+        // falling back to a lexicographically-first provider instead of
+        // failing with "Provider 'xxx' not found".
+        let toml_str = r#"
+            default_provider = "AtomGit-Qwen"
+
+            [providers.openai]
+            type = "openai"
+            api_key = "sk-test"
+            model = "gpt-4o"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-a"
+            model = "claude-opus-4-6"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let provider = config.active_provider(None).unwrap();
+        // Should fall back to "claude" (lexicographically first)
+        assert_eq!(provider.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn active_provider_falls_back_when_override_points_to_deleted_provider() {
+        // Same as above but via the --provider CLI override.
+        let toml_str = r#"
+            default_provider = "openai"
+
+            [providers.openai]
+            type = "openai"
+            api_key = "sk-test"
+            model = "gpt-4o"
+
+            [providers.claude]
+            type = "claude"
+            api_key = "sk-a"
+            model = "claude-opus-4-6"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let provider = config.active_provider(Some("nonexistent")).unwrap();
+        // Should fall back to "claude" (lexicographically first)
+        assert_eq!(provider.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn active_provider_errors_when_default_deleted_and_no_other_providers() {
+        // default_provider points to a deleted section AND there are no
+        // other providers — must error (nothing to fall back to).
+        let toml_str = r#"
+            default_provider = "deleted"
+            [providers]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let err = config.active_provider(None).unwrap_err();
+        assert!(
+            err.to_string().contains("No providers configured"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn vision_preprocessor_provider_defaults_to_none() {
@@ -926,6 +1129,8 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: None,
             language: Some(crate::locale::Locale::ZhCn),
+            ui: Default::default(),
+            plugin: Default::default(),
         };
         cfg.providers.insert(
             "p".to_string(),
@@ -1025,6 +1230,8 @@ mod tests {
             subagent: Default::default(),
             vision_preprocessor_provider: preprocessor_key.map(|s| s.to_string()),
             language: None,
+            ui: Default::default(),
+            plugin: Default::default(),
         }
     }
 
@@ -1150,5 +1357,35 @@ endpoint = "https://test.example/v1"
             c.telemetry.endpoint.as_deref(),
             Some("https://test.example/v1")
         );
+    }
+
+    #[test]
+    fn saved_config_preserves_explicit_telemetry_section() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atomcode_cfg_telemetry_rt_{}.toml",
+            std::process::id()
+        ));
+        let cfg = Config {
+            default_provider: "p".to_string(),
+            telemetry: TelemetryConfig {
+                enabled: Some(false),
+                endpoint: Some("https://telemetry.example/v1".to_string()),
+            },
+            ..Config::default()
+        };
+
+        cfg.save(&tmp).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        assert!(text.contains("[telemetry]"));
+        assert!(text.contains("enabled = false"));
+        assert!(text.contains("endpoint = \"https://telemetry.example/v1\""));
+
+        let reloaded = Config::load(&tmp).unwrap();
+        assert_eq!(reloaded.telemetry.enabled, Some(false));
+        assert_eq!(
+            reloaded.telemetry.endpoint.as_deref(),
+            Some("https://telemetry.example/v1")
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }

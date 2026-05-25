@@ -2,11 +2,11 @@ import React from 'react';
 import { useChatContext } from '../state/ChatProvider';
 
 export function Header() {
-  const { dispatch, newConversation } = useChatContext();
+  const { dispatch, openSidebar, openSessionInTab } = useChatContext();
 
   return (
     <header className="header">
-      <button className="ghost-btn" onClick={() => dispatch({ type: 'TOGGLE_HISTORY' })} title="History">
+      <button className="ghost-btn" onClick={openSidebar} title="Open sessions sidebar">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
           <rect x="2" y="3" width="12" height="1.5" rx="0.5" />
           <rect x="2" y="7.25" width="12" height="1.5" rx="0.5" />
@@ -14,7 +14,7 @@ export function Header() {
         </svg>
       </button>
       <span className="header-spacer" />
-      <button className="ghost-btn" onClick={() => newConversation()} title="New conversation">
+      <button className="ghost-btn" onClick={() => openSessionInTab()} title="New conversation">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
           <path d="M8 1.5a.75.75 0 01.75.75v5h5a.75.75 0 010 1.5h-5v5a.75.75 0 01-1.5 0v-5h-5a.75.75 0 010-1.5h5v-5A.75.75 0 018 1.5z" />
         </svg>

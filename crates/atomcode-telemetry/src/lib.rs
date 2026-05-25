@@ -12,7 +12,10 @@ pub mod scrub;
 pub mod sender;
 
 pub use config::{CliOverride, ResolvedConfig, TelemetryConfig, TelemetryState};
-pub use event::{CodingplanResult, Envelope, Event, Record, RepoHost, RepoOrigin, SessionMode};
+pub use event::{
+    CodingplanErrorKind, CodingplanResult, Envelope, Event, LlmErrorKind, McpErrorKind,
+    McpTransport, Record, RepoHost, RepoOrigin, SessionMode, ToolErrorKind, UseCommandErrorKind,
+};
 pub use runtime::{resolve_provider_host, Counters, CountersSnapshot, CurrentContext, Telemetry};
 
 pub const SCHEMA_VERSION: u32 = 1;

@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use super::{save_and_reload, LoopCtx};
+use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
@@ -23,17 +23,27 @@ use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
-use atomcode_core::session::{SessionId, SessionManager};
+use atomcode_core::conversation::Conversation;
+use atomcode_core::session::{Session, SessionId, SessionManager};
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
 
 fn build_oauth_provider() -> ProviderConfig {
+    // Post-P3 cutover: default OAuth fallback now points at the new
+    // signed gateway (`llm-api.atomgit.com`). The legacy
+    // `api-ai.gitcode.com` host previously served plaintext as a
+    // fallback for open-source builds — that escape hatch closes here
+    // because the legacy host is now also signing-enforced (see
+    // `crypto::is_atomgit_gateway`). Open-source-build users hitting
+    // `/login` will see `CpOfficialBuildRequired` on their first chat;
+    // they must either install the official build or configure a
+    // third-party provider via `/provider`.
     ProviderConfig {
         provider_type: "openai".to_string(),
         api_key: None,
         model: "MiniMax-M2.7".to_string(),
-        base_url: Some("https://api-ai.gitcode.com/v1".to_string()),
+        base_url: Some("https://llm-api.atomgit.com/v1".to_string()),
         system_prompt: None,
         user_agent: None,
         context_window: 64_000,
@@ -47,6 +57,105 @@ fn build_oauth_provider() -> ProviderConfig {
         ephemeral: false,
 
 }
+}
+
+fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
+    if matches!(
+        state.phase,
+        crate::state::UiPhase::Streaming | crate::state::UiPhase::Approval
+    ) {
+        bg_runtime::RuntimeState::Running
+    } else {
+        bg_runtime::RuntimeState::Idle
+    }
+}
+
+fn render_welcome(renderer: &mut dyn Renderer, ctx: &LoopCtx) {
+    let dir_display = crate::platform::collapse_home(&ctx.working_dir.to_string_lossy());
+    renderer.render(UiLine::Welcome {
+        model: ctx.model_name.clone(),
+        working_dir: dir_display,
+    });
+}
+
+fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
+    if let Ok(uuid) = uuid::Uuid::parse_str(session.id.as_str()) {
+        ctx.telemetry.set_session_id(uuid);
+    }
+}
+
+/// Scan session messages for a pending tool approval — an
+/// `AssistantWithToolCalls` message whose tool calls lack corresponding
+/// `ToolResult` entries.  Returns `(display_name, detail)` of the first
+/// unpaired tool call, or `None` if all tool calls have results.
+fn find_pending_approval(session: &Session) -> Option<(String, String)> {
+    use atomcode_core::conversation::message::{MessageContent, Role};
+    use crate::event_loop::format_tool_detail;
+
+    // Collect all call_ids that already have a ToolResult.
+    let mut answered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in &session.messages {
+        if let (Role::Tool, MessageContent::ToolResult(r)) = (&m.role, &m.content) {
+            answered_ids.insert(r.call_id.clone());
+        }
+    }
+
+    // Walk messages in reverse to find the most recent unpaired tool call.
+    for m in session.messages.iter().rev() {
+        if let (
+            Role::Assistant,
+            MessageContent::AssistantWithToolCalls { tool_calls, .. },
+        ) = (&m.role, &m.content)
+        {
+            for tc in tool_calls.iter().rev() {
+                if !answered_ids.contains(&tc.id) {
+                    let display = super::display_tool_name(&tc.name);
+                    let detail = format_tool_detail(&tc.name, &tc.arguments);
+                    return Some((display, detail));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn short_task_name(task: &str) -> String {
+    let first_line = task.lines().next().unwrap_or(task).trim();
+    let mut out: String = first_line.chars().take(80).collect();
+    if out.is_empty() {
+        out = "background task".to_string();
+    }
+    out
+}
+
+fn spawn_runtime(
+    ctx: &mut LoopCtx,
+    session: Session,
+) -> (
+    bg_runtime::RuntimeId,
+    atomcode_core::agent::AgentClient,
+    Session,
+) {
+    let runtime_id = ctx.bg_manager.allocate_runtime_id();
+    let (client, event_rx) = ctx.runtime_factory.spawn_runtime(Conversation::new());
+    bg_runtime::spawn_event_forwarder(runtime_id, event_rx, ctx.runtime_event_tx.clone());
+    (runtime_id, client, session)
+}
+
+/// Synchronise the current foreground session into `BgRuntimeManager`.
+///
+/// Mid-turn session state (including conversations where the agent is
+/// waiting for tool approval) is already persisted to
+/// `ctx.current_session` by `handle_agent_event` when it processes
+/// `AgentEvent::ApprovalNeeded` (which carries a snapshot of
+/// `conversation.messages`).  So by the time `/bg` runs,
+/// `ctx.current_session.messages` should be up-to-date.
+fn sync_bg_foreground(ctx: &mut LoopCtx) {
+    ctx.bg_manager.set_foreground_runtime(
+        ctx.foreground_runtime_id,
+        ctx.agent.clone(),
+        ctx.current_session.clone(),
+    );
 }
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
@@ -85,7 +194,7 @@ pub fn perform_session_rename(
     let new_name = new_name.trim().to_string();
     let session = session_manager
         .load(session_id)
-        .map_err(|e| format!("Failed to load session: {}", e))?;
+        .map_err(|e| t(Msg::SessionLoadFailed { error: &e.to_string() }).into_owned())?;
     let old_name = session.name.clone();
     let renamed_session = atomcode_core::session::Session {
         name: new_name.clone(),
@@ -93,11 +202,12 @@ pub fn perform_session_rename(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(session.updated_at),
+        user_renamed: true,
         ..session
     };
     session_manager
         .save(&renamed_session)
-        .map_err(|e| format!("Failed to save session: {}. The name was not persisted.", e))?;
+        .map_err(|e| t(Msg::SessionSaveFailed { error: &e.to_string() }).into_owned())?;
     Ok((old_name, new_name))
 }
 
@@ -152,7 +262,7 @@ pub(super) fn execute_slash_command(
     {
         use atomcode_telemetry::Event;
         let cmd_name = cmd.trim_start_matches('/').to_string();
-        ctx.telemetry.track(Event::UseCommand { type_: cmd_name });
+        ctx.telemetry.track(Event::UseCommand { type_: cmd_name, success: Some(true), error_kind: None, error_data: None });
     }
 
     match cmd {
@@ -183,6 +293,16 @@ pub(super) fn execute_slash_command(
             } else {
                 renderer.render(UiLine::CommandOutput(ctx.commands.help_text()));
             }
+            renderer.flush();
+        }
+        "keys" => {
+            // Dump the full keyboard-shortcut reference into scrollback.
+            // i18n string owns column alignment so translators can adjust
+            // per locale without touching this arm. /help complements
+            // this with the slash-command list.
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::KeybindingsHelp).into_owned(),
+            ));
             renderer.flush();
         }
         "plan" => {
@@ -248,6 +368,7 @@ pub(super) fn execute_slash_command(
                         .map(|p| p.model.clone())
                         .unwrap_or_else(|| new_default.clone());
                     ctx.config = new_cfg.clone();
+                    ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
                     ctx.agent
                         .cmd_tx
@@ -301,6 +422,8 @@ pub(super) fn execute_slash_command(
             // it can still be `/resume`d; we just stop writing into it.
             ctx.current_session =
                 atomcode_core::session::Session::default_session(ctx.working_dir.clone());
+            ctx.bg_manager
+                .set_foreground_session(ctx.current_session.clone());
             // Bind telemetry session_id to the new session's UUID.
             if let Ok(uuid) = uuid::Uuid::parse_str(ctx.current_session.id.as_str()) {
                 ctx.telemetry.set_session_id(uuid);
@@ -387,25 +510,37 @@ pub(super) fn execute_slash_command(
             }
         },
         "rename" => {
-            if let Some(ref session_id) = ctx.current_session_id {
-                match perform_session_rename(&ctx.session_manager, session_id, arg) {
-                    Ok((old_name, new_name)) => {
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  Session renamed: '{}' -> '{}'",
-                            old_name, new_name
-                        )));
+            // Rename targets `ctx.current_session` (the in-flight conversation),
+            // not whichever id `/resume` last loaded — the user expects /rename
+            // to relabel the conversation they're currently typing into. The
+            // session is always initialised at startup, so we never need a
+            // "load a session first" fallback.
+            if let Some(err) = validate_session_name(arg) {
+                renderer.render(UiLine::Error(err));
+                renderer.flush();
+            } else {
+                let old_name = ctx.current_session.name.clone();
+                let new_name = arg.trim().to_string();
+                ctx.current_session.rename(new_name.clone());
+                match ctx.session_manager.save(&ctx.current_session) {
+                    Ok(()) => {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::SessionRenamed { old: &old_name, new: &new_name })
+                                .into_owned(),
+                        ));
                         renderer.flush();
                     }
-                    Err(err) => {
-                        renderer.render(UiLine::Error(err));
+                    Err(e) => {
+                        // Revert the in-memory rename so a follow-up retry
+                        // still reports the original name.
+                        ctx.current_session.name = old_name;
+                        renderer.render(UiLine::Error(
+                            t(Msg::SessionSaveFailed { error: &e.to_string() })
+                                .into_owned(),
+                        ));
                         renderer.flush();
                     }
                 }
-            } else {
-                renderer.render(UiLine::Error(
-                    "No active session to rename. Use /resume to load a session first.".into()
-                ));
-                renderer.flush();
             }
         }
         "provider" => {
@@ -464,7 +599,10 @@ pub(super) fn execute_slash_command(
                 0
             };
             let cost = atomcode_core::pricing::calculate_cost(
-                &ctx.model_name, state.prompt_tokens, state.completion_tokens, state.cached_tokens,
+                &ctx.model_name,
+                state.prompt_tokens,
+                state.completion_tokens,
+                state.cached_tokens,
             );
             let cost_str = atomcode_core::pricing::format_cost(cost);
             renderer.render(UiLine::CommandOutput(
@@ -515,6 +653,7 @@ pub(super) fn execute_slash_command(
             let text = arg.trim();
             if text.is_empty() {
                 renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
+
                 renderer.flush();
             } else {
                 let (content, global) = if text.starts_with("--global ") {
@@ -524,9 +663,13 @@ pub(super) fn execute_slash_command(
                 };
                 if content.is_empty() {
                     renderer.render(UiLine::Error(t(Msg::RememberUsage).into_owned()));
+
                     renderer.flush();
                 } else {
-                    ctx.agent.cmd_tx.send(AgentCommand::Remember { content, global }).ok();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::Remember { content, global })
+                        .ok();
                 }
             }
         }
@@ -536,7 +679,12 @@ pub(super) fn execute_slash_command(
                 renderer.render(UiLine::Error(t(Msg::ForgetUsage).into_owned()));
                 renderer.flush();
             } else {
-                ctx.agent.cmd_tx.send(AgentCommand::Forget { keyword: keyword.to_string() }).ok();
+                ctx.agent
+                    .cmd_tx
+                    .send(AgentCommand::Forget {
+                        keyword: keyword.to_string(),
+                    })
+                    .ok();
             }
         }
         "memory" => {
@@ -708,12 +856,153 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "bg" => {
+            match bg_runtime::parse_bg_command(arg) {
+                bg_runtime::BgCommand::Help => {
+                    renderer.render(UiLine::CommandOutput(bg_runtime::render_bg_help()));
+                }
+                bg_runtime::BgCommand::List => {
+                    renderer.render(UiLine::CommandOutput(bg_runtime::render_bg_list(
+                        ctx.bg_manager.backgrounds(),
+                    )));
+                }
+                bg_runtime::BgCommand::BackgroundCurrent => {
+                    sync_bg_foreground(ctx);
+                    if !ctx.bg_manager.has_capacity() {
+                        renderer.render(UiLine::Error(
+                            t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+                    let old_short_id = ctx.current_session.short_id().to_string();
+                    let new_session = Session::default_session(ctx.working_dir.clone());
+                    let new_short_id = new_session.short_id().to_string();
+                    let (runtime_id, client, new_session) = spawn_runtime(ctx, new_session);
+                    let old_state = foreground_state_from_ui(state);
+                    let slot = match ctx.bg_manager.background_current(
+                        client.clone(),
+                        new_session.clone(),
+                        runtime_id,
+                        old_state,
+                    ) {
+                        Ok(slot) => slot,
+                        Err(bg_runtime::BgError::SlotLimit { max }) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgSlotLimitReached { max }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+                    };
+
+                    ctx.agent = client;
+                    ctx.foreground_runtime_id = runtime_id;
+                    ctx.current_session = new_session;
+                    bind_telemetry_to_session(ctx, &ctx.current_session);
+                    state.on_turn_complete();
+                    renderer.reset();
+                    render_welcome(renderer, ctx);
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::BgBackgroundCurrent {
+                            new_id: &new_short_id,
+                            slot,
+                            old_id: &old_short_id,
+                            state: &old_state.localised(),
+                        }).into_owned(),
+                    ));
+                }
+                bg_runtime::BgCommand::Resume(slot) => {
+                    sync_bg_foreground(ctx);
+                    let outcome = match ctx
+                        .bg_manager
+                        .resume_slot(slot, foreground_state_from_ui(state))
+                    {
+                        Ok(outcome) => outcome,
+                        Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::SlotLimit { max }) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgSlotLimitReached { max }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                    };
+                    let Some(client) = outcome.resumed_client else {
+                        renderer.render(UiLine::Error(
+                            t(Msg::BgNoRuntimeClient).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    };
+
+                    ctx.agent = client;
+                    ctx.foreground_runtime_id = outcome.resumed_runtime_id;
+                    ctx.current_session = outcome.resumed_session;
+                    bind_telemetry_to_session(ctx, &ctx.current_session);
+                    state.on_turn_complete();
+                    crate::modals::session_picker::replay_session(
+                        renderer,
+                        &ctx.current_session,
+                        true,
+                    );
+
+                    // If the resumed session was waiting for tool approval,
+                    // re-render the approval prompt so the user can
+                    // continue interacting.  Detect this by looking for
+                    // an AssistantWithToolCalls message whose tool_calls
+                    // lack corresponding ToolResult entries.
+                    let pending_approval = find_pending_approval(&ctx.current_session);
+                    if let Some((tool_name, detail)) = pending_approval {
+                        renderer.render(UiLine::ApprovalPrompt { tool: tool_name, detail });
+                        state.on_approval_needed("");
+                    }
+
+                    let short_id = ctx.current_session.short_id().to_string();
+                    let mut msg = t(Msg::BgResumed { slot, short_id: &short_id }).into_owned();
+                    if let Some(previous_slot) = outcome.previous_foreground_slot {
+                        msg.push_str(&t(Msg::BgPreviousForegroundMoved { slot: previous_slot }).into_owned());
+                    }
+                    renderer.render(UiLine::CommandOutput(msg));
+                }
+                bg_runtime::BgCommand::Drop(slot) => {
+                    let dropped = match ctx.bg_manager.drop_slot(slot) {
+                        Ok(dropped) => dropped,
+                        Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
+                            renderer.render(UiLine::Error(
+                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                            ));
+                            renderer.flush();
+                            return Ok(());
+                        }
+                        Err(bg_runtime::BgError::SlotLimit { .. }) => unreachable!(),
+                    };
+                    if matches!(dropped.state, bg_runtime::RuntimeState::Running) {
+                        if let Some(client) = dropped.client.as_ref() {
+                            client.cmd_tx.send(AgentCommand::Cancel).ok();
+                        }
+                    }
+                    if !dropped.session.messages.is_empty() {
+                        let _ = ctx.session_manager.save(&dropped.session);
+                    }
+                    let short_id = dropped.session.short_id().to_string();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::BgDropped { slot, short_id: &short_id }).into_owned(),
+                    ));
+                }
+            }
+            renderer.flush();
+        }
         "background" => {
-            // Send the task to the agent loop; result comes back as
-            // AgentEvent::BackgroundComplete (rendered in event_loop/mod.rs).
-            // The agent loop guards against concurrent background tasks via
-            // an AtomicBool — second invocation while one is running gets
-            // an Error event back.
+            // Compatibility wrapper around `/bg`: start a one-shot task in a
+            // real background runtime, keep the current foreground active.
             let task = arg.trim();
             if task.is_empty() {
                 renderer.render(UiLine::CommandOutput(
@@ -722,10 +1011,41 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
                 return Ok(());
             }
-            ctx.agent
+            if !ctx.bg_manager.has_capacity() {
+                renderer.render(UiLine::Error(
+                    t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+            let mut session = Session::default_session(ctx.working_dir.clone());
+            session.name = short_task_name(task);
+            let short_id = session.short_id().to_string();
+            let (runtime_id, client, session) = spawn_runtime(ctx, session);
+            let slot = match ctx.bg_manager.push_background_runtime(
+                runtime_id,
+                client.clone(),
+                session,
+                bg_runtime::RuntimeState::Running,
+            ) {
+                Ok(slot) => slot,
+                Err(bg_runtime::BgError::SlotLimit { max }) => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::BgSlotLimitReached { max }).into_owned(),
+                    ));
+                    renderer.flush();
+                    return Ok(());
+                }
+                Err(bg_runtime::BgError::InvalidSlot { .. }) => unreachable!(),
+            };
+            client
                 .cmd_tx
-                .send(AgentCommand::Background { task: task.to_string() })
+                .send(AgentCommand::SendMessage { text: task.to_string(), images: Vec::new(), image_markers: Vec::new() })
                 .ok();
+            renderer.render(UiLine::CommandOutput(
+                t(Msg::BgTaskStarted { slot, short_id: &short_id }).into_owned(),
+            ));
+            renderer.flush();
         }
         "init" => {
             // Generate .atomcode.md from project structure. Refuses to
@@ -871,6 +1191,7 @@ pub(super) fn execute_slash_command(
                 };
 
                 let mut header = t(Msg::McpReloading { count: configs.len() }).into_owned();
+
                 if !configs.is_empty() {
                     header.push_str(&t(Msg::McpConnecting));
                     for c in &configs {
@@ -1094,6 +1415,7 @@ pub(super) fn execute_slash_command(
                                 renderer.render(UiLine::Error(
                                     t(Msg::ThinkBudgetUsage).into_owned(),
                                 ));
+
                                 renderer.flush();
                             }
                         }
@@ -1174,6 +1496,104 @@ pub(super) fn execute_slash_command(
                 }
             }
         }
+        "setup" => {
+            // Check if the setup skill is already installed. If so, skip
+            // the seed-install step and directly invoke the skill — this
+            // avoids unnecessary file I/O, locking, and reloading every
+            // time the user runs /setup on a project that's already set up.
+            let skill_already_installed = {
+                let reg = ctx.skill_registry.read().ok();
+                reg.as_ref().map_or(false, |r| r.get("setup").is_some())
+            };
+
+            if skill_already_installed {
+                // Fast path: skill already present — just invoke it.
+                if let Some(rendered) = expand_skill(ctx, "setup", arg) {
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::CmdSetupRunningSkill).into_owned(),
+                    ));
+                    renderer.flush();
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                    state.on_submit();
+                } else {
+                    renderer.render(UiLine::Error(
+                        t(Msg::CmdSetupSkillMissing).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+            } else {
+                // First run: install seeds, reload, then invoke.
+                renderer.render(UiLine::CommandOutput(
+                    t(Msg::CmdSetupRunning).into_owned(),
+                ));
+                renderer.flush();
+
+                let project_root = ctx.working_dir.clone();
+                let opts = atomcode_core::setup::RunOptions::new(project_root);
+
+                // `setup::run` is synchronous (file I/O only). Run it on the
+                // current thread via `block_in_place` to avoid blocking the
+                // tokio runtime — no `block_on` needed since it's not async.
+                let result = tokio::task::block_in_place(|| {
+                    atomcode_core::setup::run(opts)
+                });
+
+                match result {
+                    Ok(report) => {
+                        for line in report.render_cli().lines() {
+                            renderer.render(UiLine::CommandOutput(line.to_string()));
+                        }
+
+                        // Reload skills/commands so newly-installed seeds are
+                        // visible immediately — without this the user would need
+                        // to restart AtomCode to see them in /skills.
+                        let (skills_loaded, _) = super::reload_plugins(ctx);
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CmdSetupSkillsReloaded { count: skills_loaded }).into_owned(),
+                        ));
+                        renderer.flush();
+
+                        // After installing seeds and reloading, automatically
+                        // invoke the "setup" skill (atomcode-automation-recommender)
+                        // so the user gets a full project analysis + recommendations
+                        // in one step instead of having to run /skills setup manually.
+                        if let Some(rendered) = expand_skill(ctx, "setup", arg) {
+                            renderer.render(UiLine::CommandOutput(
+                                t(Msg::CmdSetupRunningSkill).into_owned(),
+                            ));
+                            renderer.flush();
+                            ctx.agent
+                                .cmd_tx
+                                .send(AgentCommand::SendMessage {
+                                    text: rendered,
+                                    images: vec![],
+                                    image_markers: vec![],
+                                })
+                                .ok();
+                            state.on_submit();
+                        } else {
+                            renderer.render(UiLine::Error(
+                                t(Msg::CmdSetupSkillMissing).into_owned(),
+                            ));
+                            renderer.flush();
+                        }
+                    }
+                    Err(e) => {
+                        renderer.render(UiLine::Error(
+                            t(Msg::CmdSetupError { error: &e.to_string() }).into_owned(),
+                        ));
+                    }
+                }
+                renderer.flush();
+            }
+        }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,
@@ -1192,6 +1612,27 @@ pub(super) fn execute_slash_command(
                     .ok();
                 state.on_submit();
             } else {
+                // Unknown command — emit failure telemetry
+                let available_commands: Vec<&str> = vec![
+                    "help", "quit", "exit", "clear", "compact", "reload", "config",
+                    "plan", "build", "session", "model", "language", "resume",
+                    "rename", "provider", "status", "diff", "undo", "cost",
+                    "context", "remember", "forget", "memory", "login", "logout",
+                    "whoami", "upgrade", "issue", "cd", "bg", "codingplan",
+                ];
+                ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
+                    type_: other.to_string(),
+                    success: Some(false),
+                    error_kind: Some(atomcode_telemetry::UseCommandErrorKind::NotFound),
+                    error_data: Some(serde_json::json!({
+                        "command": other,
+                        "duration_ms": 0,
+                        "message": format!("Unknown command: {}", other),
+                        "reason": "用户输入了不存在的斜杠命令",
+                        "resolution": "使用 /help 查看所有可用命令",
+                        "available_commands": available_commands,
+                    }).to_string()),
+                });
                 renderer.render(UiLine::Error(
                     t(Msg::CmdUnknownCommand { name: other }).into_owned(),
                 ));
@@ -1441,6 +1882,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::WorktreeNoActive).into_owned(),
                         ));
+
                     } else {
                         let mut txt = t(Msg::WorktreeActiveHeader).into_owned();
                         for (branch, path, has_changes) in &worktrees {
@@ -1456,6 +1898,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                             } else {
                                 "".into()
                             };
+
                             txt.push_str(&format!(
                                 "    {} {:<16} {}  {}{}\n",
                                 marker,
@@ -1905,6 +2348,7 @@ pub(crate) fn apply_cd(ctx: &mut LoopCtx, path: PathBuf) {
         .send(AgentCommand::ChangeDir(path.to_string_lossy().to_string()))
         .ok();
     ctx.previous_dir = Some(std::mem::replace(&mut ctx.working_dir, path.clone()));
+    ctx.runtime_factory.set_working_dir(path.clone());
     push_recent_dir(&mut ctx.recent_dirs, path);
     save_recent_dirs(&ctx.recent_dirs);
 }
@@ -2069,12 +2513,7 @@ fn compose_login_chrome_inner(url: &str, unicode: bool, omit_url: bool) -> Strin
 /// passed through `decide_qr_style` so the decision logic stays unit
 /// testable.
 fn pick_qr_style(unicode: bool) -> Option<crate::render::qr::QrStyle> {
-    let env_flag = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-    };
+    let env_flag = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).is_some();
     let is_jediterm = std::env::var("TERMINAL_EMULATOR")
         .map(|v| v == "JetBrains-JediTerm")
         .unwrap_or(false);
@@ -2267,12 +2706,11 @@ fn run_oauth_with_renderer(
     let session = atomcode_core::auth::start_login()?;
 
     // QR + URL + ESC affordance go through the body via UiLine::CommandOutput
-    // — same channel as `Auth saved to:` etc., so they sit in scrollback
-    // above the input box exactly like any other slash-command output. The
-    // QR is the primary CTA (scan with phone); the URL is the fallback for
-    // users who'd rather click into a desktop browser. Both render before
-    // the best-effort browser launch so the QR is on screen even when the
-    // browser opens instantly.
+    // so they sit in scrollback above the input box exactly like any other
+    // slash-command output. The QR is the primary CTA (scan with phone); the
+    // URL is the fallback for users who'd rather click into a desktop browser.
+    // Both render before the best-effort browser launch so the QR is on
+    // screen even when the browser opens instantly.
     renderer.render(UiLine::CommandOutput(compose_login_chrome(
         session.url(),
         ctx.caps.unicode_symbols,
@@ -2409,7 +2847,43 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
     // Phase 2: claim/models/status. Pure HTTP + config mutation — no
     // stdin / stdout interaction, so we don't need to suspend the
     // renderer. `step_login` short-circuits via `is_logged_in()`.
-    let report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+    //
+    // If the stored token is locally valid (file present, expires_in
+    // not yet past) but the server rejects it (revoked, refresh-token
+    // dead, etc.), the orchestrator surfaces `report.auth_expired =
+    // true`. Run OAuth *once* on that path — same flow `/login` would
+    // have used — then re-run setup against the fresh token. Without
+    // this the user sees "✓ already logged in as X" followed by
+    // "✗ claim failed — run `atomcode login` again" and has to do
+    // manually what `/codingplan` could do itself.
+    let mut report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+    if matches!(&report, Ok(r) if r.auth_expired) {
+        renderer.render(UiLine::CommandOutput(
+            t(Msg::CpReauthAfter401).into_owned(),
+        ));
+        renderer.flush();
+        match run_oauth_with_renderer(renderer, ctx)
+            .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
+        {
+            Ok(_) => {
+                report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
+            }
+            Err(e) => {
+                // Re-OAuth itself failed (user pressed ESC, network
+                // dead, etc.). Render the *original* report so they
+                // still see what triggered the retry, then surface the
+                // OAuth error.
+                if let Ok(r) = &report {
+                    renderer.render(UiLine::CommandOutput(r.render()));
+                }
+                renderer.render(UiLine::Error(
+                    t(Msg::CodingPlanSetupFailed { error: &e.to_string() }).into_owned(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+        }
+    }
 
     match report {
         Ok(report) => {

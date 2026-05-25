@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>斜杠命令 · AtomCode 文档</title>
+<meta name="description" content="斜杠命令 — AtomCode 文档。">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="slash-commands">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>斜杠命令</h1>
+      <p class="lede">在 TUI 输入框中以 <code>/</code> 开头即可触发命令,并获得自动补全菜单。按功能分类的 30+ 个内置命令如下;Skills 和 Plugin 加载的命令也会自动出现在补全菜单里。</p>
+
+      <h2>核心功能</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/codingplan</code></td><td><strong>推荐</strong> — 一条命令登录 + 申领 AtomGit CodingPlan 免费额度 + 自动根据额度模型列表写好 provider 配置。首次启动最省事的入口</td></tr>
+          <tr><td><code>/login</code></td><td>仅完成 AtomGit OAuth 身份认证,<strong>不动 provider 配置</strong>(给已有 API Key 但想用 <code>/issue</code> 等 AtomGit 集成的用户)</td></tr>
+          <tr><td><code>/resume</code></td><td>打开会话选择器,恢复任意一个之前的持久化会话(含消息、目录和模型状态)</td></tr>
+          <tr><td><code>/session</code></td><td>创建一个全新的、干净的会话</td></tr>
+          <tr><td><code>/bg</code></td><td>将当前会话放到后台并打开新的前台会话;子命令: <code>/bg list</code>、<code>/bg &lt;N&gt;</code>、<code>/bg drop &lt;N&gt;</code>、<code>/bg help</code>。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
+          <tr><td><code>/background &lt;task&gt;</code></td><td>兼容入口:在一个 <code>/bg</code> 槽位中启动一次性后台任务(<a href="./sessions.html#bg">详解</a>)</td></tr>
+          <tr><td><code>/rename &lt;新名字&gt;</code></td><td>重命名当前会话(影响 <code>/resume</code> 选择器里的显示名)</td></tr>
+          <tr><td><code>/provider</code></td><td>打开 provider 管理界面,增删改切换</td></tr>
+          <tr><td><code>/model</code></td><td>在当前 provider 下切换模型,或跨 provider 切换</td></tr>
+          <tr><td><code>/cd</code></td><td>切换工作目录,并写回 <code>default_workdir</code>。也可以直接输入 <code>cd /path</code>(无需斜杠前缀)</td></tr>
+        </tbody>
+      </table>
+
+      <h2>工具与实用操作</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/undo</code></td><td>回滚上一轮 AI 对本地文件的所有编辑,基于 file-history 快照</td></tr>
+          <tr><td><code>/diff</code></td><td>显示当前工作目录未提交改动的 git diff</td></tr>
+          <tr><td><code>/cost</code></td><td>展示当前会话输出 token 数。不支持 usage 报告的 API 会自动估算</td></tr>
+          <tr><td><code>/context</code></td><td>显示本轮上下文预算分解:系统提示、工具定义、冷区压缩、总消息数、context window 占用</td></tr>
+          <tr><td><code>/compact</code></td><td>压缩历史消息,把早期对话压缩成摘要以腾出上下文预算</td></tr>
+          <tr><td><code>/clear</code></td><td>清空当前会话的消息(保留工作目录和模型)</td></tr>
+          <tr><td><code>/init</code></td><td>扫描当前工作目录,生成 / 刷新 <code>.atomcode.md</code> 项目指令文件 — 内含 build / test 命令、技术栈摘要、目录结构等,后续每次启动都会作为系统提示注入</td></tr>
+          <tr><td><code>/background &lt;任务&gt;</code></td><td>把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于"顺手让它去查一下 X"这类轻探索。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
+          <tr><td><code>/worktree &lt;子命令&gt;</code></td><td>Git worktree 隔离:<code>create</code> 在新分支上拉一份独立 worktree、<code>list</code> 查看现有 worktree、<code>done</code> 把 worktree 改动 squash 回主分支、<code>cleanup</code> 清理已完成的 worktree</td></tr>
+          <tr><td><code>/issue</code></td><td>交互式向导:在当前 git 仓库对应的 AtomGit 仓库创建一个新 issue(需先 OAuth 登录,cwd 必须是 atomgit.com 仓库的 clone)</td></tr>
+        </tbody>
+      </table>
+
+      <h2>对话模式与思考</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/plan</code></td><td>切到 <strong>Plan 模式</strong>:只读探索,模型可以调用 <code>read_file</code> / <code>grep</code> / <code>list_directory</code> 等不写盘的工具,但 <code>edit_file</code> / <code>bash</code> 等会被屏蔽。适合在动手之前让模型先理清方案</td></tr>
+          <tr><td><code>/build</code></td><td>切回 <strong>Build 模式</strong>(默认):全部工具可用,可以读、写、执行。<code>/plan</code> 和 <code>/build</code> 之间可随时来回切</td></tr>
+          <tr><td><code>/think on</code> / <code>off</code></td><td>开关 extended thinking(对支持的模型 — Claude / DeepSeek-R1 / GLM-4.5 等)。开启后模型会输出推理过程,代价是更慢更费 token</td></tr>
+          <tr><td><code>/think budget &lt;N&gt;</code></td><td>给 thinking 设个 token 预算上限(对 Claude 系列生效),控制推理长度</td></tr>
+        </tbody>
+      </table>
+
+      <h2>永久记忆</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/remember &lt;内容&gt;</code></td><td>记一条到项目级记忆(默认作用域,绑定当前工作目录)</td></tr>
+          <tr><td><code>/remember --global &lt;内容&gt;</code></td><td>记一条到全局记忆(所有项目共享)</td></tr>
+          <tr><td><code>/forget &lt;关键词&gt;</code></td><td>删除全局 + 项目记忆中含该关键词的所有条目(大小写不敏感)</td></tr>
+          <tr><td><code>/memory</code></td><td>查看当前生效的所有记忆,按 <code>[Global]</code> / <code>[Project]</code> 分组</td></tr>
+        </tbody>
+      </table>
+      <p>详细使用与最佳实践见 <a href="./memory.html">永久记忆</a>。</p>
+
+      <h2>扩展生态</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/setup</code></td><td>第一次执行时,把内置的 <code>atomcode-automation-recommender</code> skill 解压到 <code>~/.atomcode/skills/</code>,在项目 <code>.gitignore</code> 追加 <code>.atomcode/local/</code>,并写 <code>.atomcode/setup-state.json</code>(signals 哈希 + atomcode 版本 + 已安装列表),全程持项目级锁。然后自动调用 recommender skill — 它会扫描项目(语言、框架、已有 hook 等)、联网检索并推荐适合该代码库的其他 atomcode skill 安装。后续执行会跳过 seed 安装、直接重跑 skill。命令后跟的文字会作为 steering 传给 skill,例如 <code>/setup 重点关注测试</code>。CLI 形式 <code>atomcode setup --force</code> 会按内容哈希强制重装 seed 文件</td></tr>
+          <tr><td><code>/skills</code></td><td>浏览当前已加载的 skills(项目级 + 用户级)。每个 skill 也会以独立的斜杠命令形式出现在补全菜单里,可以直接 <code>/&lt;skill-name&gt;</code> 触发</td></tr>
+          <tr><td><code>/plugin marketplace</code></td><td>打开插件市场浏览器,从已注册的 marketplace 中挑选并安装</td></tr>
+          <tr><td><code>/plugin install &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>从指定 marketplace 安装插件</td></tr>
+          <tr><td><code>/plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;</code></td><td>卸载已安装的插件(保留 marketplace 注册)</td></tr>
+          <tr><td><code>/plugin list</code></td><td>列出本地已安装的插件</td></tr>
+        </tbody>
+      </table>
+      <p>详细配置与使用见 <a href="./skills.html">Skills 扩展</a> 和 <a href="./plugins.html">Plugin 系统</a>。</p>
+
+      <h2>MCP 集成</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/mcp</code></td><td>列出已成功连接的 MCP server 及其状态(连接失败的 server 不在此列表,只在会话区有红色错误行)</td></tr>
+          <tr><td><code>/mcp tools &lt;server&gt;</code></td><td>异步列出某个 MCP server 实际暴露的远端 tools(若超时/失败会提示)</td></tr>
+          <tr><td><code>/mcp reload</code></td><td>重新读取 <code>.mcp.json</code> / <code>~/.atomcode/mcp.json</code> 并后台重连所有 server</td></tr>
+        </tbody>
+      </table>
+      <p>详细配置与使用见 <a href="./mcp.html">MCP 集成</a>。</p>
+
+      <h2>配置与帮助</h2>
+      <table>
+        <thead>
+          <tr><th>命令</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/status</code></td><td>显示登录状态、当前 provider、模型、上下文预算、CodingPlan 用量和重置时间</td></tr>
+          <tr><td><code>/whoami</code></td><td>显示当前 AtomGit 登录用户的用户名 / 邮箱</td></tr>
+          <tr><td><code>/config</code></td><td>显示 <code>~/.atomcode/config.toml</code> 的路径</td></tr>
+          <tr><td><code>/reload</code></td><td>从磁盘热加载 <code>~/.atomcode/config.toml</code>,不需要重启 atomcode 就能让外部修改(或另一个终端的 <code>/codingplan</code> 带来的变更)生效</td></tr>
+          <tr><td><code>/language</code></td><td>切换界面语言:自动检测(<code>LC_ALL</code> / <code>LANG</code>)、English、或 简体中文。立即生效并写回 <code>~/.atomcode/config.toml</code></td></tr>
+          <tr><td><code>/welcome</code></td><td>重新打开 3 步首次启动向导(欢迎页 → 语言 → 接入方式)。会话非空时会先弹 <code>y/N</code> 二次确认,确认后清屏。语言和默认接入方式都可以从这里再调一次</td></tr>
+          <tr><td><code>/logout</code></td><td>清除 AtomGit OAuth token</td></tr>
+          <tr><td><code>/upgrade</code></td><td>自动升级到最新版本;子命令 <code>/upgrade rollback</code> 回滚到上一个版本</td></tr>
+          <tr><td><code>/help</code></td><td>展示所有可用斜杠命令的列表</td></tr>
+          <tr><td><code>/keys</code></td><td>展示键盘快捷键参考(分组列出输入 / 历史 / 会话 / 弹层导航,并标注 <code>Shift+Enter</code>、<code>Alt+Enter</code> 在不同终端的兼容性)。详见 <a href="./keybindings.html">键盘快捷键</a></td></tr>
+          <tr><td><code>/quit</code></td><td>退出 atomcode(也可以连按两次 <code>Ctrl+C</code>)</td></tr>
+        </tbody>
+      </table>
+
+      <h2>命令使用技巧</h2>
+      <ul>
+        <li><strong>自动补全</strong> —— 输入 <code>/</code> 后会立刻弹出补全菜单,用 <code>↑↓</code> 选择,<code>Tab</code> / <code>Enter</code> 确认。</li>
+        <li><strong>模糊匹配</strong> —— 补全支持子串匹配,比如输入 <code>/prov</code> 就能命中 <code>/provider</code>。</li>
+        <li><strong>打断正在进行的操作</strong> —— 模型正在流式输出时按 <code>Esc</code> 可以打断,然后再输入新的命令或 prompt。</li>
+        <li><strong>Skills 也会出现在菜单里</strong> —— 当你在 <a href="./skills.html">Skills 目录</a>中添加了自定义命令后,它们会以相同格式出现在补全菜单里。</li>
+      </ul>
+
+      <h2>典型工作流</h2>
+
+      <h3>第一次启动 — 一键接入</h3>
+      <pre><code>&gt; /codingplan
+  ✔ Logged in as alice (alice, alice@example.com)
+  ✔ CodingPlan claimed — CodingPlan Free · expires 2026-05-22 (29d / 30d)
+  ✔ 3 models registered as AtomGit-* providers
+  ✔ Default provider set to AtomGit-GLM
+&gt; 你好</code></pre>
+
+      <h3>做完一件事前把成本看一眼</h3>
+      <pre><code>&gt; 重构 src/db 使用连接池
+... (AI 执行)
+&gt; /cost
+Session token usage
+- Total output tokens: 8342
+- Current turn tokens: 2156
+- Context: 42K / 128K</code></pre>
+
+      <h3>改完不满意就回滚</h3>
+      <pre><code>&gt; 给所有函数加 JSDoc
+... (AI 编辑了 12 个文件)
+&gt; /undo
+Rolled back 12 file edits from the last turn.</code></pre>
+
+      <h3>模型表现不好换一个再试</h3>
+      <pre><code>&gt; /model
+&gt; (在弹出的菜单里选择 claude-opus-4-6)
+&gt; 再试一次,这次注意保留原有注释</code></pre>
+
+      <h2>下一步</h2>
+      <ul>
+        <li><a href="./keybindings.html">快捷键</a> —— 命令和快捷键配合使用效率翻倍</li>
+        <li><a href="./sessions.html">会话与撤销</a> —— <code>/resume</code>、<code>/undo</code>、<code>/compact</code> 的详细行为</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

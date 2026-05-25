@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 const fs = require('fs');
 const path = require('path');
 
@@ -23,15 +24,34 @@ function currentTargetId() {
   return undefined;
 }
 
+// Map platform IDs to Rust target triples for cross-compilation lookup.
+function targetTriple(platformId) {
+  const triples = {
+    'darwin-arm64': 'aarch64-apple-darwin',
+    'darwin-x64': 'x86_64-apple-darwin',
+    'linux-x64': 'x86_64-unknown-linux-gnu',
+    'linux-arm64': 'aarch64-unknown-linux-gnu',
+    'win32-x64': 'x86_64-pc-windows-msvc',
+  };
+  return triples[platformId];
+}
+
 function sourceFor(target) {
   const explicit = process.env[target.env];
   if (explicit) return path.resolve(explicit);
 
   if (target.id === currentTargetId()) {
     const localExe = process.platform === 'win32' ? 'atomcode-daemon.exe' : 'atomcode-daemon';
+    // Search native (no --target) and cross-compilation (--target <triple>) build outputs.
+    const triple = targetTriple(target.id);
     for (const profile of ['release', 'debug']) {
-      const candidate = path.join(repoRoot, 'target', profile, localExe);
-      if (fs.existsSync(candidate)) return candidate;
+      const candidates = [path.join(repoRoot, 'target', profile, localExe)];
+      if (triple) {
+        candidates.push(path.join(repoRoot, 'target', triple, profile, localExe));
+      }
+      for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+      }
     }
   }
 

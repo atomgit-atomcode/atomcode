@@ -17,42 +17,55 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── /codingplan ──
         Msg::CodingPlanSetupFailed { error } =>
             format!("CodingPlan 设置失败：{error}").into(),
+        Msg::CpReauthAfter401 =>
+            "  ⚠ 登录凭证已失效 — 正在重新登录...\n".into(),
+        Msg::ChatAuthExpired =>
+            "认证已过期，请执行 /login 重新登录".into(),
         Msg::CpSetupHeader =>
             "  AtomCode CodingPlan 配置：\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>
-            format!("  ✔ 已登录：{} ({}，{})\n", who, username, email).into(),
+            format!("  ✓ 已登录：{} ({}，{})\n", who, username, email).into(),
         Msg::CpStepSkipped { reason } =>
-            format!("  ✔ {}\n", reason).into(),
+            format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✘ 登录失败 — {}\n", error).into(),
+            format!("  ✗ 登录失败 — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
-            format!("  ✔ CodingPlan 已领取 — {}（CodingPlan {}）\n", message, plan_type).into(),
+            format!("  ✓ CodingPlan 已领取 — {}（CodingPlan {}）\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "成功".into(),
         Msg::CpAlreadyClaimed { reason } =>
-            format!("  ✔ CodingPlan 已领取 — {}\n", reason).into(),
+            format!("  ✓ CodingPlan 已领取 — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✘ CodingPlan 领取失败 — {}\n", error).into(),
+            format!("  ✗ CodingPlan 领取失败 — {}\n", error).into(),
+        Msg::CpClaimTierSucceeded { tier } =>
+            format!("  ✓ CodingPlan {} 领取成功\n", tier).into(),
+        Msg::CpClaimTierAlreadyHeld { tier } =>
+            format!("  ✓ CodingPlan {} 已领取\n", tier).into(),
+        Msg::CpClaimTierFailed { tier, reason } =>
+            format!("  ✗ CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
-            format!("  ✔ 已添加 {} 个 Provider：\n", count).into(),
-        Msg::CpLockedJediterm { name } =>
-            format!("      ✗ {}  （已锁定：需要升级套餐）\n", name).into(),
-        Msg::CpLockedAnsi { name } =>
-            format!("      • \x1b[9m{}\x1b[29m  （需要升级套餐）\n", name).into(),
+            format!("  ✓ 已添加 {} 个 Provider：\n", count).into(),
+        Msg::CpLocked { name } =>
+            // SGR 31 / 39 = 标准红前景 + 默认色重置。用标准色（不
+            // 是亮色）让终端按当前主题映射 —— Solarized / Dracula /
+            // 浅色模式都会落到各自的「红」上，不会被一个写死的 RGB
+            // 锁住。retained 渲染器走严格 sanitizer 会把 SGR 剥光，
+            // 但 `✗ … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
+            format!("      \x1b[31m✗ {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  （默认）".into(),
         Msg::CpVisionAuto { kind } =>
-            format!("  ✔ 视觉预处理器 → {}  （自动检测）\n", kind).into(),
+            format!("  ✓ 视觉预处理器 → {}  （自动检测）\n", kind).into(),
         Msg::CpVisionUserSupplied { kind } =>
-            format!("  ✔ 视觉预处理器 → {}  （保留用户设置）\n", kind).into(),
+            format!("  ✓ 视觉预处理器 → {}  （保留用户设置）\n", kind).into(),
         Msg::CpVisionCleared =>
             "  ⚠ 视觉预处理器已清除 — 当前模型列表中没有可用的 VL/OCR 模型\n".into(),
         Msg::CpModelsSkipped { reason } =>
-            format!("  ✔ 模型步骤已跳过 — {}\n", reason).into(),
+            format!("  ✓ 模型步骤已跳过 — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✘ 模型步骤失败 — {}\n", error).into(),
+            format!("  ✗ 模型步骤失败 — {}\n", error).into(),
         Msg::CpStatusHeader =>
-            "  ✔ CodingPlan 状态：\n".into(),
+            "  ✓ CodingPlan 状态：\n".into(),
         Msg::CpPlanPending { plan } =>
             format!("      套餐：{}  ·  正在激活\n", plan).into(),
         Msg::CpPlanActive { plan, expires_at, remaining_days, total_days } =>
@@ -70,6 +83,25 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("  ⚠ 状态获取已跳过 — {}\n", reason).into(),
         Msg::CpStatusFetchFailed { error } =>
             format!("  ⚠ 状态获取失败（非致命） — {}\n", error).into(),
+        Msg::CpOfficialBuildRequired => Cow::Borrowed(
+            "此功能需要官方 AtomCode 构建，请前往 \
+             https://atomgit.com/atomgit_atomcode/atomcode/releases 下载安装。",
+        ),
+        Msg::CpAuthRequired => Cow::Borrowed(
+            "未登录 AtomCode CodingPlan。请运行 /codingplan 完成登录后再发送请求。",
+        ),
+        Msg::CpSignStaleClockSkew => Cow::Borrowed(
+            "请求被服务端拒绝：签名时间戳已过期。请校准本地系统时间（NTP 同步）后重试。",
+        ),
+        Msg::CpSignReplayPersisted => Cow::Borrowed(
+            "请求多次被识别为重放，请重新运行命令。",
+        ),
+        Msg::CpSignVersionTooOld => Cow::Borrowed(
+            "当前 AtomCode 版本过旧，已不兼容 CodingPlan。请升级 AtomCode 后继续使用。",
+        ),
+        Msg::CpUpgradeRequired => Cow::Borrowed(
+            "需要升级才能继续使用 CodingPlan，请前往官方发布页安装最新版 AtomCode。",
+        ),
 
         Msg::ErrUnsupportedLocale { input } =>
             format!("不支持的语言：{input}").into(),
@@ -83,6 +115,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "（未配置）".into(),
         Msg::StatusClipboardImageHint =>
             "剪贴板有图片 · ctrl+v 粘贴".into(),
+        Msg::StatusClipboardImageHintSlash =>
+            "剪贴板有图片 · /paste 粘贴".into(),
 
         // ── /status 命令主体 ──
         Msg::StatusBody { model, dir, config, tokens } =>
@@ -124,6 +158,53 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 帮助 ──
         Msg::HelpAvailableCommands =>
             "  可用命令：\n".into(),
+        Msg::KeybindingsHelp => r#"  键盘快捷键
+
+  ── 输入 ──
+    Enter                            发送消息
+    Ctrl+J                           插入换行（所有终端通用）
+    \ 后接 Enter                     插入换行（atomcode 兜底，所有终端通用）
+    Alt+Enter                        插入换行 *
+    Shift+Enter                      插入换行 **
+    /                                打开斜杠命令菜单
+    Tab                              自动补全
+    Backspace / Ctrl+H               删除上一个字符
+    Delete / Ctrl+?                  删除下一个字符
+    Ctrl+W                           删除前一个单词
+    Ctrl+U                           清空当前行
+    Ctrl+K                           删除到行尾
+    Ctrl+A / Home                    跳到行首
+    Ctrl+E / End                     跳到行尾
+    Left / Right                     光标左右移动
+
+  ── 历史 ──
+    Up                               上一条输入
+    Down                             下一条输入
+
+  ── 会话 ──
+    Ctrl+C                           取消当前轮 / 关闭弹层
+    Ctrl+D                           退出 atomcode
+    Ctrl+L                           清屏
+    Ctrl+O                           切换工具实时输出
+    Ctrl+V                           粘贴（文本 + 图片）
+
+  ── 斜杠菜单 / 弹层导航 ──
+    Up / Down                        移动选择
+    Enter                            确认
+    Esc                              取消 / 关闭弹层
+    Tab                              插入当前高亮命令
+
+  * Alt+Enter 在多数终端可用；macOS Apple Terminal 需在
+    Settings → Profiles → Keyboard 启用 "Use Option as Meta key"
+    才会发送换行。
+  ** Shift+Enter 需要终端区分该按键，目前已知支持的有：
+     Kitty / WezTerm / iTerm2（启用 Report Modifiers）/
+     Windows Terminal / Ghostty / Warp。其他终端（包括 macOS
+     Apple Terminal、默认 xterm、GNOME Terminal、VS Code 集成
+     终端）不区分 Shift+Enter 与 Enter，请用 Ctrl+J 或 \ + Enter。
+
+  提示：输入 /help 查看完整斜杠命令列表。
+"#.into(),
 
         // ── Provider 向导 ──
         Msg::ProviderWizardHeader =>
@@ -202,6 +283,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出会话失败：{error}").into(),
         Msg::SessionRenamed { old, new } =>
             format!("  已重命名：'{old}' -> '{new}'").into(),
+        Msg::SessionSaveFailed { error } =>
+            format!("保存会话失败：{error}。未持久化新名称。").into(),
         Msg::SessionNoneSelected =>
             "未选中会话".into(),
         Msg::SessionRenameEditing { buffer } =>
@@ -227,7 +310,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueTitleConfirmed { title } =>
             format!("✓ 标题：{title}").into(),
         Msg::IssueCreated { number, title, url } =>
-            format!("  [issue] ✔ 已创建 #{number}：{title}\n  {url}\n").into(),
+            format!("  [issue] ✓ 已创建 #{number}：{title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
             format!("  [issue] ✗ 创建失败：{error}\n").into(),
         Msg::IssueRequiredField { field } =>
@@ -250,6 +333,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "添加自定义模型".into(),
         Msg::IdleHintProviderFull =>
             "使用 /provider 添加自定义模型".into(),
+        Msg::IdleHintCodingplan => "/codingplan".into(),
+        Msg::IdleHintCodingplanSuffix =>
+            "领取免费 Token 额度".into(),
+        Msg::IdleHintCodingplanFull =>
+            "使用 /codingplan 领取免费 Token 额度".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>
@@ -345,11 +433,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             设置 ATOMCODE_PLAIN=1 使用基础输出，或设置 ATOMCODE_RETAIN=1\n    \
             绕过此回退（滚动时可能出现重复内容）。\n\n".into(),
 
-        // ── 会话回放 ──
-        Msg::SessionReplayHint =>
-            "  ⓘ 正在显示上次会话 — 模型上下文从头开始。\n    \
-            使用 /resume 完整恢复对话，包括模型记忆。\n\n".into(),
-
         // ── 后台任务 ──
         Msg::BackgroundComplete { turns } =>
             format!("  后台任务完成（{} 轮）：\n", turns).into(),
@@ -402,7 +485,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::InitAlreadyExists { path } =>
             format!("  {} 已存在。使用 `/init --force` 覆盖。\n", path).into(),
         Msg::InitWrote { path, bytes } =>
-            format!("  已写入 {}（{} 字节）。编辑以自定义；下次会话生效。\n", path, bytes).into(),
+            format!("  已写入 {}（{} 字节）。编辑以自定义；下一条消息生效。\n", path, bytes).into(),
         Msg::InitFailed { error } =>
             format!("  /init 失败：{}\n", error).into(),
 
@@ -448,7 +531,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServersHeader =>
             "  MCP 服务器：\n".into(),
         Msg::McpReloadFailed { error } =>
-            format!("MCP 重载失败：无法加载 .mcp.json / ~/.atomcode/mcp.json：{:#}", error).into(),
+            format!("MCP 重载失败：无法加载 .mcp.json / $ATOMCODE_HOME/mcp.json：{:#}", error).into(),
         // /mcp login / logout
         Msg::McpOAuthLoginUsage =>
             "  用法：/mcp login <服务名>\n  示例：/mcp login github\n".into(),
@@ -525,6 +608,34 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HelpSourceGlobal => "全局".into(),
         Msg::HelpSourceProject => "项目".into(),
 
+        // ── /setup ──
+        Msg::SetupHeader { installed, skipped, failed, duration_ms } =>
+            format!("\n✅ Setup 完成 — {} 装好, {} 跳过, {} 失败  · 耗时 {}ms\n\n", installed, skipped, failed, duration_ms).into(),
+        Msg::SetupInstalledLabel =>
+            "已安装:\n".into(),
+        Msg::SetupSkippedLabel =>
+            "\n跳过:\n".into(),
+        Msg::SetupFailedLabel =>
+            "\n失败:\n".into(),
+        Msg::SetupInstalledRow { kind, slug, path } =>
+            format!("  ✓ {}:{} → {}\n", kind, slug, path).into(),
+        Msg::SetupSkippedRow { kind, slug, reason } =>
+            format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
+        Msg::SetupFailedRow { kind, slug, error } =>
+            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+        Msg::CmdSetupTip =>
+            "\u{1f4a1} 提示：运行 \x1b[1;96m/setup\x1b[0m 可自动为该项目配置 hooks、skills 和 MCP。".into(),
+        Msg::CmdSetupRunning =>
+            "正在运行 atomcode setup...".into(),
+        Msg::CmdSetupSkillsReloaded { count } =>
+            format!("  🔄 Skills 已重载 — {} 个可用", count).into(),
+        Msg::CmdSetupError { error } =>
+            format!("setup 错误：{error}").into(),
+        Msg::CmdSetupRunningSkill =>
+            "  🚀 正在运行 setup skill — 分析项目并生成推荐...".into(),
+        Msg::CmdSetupSkillMissing =>
+            "setup skill 未找到 — 请重新运行 /setup 以重新安装".into(),
+
         // ── /plugin ──
         Msg::PluginUsage =>
             "用法：/plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),
@@ -562,6 +673,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出插件失败：{error}").into(),
 
         // ── 命令描述 ──
+Msg::CmdDescSetup =>
+"扫描项目、安装种子文件并运行 setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescCodingplan =>
             "领取 CodingPlan 并从计划的模型列表中配置模型".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),
@@ -573,10 +686,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescProvider => "管理 Provider（添加 / 编辑 / 删除）".into(),
         Msg::CmdDescStatus => "显示会话状态".into(),
         Msg::CmdDescConfig => "显示配置文件路径".into(),
-        Msg::CmdDescReload => "从磁盘重新加载 ~/.atomcode/config.toml".into(),
+        Msg::CmdDescReload => "从磁盘重新加载 $ATOMCODE_HOME/config.toml".into(),
         Msg::CmdDescCd => "切换工作目录".into(),
-        Msg::CmdDescInit => "从工作目录生成 .atomcode.md 项目指令".into(),
-        Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务（只读工具子集）".into(),
+Msg::CmdDescInit => "从工作目录生成 .atomcode.md 项目指令".into(),
+Msg::CmdDescBg => "后台会话：/bg、/bg list、/bg <N>、/bg drop <N>".into(),
+Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务（只读工具子集）".into(),
         Msg::CmdDescDiff => "显示 git diff".into(),
         Msg::CmdDescClear => "清屏".into(),
         Msg::CmdDescSession => "开始新会话（清除对话）".into(),
@@ -595,10 +709,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
         Msg::CmdDescHelp => "显示帮助".into(),
+        Msg::CmdDescKeys => "显示键盘快捷键".into(),
         Msg::CmdDescLanguage => "切换显示语言".into(),
         Msg::CmdDescQuit => "退出 AtomCode".into(),
         Msg::CmdDescSkills => "浏览已加载的技能".into(),
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, list）".into(),
+        Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
+        Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>
@@ -682,5 +799,80 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             所有终端均可用。（Shift / Alt / Ctrl + Enter 在部分终端也支持，\n    \
             取决于该终端的键盘协议 — 可以试试看。）\n\n"
                 .into(),
+
+        // ── /bg（后台会话）──
+        Msg::BgHelp =>
+            "  /bg                 将当前会话放到后台，打开新的前台会话\n  /bg list            列出后台会话\n  /bg <N>             恢复第 N 号后台会话\n  /bg drop <N>        丢弃第 N 号后台会话\n  /bg help            显示此帮助\n".into(),
+        Msg::BgListEmpty => "  没有后台会话。\n".into(),
+        Msg::BgListHeader => "  #   ID        状态       创建时间   摘要\n".into(),
+        Msg::BgListRow { slot, short_id, state, age, summary } =>
+            format!("  {:<3} {:<8}  {:<9}  {:<8}  {}\n", slot, short_id, state, age, summary).into(),
+        Msg::BgStateRunning => "运行中".into(),
+        Msg::BgStateIdle => "空闲".into(),
+        Msg::BgStateDone => "已完成".into(),
+        Msg::BgStateCancelled => "已取消".into(),
+        Msg::BgStateError => "错误".into(),
+        Msg::BgAgeNow => "刚刚".into(),
+        Msg::BgAgeMinutes { n } => format!("{n} 分钟").into(),
+        Msg::BgAgeHours { n } => format!("{n} 小时").into(),
+        Msg::BgAgeDays { n } => format!("{n} 天").into(),
+        Msg::BgSlotLimitReached { max } =>
+            format!("后台槽位已达上限（{max}）").into(),
+        Msg::BgBackgroundCurrent { new_id, slot, old_id, state } =>
+            format!("  新前台会话 [{new_id}]\n  后台：[#{slot}] {old_id}（状态：{state}）\n").into(),
+        Msg::BgInvalidSlot { slot, available } =>
+            format!("无效的后台槽位 {slot}（可用：{available}）").into(),
+        Msg::BgNoRuntimeClient => "后台槽位没有运行时客户端".into(),
+        Msg::BgResumed { slot, short_id } =>
+            format!("  已恢复后台 [#{slot}] {short_id}\n").into(),
+        Msg::BgPreviousForegroundMoved { slot } =>
+            format!("  原前台会话已移至 [#{slot}]\n").into(),
+        Msg::BgDropped { slot, short_id } =>
+            format!("  已丢弃后台 [#{slot}] {short_id}\n").into(),
+        Msg::BgTaskStarted { slot, short_id } =>
+            format!("  后台：[#{slot}] {short_id}（状态：运行中）\n").into(),
+        Msg::BgTaskTimedOut { secs } =>
+            format!("后台任务超时（{secs} 秒）。").into(),
+        Msg::BgTaskError { error } =>
+            format!("错误：{error}").into(),
+        Msg::BgTaskCancelled => "已取消。".into(),
+        Msg::BgTaskNoSummary => "任务完成（无摘要文本）。".into(),
+    }
+}
+
+#[cfg(test)]
+mod codingplan_crypto_tests {
+    use super::*;
+    use crate::i18n::Msg;
+
+    #[test]
+    fn zh_official_build_required_mentions_official_and_releases() {
+        let s = zh_cn(Msg::CpOfficialBuildRequired);
+        assert!(s.contains("官方"));
+        assert!(s.contains("releases") || s.contains("发布"));
+    }
+
+    #[test]
+    fn zh_stale_clock_mentions_time() {
+        let s = zh_cn(Msg::CpSignStaleClockSkew);
+        assert!(s.contains("时间") || s.contains("时钟"));
+    }
+
+    #[test]
+    fn zh_replay_persisted_is_non_empty() {
+        let s = zh_cn(Msg::CpSignReplayPersisted);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn zh_version_too_old_mentions_upgrade() {
+        let s = zh_cn(Msg::CpSignVersionTooOld);
+        assert!(s.contains("升级") || s.contains("更新"));
+    }
+
+    #[test]
+    fn zh_upgrade_required_is_non_empty() {
+        let s = zh_cn(Msg::CpUpgradeRequired);
+        assert!(!s.is_empty());
     }
 }

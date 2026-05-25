@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Quickstart · AtomCode Docs</title>
+<meta name="description" content="Install AtomCode and run your first task in a few minutes.">
+<link rel="icon" type="image/png" href="https://cdn-static.gitcode.host/static/images/logo-favicon.png">
+<link rel="stylesheet" href="../docs.css">
+<script>(function(){try{var s=localStorage.getItem('atomcode_theme')||localStorage.getItem('atomcode-theme');if(s==='light'){document.documentElement.classList.add('light');document.documentElement.setAttribute('data-theme','light')}}catch(e){}})();</script>
+</head>
+<body data-page="getting-started">
+
+<header class="dhdr" id="dhdr">
+  <a class="dhdr-logo" href="../../index.html">
+    <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
+    <span>AtomCode</span>
+    <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
+    <span class="dhdr-ver">v4.23.1</span>
+  </a>
+  <div class="dhdr-right">
+    <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <span data-i18n="search.trigger.text">搜索文档…</span>
+      <span class="kbd">⌘K</span>
+    </button>
+    <button class="icon-btn" id="themeBtn" data-i18n-aria="aria.theme" aria-label="切换主题"></button>
+    <button class="icon-btn" id="langBtn" data-i18n-aria="aria.lang" aria-label="切换语言">中</button>
+    <a class="dhdr-link" href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank" rel="noopener" data-i18n="hdr.repo">仓库 →</a>
+    <button class="icon-btn sb-toggle" id="sbToggle" data-i18n-aria="aria.sidebar" aria-label="目录">☰</button>
+  </div>
+</header>
+
+<div class="dlayout">
+  <aside class="dside" id="dside">
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.overview">概览</div>
+    <a class="dside-link" href="./index.html" data-slug="index" data-i18n="side.index">文档首页</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.start">开始</div>
+    <a class="dside-link" href="./getting-started.html" data-slug="getting-started" data-i18n="side.getting-started">快速开始</a>
+    <a class="dside-link" href="./login.html" data-slug="login" data-i18n="side.login">登录方式</a>
+    <a class="dside-link" href="./configuration.html" data-slug="configuration" data-i18n="side.configuration">配置文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.usage">使用</div>
+    <a class="dside-link" href="./basic-usage.html" data-slug="basic-usage" data-i18n="side.basic-usage">基本使用</a>
+    <a class="dside-link" href="./slash-commands.html" data-slug="slash-commands" data-i18n="side.slash-commands">斜杠命令</a>
+    <a class="dside-link" href="./keybindings.html" data-slug="keybindings" data-i18n="side.keybindings">快捷键</a>
+    <a class="dside-link" href="./sessions.html" data-slug="sessions" data-i18n="side.sessions">会话与撤销</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.advanced">进阶</div>
+    <a class="dside-link" href="./tools.html" data-slug="tools" data-i18n="side.tools">内置工具</a>
+    <a class="dside-link" href="./skills.html" data-slug="skills" data-i18n="side.skills">Skills 扩展</a>
+    <a class="dside-link" href="./mcp.html" data-slug="mcp" data-i18n="side.mcp">MCP 集成</a>
+    <a class="dside-link" href="./plugins.html" data-slug="plugins" data-i18n="side.plugins">Plugin 系统</a>
+    <a class="dside-link" href="./memory.html" data-slug="memory" data-i18n="side.memory">永久记忆</a>
+    <a class="dside-link" href="./project-instructions.html" data-slug="project-instructions" data-i18n="side.project-instructions">项目指令文件</a>
+  </div>
+
+  <div class="dside-group">
+    <div class="dside-group-t" data-i18n="side.g.ops">问题</div>
+    <a class="dside-link" href="./faq.html" data-slug="faq" data-i18n="side.faq">常见问题</a>
+  </div>
+  </aside>
+
+  <main class="dmain prose-docs">
+<h1>Quickstart</h1>
+      <p class="lede">Install AtomCode, run the first-time wizard, and complete your first task in a few minutes.</p>
+
+      <h2>Requirements</h2>
+      <ul>
+        <li><strong>OS</strong>: macOS (Apple Silicon or Intel), Linux, Windows, or HarmonyOS PC</li>
+        <li><strong>Rust toolchain</strong>: 1.75+ (only required when building from source)</li>
+        <li><strong>LLM</strong>: an API key for any supported provider, or an AtomGit account (for OAuth login)</li>
+      </ul>
+
+      <h2>Install</h2>
+
+      <h3>Option 1: one-click install (recommended)</h3>
+      <p>On macOS, Linux, or HarmonyOS PC:</p>
+      <pre><code>curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.23.1/install.sh | sh</code></pre>
+      <p>The script downloads the prebuilt binary for your platform and places it at <code>~/.local/bin/atomcode</code>. Make sure that directory is on your <code>PATH</code>.</p>
+      <p>On Windows PowerShell:</p>
+      <pre><code>irm https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v4.23.1/install.ps1 | iex</code></pre>
+      <p>It downloads the Windows x64 prebuilt binary and updates <code>PATH</code>; open a fresh terminal to use the <code>atomcode</code> command.</p>
+
+      <h3>Option 2: build from source</h3>
+      <pre><code>git clone https://atomgit.com/atomgit_atomcode/atomcode.git
+cd atomcode
+cargo build --release
+cp target/release/atomcode ~/.local/bin/</code></pre>
+      <p>Release builds take longer to compile but produce a small, fast binary. For day-to-day development a plain <code>cargo build</code> is fine.</p>
+
+      <h2>Verify the install</h2>
+      <pre><code>atomcode --version</code></pre>
+      <p>You should see something like <code>atomcode 4.20.x (build-id)</code>.</p>
+
+      <h2>First run</h2>
+      <p>Just run:</p>
+      <pre><code>atomcode</code></pre>
+      <p>The first launch shows a <strong>3-step onboarding wizard</strong> (you can re-open it any time with <code>/welcome</code>):</p>
+
+      <h3>Step 1/3 · Welcome</h3>
+      <pre><code>             ███  █████  ███  █     █  ████  ███  ████  █████
+            █   █   █   █   █ ██   ██ █     █   █ █   █ █
+            █████   █   █   █ █ █ █ █ █     █   █ █   █ ████
+            █   █   █   █   █ █  █  █ █     █   █ █   █ █
+            █   █   █    ███  █     █  ████  ███  ████  █████
+
+  AtomCode
+  Version 4.22.3  ·  AI coding agent in your terminal
+
+  • Multi-step agent loop · built-in code-graph tools
+  • Compatible with any OpenAI-style API
+  • Free tokens via CodingPlan
+
+  Press Enter to continue.   Ctrl+C exits at any point.</code></pre>
+
+      <h3>Step 2/3 · Language (Choose your language / 选择语言)</h3>
+      <pre><code>  1. Auto-detect (LC_ALL / LANG)
+  2. English
+  3. 简体中文 (Simplified Chinese)
+
+  1-3 select · Enter confirm · ← back · Esc skip</code></pre>
+      <p>Your choice takes effect immediately and is written to the <code>locale</code> field of <code>~/.atomcode/config.toml</code>. Run <code>/language</code> later to change it.</p>
+
+      <h3>Step 3/3 · Setup (how would you like to start?)</h3>
+      <pre><code>  1. One-click with AtomGit CodingPlan  (recommended · free tokens + auto-configured provider)
+  2. Configure a provider manually      (you have an API key)
+  3. Skip and explore the TUI first     (run /codingplan or /provider later)
+
+  1-3 select · Enter confirm · ← back · Esc skip</code></pre>
+      <ul>
+        <li><strong>CodingPlan</strong> — the recommended path; equivalent to running <code>/codingplan</code> inside the TUI. The browser opens AtomGit OAuth; after you log in, free tokens are claimed automatically and the granted model list is written as a provider config.</li>
+        <li><strong>Configure manually</strong> — equivalent to <code>/provider</code>: open the provider manager to fill in key / base URL / model.</li>
+        <li><strong>Skip</strong> — jump straight into the TUI and run <code>/codingplan</code>, <code>/login</code>, or <code>/provider</code> later.</li>
+      </ul>
+      <p>For a deeper breakdown see <a href="./login.html">Login Methods</a>. You can re-open the wizard any time with <code>/welcome</code>.</p>
+
+      <h2>Your first task</h2>
+      <p><code>cd</code> into a project you know, launch atomcode, and just describe what you want:</p>
+      <pre><code>cd ~/projects/my-web-app
+atomcode
+
+&gt; give me a brief overview of this project's directory layout and tech stack</code></pre>
+      <p>AtomCode autonomously:</p>
+      <ol>
+        <li>Runs <code>list_directory</code>, <code>read_file</code>, and similar tools to explore the code;</li>
+        <li>Identifies key descriptor files (<code>package.json</code> / <code>Cargo.toml</code> / …);</li>
+        <li>Returns a structured summary.</li>
+      </ol>
+
+      <div class="callout callout-tip">
+        <strong>Tip</strong>
+        <p>Not sure what to ask? Try: "<em>fix every typo in the README</em>", "<em>add TypeScript types to the functions in src/utils.ts</em>", "<em>run the tests and fix any failures</em>".</p>
+      </div>
+
+      <h2>Uninstall</h2>
+      <p>When you're done with AtomCode, the built-in <code>uninstall</code> subcommand cleans up in one shot. It asks group-by-group whether to delete: the binary plus the <code>PATH</code> edits the installer made, credentials such as <code>~/.atomcode/auth.toml</code>, and runtime state such as <code>~/.atomcode/sessions/</code>.</p>
+
+      <h3>Interactive (recommended)</h3>
+      <pre><code>atomcode uninstall</code></pre>
+      <p>Each group prompts y/N with a sensible default (binary = yes, credentials = no, state = yes) — pressing Enter is a reasonable choice.</p>
+
+      <h3>Non-interactive</h3>
+      <pre><code># Fully automatic: take the default decisions, no prompts
+atomcode uninstall --yes
+
+# Wipe everything (including the entire ~/.atomcode/ directory)
+atomcode uninstall --purge
+
+# Only remove the binary and PATH edits; keep ~/.atomcode/ intact
+atomcode uninstall --keep-data
+
+# Just print the plan; do nothing
+atomcode uninstall --dry-run</code></pre>
+
+      <div class="callout callout-warn">
+        <strong>Heads up</strong>
+        <p><code>--purge</code> also deletes <strong>all session history, memories, custom provider configs, and OAuth tokens</strong>. It is irreversible. If you might use AtomCode again, prefer the interactive default or <code>--keep-data</code>.</p>
+      </div>
+
+      <h2>Next steps</h2>
+      <ul>
+        <li><a href="./configuration.html">Configuration</a> — manage multiple providers and models.</li>
+        <li><a href="./basic-usage.html">Basic Usage</a> — CLI flags and best practices for phrasing tasks.</li>
+        <li><a href="./slash-commands.html">Slash Commands</a> — get fluent with <code>/resume</code>, <code>/undo</code>, <code>/diff</code>, and friends.</li>
+      </ul>
+
+    <footer class="dftr">
+      <span data-i18n="ftr.copy">© 2026 AtomCode · MIT</span>
+      <a href="https://atomgit.com/atomgit_atomcode/atomcode/issues" target="_blank" rel="noopener" data-i18n="ftr.issue">报告问题</a>
+    </footer>
+  </main>
+</div>
+
+<div class="search-modal" id="searchModal" role="dialog" data-i18n-aria="aria.search" aria-label="搜索文档">
+  <div class="search-modal-bg"></div>
+  <div class="search-modal-box">
+    <div class="search-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="searchInput" type="search" data-i18n-placeholder="search.placeholder" placeholder="搜索文档…" autocomplete="off">
+      <span class="search-esc">ESC</span>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+</div>
+
+<script src="../docs.js"></script>
+</body>
+</html>

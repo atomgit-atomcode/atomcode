@@ -1,4 +1,4 @@
-//! Device identity. `device_id` persists in `$HOME/.atomcode/device_id`.
+//! Device identity. `device_id` persists in `$ATOMCODE_HOME/device_id`.
 
 use anyhow::{Context, Result};
 use std::env;
@@ -51,8 +51,20 @@ pub fn real_home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-pub fn default_atomcode_dir() -> Option<PathBuf> {
-    real_home_dir().map(|h| h.join(".atomcode"))
+/// Return the AtomCode data directory, respecting the `ATOMCODE_HOME`
+/// environment variable. When `ATOMCODE_HOME` is set, it IS the data root
+/// (no `.atomcode` suffix is appended). Otherwise falls back to
+/// `$HOME/.atomcode`, or `./.atomcode` when `$HOME` cannot be resolved.
+///
+/// This mirrors the logic in `atomcode_core::config::Config::config_dir()`
+/// but is implemented independently to avoid a circular dependency between
+/// the `atomcode-telemetry` and `atomcode-core` crates.
+pub fn default_atomcode_dir() -> PathBuf {
+    if let Some(p) = env::var("ATOMCODE_HOME").ok().filter(|s| !s.is_empty()) {
+        PathBuf::from(p)
+    } else {
+        real_home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".atomcode")
+    }
 }
 
 #[cfg(test)]
