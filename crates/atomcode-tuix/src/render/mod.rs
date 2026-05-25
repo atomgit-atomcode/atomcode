@@ -5,6 +5,7 @@ pub mod plain;
 pub mod qr;
 pub mod retained;
 pub mod screen;
+pub mod selection;
 pub mod theme;
 pub mod worker;
 
