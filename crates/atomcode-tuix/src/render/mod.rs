@@ -28,7 +28,18 @@ pub enum MarkKind {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MessageMark {
+    /// Index into the renderer's visible body buffer (`Vec<String>` /
+    /// `Vec<Vec<Cell>>`). Drives "jump to message" — viewport_top is
+    /// compared against this.
     pub line_idx: usize,
+    /// Index into the renderer's raw-line buffer (alt_screen only,
+    /// where `raw_body_lines` survives soft-wrap; retained mirrors
+    /// `line_idx` here since each push produces one body row). Used by
+    /// alt_screen's `reflow_body_lines` on terminal resize / scrollbar
+    /// toggle to recompute `line_idx` after the buffer is rebuilt at
+    /// the new width. Without it, marks point at pre-reflow positions
+    /// and message-jump lands on the wrong rows.
+    pub raw_idx: usize,
     pub kind: MarkKind,
 }
 

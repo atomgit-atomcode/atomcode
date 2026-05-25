@@ -506,8 +506,14 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// (i.e. the index the NEXT `push_body_row` will occupy).
     /// Called before any push in the render arm that starts a new message.
     fn mark_message(&mut self, kind: crate::render::MarkKind) {
+        // Record both the body and raw indices. reflow_body_lines uses
+        // raw_idx to re-derive line_idx after wrapping at a new width
+        // — without it, marks would point at pre-reflow body positions
+        // and Alt+↑/↓ would land on the wrong rows after `on_resize` or
+        // `/scrollbar` toggle.
         self.message_marks.push(crate::render::MessageMark {
             line_idx: self.body_lines.len(),
+            raw_idx: self.raw_body_lines.len(),
             kind,
         });
     }
@@ -524,10 +530,26 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // to `width - 1` (scrollbar on) chops the trailing cluster of
         // every wrapped-to-exactly-full line.
         let max_w = self.effective_body_width();
+        // Build a parallel `raw_to_body` map so we can remap each
+        // message_mark.raw_idx to its new line_idx after wrapping.
+        // Index i = "after consuming raw line i, body_lines.len() = ?".
+        let mut raw_to_body: Vec<usize> = Vec::with_capacity(self.raw_body_lines.len() + 1);
+        raw_to_body.push(0);
         for raw in &self.raw_body_lines {
             for chunk in wrap_to_width_sgr_aware(raw, max_w) {
                 self.body_lines.push(chunk);
             }
+            raw_to_body.push(self.body_lines.len());
+        }
+        // Remap marks: a mark with raw_idx=k pointed at the first body
+        // row produced by raw line k, which is now `raw_to_body[k]`.
+        // raw_idx past the end (sentinel — never happened in practice
+        // because marks fire before push) clamps to body_lines.len().
+        for m in self.message_marks.iter_mut() {
+            m.line_idx = raw_to_body
+                .get(m.raw_idx)
+                .copied()
+                .unwrap_or(self.body_lines.len());
         }
         // Bound the buffer (same cap as push_body_row).
         while self.body_lines.len() > self.max_scrollback_rows {
@@ -538,9 +560,14 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             }
         }
         // Also bound raw_body_lines to the same cap so the two buffers
-        // don't drift over time.
+        // don't drift over time. Sync `raw_idx` on each drain — marks
+        // whose raw_idx hits 0 lose their anchor and get dropped.
         while self.raw_body_lines.len() > self.max_scrollback_rows {
             self.raw_body_lines.remove(0);
+            self.message_marks.retain(|m| m.raw_idx > 0);
+            for m in self.message_marks.iter_mut() {
+                m.raw_idx -= 1;
+            }
         }
     }
 

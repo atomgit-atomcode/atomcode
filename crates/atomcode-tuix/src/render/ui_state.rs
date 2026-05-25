@@ -39,8 +39,22 @@ pub fn save(state: &UiState) {
         crate::tuix_trace!("UI", "ui-state serialize failed");
         return;
     };
-    if let Err(e) = std::fs::write(&path, text) {
-        crate::tuix_trace!("UI", "ui-state write failed: {}", e);
+    // Atomic write: write to `.tmp` sibling, then rename. `std::fs::
+    // rename` is atomic on POSIX (same filesystem) and on Windows
+    // (since 1.5) — readers either see the old file or the new file,
+    // never a truncated partial. A crash mid-`write_all` to the .tmp
+    // file leaves the original ui-state.toml intact. Same fix every
+    // serious config-persistence path needs and that `serial_test`
+    // hack in tests was papering over for the env-var race only.
+    let tmp = path.with_extension("toml.tmp");
+    if let Err(e) = std::fs::write(&tmp, text) {
+        crate::tuix_trace!("UI", "ui-state tmp write failed: {}", e);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        crate::tuix_trace!("UI", "ui-state rename failed: {}", e);
+        // best-effort cleanup of orphan .tmp
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
