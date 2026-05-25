@@ -1354,6 +1354,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// at body_bottom (typically the freshly-popped approval prompt)
     /// so the visual flow `▸ Tool` → `⎿ result` has no gap.
     fn emit_body_line_inner(&mut self, row: &[Cell], bottom: u16) {
+        if self.view_mode {
+            // In view_mode the body_lines buffer is the source of truth and
+            // paint_body repaints from buffer. Don't write to terminal here —
+            // we'd overwrite scrolled-away content.
+            return;
+        }
         // `\x1b[K` (EL — erase from cursor to end of line) runs AFTER
         // reposition and BEFORE writing the row. ECMA-48 says SU at
         // bottom of a scroll region must blank the new bottom row, but
@@ -7692,5 +7698,27 @@ mod tests {
         r.scroll_body_to_top();
         assert_eq!(r.viewport_top, 0);
         assert!(r.view_mode);
+    }
+
+    #[test]
+    fn retained_view_mode_suppresses_terminal_writes() {
+        let (mut r, buf) = new_capturing(80, 24);
+        // Get into view_mode
+        for i in 0..30 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.scroll_body(-5);
+        assert!(r.view_mode);
+        let bytes_before = buf.lock().unwrap().len();
+        // Push more content; terminal write count should not grow (view paint
+        // is idempotent and we already painted in scroll_body).
+        r.render(UiLine::User("after view".into()));
+        // Snapshot to drop the lock before further mutation
+        let new_bytes = buf.lock().unwrap()[bytes_before..].to_vec();
+        let s = String::from_utf8_lossy(&new_bytes);
+        assert!(!s.contains('\n'), "view_mode must NOT emit \\n scroll: {:?}", s);
+        // body_lines should still grow.
+        let non_empty = r.body_lines.iter().filter(|row| !row.is_empty()).count();
+        assert!(non_empty >= 31, "expected body_lines to keep growing in view_mode, got {}", non_empty);
     }
 }
