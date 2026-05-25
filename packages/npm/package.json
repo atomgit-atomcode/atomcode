@@ -1,6 +1,6 @@
 {
-  "name": "@atomgit/atomcode",
-  "version": "4.23.1",
+  "name": "@atomgit.com/atomcode",
+  "version": "0.0.0-dev",
   "description": "Open-source terminal AI coding agent — connect any LLM, edit code, run commands, verify autonomously",
   "keywords": ["ai", "coding", "cli", "agent", "terminal", "llm"],
   "homepage": "https://atomgit.com/atomgit_atomcode/atomcode",
@@ -11,22 +11,14 @@
   "license": "MIT",
   "author": "AtomGit",
   "bin": {
-    "atomcode": "./wrapper.js"
-  },
-  "scripts": {
-    "postinstall": "node install.js",
-    "postuninstall": "node uninstall.js"
+    "atomcode": "./bin/atomcode.js"
   },
   "files": [
-    "install.js",
-    "uninstall.js",
-    "wrapper.js"
+    "bin/atomcode.js"
   ],
   "engines": {
     "node": ">=18"
   },
-  "os": ["darwin", "linux", "win32", "ohos"],
-  "cpu": ["x64", "arm64"],
   "publishConfig": {
     "access": "public"
   }

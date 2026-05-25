@@ -135,22 +135,13 @@ Choose the method that works best for you:
 <table>
 <tr>
 <th>npm</th>
-<th>Homebrew</th>
 <th>Shell</th>
 </tr>
 <tr>
 <td>
 
 ```bash
-npm install -g @atomgit/atomcode
-```
-
-</td>
-<td>
-
-```bash
-brew tap atomgit/tap
-brew install atomcode
+npm install -g @atomgit.com/atomcode
 ```
 
 </td>
@@ -164,8 +155,7 @@ curl -fsSL https://atomgit.com/atomgit_atomcode/atomcode/raw/main/install.sh | s
 </tr>
 </table>
 
-> **npm**: The npm package downloads the pre-compiled binary for your platform automatically.
-> **Homebrew**: Requires tapping `atomgit/tap` first (contains the Formula).
+> **npm**: Automatically downloads the pre-compiled binary for your platform.
 > **Shell**: Universal installer for any platform.
 
 ### From Source (recommended for developers)

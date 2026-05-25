@@ -2,8 +2,8 @@
 /target
 /runs
 
-# npm package downloaded binaries (platform-specific, not committed)
-packages/npm/bin/
+# npm package: build artifacts
+packages/npm/*.tgz
 
 .env/
 

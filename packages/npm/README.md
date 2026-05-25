@@ -1,16 +1,14 @@
-# @atomgit/atomcode
+# @atomgit.com/atomcode
 
-[![npm version](https://img.shields.io/npm/v/@atomgit/atomcode)](https://www.npmjs.com/package/@atomgit/atomcode)
-[![license](https://img.shields.io/npm/l/@atomgit/atomcode)](https://atomgit.com/atomgit_atomcode/atomcode)
+[![npm version](https://img.shields.io/npm/v/@atomgit.com/atomcode)](https://www.npmjs.com/package/@atomgit.com/atomcode)
+[![license](https://img.shields.io/npm/l/@atomgit.com/atomcode)](https://atomgit.com/atomgit_atomcode/atomcode)
 
 **AtomCode** — 开源终端 AI 编码助手。用自然语言描述任务，自动阅读代码、编辑文件、执行命令、验证结果。
-
-这是 AtomCode CLI 的 npm 安装包。安装后会自动下载对应平台的预编译二进制文件（无需本地 Rust 编译环境）。
 
 ## 安装
 
 ```bash
-npm install -g @atomgit/atomcode
+npm install -g @atomgit.com/atomcode
 ```
 
 安装完成后即可使用：
@@ -18,6 +16,8 @@ npm install -g @atomgit/atomcode
 ```bash
 atomcode
 ```
+
+> 安装时 npm 会自动下载匹配当前平台的预编译二进制（darwin/linux arm64+x64, windows x64, ohos arm64）。
 
 ## 使用
 
@@ -41,7 +41,7 @@ atomcode --continue
 ## 卸载
 
 ```bash
-npm uninstall -g @atomgit/atomcode
+npm uninstall -g @atomgit.com/atomcode
 
 # 或使用内置卸载命令（会保留配置文件）
 atomcode uninstall
