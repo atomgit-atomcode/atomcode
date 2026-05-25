@@ -414,7 +414,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // doesn't remain visible above the atomcode viewport and mix with
         // the atomcode session transcript. `\x1b[3J` only affects scrollback;
         // it does not touch the visible screen rows.
-        let _ = out.write_all(b"\x1b[3J");
+        // Enable button-event tracking (`\x1b[?1002h`) and SGR-extended
+        // coordinates (`\x1b[?1006h`) so scroll wheel events route through
+        // the terminal's mouse event stream (needed for Phase 4 scroll support).
+        let _ = out.write_all(b"\x1b[3J\x1b[?1002h\x1b[?1006h");
         let _ = out.flush();
         Self {
             out,
@@ -3026,6 +3029,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn shutdown(&mut self) {
+        // Disable mouse capture (button-event + SGR coordinates) so the
+        // terminal returns to default mouse behavior when atomcode exits.
+        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        let _ = self.out.flush();
         // Drain any pending frame before exit so the user sees the
         // latest widget state (typically a final prompt or an error
         // line) rather than a frame that dirty-flagged too late.
@@ -7892,5 +7899,28 @@ mod tests {
             detail: "ls".into(),
         });
         assert!(!r.view_mode, "approval prompt must force exit from view_mode");
+    }
+
+    #[test]
+    fn retained_with_writer_enables_mouse_capture() {
+        let mut buf = Vec::new();
+        let _r = RetainedRenderer::with_writer(&mut buf, caps_with_color(), 80, 24);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("\x1b[?1002h"), "must enable button-event tracking: {:?}", s);
+        assert!(s.contains("\x1b[?1006h"), "must enable SGR coordinates: {:?}", s);
+    }
+
+    #[test]
+    fn retained_shutdown_disables_mouse_capture() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        // clear startup bytes
+        buf.lock().unwrap().clear();
+        r.shutdown();
+        let bytes = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\x1b[?1002l"), "shutdown must disable button-event: {:?}", s);
+        assert!(s.contains("\x1b[?1006l"), "shutdown must disable SGR coords: {:?}", s);
     }
 }
