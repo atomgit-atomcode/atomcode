@@ -2219,6 +2219,34 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let seq = format!("\x1b[{};1H\x1b[K", target_row);
             let _ = self.out.write_all(seq.as_bytes());
         }
+        // Paint right-edge scrollbar (mirrors alt-screen paint_body logic).
+        // The scrollbar naturally overpaints whatever body content extended to
+        // the rightmost column — option (b) from the plan, acceptable for now.
+        let viewport_start = if self.view_mode {
+            self.viewport_top
+        } else {
+            total.saturating_sub(body_height)
+        };
+        let scrollbar_shape = crate::render::scrollbar::compute(
+            total,
+            body_height,
+            viewport_start,
+            self.sticky_bottom,
+            self.show_scrollbar,
+        );
+        if let Some(shape) = &scrollbar_shape {
+            let scrollbar_col = self.screen.width();
+            for row_idx in 0..body_height {
+                let target_row = 1 + row_idx as u16;
+                let glyph = if crate::render::scrollbar::is_thumb_row(shape, row_idx) {
+                    "█"
+                } else {
+                    "│"
+                };
+                let seq = format!("\x1b[{};{}H{}", target_row, scrollbar_col, glyph);
+                let _ = self.out.write_all(seq.as_bytes());
+            }
+        }
         let _ = self.out.flush();
         self.screen.invalidate();
     }
@@ -8107,6 +8135,17 @@ mod tests {
         r.selection.begin((0, 0));
         r.selection.update((0, 5));
         assert!(r.copy_selection(), "expected non-empty selection to copy");
+    }
+
+    #[test]
+    fn retained_scrollbar_paints_when_enabled_in_view_mode() {
+        let (mut r, buf) = new_capturing(80, 10);
+        r.show_scrollbar = true;
+        for i in 0..30 { r.render(UiLine::User(format!("R{:02}", i))); }
+        r.scroll_body(-3);  // enter view_mode + repaint_body_region
+        let binding = buf.lock().unwrap();
+        let s = String::from_utf8_lossy(&binding);
+        assert!(s.contains("█"), "thumb missing in view paint: {:?}", s);
     }
 
     #[test]
