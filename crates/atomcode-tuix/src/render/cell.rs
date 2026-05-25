@@ -408,12 +408,30 @@ pub fn serialize_patches(patches: &[Patch]) -> Vec<u8> {
 /// cells; closes with `\x1b[0m` iff any SGR was emitted so subsequent
 /// writes start from a clean state.
 pub fn serialize_row(row: &[Cell]) -> Vec<u8> {
+    serialize_row_clipped(row, usize::MAX)
+}
+
+/// Serialise at most `max_cols` display columns of `row`. Used when
+/// the body's effective width must reserve space for an adjacent UI
+/// element (e.g. the right-side scrollbar): clipping at the cell
+/// boundary is cluster-aware because `cell.width` already encodes
+/// wide-glyph extent (continuation cells have width 0). A wide cluster
+/// that would straddle the budget is dropped whole, NOT half-painted —
+/// without this the trailing scrollbar `│` could land on the second
+/// cell of a CJK / emoji cluster and the terminal would render it as
+/// mojibake.
+pub fn serialize_row_clipped(row: &[Cell], max_cols: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(row.len() * 4);
     let mut current_style: Option<CellStyle> = None;
     let mut emitted_any_sgr = false;
+    let mut cols = 0usize;
     for cell in row {
         if cell.width == 0 {
             continue;
+        }
+        let w = cell.width as usize;
+        if cols.saturating_add(w) > max_cols {
+            break;
         }
         if current_style.as_ref() != Some(&cell.style) {
             let before = out.len();
@@ -426,6 +444,7 @@ pub fn serialize_row(row: &[Cell]) -> Vec<u8> {
         let mut buf = [0u8; 4];
         let encoded = cell.ch.encode_utf8(&mut buf);
         out.extend_from_slice(encoded.as_bytes());
+        cols += w;
     }
     if emitted_any_sgr {
         out.extend_from_slice(b"\x1b[0m");

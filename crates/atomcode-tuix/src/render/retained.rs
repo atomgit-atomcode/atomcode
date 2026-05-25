@@ -24,7 +24,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
-use super::cell::{push_str_cells, serialize_row, Cell, CellStyle};
+use super::cell::{push_str_cells, serialize_row, serialize_row_clipped, Cell, CellStyle};
 use super::screen::Screen;
 use super::theme::{role, Role};
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
@@ -1207,6 +1207,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
         h.saturating_sub(footer_rows) as u16
     }
 
+    /// Effective body width: paint reserves the rightmost column for
+    /// the scrollbar glyph when `show_scrollbar` is on, so body content
+    /// must be clipped to `width - 1` to avoid splitting the trailing
+    /// wide cluster (e.g. a CJK char at col `width-1` whose continuation
+    /// cell sits at col `width` — painting the scrollbar over the
+    /// continuation cell makes the cluster render as mojibake).
+    ///
+    /// We reserve based on `show_scrollbar` alone (not on runtime
+    /// overflow) to match `effective_body_width` semantics in
+    /// `alt_screen.rs` — the small predictability win of always-reserve
+    /// is worth one col of body area when scrollbar is on but content
+    /// hasn't overflowed yet.
+    fn effective_body_width(&self) -> usize {
+        let raw = self.screen.width() as usize;
+        if self.show_scrollbar {
+            raw.saturating_sub(1).max(1)
+        } else {
+            raw
+        }
+    }
+
     /// Sync the terminal's DECSTBM scroll region with the current
     /// body_bottom. Called at the top of `paint_frame` and before
     /// every body-line emit so `\n` in `emit_body_line` only scrolls
@@ -2208,7 +2229,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 (s.head, s.anchor)
             }
         });
-        let screen_width = self.screen.width() as usize;
+        // Use effective_body_width — same column budget as alt_screen,
+        // so a wide cluster never lands under the scrollbar column.
+        // `serialize_row_clipped` drops a cluster whole if it would
+        // straddle the budget; `render_line_with_selection` already
+        // honours its `max_cols` arg cluster-aware.
+        let body_width = self.effective_body_width();
         // Clone the slice to avoid simultaneous borrow of self.
         let rows: Vec<Vec<Cell>> = self.body_lines[start..end].to_vec();
         for (i, row) in rows.iter().enumerate() {
@@ -2225,11 +2251,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             });
             if let Some((sel_start, sel_end)) = sel_range {
                 let highlighted = crate::render::selection::render_line_with_selection(
-                    &row_text, screen_width, sel_start, sel_end,
+                    &row_text, body_width, sel_start, sel_end,
                 );
                 let _ = self.out.write_all(highlighted.as_bytes());
             } else {
-                let bytes = serialize_row(row);
+                let bytes = serialize_row_clipped(row, body_width);
                 let _ = self.out.write_all(&bytes);
             }
         }

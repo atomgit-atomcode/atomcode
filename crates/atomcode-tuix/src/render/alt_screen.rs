@@ -463,6 +463,27 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         self.body_dirty = true;
     }
 
+    /// Effective body width: when `show_scrollbar` is on, paint reserves
+    /// the rightmost column for the scrollbar glyph (`│`/`█`), so body
+    /// content must wrap at `width - 1`. Otherwise body uses the full
+    /// `width`.
+    ///
+    /// We reserve the column based on `show_scrollbar` alone (not on
+    /// runtime overflow) so reflow and paint always agree: reflowing
+    /// at a wider width than paint uses would cause `truncate_to_width_
+    /// sgr_aware` to silently chop the trailing cluster of any line
+    /// that wrapped to exactly `width` cols. Slight cost: one col is
+    /// reserved even when the buffer doesn't overflow yet — accepted
+    /// in trade for predictable, non-chicken-and-egg sizing.
+    fn effective_body_width(&self) -> usize {
+        let raw = self.width as usize;
+        if self.show_scrollbar {
+            raw.saturating_sub(1).max(1)
+        } else {
+            raw
+        }
+    }
+
     /// Push a **raw** (not yet soft-wrapped) body row. The raw line is
     /// stored in `raw_body_lines` for later re-flow on resize, while
     /// the soft-wrapped chunks are pushed to `body_lines` for immediate
@@ -472,8 +493,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     fn push_body_row_raw(&mut self, raw_line: String) {
         // Store raw line for re-flow on resize.
         self.raw_body_lines.push(raw_line.clone());
-        // Soft-wrap at the current terminal width and push each chunk.
-        let max_w = self.width as usize;
+        // Soft-wrap at the effective body width (honors scrollbar
+        // reservation) so reflow + paint use the same column budget.
+        let max_w = self.effective_body_width();
         for chunk in wrap_to_width_sgr_aware(&raw_line, max_w) {
             self.push_body_row(chunk);
         }
@@ -497,7 +519,11 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     /// truncating them (issue #363).
     fn reflow_body_lines(&mut self) {
         self.body_lines.clear();
-        let max_w = self.width as usize;
+        // Reflow at the effective body width — same column budget paint
+        // will use. Reflowing at full `self.width` while paint truncates
+        // to `width - 1` (scrollbar on) chops the trailing cluster of
+        // every wrapped-to-exactly-full line.
+        let max_w = self.effective_body_width();
         for raw in &self.raw_body_lines {
             for chunk in wrap_to_width_sgr_aware(raw, max_w) {
                 self.body_lines.push(chunk);
@@ -569,14 +595,14 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // and stale colour spans don't bleed). For rows past the end
         // of body_lines, just EL (clear). 1-indexed rows.
         //
-        // When the scrollbar is active, body content is truncated to
-        // `width - 1` columns so the rightmost column stays free for
-        // the scrollbar glyph (painted after this loop).
-        let max_cols = if scrollbar_shape.is_some() {
-            (self.width as usize).saturating_sub(1)
-        } else {
-            self.width as usize
-        };
+        // Use `effective_body_width()` so reflow and paint agree on
+        // the column budget. Previously paint subtracted 1 only when
+        // `scrollbar_shape.is_some()` (overflow active), but reflow
+        // unconditionally used `self.width` — when scrollbar was on +
+        // overflow happened, the trailing cluster of any
+        // wrapped-to-exact-width line was silently chopped by
+        // `truncate_to_width_sgr_aware`.
+        let max_cols = self.effective_body_width();
         // Snapshot the ordered selection bounds once so the per-row
         // loop doesn't re-borrow `self.selection` while we hold a
         // reference to `self.body_lines[i]`. Cheap (Copy) and only
