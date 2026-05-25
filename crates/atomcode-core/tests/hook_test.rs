@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 
 use atomcode_core::hook::{
-    Hook, HookContext, HookRegistry, HookResult, PreToolExecutionHook,
+    Hook, HookCtx, HookRegistry, HookResult, PreToolExecutionHook,
     PostToolExecutionHook, PostTurnHook, SystemPromptHook, ToolResultContext,
 };
 
@@ -22,7 +22,7 @@ impl Hook for CountingPreHook {
 
 #[async_trait]
 impl PreToolExecutionHook for CountingPreHook {
-    async fn on_pre_execute(&self, _ctx: &HookContext) -> HookResult {
+    async fn on_pre_execute(&self, _ctx: &HookCtx) -> HookResult {
         self.count.fetch_add(1, Ordering::SeqCst);
         HookResult::Ok
     }
@@ -41,7 +41,7 @@ impl Hook for CountingPostHook {
 
 #[async_trait]
 impl PostToolExecutionHook for CountingPostHook {
-    async fn on_post_execute(&self, _ctx: &HookContext, _result_ctx: &ToolResultContext) -> HookResult {
+    async fn on_post_execute(&self, _ctx: &HookCtx, _result_ctx: &ToolResultContext) -> HookResult {
         self.count.fetch_add(1, Ordering::SeqCst);
         HookResult::Ok
     }
@@ -60,7 +60,7 @@ impl Hook for CountingPostTurnHook {
 
 #[async_trait]
 impl PostTurnHook for CountingPostTurnHook {
-    async fn on_post_turn(&self, _ctx: &HookContext, _turn_result: &str) -> HookResult {
+    async fn on_post_turn(&self, _ctx: &HookCtx, _turn_result: &str) -> HookResult {
         self.count.fetch_add(1, Ordering::SeqCst);
         HookResult::Ok
     }
@@ -107,7 +107,7 @@ async fn test_hook_registry_basic() {
     assert_eq!(stats.post_turn_hooks, 1);
     
     // Test pre-tool hooks
-    let ctx = HookContext::new("test_tool".to_string(), "{}".to_string(), "/tmp".to_string());
+    let ctx = HookCtx::new("test_tool".to_string(), "{}".to_string(), "/tmp".to_string());
     let result = registry.trigger_pre_tool_hooks(&ctx).await;
     assert!(result.is_ok());
     assert_eq!(pre_count.load(Ordering::SeqCst), 1);
@@ -143,14 +143,14 @@ async fn test_hook_deny_execution() {
     
     #[async_trait]
     impl PreToolExecutionHook for DenyingHook {
-        async fn on_pre_execute(&self, _ctx: &HookContext) -> HookResult {
+        async fn on_pre_execute(&self, _ctx: &HookCtx) -> HookResult {
             HookResult::Denied("Security policy violation".to_string())
         }
     }
     
     registry.register_pre_tool_hook(Arc::new(DenyingHook));
     
-    let ctx = HookContext::new("bash".to_string(), "rm -rf /".to_string(), "/tmp".to_string());
+    let ctx = HookCtx::new("bash".to_string(), "rm -rf /".to_string(), "/tmp".to_string());
     let result = registry.trigger_pre_tool_hooks(&ctx).await;
     
     assert!(result.is_err());
@@ -172,14 +172,14 @@ async fn test_hook_modify_args() {
     
     #[async_trait]
     impl PreToolExecutionHook for ModifyingHook {
-        async fn on_pre_execute(&self, _ctx: &HookContext) -> HookResult {
+        async fn on_pre_execute(&self, _ctx: &HookCtx) -> HookResult {
             HookResult::Modified("{\"modified\": true}".to_string())
         }
     }
     
     registry.register_pre_tool_hook(Arc::new(ModifyingHook));
     
-    let ctx = HookContext::new("edit_file".to_string(), "{}".to_string(), "/tmp".to_string());
+    let ctx = HookCtx::new("edit_file".to_string(), "{}".to_string(), "/tmp".to_string());
     let result = registry.trigger_pre_tool_hooks(&ctx).await;
     
     assert!(result.is_ok());
@@ -228,7 +228,7 @@ async fn test_hook_priority_order() {
     
     #[async_trait]
     impl PreToolExecutionHook for PriorityHook {
-        async fn on_pre_execute(&self, _ctx: &HookContext) -> HookResult {
+        async fn on_pre_execute(&self, _ctx: &HookCtx) -> HookResult {
             self.order.lock().unwrap().push(self.priority);
             HookResult::Ok
         }
@@ -239,7 +239,7 @@ async fn test_hook_priority_order() {
     registry.register_pre_tool_hook(Arc::new(PriorityHook { priority: 10, order: call_order.clone() }));
     registry.register_pre_tool_hook(Arc::new(PriorityHook { priority: 20, order: call_order.clone() }));
     
-    let ctx = HookContext::new("test".to_string(), "{}".to_string(), "/tmp".to_string());
+    let ctx = HookCtx::new("test".to_string(), "{}".to_string(), "/tmp".to_string());
     let _ = registry.trigger_pre_tool_hooks(&ctx).await;
     
     let order = call_order.lock().unwrap();

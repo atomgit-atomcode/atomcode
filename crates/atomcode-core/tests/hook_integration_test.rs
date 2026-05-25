@@ -17,6 +17,7 @@ use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::message::Message;
 use atomcode_core::conversation::Conversation;
+use atomcode_core::ctx::default::DefaultCtx;
 use atomcode_core::provider::LlmProvider;
 use atomcode_core::stream::StreamEvent;
 use atomcode_core::tool::{
@@ -25,7 +26,7 @@ use atomcode_core::tool::{
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
 use atomcode_core::turn::runner::TurnRunner;
-use atomcode_core::hook::{Hook, HookContext, HookRegistry, HookResult, PreToolExecutionHook, PostToolExecutionHook, ToolResultContext};
+use atomcode_core::hook::{Hook, HookCtx, HookRegistry, HookResult, PreToolExecutionHook, PostToolExecutionHook, ToolResultContext};
 
 // ===========================================================================
 // Mock Provider
@@ -131,7 +132,7 @@ impl Hook for TrackingPreHook {
 
 #[async_trait]
 impl PreToolExecutionHook for TrackingPreHook {
-    async fn on_pre_execute(&self, ctx: &HookContext) -> HookResult {
+    async fn on_pre_execute(&self, ctx: &HookCtx) -> HookResult {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         *self.last_tool_name.lock().unwrap() = ctx.tool_name.clone();
         HookResult::Ok
@@ -152,7 +153,7 @@ impl Hook for TrackingPostHook {
 
 #[async_trait]
 impl PostToolExecutionHook for TrackingPostHook {
-    async fn on_post_execute(&self, _ctx: &HookContext, result_ctx: &ToolResultContext) -> HookResult {
+    async fn on_post_execute(&self, _ctx: &HookCtx, result_ctx: &ToolResultContext) -> HookResult {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         *self.last_result.lock().unwrap() = result_ctx.result.clone();
         HookResult::Ok
@@ -176,6 +177,12 @@ fn test_config() -> Config {
             user_agent: None,
             context_window: 16000,
             max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
             ephemeral: false,
         },
     );
@@ -185,6 +192,15 @@ fn test_config() -> Config {
         providers,
         datalog: Default::default(),
         auto_update: false,
+        subagent: Default::default(),
+        vision_preprocessor_provider: None,
+        language: None,
+        ui: Default::default(),
+        plugin: Default::default(),
+        notifications: Default::default(),
+        telemetry: Default::default(),
+        lsp: Default::default(),
+        auto_commit: false,
     }
 }
 
@@ -207,8 +223,9 @@ fn create_test_runner(
         permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
         hook_registry,
         recently_edited_files: Vec::new(),
-        recent_calls: Vec::new(),
-        file_read_counts: std::collections::HashMap::new(),
+        ctx: std::sync::Arc::new(DefaultCtx::new(&test_config().providers.get("mock").unwrap())),
+        hook_executor: std::sync::Arc::new(atomcode_core::hook::executor::HookExecutor::new(vec![])),
+        loop_guard: Default::default(),
     }
 }
 
