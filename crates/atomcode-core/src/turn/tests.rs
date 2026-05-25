@@ -24,6 +24,7 @@ use crate::tool::{
 use super::event::{TurnEvent, TurnResult};
 use super::permission::{AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider};
 use super::runner::TurnRunner;
+use crate::hook::HookRegistry;
 
 // ---------------------------------------------------------------------------
 // Test helpers: Mock LlmProvider
@@ -1499,6 +1500,7 @@ mod telemetry_tests {
             config: test_config(),
             ctx: test_ctx,
             permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+            hook_registry: HookRegistry::new(),
             recently_edited_files: Vec::new(),
             hook_executor: std::sync::Arc::new(
                 crate::hook::executor::HookExecutor::empty()

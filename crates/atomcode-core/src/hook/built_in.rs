@@ -353,3 +353,205 @@ impl OnModelResponseHook for ResponseValidationHook {
         HookResult::Ok
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ToolAuditLogHook ─────────────────────────────────────────────
+
+    #[test]
+    fn test_tool_audit_log_hook_trait() {
+        let hook = ToolAuditLogHook { enabled: true, log_file: None };
+        assert_eq!(hook.name(), "tool-audit-log");
+        assert!(hook.is_enabled());
+
+        let hook_disabled = ToolAuditLogHook { enabled: false, log_file: None };
+        assert!(!hook_disabled.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_tool_audit_log_on_tool_call_start() {
+        let hook = ToolAuditLogHook { enabled: true, log_file: None };
+        let ctx = ToolCallStartContext {
+            tool_name: "bash".into(),
+            tool_args: "echo hello".into(),
+            call_id: "call_123".into(),
+            turn_number: 1,
+        };
+        let result = hook.on_tool_call_start(&ctx).await;
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    // ── TurnStatsHook ────────────────────────────────────────────────
+
+    #[test]
+    fn test_turn_stats_hook_trait() {
+        let hook = TurnStatsHook { enabled: true };
+        assert_eq!(hook.name(), "turn-stats");
+        assert!(hook.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_turn_stats_on_turn_start_and_complete() {
+        let hook = TurnStatsHook { enabled: true };
+        let ctx = TurnStartContext {
+            turn_number: 1,
+            session_id: Some("test-session".into()),
+            working_dir: "/tmp".into(),
+            phase: "execution".into(),
+            has_file_context: false,
+        };
+        let result = hook.on_turn_start(&ctx).await;
+        assert!(matches!(result, HookResult::Ok));
+
+        let complete_ctx = TurnCompleteContext {
+            turn_number: 1,
+            result_type: "Responded".into(),
+            tokens_used: 500,
+            tool_calls: 3,
+            duration_ms: 1500,
+            truncated: false,
+            edited_files: vec!["a.rs".into(), "b.rs".into()],
+        };
+        let result = hook.on_turn_complete(&complete_ctx).await;
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    // ── AutoCommitHook ───────────────────────────────────────────────
+
+    #[test]
+    fn test_auto_commit_hook_trait() {
+        let hook = AutoCommitHook { enabled: true, interval: 1 };
+        assert!(hook.is_enabled());
+
+        let hook_disabled = AutoCommitHook { enabled: false, interval: 1 };
+        assert!(!hook_disabled.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_auto_commit_no_changes() {
+        let hook = AutoCommitHook { enabled: true, interval: 1 };
+        let ctx = TurnCompleteContext {
+            turn_number: 1,
+            result_type: "Responded".into(),
+            tokens_used: 100,
+            tool_calls: 1,
+            duration_ms: 100,
+            truncated: false,
+            edited_files: vec![],
+        };
+        let result = hook.run_git_commit(&ctx).await;
+        // In a real repo this may attempt a git commit; verify no panic
+        match result {
+            HookResult::Ok | HookResult::Warning(_) => {}
+            other => panic!("Unexpected result: {:?}", other),
+        }
+    }
+
+    // ── SessionSummaryHook ───────────────────────────────────────────
+
+    #[test]
+    fn test_session_summary_hook_trait() {
+        let hook = SessionSummaryHook::new();
+        assert_eq!(hook.name(), "session-summary");
+        assert!(hook.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_session_summary_start_end() {
+        let hook = SessionSummaryHook::new();
+        let ctx = SessionContext {
+            session_id: "session-1".into(),
+            working_dir: "/tmp".into(),
+            model_name: "deepseek-v4".into(),
+            provider_name: "atomgit".into(),
+        };
+        let result = hook.on_session_start(&ctx).await;
+        assert!(matches!(result, HookResult::Ok));
+
+        let result = hook.on_session_end(&ctx).await;
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    // ── ErrorReportHook ──────────────────────────────────────────────
+
+    #[test]
+    fn test_error_report_hook_trait() {
+        let hook = ErrorReportHook { enabled: true };
+        assert_eq!(hook.name(), "error-report");
+        assert!(hook.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_error_report_on_error() {
+        let hook = ErrorReportHook { enabled: true };
+        let ctx = ErrorContext {
+            error_type: "timeout".into(),
+            error_message: "Tool execution timed out after 30s".into(),
+            phase: "tool_execution".into(),
+            turn_number: Some(3),
+        };
+        let result = hook.on_error(&ctx).await;
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    // ── ResponseValidationHook ───────────────────────────────────────
+
+    #[test]
+    fn test_response_validation_hook_trait() {
+        let hook = ResponseValidationHook::new(vec!["password".into(), "secret".into()]);
+        assert_eq!(hook.name(), "response-validation");
+        assert!(hook.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_response_validation_no_sensitive_content() {
+        let hook = ResponseValidationHook::new(vec!["password".into(), "secret".into()]);
+        let turn_ctx = TurnStartContext {
+            turn_number: 1,
+            session_id: Some("test".into()),
+            working_dir: "/tmp".into(),
+            phase: "execution".into(),
+            has_file_context: false,
+        };
+        let result = hook.on_model_response("Hello, how can I help you?", &turn_ctx).await;
+        assert!(matches!(result, HookResult::Ok));
+    }
+
+    #[tokio::test]
+    async fn test_response_validation_detects_sensitive_content() {
+        let hook = ResponseValidationHook::new(vec!["password".into(), "secret".into()]);
+        let turn_ctx = TurnStartContext {
+            turn_number: 1,
+            session_id: Some("test".into()),
+            working_dir: "/tmp".into(),
+            phase: "execution".into(),
+            has_file_context: false,
+        };
+        let result = hook.on_model_response(
+            "The admin password is super_secret_123",
+            &turn_ctx,
+        ).await;
+        match result {
+            HookResult::Warning(msg) => {
+                assert!(msg.contains("password"), "Warning should mention 'password'");
+            }
+            other => panic!("Expected Warning, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_response_validation_case_insensitive() {
+        let hook = ResponseValidationHook::new(vec!["SECRET".into()]);
+        let turn_ctx = TurnStartContext {
+            turn_number: 1,
+            session_id: Some("test".into()),
+            working_dir: "/tmp".into(),
+            phase: "execution".into(),
+            has_file_context: false,
+        };
+        let result = hook.on_model_response("This is a Secret value", &turn_ctx).await;
+        assert!(matches!(result, HookResult::Warning(_)));
+    }
+}
