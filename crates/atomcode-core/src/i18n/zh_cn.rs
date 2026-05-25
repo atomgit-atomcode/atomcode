@@ -638,7 +638,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── /plugin ──
         Msg::PluginUsage =>
-            "用法：/plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),
+            "用法：/plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | reload | list]".into(),
         Msg::PluginMarketplaceUsage =>
             "用法：/plugin marketplace [add|remove|update|list] <参数>".into(),
         Msg::PluginInstallUsage =>
@@ -671,6 +671,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("卸载失败：{error}").into(),
         Msg::PluginListFailed { error } =>
             format!("列出插件失败：{error}").into(),
+        Msg::PluginReloadDone { skills, warnings } =>
+            format!("插件已重新加载：{skills} 个 skill，{warnings} 个警告").into(),
+        Msg::SetupAutoReloaded { skills, warnings } =>
+            format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
 
         // ── 命令描述 ──
 Msg::CmdDescSetup =>
@@ -713,7 +717,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescLanguage => "切换显示语言".into(),
         Msg::CmdDescQuit => "退出 AtomCode".into(),
         Msg::CmdDescSkills => "浏览已加载的技能".into(),
-        Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, list）".into(),
+        Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
 

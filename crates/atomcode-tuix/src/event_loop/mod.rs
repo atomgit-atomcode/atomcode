@@ -2483,6 +2483,11 @@ pub struct App {
     /// fixissue turn, verbatim. Sent as the AtomGit comment body on
     /// successful completion.
     pub fixissue_buffer: String,
+    /// True while a setup skill turn is in flight. On `TurnComplete`,
+    /// skill/command registries are reloaded so newly-created skills
+    /// become visible to the LLM immediately. Cleared on
+    /// TurnComplete / TurnCancelled / Error.
+    pub setup_pending: bool,
     /// Accumulates reasoning/thinking content for display in verbose mode.
     /// Flushed on newline or when buffer exceeds threshold.
     pub reasoning_buffer: String,
@@ -2518,6 +2523,7 @@ impl App {
             exit_pending: None,
             fixissue_pending: None,
             fixissue_buffer: String::new(),
+            setup_pending: false,
             reasoning_buffer: String::new(),
             setup_hint_shown: false,
             #[cfg(windows)]
@@ -3159,7 +3165,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer, &app.buf);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &app.buf);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -3539,7 +3545,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 let Some(runtime_event) = maybe else { break };
                 if runtime_event.runtime_id == ctx.foreground_runtime_id {
                     let pre_phase = app.state.phase;
-                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.reasoning_buffer, &app.buf);
+                    handle_agent_event(runtime_event.event, &mut app.state, &mut app.think, renderer, &mut app.pending_tools, &mut ctx, &mut app.fixissue_pending, &mut app.fixissue_buffer, &mut app.setup_pending, &mut app.reasoning_buffer, &app.buf);
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
@@ -4580,6 +4586,7 @@ fn handle_idle_key(
                             &mut app.active_modal,
                             &mut app.fixissue_pending,
                             &mut app.fixissue_buffer,
+                            &mut app.setup_pending,
                         )?;
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
@@ -4782,6 +4789,7 @@ fn handle_idle_key(
                         &mut app.active_modal,
                         &mut app.fixissue_pending,
                         &mut app.fixissue_buffer,
+                        &mut app.setup_pending,
                     )?;
                 }
                 if matches!(app.state.phase, UiPhase::Idle) {
@@ -5331,6 +5339,7 @@ fn handle_streaming_key(
                     &mut app.active_modal,
                     &mut app.fixissue_pending,
                     &mut app.fixissue_buffer,
+                    &mut app.setup_pending,
                 )?;
                 app.message_queue.clear();
                 app.pending_tools.clear();
@@ -5658,6 +5667,7 @@ fn handle_agent_event(
     ctx: &mut LoopCtx,
     fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
     fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
     reasoning_buffer: &mut String,
     buf: &Buffer,
 ) {
@@ -6098,6 +6108,23 @@ fn handle_agent_event(
                 }
                 renderer.flush();
             }
+
+            // setup post-run side effects — only on successful TurnComplete.
+            // Reload skills/commands so newly-created skills become visible
+            // to the LLM immediately.
+            if std::mem::take(setup_pending) {
+                let (skills_loaded, warnings) = reload_plugins(ctx);
+                let warn_count = warnings.len();
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::SetupAutoReloaded { skills: skills_loaded, warnings: warn_count }).into_owned(),
+                ));
+                if !warnings.is_empty() {
+                    for w in &warnings {
+                        renderer.render(UiLine::Error(w.clone()));
+                    }
+                }
+                renderer.flush();
+            }
         }
         AgentEvent::TurnCancelled { messages } => {
             atomcode_core::notify::notify(
@@ -6139,6 +6166,7 @@ fn handle_agent_event(
             // against an incomplete "fix".
             fixissue_pending.take();
             fixissue_buffer.clear();
+            *setup_pending = false;
             // Same reset rationale as TurnComplete: a cancelled turn is the
             // single most common way for `<think>` to go unclosed, so this
             // branch is even more important for the stripper's hygiene.
@@ -6152,6 +6180,7 @@ fn handle_agent_event(
             renderer.flush();
             fixissue_pending.take();
             fixissue_buffer.clear();
+            *setup_pending = false;
             state.on_error();
             // Same reset rationale as TurnComplete / TurnCancelled — an
             // aborted turn is another way to leave `<think>` half-open.

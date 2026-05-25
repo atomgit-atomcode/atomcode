@@ -240,6 +240,7 @@ pub(super) fn execute_slash_command(
     active_modal: &mut Option<Box<dyn Modal>>,
     fixissue_pending: &mut Option<atomcode_core::atomgit::IssueRef>,
     fixissue_buffer: &mut String,
+    setup_pending: &mut bool,
 ) -> Result<()> {
     // `fixissue_pending` / `fixissue_buffer` no longer have a slash-command
     // entry that consumes them (the `/fixissue` arm was removed; the
@@ -1521,6 +1522,7 @@ pub(super) fn execute_slash_command(
                             image_markers: vec![],
                         })
                         .ok();
+                    *setup_pending = true;
                     state.on_submit();
                 } else {
                     renderer.render(UiLine::Error(
@@ -1577,6 +1579,7 @@ pub(super) fn execute_slash_command(
                                     image_markers: vec![],
                                 })
                                 .ok();
+                            *setup_pending = true;
                             state.on_submit();
                         } else {
                             renderer.render(UiLine::Error(
@@ -1798,6 +1801,19 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             }
             Err(e) => err(renderer, t(Msg::PluginListFailed { error: &e.to_string() }).into_owned()),
         },
+        "reload" => {
+            let (skills_loaded, warnings) = super::reload_plugins(ctx);
+            let warn_count = warnings.len();
+            ok(renderer, t(Msg::PluginReloadDone {
+                skills: skills_loaded,
+                warnings: warn_count,
+            }).into_owned());
+            if !warnings.is_empty() {
+                for w in &warnings {
+                    err(renderer, w.clone());
+                }
+            }
+        }
         _ => err(
             renderer,
             t(Msg::PluginUsage).into_owned(),
