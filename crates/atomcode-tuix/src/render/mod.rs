@@ -9,6 +9,7 @@ pub mod retained;
 pub mod screen;
 pub mod selection;
 pub mod theme;
+pub mod ui_state;
 pub mod worker;
 
 use std::time::Duration;
