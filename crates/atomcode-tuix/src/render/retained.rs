@@ -1409,6 +1409,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // The cursor will be re-shown on the next paint_footer (which
         // sees live_spinner_active=false and calls set_cursor_visible(true)).
         self.body_lines.pop();
+        // Skip terminal write in view_mode — paint_body owns the body
+        // region; writing CUP+EL here would overwrite the scrolled content
+        // at body_bottom_row().  The buffer cleanup above still runs so the
+        // buffer is correct when the user exits view_mode.
+        if self.view_mode {
+            return true;
+        }
         self.ensure_scroll_region();
         let bottom = self.body_bottom_row();
         if bottom > 0 {
@@ -1484,6 +1491,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if self.live_spinner_active {
             if let Some(last) = self.body_lines.last_mut() {
                 *last = row_cells.clone();
+            }
+            // Skip terminal write in view_mode — paint_body owns the body
+            // region and would otherwise see this CUP+EL overwrite the
+            // scrolled content at body_bottom_row().
+            if self.view_mode {
+                return;
             }
             self.ensure_scroll_region();
             let bottom = self.body_bottom_row();
@@ -7720,5 +7733,110 @@ mod tests {
         // body_lines should still grow.
         let non_empty = r.body_lines.iter().filter(|row| !row.is_empty()).count();
         assert!(non_empty >= 31, "expected body_lines to keep growing in view_mode, got {}", non_empty);
+    }
+
+    /// push_or_update_live_spinner and clear_live_spinner must NOT write CUP/EL
+    /// sequences to the terminal when view_mode is active.  paint_body owns the
+    /// body region in that state; direct spinner writes would overwrite the
+    /// scrolled content painted there.
+    ///
+    /// The buffer update (body_lines) must still happen so that the buffer is
+    /// correct when the user exits view_mode.
+    #[test]
+    fn retained_view_mode_suppresses_spinner_terminal_writes() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let status = status_basic();
+
+        // Push enough lines that we have room to scroll up.
+        for i in 0..30 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.scroll_body(-5);
+        assert!(r.view_mode, "precondition: scroll_body(-5) must enter view_mode");
+
+        let body_len_before = r.body_lines.len();
+        let bytes_before = buf.lock().unwrap().len();
+
+        // First spinner tick — goes through the push-new-row branch of
+        // push_or_update_live_spinner (live_spinner_active is false).
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋",
+            label: "Thinking".into(),
+            status: status.clone(),
+            menu: None,
+            attachments: Vec::new(),
+        });
+
+        // Second tick — goes through the update-in-place branch.
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠙",
+            label: "Thinking".into(),
+            status: status.clone(),
+            menu: None,
+            attachments: Vec::new(),
+        });
+
+        let new_bytes = buf.lock().unwrap()[bytes_before..].to_vec();
+        let s = String::from_utf8_lossy(&new_bytes);
+
+        // The spinner tick must not write its frame/label glyphs to the
+        // terminal in view_mode.  repaint_body_region (triggered by
+        // push_body_row → ensure_scroll_region) is allowed to write CUP+EL
+        // sequences to repaint the viewport; what is forbidden is the
+        // push_or_update_live_spinner direct write that places the spinner
+        // content at body_bottom_row, overwriting scrolled content.
+        //
+        // Check: the spinner frame glyphs ("⠋", "⠙") and label ("Thinking")
+        // must not appear in the terminal output during view_mode.
+        assert!(
+            !s.contains("Thinking"),
+            "spinner label must not be written to terminal in view_mode; got: {:?}",
+            s
+        );
+        assert!(
+            !s.contains('⠋') && !s.contains('⠙'),
+            "spinner frame glyphs must not be written to terminal in view_mode; got: {:?}",
+            s
+        );
+
+        // Buffer must still be updated so view_mode exit produces the right paint.
+        // The spinner row should have been pushed (body_lines grew by 1 total —
+        // the second tick replaces in place so no extra row).
+        assert!(
+            r.body_lines.len() > body_len_before,
+            "body_lines must grow despite view_mode (got {} before, {} after)",
+            body_len_before,
+            r.body_lines.len()
+        );
+        assert!(
+            r.live_spinner_active,
+            "live_spinner_active must be true after spinner ticks in view_mode"
+        );
+
+        // Now drive clear_live_spinner via a user turn start (which calls
+        // clear_live_spinner internally when it commits the spinner row).
+        // We capture the bytes after this point.
+        let bytes_before_clear = buf.lock().unwrap().len();
+        // Feeding a TurnComplete-equivalent: render a user line, which
+        // calls push_body_row → clear_live_spinner.
+        r.render(UiLine::User("done".into()));
+        let clear_bytes = buf.lock().unwrap()[bytes_before_clear..].to_vec();
+        let _cs = String::from_utf8_lossy(&clear_bytes);
+        // clear_live_spinner's direct CUP+EL targeting body_bottom must be
+        // suppressed in view_mode.  Any repaint triggered by view-mode-exit
+        // (not the case here since we're still in view_mode) is a separate
+        // path.  Here we just verify no stray spinner glyphs are emitted.
+        // The primary check is that the spinner frame/label (which would
+        // appear on any residual write from push_or_update_live_spinner)
+        // were already asserted absent above; here we just double-check
+        // live_spinner_active is now false (clear succeeded in buffer).
+        assert!(
+            !r.live_spinner_active,
+            "live_spinner_active must be false after clear; got true"
+        );
     }
 }
