@@ -2170,6 +2170,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let _ = self.out.flush();
         self.screen.invalidate();
     }
+
+    /// Exit view_mode unconditionally, restoring sticky-bottom state.
+    /// Call at the start of any operation that invalidates the current
+    /// viewport (reset, clear, resize, approval prompt).
+    fn exit_view_mode(&mut self) {
+        if self.view_mode {
+            self.view_mode = false;
+            self.sticky_bottom = true;
+            self.viewport_top = 0;
+        }
+    }
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -2692,6 +2703,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: approval / errors / command output ──
             UiLine::ApprovalPrompt { tool, detail } => {
+                self.exit_view_mode();
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
                 let chip = |c: Color| CellStyle {
@@ -3052,6 +3064,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn reset(&mut self) {
+        self.exit_view_mode();
         // Terminal-side wipe + full state reset. `body_lines` is
         // also dropped so post-reset the screen truly starts clean
         // (old transcript stays in the terminal's own scrollback).
@@ -3376,6 +3389,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if cols == self.screen.width() && rows == self.screen.height() {
             return;
         }
+        self.exit_view_mode();
         // Terminal-side wipe: resize leaves pre-resize chars at old
         // absolute positions. Use per-row CUP+EL instead of `\x1b[2J`
         // for the same reason as `reset()` — iTerm2 3.5+ has been
@@ -7838,5 +7852,45 @@ mod tests {
             !r.live_spinner_active,
             "live_spinner_active must be false after clear; got true"
         );
+    }
+
+    #[test]
+    fn retained_reset_clears_view_mode() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        for i in 0..30 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.scroll_body(-5);
+        assert!(r.view_mode);
+        r.reset();
+        assert!(!r.view_mode);
+        assert!(r.sticky_bottom);
+    }
+
+    #[test]
+    fn retained_resize_clears_view_mode() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        for i in 0..30 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.scroll_body(-5);
+        assert!(r.view_mode);
+        r.on_resize(100, 30);
+        assert!(!r.view_mode);
+    }
+
+    #[test]
+    fn retained_approval_prompt_forces_view_exit() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        for i in 0..30 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.scroll_body(-5);
+        assert!(r.view_mode);
+        r.render(UiLine::ApprovalPrompt {
+            tool: "Bash".into(),
+            detail: "ls".into(),
+        });
+        assert!(!r.view_mode, "approval prompt must force exit from view_mode");
     }
 }
