@@ -381,6 +381,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// no-op since the group rows are no longer at the bottom and may
     /// have scrolled out of the visible body strip).
     live_group: Option<LiveGroup>,
+    /// Windows only: the STD_INPUT_HANDLE console mode value saved by
+    /// `enable_conhost_mouse_capture` at startup / resume. Restored by
+    /// `restore_conhost_console_in_mode` on suspend / shutdown so the
+    /// parent shell gets its quick-edit / line-input flags back exactly
+    /// as they were (not "approximated" by crossterm's snapshot).
+    #[cfg(windows)]
+    prior_console_in_mode: Option<u32>,
 }
 
 /// Tracking state for an active multi-row live group. Populated by
@@ -419,6 +426,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the terminal's mouse event stream (needed for Phase 4 scroll support).
         let _ = out.write_all(b"\x1b[3J\x1b[?1002h\x1b[?1006h");
         let _ = out.flush();
+        #[cfg(windows)]
+        let prior_console_in_mode = crate::render::conhost::enable_conhost_mouse_capture();
         Self {
             out,
             caps,
@@ -446,6 +455,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             inflight_tool: None,
             inflight_tool_rows: 0,
             live_group: None,
+            #[cfg(windows)]
+            prior_console_in_mode,
         }
     }
 
@@ -3032,6 +3043,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // Disable mouse capture (button-event + SGR coordinates) so the
         // terminal returns to default mouse behavior when atomcode exits.
         let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        #[cfg(windows)]
+        if let Some(prior) = self.prior_console_in_mode.take() {
+            crate::render::conhost::restore_conhost_console_in_mode(prior);
+        }
         let _ = self.out.flush();
         // Drain any pending frame before exit so the user sees the
         // latest widget state (typically a final prompt or an error
@@ -3125,6 +3140,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // button-event. Mouse mode must be off before raw_mode is disabled,
         // so the child process sees the terminal with mouse disabled.
         let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        #[cfg(windows)]
+        if let Some(prior) = self.prior_console_in_mode.take() {
+            crate::render::conhost::restore_conhost_console_in_mode(prior);
+        }
         // Position cursor at the top of where the footer (input box +
         // status + menu) used to be, then clear from there to end of
         // screen. Without this, cursor stays wherever the last paint
@@ -3239,6 +3258,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // This ensures the user has a clean alt-screen-like state with mouse
         // hooked and working.
         let _ = self.out.write_all(b"\x1b[?1002h\x1b[?1006h");
+        #[cfg(windows)]
+        {
+            self.prior_console_in_mode = crate::render::conhost::enable_conhost_mouse_capture();
+        }
         let _ = self.out.flush();
     }
 
