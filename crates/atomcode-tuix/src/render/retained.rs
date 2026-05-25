@@ -3119,6 +3119,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn suspend_for_external(&mut self) {
+        // Disable mouse capture so the external child process (OAuth browser,
+        // shell prompt, etc.) runs with a clean terminal state. Mirrors the
+        // disable order in alt_screen::leave_alt_screen: SGR first, then
+        // button-event. Mouse mode must be off before raw_mode is disabled,
+        // so the child process sees the terminal with mouse disabled.
+        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
         // Position cursor at the top of where the footer (input box +
         // status + menu) used to be, then clear from there to end of
         // screen. Without this, cursor stays wherever the last paint
@@ -3226,6 +3232,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.emit_body_line_inner(row, bottom);
             }
         }
+        let _ = self.out.flush();
+        // Re-enable mouse capture after resume, mirroring the disable in
+        // suspend_for_external and the enable in with_writer. Mouse re-enable
+        // order: button-event first, then SGR coords (opposite of disable).
+        // This ensures the user has a clean alt-screen-like state with mouse
+        // hooked and working.
+        let _ = self.out.write_all(b"\x1b[?1002h\x1b[?1006h");
         let _ = self.out.flush();
     }
 
@@ -7908,6 +7921,33 @@ mod tests {
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("\x1b[?1002h"), "must enable button-event tracking: {:?}", s);
         assert!(s.contains("\x1b[?1006h"), "must enable SGR coordinates: {:?}", s);
+    }
+
+    #[test]
+    fn retained_suspend_disables_mouse_capture() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        buf.lock().unwrap().clear();
+        r.suspend_for_external();
+        let bytes = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\x1b[?1006l"), "suspend must disable SGR: {:?}", s);
+        assert!(s.contains("\x1b[?1002l"), "suspend must disable button-event: {:?}", s);
+    }
+
+    #[test]
+    fn retained_resume_reenables_mouse_capture() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        r.suspend_for_external();
+        buf.lock().unwrap().clear();
+        r.resume_from_external();
+        let bytes = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\x1b[?1002h"), "resume must re-enable button-event: {:?}", s);
+        assert!(s.contains("\x1b[?1006h"), "resume must re-enable SGR: {:?}", s);
     }
 
     #[test]
