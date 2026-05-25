@@ -152,10 +152,14 @@ pub fn line_display_width_sgr_aware(s: &str) -> usize {
 /// solid (otherwise an inline `\x1b[0m` from markdown styling would
 /// reset the highlight mid-span).
 ///
-/// Wide chars (CJK, emoji): a single char that straddles `sel_start`
-/// or `sel_end` is treated as fully inside if its first column is in
-/// range — matches what the user expects when they click on the left
-/// half of a wide char.
+/// Wide chars (CJK, emoji): a cluster is selected iff its visual
+/// footprint OVERLAPS `[sel_start, sel_end)`. Concretely:
+/// `cols + w > sel_start && cols < sel_end`. This matches what the
+/// user expects when they drag-select any column inside a wide cluster
+/// — the whole cluster joins the selection. The previous rule
+/// `cols >= sel_start && cols < sel_end` silently dropped any cluster
+/// whose first column was below `sel_start`, even when the cluster's
+/// second column sat inside the selection.
 pub fn render_line_with_selection(
     line: &str,
     max_cols: usize,
@@ -198,7 +202,13 @@ pub fn render_line_with_selection(
             .unwrap_or(line.len());
         let g = &line[i..next];
         let w = cluster_width(g);
-        let want_in_sel = cols >= sel_start && cols < sel_end;
+        // Overlap test: the cluster spans `cols..cols+w`. It enters the
+        // selection if any of those cols falls in [sel_start, sel_end).
+        // For width-1 clusters this collapses to `cols >= sel_start &&
+        // cols < sel_end` (same as before). For wide clusters whose
+        // first col is below sel_start but second col is inside, the
+        // cluster now joins the selection — see doc-comment for why.
+        let want_in_sel = cols + w > sel_start && cols < sel_end;
         if want_in_sel && !in_sel {
             // Reset existing colours then enable reverse video so the
             // selection highlight is visually consistent regardless of
@@ -260,7 +270,12 @@ pub fn extract_line_selection_text(
             .unwrap_or(line.len());
         let g = &line[i..next];
         let w = cluster_width(g);
-        if cols >= sel_start {
+        // Match `render_line_with_selection`'s overlap rule so the
+        // highlight and the copied text agree on which wide clusters
+        // belong to the selection. A cluster overlapping sel_start
+        // joins the copy; one overlapping sel_end falls in via the
+        // `cols < sel_end` check (the break above covers >= sel_end).
+        if cols + w > sel_start {
             out.push_str(g);
         }
         cols += w;
@@ -438,6 +453,24 @@ pub fn emit_osc52(out: &mut dyn Write, text: &str) {
     let encoded = base64_encode(text.as_bytes());
     let _ = write!(out, "\x1b]52;c;{}\x07", encoded);
     let _ = out.flush();
+}
+
+/// Push a drag-release selection to the system clipboard via BOTH
+/// OSC 52 (terminal-side, no extra process cost) AND arboard
+/// (process-side, via the system clipboard service). Many terminals
+/// don't honor OSC 52 — macOS Terminal.app default, some Windows
+/// conhost configurations, OSC-52-disabled iTerm2 profiles — so
+/// without the arboard parallel write the user drags, releases, and
+/// finds the clipboard empty. Both calls are best-effort; arboard
+/// fails gracefully on headless servers / WSL without an X server.
+pub fn copy_to_clipboard(out: &mut dyn Write, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    emit_osc52(out, text);
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text.to_string());
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

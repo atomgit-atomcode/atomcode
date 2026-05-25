@@ -3586,6 +3586,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.sticky_bottom = new_top >= max_top;
         let was_view = self.view_mode;
         self.view_mode = !self.sticky_bottom;
+        // Entering view_mode invalidates any in-progress drag selection
+        // — the anchor was recorded against the sticky-bottom layout,
+        // but body rows now shift relative to viewport_top. Without a
+        // clear, the next mouse-move applies stale anchor against new
+        // coords and paints highlight on rows the user didn't drag.
+        // Spec line 293 said "selection 状态保留" but the visual
+        // promise is impossible to keep across the layout change.
+        if !was_view && self.view_mode {
+            self.selection.clear();
+        }
         // Trigger paint. When transitioning out of view_mode (was_view=true,
         // view_mode=false), the next paint_body must repaint the body tail
         // without a `\n` scroll (handled in P3.5).
@@ -3689,7 +3699,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn end_selection(&mut self) {
         if let Some(text) = self.selection.end(&self.body_lines) {
-            crate::render::selection::emit_osc52(&mut self.out, &text);
+            // copy_to_clipboard fans out to OSC 52 + arboard so Terminal.app
+            // (OSC 52 off by default) and headless terminals both get the
+            // selection. Pure OSC 52 would silently drop on those.
+            crate::render::selection::copy_to_clipboard(&mut self.out, &text);
         }
     }
 
