@@ -542,13 +542,32 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             self.viewport_top.min(total.saturating_sub(body_height))
         };
 
+        // Compute scrollbar shape before the body loop so we know
+        // whether to reserve the rightmost column for the thumb/track.
+        // scrollbar::compute returns None when disabled or no overflow.
+        let scrollbar_shape = crate::render::scrollbar::compute(
+            total,
+            body_height,
+            viewport_start,
+            self.sticky_bottom,
+            self.show_scrollbar,
+        );
+
         // Walk every row in the visible window. CUP each row, EL to
         // wipe leftover glyphs from previous frames, then write the
         // body content (trimmed to terminal width and SGR-terminated
         // so long lines don't autowrap into the next body row's slot
         // and stale colour spans don't bleed). For rows past the end
         // of body_lines, just EL (clear). 1-indexed rows.
-        let max_cols = self.width as usize;
+        //
+        // When the scrollbar is active, body content is truncated to
+        // `width - 1` columns so the rightmost column stays free for
+        // the scrollbar glyph (painted after this loop).
+        let max_cols = if scrollbar_shape.is_some() {
+            (self.width as usize).saturating_sub(1)
+        } else {
+            self.width as usize
+        };
         // Snapshot the ordered selection bounds once so the per-row
         // loop doesn't re-borrow `self.selection` while we hold a
         // reference to `self.body_lines[i]`. Cheap (Copy) and only
@@ -587,6 +606,26 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 let _ = self.out.write_all(b"\x1b[0m");
             }
         }
+
+        // Paint right-side scrollbar. Executed AFTER the body rows so
+        // the scrollbar glyphs overwrite whatever the body row emitted
+        // in that column (for lines that were not truncated by the
+        // max_cols guard above, e.g. very short lines).
+        // scrollbar_col is 1-indexed = self.width (the rightmost column).
+        if let Some(shape) = &scrollbar_shape {
+            let scrollbar_col = self.width;
+            for row_idx in 0..body_height {
+                let target_row = 1 + row_idx as u16;
+                let glyph = if crate::render::scrollbar::is_thumb_row(shape, row_idx) {
+                    "\u{2588}" // █ FULL BLOCK
+                } else {
+                    "\u{2502}" // │ LIGHT VERTICAL
+                };
+                let seq = format!("\x1b[{};{}H{}", target_row, scrollbar_col, glyph);
+                let _ = self.out.write_all(seq.as_bytes());
+            }
+        }
+
         // No flush here: paint_frame batches body + footer +
         // anchor_cursor_to_input into a single flush at the very
         // end so the terminal renders only the final cursor
@@ -3881,5 +3920,29 @@ mod tests {
         }
         assert_eq!(r.message_marks.len(), 2500);
         assert_eq!(r.message_marks[0].line_idx, 0, "first surviving mark should point at body_lines[0] after drain");
+    }
+
+    #[test]
+    fn alt_scrollbar_paints_thumb_when_enabled_and_overflow() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.show_scrollbar = true;
+        for i in 0..30 { r.push_body_row(format!("R{:02}", i)); }
+        r.paint_body();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("█"), "thumb char missing: {:?}", s);
+    }
+
+    #[test]
+    fn alt_scrollbar_not_painted_when_disabled() {
+        let mut buf = Vec::new();
+        let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
+        r.show_scrollbar = false;
+        for i in 0..30 { r.push_body_row(format!("R{:02}", i)); }
+        r.paint_body();
+        drop(r);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(!s.contains("█"), "thumb should not appear when disabled: {:?}", s);
     }
 }
