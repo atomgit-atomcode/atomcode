@@ -35,6 +35,10 @@ use crossterm::style::Color;
 
 const PAD_COL: usize = 2;
 
+/// Max body_lines kept in the in-app scrollback buffer (matches alt-screen).
+/// Bounded so memory doesn't grow without limit on long sessions.
+pub const MAX_SCROLLBACK_ROWS: usize = 5000;
+
 /// Render context usage as `12.3k / 131k tok` when both used and window
 /// are known, or `12.3k tok` when only the used count is known (provider
 /// hasn't reported its window yet, e.g. pre-config or fallback).
@@ -1421,9 +1425,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             self.emit_body_line_inner(&row, bottom);
         }
         self.body_lines.push(row);
-        let max_keep = (self.screen.height() as usize).saturating_mul(4).max(128);
-        if self.body_lines.len() > max_keep {
-            let drain = self.body_lines.len() - max_keep;
+        if self.body_lines.len() > MAX_SCROLLBACK_ROWS {
+            let drain = self.body_lines.len() - MAX_SCROLLBACK_ROWS;
             self.body_lines.drain(0..drain);
         }
     }
@@ -7476,5 +7479,15 @@ mod tests {
         // there's no per-attribute toggle for faint.
         assert!(!style.bold, "SGR 22 must clear bold");
         assert!(!style.faint, "SGR 22 must clear faint");
+    }
+
+    #[test]
+    fn retained_body_lines_cap_is_5000_not_height_times_4() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        // Push 5050 user lines (use a method that goes through push_body_row).
+        for i in 0..5050 {
+            r.render(UiLine::User(format!("line {}", i)));
+        }
+        assert_eq!(r.body_lines.len(), 5000, "body_lines should cap at 5000, got {}", r.body_lines.len());
     }
 }
