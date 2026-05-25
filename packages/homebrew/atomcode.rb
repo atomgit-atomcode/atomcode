@@ -45,7 +45,9 @@ class Atomcode < Formula
     # The downloaded file has the release-format name; we rename it to
     # "atomcode" for the bin/ slot so the user gets a clean `atomcode`
     # command regardless of platform.
-    bin.install Dir["atomcode-v#{version}-*"].first => "atomcode"
+    found = Dir["atomcode-v#{version}-*"]
+    raise "AtomCode binary not found (version #{version}) in #{Dir.pwd}" if found.empty?
+    bin.install found.first => "atomcode"
   end
 
   test do

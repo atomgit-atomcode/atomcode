@@ -17,8 +17,6 @@
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
-const { createUnzip } = require("zlib");
-const { pipeline } = require("stream/promises");
 
 const PKG_VERSION = process.env.npm_package_version;
 const VERSION = process.env.ATOMCODE_VERSION || `v${PKG_VERSION}`;
@@ -60,33 +58,44 @@ const BIN_DIR = path.join(__dirname, "bin");
 const BIN_PATH = path.join(BIN_DIR, `atomcode${BIN_SUFFIX}`);
 
 // ── helpers ─────────────────────────────────────────────────────────
-function download(url, destPath) {
+const MAX_REDIRECTS = 5;
+
+function download(url, destPath, redirectCount) {
+  if (redirectCount === undefined) redirectCount = 0;
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(destPath);
     https
       .get(url, { headers: { "User-Agent": "atomcode-npm-installer" } }, (res) => {
         // Follow redirects (GitCode may redirect to CDN)
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          file.close();
-          fs.unlinkSync(destPath);
-          return download(new URL(res.headers.location, url).href, destPath).then(resolve, reject);
+          file.close(() => {
+            fs.unlinkSync(destPath);
+            if (redirectCount >= MAX_REDIRECTS) {
+              return reject(new Error(`Too many redirects (${MAX_REDIRECTS})`));
+            }
+            download(new URL(res.headers.location, url).href, destPath, redirectCount + 1).then(resolve, reject);
+          });
+          return;
         }
         if (res.statusCode !== 200) {
-          file.close();
-          fs.unlinkSync(destPath);
-          return reject(
-            new Error(`HTTP ${res.statusCode} ${res.statusMessage}\n  DOWNLOAD_URL: ${url}`)
-          );
+          file.close(() => {
+            fs.unlinkSync(destPath);
+            reject(
+              new Error(`HTTP ${res.statusCode} ${res.statusMessage}\n  DOWNLOAD_URL: ${url}`)
+            );
+          });
+          return;
         }
         res.pipe(file);
         file.on("finish", () => {
-          file.close(resolve);
+          file.close(() => resolve());
         });
       })
       .on("error", (err) => {
-        file.close();
-        if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
-        reject(err);
+        file.close(() => {
+          if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+          reject(err);
+        });
       });
   });
 }

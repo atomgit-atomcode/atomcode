@@ -11,21 +11,7 @@ const path = require("path");
 
 const BIN_DIR = path.join(__dirname, "bin");
 
-function rmSync(dir) {
-  if (!fs.existsSync(dir)) return;
-  for (const entry of fs.readdirSync(dir)) {
-    const p = path.join(dir, entry);
-    const stat = fs.lstatSync(p);
-    if (stat.isDirectory()) {
-      rmSync(p);
-    } else {
-      fs.unlinkSync(p);
-    }
-  }
-  fs.rmdirSync(dir);
-}
-
 if (fs.existsSync(BIN_DIR)) {
-  rmSync(BIN_DIR);
+  fs.rmSync(BIN_DIR, { recursive: true, force: true });
   console.log("  ✓ AtomCode binary removed.");
 }
