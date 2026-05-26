@@ -716,14 +716,17 @@ context from second".into()));
     async fn user_prompt_json_block_with_trailing_debug_falls_through() {
         // When the LAST non-empty line is debug noise (not JSON), the hook
         // falls through to plain-text inject even if an earlier line
-        // contained a valid block JSON.
+        // contained a valid block JSON. The entire stdout is injected.
         let hook = make_hook(HookEvent::UserPromptSubmit, None,
             r#"echo '{"decision":"block","reason":"missed"}'; echo 'some trailing log'"#);
         let exec = HookExecutor::new(vec![hook]);
         let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
-        // The last non-empty line "some trailing log" is not valid JSON,
-        // so it goes through the plain-text inject path.
-        assert_eq!(r, UserPromptHookResult::Inject("some trailing log".into()));
+        assert!(matches!(r, UserPromptHookResult::Inject(_)),
+            "expected Inject, got {:?}", r);
+        if let UserPromptHookResult::Inject(ctx) = r {
+            assert!(ctx.contains("some trailing log"), "ctx: {ctx}");
+            assert!(ctx.contains("missed"), "ctx: {ctx}");
+        }
     }
 
     #[tokio::test]
