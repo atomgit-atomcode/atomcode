@@ -3793,10 +3793,19 @@ fn handle_input(
 
     match ev {
         InputEvent::MouseScroll(delta) => {
-            // Mouse wheel — only the alt-screen renderer takes action;
-            // retained / plain default to no-op (host terminal handles
-            // their scrollback natively, mouse capture isn't enabled
-            // for them anyway).
+            // Mouse wheel routing:
+            //   * AltScreenRenderer  — moves the alt-screen viewport.
+            //   * RetainedRenderer   — no-op. Body rows that scroll off
+            //     the top are promoted to the host terminal's native
+            //     scrollback, so vertical navigation belongs to the
+            //     terminal. We still RECEIVE the wheel event here
+            //     because `?1002h` (enabled for drag selection)
+            //     consumes wheel ticks; users reach scrollback via the
+            //     terminal-level bypass (Shift+wheel in iTerm2 /
+            //     Terminal.app, Cmd+↑ for page-wise history), which
+            //     the terminal resolves BEFORE the event reaches us.
+            //   * PlainRenderer      — no-op (no mouse capture at all,
+            //     wheel reaches the terminal directly).
             renderer.scroll_body(delta);
         }
         InputEvent::MouseDown { col, row } => {

@@ -3519,9 +3519,25 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
     }
 
     fn scroll_body(&mut self, _delta: i32) {
-        // No-op: terminal-native scrollback handles vertical navigation
-        // after the append-only refactor. Kept as trait method for
-        // backward compatibility with the Renderer trait.
+        // No-op by design. After the append-only refactor body rows
+        // live in the host terminal's native scrollback once they
+        // scroll off the visible region, so vertical navigation is the
+        // terminal's job.
+        //
+        // Caveat: we enable button-event tracking (`?1002h`) for drag
+        // selection, which makes the terminal report wheel ticks to us
+        // as SGR mouse events instead of acting on them locally. To
+        // reach scrollback the user must hold the terminal-level bypass
+        // modifier — Shift+wheel in iTerm2 / Terminal.app, Cmd+↑ /
+        // Cmd+↓ for page-wise navigation. Those bypass keys are
+        // resolved by the terminal BEFORE the mouse event ever reaches
+        // our stdin, so they keep working regardless of what this
+        // method does. Acting on raw wheel events here is intentionally
+        // avoided because we can't synthesise back-scroll through
+        // already-promoted scrollback rows without re-implementing the
+        // terminal's history buffer ourselves.
+        //
+        // See regression test `retained_scroll_body_is_noop_to_preserve_native_scrollback`.
     }
 
     fn scroll_body_to_top(&mut self) {
@@ -7990,6 +8006,92 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("\x1b[?1002l"), "shutdown must disable button-event: {:?}", s);
         assert!(s.contains("\x1b[?1006l"), "shutdown must disable SGR coords: {:?}", s);
+    }
+
+    /// Pins the Issue-1 contract: when a mouse-wheel tick reaches
+    /// `RetainedRenderer::scroll_body`, it must do nothing. We
+    /// receive the event because `?1002h` (enabled for drag
+    /// selection) consumes wheel ticks from the SGR mouse stream,
+    /// but acting on the event would only shift OUR cell grid — the
+    /// host terminal's scrollback would still be unreachable. The
+    /// user-facing scrollback path is the terminal-level Shift+wheel
+    /// / Cmd+↑ bypass, which the terminal resolves BEFORE the event
+    /// hits our stdin.
+    ///
+    /// Regression guard: a future change that wires this method up
+    /// to body movement would silently break "Shift+wheel scrolls
+    /// the terminal" because the body would also jump, and would
+    /// pollute scrollback because emit-side LFs would push stale
+    /// rows into history.
+    #[test]
+    fn retained_scroll_body_is_noop_to_preserve_native_scrollback() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        // Seed enough body content that any naive scroll attempt
+        // would have something to emit (we want to assert that even
+        // with rows present, scroll_body writes nothing).
+        for i in 0..40 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.flush_deferred();
+        // Capture the byte count right BEFORE the wheel arrives so
+        // anything emitted by the wheel call shows up as a delta.
+        let before = buf.lock().unwrap().len();
+        // Simulate a few wheel ticks in each direction.
+        r.scroll_body(-3);
+        r.scroll_body(3);
+        r.scroll_body(-1);
+        r.scroll_body(1);
+        let after = buf.lock().unwrap().len();
+        assert_eq!(
+            before, after,
+            "scroll_body must NOT write any bytes — wheel scroll belongs to the \
+             terminal's native scrollback via Shift+wheel / Cmd+↑. Emitted {} \
+             unexpected bytes.",
+            after - before
+        );
+    }
+
+    /// Companion to `retained_scroll_body_is_noop_…`: even though
+    /// wheel events are intentionally inert, drag selection (the
+    /// reason `?1002h` is enabled in the first place) MUST still
+    /// work. If a future change suppresses `?1002h` to "let the
+    /// wheel through" we'd lose drag selection — this test pins
+    /// BOTH the startup ?1002h emission AND the renderer-side
+    /// drag-selection state machine so either-side regression is
+    /// loud.
+    #[test]
+    fn retained_drag_selection_survives_wheel_noop_contract() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        // Startup MUST enable button-event tracking — the only
+        // mouse mode that gives us drag motion. Without it the
+        // terminal would never report MouseDrag events and drag
+        // selection would silently no-op.
+        let startup = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&startup);
+        assert!(
+            s.contains("\x1b[?1002h"),
+            "?1002h must still be enabled — dropping it to 'let wheel \
+             through' would break drag selection: {:?}",
+            s
+        );
+        // Exercise the drag-selection state machine end-to-end on
+        // the renderer side.
+        for i in 0..10 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        assert!(r.selection.selection.is_none());
+        r.begin_selection(3, 1);
+        r.update_selection(10, 1);
+        assert!(
+            r.selection.selection.is_some(),
+            "drag selection must still produce a selection state — the wheel \
+             no-op contract must not regress drag selection"
+        );
+        r.end_selection();
     }
 
     #[test]
