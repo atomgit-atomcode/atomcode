@@ -13,6 +13,9 @@ use super::{
 /// hook-injected context blocks visually distinct when multiple hooks
 /// each contribute a chunk.
 fn push_context(acc: &mut String, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
     if !acc.is_empty() {
         acc.push_str("\n\n");
     }
@@ -374,6 +377,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_returning_modify_json() {
+        let hook = make_hook(
+            HookEvent::PreToolUse,
+            Some("bash"),
+            r#"echo '{"action":"modify","args":{"command":"ls -la"}}'"#,
+        );
+        let exec = HookExecutor::new(vec![hook]);
+        let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
+        assert_eq!(
+            result,
+            PreHookResult::Modify {
+                args: json!({"command": "ls -la"})
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_multiple_modify_last_wins() {
+        let hooks = vec![
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"modify","args":{"command":"first"}}'"#,
+            ),
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"allow"}'"#,
+            ),
+        ];
+        let exec = HookExecutor::new(hooks);
+        let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
+        // The second hook returns Allow, but the first hook's Modify should
+        // still be the accumulated result.
+        assert_eq!(
+            result,
+            PreHookResult::Modify {
+                args: json!({"command": "first"})
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_multiple_block_short_circuits() {
+        let hooks = vec![
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"allow"}'"#,
+            ),
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                r#"echo '{"action":"block","reason":"second blocks"}'"#,
+            ),
+            make_hook(
+                HookEvent::PreToolUse,
+                Some("bash"),
+                // This hook should NEVER run because Block short-circuits.
+                r#"echo 'should-not-be-called'"#,
+            ),
+        ];
+        let exec = HookExecutor::new(hooks);
+        let result = exec.run_pre_tool_use("bash", &test_ctx()).await;
+        assert_eq!(
+            result,
+            PreHookResult::Block {
+                reason: "second blocks".into()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn hook_returning_non_json_allows() {
         let hook = make_hook(
             HookEvent::PreToolUse,
@@ -627,6 +703,30 @@ context from second".into()));
     }
 
     #[tokio::test]
+    async fn user_prompt_decision_allow_continues() {
+        // JSON with decision="allow" should be treated as continue (not block).
+        let hook = make_hook(HookEvent::UserPromptSubmit, None,
+            r#"echo '{"decision":"allow"}'"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        assert_eq!(r, UserPromptHookResult::Continue);
+    }
+
+    #[tokio::test]
+    async fn user_prompt_json_block_with_trailing_debug_falls_through() {
+        // When the LAST non-empty line is debug noise (not JSON), the hook
+        // falls through to plain-text inject even if an earlier line
+        // contained a valid block JSON.
+        let hook = make_hook(HookEvent::UserPromptSubmit, None,
+            r#"echo '{"decision":"block","reason":"missed"}'; echo 'some trailing log'"#);
+        let exec = HookExecutor::new(vec![hook]);
+        let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
+        // The last non-empty line "some trailing log" is not valid JSON,
+        // so it goes through the plain-text inject path.
+        assert_eq!(r, UserPromptHookResult::Inject("some trailing log".into()));
+    }
+
+    #[tokio::test]
     async fn user_prompt_json_decision_allow_with_context_injects() {
         let hook = make_hook(HookEvent::UserPromptSubmit, None,
             r#"echo '{"decision":"allow","hookSpecificOutput":{"additionalContext":"extra"}}'"#);
@@ -808,6 +908,16 @@ context from second".into()));
     }
 
     #[tokio::test]
+    async fn execute_hook_nonzero_exit_returns_error() {
+        let hook = make_hook(HookEvent::PreToolUse, None, "exit 2");
+        let exec = HookExecutor::new(vec![hook]);
+        let result = exec.execute_hook(&exec.hooks[0], &test_ctx()).await;
+        assert!(result.is_err(), "expected Err for non-zero exit, got {:?}", result);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exited with status"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
     async fn execute_hook_with_stdin_echoes_payload() {
         let hook = make_hook(HookEvent::UserPromptSubmit, None, r#"cat"#);
         let exec = HookExecutor::new(vec![hook]);
@@ -837,7 +947,7 @@ context from second".into()));
     fn push_context_empty_extra() {
         let mut acc = "first".to_string();
         push_context(&mut acc, "");
-        assert_eq!(acc, "first\n\n");
+        assert_eq!(acc, "first");
     }
 
     #[test]

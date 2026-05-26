@@ -148,4 +148,11 @@ mod tests {
         assert_eq!(matched[0].command, "should-match.sh");
         assert_eq!(matched[1].command, "also-match.sh");
     }
+
+    #[test]
+    fn matching_hooks_empty_input() {
+        let hooks: Vec<HookConfig> = vec![];
+        let matched = matching_hooks(&hooks, HookEvent::PreToolUse, Some("bash"));
+        assert!(matched.is_empty());
+    }
 }
