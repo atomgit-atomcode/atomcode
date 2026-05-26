@@ -1447,33 +1447,57 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // region) — at that exact moment the oldest visible row
         // (index 0 in the visible tail = `body_lines[len-cap]`) needs
         // to scroll out.
-        if self.body_lines.len() >= cap {
+        let overflow = self.body_lines.len() >= cap;
+        if overflow {
             let scroll_seq = format!("\x1b[{};1H\n", h);
             let _ = self.out.write_all(scroll_seq.as_bytes());
             self.screen.shift_prev_up(1);
         }
-        // 1-indexed row where the current footer's top_rule sits.
-        // (body_lines.len() rows of body live above it.)
-        let footer_top_1idx = (self.body_lines.len().min(cap) + 1) as u16;
-        // CUP to footer top → ED 0 (erases the old footer, freeing
-        // the rows below it for the new body line + footer rewrite).
-        // Pre-format into one buffer so the write hits stdout as one
-        // call — the chunk-counting test harness asserts on chunk
-        // boundaries.
-        let seq = format!("\x1b[{};1H\x1b[0J", footer_top_1idx);
+        // 1-indexed row where the NEW body line should land on the
+        // physical terminal. Two cases:
+        //
+        //   - Non-overflow (body still has room): the new row goes at
+        //     the next-empty body slot = `body_lines.len() + 1`.
+        //     `footer_top_1idx` equals this value because the footer
+        //     sat directly below the previous tail.
+        //
+        //   - Overflow: the bottom-LF scroll above shifted the entire
+        //     visible area UP by 1, so the old footer's top_rule no
+        //     longer sits at `cap + 1` — it sits at `cap`. The new
+        //     body row should land at `cap` (the freshly-blanked
+        //     bottom-most body slot, i.e. just above where the new
+        //     footer will repaint to). Writing at `cap + 1` here
+        //     (the pre-fix formula) put the new row UNDER where the
+        //     body's last visible slot should be — paint_frame's
+        //     cell-diff then re-emitted the same row at `cap`, but
+        //     the original ghost write at `cap + 1` survived as
+        //     stale glyphs at columns the cell-diff's prev-cells
+        //     pair (after shift_prev_up) considered blank-vs-blank,
+        //     so no overwrite patch fired. Net effect: every
+        //     overflow-pushed row appeared TWICE — once at its
+        //     intended position via the cell-diff, and once at the
+        //     ghost row(s) above it that successive overflow shifts
+        //     pushed up into the visible body region.
+        //     See regression test `retained_overflow_does_not_duplicate_last_body_row`.
+        let target_1idx = if overflow {
+            cap as u16
+        } else {
+            (self.body_lines.len() + 1) as u16
+        };
+        // CUP to target → ED 0 (erases everything from target down,
+        // freeing the rows below for the new body line + the
+        // follow-up cell-diff's footer rewrite). Pre-format into one
+        // buffer so the write hits stdout as one call — the
+        // chunk-counting test harness asserts on chunk boundaries.
+        let seq = format!("\x1b[{};1H\x1b[0J", target_1idx);
         let _ = self.out.write_all(seq.as_bytes());
-        // Write the body row at footer_top, then LF. If body is
-        // below the cap, the LF just advances cursor within screen
-        // (no scroll). If body is AT the cap, the body emit lands at
-        // row cap+1 (just past the visible body region) — the
-        // earlier bottom-LF already promoted the displaced top row
-        // to scrollback; the next `paint_frame` cell-diff repaints
-        // the body tail (including the new row at row cap, 1-indexed)
-        // and the footer below.
+        // Write the body row at target, then LF. The LF advances cursor
+        // within the screen (no scroll) because target is always
+        // strictly less than `h` (cap < h since footer_rows >= 1).
         let bytes = serialize_row(row);
         let _ = self.out.write_all(&bytes);
         let _ = self.out.write_all(b"\n");
-        // ED 0 above blanked the physical terminal from `footer_top_1idx`
+        // ED 0 above blanked the physical terminal from `target_1idx`
         // down — but `screen.prev_cells` still holds whatever was there
         // last frame. Without resyncing, the next `render_diff` may
         // suppress a patch for a row whose newly-laid-out cells happen
@@ -1484,7 +1508,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // the physical terminal is blank there because the ED 0 wiped
         // it). Resync prev_cells to mirror the ED so the diff sees the
         // real delta and emits the necessary patches.
-        let footer_top_0idx = footer_top_1idx.saturating_sub(1) as usize;
+        let footer_top_0idx = target_1idx.saturating_sub(1) as usize;
         self.screen.invalidate_rows_from(footer_top_0idx);
         // Mark dirty so the next 5ms `paint_frame` tick redraws
         // the footer below the new body row via the cell-diff path.
@@ -9119,6 +9143,102 @@ mod tests {
             long_screen_row,
             w - 5,
             cell_at_right_edge,
+            vterm.dump()
+        );
+    }
+
+    /// Regression: end-of-turn burst over the overflow boundary used to
+    /// duplicate every overflow-pushed row on the physical terminal.
+    ///
+    /// Real-world repro (user screenshot):
+    ///   "以上就是 Java 语法高亮的完整速查……"   ← duplicated
+    ///   "以上就是 Java 语法高亮的完整速查……"
+    ///   "✓ Done · 1 轮 · 0 工具 · …"           ← duplicated
+    ///   "✓ Done · 1 轮 · 0 工具 · …"
+    ///
+    /// Mechanism: `emit_body_line_inner` direct-wrote the new body row
+    /// at row `footer_top_1idx = cap + 1` (one row BELOW where the body
+    /// tail should actually live after the bottom-LF scroll shifted the
+    /// footer up by 1). The follow-up `paint_frame` cell-diff then
+    /// painted the same row at row `cap` (correct). The ghost write at
+    /// `cap + 1` survived because successive overflow pushes shifted it
+    /// up into the visible body region, and the cell-diff couldn't
+    /// erase the ghost glyphs at columns where `prev_cells` (post
+    /// `shift_prev_up`) and `cells` (post `paint_body_into_cells`)
+    /// both held blanks — the bug class `850a8a47` flagged for blank-
+    /// cell diff suppression, applied here to "stale glyph from earlier
+    /// emit's wrong-row write" instead of "stale reverse-video bit".
+    ///
+    /// Test: simulate the burst (final assistant paragraph + 3-row
+    /// TurnSeparator), confirm each marker text appears EXACTLY once
+    /// in the visible body region. Pre-fix this asserts at 2x; post-
+    /// fix it stays at 1x.
+    #[test]
+    fn retained_overflow_burst_does_not_duplicate_tail_rows() {
+        let w: u16 = 80;
+        let h: u16 = 12;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+
+        // Fill body exactly to cap with filler so the upcoming burst
+        // is guaranteed to ride the overflow branch every push.
+        for i in 0..cap {
+            r.render(UiLine::AssistantText(format!("filler {}\n", i)));
+        }
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Burst: final paragraph chunk (line-terminated so it flushes
+        // inside `flush_assistant_lines`) + TurnSeparator (which pushes
+        // three rows: blank spacer / rule_with_label / blank spacer).
+        // No `flush_deferred` between pushes so the cell-diff sees the
+        // accumulated `shift_prev_up`/`invalidate_rows_from` state ALL
+        // AT ONCE — exactly how a real end-of-turn burst arrives.
+        r.render(UiLine::AssistantText("ENDPARA_UNIQUE\n".into()));
+        r.render(UiLine::TurnSeparator {
+            label: "DONE_LABEL_UNIQUE".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Count occurrences on the entire screen (body + footer). The
+        // duplicate ghost lands in the body region, never on a footer
+        // row — but we scan the whole screen so a regression that
+        // displaces the dup elsewhere still trips this test.
+        let count = |needle: &str| -> usize {
+            (0..h as usize)
+                .filter(|&row_0idx| vterm.row_text(row_0idx).contains(needle))
+                .count()
+        };
+        let occ_para = count("ENDPARA_UNIQUE");
+        let occ_label = count("DONE_LABEL_UNIQUE");
+        assert_eq!(
+            occ_para, 1,
+            "ENDPARA_UNIQUE must appear EXACTLY once after end-of-turn \
+             overflow burst (found {}). Pre-fix this was 2 — the \
+             overflow direct-write landed at row cap+1 (one below the \
+             body tail) and the follow-up cell-diff painted the same \
+             row at cap; the ghost at cap+1 then got shifted up into \
+             the visible body region by successive overflow pushes.\ndump:\n{}",
+            occ_para,
+            vterm.dump()
+        );
+        assert_eq!(
+            occ_label, 1,
+            "DONE_LABEL_UNIQUE must appear EXACTLY once after end-of-turn \
+             overflow burst (found {}). See ENDPARA_UNIQUE assertion \
+             above for the mechanism.\ndump:\n{}",
+            occ_label,
             vterm.dump()
         );
     }
