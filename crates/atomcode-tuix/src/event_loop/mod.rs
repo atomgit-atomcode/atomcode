@@ -5410,20 +5410,31 @@ pub(super) fn handle_plugin_job_event(
         PluginJobEvent::MarketplaceAdded(info) => {
             // Marketplace add by itself doesn't load any skills (those come
             // from installed plugins) — show only the marketplace summary.
+            // `✓` prefix aligns with the MCP-connect / LSP-connect toasts
+            // emitted from the same body region (mcp_connect_rx etc.) so
+            // every "background install completed" line carries the same
+            // success indicator. Leading 2-space pad keeps the toast
+            // visually indented under the welcome banner.
             let _ = reload_plugins(ctx);
+            let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
             renderer.render(UiLine::CommandOutput(format!(
-                "  marketplace `{}` added at {} ({} plugins)\n",
-                info.name,
-                &info.git_commit[..7.min(info.git_commit.len())],
-                info.plugins.len()
+                "  {}\n",
+                crate::i18n::t(crate::i18n::Msg::PluginMarketplaceAdded {
+                    name: &info.name,
+                    commit: short_commit,
+                    count: info.plugins.len(),
+                })
             )));
         }
         PluginJobEvent::MarketplaceUpdated(info) => {
             let _ = reload_plugins(ctx);
+            let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
             renderer.render(UiLine::CommandOutput(format!(
-                "  marketplace `{}` updated to {}\n",
-                info.name,
-                &info.git_commit[..7.min(info.git_commit.len())]
+                "  {}\n",
+                crate::i18n::t(crate::i18n::Msg::PluginMarketplaceUpdated {
+                    name: &info.name,
+                    commit: short_commit,
+                })
             )));
         }
         PluginJobEvent::PluginInstalled(info) => {
@@ -5436,18 +5447,16 @@ pub(super) fn handle_plugin_job_event(
                     renderer.render(UiLine::CommandOutput(format!("  {}\n", w)));
                 }
             }
-            let hint = if warnings.is_empty() || state.show_tool_output {
-                String::new()
-            } else {
-                "  (Ctrl+O for details)".to_string()
-            };
+            let show_details_hint = !warnings.is_empty() && !state.show_tool_output;
             renderer.render(UiLine::CommandOutput(format!(
-                "  installed `{}@{}` — {} skills loaded, {} skipped{}\n",
-                info.plugin,
-                info.marketplace,
-                loaded,
-                warnings.len(),
-                hint,
+                "  {}\n",
+                crate::i18n::t(crate::i18n::Msg::PluginInstallDone {
+                    plugin: &info.plugin,
+                    marketplace: &info.marketplace,
+                    loaded,
+                    skipped: warnings.len(),
+                    show_details_hint,
+                })
             )));
         }
         PluginJobEvent::Failed { op, msg } => {

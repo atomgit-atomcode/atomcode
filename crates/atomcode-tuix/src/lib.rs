@@ -247,19 +247,22 @@ pub async fn run(
     //
     // - `Light` / `Dark`: explicit, skip detection.
     // - `Auto`: query the terminal background; fall back to `dark` if
-    //   it doesn't reply within 100ms. Responsive emulators (iTerm2,
+    //   it doesn't reply within 60ms. Responsive emulators (iTerm2,
     //   WezTerm, Alacritty, Kitty, Windows Terminal, VSCode integrated)
-    //   reply on first byte well under the budget; non-responsive
-    //   terminals (macOS Terminal.app, Windows conhost, SSH through
-    //   relays that strip OSC) silently default to dark — matches the
-    //   legacy behaviour, never makes things worse.
+    //   reply on first byte well under the budget — local TTY round
+    //   trips are <10ms in practice. Non-responsive terminals (macOS
+    //   Terminal.app, Windows conhost, SSH through relays that strip
+    //   OSC) silently default to dark. The 60ms initial deadline + 80ms
+    //   tail-drain in `terminal_bg::detect_light` together cover slow
+    //   responders up to ~140ms; the previous 100ms initial was
+    //   over-budget for what local terminals actually need.
     let theme_light = match config.ui.theme {
         atomcode_core::config::UiTheme::Light => true,
         atomcode_core::config::UiTheme::Dark => false,
         atomcode_core::config::UiTheme::Auto => {
             if caps.colors {
                 crate::terminal_bg::detect_light(
-                    std::time::Duration::from_millis(100),
+                    std::time::Duration::from_millis(60),
                 )
                 .unwrap_or(false)
             } else {
@@ -449,6 +452,50 @@ pub async fn run(
     let foreground_runtime_id = event_loop::bg_runtime::RuntimeId::new(1);
     let agent_client = agent_handle.client.clone();
     let skill_registry = agent_client.skill_registry.clone();
+
+    // ── Plugin marketplace bootstrap (detached) ──
+    //
+    // Auto-install of the default skills marketplace + post-self-upgrade
+    // `git pull` of every installed marketplace. Both run git subprocesses
+    // inline (1–3s warm, 5–10s on first clone) — keeping them on the
+    // critical path used to delay the input box by the same amount. Now
+    // we hand the work to `spawn_blocking`, refresh the shared
+    // `SkillRegistry` once the disk side-effects land, then forward each
+    // resulting `PluginJobEvent` through `plugin_job_tx` so the event
+    // loop's existing `handle_plugin_job_event` renders the same toast
+    // the synchronous `/plugin install` path would emit (e.g.
+    // "marketplace `atomcode-skills` added at abc1234 (12 plugins)").
+    // The user sees the install land as a regular body row instead of
+    // a silent file-system mutation. Worst case the user types `/`
+    // before the install settles — they see an empty / partial menu
+    // and the toast arrives a beat later; acceptable trade-off vs.
+    // burning 5–10s on every first launch.
+    {
+        let cfg = config.clone();
+        let registry = skill_registry.clone();
+        let work_dir = working_dir.clone();
+        let wake = wake_tx.clone();
+        let job_tx = plugin_job_tx.clone();
+        tokio::spawn(async move {
+            let events = tokio::task::spawn_blocking(move || {
+                let events = atomcode_core::plugin::bootstrap::run_startup_hooks(&cfg);
+                // Refresh the shared SkillRegistry from disk so the
+                // freshly-installed skills are visible to the slash
+                // menu + agent loop without a restart.
+                if let Ok(mut guard) = registry.write() {
+                    let _ = guard.reload(&work_dir);
+                }
+                events
+            })
+            .await
+            .unwrap_or_default();
+            for ev in events {
+                let _ = job_tx.send(ev);
+            }
+            let _ = wake.try_send(());
+        });
+    }
+
     let (runtime_event_tx, runtime_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<event_loop::bg_runtime::RuntimeEvent>();
     event_loop::bg_runtime::spawn_event_forwarder(

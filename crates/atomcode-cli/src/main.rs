@@ -1057,23 +1057,16 @@ async fn run() -> Result<i32> {
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
     //
-    // Two best-effort hooks fire here (after config load, before any
-    // network-bound LLM activity):
-    //
-    //   1. First-startup auto-install of the default skills
-    //      marketplace. One-shot, marker-file gated; respects later
-    //      `/plugin uninstall`. Config: `plugin.auto_install_default_skills`.
-    //   2. Post-self-upgrade `git pull` of every installed
-    //      marketplace. Gated on `ATOMCODE_UPGRADED_FROM` being set
-    //      (which `self_update::re_exec_self` does on success), so a
-    //      plain `cargo build` invocation never triggers it. Config:
-    //      `plugin.auto_update_marketplaces`.
-    //
-    // Both are non-blocking from a UX standpoint (worst case ~1-3 s
-    // of `git` subprocess time on a warm path; longer for the first
-    // clone). Failures are logged to stderr and swallowed — the user
-    // gets a usable atomcode either way.
-    atomcode_core::plugin::bootstrap::run_startup_hooks(&config);
+    // Two best-effort hooks (auto-install default skills marketplace
+    // on first startup, `git pull` every installed marketplace after a
+    // self-upgrade) used to fire here synchronously, blocking the
+    // input box for 1–3s on a warm path (and 5–10s on first clone).
+    // Both now run as a detached `spawn_blocking` from inside
+    // `atomcode_tuix::run` after the skill registry is constructed —
+    // see lib.rs near `spawn_plugin_bootstrap`. Newly-installed skills
+    // are picked up by a `skill_registry.reload()` + wake pulse the
+    // background task fires on completion, so the slash menu refreshes
+    // without a restart.
 
     let unavailable_reason = if config.providers.is_empty() {
         Some(atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::CmdNoActiveProvider).into_owned())

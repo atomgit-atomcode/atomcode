@@ -665,6 +665,14 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出插件失败：{error}").into(),
         Msg::PluginReloadDone { skills, warnings } =>
             format!("插件已重新加载：{skills} 个 skill，{warnings} 个警告").into(),
+        Msg::PluginMarketplaceAdded { name, commit, count } =>
+            format!("✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）").into(),
+        Msg::PluginMarketplaceUpdated { name, commit } =>
+            format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
+        Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
+            let hint = if show_details_hint { "  （按 Ctrl+O 查看详情）" } else { "" };
+            format!("✓ 已安装 `{plugin}@{marketplace}` —— 加载 {loaded} 个 skill，跳过 {skipped} 个{hint}").into()
+        }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
 
