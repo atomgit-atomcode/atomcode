@@ -30,6 +30,11 @@ pub enum McpConnectEvent {
 pub struct McpRegistry {
     servers: Arc<RwLock<BTreeMap<String, Arc<dyn McpClient>>>>,
     server_timeouts_ms: Arc<RwLock<BTreeMap<String, u64>>>,
+    /// Servers whose initial connect failed. The TUI's `/mcp` listing
+    /// surfaces these as `failed: <error>` so a misconfigured server
+    /// doesn't silently disappear from the list (#300). Cleared when a
+    /// subsequent `add_server(name)` succeeds.
+    failed_servers: Arc<RwLock<BTreeMap<String, String>>>,
     /// Channel for connection status events (used by TUI to display in scrollback).
     connect_events: Option<mpsc::UnboundedSender<McpConnectEvent>>,
     /// Signals when all initial background connections have completed (or failed).
@@ -44,6 +49,7 @@ impl McpRegistry {
         Self {
             servers: Arc::new(RwLock::new(BTreeMap::new())),
             server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
+            failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
             connect_events: None,
             initial_ready: Arc::new(tokio::sync::Notify::new()),
             telemetry: None,
@@ -63,6 +69,7 @@ impl McpRegistry {
             Self {
                 servers: Arc::new(RwLock::new(BTreeMap::new())),
                 server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
+                failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
                 connect_events: Some(tx),
                 initial_ready: Arc::new(tokio::sync::Notify::new()),
                 telemetry: None,
@@ -110,6 +117,7 @@ impl McpRegistry {
         if !configs.is_empty() {
             let servers = registry.servers.clone();
             let server_timeouts_ms = registry.server_timeouts_ms.clone();
+            let failed_servers = registry.failed_servers.clone();
             let initial_ready = registry.initial_ready.clone();
             let telemetry = registry.telemetry.clone();
             tokio::spawn(async move {
@@ -119,6 +127,7 @@ impl McpRegistry {
                     .map(|config| {
                         let servers = servers.clone();
                         let server_timeouts_ms = server_timeouts_ms.clone();
+                        let failed_servers = failed_servers.clone();
                         let tx = combined_tx.clone();
                         let telemetry = telemetry.clone();
                         async move {
@@ -165,6 +174,9 @@ impl McpRegistry {
                                     drop(servers);
                                     let mut timeouts = server_timeouts_ms.write().await;
                                     timeouts.insert(name.clone(), timeout_ms);
+                                    let mut failed = failed_servers.write().await;
+                                    failed.remove(&name);
+                                    drop(failed);
                                     if let Some(tx) = tx {
                                         let _ = tx.send(McpConnectEvent::Connected {
                                             name: name.clone(),
@@ -190,6 +202,9 @@ impl McpRegistry {
                                 Err(e) => {
                                     let duration_ms = start.elapsed().as_millis() as u32;
                                     let error_str = format!("{}", e);
+                                    let mut failed = failed_servers.write().await;
+                                    failed.insert(name.clone(), error_str.clone());
+                                    drop(failed);
                                     if let Some(tx) = tx {
                                         let _ = tx.send(McpConnectEvent::Failed {
                                             name: name.clone(),
@@ -283,13 +298,22 @@ impl McpRegistry {
             )),
         };
 
-        client.initialize().await?;
+        if let Err(e) = client.initialize().await {
+            // Record the failure so `/mcp` still lists the server with a
+            // `failed: <error>` status instead of silently dropping it
+            // from the registry's view (#300).
+            let mut failed = self.failed_servers.write().await;
+            failed.insert(config.name.clone(), format!("{}", e));
+            return Err(e);
+        }
 
         let mut servers = self.servers.write().await;
         servers.insert(config.name.clone(), Arc::from(client));
         drop(servers);
         let mut timeouts = self.server_timeouts_ms.write().await;
         timeouts.insert(config.name.clone(), config.timeout_ms());
+        let mut failed = self.failed_servers.write().await;
+        failed.remove(&config.name);
 
         Ok(())
     }
@@ -421,13 +445,25 @@ impl McpRegistry {
         Ok(output)
     }
 
-    /// Get the status of all servers.
+    /// Get the status of all servers — connected ones from `servers`
+    /// and any that failed their initial connect from `failed_servers`.
+    /// `/mcp` displays the result, so dropping the failed entries would
+    /// make a broken config look like "no servers configured" (#300).
     pub async fn server_statuses(&self) -> Vec<(String, ServerStatus)> {
         let servers = self.servers.read().await;
-        servers
+        let failed = self.failed_servers.read().await;
+        let mut out: BTreeMap<String, ServerStatus> = servers
             .iter()
             .map(|(name, client)| (name.clone(), client.status()))
-            .collect()
+            .collect();
+        for (name, err) in failed.iter() {
+            // Connected wins if both somehow exist — a successful
+            // reconnect should already have cleared the failed entry,
+            // but be defensive against races.
+            out.entry(name.clone())
+                .or_insert_with(|| ServerStatus::Failed(err.clone()));
+        }
+        out.into_iter().collect()
     }
 
     /// Wait for initial background connections to complete (or timeout).
@@ -441,6 +477,7 @@ impl McpRegistry {
         Arc::new(Self {
             servers: self.servers.clone(),
             server_timeouts_ms: self.server_timeouts_ms.clone(),
+            failed_servers: self.failed_servers.clone(),
             connect_events: self.connect_events.clone(),
             initial_ready: self.initial_ready.clone(),
             telemetry: self.telemetry.clone(),
@@ -480,5 +517,44 @@ impl McpServerConfig {
 impl Default for McpRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `add_server` against a stdio command that cannot be spawned must
+    /// still record the failure into `failed_servers`, so the `/mcp`
+    /// status listing surfaces it as `failed: <error>` rather than
+    /// silently dropping the server from view (#300).
+    #[tokio::test]
+    async fn failed_stdio_connect_appears_in_server_statuses() {
+        let registry = McpRegistry::new();
+        let config = McpServerConfig {
+            name: "broken".to_string(),
+            source: super::super::config::McpConfigSource::Project,
+            disabled: false,
+            config: super::super::config::McpTransportConfig::Stdio {
+                // Deliberately bogus binary so spawn() fails fast.
+                command: "/nonexistent/atomcode-mcp-test-binary".to_string(),
+                args: vec![],
+                env: Default::default(),
+                timeout_ms: Some(500),
+            },
+        };
+
+        let result = registry.add_server(config).await;
+        assert!(result.is_err(), "expected initialize to fail");
+
+        let statuses = registry.server_statuses().await;
+        let broken = statuses
+            .iter()
+            .find(|(name, _)| name == "broken")
+            .expect("failed server should still show in /mcp list");
+        match &broken.1 {
+            ServerStatus::Failed(_) => {}
+            other => panic!("expected Failed status, got {:?}", other),
+        }
     }
 }
