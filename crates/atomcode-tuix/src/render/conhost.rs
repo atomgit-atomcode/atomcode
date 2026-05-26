@@ -1,6 +1,6 @@
-//! Windows conhost mouse capture helpers, used by both AltScreenRenderer
-//! and RetainedRenderer to set/clear `ENABLE_MOUSE_INPUT` while
-//! preserving the pre-enter console mode.
+//! Windows conhost mouse capture helpers, used by RetainedRenderer to
+//! set/clear `ENABLE_MOUSE_INPUT` while preserving the pre-enter console
+//! mode.
 
 #![cfg(windows)]
 

@@ -212,11 +212,11 @@ pub async fn run(
     //
     // The append-only RetainedRenderer no longer uses DECSTBM scroll
     // regions, so the JediTerm and Windows-conhost-mode-2 quirks that
-    // previously demanded a separate AltScreenRenderer path no longer
-    // apply. `ATOMCODE_ALT` / `ATOMCODE_RETAIN` are accepted but inert
-    // (kept around briefly so users with the vars exported don't get a
-    // hard error). `ATOMCODE_RETAIN` is bound to `_force_retain` only
-    // to silence the unused-result warning.
+    // previously demanded a second renderer path no longer apply.
+    // `ATOMCODE_ALT` / `ATOMCODE_RETAIN` are accepted but inert (kept
+    // around briefly so users with the vars exported don't get a hard
+    // error). `ATOMCODE_RETAIN` is bound to `_force_retain` only to
+    // silence the unused-result warning.
     let force_plain = force_plain_env;
 
     // Capture whether stdout was a real TTY BEFORE we mutate caps.

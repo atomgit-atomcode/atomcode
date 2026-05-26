@@ -739,11 +739,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Top-rule variant that may overlay a session-name pill on the
-    /// right side. Mirrors the alt-screen renderer's top-rule overlay
-    /// so both render paths show CC-style per-conversation badge. The
+    /// right side. Produces the CC-style per-conversation badge. The
     /// bot_rule keeps using `build_rule_row` (no badge there).
     ///
-    /// Budget mirrors `alt_screen::paint_footer`:
+    /// Budget:
     ///   right_margin  = 2 cells
     ///   pill_padding  = 2 cells (one space each side of the name)
     ///   min_rule_left = 8 cells (keep some ─ on the left so the box
@@ -1352,8 +1351,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// continuation cell makes the cluster render as mojibake).
     ///
     /// We reserve based on `show_scrollbar` alone (not on runtime
-    /// overflow) to match `effective_body_width` semantics in
-    /// `alt_screen.rs` — the small predictability win of always-reserve
+    /// overflow) — the small predictability win of always-reserve
     /// is worth one col of body area when scrollbar is on but content
     /// hasn't overflowed yet.
     fn effective_body_width(&self) -> usize {
@@ -2213,7 +2211,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         // Trailing blank so subsequent async events (MCP "已连接",
         // upgrade hints, etc.) don't butt up against the hint row.
-        // Mirrors alt_screen's push_welcome trailing blank.
         rows.push(Vec::new());
 
         rows
@@ -2451,8 +2448,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // body text. Previously we used `Role::Muted`, but when
                 // MUTED_DARK was widened from SGR 90 → 37 (so tool-batch
                 // child rows stay readable on Warp dark), this rule lost
-                // its contrast against assistant text. Mirrors the SGR_DIM
-                // approach `alt_screen::build_turn_separator` already uses.
+                // its contrast against assistant text. Fix: keep fg at
+                // terminal default and only layer SGR 2 on top.
                 let rule = self.style_faint(Role::Secondary);
                 for _ in 0..left {
                     row.push(Cell {
@@ -2977,8 +2974,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // attributes survive (e.g. the `/codingplan` red
                 // locked-model row). `push_body_text_sgr` parses
                 // those escapes into `CellStyle` mutations so the
-                // cell pipeline renders the same colours alt_screen
-                // and plain do.
+                // cell pipeline renders the same colours that the
+                // plain renderer streams to stdout.
                 let safe = crate::sanitize::scrub_controls_keep_sgr(&text);
                 self.push_body_text_sgr(&safe);
             }
@@ -3303,10 +3300,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn suspend_for_external(&mut self) {
         // Disable mouse capture so the external child process (OAuth browser,
-        // shell prompt, etc.) runs with a clean terminal state. Mirrors the
-        // disable order in alt_screen::leave_alt_screen: SGR first, then
-        // button-event. Mouse mode must be off before raw_mode is disabled,
-        // so the child process sees the terminal with mouse disabled.
+        // shell prompt, etc.) runs with a clean terminal state. Disable order:
+        // SGR first, then button-event. Mouse mode must be off before
+        // raw_mode is disabled, so the child process sees the terminal with
+        // mouse disabled.
         let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
         #[cfg(windows)]
         if let Some(prior) = self.prior_console_in_mode.take() {
@@ -3706,10 +3703,9 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
     /// (e.g. inside `paint_frame`, channel send failures, OOM in a
     /// downstream consumer) bypasses `shutdown()` and leaves the host
     /// shell receiving SGR mouse reports (`\x1b[<0;X;YM`) as stdin
-    /// garbage every time the user clicks. AltScreenRenderer already
-    /// has the equivalent Drop at alt_screen.rs:2208; without this
-    /// retained leaves the terminal in a broken state on any panic
-    /// after `with_writer` ran.
+    /// garbage every time the user clicks. Without this Drop, retained
+    /// leaves the terminal in a broken state on any panic after
+    /// `with_writer` ran.
     ///
     /// Minimal cleanup only — no paint, no flush retries, no body
     /// promotion. The mouse mode toggle is idempotent: `shutdown()`
@@ -5765,8 +5761,7 @@ mod tests {
     /// SGR 37 (light gray) so child rows of tool batches read on Warp
     /// dark, but reusing `Role::Muted` here made the `resumed:` rule
     /// blend into body text. The fix: this rule is decoration, so it
-    /// should use the same SGR-2 dim that alt_screen uses, leaving fg
-    /// at terminal default.
+    /// uses SGR-2 dim and leaves fg at terminal default.
     ///
     /// Two complementary assertions are needed: the vterm grid only
     /// tracks fg/bold/reverse (no faint/dim field), so `cell.fg.is_none()`

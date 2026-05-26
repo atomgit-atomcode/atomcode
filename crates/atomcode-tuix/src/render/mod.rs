@@ -260,13 +260,10 @@ pub trait Renderer: Send {
     /// stdout (plain/pipe mode) can't retract them.
     fn pop_approval_prompt(&mut self) {}
 
-    /// Terminal window was resized to `(cols, rows)`. DECSTBM-based
-    /// renderers must re-issue the scroll region (`\x1b[1;H-N r`) so
-    /// the fixed footer stays pinned to the new bottom. Non-DECSTBM
-    /// renderers can treat this as a redraw hint or a no-op.
-    ///
-    /// Default is no-op — backends that don't care about geometry
-    /// (Plain, tests) don't need to override.
+    /// Terminal window was resized to `(cols, rows)`. The retained
+    /// backend uses this to re-flow body width and reposition the
+    /// pinned footer; non-geometry-sensitive backends (Plain, tests)
+    /// keep the no-op default.
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
 
     /// Scroll the body viewport up (negative `delta`) or down
@@ -282,9 +279,9 @@ pub trait Renderer: Send {
     fn scroll_body_to_top(&mut self) {}
     fn scroll_body_to_bottom(&mut self) {}
 
-    /// Mouse text-selection hooks. Backends that own mouse capture can
-    /// override these; streaming/native-scrollback backends keep host
-    /// terminal selection behavior and no-op here.
+    /// Mouse text-selection hooks. RetainedRenderer owns mouse capture
+    /// and overrides these to paint the selection overlay; PlainRenderer
+    /// keeps the host terminal's native selection behaviour and no-ops.
     fn begin_selection(&mut self, _col: u16, _row: u16) {}
     fn update_selection(&mut self, _col: u16, _row: u16) {}
     fn end_selection(&mut self) {}
@@ -296,7 +293,7 @@ pub trait Renderer: Send {
     /// This is the Ctrl+C fallback for terminals (Windows Terminal,
     /// conhost) that ignore OSC 52 — the user selects text with the
     /// mouse, then presses Ctrl+C to copy it. RetainedRenderer
-    /// implements this; other backends return `false` (they use the
+    /// implements this; PlainRenderer returns `false` (it uses the
     /// host terminal's native selection).
     fn copy_selection(&mut self) -> bool {
         false

@@ -2600,20 +2600,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // "won't work" claim, and surface `\<Enter>` as the universal
     // fallback so legacy-conhost users (where modifier+Enter IS
     // genuinely swallowed at the OS layer) have a guaranteed path.
-    //
-    // Also suppressed when the legacy-conhost hint is firing — that
-    // hint already covers the only environment where the chord
-    // truly fails, so dual-firing produced wall-of-text noise (see
-    // user feedback 2026-05-09 "全部展示的是…可以更精细化下").
     let kbd_hint_set = std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok();
-    let jediterm_set = std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok();
     if kbd_hint_set {
         std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
     }
-    // Suppress the standalone keyboard hint when the JediTerm banner
-    // is firing — that banner already carries its own newline
-    // guidance, so dual-firing produced wall-of-text noise. Otherwise
-    // emit a single universal hint pointing at `\<Enter>`.
+    // Emit a single universal hint pointing at `\<Enter>` whenever the
+    // keyboard-enhanced negotiation failed.
     //
     // Why the universal-fallback message instead of per-terminal
     // chord recommendations: the previous helper detected MSYSTEM /
@@ -2630,41 +2622,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // use them. The startup hint targets the user who doesn't know,
     // and for them a guaranteed-works recommendation beats a
     // sometimes-wrong terminal-specific one.
-    if kbd_hint_set && !jediterm_set {
+    if kbd_hint_set {
         renderer.render(UiLine::CommandOutput(
             crate::i18n::t(crate::i18n::Msg::HintMultiLineInput).into_owned(),
-        ));
-    }
-
-    // JediTerm auto-fallback hint: lib.rs detected
-    // `TERMINAL_EMULATOR=JetBrains-JediTerm` (Android Studio, IntelliJ,
-    // PyCharm, etc.) and routed to AltScreenRenderer because the
-    // retained renderer's DECSTBM-pinned footer misaligns there.
-    // Tell the user about the trade-off — alt-screen owns the
-    // viewport so the host terminal's native scrollback isn't
-    // available; the app provides its own (PageUp / Shift+Up /
-    // mouse wheel). Only set by lib.rs when the user did NOT
-    // explicitly opt in via ATOMCODE_PLAIN / ATOMCODE_ALT —
-    // informed choices don't get lectured.
-    if std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok() {
-        std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
-        // Includes newline-insertion guidance because the standalone
-        // keyboard hint is suppressed when this banner fires (see
-        // kbd_hint_set block above). Lead with `\<Enter>` — the
-        // buffer-layer fallback that works regardless of which
-        // chord the IDE's JediTerm fork happens to forward. Modifier
-        // chords still supported by `key_action.rs::classify`; users
-        // who know they have them just use them.
-        renderer.render(UiLine::CommandOutput(
-            "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
-            Newlines: end the line with `\\` then press Enter (Shift / Alt /\n    \
-            Ctrl + Enter may also work depending on your IDE version).\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs;\n    \
-            on exit your host terminal restores its pre-atomcode state.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
-            ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
-                .into(),
         ));
     }
 
@@ -3794,8 +3754,7 @@ fn handle_input(
     match ev {
         InputEvent::MouseScroll(delta) => {
             // Mouse wheel routing:
-            //   * AltScreenRenderer  — moves the alt-screen viewport.
-            //   * RetainedRenderer   — no-op. Body rows that scroll off
+            //   * RetainedRenderer — no-op. Body rows that scroll off
             //     the top are promoted to the host terminal's native
             //     scrollback, so vertical navigation belongs to the
             //     terminal. We still RECEIVE the wheel event here
@@ -3804,14 +3763,14 @@ fn handle_input(
             //     terminal-level bypass (Shift+wheel in iTerm2 /
             //     Terminal.app, Cmd+↑ for page-wise history), which
             //     the terminal resolves BEFORE the event reaches us.
-            //   * PlainRenderer      — no-op (no mouse capture at all,
+            //   * PlainRenderer    — no-op (no mouse capture at all,
             //     wheel reaches the terminal directly).
             renderer.scroll_body(delta);
         }
         InputEvent::MouseDown { col, row } => {
-            // Anchor a new selection. Only AltScreenRenderer responds
-            // (it owns mouse capture); other backends no-op since the
-            // host terminal still does native drag-to-select for them.
+            // Anchor a new selection. Only RetainedRenderer responds
+            // (it owns mouse capture); PlainRenderer no-ops since the
+            // host terminal still does native drag-to-select there.
             renderer.begin_selection(col, row);
         }
         InputEvent::MouseDrag { col, row } => {
@@ -4035,22 +3994,19 @@ fn handle_input(
             }
             // PageUp / PageDown / Home / End: scroll the body
             // viewport. Universal across phases — same as a terminal's
-            // own scrollback navigation. Only AltScreenRenderer
-            // implements these (it owns the alt-screen buffer and
-            // host-terminal scrollback is unavailable while we're
-            // in alt-screen); other renderers default to no-op so
-            // these keys do nothing in retained / plain modes (as
-            // before — those rely on the host terminal's native
-            // scrollback). We intercept BEFORE phase dispatch so
-            // scrolling works in Idle / Streaming alike.
+            // own scrollback navigation. RetainedRenderer and
+            // PlainRenderer rely on the host terminal's native
+            // scrollback, so these keys default to a no-op there.
+            // We intercept BEFORE phase dispatch so scrolling works in
+            // Idle / Streaming alike.
 
             // ── Ctrl+C: copy selection ──────────────────────────────
             // On Windows, OSC 52 is not supported by Windows Terminal /
             // conhost, so the user cannot copy text by mouse-selecting
             // alone (end_selection's OSC 52 write is silently ignored).
             // Ctrl+C is the user's natural instinct to copy selected
-            // text. We intercept it here: if a selection exists in the
-            // alt-screen renderer, copy its text to the system clipboard
+            // text. We intercept it here: if the retained renderer has
+            // a live selection, copy its text to the system clipboard
             // via arboard and clear the selection. If no selection exists,
             // fall through to the normal Cancel behaviour.
             //
@@ -4168,10 +4124,10 @@ fn handle_input(
 ///     cursor instead)
 ///   - `None`        → not a scroll key at all
 ///
-/// Both AltScreenRenderer and RetainedRenderer implement these scroll
-/// methods (unified-scroll feature, Phase 3+7); PlainRenderer uses the
-/// trait no-op defaults and silently falls through to the existing
-/// phase dispatch (e.g. End-of-line cursor movement during input).
+/// RetainedRenderer implements the scroll-related trait methods;
+/// PlainRenderer uses the trait no-op defaults and silently falls
+/// through to the existing phase dispatch (e.g. End-of-line cursor
+/// movement during input).
 fn handle_scroll_key(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -5805,9 +5761,9 @@ fn handle_agent_event(
                 // Dingbats), ● (U+25CF Geometric Shapes): all in WGL4 so
                 // every Windows monospace font (Consolas, NSimSun,
                 // Cascadia, Microsoft YaHei) ships them. Hardcoded —
-                // no `unicode_symbols` ASCII fallback — matching
-                // `alt_screen::push_tool_call`'s ● treatment for visual
-                // parity between batched and single tool-call paths.
+                // no `unicode_symbols` ASCII fallback — matching the
+                // single-tool-call ● treatment for visual parity
+                // between batched and single tool-call paths.
                 let child_glyph = "\u{2514}";
                 let arrow = "\u{2192}";
                 let suffix = if success {
@@ -6379,9 +6335,8 @@ fn handle_agent_event(
             // with `└` for tool-result rows below the call. Both
             // glyphs are in WGL4 (Consolas, NSimSun, Cascadia, Microsoft
             // YaHei all ship them), so no `unicode_symbols` ASCII
-            // fallback — matches `alt_screen::push_tool_call`'s
-            // hardcoded ● for visual parity between batched and single
-            // tool-call paths.
+            // fallback — matches the single-tool-call hardcoded ● for
+            // visual parity between batched and single tool-call paths.
             let head_glyph = "\u{25cf}";
             let child_glyph = "\u{2514}";
             // Build header + child rows; renderer keeps the group
