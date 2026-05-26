@@ -112,9 +112,22 @@ pub fn variable() -> &'static str { "" }
 /// Both palettes intentionally use terminal default fg.
 pub fn punctuation() -> &'static str { "" }
 
-/// Closes color + italic. Use after every wrapped token span.
-/// SGR 23 = italic off, SGR 39 = default foreground.
-pub const RESET: &str = "\x1b[23;39m";
+/// Full SGR clear. Use after every wrapped token span.
+///
+/// Historically this was `"\x1b[23;39m"` (italic off + default fg only)
+/// to minimise emitted bytes. That under-cleared: any upstream UI chrome
+/// that left `reverse` (SGR 7), `bold` (SGR 1), or `faint` (SGR 2) on
+/// the working style — e.g. the ApprovalPrompt Y chip or the top-rule
+/// session pill — leaked across token boundaries inside
+/// `parse_markdown_to_cells`, baking those bits onto syntect-coloured
+/// cells. On Terminal.app this rendered as solid coloured blocks at
+/// Number/String token positions (fg-as-bg with default-fg glyph); iTerm2
+/// happened to mask the bug with more lenient SGR state handling.
+///
+/// `"\x1b[0m"` is the full ECMA-48 reset (4 bytes, no perceptible perf
+/// impact) and is the only safe close when we don't know what attributes
+/// the surrounding stream left enabled.
+pub const RESET: &str = "\x1b[0m";
 
 // ── Markdown inline element colours ──────────────────────────────────
 
@@ -227,8 +240,13 @@ mod tests {
     }
 
     #[test]
-    fn reset_closes_italic_and_fg() {
-        assert_eq!(RESET, "\x1b[23;39m");
+    fn reset_is_full_sgr_clear() {
+        // Must be a full SGR reset (`\x1b[0m`), not the historical
+        // partial close (`\x1b[23;39m`) which only cleared italic + fg
+        // and let reverse / bold / faint leak across token boundaries
+        // inside `parse_markdown_to_cells`. See the doc on `RESET` for
+        // the full bug class this guards against.
+        assert_eq!(RESET, "\x1b[0m");
     }
 
     #[test]

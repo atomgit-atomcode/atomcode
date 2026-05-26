@@ -9154,8 +9154,11 @@ mod tests {
     /// future change that lets reverse-video bleed onto syntax-
     /// highlighted code (the "green background blocks" symptom the user
     /// reported when a stray SGR 7 from earlier output couldn't be
-    /// cleared by `theme::RESET = "\x1b[23;39m"` because the latter
-    /// only clears italic + fg, not reverse).
+    /// cleared by the historical `theme::RESET = "\x1b[23;39m"` — that
+    /// only cleared italic + fg, not reverse. `RESET` has since been
+    /// promoted to a full SGR 0 reset; see
+    /// `markdown_stream_does_not_leak_reverse_across_tokens` below for
+    /// the unit-level proof.).
     ///
     /// Current code already passes this — none of the syntect, markdown,
     /// or render paths emit SGR 7 onto body cells; the test exists as
@@ -9194,6 +9197,78 @@ mod tests {
              code block renders with swapped fg/bg (green-on-default for \
              string tokens, etc.).",
             reverse_cells,
+        );
+    }
+
+    /// Unit-level regression for the `theme::RESET` under-clearing bug.
+    ///
+    /// Pre-fix `RESET` was `\x1b[23;39m` (italic-off + default-fg only).
+    /// When upstream UI chrome (ApprovalPrompt Y chip, top-rule session
+    /// pill, etc.) emitted `\x1b[7m` and never explicitly disabled it
+    /// with SGR 27, the working `style` inside `parse_markdown_to_cells`
+    /// carried `reverse=true` across token boundaries. The highlighter's
+    /// per-token RESET could not clear it, so subsequent token cells
+    /// (Number, String, etc.) were baked with `style.reverse == true` —
+    /// rendering as solid coloured blocks on Terminal.app (Terminal.app
+    /// honours SGR state more strictly than iTerm2, which is why the
+    /// bug was Terminal.app-specific even though the bytes were wrong
+    /// everywhere).
+    ///
+    /// This test directly drives `parse_markdown_to_cells` with the
+    /// exact pattern that triggered the leak: turn reverse ON, write
+    /// some text, hit the highlighter's `RESET`, then write a tinted
+    /// Number token. Post-fix (`RESET = "\x1b[0m"`), the Number cell
+    /// must have `style.reverse == false`. Pre-fix, this assertion
+    /// trips because reverse=true leaks past the partial RESET.
+    #[test]
+    fn markdown_stream_does_not_leak_reverse_across_tokens() {
+        // Pattern: reverse-ON, "Y", theme::RESET, then a Number token
+        // wrapped with truecolor open + theme::RESET close — mirrors how
+        // an ApprovalPrompt chip's reverse state could leak into a
+        // syntect-highlighted code block.
+        let stream = format!(
+            "\x1b[7mY{reset}\x1b[38;2;209;154;102m42{reset}",
+            reset = crate::highlight::theme::RESET,
+        );
+
+        let lines = parse_markdown_to_cells(&stream);
+        assert_eq!(lines.len(), 1, "expected single line, got {:?}", lines);
+        let row = &lines[0];
+
+        // Find the Number-token cells (chars '4' and '2').
+        let number_cells: Vec<&Cell> =
+            row.iter().filter(|c| c.ch == '4' || c.ch == '2').collect();
+        assert_eq!(
+            number_cells.len(),
+            2,
+            "expected the two Number-token cells, got row: {:?}",
+            row,
+        );
+
+        for cell in &number_cells {
+            assert!(
+                !cell.style.reverse,
+                "Number-token cell {:?} must NOT carry reverse=true — \
+                 the highlighter's RESET must fully clear SGR state \
+                 (including SGR 7 reverse) emitted upstream. If this \
+                 fires, `theme::RESET` likely regressed back to a partial \
+                 close like `\\x1b[23;39m` that only clears italic + fg.",
+                cell,
+            );
+        }
+
+        // Sanity: the leading "Y" cell DOES carry reverse — confirms the
+        // SGR 7 actually took effect and the test isn't trivially green
+        // because reverse never made it into the style stream.
+        let y_cell = row
+            .iter()
+            .find(|c| c.ch == 'Y')
+            .expect("expected the leading reverse-Y cell, got row: {:?}");
+        assert!(
+            y_cell.style.reverse,
+            "control: the upstream `Y` cell must carry reverse=true so we \
+             know the SGR 7 entered the style stream. If THIS fires, the \
+             test setup is broken — not the fix.",
         );
     }
 
