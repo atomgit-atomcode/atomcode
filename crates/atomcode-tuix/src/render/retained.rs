@@ -3313,6 +3313,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.last_painted_footer_rows = 0;
         self.scroll_region_bottom = None;
         let _ = self.out.flush();
+        // Force cold-start CUP+EL on next paint to wipe pre-reset stdout writes.
+        self.screen.invalidate();
     }
 
     fn clear_screen(&mut self) {
@@ -9366,5 +9368,118 @@ mod tests {
             occ_label,
             vterm.dump()
         );
+    }
+
+    /// Regression: `/resume` replay calls `reset()` then direct-writes
+    /// historical rows via `emit_body_line_inner` BEFORE the next
+    /// `paint_frame` tick. Pre-fix, `reset()` rebuilt `screen` with a
+    /// fresh blank `prev_cells` AND blank `cells` but left
+    /// `physical_dirty = false`, so the first post-reset render_diff
+    /// skipped the cold-start CUP+EL preamble. Stale-column glyphs
+    /// from the replay direct-writes then survived in the physical
+    /// terminal — the cell-diff saw `prev_blank == new_blank` at
+    /// trailing columns and emitted no patch — and the next streaming
+    /// overflow burst ghosted those fragments into the visible body,
+    /// producing duplicated tail rows ONLY after `/resume` (never
+    /// after `/new`, whose `body_lines` starts empty so no replay
+    /// direct-writes have populated the physical terminal).
+    ///
+    /// Fix: `reset()` ends with `screen.invalidate()` so the next
+    /// `render_diff` begins with the cold-start preamble (per-row
+    /// CUP+EL across every row) and wipes everything before patches
+    /// land. From that point on `prev_cells` correctly mirrors
+    /// physical and the existing db346457 overflow-target fix works
+    /// for resumed sessions the same way it does for fresh ones.
+    ///
+    /// We test the contract at the byte-stream level: after `reset()`,
+    /// the next `render_diff` MUST emit the per-row CUP+EL preamble.
+    /// This mirrors `screen::tests::invalidate_prepends_per_row_clear_on_next_diff`
+    /// but at the renderer boundary (the public reset API), so a
+    /// future refactor that drops the `invalidate()` call here can't
+    /// silently regress the contract by relying on Screen-internal
+    /// invariants the renderer never enforced.
+    #[test]
+    fn retained_post_reset_replay_then_burst_does_not_duplicate_tail() {
+        let w: u16 = 40;
+        let h: u16 = 8;
+        let (mut r, buf) = new_capturing(w, h);
+
+        // Warm the renderer: push some body content + paint so
+        // `prev_cells` is NOT all-blank when reset() runs. Without
+        // this the bug is hidden — Screen::new() already starts with
+        // blank prev_cells, so a "no invalidate" reset wouldn't show
+        // any difference on the FIRST post-reset diff. Real-world
+        // /resume always runs against a populated prev_cells (the
+        // pre-resume session painted something), so the warm-up is
+        // load-bearing for reproducing the bug class.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::AssistantText("pre-resume content\n".into()));
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // /resume hard reset. Pre-fix this rebuilt Screen with
+        // `physical_dirty = false`; post-fix it ends with
+        // `screen.invalidate()` so the next diff cold-starts.
+        r.reset();
+
+        // Simulate replay phase: push one body row + render the
+        // prompt so paint_frame has something to draw. The exact
+        // content doesn't matter for the cold-start assertion — we
+        // just need to reach `flush_deferred → paint_frame →
+        // render_diff` so the first post-reset diff actually runs.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::AssistantText("replay row 0\n".into()));
+
+        // Snapshot the buffer right before the first post-reset
+        // paint so we can isolate render_diff's output (the
+        // direct-write emits from `emit_body_line_inner` above also
+        // live in `buf` but we want to assert only on what
+        // render_diff produces — that's where the cold-start
+        // preamble must appear).
+        let pre_paint_len = buf.lock().unwrap().len();
+
+        // First post-reset paint tick.
+        r.flush_deferred();
+
+        // Inspect the bytes emitted by the first post-reset
+        // render_diff. Pre-fix, `physical_dirty` was false so
+        // render_diff skipped its cold-start preamble and produced
+        // ONLY cell-diff patches. Post-fix, every row must be
+        // preceded by `CUP(row,1) + EL` somewhere in the output.
+        let post_paint = {
+            let g = buf.lock().unwrap();
+            g[pre_paint_len..].to_vec()
+        };
+        let post_paint_str = String::from_utf8_lossy(&post_paint);
+
+        // The cold-start preamble emits per-row CUP+EL for every row
+        // from 1..=h. Asserting on all of them makes the test robust
+        // against a partial regression (e.g. someone replacing the
+        // loop with a `\x1b[2J` would fail this just like dropping
+        // invalidate() entirely would).
+        for row in 1..=(h as usize) {
+            let needle = format!("\x1b[{};1H\x1b[K", row);
+            assert!(
+                post_paint_str.contains(&needle),
+                "first render_diff after reset() must emit cold-start CUP+EL \
+                 for row {} (pre-fix: physical_dirty=false → preamble skipped \
+                 → stale replay direct-write glyphs survive → next overflow \
+                 ghosts them into visible body as duplicated tail).\nbytes: {:?}",
+                row,
+                post_paint_str
+            );
+        }
     }
 }
