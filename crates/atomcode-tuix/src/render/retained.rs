@@ -1314,6 +1314,40 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // Footer fills the entire viewport — no room for body.
             return;
         }
+        // Live scrollback feed: when this push would put body_lines.len()
+        // above the visible cap, the oldest currently-visible row must
+        // leave the viewport. Without help, the cell-diff just overwrites
+        // it in place — the row vanishes without ever entering the host
+        // terminal's native scrollback, so `cmd+↑` / mouse-wheel during
+        // the session show nothing above the atomcode frame.
+        //
+        // Fix: position the cursor at the absolute last screen row and
+        // emit LF. Terminals interpret LF at the bottom row as "scroll
+        // the entire visible area up by 1, the row that was at the top
+        // enters scrollback, the bottom row becomes blank". The cursor
+        // lands at (h, 1) afterwards.
+        //
+        // The internal cells / prev_cells cache must mirror this
+        // shift, otherwise the next paint_frame's cell-diff treats the
+        // shift as "the whole frame moved" and emits a redundant
+        // full-frame redraw. `screen.shift_prev_up(1)` performs the
+        // same logical rotate on prev_cells so the diff stays small
+        // (only the slot where the new body row lands plus the freshly
+        // re-laid-out footer differ).
+        //
+        // `body_lines.len() >= cap` is the entry condition because
+        // `push_body_row` calls `emit_body_line_inner` BEFORE pushing
+        // the new row. With len == cap-1, the push lands at index
+        // cap-1 (still inside the visible region). With len == cap,
+        // the push would land at index cap (just past the visible
+        // region) — at that exact moment the oldest visible row
+        // (index 0 in the visible tail = `body_lines[len-cap]`) needs
+        // to scroll out.
+        if self.body_lines.len() >= cap {
+            let scroll_seq = format!("\x1b[{};1H\n", h);
+            let _ = self.out.write_all(scroll_seq.as_bytes());
+            self.screen.shift_prev_up(1);
+        }
         // 1-indexed row where the current footer's top_rule sits.
         // (body_lines.len() rows of body live above it.)
         let footer_top_1idx = (self.body_lines.len().min(cap) + 1) as u16;
@@ -1326,11 +1360,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let _ = self.out.write_all(seq.as_bytes());
         // Write the body row at footer_top, then LF. If body is
         // below the cap, the LF just advances cursor within screen
-        // (no scroll). If body is AT the cap, the new body line
-        // overlaps with cells the next `paint_frame` will reshape
-        // — the cell-diff handles the visual shift; scrollback
-        // feed for the displaced row is deferred to shutdown's
-        // `promote_visible_body_to_scrollback`.
+        // (no scroll). If body is AT the cap, the body emit lands at
+        // row cap+1 (just past the visible body region) — the
+        // earlier bottom-LF already promoted the displaced top row
+        // to scrollback; the next `paint_frame` cell-diff repaints
+        // the body tail (including the new row at row cap, 1-indexed)
+        // and the footer below.
         let bytes = serialize_row(row);
         let _ = self.out.write_all(&bytes);
         let _ = self.out.write_all(b"\n");
@@ -7889,6 +7924,164 @@ mod tests {
         r.selection.begin((0, 0));
         r.selection.update((0, 5));
         assert!(r.copy_selection(), "expected non-empty selection to copy");
+    }
+
+    /// Live scrollback feed: once body_lines exceeds the visible cap,
+    /// every subsequent `emit_body_line_inner` must precede its own
+    /// body-row emit with a "park at (h,1) + LF" sequence — that's the
+    /// instruction terminals interpret as "scroll the entire visible
+    /// area up by 1, top row enters native scrollback". The user
+    /// experience this unlocks is `cmd+↑` / mouse-wheel during the
+    /// atomcode session showing history above the live viewport.
+    #[test]
+    fn retained_overflow_pushes_oldest_to_scrollback() {
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(80, h);
+        // Seed footer state so current_footer_rows() is stable.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        // Fill the body up to the cap (no overflow expected yet) so we
+        // know exactly when the first scrollback feed should land.
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+        for i in 0..cap {
+            r.render(UiLine::AssistantText(format!("filler {}\n", i)));
+        }
+        r.flush_deferred();
+        // Reset the capture so subsequent overflow events are isolated.
+        buf.lock().unwrap().clear();
+        // One more body line — body_lines.len() is now == cap at entry
+        // to emit_body_line_inner, so it must trigger the bottom-LF
+        // scroll BEFORE its own row emit.
+        r.render(UiLine::AssistantText("overflow row\n".into()));
+        r.flush_deferred();
+        let captured = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&captured);
+        let expected = format!("\x1b[{};1H\n", h);
+        assert!(
+            s.contains(&expected),
+            "overflow emit must include bottom-row LF scroll trigger {:?}\nfull: {:?}",
+            expected,
+            s
+        );
+    }
+
+    /// Sub-cap pushes must NOT touch the bottom row — that would scroll
+    /// content the user can still see into native scrollback prematurely,
+    /// duplicating rows between the visible area and the scrollback view.
+    /// The bottom-LF is reserved for genuine overflow moments only.
+    #[test]
+    fn retained_below_cap_does_not_scroll_terminal() {
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(80, h);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+        // Push strictly fewer body rows than cap so emit_body_line_inner
+        // never enters the overflow branch.
+        let push_count = cap.saturating_sub(2);
+        buf.lock().unwrap().clear();
+        for i in 0..push_count {
+            r.render(UiLine::AssistantText(format!("row {}\n", i)));
+        }
+        r.flush_deferred();
+        let captured = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&captured);
+        let forbidden = format!("\x1b[{};1H\n", h);
+        assert!(
+            !s.contains(&forbidden),
+            "below-cap pushes must not emit bottom-LF scroll {:?}\nfull: {:?}",
+            forbidden,
+            s
+        );
+    }
+
+    /// After overflow has happened, the visible body region must still
+    /// show the MOST RECENT body_height rows of `body_lines`, with the
+    /// footer immediately below — i.e. the scroll-up-then-repaint dance
+    /// must leave the on-screen state identical to "if the cap had never
+    /// been exceeded and we just painted the tail directly". Without the
+    /// `shift_prev_up` sync the cell-diff would produce a smeared frame
+    /// (stale top row + duplicate row at the bottom).
+    #[test]
+    fn retained_overflow_keeps_visible_body_correct() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+        // Push 2x cap rows to guarantee overflow events have fired.
+        for i in 0..(cap * 2) {
+            r.render(UiLine::AssistantText(format!("R{:03}\n", i)));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The body_lines tail's most recent labels MUST be visible on
+        // the live viewport rows [0..body_rows_on_screen). The very last
+        // row before the footer should show the latest pushed label.
+        let body_rows_on_screen = r.body_bottom_row() as usize;
+        assert!(body_rows_on_screen > 0, "body should occupy at least one row after overflow");
+        // Take a sample of the most recent labels and confirm each is
+        // present somewhere in the live body region.
+        let total = r.body_lines.len();
+        // The body_lines that actually live in the screen tail.
+        let tail_start = total.saturating_sub(body_rows_on_screen);
+        let mut seen_recent = 0;
+        for idx in tail_start..total {
+            // Recover the label by scanning body_lines for the printable chars.
+            let label: String = r.body_lines[idx]
+                .iter()
+                .filter(|c| c.width > 0)
+                .map(|c| c.ch)
+                .collect();
+            let label = label.trim().to_string();
+            if label.is_empty() {
+                continue;
+            }
+            let found = (0..body_rows_on_screen)
+                .any(|row| vterm.row_text(row).contains(&label));
+            if found {
+                seen_recent += 1;
+            }
+        }
+        assert!(
+            seen_recent >= 1,
+            "expected at least one recent body row visible on screen after overflow; \
+             body_rows_on_screen={} total={}\ndump:\n{}",
+            body_rows_on_screen,
+            total,
+            vterm.dump()
+        );
+        // The oldest row (R000) MUST NOT be in the live viewport
+        // (it should have been scrolled out into scrollback).
+        let oldest_visible_in_live = (0..body_rows_on_screen)
+            .any(|row| vterm.row_text(row).contains("R000"));
+        assert!(
+            !oldest_visible_in_live,
+            "oldest body row R000 must be off-screen (scrolled into native scrollback) \
+             after pushing 2*cap rows\ndump:\n{}",
+            vterm.dump()
+        );
     }
 
     #[test]

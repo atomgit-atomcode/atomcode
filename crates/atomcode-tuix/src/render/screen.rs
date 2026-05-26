@@ -200,6 +200,32 @@ impl Screen {
         }
     }
 
+    /// Shift the recorded `prev_cells` up by `n` rows, blanking the
+    /// freed rows at the bottom. Used when the caller has triggered
+    /// a TERMINAL-side scroll (e.g. emitted `CUP(h,1) + LF` to push
+    /// the visible top into native scrollback): the physical terminal
+    /// state has shifted but our prev-frame cache hasn't. Re-syncing
+    /// here lets the next `render_diff` compute correct deltas
+    /// against reality instead of emitting a full-frame repaint.
+    ///
+    /// Mirrors `scroll_up`'s rotate-then-blank shape but operates on
+    /// `prev_cells` (the diff basis), not `cells` (the next-frame
+    /// scratch). `cells` is left untouched because the standard paint
+    /// cycle clears it at the end of every `render_diff` anyway —
+    /// the next `paint_frame` re-populates it from scratch.
+    pub fn shift_prev_up(&mut self, n: usize) {
+        let h = self.prev_cells.len();
+        if n == 0 || h == 0 {
+            return;
+        }
+        let n = n.min(h);
+        let blank_row = vec![Cell::blank(); self.width as usize];
+        self.prev_cells.rotate_left(n);
+        for row_idx in (h - n)..h {
+            self.prev_cells[row_idx] = blank_row.clone();
+        }
+    }
+
     /// Rebuild for new dimensions. Current and prev frames are
     /// discarded — the caller must re-draw every widget before
     /// the next `render_diff`.
@@ -330,6 +356,64 @@ mod tests {
             !out.contains("stuff"),
             "old content must be gone after resize: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn shift_prev_up_drops_top_blanks_bottom() {
+        // Populate two distinct rows then commit (swap into prev).
+        let mut s = Screen::new(10, 4);
+        let mut a = Vec::new();
+        push_str_cells(&mut a, "AAA", &CellStyle::default());
+        let mut b = Vec::new();
+        push_str_cells(&mut b, "BBB", &CellStyle::default());
+        s.draw_row(0, 0, &a);
+        s.draw_row(1, 0, &b);
+        let _ = s.render_diff();
+        // prev_cells now: row0="AAA", row1="BBB", row2=blank, row3=blank.
+        s.shift_prev_up(1);
+        // Expect: row0="BBB", row1=blank, row2=blank, row3=blank.
+        let prev = s.prev_cells_for_test();
+        let row0_text: String = prev[0]
+            .iter()
+            .filter(|c| c.width > 0)
+            .map(|c| c.ch)
+            .collect::<String>();
+        let row1_text: String = prev[1]
+            .iter()
+            .filter(|c| c.width > 0)
+            .map(|c| c.ch)
+            .collect::<String>();
+        assert!(
+            row0_text.trim_end().starts_with("BBB"),
+            "prev row 0 should now be the old row 1 (BBB), got {:?}",
+            row0_text
+        );
+        assert_eq!(
+            row1_text.trim_end(),
+            "",
+            "prev row 1 should be blank after shift, got {:?}",
+            row1_text
+        );
+    }
+
+    #[test]
+    fn shift_prev_up_zero_is_noop() {
+        let mut s = Screen::new(10, 3);
+        let mut a = Vec::new();
+        push_str_cells(&mut a, "KEEP", &CellStyle::default());
+        s.draw_row(0, 0, &a);
+        let _ = s.render_diff();
+        s.shift_prev_up(0);
+        let row0_text: String = s.prev_cells_for_test()[0]
+            .iter()
+            .filter(|c| c.width > 0)
+            .map(|c| c.ch)
+            .collect::<String>();
+        assert!(
+            row0_text.trim_end().starts_with("KEEP"),
+            "shift_prev_up(0) must be a no-op, got {:?}",
+            row0_text
         );
     }
 
