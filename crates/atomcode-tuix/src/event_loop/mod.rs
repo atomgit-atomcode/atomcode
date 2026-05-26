@@ -5410,46 +5410,48 @@ pub(super) fn handle_plugin_job_event(
         PluginJobEvent::MarketplaceAdded(info) => {
             // Marketplace add by itself doesn't load any skills (those come
             // from installed plugins) — show only the marketplace summary.
-            // `✓` prefix aligns with the MCP-connect / LSP-connect toasts
-            // emitted from the same body region (mcp_connect_rx etc.) so
-            // every "background install completed" line carries the same
-            // success indicator. Leading 2-space pad keeps the toast
-            // visually indented under the welcome banner.
+            // `✓` prefix + col-0 alignment mirrors the MCP-connect toast
+            // (`McpServerConnected`) emitted from the same body region, so
+            // every "background install completed" line lands at the same
+            // left edge regardless of which subsystem owns it.
             let _ = reload_plugins(ctx);
             let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
-            renderer.render(UiLine::CommandOutput(format!(
-                "  {}\n",
+            renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::PluginMarketplaceAdded {
                     name: &info.name,
                     commit: short_commit,
                     count: info.plugins.len(),
                 })
-            )));
+                .into_owned(),
+            ));
         }
         PluginJobEvent::MarketplaceUpdated(info) => {
             let _ = reload_plugins(ctx);
             let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
-            renderer.render(UiLine::CommandOutput(format!(
-                "  {}\n",
+            renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::PluginMarketplaceUpdated {
                     name: &info.name,
                     commit: short_commit,
                 })
-            )));
+                .into_owned(),
+            ));
         }
         PluginJobEvent::PluginInstalled(info) => {
             let (loaded, warnings) = reload_plugins(ctx);
             // Verbose mode (Ctrl+O) dumps the per-skill rejection reasons,
             // so users can debug a misnamed SKILL.md without restarting.
             // Default mode prints only the count summary — no cursor races.
+            //
+            // Sub-detail warning rows keep a 2-col indent: they are
+            // children of the install summary line, indenting communicates
+            // that subordination.
             if state.show_tool_output {
                 for w in &warnings {
-                    renderer.render(UiLine::CommandOutput(format!("  {}\n", w)));
+                    renderer.render(UiLine::CommandOutput(format!("  {}", w)));
                 }
             }
             let show_details_hint = !warnings.is_empty() && !state.show_tool_output;
-            renderer.render(UiLine::CommandOutput(format!(
-                "  {}\n",
+            renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::PluginInstallDone {
                     plugin: &info.plugin,
                     marketplace: &info.marketplace,
@@ -5457,7 +5459,8 @@ pub(super) fn handle_plugin_job_event(
                     skipped: warnings.len(),
                     show_details_hint,
                 })
-            )));
+                .into_owned(),
+            ));
         }
         PluginJobEvent::Failed { op, msg } => {
             renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
