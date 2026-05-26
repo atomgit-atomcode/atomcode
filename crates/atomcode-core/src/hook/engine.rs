@@ -768,7 +768,7 @@ mod tests {
         let config = HookConfig {
             event: HookEvent::PreToolUse,
             matcher: None,
-            command: "echo '{\"allow\": true}'".to_string(),
+            command: "echo '{\"action\": \"allow\"}'".to_string(),
             timeout_ms: 10_000,
             plugin_root: None,
         };
@@ -783,7 +783,7 @@ mod tests {
         let config = HookConfig {
             event: HookEvent::PreToolUse,
             matcher: None,
-            command: "echo '{\"block\": true, \"reason\": \"not allowed\"}'".to_string(),
+            command: "echo '{\"action\": \"block\", \"reason\": \"not allowed\"}'".to_string(),
             timeout_ms: 10_000,
             plugin_root: None,
         };
@@ -858,7 +858,7 @@ mod tests {
         let config = HookConfig {
             event: HookEvent::PreToolUse,
             matcher: Some("edit_*".to_string()),
-            command: "echo '{\"block\": true, \"reason\": \"no\"}'".to_string(),
+            command: "echo '{\"action\": \"block\", \"reason\": \"no\"}'".to_string(),
             timeout_ms: 10_000,
             plugin_root: None,
         };
