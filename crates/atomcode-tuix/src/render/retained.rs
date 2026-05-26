@@ -442,10 +442,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// have scrolled out of the visible body strip).
     live_group: Option<LiveGroup>,
     /// Windows only: the STD_INPUT_HANDLE console mode value saved by
-    /// `enable_conhost_mouse_capture` at startup / resume. Restored by
-    /// `restore_conhost_console_in_mode` on suspend / shutdown so the
-    /// parent shell gets its quick-edit / line-input flags back exactly
-    /// as they were (not "approximated" by crossterm's snapshot).
+    /// `enable_conhost_mouse_capture`. Currently always `None` — mouse
+    /// capture is intentionally disabled (see `with_writer` comment),
+    /// so there's nothing to restore. Field retained because the
+    /// suspend / shutdown paths still defensively call
+    /// `restore_conhost_console_in_mode` if it ever became `Some`
+    /// (belt-and-suspenders against a future re-enable being added
+    /// only on one side of the lifecycle).
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
     /// Mouse text-selection state: anchor, head, and drag-active flag.
@@ -489,13 +492,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // doesn't remain visible above the atomcode viewport and mix with
         // the atomcode session transcript. `\x1b[3J` only affects scrollback;
         // it does not touch the visible screen rows.
-        // Enable button-event tracking (`\x1b[?1002h`) and SGR-extended
-        // coordinates (`\x1b[?1006h`) so scroll wheel events route through
-        // the terminal's mouse event stream (needed for Phase 4 scroll support).
-        let _ = out.write_all(b"\x1b[3J\x1b[?1002h\x1b[?1006h");
+        //
+        // Mouse capture (`\x1b[?1002h` button-event + `\x1b[?1006h` SGR
+        // coords) is intentionally NOT enabled here. We defer mouse wheel,
+        // cmd+drag selection, and cmd+C copy to the terminal's native
+        // handling — matches Claude Code's UX model. Trade-off: atomcode's
+        // reverse-video drag selection and arboard/OSC52 clipboard write
+        // path are no longer reachable from interactive events. The
+        // disable-on-shutdown (`?1002l`/`?1006l`) sequences below are
+        // preserved as defensive hygiene against any other actor (a child
+        // process that exited weirdly, a prior atomcode run that
+        // panicked before Drop) having left capture on.
+        let _ = out.write_all(b"\x1b[3J");
         let _ = out.flush();
         #[cfg(windows)]
-        let prior_console_in_mode = crate::render::conhost::enable_conhost_mouse_capture();
+        // Conhost mouse capture intentionally skipped — see comment
+        // above re: deferring to terminal-native selection/wheel/copy.
+        let prior_console_in_mode: Option<u32> = None;
         let show_scrollbar = crate::render::ui_state::load().ui.show_scrollbar;
         Self {
             out,
@@ -3408,15 +3421,18 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
         }
         let _ = self.out.flush();
-        // Re-enable mouse capture after resume, mirroring the disable in
-        // suspend_for_external and the enable in with_writer. Mouse re-enable
-        // order: button-event first, then SGR coords (opposite of disable).
-        // This ensures the user has a clean alt-screen-like state with mouse
-        // hooked and working.
-        let _ = self.out.write_all(b"\x1b[?1002h\x1b[?1006h");
+        // Mouse capture intentionally NOT re-enabled on resume. We deferred
+        // mouse wheel / cmd+drag selection / cmd+C copy to the terminal's
+        // native handling at startup (see with_writer comment), so resume
+        // must keep that contract — re-enabling here would suddenly steal
+        // wheel events back from the terminal after the user returned from
+        // an external subprocess. The matching disable in
+        // suspend_for_external is still emitted so any subprocess that
+        // somehow turned capture on during its run gets cleaned up here.
         #[cfg(windows)]
         {
-            self.prior_console_in_mode = crate::render::conhost::enable_conhost_mouse_capture();
+            // Mirror the lib-level decision: leave conhost mode alone.
+            self.prior_console_in_mode = None;
         }
         let _ = self.out.flush();
     }
@@ -3524,18 +3540,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // scroll off the visible region, so vertical navigation is the
         // terminal's job.
         //
-        // Caveat: we enable button-event tracking (`?1002h`) for drag
-        // selection, which makes the terminal report wheel ticks to us
-        // as SGR mouse events instead of acting on them locally. To
-        // reach scrollback the user must hold the terminal-level bypass
-        // modifier — Shift+wheel in iTerm2 / Terminal.app, Cmd+↑ /
-        // Cmd+↓ for page-wise navigation. Those bypass keys are
-        // resolved by the terminal BEFORE the mouse event ever reaches
-        // our stdin, so they keep working regardless of what this
-        // method does. Acting on raw wheel events here is intentionally
-        // avoided because we can't synthesise back-scroll through
-        // already-promoted scrollback rows without re-implementing the
-        // terminal's history buffer ourselves.
+        // Mouse capture is now intentionally disabled at startup
+        // (see `with_writer`), so crossterm never emits Event::Mouse
+        // events on stdin and this method effectively never gets
+        // called from interactive use. The terminal handles wheel
+        // ticks directly — scrollback via plain wheel, native
+        // selection via drag, copy via cmd+C — which is the whole
+        // point of the trade-off.
         //
         // See regression test `retained_scroll_body_is_noop_to_preserve_native_scrollback`.
     }
@@ -7951,20 +7962,45 @@ mod tests {
     }
 
     #[test]
-    fn retained_with_writer_enables_mouse_capture() {
-        let mut buf = Vec::new();
-        let r = RetainedRenderer::with_writer(&mut buf, caps_with_color(), 80, 24);
-        // Drop the renderer FIRST — its Drop impl emits the mouse-OFF
-        // sequence, and the borrow checker won't let us read `buf` while
-        // `r` still holds a mutable borrow.
+    fn retained_with_writer_does_not_enable_mouse_capture() {
+        // Contract inverted: mouse capture is intentionally disabled at
+        // startup so wheel / cmd+drag selection / cmd+C copy stay with
+        // the terminal's native handling. Previously this test asserted
+        // ?1002h/?1006h were emitted at startup; that behaviour was
+        // removed by the "disable mouse capture, defer to terminal-
+        // native selection/wheel" change.
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        // Snapshot startup bytes BEFORE Drop emits the disable sequence.
+        let startup = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&startup);
+        assert!(
+            !s.contains("\x1b[?1002h"),
+            "startup must NOT enable button-event tracking — defer to terminal-native wheel/selection: {:?}",
+            s
+        );
+        assert!(
+            !s.contains("\x1b[?1006h"),
+            "startup must NOT enable SGR mouse coords — defer to terminal-native wheel/selection: {:?}",
+            s
+        );
         drop(r);
-        let s = String::from_utf8_lossy(&buf);
-        assert!(s.contains("\x1b[?1002h"), "must enable button-event tracking: {:?}", s);
-        assert!(s.contains("\x1b[?1006h"), "must enable SGR coordinates: {:?}", s);
-        // Belt-and-suspenders: confirm Drop also emitted the disable
-        // sequence (same contract alt_screen tests pin at alt_screen.rs:2244).
-        assert!(s.contains("\x1b[?1002l"), "Drop must emit mouse-mode disable (1002l): {:?}", s);
-        assert!(s.contains("\x1b[?1006l"), "Drop must emit mouse-mode disable (1006l): {:?}", s);
+        // Drop must still emit the disable sequence as a defensive
+        // hygiene measure (clears any stale capture state inherited
+        // from a prior process or panicked atomcode run).
+        let after_drop_bytes = buf.lock().unwrap().clone();
+        let after_drop = String::from_utf8_lossy(&after_drop_bytes);
+        assert!(
+            after_drop.contains("\x1b[?1002l"),
+            "Drop must emit mouse-mode disable (1002l) defensively: {:?}",
+            after_drop
+        );
+        assert!(
+            after_drop.contains("\x1b[?1006l"),
+            "Drop must emit mouse-mode disable (1006l) defensively: {:?}",
+            after_drop
+        );
     }
 
     #[test]
@@ -7981,7 +8017,12 @@ mod tests {
     }
 
     #[test]
-    fn retained_resume_reenables_mouse_capture() {
+    fn retained_resume_does_not_reenable_mouse_capture() {
+        // Contract inverted: resume must NOT re-enable mouse capture,
+        // because startup never enabled it. Re-enabling here would
+        // suddenly steal wheel events back from the terminal after the
+        // user returns from an external subprocess (OAuth browser,
+        // shell prompt), breaking the deferred-to-terminal contract.
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(buf.clone());
         let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
@@ -7990,8 +8031,16 @@ mod tests {
         r.resume_from_external();
         let bytes = buf.lock().unwrap().clone();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("\x1b[?1002h"), "resume must re-enable button-event: {:?}", s);
-        assert!(s.contains("\x1b[?1006h"), "resume must re-enable SGR: {:?}", s);
+        assert!(
+            !s.contains("\x1b[?1002h"),
+            "resume must NOT re-enable button-event tracking — defer to terminal: {:?}",
+            s
+        );
+        assert!(
+            !s.contains("\x1b[?1006h"),
+            "resume must NOT re-enable SGR mouse coords — defer to terminal: {:?}",
+            s
+        );
     }
 
     #[test]
@@ -8053,33 +8102,35 @@ mod tests {
         );
     }
 
-    /// Companion to `retained_scroll_body_is_noop_…`: even though
-    /// wheel events are intentionally inert, drag selection (the
-    /// reason `?1002h` is enabled in the first place) MUST still
-    /// work. If a future change suppresses `?1002h` to "let the
-    /// wheel through" we'd lose drag selection — this test pins
-    /// BOTH the startup ?1002h emission AND the renderer-side
-    /// drag-selection state machine so either-side regression is
-    /// loud.
+    /// Contract inverted from the original `retained_drag_selection_
+    /// survives_wheel_noop_contract`: that test pinned `?1002h` MUST
+    /// be emitted at startup so drag selection worked, accepting the
+    /// trade-off that wheel events went through us. We've now chosen
+    /// the opposite trade-off: `?1002h` is NOT emitted, the terminal
+    /// keeps wheel + native drag-select + cmd+C, and atomcode's
+    /// in-renderer drag selection becomes effectively dead (no
+    /// external code path can fire begin/update/end_selection since
+    /// mouse events never arrive). The internal selection API still
+    /// works when called directly — Task 7.1 will collapse it.
     #[test]
-    fn retained_drag_selection_survives_wheel_noop_contract() {
+    fn retained_drag_selection_api_still_callable_but_terminal_owns_wheel() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(buf.clone());
         let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
-        // Startup MUST enable button-event tracking — the only
-        // mouse mode that gives us drag motion. Without it the
-        // terminal would never report MouseDrag events and drag
-        // selection would silently no-op.
+        // Startup MUST NOT enable button-event tracking — the whole
+        // point of this change is to let the terminal own the mouse.
         let startup = buf.lock().unwrap().clone();
         let s = String::from_utf8_lossy(&startup);
         assert!(
-            s.contains("\x1b[?1002h"),
-            "?1002h must still be enabled — dropping it to 'let wheel \
-             through' would break drag selection: {:?}",
+            !s.contains("\x1b[?1002h"),
+            "?1002h must NOT be enabled — terminal-native wheel / cmd+drag \
+             selection / cmd+C copy take over: {:?}",
             s
         );
-        // Exercise the drag-selection state machine end-to-end on
-        // the renderer side.
+        // The selection API on the struct is still callable directly
+        // (selection.rs has not been deleted yet — Task 7.1). It just
+        // never fires from interactive events because crossterm gets
+        // no mouse-protocol bytes from stdin.
         for i in 0..10 {
             r.render(UiLine::User(format!("L{}", i)));
         }
@@ -8088,8 +8139,8 @@ mod tests {
         r.update_selection(10, 1);
         assert!(
             r.selection.selection.is_some(),
-            "drag selection must still produce a selection state — the wheel \
-             no-op contract must not regress drag selection"
+            "selection API must remain callable directly even though it's no \
+             longer wired to mouse events"
         );
         r.end_selection();
     }
