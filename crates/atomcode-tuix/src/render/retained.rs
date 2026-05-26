@@ -3714,9 +3714,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn end_selection(&mut self) {
         if let Some(text) = self.selection.end(&self.body_lines) {
-            // copy_to_clipboard fans out to OSC 52 + arboard so Terminal.app
-            // (OSC 52 off by default) and headless terminals both get the
-            // selection. Pure OSC 52 would silently drop on those.
             crate::render::selection::copy_to_clipboard(&mut self.out, &text);
         }
     }

@@ -455,22 +455,25 @@ pub fn emit_osc52(out: &mut dyn Write, text: &str) {
     let _ = out.flush();
 }
 
-/// Push a drag-release selection to the system clipboard via BOTH
-/// OSC 52 (terminal-side, no extra process cost) AND arboard
-/// (process-side, via the system clipboard service). Many terminals
-/// don't honor OSC 52 — macOS Terminal.app default, some Windows
-/// conhost configurations, OSC-52-disabled iTerm2 profiles — so
-/// without the arboard parallel write the user drags, releases, and
-/// finds the clipboard empty. Both calls are best-effort; arboard
-/// fails gracefully on headless servers / WSL without an X server.
+/// Copy `text` to the system clipboard. Tries arboard first (writes
+/// directly to NSPasteboard / X11 / Win32 clipboard, doesn't touch the
+/// terminal, doesn't trigger iTerm2's "may access clipboard" prompt).
+/// Falls back to OSC 52 only if arboard fails — covers SSH sessions and
+/// other contexts with no local clipboard service.
+///
+/// Empty text is a no-op (don't clobber whatever the user previously had).
 pub fn copy_to_clipboard(out: &mut dyn Write, text: &str) {
     if text.is_empty() {
         return;
     }
-    emit_osc52(out, text);
     if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(text.to_string());
+        if cb.set_text(text.to_string()).is_ok() {
+            return; // arboard succeeded; no need for OSC 52
+        }
     }
+    // arboard unavailable (headless / SSH / no clipboard service):
+    // fall back to OSC 52 so a remote local terminal can still copy.
+    emit_osc52(out, text);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -664,4 +667,20 @@ mod tests {
         let body: Vec<Vec<Cell>> = vec![row];
         assert_eq!(body.line_text(0), "hi中");
     }
+
+    /// `copy_to_clipboard` with empty text must not emit OSC 52 or
+    /// anything else — emitting a blank OSC 52 would clobber whatever
+    /// the user previously had in their clipboard with an empty string.
+    #[test]
+    fn copy_to_clipboard_empty_is_noop() {
+        let mut buf = Vec::new();
+        copy_to_clipboard(&mut buf, "");
+        assert!(buf.is_empty(), "empty text must not emit OSC 52 or anything else");
+    }
+
+    // Note: we can't directly assert that arboard was called (would need
+    // dependency injection), but we CAN assert that for non-empty text on
+    // a successful arboard write, nothing reaches `out`. On a CI/headless
+    // env where arboard fails, the OSC 52 fallback fires. Either is correct
+    // behavior; we don't lock either path in here. Just verify the no-op guard.
 }

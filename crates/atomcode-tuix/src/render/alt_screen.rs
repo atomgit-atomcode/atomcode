@@ -2166,9 +2166,6 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
 
     fn end_selection(&mut self) {
         if let Some(text) = self.selection.end(&self.body_lines) {
-            // copy_to_clipboard fans out to OSC 52 + arboard so Terminal.app
-            // (OSC 52 off by default) and headless terminals both get the
-            // selection. Pure OSC 52 would silently drop on those.
             crate::render::selection::copy_to_clipboard(&mut self.out, &text);
         }
     }
@@ -3699,26 +3696,29 @@ mod tests {
     /// chevron `❯ `, so the visible cols of "hello there" are:
     /// `❯=0 space=1 h=2 e=3 l=4 l=5 o=6 ' '=7 t=8 …`. Drag cols
     /// 2..=6 captures "hello".
+    ///
+    /// With the arboard-first strategy, `copy_to_clipboard` tries
+    /// arboard before touching the writer. When arboard succeeds (local
+    /// macOS / Linux), no OSC 52 is emitted to `out` — that is the
+    /// intended behavior: it's exactly what stops iTerm2 from popping
+    /// its "may access clipboard" dialog. When arboard is unavailable
+    /// (headless CI, SSH without clipboard forwarding), the fallback
+    /// fires and the test allows OSC 52 to be present. Either path is
+    /// correct — what must never happen is a zero-length selection write.
     #[test]
-    fn drag_select_writes_osc52_to_writer() {
+    fn drag_select_copies_selection_text() {
         let mut buf = Vec::new();
         let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 10);
         r.render(UiLine::User("hello there".into()));
         r.begin_selection(2, 0);
         r.update_selection(6, 0);
         r.end_selection();
+        // Verify the selection state captured the right text regardless
+        // of which clipboard path was taken.
+        let text = r.extract_selection_text();
+        assert_eq!(text, "hello", "selection text mismatch. got: {:?}", text);
         r.flush();
         drop(r);
-        let s = String::from_utf8_lossy(&buf);
-        let expected = format!(
-            "\x1b]52;c;{}\x07",
-            crate::render::selection::base64_encode(b"hello")
-        );
-        assert!(
-            s.contains(&expected),
-            "OSC 52 with base64('hello') missing. got: {:?}",
-            s
-        );
     }
 
     /// Drag end with empty selection (begin only, no movement, head
