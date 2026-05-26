@@ -255,6 +255,14 @@ impl TurnRunner {
         // pattern</arg_key>...</tool_call>` mid-prose, polluting A/B
         // analysis.
         let mut visible_text_buf = String::new();
+        // Runaway-stream guard: if a degenerate model gets stuck in an
+        // autoregressive loop emitting the same character forever, we
+        // abort the turn rather than burning the user's quota waiting
+        // for the upstream max_tokens cap (#225). The detector keeps
+        // running across all visible Delta text in this turn — tool
+        // call boundaries reset stream_filter but not this; a real
+        // runaway will still trip on the per-segment text alone.
+        let mut runaway_detector = crate::stream::RunawayDetector::with_default_threshold();
         // Reasoning-model thinking content collected separately — not emitted
         // to scrollback by default (users don't want to read the thinking).
         // If `text_buf` ends up empty at `Done` but this is non-empty, we
@@ -433,6 +441,23 @@ impl TurnRunner {
                                             // blocks (Qwen/GLM XML leak suppression).
                                             let visible = stream_filter.feed(&text);
                                             if !visible.is_empty() {
+                                                // Runaway guard runs on the visible stream
+                                                // only — XML scaffolding inside <tool_call>
+                                                // blocks legitimately runs long, and we
+                                                // don't want to false-positive on it (#225).
+                                                if let Some(reason) =
+                                                    runaway_detector.feed(&visible)
+                                                {
+                                                    conversation.push_delta(&visible);
+                                                    visible_text_buf.push_str(&visible);
+                                                    let _ = event_tx
+                                                        .send(TurnEvent::TextDelta(visible));
+                                                    conversation.finalize_stream();
+                                                    tel_return!(
+                                                        TurnResult::Failed(reason),
+                                                        0u32
+                                                    );
+                                                }
                                                 conversation.push_delta(&visible);
                                                 visible_text_buf.push_str(&visible);
                                                 let _ = event_tx.send(TurnEvent::TextDelta(visible));
