@@ -1369,6 +1369,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let bytes = serialize_row(row);
         let _ = self.out.write_all(&bytes);
         let _ = self.out.write_all(b"\n");
+        // ED 0 above blanked the physical terminal from `footer_top_1idx`
+        // down — but `screen.prev_cells` still holds whatever was there
+        // last frame. Without resyncing, the next `render_diff` may
+        // suppress a patch for a row whose newly-laid-out cells happen
+        // to be byte-equal to the now-stale prev cells (the classic
+        // case: the new footer's top_rule lining up with the old
+        // footer's bot_rule — both are full rows of `─` in identical
+        // style, so the diff sees "no change" and emits nothing, but
+        // the physical terminal is blank there because the ED 0 wiped
+        // it). Resync prev_cells to mirror the ED so the diff sees the
+        // real delta and emits the necessary patches.
+        let footer_top_0idx = footer_top_1idx.saturating_sub(1) as usize;
+        self.screen.invalidate_rows_from(footer_top_0idx);
         // Mark dirty so the next 5ms `paint_frame` tick redraws
         // the footer below the new body row via the cell-diff path.
         self.dirty = true;
@@ -8264,5 +8277,126 @@ mod tests {
                 vterm.dump()
             );
         }
+    }
+
+    /// Regression for the "missing top rule after /model switch" bug.
+    ///
+    /// Reproduction sequence (mirrors the real /model flow):
+    ///   1. Steady-state InputPrompt (no menu) — paint, drain.
+    ///   2. Open the slash menu (4 items) via InputPrompt with menu=Some —
+    ///      paint, drain. Footer grows from 4 rows to 8 (top+middle+bot+
+    ///      4 menu + status).
+    ///   3. Close the menu via InputPrompt with menu=None AND immediately
+    ///      push a body row ("已切换到 …") in the SAME tick — no
+    ///      flush_deferred between the two so they coalesce into one
+    ///      paint cycle.
+    ///   4. flush_deferred → drain into vterm.
+    ///
+    /// Expected post-condition: the footer's top_rule lives at the row
+    /// immediately above the input prompt `>`, and reads as a row full of
+    /// `─` (or at least starts with `─`). The bug renders this row blank
+    /// because `emit_body_line_inner` wrote the body row + LF directly to
+    /// the terminal (advancing cursor past footer_top), then the next
+    /// paint's cell-diff suppressed the top_rule emit on the rows whose
+    /// prev_cells still held the (now-stale) menu content from before the
+    /// close.
+    #[test]
+    fn retained_top_rule_visible_after_menu_close_and_body_push() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Step 1: baseline InputPrompt, no menu.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Step 2: open the slash menu (4 items, mirrors /model entry).
+        let items: Vec<(String, String)> = vec![
+            ("model".into(), "Switch model".into()),
+            ("provider".into(), "Add provider".into()),
+            ("session".into(), "New session".into()),
+            ("resume".into(), "Resume session".into()),
+        ];
+        r.render(UiLine::InputPrompt {
+            buf: "/model".into(),
+            cursor_byte: 6,
+            menu: Some(MenuPayload {
+                items: items.clone(),
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Step 3a: user selects an item — menu closes via InputPrompt with
+        // menu=None. State is updated but we DON'T flush_deferred yet —
+        // in the real /model path the slash-handler immediately follows
+        // up with the "已切换到 …" body row in the same event_loop tick.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+
+        // Step 3b: slash handler emits the confirmation body row. This
+        // is the line the user actually saw on screen.
+        r.render(UiLine::CommandOutput(
+            "  已切换到 AtomGit-deepseek-v4-flash · deepseek-v4-flash\n".into(),
+        ));
+
+        // Step 4: coalesce + paint + drain.
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Post-condition: locate the input-prompt row (the one starting
+        // with the chevron) and assert the row IMMEDIATELY ABOVE it is a
+        // full-width rule. With unicode + colors enabled, the chevron is
+        // '❯'. Pad column varies, so we search the whole grid.
+        let prompt_row = (0..h as usize)
+            .find(|&row| {
+                let text = vterm.row_text(row);
+                text.contains('\u{276f}')
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no prompt-bearing row found post-menu-close;\ndump:\n{}",
+                    vterm.dump()
+                )
+            });
+        assert!(
+            prompt_row >= 1,
+            "prompt row {} has no row above it for top_rule;\ndump:\n{}",
+            prompt_row,
+            vterm.dump()
+        );
+        let top_rule_row = prompt_row - 1;
+        let dashes = (0..w as usize)
+            .filter(|&c| vterm.cell_at(top_rule_row, c).ch == '\u{2500}')
+            .count();
+        assert!(
+            dashes >= (w as usize / 2),
+            "top_rule above prompt row {} (i.e. row {}) is blank/short — only {} '─' dashes.\n\
+             top_rule row text: {:?}\n\
+             dump:\n{}",
+            prompt_row,
+            top_rule_row,
+            dashes,
+            vterm.row_text(top_rule_row),
+            vterm.dump()
+        );
     }
 }

@@ -200,6 +200,30 @@ impl Screen {
         }
     }
 
+    /// Blank `prev_cells` for rows `[start_row, height)`. Used by callers
+    /// that wrote `\x1b[0J` (erase-to-end-of-display) directly to stdout
+    /// from `start_row` down: the physical terminal is now blank in that
+    /// region, but `prev_cells` still holds the cells of whatever was
+    /// there last frame. Without resyncing, the next `render_diff` may
+    /// suppress a patch for a row whose new cells COINCIDENTALLY match
+    /// the stale `prev_cells` (e.g. a top_rule full of `─` lining up
+    /// with a stale bot_rule full of the same `─`) — and the row stays
+    /// physically blank because the diff thinks no change is needed.
+    ///
+    /// Mirrors `invalidate()` (which blanks everything) and
+    /// `shift_prev_up()` (which scrolls then blanks the bottom n rows)
+    /// — same shape, different region. The companion direct-stdout
+    /// write is the caller's responsibility; this method only updates
+    /// the diff cache to match what the caller already told the
+    /// terminal to do.
+    pub fn invalidate_rows_from(&mut self, start_row: usize) {
+        let blank_row = vec![Cell::blank(); self.width as usize];
+        let h = self.prev_cells.len();
+        for r in start_row.min(h)..h {
+            self.prev_cells[r] = blank_row.clone();
+        }
+    }
+
     /// Shift the recorded `prev_cells` up by `n` rows, blanking the
     /// freed rows at the bottom. Used when the caller has triggered
     /// a TERMINAL-side scroll (e.g. emitted `CUP(h,1) + LF` to push
