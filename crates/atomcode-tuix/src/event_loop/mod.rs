@@ -830,6 +830,14 @@ pub struct LoopCtx {
     /// run interactive multi-step flows, so first-run falls through to
     /// the existing "no provider configured" status hint.
     pub is_plain_renderer: bool,
+    /// Current reasoning_effort for the active provider's model.
+    /// Driven by Ctrl+T and /effort; read by build_status and
+    /// persisted to config.toml on change.
+    pub reasoning_effort: Option<String>,
+    /// Transient status-line hint with auto-dismiss. Set with a
+    /// 5 s deadline by Ctrl+T / /effort when the action has no
+    /// effect; cleared by `build_status` once expired.
+    pub transient_hint: std::sync::Arc<std::sync::Mutex<Option<TransientHint>>>,
 }
 
 /// Memoised result of the most recent clipboard probe. The hash is a
@@ -842,6 +850,16 @@ pub struct LoopCtx {
 pub struct ClipboardCheckState {
     pub image_hash: Option<u64>,
     pub last_checked: Option<std::time::Instant>,
+}
+
+/// Auto-dismissing status-line hint. Set with a deadline; `build_status`
+/// renders it as an Info hint until the deadline passes, then clears it
+/// on the next redraw. Used for transient feedback like "Ctrl+T on a
+/// non-DeepSeek model".
+#[derive(Debug, Clone)]
+pub struct TransientHint {
+    pub text: String,
+    pub deadline: std::time::Instant,
 }
 
 /// Cheap content fingerprint for clipboard images. Hashes width, height,
@@ -3626,6 +3644,7 @@ fn refresh_after_cross_process_codingplan_sync(ctx: &mut LoopCtx) {
         if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
             ctx.model_name = p.model.clone();
         }
+        sync_reasoning_effort_from_provider(ctx);
         let _ = ctx
             .agent
             .cmd_tx
@@ -4368,6 +4387,30 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // Ctrl+T cycles reasoning_effort
+    if code == KeyCode::Char('t') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if !reasoning_effort_applicable_on_provider(ctx) {
+            if let Ok(mut g) = ctx.transient_hint.lock() {
+                *g = Some(TransientHint {
+                    text: crate::i18n::t(crate::i18n::Msg::ReasoningEffortNoEffect).into_owned(),
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                });
+            }
+            redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            return Ok(());
+        }
+        let new = app.state.cycle_reasoning_effort();
+        ctx.reasoning_effort = new.map(|s| s.to_string());
+        persist_reasoning_effort(ctx);
+        let label = new.unwrap_or("default (API auto)");
+        renderer.render(UiLine::CommandOutput(format!(
+            "  ○ Reasoning effort: {label} (Ctrl+T to change)\n"
+        )));
+        renderer.flush();
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     // Suppress while scrolling history — otherwise a recalled `/se…` from
     // history immediately re-pops the menu and traps Up inside it.
@@ -5103,10 +5146,26 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     (loaded, warnings)
 }
 
+/// Sync ctx.reasoning_effort from the current default provider's config.
+/// For non-DeepSeek providers, always clears to None regardless of stale config.
+/// Call this after any operation that changes the active provider / model.
+fn sync_reasoning_effort_from_provider(ctx: &mut LoopCtx) {
+    let applicable = reasoning_effort_applicable_on_provider(ctx);
+    ctx.reasoning_effort = if applicable {
+        ctx.config
+            .providers
+            .get(&ctx.config.default_provider)
+            .and_then(|p| p.reasoning_effort.clone())
+    } else {
+        None
+    };
+}
+
 pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     let path = Config::default_path();
     match ctx.config.save(&path) {
         Ok(()) => {
+            sync_reasoning_effort_from_provider(ctx);
             ctx.runtime_factory.set_config(ctx.config.clone());
             let _ = ctx
                 .agent
@@ -5117,6 +5176,36 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
             renderer.render(UiLine::Error(crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed { error: &format!("{}", e) }).into_owned()));
             renderer.flush();
         }
+    }
+}
+
+/// Persist the current reasoning_effort to config.toml and notify the agent.
+fn persist_reasoning_effort(ctx: &mut LoopCtx) {
+    let path = Config::default_path();
+    let default_provider = ctx.config.default_provider.clone();
+    if let Some(p) = ctx.config.providers.get_mut(&default_provider) {
+        p.reasoning_effort = ctx.reasoning_effort.clone();
+    }
+    if let Err(e) = ctx.config.save(&path) {
+        eprintln!("[reasoning_effort] failed to save config: {e}");
+    }
+    ctx.runtime_factory.set_config(ctx.config.clone());
+    let _ = ctx
+        .agent
+        .cmd_tx
+        .send(AgentCommand::ReloadConfig(ctx.config.clone()));
+}
+
+/// True when the current default provider's model is likely to accept
+/// `reasoning_effort` as a request field. Returns false for non-applicable
+/// providers (e.g. Kimi, OpenAI), so Ctrl+T and /effort can short-circuit.
+pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
+    match ctx.config.providers.get(&ctx.config.default_provider) {
+        Some(p) => atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
+            &p.model,
+            p.base_url.as_deref().unwrap_or(""),
+        ),
+        None => false,
     }
 }
 
@@ -5156,6 +5245,44 @@ fn handle_streaming_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // Ctrl+T cycles reasoning_effort (None → high → max → None).
+    // Only has effect on DeepSeek V4 / reasoner models.
+    if code == KeyCode::Char('t') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if !reasoning_effort_applicable_on_provider(ctx) {
+            if let Ok(mut g) = ctx.transient_hint.lock() {
+                *g = Some(TransientHint {
+                    text: crate::i18n::t(crate::i18n::Msg::ReasoningEffortNoEffect).into_owned(),
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                });
+            }
+            draw_spinner_now(
+                &mut app.state,
+                &app.buf,
+                ctx,
+                renderer,
+                app.message_queue.len(),
+                app.menu.selected,
+            );
+            return Ok(());
+        }
+        let new = app.state.cycle_reasoning_effort();
+        ctx.reasoning_effort = new.map(|s| s.to_string());
+        persist_reasoning_effort(ctx);
+        let label = new.unwrap_or("default (API auto)");
+        let msg = format!("  ○ Reasoning effort: {label} (Ctrl+T to change)\n");
+        renderer.render(UiLine::CommandOutput(msg));
+        renderer.flush();
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+        return Ok(());
+    }
+
     // Ctrl+O toggles verbose mode (real-time tool output + reasoning visibility)
     if code == KeyCode::Char('o') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         app.state.toggle_tool_output();
@@ -5442,6 +5569,28 @@ fn handle_approval_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // Ctrl+T cycles reasoning_effort
+    if code == KeyCode::Char('t') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if !reasoning_effort_applicable_on_provider(ctx) {
+            if let Ok(mut g) = ctx.transient_hint.lock() {
+                *g = Some(TransientHint {
+                    text: crate::i18n::t(crate::i18n::Msg::ReasoningEffortNoEffect).into_owned(),
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                });
+            }
+            return Ok(());
+        }
+        let new = app.state.cycle_reasoning_effort();
+        ctx.reasoning_effort = new.map(|s| s.to_string());
+        persist_reasoning_effort(ctx);
+        let label = new.unwrap_or("default (API auto)");
+        renderer.render(UiLine::CommandOutput(format!(
+            "  ○ Reasoning effort: {label} (Ctrl+T to change)\n"
+        )));
+        renderer.flush();
+        return Ok(());
+    }
+
     // Ctrl+C: first press denies the tool and arms exit confirmation;
     // second press within the window actually exits.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
@@ -6715,13 +6864,25 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     //   3. None.
     let no_provider =
         ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none();
-    // Priority: no-provider (Warning red) > CodingPlan drift monitor
-    // (Warning red) > CodingPlan token-usage hint (Info ≥80%, Warning
-    // ≥95%) > upgrade banner (Info dim). Usage outranks upgrade because
-    // ">80% in this rolling window" is more actionable than "new
-    // version available". Only one hint renders at a time (right-aligned
-    // on the status row).
-    let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
+    // Always check and clear expired transient_hint, even when another
+    // hint is active — otherwise a transient hint set while a monitor
+    // warning is visible would never expire.
+    let transient_active: Option<String> =
+        ctx.transient_hint.lock().ok().and_then(|mut g| {
+            let h = g.as_ref()?;
+            if h.deadline > std::time::Instant::now() {
+                Some(h.text.clone())
+            } else {
+                *g = None;
+                None
+            }
+        });
+    // Priority: transient hint (user-action feedback) > no-provider
+    // (Warning) > CodingPlan drift (Warning) > CodingPlan usage hint
+    // (Info ≥80%, Warning ≥95%) > upgrade banner.
+    let hint: Option<(String, crate::render::HintSeverity)> = if let Some(t) = transient_active {
+        Some((t, crate::render::HintSeverity::Info))
+    } else if no_provider {
         Some((
             crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
             crate::render::HintSeverity::Warning,
@@ -6735,13 +6896,6 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else if let Some(h) = clipboard_image_hash(&ctx.clipboard_check)
         .filter(|h| !state.pending_image_hashes.contains(h))
     {
-        // Transient cue — beats the upgrade banner because the action
-        // window is "now" (the image is in the clipboard right now).
-        // Suppressed when the clipboard's image fingerprint matches one
-        // already in `pending_images`: the input box already shows
-        // `[Image #N]`, prompting another paste of the same image would
-        // just attach a dup. A NEW image (different fingerprint) appears
-        // here as a fresh hint so the user can attach it too.
         let _ = h;
         // Windows Terminal / conhost swallow Ctrl+V (they bind it to
         // their own `paste` action that only forwards CF_UNICODETEXT,
@@ -6820,6 +6974,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         hint,
         mode_indicator,
         session_name,
+        reasoning_effort: ctx.reasoning_effort.clone(),
     }
 }
 

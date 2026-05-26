@@ -51,6 +51,7 @@ fn build_oauth_provider() -> ProviderConfig {
         thinking_type: None,
         thinking_keep: None,
         reasoning_history: None,
+        reasoning_effort: None,
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -370,6 +371,26 @@ pub(super) fn execute_slash_command(
                     ctx.config = new_cfg.clone();
                     ctx.runtime_factory.set_config(new_cfg.clone());
                     ctx.model_name = new_model.clone();
+                    // Sync reasoning_effort from the new provider; clear
+                    // for non-DeepSeek models so stale values don't persist.
+                    let applicable = new_cfg
+                        .providers
+                        .get(&new_default)
+                        .map_or(false, |p| {
+                            atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
+                                &p.model,
+                                p.base_url.as_deref().unwrap_or(""),
+                            )
+                        });
+                    ctx.reasoning_effort = if applicable {
+                        new_cfg
+                            .providers
+                            .get(&new_default)
+                            .and_then(|p| p.reasoning_effort.clone())
+                    } else {
+                        None
+                    };
+                    state.reasoning_effort = ctx.reasoning_effort.clone();
                     ctx.agent
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(new_cfg))
@@ -1422,6 +1443,65 @@ pub(super) fn execute_slash_command(
                     } else {
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::ThinkUsage).into_owned(),
+                        ));
+                        renderer.flush();
+                    }
+                }
+            }
+        }
+        "effort" => {
+            let provider_name = ctx.config.default_provider.clone();
+            let provider = ctx.config.providers.get_mut(&provider_name);
+            match provider {
+                None => {
+                    renderer.render(UiLine::Error(
+                        t(Msg::CmdNoActiveProvider).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+                Some(p) => {
+                    let sub = arg.trim().to_ascii_lowercase();
+                    if sub.is_empty() {
+                        let current = p.reasoning_effort.as_deref().unwrap_or("off (API default)");
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Current reasoning effort: {current}\n  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n"
+                        )));
+                        renderer.flush();
+                    } else if sub == "off" {
+                        p.reasoning_effort = None;
+                        ctx.reasoning_effort = None;
+                        state.reasoning_effort = None;
+                        save_and_reload(ctx, renderer);
+                        renderer.render(UiLine::CommandOutput(
+                            "  ○ Reasoning effort: off (API default)\n".into(),
+                        ));
+                        renderer.flush();
+                    } else if sub == "high" || sub == "max" {
+                        let applicable = atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
+                            &p.model,
+                            p.base_url.as_deref().unwrap_or(""),
+                        );
+                        if !applicable {
+                            if let Ok(mut g) = ctx.transient_hint.lock() {
+                                *g = Some(crate::event_loop::TransientHint {
+                                    text: t(Msg::ReasoningEffortNoEffect).into_owned(),
+                                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                                });
+                            }
+                            return Ok(());
+                        }
+                        let v = sub.as_str();
+                        p.reasoning_effort = Some(v.to_string());
+                        ctx.reasoning_effort = Some(v.to_string());
+                        state.reasoning_effort = Some(v.to_string());
+                        save_and_reload(ctx, renderer);
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  ○ Reasoning effort: {v} (Ctrl+T to change)\n"
+                        )));
+                        renderer.flush();
+                    } else {
+                        renderer.render(UiLine::CommandOutput(
+                            "  Usage: /effort high | max | off\n  Shortcut: Ctrl+T\n".into(),
                         ));
                         renderer.flush();
                     }
@@ -2794,6 +2874,11 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
             } else {
                 if let Some(provider) = ctx.config.providers.get(&ctx.config.default_provider) {
                     ctx.model_name = provider.model.clone();
+                    ctx.reasoning_effort = if super::reasoning_effort_applicable_on_provider(ctx) {
+                        provider.reasoning_effort.clone()
+                    } else {
+                        None
+                    };
                 }
                 let _ = ctx
                     .agent
@@ -2904,6 +2989,11 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
                 // requiring a /reload.
                 if let Some(p) = ctx.config.providers.get(&ctx.config.default_provider) {
                     ctx.model_name = p.model.clone();
+                    ctx.reasoning_effort = if super::reasoning_effort_applicable_on_provider(ctx) {
+                        p.reasoning_effort.clone()
+                    } else {
+                        None
+                    };
                 }
                 // Clear any stale drift warning now that we've just
                 // re-synced. Also reset the cooldown so the next

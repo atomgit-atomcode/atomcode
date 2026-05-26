@@ -1297,7 +1297,14 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // Compute a budget for cwd that accounts for model name, " · "
         // separators, and mode badge — same logic as retained's
         // build_status_row.
-        let model = scrub_controls(&self.pending_status.model);
+        let model = {
+            let m = scrub_controls(&self.pending_status.model);
+            if let Some(ref e) = self.pending_status.reasoning_effort {
+                format!("{} :{}", m, e)
+            } else {
+                m
+            }
+        };
         let cwd_full = scrub_controls(&self.pending_status.cwd);
         let mode_badge_w = mode_badge
             .as_ref()
@@ -3227,6 +3234,7 @@ mod tests {
                 hint: None,
                 mode_indicator: Some("PLAN".into()),
                 session_name: None,
+                reasoning_effort: None,
             },
             attachments: Vec::new(),
         });
@@ -3281,6 +3289,7 @@ mod tests {
                 hint: None,
                 mode_indicator: None,
                 session_name: Some("atomcode加解密".into()),
+                reasoning_effort: None,
             },
             attachments: Vec::new(),
         });
@@ -3331,6 +3340,7 @@ mod tests {
                 hint: None,
                 mode_indicator: None,
                 session_name: None,
+                reasoning_effort: None,
             },
             attachments: Vec::new(),
         });
@@ -3367,6 +3377,7 @@ mod tests {
                 hint: None,
                 mode_indicator: None,
                 session_name: Some(very_long.into()),
+                reasoning_effort: None,
             },
             attachments: Vec::new(),
         });
@@ -3405,6 +3416,7 @@ mod tests {
                 hint: None,
                 mode_indicator: None,
                 session_name: None,
+                reasoning_effort: None,
             },
             attachments: Vec::new(),
         });

@@ -816,7 +816,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // would eat the entire row, `truncate_path` replaces leading
         // segments with ".../" and keeps only the last segment.
         let model_str = if !status.model.is_empty() {
-            scrub_controls(&status.model)
+            let m = scrub_controls(&status.model);
+            if let Some(ref e) = status.reasoning_effort {
+                format!("{} :{}", m, e)
+            } else {
+                m
+            }
         } else {
             String::new()
         };
@@ -3469,6 +3474,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             session_name: None,
+            reasoning_effort: None,
         }
     }
 
@@ -3491,6 +3497,7 @@ mod tests {
             hint: None,
             mode_indicator: Some("PLAN".into()),
             session_name: None,
+            reasoning_effort: None,
         };
         let row = r.build_status_row(&status, 60);
         // Concatenate visible chars from the cells. `PAD_COL` of leading

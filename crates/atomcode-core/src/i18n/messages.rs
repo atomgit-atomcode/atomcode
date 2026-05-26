@@ -490,6 +490,10 @@ pub enum Msg<'a> {
     CmdDescPlan,
     CmdDescBuild,
     CmdDescThink,
+    CmdDescEffort,
+    /// Rendered when the user tries to set reasoning_effort on a
+    /// provider that doesn't support it (non-DeepSeek V4 / reasoner).
+    ReasoningEffortNoEffect,
     CmdDescHelp,
     CmdDescKeys,
     CmdDescLanguage,

@@ -127,6 +127,10 @@ pub struct OpenAiProvider {
     /// `ProviderConfig::reasoning_history` at construction so bad values
     /// fail early at load time with a clear error, not silently mid-turn.
     reasoning_history_override: Option<ReasoningPolicy>,
+    /// DeepSeek V4 reasoning_effort control ("high" | "max"). Sent as a
+    /// top-level field in the request body when the provider API is
+    /// applicable. None = don't send the field.
+    reasoning_effort: Option<String>,
     /// Whether the active model accepts image inputs. Drives `MultiPart`
     /// serialisation: vision-capable → OpenAI image_url schema, text-only
     /// → flat string. Computed once from `ProviderConfig::accepts_images()`
@@ -170,6 +174,7 @@ impl OpenAiProvider {
             thinking_type: config.thinking_type.clone(),
             thinking_keep: config.thinking_keep.clone(),
             reasoning_history_override,
+            reasoning_effort: config.reasoning_effort.clone(),
             supports_vision: config.accepts_images(),
         })
     }
@@ -207,6 +212,20 @@ impl OpenAiProvider {
             return ReasoningPolicy::Include;
         }
         ReasoningPolicy::Exclude
+    }
+
+    /// True when the provider's base_url or model name indicates that
+    /// `reasoning_effort` is a valid request field. Gateways that
+    /// don't match will reject the unknown field with 400.
+    /// - Official DeepSeek API (`api.deepseek.com`) always accepts it.
+    /// - Third-party proxies: check model name for `deepseek-v4` or
+    ///   `deepseek-reasoner`.
+    pub fn reason_effort_applicable(model: &str, base_url: &str) -> bool {
+        let m = model.to_ascii_lowercase();
+        let u = base_url.to_ascii_lowercase();
+        u.contains("api.deepseek.com")
+            || m.contains("deepseek-v4")
+            || m.contains("deepseek-reasoner")
     }
 
     /// Build Kimi's `thinking` request-body object from the two flat
@@ -528,6 +547,15 @@ impl LlmProvider for OpenAiProvider {
             Self::thinking_body_value(self.thinking_type.as_deref(), self.thinking_keep.as_deref())
         {
             body["thinking"] = th;
+        }
+
+        // DeepSeek V4 reasoning_effort: only emitted when applicable
+        // (official API or model-name match) AND the user has set a
+        // value. None = don't send, API uses its own default.
+        if let Some(ref effort) = self.reasoning_effort {
+            if Self::reason_effort_applicable(&self.model, &self.base_url) {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
 
         let policy = crate::provider::retry::RetryPolicy::default_policy();
@@ -1630,6 +1658,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("exclude".into()),
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -1669,6 +1698,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: Some("always".into()),
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,
@@ -2022,6 +2052,7 @@ mod tests {
             thinking_type: None,
             thinking_keep: None,
             reasoning_history: None,
+            reasoning_effort: None,
             thinking_enabled: None,
             thinking_budget: None,
             skip_tls_verify: false,

@@ -366,6 +366,10 @@ pub struct StatusLine {
     /// auto-named / default sessions leave this `None` to keep the
     /// chrome quiet on fresh conversations.
     pub session_name: Option<String>,
+    /// Current reasoning_effort level for display in the status row.
+    /// None = not shown. Rendered as a dimmed suffix after the model
+    /// name (e.g. `deepseek-v4-pro :high`).
+    pub reasoning_effort: Option<String>,
 }
 
 /// One line in a diff batch. `added = true` renders as `+`, false as `-`.

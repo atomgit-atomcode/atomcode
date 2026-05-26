@@ -554,6 +554,10 @@ pub async fn run(
     );
 
     let file_index_root = working_dir.clone();
+    let initial_reasoning_effort = config
+        .providers
+        .get(&config.default_provider)
+        .and_then(|p| p.reasoning_effort.clone());
     let ctx = LoopCtx {
         config,
         model_name,
@@ -608,6 +612,8 @@ pub async fn run(
             crate::event_loop::ClipboardCheckState::default(),
         )),
         is_plain_renderer,
+        reasoning_effort: initial_reasoning_effort,
+        transient_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current
