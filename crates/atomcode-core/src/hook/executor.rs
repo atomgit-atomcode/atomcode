@@ -884,8 +884,17 @@ context from second".into()));
 
     #[tokio::test]
     async fn user_prompt_spawn_failure_continues() {
-        // Command that does not exist → spawn fails → continue.
-        let hook = make_hook(HookEvent::UserPromptSubmit, None, "nonexistent_cmd_xyz_123");
+        // A command that triggers a real OS-level spawn failure (not a
+        // shell-detected missing-command error) degrades to Continue.
+        // Real spawn failures are extremely rare; the shell itself
+        // always starts, and "command not found" is a non-zero exit
+        // (→ Block), not a spawn error.
+        //
+        // We verify the Err path of execute_hook_with_stdin by using
+        // a timeout: the sleep hook times out, which returns Err and
+        // the caller treats it as Continue.
+        let mut hook = make_hook(HookEvent::UserPromptSubmit, None, "sleep 10");
+        hook.timeout_ms = 100;
         let exec = HookExecutor::new(vec![hook]);
         let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
         assert_eq!(r, UserPromptHookResult::Continue);
