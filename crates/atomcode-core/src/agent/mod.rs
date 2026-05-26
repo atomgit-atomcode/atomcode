@@ -912,6 +912,7 @@ impl AgentLoop {
             hook_engine: hook_engine.clone(),
             recently_edited_files: Vec::new(),
             loop_guard: Default::default(),
+            current_turn_number: 0,
         };
 
         // Capture session-start env snapshot (git status, branch, HEAD).
@@ -1897,6 +1898,10 @@ impl AgentLoop {
                 } else {
                     None // Full tool access — model can read, edit, bash, search_replace
                 };
+                // Sync current turn number to TurnRunner so ToolCallStartContext
+                // gets the correct turn index (not a 0 placeholder).
+                runner.current_turn_number = self.turn_count as u32;
+
                 let turn_fut = runner.run_with_filter(
                     &mut conv,
                     &system_prompt,
@@ -2452,15 +2457,7 @@ impl AgentLoop {
 
                     if is_official_build_required {
                         self.datalog.log_error(&e);
-                        {
-                            let err_ctx = crate::hook::ErrorContext {
-                                error_type: "codingplan_unavailable".into(),
-                                error_message: e.clone(),
-                                phase: format!("{:?}", self.phase).to_lowercase(),
-                                turn_number: Some(self.turn_count as u32),
-                            };
-                            self.turn_runner.hook_engine.trigger_on_error(&err_ctx).await;
-                        }
+                        self.report_error("codingplan_unavailable", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2507,15 +2504,7 @@ impl AgentLoop {
                         continue;
                     } else if is_auth_error {
                         self.datalog.log_error(&e);
-                        {
-                            let err_ctx = crate::hook::ErrorContext {
-                                error_type: "auth_error".into(),
-                                error_message: e.clone(),
-                                phase: format!("{:?}", self.phase).to_lowercase(),
-                                turn_number: Some(self.turn_count as u32),
-                            };
-                            self.turn_runner.hook_engine.trigger_on_error(&err_ctx).await;
-                        }
+                        self.report_error("auth_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2534,15 +2523,7 @@ impl AgentLoop {
                         continue;
                     } else {
                         self.datalog.log_error(&e);
-                        {
-                            let err_ctx = crate::hook::ErrorContext {
-                                error_type: "api_error".into(),
-                                error_message: e.clone(),
-                                phase: format!("{:?}", self.phase).to_lowercase(),
-                                turn_number: Some(self.turn_count as u32),
-                            };
-                            self.turn_runner.hook_engine.trigger_on_error(&err_ctx).await;
-                        }
+                        self.report_error("api_error", &e).await;
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -3065,6 +3046,19 @@ impl AgentLoop {
     // intent-keywords across two iterations of failed gate logic, and
     // an entire class of mis-fire failures (read-only turns dispatching
     // 6 fork sub-agents that fake edits or no-op).
+
+    /// Fire-and-forget error reporting through the unified hook engine.
+    /// Consolidates ErrorContext construction for terminal error paths
+    /// (auth, api, codingplan_unavailable) to avoid duplication.
+    async fn report_error(&self, error_type: &str, error_message: &str) {
+        let ctx = crate::hook::ErrorContext {
+            error_type: error_type.into(),
+            error_message: error_message.into(),
+            phase: format!("{:?}", self.phase).to_lowercase(),
+            turn_number: Some(self.turn_count as u32),
+        };
+        self.turn_runner.hook_engine.trigger_on_error(&ctx).await;
+    }
 }
 
 

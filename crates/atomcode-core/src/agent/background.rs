@@ -92,6 +92,7 @@ async fn run_background_inner(
         recently_edited_files: Vec::new(),
         hook_engine: std::sync::Arc::new(hook_engine),
         loop_guard: Default::default(),
+        current_turn_number: 0,
     };
 
     let mut conversation = Conversation::new();

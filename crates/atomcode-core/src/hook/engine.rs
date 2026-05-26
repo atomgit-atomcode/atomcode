@@ -519,9 +519,7 @@ impl HookEngine {
             enabled: true,
             interval: 1,
         });
-        if auto_commit.is_enabled() {
-            self.on_turn_complete_hooks.push(auto_commit);
-        }
+        self.register_on_turn_complete_hook(auto_commit);
 
         // SessionSummaryHook: OnSessionStart + OnSessionEnd
         let summary = Arc::new(SessionSummaryHook::new());

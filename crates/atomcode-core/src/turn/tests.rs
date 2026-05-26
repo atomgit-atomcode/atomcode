@@ -349,6 +349,7 @@ fn make_runner(
         hook_engine: std::sync::Arc::new(crate::hook::HookEngine::new()),
         recently_edited_files: Vec::new(),
         loop_guard: Default::default(),
+        current_turn_number: 0,
     }
 }
 
@@ -1500,6 +1501,7 @@ mod telemetry_tests {
             hook_engine: std::sync::Arc::new(HookEngine::new()),
             recently_edited_files: Vec::new(),
             loop_guard: Default::default(),
+            current_turn_number: 0,
         };
         (runner, captured)
     }

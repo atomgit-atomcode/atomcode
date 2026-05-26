@@ -2084,6 +2084,7 @@ async fn process_chat_request(
         hook_engine: std::sync::Arc::new(atomcode_core::hook::HookEngine::new()), // Daemon mode doesn't use hooks for now
         recently_edited_files: Vec::new(),
         loop_guard: Default::default(),
+        current_turn_number: 0,
     };
 
     // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt

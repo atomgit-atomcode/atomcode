@@ -51,7 +51,11 @@ pub struct TurnRunner {
     /// `(name, args, output_hash)` triple and short-circuits the third
     /// identical attempt. See `loop_guard.rs` for the full rationale.
     pub loop_guard: LoopGuardState,
-}
+    /// Current turn number, set by AgentLoop before each turn.
+    /// Propagated to ToolCallStartContext so built-in hooks (e.g.
+    /// ToolAuditLogHook) see the correct turn index.
+    pub current_turn_number: u32,
+ }
 
 impl TurnRunner {
     /// Execute one LLM turn: stream response, execute any tool calls, return result.
@@ -1337,7 +1341,7 @@ impl TurnRunner {
             tool_name: call.name.clone(),
             tool_args: call.arguments.clone(),
             call_id: call.id.clone(),
-            turn_number: 0, // turn_number 由上层 (AgentLoop) 通过 TurnStart 提供; 这里用 0 占位
+            turn_number: self.current_turn_number,
         };
         self.hook_engine.trigger_on_tool_call_start(&tc_start_ctx).await;
 

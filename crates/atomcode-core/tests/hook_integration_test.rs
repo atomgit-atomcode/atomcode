@@ -224,6 +224,7 @@ fn create_test_runner(
         recently_edited_files: Vec::new(),
         ctx: std::sync::Arc::new(DefaultCtx::new(&test_config().providers.get("mock").unwrap())),
         loop_guard: Default::default(),
+        current_turn_number: 0,
     }
 }
 

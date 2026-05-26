@@ -511,6 +511,7 @@ impl SubAgentTask {
             hook_engine: std::sync::Arc::new(crate::hook::HookEngine::new()), // Sub-agents don't use hooks for now
             recently_edited_files: Vec::new(),
             loop_guard: Default::default(),
+            current_turn_number: 0,
         };
 
         // 4. Event channel (we drain but don't forward — sub-agent is silent)
