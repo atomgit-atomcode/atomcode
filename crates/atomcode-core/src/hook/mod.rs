@@ -11,6 +11,7 @@ pub mod json_config;
 pub mod async_batcher;
 pub mod built_in;
 pub mod config_loader;
+pub mod engine;
 pub mod script_runner;
 pub mod webhook;
 
@@ -442,6 +443,37 @@ pub trait OnModelResponseHook: Hook {
     async fn on_model_response(&self, response: &str, turn_ctx: &TurnStartContext) -> HookResult;
 }
 
+/// 用户 Prompt 提交钩子 - 在用户提交消息时调用 (CC 兼容)
+/// 可用于：阻止/注入上下文/预处理
+#[async_trait]
+pub trait OnUserPromptSubmitHook: Hook {
+    /// 用户 prompt 提交时的回调
+    async fn on_user_prompt_submit(
+        &self,
+        payload: &UserPromptSubmitPayload,
+    ) -> UserPromptSubmitResult;
+}
+
+/// UserPromptSubmit hook 的返回结果
+pub enum UserPromptSubmitResult {
+    /// 继续，不干预
+    Continue,
+    /// 注入额外上下文
+    Inject(String),
+    /// 阻止此 prompt
+    Block(String),
+}
+
+impl From<UserPromptSubmitResult> for HookResult {
+    fn from(r: UserPromptSubmitResult) -> Self {
+        match r {
+            UserPromptSubmitResult::Continue => HookResult::Ok,
+            UserPromptSubmitResult::Inject(s) => HookResult::Modified(s),
+            UserPromptSubmitResult::Block(s) => HookResult::Denied(s),
+        }
+    }
+}
+
 // ============================================================================
 // HookRegistry — 管理和触发所有 PR 钩子
 // ============================================================================
@@ -776,6 +808,8 @@ impl HookRegistry {
         }
     }
 }
+
+pub use engine::HookEngine;
 
 // ============================================================================
 // Upstream (HEAD) tests

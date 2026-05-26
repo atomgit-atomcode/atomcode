@@ -80,6 +80,7 @@ impl ScriptHook {
         // 启动子进程
         let mut child = tokio::process::Command::new(cmd)
             .args(&args)
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

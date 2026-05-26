@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::hook::HookEngine;
 use crate::hook::HookRegistry;
 use super::script_runner::{ScriptHook, ScriptHookConfig};
 use super::webhook::{WebhookHook, WebhookConfig};
@@ -148,6 +149,97 @@ impl HooksConfig {
         }
 
         // 存储异步注册表以便后续关闭
+        if !async_registry.batchers.is_empty() {
+            eprintln!("[AsyncWebhook] Registered {} async batchers", async_registry.batchers.len());
+        }
+    }
+
+    /// 注册所有脚本 hooks 到 HookEngine
+    pub fn register_hooks_to_engine(&self, engine: &mut HookEngine, base_dir: &Path) {
+        for config in &self.hooks {
+            if !config.enabled {
+                continue;
+            }
+
+            // 解析脚本路径（相对或绝对）
+            let script_path = if config.script.is_absolute() {
+                config.script.clone()
+            } else {
+                base_dir.join(&config.script)
+            };
+
+            if !script_path.exists() {
+                eprintln!("[Hook] Warning: Script not found: {}", script_path.display());
+                continue;
+            }
+
+            let config_with_path = ScriptHookConfig {
+                name: config.name.clone(),
+                trigger: config.trigger.clone(),
+                script: script_path,
+                script_type: config.script_type.clone(),
+                enabled: config.enabled,
+                timeout_secs: config.timeout_secs,
+                description: config.description.clone(),
+            };
+
+            let hook = Arc::new(ScriptHook::new(config_with_path));
+
+            match config.trigger.as_str() {
+                "pre_tool" | "pre_tool_execution" => {
+                    engine.register_pre_tool_hook(hook);
+                }
+                "post_tool" | "post_tool_execution" => {
+                    engine.register_post_tool_hook(hook);
+                }
+                "post_turn" => {
+                    engine.register_post_turn_hook(hook);
+                }
+                "system_prompt" => {
+                    engine.register_system_prompt_hook(hook);
+                }
+                _ => {
+                    eprintln!("[Hook] Warning: Unknown trigger type: {}", config.trigger);
+                }
+            }
+        }
+    }
+
+    /// 注册所有 webhooks 到 HookEngine
+    pub fn register_webhooks_to_engine(&self, engine: &mut HookEngine) {
+        let mut async_registry = AsyncWebhookRegistry::new();
+
+        for config in &self.async_webhooks {
+            if !config.enabled {
+                continue;
+            }
+            async_registry.register(config.clone());
+        }
+
+        for config in &self.webhooks {
+            if !config.enabled {
+                continue;
+            }
+
+            let webhook = if let Some(batcher) = async_registry.get(&config.name) {
+                Arc::new(WebhookHook::new_with_async(config.clone(), batcher.clone()))
+            } else {
+                Arc::new(WebhookHook::new(config.clone()))
+            };
+
+            engine.register_pre_tool_hook(webhook.clone());
+            engine.register_post_tool_hook(webhook.clone());
+            engine.register_post_turn_hook(webhook.clone());
+            engine.register_system_prompt_hook(webhook.clone());
+            engine.register_on_session_start_hook(webhook.clone());
+            engine.register_on_session_end_hook(webhook.clone());
+            engine.register_on_error_hook(webhook.clone());
+            engine.register_on_tool_call_start_hook(webhook.clone());
+            engine.register_on_model_response_hook(webhook.clone());
+
+            eprintln!("[Webhook] Registered: {} -> {}", config.name, config.url);
+        }
+
         if !async_registry.batchers.is_empty() {
             eprintln!("[AsyncWebhook] Registered {} async batchers", async_registry.batchers.len());
         }
