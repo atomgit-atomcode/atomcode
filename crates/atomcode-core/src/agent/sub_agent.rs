@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
-use crate::hook::HookRegistry;
+use crate::hook::HookEngine;
 use crate::provider::LlmProvider;
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::turn::event::{TurnEvent, TurnResult};
@@ -501,7 +501,6 @@ impl SubAgentTask {
         let sandboxed_tools =
             Arc::new(filter_tools_for_subagent(&tools, &self.file_path).await);
 
-        let hooks = crate::hook::json_config::load_hooks_config(working_dir);
         let mut runner = TurnRunner {
             provider,
             tools: sandboxed_tools,
@@ -509,11 +508,8 @@ impl SubAgentTask {
             config: config.clone(),
             ctx: build_ctx,
             permission,
-            hook_registry: HookRegistry::new(), // Sub-agents don't use hooks for now
+            hook_engine: std::sync::Arc::new(crate::hook::HookEngine::new()), // Sub-agents don't use hooks for now
             recently_edited_files: Vec::new(),
-            hook_executor: std::sync::Arc::new(
-                crate::hook::executor::HookExecutor::new(hooks)
-            ),
             loop_guard: Default::default(),
         };
 

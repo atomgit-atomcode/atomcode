@@ -8,7 +8,7 @@ use atomcode_telemetry::{CurrentContext, Event as TelemetryEvent, LlmErrorKind, 
 
 use crate::config::Config;
 use crate::conversation::Conversation;
-use crate::hook::{HookCtx, HookRegistry, ToolResultContext};
+use crate::hook::{HookCtx, HookEngine, ToolResultContext};
 use crate::provider::LlmProvider;
 use crate::stream::StreamEvent;
 use crate::tool::{
@@ -42,12 +42,10 @@ pub struct TurnRunner {
     /// clone.
     pub ctx: std::sync::Arc<dyn crate::ctx::CtxBuilder>,
     pub permission: Box<dyn PermissionDecider>,
-    /// Hook registry for pre/post tool execution hooks
-    pub hook_registry: HookRegistry,
+    /// 统一 Hook 引擎 (Arc, 由 AgentLoop 管理)
+    pub hook_engine: std::sync::Arc<HookEngine>,
     /// Files edited during the current session (tracked for context awareness).
     pub recently_edited_files: Vec<String>,
-    /// Hook executor — runs user-configured lifecycle hooks at tool execution boundaries.
-    pub hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
     /// Cross-batch tool-call loop guard. Cleared per user-message by the
     /// agent (see `handle_send_message`); records every executed tool's
     /// `(name, args, output_hash)` triple and short-circuits the third
@@ -1060,7 +1058,7 @@ impl TurnRunner {
             "".to_string(),
             working_dir.to_string_lossy().to_string(),
         );
-        self.hook_registry.trigger_post_turn_hooks(&hook_ctx, turn_result).await;
+        self.hook_engine.trigger_post_turn(&hook_ctx, turn_result).await;
     }
 
     /// EXECUTE mode: run one LLM turn with minimal context.
@@ -1326,71 +1324,21 @@ impl TurnRunner {
             }
         }
 
-        // --- PreToolUse Hook (upstream) ---
-        if self.hook_executor.has_hooks() {
-            let hook_ctx = self.build_hook_context(
-                "pre_tool_use",
-                Some(&call.name),
-                Some(&call.arguments),
-                None,
-                None,
-            );
-            let pre_result = self.hook_executor.run_pre_tool_use(&call.name, &hook_ctx).await;
-            match pre_result {
-                crate::hook::PreHookResult::Block { reason } => {
-                    let output = format!("Blocked by hook: {}", reason);
-                    let _ = event_tx.send(TurnEvent::ToolCallResult {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        output: output.clone(),
-                        success: false,
-                        duration: std::time::Duration::ZERO,
-                    });
-                    self.context.telemetry.track(TelemetryEvent::ToolCall {
-                        name: corrected_name.clone(),
-                        success: false,
-                        duration_ms: 0,
-                        error_kind: Some(ToolErrorKind::BlockedByHook),
-                        error_data: Some(serde_json::json!({
-                            "tool_name": corrected_name,
-                            "duration_ms": 0,
-                            "args_summary": build_args_summary(&corrected_name, &call.arguments),
-                            "hook_reason": reason,
-                            "reason": "Tool call blocked by PreToolUse hook",
-                        }).to_string()),
-                    });
-                    return ToolResult {
-                        call_id: call.id.clone(),
-                        output,
-                        success: false,
-                    };
-                }
-                crate::hook::PreHookResult::Modify { .. } => {
-                    // Modify support deferred — treat as Allow
-                }
-                crate::hook::PreHookResult::Allow => {}
-            }
-        }
-
-        // --- Pre-tool execution hooks (PR) ---
+        // --- 统一 PreToolUse Hook ---
         let working_dir = self.context.working_dir.read().await.clone();
         let pr_hook_ctx = HookCtx::new(
             call.name.clone(),
             call.arguments.clone(),
             working_dir.to_string_lossy().to_string(),
         );
-        
+
         let mut final_args = call.arguments.clone();
-        match self.hook_registry.trigger_pre_tool_hooks(&pr_hook_ctx).await {
+        match self.hook_engine.trigger_pre_tool_use(&pr_hook_ctx).await {
             Ok(Some(new_args)) => {
-                // Hook modified the arguments
                 final_args = new_args;
             }
-            Ok(None) => {
-                // Hooks passed, continue with original args
-            }
+            Ok(None) => {}
             Err(reason) => {
-                // Hook denied execution
                 let output = format!("Tool '{}' was blocked by hook: {}", call.name, reason);
                 let _ = event_tx.send(TurnEvent::ToolCallResult {
                     call_id: call.id.clone(),
@@ -1398,6 +1346,19 @@ impl TurnRunner {
                     output: output.clone(),
                     success: false,
                     duration: std::time::Duration::ZERO,
+                });
+                self.context.telemetry.track(TelemetryEvent::ToolCall {
+                    name: corrected_name.clone(),
+                    success: false,
+                    duration_ms: 0,
+                    error_kind: Some(ToolErrorKind::BlockedByHook),
+                    error_data: Some(serde_json::json!({
+                        "tool_name": corrected_name,
+                        "duration_ms": 0,
+                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                        "hook_reason": reason,
+                        "reason": "Tool call blocked by PreToolUse hook",
+                    }).to_string()),
                 });
                 return ToolResult {
                     call_id: call.id.clone(),
@@ -1489,19 +1450,7 @@ impl TurnRunner {
             },
         };
 
-        // --- PostToolUse Hook (upstream) ---
-        if self.hook_executor.has_hooks() {
-            let hook_ctx = self.build_hook_context(
-                "post_tool_use",
-                Some(&call.name),
-                Some(&call.arguments),
-                Some(&tool_result.output),
-                Some(tool_result.success),
-            );
-            self.hook_executor.run_post_tool_use(&call.name, &hook_ctx).await;
-        }
-
-        // --- Post-tool execution hooks (PR) ---
+        // --- 统一 PostToolUse Hook ---
         let result_ctx = ToolResultContext {
             tool_name: call.name.clone(),
             tool_args: final_args.clone(),
@@ -1509,8 +1458,7 @@ impl TurnRunner {
             success: tool_result.success,
             duration_ms: duration.as_millis() as u64,
         };
-        
-        self.hook_registry.trigger_post_tool_hooks(&pr_hook_ctx, &result_ctx).await;
+        self.hook_engine.trigger_post_tool_use(&pr_hook_ctx, &result_ctx).await;
 
         let _ = event_tx.send(TurnEvent::ToolCallResult {
             call_id: call.id.clone(),
@@ -1563,30 +1511,6 @@ impl TurnRunner {
         tool_result
     }
 
-    fn build_hook_context(
-        &self,
-        event: &str,
-        tool_name: Option<&str>,
-        tool_args: Option<&str>,
-        tool_result: Option<&str>,
-        tool_success: Option<bool>,
-    ) -> crate::hook::HookContext {
-        let wd = self
-            .context
-            .working_dir
-            .try_read()
-            .map(|g| g.display().to_string())
-            .unwrap_or_default();
-        crate::hook::HookContext {
-            event: event.into(),
-            tool_name: tool_name.map(String::from),
-            tool_args: tool_args.and_then(|a| serde_json::from_str(a).ok()),
-            tool_result: tool_result.map(String::from),
-            tool_success,
-            session_id: String::new(),
-            working_dir: wd,
-        }
-    }
 }
 
 /// Canonicalise a tool-call `arguments` string for in-batch dedup keying.

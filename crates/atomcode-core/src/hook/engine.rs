@@ -176,16 +176,11 @@ impl HookEngine {
     }
 
     /// 会话开始时触发所有 OnSessionStartHook。
-    pub async fn trigger_session_start(&self) -> Vec<String> {
+    /// `ctx` 应由调用方 (AgentLoop) 传入真实的 session_id / working_dir / model 等。
+    pub async fn trigger_session_start(&self, ctx: &super::SessionContext) -> Vec<String> {
         let mut messages = Vec::new();
-        let ctx = super::SessionContext {
-            session_id: String::new(),
-            working_dir: String::new(),
-            model_name: Default::default(),
-            provider_name: Default::default(),
-        };
         for hook in &self.on_session_start_hooks {
-            match hook.on_session_start(&ctx).await {
+            match hook.on_session_start(ctx).await {
                 HookResult::Modified(msg) => messages.push(msg),
                 _ => {}
             }
@@ -194,15 +189,9 @@ impl HookEngine {
     }
 
     /// 会话结束时所有 OnSessionEndHook (fire-and-forget)。
-    pub async fn trigger_session_end(&self) {
-        let ctx = super::SessionContext {
-            session_id: String::new(),
-            working_dir: String::new(),
-            model_name: Default::default(),
-            provider_name: Default::default(),
-        };
+    pub async fn trigger_session_end(&self, ctx: &super::SessionContext) {
         for hook in &self.on_session_end_hooks {
-            let _ = hook.on_session_end(&ctx).await;
+            let _ = hook.on_session_end(ctx).await;
         }
     }
 
@@ -300,8 +289,10 @@ impl HookEngine {
 
             match shell_hook.event {
                 HookEvent::PreToolUse => {
-                    self.register_pre_tool_hook(shell_hook.clone());
-                    self.register_on_tool_call_start_hook(shell_hook);
+                    // 只注册为 PreToolExecutionHook（可阻断/修改）。
+                    // OnToolCallStartHook 是内置 hook 的专用 slot（如 ToolAuditLogHook），
+                    // 用户 shell hook 不应双重触发。
+                    self.register_pre_tool_hook(shell_hook);
                 }
                 HookEvent::PostToolUse => {
                     self.register_post_tool_hook(shell_hook);
@@ -1085,8 +1076,14 @@ mod tests {
         let mut engine = HookEngine::new();
         let hook = Arc::new(ShellCommandHook::from_hook_config(config));
         engine.register_on_session_start_hook(hook);
+        let ctx = crate::hook::SessionContext {
+            session_id: "test-s1".into(),
+            working_dir: "/tmp".into(),
+            model_name: "test-model".into(),
+            provider_name: "mock".into(),
+        };
         // Should not panic
-        engine.trigger_session_start().await;
+        engine.trigger_session_start(&ctx).await;
     }
 
     #[tokio::test]
@@ -1101,16 +1098,28 @@ mod tests {
         let mut engine = HookEngine::new();
         let hook = Arc::new(ShellCommandHook::from_hook_config(config));
         engine.register_on_session_end_hook(hook);
+        let ctx = crate::hook::SessionContext {
+            session_id: "test-s2".into(),
+            working_dir: "/tmp".into(),
+            model_name: "test-model".into(),
+            provider_name: "mock".into(),
+        };
         // Should not panic
-        engine.trigger_session_end().await;
+        engine.trigger_session_end(&ctx).await;
     }
 
     #[tokio::test]
     async fn session_event_no_matching_hooks_noop() {
         let engine = HookEngine::new();
+        let ctx = crate::hook::SessionContext {
+            session_id: "test-s3".into(),
+            working_dir: "/tmp".into(),
+            model_name: "test-model".into(),
+            provider_name: "mock".into(),
+        };
         // Should not panic with empty engine
-        engine.trigger_session_start().await;
-        engine.trigger_session_end().await;
+        engine.trigger_session_start(&ctx).await;
+        engine.trigger_session_end(&ctx).await;
     }
 
     // ── load_all tests ──────────────────────────────────────────

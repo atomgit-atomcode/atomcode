@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
-use crate::hook::HookRegistry;
+use crate::hook::HookEngine;
 use crate::provider::LlmProvider;
 use crate::skill::SkillRegistry;
 use crate::tool::use_skill::UseSkillTool;
@@ -449,6 +449,10 @@ pub struct AgentLoop {
     pub total_tokens: usize,
     pub turn_start: Option<Instant>,
 
+    /// Session identifier for hook context.
+    /// Generated once at construction and survives ReloadConfig.
+    pub session_id: String,
+
     // Per-turn counters
     tool_call_count: usize,
     /// LLM round-trip count (standard "turn" metric).
@@ -549,9 +553,6 @@ pub struct AgentLoop {
 
     // Skill registry — provides descriptions for system prompt and powers use_skill tool
     skill_registry: std::sync::Arc<std::sync::RwLock<SkillRegistry>>,
-
-    /// Hook executor for lifecycle events.
-    hook_executor: std::sync::Arc<crate::hook::executor::HookExecutor>,
 
     // Code graph background indexer channel
     reindex_tx: Option<mpsc::UnboundedSender<PathBuf>>,
@@ -891,12 +892,10 @@ impl AgentLoop {
 }),
             };
 
-        let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
-        let hook_executor = std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
-
-        // Initialize hook registry and load hooks from default locations
-        let mut hook_registry = HookRegistry::new();
-        crate::hook::config_loader::load_hooks(&mut hook_registry);
+        // Initialize unified HookEngine
+        let mut hook_engine = HookEngine::new();
+        hook_engine.load_all(&working_dir);
+        let hook_engine = std::sync::Arc::new(hook_engine);
 
         let turn_runner = TurnRunner {
             provider,
@@ -905,9 +904,8 @@ impl AgentLoop {
             config: config.clone(),
             ctx: ctx.clone(),
             permission: interactive_permission,
-            hook_registry,
+            hook_engine: hook_engine.clone(),
             recently_edited_files: Vec::new(),
-            hook_executor: hook_executor.clone(),
             loop_guard: Default::default(),
         };
 
@@ -929,6 +927,7 @@ impl AgentLoop {
             turn_tokens: 0,
             total_tokens: 0,
             turn_start: None,
+            session_id: uuid::Uuid::new_v4().to_string(),
             tool_call_count: 0,
             turn_count: 0,
             max_turns: None,
@@ -957,7 +956,6 @@ impl AgentLoop {
             plan_text: None,
             session_files: std::collections::HashMap::new(),
             skill_registry,
-            hook_executor,
             reindex_tx: None,
             datalog,
             cmd_rx,
@@ -1029,26 +1027,22 @@ impl AgentLoop {
         }
 
         // --- SessionStart Hook ---
-        if self.hook_executor.has_hooks() {
-            let wd = self
+        let session_ctx = crate::hook::SessionContext {
+            session_id: self.session_id.clone(),
+            working_dir: self
                 .turn_runner
                 .context
                 .working_dir
                 .try_read()
-                .map(|g| g.display().to_string())
-                .unwrap_or_default();
-            let ctx = crate::hook::HookContext {
-                event: "session_start".into(),
-                tool_name: None,
-                tool_args: None,
-                tool_result: None,
-                tool_success: None,
-                session_id: String::new(),
-                working_dir: wd,
-            };
-            self.hook_executor
-                .run_session_event(crate::hook::HookEvent::SessionStart, &ctx)
-                .await;
+                .map(|g| g.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            model_name: self.turn_runner.provider.model_name().to_string(),
+            provider_name: self.config.default_provider.clone(),
+        };
+        let session_msgs = self.turn_runner.hook_engine.trigger_session_start(&session_ctx).await;
+        for msg in session_msgs {
+            // TODO: integrate with TUI via AgentEvent::SystemInfo variant
+            eprintln!("[Hook SessionStart] {}", msg);
         }
 
         while let Some(cmd) = self.cmd_rx.recv().await {
@@ -1084,7 +1078,7 @@ impl AgentLoop {
                         .get(&old_provider_name)
                         .map(|p| p.provider_type.clone());
                     self.config = new_config;
-                    // Rebuild hook executor from JSON config files.
+                    // Rebuild hook engine from config files.
                     let wd = self
                         .turn_runner
                         .context
@@ -1092,10 +1086,9 @@ impl AgentLoop {
                         .try_read()
                         .map(|g| g.clone())
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
-                    self.hook_executor =
-                        std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
-                    self.turn_runner.hook_executor = self.hook_executor.clone();
+                    let mut new_engine = HookEngine::new();
+                    new_engine.load_all(&wd);
+                    self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
                     let new_provider_name = self.config.default_provider.clone();
                     let new_type = self
                         .config
@@ -1387,10 +1380,9 @@ impl AgentLoop {
                         .try_read()
                         .map(|g| g.clone())
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let hooks = crate::hook::json_config::load_hooks_config(&wd);
-                    self.hook_executor =
-                        std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks));
-                    self.turn_runner.hook_executor = self.hook_executor.clone();
+                    let mut new_engine = HookEngine::new();
+                    new_engine.load_all(&wd);
+                    self.turn_runner.hook_engine = std::sync::Arc::new(new_engine);
                 }
                 AgentCommand::SyncMessages => {
                     let messages = self.conversation.messages.clone();
@@ -1398,27 +1390,19 @@ impl AgentLoop {
                 }
                 AgentCommand::Shutdown => {
                     // --- SessionEnd Hook ---
-                    if self.hook_executor.has_hooks() {
-                        let wd = self
+                    let session_ctx = crate::hook::SessionContext {
+                        session_id: self.session_id.clone(),
+                        working_dir: self
                             .turn_runner
                             .context
                             .working_dir
                             .try_read()
-                            .map(|g| g.display().to_string())
-                            .unwrap_or_default();
-                        let ctx = crate::hook::HookContext {
-                            event: "session_end".into(),
-                            tool_name: None,
-                            tool_args: None,
-                            tool_result: None,
-                            tool_success: None,
-                            session_id: String::new(),
-                            working_dir: wd,
-                        };
-                        self.hook_executor
-                            .run_session_event(crate::hook::HookEvent::SessionEnd, &ctx)
-                            .await;
-                    }
+                            .map(|g| g.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        model_name: self.turn_runner.provider.model_name().to_string(),
+                        provider_name: self.config.default_provider.clone(),
+                    };
+                    self.turn_runner.hook_engine.trigger_session_end(&session_ctx).await;
                     break;
                 }
             }
@@ -1451,38 +1435,33 @@ impl AgentLoop {
         // input. A hook can either block the turn (CC `decision: "block"`
         // or non-zero exit) or inject extra context that we splice into
         // the user message before the LLM sees it.
-        if self.hook_executor.has_hooks() {
-            let cwd = self
-                .turn_runner
-                .context
-                .working_dir
-                .try_read()
-                .map(|g| g.display().to_string())
-                .unwrap_or_default();
-            match self
-                .hook_executor
-                .run_user_prompt_submit(&content, "", &cwd)
-                .await
-            {
-                crate::hook::UserPromptHookResult::Continue => {}
-                crate::hook::UserPromptHookResult::Inject(extra) => {
-                    // Append rather than prepend so the user's wording stays
-                    // at the top of the message — the hook context reads as
-                    // supplementary, not as a rewrite.
-                    content.push_str("\n\n");
-                    content.push_str(&extra);
-                }
-                crate::hook::UserPromptHookResult::Block(reason) => {
-                    let _ = self.event_tx.send(AgentEvent::Error {
-                        error: format!("hook blocked: {}", reason),
-                        messages: self.conversation.messages.clone(),
-                    });
-                    self.finish_turn(TurnStopReason::Error);
-                    return;
-                }
+        let cwd = self
+            .turn_runner
+            .context
+            .working_dir
+            .try_read()
+            .map(|g| g.display().to_string())
+            .unwrap_or_default();
+        match self
+            .turn_runner
+            .hook_engine
+            .trigger_user_prompt_submit(&content, &self.session_id, &cwd)
+            .await
+        {
+            crate::hook::UserPromptHookResult::Continue => {}
+            crate::hook::UserPromptHookResult::Inject(extra) => {
+                content.push_str("\n\n");
+                content.push_str(&extra);
+            }
+            crate::hook::UserPromptHookResult::Block(reason) => {
+                let _ = self.event_tx.send(AgentEvent::Error {
+                    error: format!("hook blocked: {}", reason),
+                    messages: self.conversation.messages.clone(),
+                });
+                self.finish_turn(TurnStopReason::Error);
+                return;
             }
         }
-
         // Detect negative feedback — user is unhappy with previous turn's work.
         let lower = content.to_lowercase();
         let negative_keywords = [

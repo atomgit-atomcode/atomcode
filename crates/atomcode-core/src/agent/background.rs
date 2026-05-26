@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::conversation::Conversation;
 use crate::ctx::CtxBuilder;
-use crate::hook::HookRegistry;
+use crate::hook::HookEngine;
 use crate::i18n::{t, Msg};
 use crate::provider::LlmProvider;
 use crate::tool::{ToolContext, ToolRegistry};
@@ -79,7 +79,8 @@ async fn run_background_inner(
         .try_read()
         .map(|g| g.clone())
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let hooks = crate::hook::json_config::load_hooks_config(&bg_working_dir);
+    let mut hook_engine = crate::hook::HookEngine::new();
+    hook_engine.load_all(&bg_working_dir);
 
     let mut runner = TurnRunner {
         provider,
@@ -89,10 +90,7 @@ async fn run_background_inner(
         ctx,
         permission,
         recently_edited_files: Vec::new(),
-        hook_registry: HookRegistry::new(),
-        hook_executor: std::sync::Arc::new(
-            crate::hook::executor::HookExecutor::new(hooks)
-        ),
+        hook_engine: std::sync::Arc::new(hook_engine),
         loop_guard: Default::default(),
     };
 

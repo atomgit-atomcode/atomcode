@@ -26,7 +26,7 @@ use atomcode_core::tool::{
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
 use atomcode_core::turn::runner::TurnRunner;
-use atomcode_core::hook::{Hook, HookCtx, HookRegistry, HookResult, PreToolExecutionHook, PostToolExecutionHook, ToolResultContext};
+use atomcode_core::hook::{Hook, HookCtx, HookEngine, HookResult, PreToolExecutionHook, PostToolExecutionHook, ToolResultContext};
 
 // ===========================================================================
 // Mock Provider
@@ -210,21 +210,19 @@ fn test_context() -> ToolContext {
 
 fn create_test_runner(
     provider: MockProvider,
-    hook_registry: HookRegistry,
+    hook_engine: std::sync::Arc<atomcode_core::hook::HookEngine>,
 ) -> TurnRunner {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(MockEchoTool));
-    
     TurnRunner {
-        provider: Arc::new(provider),
-        tools: Arc::new(registry),
+        provider: std::sync::Arc::new(provider),
+        tools: std::sync::Arc::new(registry),
         context: test_context(),
         config: test_config(),
         permission: Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
-        hook_registry,
+        hook_engine,
         recently_edited_files: Vec::new(),
         ctx: std::sync::Arc::new(DefaultCtx::new(&test_config().providers.get("mock").unwrap())),
-        hook_executor: std::sync::Arc::new(atomcode_core::hook::executor::HookExecutor::new(vec![])),
         loop_guard: Default::default(),
     }
 }
@@ -241,7 +239,7 @@ async fn test_hooks_fire_during_turn() {
     let last_tool = Arc::new(std::sync::Mutex::new(String::new()));
     let last_result = Arc::new(std::sync::Mutex::new(String::new()));
     
-    let mut hooks = HookRegistry::new();
+    let mut hooks = HookEngine::new();
     hooks.register_pre_tool_hook(Arc::new(TrackingPreHook {
         call_count: pre_count.clone(),
         last_tool_name: last_tool.clone(),
@@ -255,7 +253,7 @@ async fn test_hooks_fire_during_turn() {
         "echo",
         r#"{"message": "hello hooks"}"#,
     );
-    let mut runner = create_test_runner(provider, hooks);
+    let mut runner = create_test_runner(provider, std::sync::Arc::new(hooks));
     
     let mut conv = Conversation::new();
     conv.add_user_message("Test the echo tool");
