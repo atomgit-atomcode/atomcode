@@ -1161,10 +1161,7 @@ async fn run() -> Result<i32> {
             Ok(p) => (p, model_name),
             Err(e) => {
                 let msg = format!("{:#}", e);
-                let is_auth_gap = msg.contains("Not logged in")
-                    || msg.contains("Invalid auth.toml")
-                    || msg.contains("Token expired");
-                if is_auth_gap {
+                if is_auth_gap_error(&msg) {
                     eprintln!(
                         "Note: provider credentials not available ({}). \
                          Launching TUI in onboarding mode — use /login or /codingplan to set up.",
@@ -2435,10 +2432,47 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
     }));
 }
 
+/// Classify a `create_provider` error display string as an "auth gap" —
+/// i.e. the user has no usable OAuth token (file missing, malformed,
+/// access_token expired, refresh_token expired/missing, refresh network
+/// error, etc.). Auth-gap errors must NOT abort startup; they should
+/// fall back to the onboarding TUI so the user can run `/login` from
+/// within the app.
+///
+/// Implementation note — substring matching, not typed errors:
+///
+/// `create_provider` returns `anyhow::Error` and the auth-gap producers
+/// live in three modules (`provider::mod::load_auth_token`,
+/// `provider::mod::refresh_and_save`, `auth::oauth::get_valid_token`).
+/// Threading a typed sentinel through all of them is invasive; instead
+/// we match on a stable convention: **every auth-gap error message in
+/// the codebase ends with the substring `"/login"`** (either
+/// `"please /login"` or `"please use /login"`). That hint is part of
+/// the user-facing contract — any future auth-gap producer that wants
+/// graceful fallback simply has to follow the same convention.
+///
+/// The three legacy substrings (`Not logged in` / `Invalid auth.toml`
+/// / `Token expired`) are retained as belt-and-braces: they were the
+/// original matches before the `"/login"` rule was extracted, and
+/// keeping them ensures the test for the historical contract stays
+/// green even if some future refactor temporarily strips the `/login`
+/// suffix from a specific message.
+///
+/// Non-auth errors (config parse failure, network issues unrelated to
+/// the refresh endpoint, provider validation rejects model name, etc.)
+/// fall through to `return Err(e)` and abort startup as designed.
+fn is_auth_gap_error(msg: &str) -> bool {
+    msg.contains("/login")
+        || msg.contains("Not logged in")
+        || msg.contains("Invalid auth.toml")
+        || msg.contains("Token expired")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        close_thinking_chunk, format_thinking_chunk, resolve_working_dir, truncate_log_line,
+        close_thinking_chunk, format_thinking_chunk, is_auth_gap_error, resolve_working_dir,
+        truncate_log_line,
     };
     use std::path::PathBuf;
 
@@ -2624,5 +2658,88 @@ mod tests {
         close_thinking_chunk(&mut buf, &mut open);
         buf.push_str("[tool→ read_file]\n");
         assert_eq!(buf, "[thinking] I should check the file\n[tool→ read_file]\n");
+    }
+
+    // ── is_auth_gap_error ────────────────────────────────────────────
+    //
+    // Regression set for the "both access_token AND refresh_token
+    // expired → CLI bails before TUI loads" bug. Pre-fix catch list
+    // only matched `Not logged in` / `Invalid auth.toml` / `Token
+    // expired`, missing the 4 paths below — user landed in an
+    // unrecoverable startup error because they couldn't get into the
+    // TUI to run `/login`. Post-fix every auth-gap error's `/login`
+    // suffix triggers graceful fallback to onboarding mode.
+
+    #[test]
+    fn auth_gap_catches_historical_three() {
+        // Pre-existing matches — must stay green.
+        assert!(is_auth_gap_error("Not logged in — please use /login"));
+        assert!(is_auth_gap_error("Invalid auth.toml — please use /login"));
+        assert!(is_auth_gap_error("Token expired — please use /login"));
+    }
+
+    #[test]
+    fn auth_gap_catches_refresh_http_failure() {
+        // The actual user-reported scenario: access_token expired,
+        // `refresh_and_save` POSTs the (also-expired) refresh_token to
+        // the broker, broker returns 401, `provider::mod::refresh_and_save`
+        // bails with this message. Pre-fix catch list MISSED this —
+        // none of the 3 historical substrings appeared, so CLI fell
+        // through to `return Err(e)` and aborted startup.
+        assert!(is_auth_gap_error(
+            "Token refresh failed (401 Unauthorized) — please /login"
+        ));
+        assert!(is_auth_gap_error(
+            "Token refresh failed (400 Bad Request) — please /login"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_catches_refresh_network_failure() {
+        // `refresh_and_save` network-layer error path (broker host
+        // unreachable, DNS failure, TLS error, etc.). Same root cause
+        // as the HTTP path — token can't be refreshed → user needs
+        // `/login`. Onboarding TUI is the only way they can run it.
+        assert!(is_auth_gap_error(
+            "Token refresh failed: connection refused — please /login"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_catches_refresh_parse_failure() {
+        // Broker returned 200 but body wasn't valid refresh-token
+        // JSON. Treated as auth gap because there's no usable token
+        // either way.
+        assert!(is_auth_gap_error(
+            "Token refresh parse error: missing field `access_token` — please /login"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_catches_missing_refresh_token() {
+        // `auth/oauth.rs::refresh_access_token` when stored auth.toml
+        // has access_token but no refresh_token field. Suffix is
+        // "please /login again" — still ends in `/login`, so the new
+        // substring rule catches it.
+        assert!(is_auth_gap_error(
+            "No refresh_token available — please /login again"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_does_not_swallow_non_auth_errors() {
+        // Non-auth errors must NOT trigger the onboarding fallback —
+        // the user should see the real failure, not a generic "please
+        // /login" prompt that doesn't apply.
+        assert!(!is_auth_gap_error(
+            "Config parse error: invalid TOML at line 12"
+        ));
+        assert!(!is_auth_gap_error(
+            "Provider rejected model name 'foo-bar-9000': unknown model"
+        ));
+        assert!(!is_auth_gap_error(
+            "HTTP request to https://api.example.com failed: timeout"
+        ));
+        assert!(!is_auth_gap_error(""));
     }
 }
