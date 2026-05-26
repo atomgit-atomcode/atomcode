@@ -27,7 +27,7 @@ pub struct Selection {
 #[derive(Debug, Default)]
 pub struct SelectionState {
     pub selection: Option<Selection>,
-    pub active: bool,  // true while mouse button held down
+    pub active: bool, // true while mouse button held down
 }
 
 /// Trait adapter so the selection module can read body content without
@@ -39,7 +39,9 @@ pub trait BodyLineView {
 
 // Impl for the alt-screen body_lines type.
 impl BodyLineView for Vec<String> {
-    fn line_count(&self) -> usize { self.len() }
+    fn line_count(&self) -> usize {
+        self.len()
+    }
     fn line_text(&self, idx: usize) -> Cow<'_, str> {
         Cow::Borrowed(self.get(idx).map(|s| s.as_str()).unwrap_or(""))
     }
@@ -47,9 +49,13 @@ impl BodyLineView for Vec<String> {
 
 // Impl for the retained body_lines type.
 impl BodyLineView for Vec<Vec<Cell>> {
-    fn line_count(&self) -> usize { self.len() }
+    fn line_count(&self) -> usize {
+        self.len()
+    }
     fn line_text(&self, idx: usize) -> Cow<'_, str> {
-        let Some(row) = self.get(idx) else { return Cow::Borrowed(""); };
+        let Some(row) = self.get(idx) else {
+            return Cow::Borrowed("");
+        };
         // Build a visible-text string from cells; skip continuation cells
         // (width == 0) which are placeholders for the 2nd column of a wide glyph.
         let s: String = row.iter().filter(|c| c.width > 0).map(|c| c.ch).collect();
@@ -236,11 +242,7 @@ pub fn render_line_with_selection(
 /// falls in `[sel_start, sel_end)`, dropping all CSI escapes. Used by
 /// `extract_selection_text` to assemble what gets written to the
 /// clipboard. Wide-char rule matches `render_line_with_selection`.
-pub fn extract_line_selection_text(
-    line: &str,
-    sel_start: usize,
-    sel_end: usize,
-) -> String {
+pub fn extract_line_selection_text(line: &str, sel_start: usize, sel_end: usize) -> String {
     if sel_end <= sel_start {
         return String::new();
     }
@@ -329,13 +331,18 @@ pub fn selection_col_range_for_line(
 impl SelectionState {
     /// Start a new selection at body coordinates `pos`.
     pub fn begin(&mut self, pos: BodyPos) {
-        self.selection = Some(Selection { anchor: pos, head: pos });
+        self.selection = Some(Selection {
+            anchor: pos,
+            head: pos,
+        });
         self.active = true;
     }
 
     /// Extend selection head to `pos` while button held.
     pub fn update(&mut self, pos: BodyPos) {
-        if !self.active { return; }
+        if !self.active {
+            return;
+        }
         if let Some(sel) = self.selection.as_mut() {
             sel.head = pos;
         }
@@ -349,15 +356,23 @@ impl SelectionState {
         self.active = false;
         let sel = self.selection.as_ref()?;
         let text = extract_text(body, sel);
-        if text.is_empty() { None } else { Some(text) }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     /// Copy current selection to system clipboard via arboard. Returns
     /// true iff a non-empty selection was copied. Clears highlight.
     pub fn copy<B: BodyLineView>(&mut self, body: &B) -> bool {
-        let Some(sel) = self.selection else { return false };
+        let Some(sel) = self.selection else {
+            return false;
+        };
         let text = extract_text(body, &sel);
-        if text.is_empty() { return false; }
+        if text.is_empty() {
+            return false;
+        }
         let copied = match arboard::Clipboard::new() {
             Ok(mut cb) => cb.set_text(text).is_ok(),
             Err(_) => false,
@@ -387,14 +402,20 @@ fn extract_text<B: BodyLineView>(body: &B, sel: &Selection) -> String {
         let Some((start, end)) = selection_col_range_for_line(row, lo_us, hi_us, &line) else {
             continue;
         };
-        if row > lo.0 { out.push('\n'); }
+        if row > lo.0 {
+            out.push('\n');
+        }
         out.push_str(&extract_line_selection_text(&line, start, end));
     }
     out
 }
 
 fn ord(a: BodyPos, b: BodyPos) -> (BodyPos, BodyPos) {
-    if a < b { (a, b) } else { (b, a) }
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 // ── Base64 + OSC 52 ───────────────────────────────────────────────────
@@ -404,8 +425,7 @@ fn ord(a: BodyPos, b: BodyPos) -> (BodyPos, BodyPos) {
 /// payload is one user-selected text blob per drag-release, kilobytes
 /// at most, and the alphabet is fixed.
 pub fn base64_encode(input: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     let mut chunks = input.chunks_exact(3);
     for chunk in &mut chunks {
@@ -520,9 +540,21 @@ mod tests {
     fn render_line_with_selection_emits_reverse_video() {
         let line = "hello world";
         let out = render_line_with_selection(line, 80, 0, 5);
-        assert!(out.starts_with("\x1b[0m\x1b[7m"), "should open with reset+reverse. got: {:?}", out);
-        assert!(out.contains("hello"), "selected text missing. got: {:?}", out);
-        assert!(out.contains("\x1b[0m world"), "post-selection plain text missing. got: {:?}", out);
+        assert!(
+            out.starts_with("\x1b[0m\x1b[7m"),
+            "should open with reset+reverse. got: {:?}",
+            out
+        );
+        assert!(
+            out.contains("hello"),
+            "selected text missing. got: {:?}",
+            out
+        );
+        assert!(
+            out.contains("\x1b[0m world"),
+            "post-selection plain text missing. got: {:?}",
+            out
+        );
     }
 
     /// A CSI escape *inside* the selection range must be dropped
@@ -546,7 +578,11 @@ mod tests {
         // at selection end. The interior `\x1b[0m` from the source
         // line MUST be dropped; if it leaked through we'd see 3.
         let resets = out.matches("\x1b[0m").count();
-        assert_eq!(resets, 2, "expected open-reset + close-reset only. got: {:?}", out);
+        assert_eq!(
+            resets, 2,
+            "expected open-reset + close-reset only. got: {:?}",
+            out
+        );
     }
 
     /// Empty selection range collapses to a plain SGR-aware truncate.
@@ -604,7 +640,13 @@ mod tests {
     fn selection_state_begin_sets_anchor_and_active() {
         let mut s = SelectionState::default();
         s.begin((2, 5));
-        assert_eq!(s.selection, Some(Selection { anchor: (2, 5), head: (2, 5) }));
+        assert_eq!(
+            s.selection,
+            Some(Selection {
+                anchor: (2, 5),
+                head: (2, 5)
+            })
+        );
         assert!(s.active);
     }
 
@@ -659,10 +701,26 @@ mod tests {
         use crate::render::cell::CellStyle;
 
         let row = vec![
-            Cell { ch: 'h', style: CellStyle::default(), width: 1 },
-            Cell { ch: 'i', style: CellStyle::default(), width: 1 },
-            Cell { ch: '中', style: CellStyle::default(), width: 2 },
-            Cell { ch: ' ', style: CellStyle::default(), width: 0 }, // continuation
+            Cell {
+                ch: 'h',
+                style: CellStyle::default(),
+                width: 1,
+            },
+            Cell {
+                ch: 'i',
+                style: CellStyle::default(),
+                width: 1,
+            },
+            Cell {
+                ch: '中',
+                style: CellStyle::default(),
+                width: 2,
+            },
+            Cell {
+                ch: ' ',
+                style: CellStyle::default(),
+                width: 0,
+            }, // continuation
         ];
         let body: Vec<Vec<Cell>> = vec![row];
         assert_eq!(body.line_text(0), "hi中");
@@ -675,7 +733,10 @@ mod tests {
     fn copy_to_clipboard_empty_is_noop() {
         let mut buf = Vec::new();
         copy_to_clipboard(&mut buf, "");
-        assert!(buf.is_empty(), "empty text must not emit OSC 52 or anything else");
+        assert!(
+            buf.is_empty(),
+            "empty text must not emit OSC 52 or anything else"
+        );
     }
 
     // Note: we can't directly assert that arboard was called (would need
