@@ -122,14 +122,21 @@ Tailwind 做样式、Vitest 做单元测试。
         <p>如果你有很多重复的工作流(比如每次修 bug 都要跑一套相同的命令),与其在 <code>.atomcode.md</code> 里长篇大论,不如写成一个 <a href="./skills.html">Skill</a>,更清晰也更可复用。</p>
       </div>
 
-      <h2>与 CLAUDE.md / GEMINI.md 的关系</h2>
-      <p>如果你在同一个项目里也用 Claude Code 或 Gemini CLI,它们各自有自己的指令文件:</p>
+      <h2>与 AGENTS.md / CLAUDE.md / GEMINI.md 的关系</h2>
+      <p>AtomCode 原生支持 <code>AGENTS.md</code>——AI 编程代理持久化上下文的<a href="https://agents.md/">开放标准</a>。如果你的项目已经在使用 <code>AGENTS.md</code>,AtomCode 会自动识别,无需额外配置。查找顺序如下:</p>
+      <ol>
+        <li><code>.atomcode.md</code></li>
+        <li><code>ATOMCODE.md</code></li>
+        <li><code>AGENTS.md</code></li>
+        <li><code>CLAUDE.md</code> / <code>claude.md</code></li>
+      </ol>
+      <p>先找到的先生效。如果你在同一个项目里也用 Claude Code 或 Gemini CLI,它们各自有自己的指令文件:</p>
       <ul>
+        <li>AtomCode &rarr; <code>.atomcode.md</code> 或 <code>AGENTS.md</code></li>
         <li>Claude Code &rarr; <code>CLAUDE.md</code></li>
         <li>Gemini CLI &rarr; <code>GEMINI.md</code></li>
-        <li>AtomCode &rarr; <code>.atomcode.md</code></li>
       </ul>
-      <p>三者互不冲突。你可以分别维护,也可以让 <code>.atomcode.md</code> 通过链接或者简单 include 指向 <code>CLAUDE.md</code> 保持一致。</p>
+      <p>这些文件互不冲突。使用 <code>AGENTS.md</code> 可以让遵循该开放标准的多种 AI 编程工具共享同一份指令文件,避免重复维护。</p>
 
       <h2>下一步</h2>
       <ul>

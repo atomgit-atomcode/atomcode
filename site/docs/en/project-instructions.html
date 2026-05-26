@@ -122,14 +122,21 @@ Tailwind for styles, and Vitest for unit tests.
         <p>If you have repetitive workflows (e.g. the same set of commands every bug fix), don't bloat <code>.atomcode.md</code> — write a <a href="./skills.html">Skill</a> instead. It's clearer and more reusable.</p>
       </div>
 
-      <h2>Relationship to CLAUDE.md / GEMINI.md</h2>
-      <p>If you also use Claude Code or Gemini CLI in the same project, they each have their own instruction files:</p>
+      <h2>Relationship to AGENTS.md / CLAUDE.md / GEMINI.md</h2>
+      <p>AtomCode natively supports <code>AGENTS.md</code>, the <a href="https://agents.md/">open standard</a> for AI coding agent context. If you have a project that already uses <code>AGENTS.md</code>, AtomCode will pick it up automatically — no extra setup needed. The lookup order is:</p>
+      <ol>
+        <li><code>.atomcode.md</code></li>
+        <li><code>ATOMCODE.md</code></li>
+        <li><code>AGENTS.md</code></li>
+        <li><code>CLAUDE.md</code> / <code>claude.md</code></li>
+      </ol>
+      <p>First match wins. If you also use Claude Code or Gemini CLI in the same project, they each have their own instruction files:</p>
       <ul>
+        <li>AtomCode &rarr; <code>.atomcode.md</code> or <code>AGENTS.md</code></li>
         <li>Claude Code &rarr; <code>CLAUDE.md</code></li>
         <li>Gemini CLI &rarr; <code>GEMINI.md</code></li>
-        <li>AtomCode &rarr; <code>.atomcode.md</code></li>
       </ul>
-      <p>The three don't conflict. Maintain them separately, or make <code>.atomcode.md</code> a link / simple include of <code>CLAUDE.md</code> to keep them aligned.</p>
+      <p>These don't conflict. By using <code>AGENTS.md</code>, you can share the same instruction file across multiple AI coding tools that follow the open standard.</p>
 
       <h2>Next steps</h2>
       <ul>

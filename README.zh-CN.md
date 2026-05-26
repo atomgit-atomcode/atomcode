@@ -372,7 +372,7 @@ atomcode/
 - 编辑 .vue/.ts 文件后运行 `npm run lint`
 ```
 
-AtomCode 会自动读取这个文件并注入到系统提示中。
+AtomCode 会自动读取这个文件并注入到系统提示中。AtomCode 也支持 `AGENTS.md`（AI 编程代理的[开放标准](https://agents.md/)）作为替代——如果两个文件同时存在，`.atomcode.md` 优先。
 
 ## 开发
 
