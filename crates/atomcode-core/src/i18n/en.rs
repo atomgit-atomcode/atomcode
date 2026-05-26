@@ -192,13 +192,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Down                             Next input
 
   ── Scrollback ──
-    PageUp / PageDown                Page up / down (10 lines)
-    Shift+↑ / Shift+↓                Line up / down
-    Alt+↑ / Alt+↓                    Jump to prev / next message ***
-    Ctrl+↑ / Ctrl+↓                  Jump to prev / next user message
-    Home / End                       Jump to top / back to latest
-    Mouse wheel                      Scroll body (atomcode captures)
-    Shift+drag mouse                 Use host terminal selection (bypass)
+    Use the host terminal's native scrollback (cmd+↑/↓, mouse wheel,
+    tmux copy-mode — whatever your terminal already provides).
+    Drag + Ctrl+C                    Copy text (atomcode does not capture the mouse)
 
   ── Display ──
     /scrollbar                       Toggle right-side scrollbar
@@ -225,9 +221,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
      (macOS Apple Terminal, default xterm, GNOME Terminal, VS Code's
      integrated terminal) collapse Shift+Enter into plain Enter —
      use Ctrl+J or \ + Enter instead.
-  *** Alt+↑/↓ on macOS Apple Terminal requires enabling "Use Option as
-      Meta key" under Settings → Profiles → Keyboard. Other terminals
-      send the modifier by default.
 
   Tip: run /help for the full slash command list.
 "#.into(),
@@ -441,23 +434,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
         Msg::KbdHintOther =>
             "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
-
-        // ── JediTerm / conhost fallback ──
-        Msg::JediTermFallback =>
-            "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs;\n    \
-            on exit your host terminal restores its pre-atomcode state.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
-            ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n".into(),
-        Msg::LegacyConhostFallback =>
-            "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs.\n    \
-            For full host-terminal scrollback support, install Windows Terminal\n    \
-            (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
-            bypass this fallback (may show duplicated content on scroll).\n\n".into(),
 
         // ── Background task ──
         Msg::BackgroundComplete { turns } =>

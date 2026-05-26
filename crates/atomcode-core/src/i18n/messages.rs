@@ -296,10 +296,6 @@ pub enum Msg<'a> {
     KbdHintMacos,
     KbdHintOther,
 
-    // ── JediTerm / conhost fallback ──
-    JediTermFallback,
-    LegacyConhostFallback,
-
     // ── Background task ──
     BackgroundComplete { turns: usize },
     BackgroundFailed { turns: usize },
