@@ -83,6 +83,23 @@ mod tests {
         assert!(!matches_tool(&m, "edit")); // no underscore, no match
     }
 
+    #[test]
+    fn empty_string_matcher_exact_only() {
+        // An empty-string matcher only matches an empty tool name.
+        let m = Some("".to_string());
+        assert!(matches_tool(&m, ""));
+        assert!(!matches_tool(&m, "anything"));
+    }
+
+    #[test]
+    fn mid_pattern_wildcard_exact_match() {
+        // A wildcard that is NOT at the end is treated as an exact match.
+        let m = Some("foo*bar".to_string());
+        assert!(matches_tool(&m, "foo*bar"));
+        assert!(!matches_tool(&m, "foobar"));
+        assert!(!matches_tool(&m, "fooXbar"));
+    }
+
     // ── matching_hooks ───────────────────────────────────────────
 
     fn make_hook(event: HookEvent, matcher: Option<&str>, cmd: &str) -> HookConfig {
