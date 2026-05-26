@@ -51,6 +51,17 @@ pub struct Screen {
     /// typically only useful in tests.
     cursor: Option<(u16, u16)>,
     cursor_visible: bool,
+    /// Set when the physical terminal state is known to be out of sync
+    /// with `prev_cells` — typically because a caller invoked
+    /// `invalidate()` after a direct-stdout write or session-state
+    /// change. The next `render_diff` prepends a per-row CUP+EL so the
+    /// terminal starts from a known-blank canvas before the diff
+    /// patches put content back. Without this, the cell-diff alone
+    /// can't fix the staleness: if the new frame's `cells` are blank
+    /// at a column whose `prev_cells` is ALSO blank (post-invalidate),
+    /// no patch is emitted and the stale physical glyph survives —
+    /// the "right-edge ghost row tail" symptom.
+    physical_dirty: bool,
 }
 
 impl Screen {
@@ -64,6 +75,7 @@ impl Screen {
             height,
             cursor: None,
             cursor_visible: true,
+            physical_dirty: false,
         }
     }
 
@@ -169,8 +181,31 @@ impl Screen {
     /// the next draw cycle starts clean — callers must re-draw
     /// every widget every frame (retained-mode invariant).
     pub fn render_diff(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.physical_dirty {
+            // Cold-start the physical terminal: per-row CUP+EL across
+            // every screen row, then `\x1b[H` to home. The subsequent
+            // diff patches put cells's content back. This costs ~8
+            // bytes per row plus the home — only paid when callers
+            // explicitly signal that physical state is unknown via
+            // `invalidate()`. Without this, body rows whose cells go
+            // from "long content" (last frame) to "short content"
+            // (this frame, with `prev_cells` blanked by invalidate)
+            // leave the long row's tail on the physical terminal
+            // forever — the cell-diff sees `cells=blank == prev=blank`
+            // for the trailing columns and emits no patch, so the
+            // stale glyphs survive.
+            let h = self.cells.len();
+            out.reserve(h * 8 + 4);
+            for row in 1..=h {
+                let _ = write!(&mut out, "\x1b[{};1H\x1b[K", row);
+            }
+            out.extend_from_slice(b"\x1b[H");
+            self.physical_dirty = false;
+        }
         let patches = diff_cell_frames(&self.prev_cells, &self.cells);
-        let mut out = serialize_patches(&patches);
+        let patch_bytes = serialize_patches(&patches);
+        out.extend_from_slice(&patch_bytes);
         if let Some((r, c)) = self.cursor {
             let _ = write!(&mut out, "\x1b[{};{}H", r, c);
         }
@@ -198,6 +233,11 @@ impl Screen {
         for row in &mut self.prev_cells {
             *row = blank_row.clone();
         }
+        // Mark physical state unknown so the next render_diff begins
+        // with a cold-start per-row CUP+EL — see `Screen::physical_dirty`
+        // for the failure mode this guards against (right-edge ghost
+        // tail after invalidate + shrink).
+        self.physical_dirty = true;
     }
 
     /// Blank `prev_cells` for rows `[start_row, height)`. Used by callers
@@ -341,6 +381,66 @@ mod tests {
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
         assert!(out.contains("BBB"), "row 0 should now show BBB");
+    }
+
+    /// `invalidate()` is the documented way for callers to signal
+    /// "physical terminal state is unknown — repaint cold". The diff
+    /// alone cannot restore correctness in that case: if the new frame's
+    /// `cells` are blank at a column whose `prev_cells` was ALSO blanked
+    /// by the invalidate, no patch is emitted and the stale physical
+    /// glyph survives. The next render_diff after invalidate MUST
+    /// therefore prepend a per-row CUP+EL so the terminal cold-starts.
+    #[test]
+    fn invalidate_prepends_per_row_clear_on_next_diff() {
+        let mut s = Screen::new(10, 3);
+        // Warm the prev_cells with content so the test mirrors the
+        // "previous frame had content, now we invalidate" flow.
+        let mut cells = Vec::new();
+        push_str_cells(&mut cells, "hi", &CellStyle::default());
+        s.draw_row(0, 0, &cells);
+        let _ = s.render_diff();
+        // Caller invalidates because physical state is now unknown.
+        s.invalidate();
+        // Next paint cycle: redraw the same content.
+        s.draw_row(0, 0, &cells);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        // Per-row CUP+EL must appear for every row before the content
+        // patches — that's the cold-start cue for the physical
+        // terminal.
+        for row in 1..=3 {
+            let needle = format!("\x1b[{};1H\x1b[K", row);
+            assert!(
+                out.contains(&needle),
+                "invalidate should prepend CUP+EL for row {} on next render_diff; got: {:?}",
+                row,
+                out
+            );
+        }
+        // Content must still emit.
+        assert!(
+            out.contains("hi"),
+            "invalidated content should still re-emit: {:?}",
+            out
+        );
+    }
+
+    /// `invalidate()` is "one-shot": the cold-start cue fires on the
+    /// NEXT render_diff and clears the flag, so subsequent frames go
+    /// back to the cheap incremental diff path.
+    #[test]
+    fn invalidate_cold_start_does_not_repeat_across_frames() {
+        let mut s = Screen::new(10, 3);
+        s.invalidate();
+        let _ = s.render_diff(); // consumes the cold-start cue
+        // Second frame: no invalidate, no cold start.
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(
+            !out.contains("\x1b[1;1H\x1b[K"),
+            "no cold-start CUP+EL on second frame after one-shot invalidate: {:?}",
+            out
+        );
     }
 
     #[test]

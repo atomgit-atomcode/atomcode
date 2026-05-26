@@ -8660,4 +8660,327 @@ mod tests {
             vterm.dump()
         );
     }
+
+    /// Regression: body rows painted via `paint_body_into_cells` were
+    /// only writing `clipped.len()` cells into `screen.cells[i]`, leaving
+    /// the trailing `[clipped.len(), width)` columns untouched. The diff
+    /// against `prev_cells` then emitted blanks correctly... in theory.
+    ///
+    /// In practice — and only when the body overflows the visible cap so
+    /// `emit_body_line_inner`'s scroll-then-shift_prev_up path runs — the
+    /// shift rotates `prev_cells` such that the new logical body row's
+    /// slot in `prev_cells` holds the SAME body row's content from the
+    /// last frame (the prior row shifted into its position is its own
+    /// previous representation). So the diff sees "row content
+    /// unchanged" for the slot and emits zero patches for it — including
+    /// no blanks for the trailing columns that the body row never wrote.
+    ///
+    /// When the body line is then REPLACED with shorter content (e.g.
+    /// `commit_inflight_tool` swapping a wrapped 3-row spinner for a
+    /// single committed row; the spinner row was 60-cols wide, the
+    /// commit row is 24-cols), the right-edge fragment of the old row
+    /// stays on the physical terminal because no blank patches were
+    /// emitted for those columns.
+    ///
+    /// Reproduction here is more direct: push a LONG body row, paint;
+    /// then directly replace `body_lines.last()` with a SHORT row (the
+    /// same shape `push_or_update_live_spinner`'s in-place update does),
+    /// re-paint, and verify the right edge of the row is BLANK in the
+    /// vterm grid — not the trailing fragment of the long row.
+    #[test]
+    fn retained_short_row_replacing_long_row_clears_trailing_cells_via_vterm() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Frame 1: seed the footer.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Push a LONG body row that fits on a single terminal row
+        // (body width on an 80-col terminal with no scrollbar is 80 - 4
+        // = 76 cells after `push_body_text`'s PAD_COL=2 padding on each
+        // side; pick a payload that lands a unique trailing marker near
+        // the right edge so we can spot it later).
+        let long_marker = "ENDMARKER";
+        let long_payload =
+            format!("write_file(/long/path/to/file.md) {}", long_marker);
+        // Sanity: ensure the payload fits in a single body row so we
+        // don't accidentally land the marker on a wrapped second row.
+        assert!(
+            long_payload.len() <= (w as usize - 2 * 2),
+            "long payload must fit one body row to make the test deterministic"
+        );
+        r.render(UiLine::CommandOutput(long_payload.clone()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Locate the body row that holds our long content on the
+        // physical terminal grid.
+        let body_height = r.body_bottom_row() as usize;
+        let long_screen_row = (0..body_height)
+            .find(|&row_0idx| vterm.row_text(row_0idx).contains(long_marker))
+            .unwrap_or_else(|| {
+                panic!(
+                    "long row should be visible in vterm\nbody_height={}, body_lines.len()={}\ndump:\n{}",
+                    body_height,
+                    r.body_lines.len(),
+                    vterm.dump()
+                )
+            });
+
+        // Replace the in-memory body row with a SHORTER row and re-paint
+        // via the normal paint pipeline. (Mirrors the shape of
+        // `commit_inflight_tool` and similar paths that swap a long
+        // wrapped row for a short committed one without going through
+        // emit_body_line_inner / EL erase.)
+        let short = {
+            let mut row: Vec<Cell> = Vec::new();
+            push_str_cells(&mut row, "  write_file(file.md)", &CellStyle::default());
+            row
+        };
+        if let Some(last) = r.body_lines.last_mut() {
+            *last = short;
+        }
+        // Mark dirty so the next flush actually runs paint_frame.
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Assert: the marker from the long row must be GONE from the
+        // physical terminal — the trailing cells where it lived must
+        // have been blanked by the paint cycle.
+        let row_text = vterm.row_text(long_screen_row);
+        assert!(
+            !row_text.contains(long_marker),
+            "ghost fragment {:?} still on screen at row {}\nrow text: {:?}\ndump:\n{}",
+            long_marker,
+            long_screen_row,
+            row_text,
+            vterm.dump()
+        );
+    }
+
+    /// Regression for the ghost-row-tail bug seen in the user
+    /// screenshot. The root cause is a multi-step interaction:
+    ///   1. A body row is painted with LONG content. The cell-diff
+    ///      emits the LONG cells; after the swap, `prev_cells` holds
+    ///      `[LONG content][trailing blanks]` and physical terminal
+    ///      mirrors that exactly.
+    ///   2. Something invokes `screen.invalidate()` (or a path that
+    ///      effectively zeroes the relevant `prev_cells` rows) — the
+    ///      cell-diff cache now claims "no content anywhere", but the
+    ///      physical terminal is unchanged.
+    ///   3. The body row is replaced with SHORTER content and the
+    ///      next paint runs. `paint_body_into_cells` only writes the
+    ///      short cells into `screen.cells[i][0..short_len]`, leaving
+    ///      `cells[i][short_len..w]` blank from `screen.clear()`.
+    ///   4. The diff for trailing cols sees `cells = blank` and
+    ///      `prev_cells = blank` (post-invalidate) → no patch emitted.
+    ///      Physical terminal STILL holds `[LONG content tail]` at
+    ///      those cols → user sees `[SHORT][ghost trail of LONG]`.
+    ///
+    /// `paint_body_into_cells` must pad each body row to the
+    /// effective body width before `draw_row` and the invalidate
+    /// callers must physically erase the affected rows; together this
+    /// keeps cells / prev_cells / terminal byte-aligned across the
+    /// invalidate-then-shrink boundary.
+    #[test]
+    fn retained_paint_body_clears_trailing_after_invalidate_with_shorter_row_via_vterm() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Seed the footer.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Frame 1: push a LONG body row through the normal paint path.
+        let long_marker = "LONG_TAIL_ZZZ";
+        let mut long_row: Vec<Cell> = Vec::new();
+        push_str_cells(
+            &mut long_row,
+            &format!("body_payload {}", long_marker),
+            &CellStyle::default(),
+        );
+        // Extend to a near-full-width payload so the marker lands well
+        // past where any subsequent short row would reach.
+        let target_len = (w as usize).saturating_sub(2);
+        while long_row.iter().map(|c| c.width as usize).sum::<usize>() < target_len {
+            long_row.push(Cell {
+                ch: 'X',
+                style: CellStyle::default(),
+                width: 1,
+            });
+        }
+        r.push_body_row(long_row);
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Locate the row on the physical grid.
+        let body_height = r.body_bottom_row() as usize;
+        let long_screen_row = (0..body_height)
+            .find(|&row_0idx| vterm.row_text(row_0idx).contains(long_marker))
+            .unwrap_or_else(|| {
+                panic!(
+                    "long row should be visible in vterm\nbody_lines.len()={} body_height={}\ndump:\n{}",
+                    r.body_lines.len(),
+                    body_height,
+                    vterm.dump()
+                )
+            });
+
+        // Frame 2: simulate the invalidate-then-shrink sequence the
+        // bug requires. `pop_approval_prompt` / `refresh_welcome_banner`
+        // both call `screen.invalidate()` to force a cold-start repaint
+        // — verify the bug class by invoking invalidate directly so the
+        // test isolates the rendering invariant (not the specific
+        // caller).
+        r.screen.invalidate();
+        // Replace `body_lines.last()` with a much shorter row.
+        let mut short_row: Vec<Cell> = Vec::new();
+        push_str_cells(&mut short_row, "tiny", &CellStyle::default());
+        if let Some(last) = r.body_lines.last_mut() {
+            *last = short_row;
+        }
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The trailing cells must be blank — no ghost trail from the
+        // LONG row.
+        let after = vterm.row_text(long_screen_row);
+        assert!(
+            !after.contains(long_marker),
+            "trailing fragment {:?} survived at row {} after invalidate+shrink: {:?}\ndump:\n{}",
+            long_marker,
+            long_screen_row,
+            after,
+            vterm.dump()
+        );
+        let right_edge = vterm.cell_at(long_screen_row, (w - 5) as usize);
+        assert_eq!(
+            right_edge.ch, ' ',
+            "right-edge cell at row {} col {} should be blank, got {:?}\ndump:\n{}",
+            long_screen_row,
+            w - 5,
+            right_edge,
+            vterm.dump()
+        );
+    }
+
+    /// Variant of the test above that DIRECTLY exercises the
+    /// `paint_body_into_cells` short-row-after-long-row case at the
+    /// screen.cells layer (no `body_lines.last_mut()` shenanigans),
+    /// using `repaint_body_region` to drive the paint pipeline twice
+    /// against a body_lines slot whose content was just shortened.
+    #[test]
+    fn retained_paint_body_short_row_clears_trailing_cells_via_vterm() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Seed the footer.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Push a long body row directly. Use a uniquely identifiable
+        // tail marker.
+        let long_marker = "RIGHT_EDGE_TAIL_ZZZ";
+        let mut long_row: Vec<Cell> = Vec::new();
+        push_str_cells(
+            &mut long_row,
+            &format!("short_payload {}", long_marker),
+            &CellStyle::default(),
+        );
+        // Force the row to be exactly the full effective body width by
+        // padding with trailing spaces — same shape a CommandOutput row
+        // would have when it exhausts the wrap budget. This is the case
+        // where prev_cells would otherwise be wide enough that the diff
+        // sees changes across the WHOLE row when we shorten.
+        let target_len = (w as usize).saturating_sub(2 * 2);
+        while long_row.iter().map(|c| c.width as usize).sum::<usize>() < target_len {
+            long_row.push(Cell {
+                ch: 'X',
+                style: CellStyle::default(),
+                width: 1,
+            });
+        }
+        r.push_body_row(long_row);
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The long row should be on the screen.
+        let body_height = r.body_bottom_row() as usize;
+        let long_screen_row = (0..body_height)
+            .find(|&row_0idx| vterm.row_text(row_0idx).contains(long_marker))
+            .unwrap_or_else(|| {
+                panic!(
+                    "long row should be visible in vterm\nbody_lines.len()={} body_height={}\ndump:\n{}",
+                    r.body_lines.len(),
+                    body_height,
+                    vterm.dump()
+                )
+            });
+
+        // Replace `body_lines.last()` with a much shorter row.
+        let mut short_row: Vec<Cell> = Vec::new();
+        push_str_cells(&mut short_row, "tiny", &CellStyle::default());
+        if let Some(last) = r.body_lines.last_mut() {
+            *last = short_row;
+        }
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The trailing cells of long_screen_row must be wiped.
+        let after = vterm.row_text(long_screen_row);
+        assert!(
+            !after.contains(long_marker),
+            "trailing fragment {:?} survived at row {}: {:?}\ndump:\n{}",
+            long_marker,
+            long_screen_row,
+            after,
+            vterm.dump()
+        );
+        // Also: cells past the short row's content should be SPACE.
+        let cell_at_right_edge = vterm.cell_at(long_screen_row, (w - 5) as usize);
+        assert_eq!(
+            cell_at_right_edge.ch, ' ',
+            "right-edge cell at row {} col {} should be blank, got {:?}\ndump:\n{}",
+            long_screen_row,
+            w - 5,
+            cell_at_right_edge,
+            vterm.dump()
+        );
+    }
 }
