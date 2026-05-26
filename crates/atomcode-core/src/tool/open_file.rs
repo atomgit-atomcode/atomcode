@@ -25,7 +25,7 @@ pub struct OpenFileTool;
 
 #[derive(Deserialize)]
 struct OpenFileArgs {
-    path: String,
+    file_path: String,
 }
 
 /// What command pattern (if any) is appropriate for opening a local
@@ -191,12 +191,12 @@ impl Tool for OpenFileTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "file_path": {
                         "type": "string",
                         "description": "File path to open. Absolute, or relative to the current working directory. Must exist."
                     }
                 },
-                "required": ["path"]
+                "required": ["file_path"]
             }),
         }
     }
@@ -235,7 +235,7 @@ impl Tool for OpenFileTool {
             Err(_) => return self.approval(args),
         };
         match super::approval_for_path(
-            &parsed.path,
+            &parsed.file_path,
             &wd,
             super::ExternalPathAction::Enumerate,
         ) {
@@ -246,7 +246,7 @@ impl Tool for OpenFileTool {
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: OpenFileArgs = serde_json::from_str(args)?;
-        let path = parsed.path.as_str();
+        let path = parsed.file_path.as_str();
 
         // Resolve relative to working_dir, mirroring every other file tool.
         let wd = ctx.working_dir.read().await.clone();

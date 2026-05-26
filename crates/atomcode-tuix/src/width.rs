@@ -1,11 +1,67 @@
 // crates/atomcode-tuix/src/width.rs
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
-/// Terminal column width of a string, CJK-aware.
+/// Display width of a single user-perceived character (grapheme cluster).
+///
+/// `UnicodeWidthChar::width` operates per code point and doesn't know about
+/// ZWJ joiners, variation selectors, skin-tone modifiers, or regional
+/// indicators. Summing per-char widths gives the wrong answer for emoji
+/// sequences that modern terminals render as a single glyph:
+///   - 👨‍👩‍👦 (man + ZWJ + woman + ZWJ + boy) renders as 1 emoji = 2 cols
+///   - ❤️ (heart + VS-16) renders as 1 emoji = 2 cols (VS-16 forces emoji
+///     presentation of an otherwise text-width 1 codepoint)
+///   - 👍🏽 (thumb + skin-tone) renders as 1 emoji = 2 cols
+///   - 🇺🇸 (regional indicators) renders as 1 flag = 2 cols
+///
+/// Cluster width strategy:
+///   - Single code point: width per UnicodeWidthChar (handles CJK, plain
+///     emoji, ASCII, combining marks-as-base, etc.).
+///   - Multi code point + contains any emoji-presentation marker
+///     (ZWJ U+200D, VS-16 U+FE0F, skin-tone U+1F3FB..=U+1F3FF, regional
+///     indicator U+1F1E6..=U+1F1FF): treat as one emoji = 2 cols. This is
+///     the convention iTerm2 / Kitty / WezTerm / Terminal.app (recent)
+///     follow when rendering Unicode emoji clusters.
+///   - Multi code point without an emoji marker (e.g. `a` + combining
+///     grave): take the max per-char width — combining marks contribute 0,
+///     so the result is the base character's width.
+fn cluster_width(g: &str) -> usize {
+    let mut iter = g.chars();
+    let Some(first) = iter.next() else {
+        return 0;
+    };
+    if iter.clone().next().is_none() {
+        return UnicodeWidthChar::width(first).unwrap_or(0);
+    }
+    let mut has_emoji_marker = false;
+    let mut max_w = UnicodeWidthChar::width(first).unwrap_or(0);
+    for c in std::iter::once(first).chain(iter) {
+        match c {
+            '\u{200D}' | '\u{FE0F}' => has_emoji_marker = true,
+            '\u{1F3FB}'..='\u{1F3FF}' => has_emoji_marker = true,
+            '\u{1F1E6}'..='\u{1F1FF}' => has_emoji_marker = true,
+            _ => {}
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w > max_w {
+            max_w = w;
+        }
+    }
+    if has_emoji_marker {
+        2
+    } else {
+        max_w
+    }
+}
+
+/// Terminal column width of a string, CJK- and emoji-cluster-aware.
+///
+/// Walks user-perceived characters (grapheme clusters) rather than raw
+/// code points so multi-codepoint emoji (ZWJ sequences, VS-16, skin-tone
+/// modifiers, regional-indicator flags) report their rendered width — see
+/// [`cluster_width`] for the per-cluster rule.
 pub fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum()
+    s.graphemes(true).map(cluster_width).sum()
 }
 
 /// Split a line (possibly containing SGR escape sequences) into chunks
@@ -140,19 +196,22 @@ pub fn slice_cols(s: &str, start_col: usize, max_cols: usize) -> String {
 }
 
 /// Truncate `s` so its display width is at most `max_cols`.
-/// Guaranteed to return a valid UTF-8 string that never splits a grapheme.
+/// Guaranteed to return a valid UTF-8 string that never splits a grapheme
+/// cluster — important for multi-codepoint emoji where a mid-cluster cut
+/// would leave a dangling ZWJ / VS-16 / skin-tone modifier visible in the
+/// downstream string.
 pub fn truncate_to_width(s: &str, max_cols: usize) -> String {
     if max_cols == 0 {
         return String::new();
     }
     let mut acc = String::with_capacity(s.len());
     let mut cols = 0usize;
-    for c in s.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+    for g in s.graphemes(true) {
+        let w = cluster_width(g);
         if cols + w > max_cols {
             break;
         }
-        acc.push(c);
+        acc.push_str(g);
         cols += w;
     }
     acc
@@ -433,5 +492,51 @@ mod tests {
         let tinted = "\x1b[3;38;2;124;132;153m// comment\x1b[23;39m";
         let chunks = wrap_line_to_width(tinted, 10);
         assert_eq!(chunks.len(), 1);
+    }
+
+    // --- grapheme-cluster width tests ---
+    //
+    // These tests pin terminal-display semantics for multi-codepoint emoji
+    // clusters: ZWJ sequences (family emoji), VS-16 (text→emoji presentation)
+    // and skin-tone modifiers are rendered by modern terminals (iTerm2,
+    // Kitty, WezTerm, recent Terminal.app) as a single emoji of width 2.
+    // Summing per-char widths gives the wrong answer; cursor placement and
+    // truncation must use the cluster-aggregated width.
+
+    #[test]
+    fn display_width_zwj_family_is_one_emoji() {
+        // 👨‍👩‍👦 = U+1F468 U+200D U+1F469 U+200D U+1F466
+        // Sum of per-char widths = 2+0+2+0+2 = 6. As one ZWJ-joined emoji = 2.
+        let family = "👨\u{200D}👩\u{200D}👦";
+        assert_eq!(display_width(family), 2);
+    }
+
+    #[test]
+    fn display_width_heart_with_vs16_is_emoji_width() {
+        // ❤️ = U+2764 (width 1, text presentation) + U+FE0F (VS-16, forces
+        // emoji presentation). Rendered as an emoji = width 2.
+        assert_eq!(display_width("❤\u{FE0F}"), 2);
+    }
+
+    #[test]
+    fn display_width_emoji_with_skin_tone_modifier() {
+        // 👍🏽 = U+1F44D U+1F3FD. Sum = 4; cluster = 2.
+        assert_eq!(display_width("👍\u{1F3FD}"), 2);
+    }
+
+    #[test]
+    fn truncate_to_width_does_not_split_zwj_cluster() {
+        // Cluster has display width 2. Budget of 2 must accept the whole
+        // cluster, not return "👨\u{200D}" (a broken cluster — the trailing
+        // ZWJ leaks into whatever string is concatenated after).
+        let family = "👨\u{200D}👩\u{200D}👦";
+        assert_eq!(truncate_to_width(family, 2), family);
+    }
+
+    #[test]
+    fn truncate_to_width_drops_cluster_that_does_not_fit() {
+        // Budget < cluster width → drop the whole cluster (don't emit half).
+        let family = "👨\u{200D}👩\u{200D}👦";
+        assert_eq!(truncate_to_width(family, 1), "");
     }
 }

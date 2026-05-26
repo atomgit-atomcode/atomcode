@@ -83,3 +83,6 @@ crates/atomcode-codingplan-crypto/
 scripts/build-official.sh
 build-official.sh
 build-official-vscode.sh
+
+# git worktrees
+.worktrees/

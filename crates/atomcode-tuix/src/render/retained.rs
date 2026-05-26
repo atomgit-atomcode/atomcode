@@ -198,7 +198,14 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
         match part.parse::<u32>().ok() {
             Some(0) => *style = CellStyle::default(),
             Some(1) => style.bold = true,
-            Some(22) => style.bold = false,
+            Some(2) => style.faint = true,
+            Some(22) => {
+                // ECMA-48 22 = normal intensity — clears both bold AND
+                // faint as a pair. There is no per-attribute toggle for
+                // faint, so bold→off and faint→off both route through 22.
+                style.bold = false;
+                style.faint = false;
+            }
             // Italic (3/23) — no CellStyle bit; text renders plain.
             Some(3) | Some(23) => {}
             Some(7) => style.reverse = true,
@@ -2170,14 +2177,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let mut row = Vec::new();
                 let pad = CellStyle::default();
                 push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-                // Muted gray (SGR 90 / DarkGrey) for the per-turn rule
-                // and summary text. The input box border below uses full
-                // cyan; making this rule cyan too produced three
-                // identical bright-cyan rules in one viewport (see
-                // screenshot regression). Gray is the historically
-                // expected look — quiet historical separator that
-                // doesn't compete with the live input chrome.
-                let rule = self.style_for(Role::Muted);
+                // SGR 2 (faint) on the terminal-default fg. This is the
+                // quiet "historical" look: the rule and `resumed:` label
+                // sit at ~50% intensity so they read as scaffolding, not
+                // body text. Previously we used `Role::Muted`, but when
+                // MUTED_DARK was widened from SGR 90 → 37 (so tool-batch
+                // child rows stay readable on Warp dark), this rule lost
+                // its contrast against assistant text. Mirrors the SGR_DIM
+                // approach `alt_screen::build_turn_separator` already uses.
+                let rule = self.style_faint(Role::Secondary);
                 for _ in 0..left {
                     row.push(Cell {
                         ch: '─',
@@ -2186,7 +2194,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     });
                 }
                 push_str_cells(&mut row, " ", &pad);
-                push_str_cells(&mut row, &safe, &self.style_for(Role::Muted));
+                push_str_cells(&mut row, &safe, &rule);
                 push_str_cells(&mut row, " ", &pad);
                 for _ in 0..right {
                     row.push(Cell {
@@ -2512,6 +2520,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // Muted (dim gray) for the result prefix — visually subordinate
                 // to the tool-call header above (● ToolName).
                 let prefix_style = self.style_for(Role::Muted);
+                // `└` is a leaf marker for the whole result block, not
+                // a per-line bullet — emit it on the FIRST visual row
+                // only. Continuation rows (both wrap chunks of one
+                // physical line and subsequent `\n`-separated lines)
+                // use 4 spaces, same column width as `"  └ "`, so the
+                // text stays aligned under the head text.
+                let mut first_visual = true;
                 for (line_idx, phys) in body_str.split('\n').enumerate() {
                     // First physical line of a failure body is the
                     // header. Wrapped continuation chunks of that same
@@ -2533,9 +2548,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     };
                     for chunk in crate::width::wrap_line_to_width(phys, row_w.max(1)) {
                         let mut row = Vec::new();
-                        push_str_cells(&mut row, "  └ ", &prefix_style);
+                        let prefix = if first_visual { "  └ " } else { "    " };
+                        push_str_cells(&mut row, prefix, &prefix_style);
                         push_str_cells(&mut row, &chunk, line_style);
                         self.push_body_row(row);
+                        first_visual = false;
                     }
                 }
                 // No trailing spacer — tool chains stay compact. A
@@ -3289,29 +3306,35 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 fn build_one_row(text: &str, style: &CellStyle, screen_w: u16) -> Vec<Cell> {
     let avail = (screen_w as usize).saturating_sub(PAD_COL);
     let safe = scrub_controls(text);
-    let truncated = if safe.chars().count() > avail.max(1) {
-        let take_n = avail.saturating_sub(1).max(1);
-        let mut s: String = safe.chars().take(take_n).collect();
-        s.push('…');
-        s
-    } else {
-        safe
-    };
+    // Width-aware truncation: CJK glyphs occupy 2 cols each, so a row of
+    // 30 汉字 (60 cols) on a 40-col screen must trip truncate and append `…`,
+    // not slip past the chars().count() check and leak past the screen edge.
+    let truncated = crate::width::truncate_with_ellipsis(&safe, avail.max(1));
     let mut row = Vec::new();
     push_str_cells(&mut row, &truncated, style);
     row
 }
 
-/// Truncate `body_str` to at most `max_chars` display-width characters,
-/// preserving whole characters (not splitting multi-byte sequences).
-/// This is a rendering safeguard to prevent degenerate bodies
-/// (e.g. multi-KB bash commands) from producing hundreds of terminal lines.
-fn truncate_body_str(body_str: &str, max_chars: usize) -> String {
-    if let Some((idx, _)) = body_str.char_indices().nth(max_chars) {
-        format!("{}… (truncated)", &body_str[..idx])
-    } else {
-        body_str.to_string()
+/// Truncate `body_str` so its display width is at most `max_cols`,
+/// preserving grapheme clusters (never splits a multi-codepoint emoji or
+/// a CJK glyph). Appends `… (truncated)` when a cut happened.
+///
+/// Rendering safeguard against degenerate bodies (e.g. multi-KB bash
+/// commands) producing hundreds of terminal lines.
+fn truncate_body_str(body_str: &str, max_cols: usize) -> String {
+    if crate::width::display_width(body_str) <= max_cols {
+        return body_str.to_string();
     }
+    let suffix = "… (truncated)";
+    let suffix_w = crate::width::display_width(suffix);
+    let budget = max_cols.saturating_sub(suffix_w);
+    if budget == 0 {
+        // Budget too small to fit even one cluster of body + the suffix.
+        // Emit just the suffix, capped at max_cols.
+        return crate::width::truncate_to_width(suffix, max_cols);
+    }
+    let head = crate::width::truncate_to_width(body_str, budget);
+    format!("{}{}", head, suffix)
 }
 
 /// Pluck the metadata suffix (` · 12s` and/or ` · N queued`) out of a
@@ -5162,6 +5185,74 @@ mod tests {
         );
     }
 
+    /// `└` is a leaf marker for the whole tool-result block, not a
+    /// per-line bullet. When the body wraps to multiple visual rows
+    /// (narrow terminal, long summary, or `\n`-separated lines) only
+    /// the FIRST visual row carries `└`; continuation rows align under
+    /// the text via 4 spaces. Without this, every wrapped chunk shows
+    /// a redundant `└` at col 2 — the bug fixed alongside this test.
+    #[test]
+    fn retained_tool_result_wrap_continuation_has_no_arrow() {
+        // 40-col width → row_w = 40 - PAD_COL(2) - prefix(4) = 34.
+        // Summary is > 34 cols so it must wrap to at least 2 visual rows.
+        let (mut r, buf) = new_capturing(40, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(40, 24);
+        let status = status_basic();
+        let long_summary =
+            "Created new file /tmp/atomcode-smoke-temp-check.txt (15 bytes, 1 line)";
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: long_summary.into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let arrow_rows: Vec<usize> = (0..vterm.height() as usize)
+            .filter(|&i| vterm.row_text(i).contains('└'))
+            .collect();
+        assert_eq!(
+            arrow_rows.len(),
+            1,
+            "`└` must appear on exactly one row (the first), found {} rows. dump:\n{}",
+            arrow_rows.len(),
+            vterm.dump()
+        );
+        let first_row = arrow_rows[0];
+        // The text just after `└ ` should appear on the first row.
+        assert!(
+            vterm.row_text(first_row).contains("Created new file"),
+            "first row must carry the head of the body, got: {:?}",
+            vterm.row_text(first_row)
+        );
+
+        // A continuation row exists (the body wrapped) and it must
+        // start with 4 spaces (cols 0..4) — same width as `"  └ "` —
+        // so the text aligns under the head text, not under the `└`.
+        let cont_row = first_row + 1;
+        assert!(
+            (cont_row as u16) < vterm.height(),
+            "expected at least one continuation row, vterm height = {}",
+            vterm.height()
+        );
+        for c in 0..4 {
+            assert_eq!(
+                vterm.cell_at(cont_row, c).ch,
+                ' ',
+                "continuation row col {} must be blank, got {:?} (row text: {:?})",
+                c,
+                vterm.cell_at(cont_row, c).ch,
+                vterm.row_text(cont_row),
+            );
+        }
+    }
+
     /// DiffBlock: multiple added/removed lines, each with its own
     /// marker. Grid-verifies `+` and `-` both appear in the
     /// respective rows at the correct indent (7-space prefix).
@@ -5217,6 +5308,80 @@ mod tests {
         let found = vterm
             .any_row(|row| row.contains("─") && row.contains("Sealed") && row.contains("1 turn"));
         assert!(found, "separator missing\ndump:\n{}", vterm.dump());
+    }
+
+    /// TurnSeparator rule must render dim (default fg + SGR 2) — not
+    /// pinned to a bright muted color. v4.23.0 broadened MUTED_DARK to
+    /// SGR 37 (light gray) so child rows of tool batches read on Warp
+    /// dark, but reusing `Role::Muted` here made the `resumed:` rule
+    /// blend into body text. The fix: this rule is decoration, so it
+    /// should use the same SGR-2 dim that alt_screen uses, leaving fg
+    /// at terminal default.
+    ///
+    /// Two complementary assertions are needed: the vterm grid only
+    /// tracks fg/bold/reverse (no faint/dim field), so `cell.fg.is_none()`
+    /// alone wouldn't catch a regression to `style_for(Role::Secondary)`
+    /// — that also has `fg=None` but drops the `\x1b[2m`, leaving the
+    /// rule at full intensity. We pin the byte stream too so the dim
+    /// requirement survives a future refactor.
+    #[test]
+    fn retained_turn_separator_rule_uses_default_fg() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::TurnSeparator {
+            label: "resumed: mcp with plan mode".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Snapshot raw bytes BEFORE `drain_into_vterm` consumes the
+        // buffer — we need to inspect the SGR stream that the vterm
+        // grid can't represent.
+        let raw_bytes = buf.lock().unwrap().clone();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let row_idx = (0..vterm.height() as usize)
+            .find(|&r| vterm.row_text(r).contains("─") && vterm.row_text(r).contains("resumed"))
+            .unwrap_or_else(|| panic!("separator row missing\ndump:\n{}", vterm.dump()));
+        let row_text = vterm.row_text(row_idx);
+        let rule_col = row_text.find('─').unwrap();
+        let rule_cell = vterm.cell_at(row_idx, rule_col);
+        assert!(
+            rule_cell.fg.is_none(),
+            "separator rule should use terminal-default fg (dimmed via SGR 2), \
+             not a pinned color — got fg={:?}",
+            rule_cell.fg,
+        );
+
+        // Same contract on the `resumed:` label cell — rule and label
+        // share one `CellStyle`; a future split that recolours only the
+        // label would silently break the "quiet decoration" intent.
+        let label_col = row_text.find('r').expect("`resumed` label missing");
+        let label_cell = vterm.cell_at(row_idx, label_col);
+        assert!(
+            label_cell.fg.is_none(),
+            "`resumed:` label should share the rule's default-fg style — got fg={:?}",
+            label_cell.fg,
+        );
+
+        // Byte-stream guard: `\x1b[2m` MUST appear in the rendered
+        // output. Catches a regression to `style_for(Role::Secondary)`
+        // — same `fg=None` so vterm assertions above pass, but no dim
+        // is emitted and the rule visually matches body text again.
+        let bytes_str = String::from_utf8_lossy(&raw_bytes);
+        assert!(
+            bytes_str.contains("\x1b[2m"),
+            "separator must emit SGR 2 (faint) so terminal renders the rule \
+             and label dimmed against body text; got bytes (truncated): {:?}",
+            &bytes_str[..bytes_str.len().min(400)],
+        );
     }
 
     /// Error line: `[Error: msg]` body row with red fg — we assert
@@ -7249,5 +7414,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- width-aware truncation tests (Bug B) ---
+    //
+    // ToolGroup rows are forced to single terminal lines so child indices map
+    // 1:1 with terminal positions for in-place CUP rewrites. Pre-fix the
+    // truncators counted code points instead of display columns, so a row of
+    // 30 汉字 (60 cols) on a 40-col screen never tripped the truncate branch
+    // and the wide cells leaked past the screen edge — Screen::draw_row then
+    // hard-cut mid-glyph with no `…` marker.
+
+    #[test]
+    fn build_one_row_cjk_does_not_overflow_screen() {
+        // 30 汉字 = 60 display cols. Screen 40 → avail = 40 - PAD_COL = 38.
+        // Row's summed cell widths must fit within avail.
+        let text = "你".repeat(30);
+        let row = build_one_row(&text, &CellStyle::default(), 40);
+        let total_cols: usize = row.iter().map(|c| c.width as usize).sum();
+        assert!(
+            total_cols <= 38,
+            "row width {} cols exceeds avail 38 (screen=40, PAD_COL=2)",
+            total_cols
+        );
+    }
+
+    #[test]
+    fn truncate_body_str_uses_display_width_not_char_count() {
+        // 50 汉字 = 100 display cols. Budget 10 means "≤10 display cols of
+        // visible content"; the old `char_indices().nth(10)` cut after 10 code
+        // points (= 20 cols) which still overflows narrow ToolGroup rows.
+        let out = truncate_body_str(&"你".repeat(50), 10);
+        let w = crate::width::display_width(&out);
+        assert!(w <= 10, "output {} cols exceeds budget 10", w);
+    }
+
+    // --- SGR parser parity (Bug C) ---
+    //
+    // `CellStyle.faint` exists (cell.rs:48) and `cell::apply_sgr_params`
+    // already honors SGR 2 + clears it on SGR 22. The retained.rs local
+    // parser was missing both — commit 24b6dc04 switched the resumed
+    // divider to `\x1b[2m`, but trusted output routed through this parser
+    // would silently drop dim.
+
+    #[test]
+    fn apply_sgr_handles_faint_sgr_2() {
+        let mut style = CellStyle::default();
+        apply_sgr("2", &mut style);
+        assert!(style.faint, "SGR 2 must set faint");
+    }
+
+    #[test]
+    fn apply_sgr_22_clears_both_bold_and_faint() {
+        let mut style = CellStyle {
+            bold: true,
+            faint: true,
+            ..CellStyle::default()
+        };
+        apply_sgr("22", &mut style);
+        // ECMA-48 22 = "normal intensity" — clears bold AND faint as a pair;
+        // there's no per-attribute toggle for faint.
+        assert!(!style.bold, "SGR 22 must clear bold");
+        assert!(!style.faint, "SGR 22 must clear faint");
     }
 }

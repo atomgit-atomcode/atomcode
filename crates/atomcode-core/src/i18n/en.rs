@@ -649,7 +649,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── /plugin ──
         Msg::PluginUsage =>
-            "usage: /plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),
+            "usage: /plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | reload | list]".into(),
         Msg::PluginMarketplaceUsage =>
             "usage: /plugin marketplace [add|remove|update|list] <args>".into(),
         Msg::PluginInstallUsage =>
@@ -682,6 +682,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("uninstall: {error}").into(),
         Msg::PluginListFailed { error } =>
             format!("list plugins: {error}").into(),
+        Msg::PluginReloadDone { skills, warnings } =>
+            format!("Plugins reloaded: {skills} skill(s), {warnings} warning(s)").into(),
+        Msg::SetupAutoReloaded { skills, warnings } =>
+            format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
 
         // ── Command descriptions ──
 Msg::CmdDescSetup =>
@@ -724,7 +728,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescLanguage => "Switch display language".into(),
         Msg::CmdDescQuit => "Exit AtomCode".into(),
         Msg::CmdDescSkills => "Browse loaded skills".into(),
-        Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, list)".into(),
+        Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
 

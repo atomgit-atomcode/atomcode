@@ -455,6 +455,8 @@ pub enum Msg<'a> {
     PluginUninstalled { plugin: &'a str, marketplace: &'a str },
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },
+    PluginReloadDone { skills: usize, warnings: usize },
+    SetupAutoReloaded { skills: usize, warnings: usize },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
     CmdDescSetup,
