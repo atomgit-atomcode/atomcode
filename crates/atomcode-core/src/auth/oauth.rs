@@ -357,10 +357,16 @@ impl LoginSession {
             .json()
             .context("Failed to parse /auth/token response")?;
 
+        // `duration_since(UNIX_EPOCH)` only fails when the wall clock
+        // is before 1970 — a misconfigured VM clock at boot is the
+        // realistic trigger. Treat that as `created_at = 0`: the
+        // expiry check downstream will see the token as immediately
+        // stale and force a refresh / re-login rather than panicking
+        // out of the OAuth callback (#45).
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
 
         let auth_info = AuthInfo {
             access_token: token_resp.access_token,
@@ -489,10 +495,13 @@ fn pasted_state(url: &str) -> Option<String> {
 #[allow(dead_code)]
 fn generate_state() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // Pre-1970 wall clock falls back to 0 instead of panicking. The
+    // value is folded into a CSRF state string so a deterministic
+    // 0-derived value is fine for the dead-code path (#45 audit).
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     format!("atomcode_{}", timestamp)
 }
 
@@ -875,10 +884,13 @@ pub fn refresh_access_token(auth: &AuthInfo) -> Result<AuthInfo> {
 
     let broker_resp: BrokerResponse = response.json().context("Failed to parse broker response")?;
 
+    // Pre-1970 wall clock would otherwise panic on `unwrap` and lose
+    // the refresh result. Falling back to 0 forces the next token
+    // check to refresh again — safer than crashing the broker path.
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
 
     let new_auth = AuthInfo {
         access_token: broker_resp.access_token,

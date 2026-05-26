@@ -421,10 +421,13 @@ fn load_auth_token() -> Result<String> {
 
     // Check expiry (5-minute safety margin)
     if let Some(expires_in) = auth.expires_in {
+        // If the wall clock is somehow before 1970, treat the token
+        // as expired — far safer than panicking inside `create_provider`
+        // and bringing down /login (#45).
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX);
         if now >= auth.created_at + expires_in - 300 {
             // Token expired — try refresh
             if let Some(ref rt) = auth.refresh_token {
@@ -490,11 +493,14 @@ fn refresh_and_save(refresh_token: &str, auth_path: &std::path::Path) -> Result<
     // Preserve original token_type or use default
     let token_type = token.token_type.as_deref().unwrap_or("Bearer");
 
-    // Save updated auth.toml
+    // Save updated auth.toml — never panic the refresh path on a
+    // misconfigured wall clock (#45). `now = 0` makes the persisted
+    // token look immediately stale, forcing another refresh, which
+    // is the desired fail-safe behaviour.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let new_rt = token.refresh_token.as_deref().unwrap_or(refresh_token);
     let mut content = format!(
         "access_token = \"{}\"\ncreated_at = {}\nrefresh_token = \"{}\"\n",
