@@ -287,14 +287,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// of a turn gets a new mark; subsequent chunks within the same assistant turn are silent.
     /// Cleared whenever a User / ToolCall / ToolCallInFlight / TurnSeparator fires.
     last_mark_was_assistant: bool,
-    /// True iff user has scrolled away from the tail. While true, body
-    /// emit suppresses terminal writes and paint_body redraws from
-    /// body_lines[viewport_top..] via CUP+EL instead of DECSTBM \n.
-    view_mode: bool,
-    /// Top body_lines index visible at body region top, when view_mode = true.
-    viewport_top: usize,
-    /// True iff viewport_top >= max_top (auto-tail). Drives view_mode entry/exit.
-    sticky_bottom: bool,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
@@ -449,9 +441,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             body_lines: Vec::new(),
             message_marks: Vec::new(),
             last_mark_was_assistant: false,
-            view_mode: false,
-            viewport_top: 0,
-            sticky_bottom: true,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             dirty: false,
