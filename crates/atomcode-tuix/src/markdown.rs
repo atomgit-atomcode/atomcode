@@ -780,19 +780,20 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_block_colors_on_emits_truecolor_for_known_lang() {
-        // With colors enabled and a known language tag, the close-fence
-        // flush must include at least one truecolor SGR (theme color).
-        // We don't assert exact bytes — the palette is intentionally
-        // free to evolve in `highlight::theme`.
+    fn fenced_code_block_known_lang_emits_plain_indent_no_ansi() {
+        // Plan-0 contract (see `highlight_block`'s doc): even with colors
+        // enabled and a known language tag, the close-fence flush emits
+        // plain 2-space-indented source with zero ANSI. Per-token
+        // colouring was dropped because macOS Terminal.app's selection
+        // overlay made truecolor tokens unreadable inside selections.
         let mut state = MdState::new();
         let _ = render_line("```rust", &mut state, caps());
         assert!(render_line("fn main() {}", &mut state, caps()).is_none());
         let out = render_line("```", &mut state, caps()).unwrap();
-        assert!(out.contains("  "), "indent preserved: {:?}", out);
+        assert!(out.contains("  fn main() {}"), "indent + body preserved: {:?}", out);
         assert!(
-            out.contains("\x1b[38;2;"),
-            "expected at least one truecolor SGR, got: {:?}",
+            !out.contains('\x1b'),
+            "expected zero ANSI bytes under plan-0, got: {:?}",
             out
         );
     }
@@ -1175,12 +1176,11 @@ mod tests {
 
     #[test]
     fn fence_close_flushes_buffered_block_as_one_chunk() {
-        // Use plain_caps so the substring checks see the literal source text
-        // — with truecolor caps, syntect interleaves ANSI escapes between
-        // every token boundary (keywords/identifiers/operators each get
-        // their own SGR pair), so `out.contains("let x = 1;")` won't match.
-        // The colored path is covered separately by
-        // `fence_close_with_colors_produces_truecolor_ansi`.
+        // Uses `plain_caps()`; under plan-0 `caps()` would also emit
+        // plain-indent (no per-token colour), but staying on `plain_caps()`
+        // keeps the test's intent (buffer-flush contract) separable from
+        // the colour-policy contract pinned in
+        // `fence_close_with_colors_emits_plain_indent_no_ansi`.
         let mut st = MdState::new();
         assert!(render_line("```rust", &mut st, plain_caps()).is_none());
         assert!(render_line("let x = 1;", &mut st, plain_caps()).is_none());
@@ -1199,16 +1199,21 @@ mod tests {
     }
 
     #[test]
-    fn fence_close_with_colors_produces_truecolor_ansi() {
+    fn fence_close_with_colors_emits_plain_indent_no_ansi() {
+        // Plan-0: even with `caps.colors == true`, code-block flush
+        // emits the body with a 2-space indent and zero ANSI. See
+        // `highlight::highlight_block`'s doc for why per-token colour
+        // was dropped (Terminal.app selection-overlay readability).
         let mut st = MdState::new();
         render_line("```rust", &mut st, caps());
         render_line("fn main() {}", &mut st, caps());
         let out = render_line("```", &mut st, caps()).unwrap();
         assert!(
-            out.contains("\x1b[38;2;"),
-            "tinted output must contain a truecolor SGR, got: {:?}",
+            !out.contains('\x1b'),
+            "code-block output must contain zero ANSI under plan-0, got: {:?}",
             out
         );
+        assert!(out.contains("  fn main() {}"), "indent + body preserved: {:?}", out);
     }
 
     #[test]
