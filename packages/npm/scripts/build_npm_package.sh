@@ -2,8 +2,8 @@
 # ──────────────────────────────────────────────────────────────────────
 # AtomCode npm package build script
 # Usage:  ./scripts/build_npm_package.sh <version>
-# Example: ./scripts/build_npm_package.sh 4.23.1 --dry-run
-#          ./scripts/build_npm_package.sh 4.23.1
+# Example: ./scripts/build_npm_package.sh 4.23.2 --dry-run
+#          ./scripts/build_npm_package.sh 4.23.2
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 

@@ -872,7 +872,7 @@ impl OnboardingWizard {
         // Panel title carries the running atomcode version so users
         // reporting a screenshot tell us the build their bug landed
         // in without having to /status first. CARGO_PKG_VERSION is
-        // workspace-bound (e.g. "4.23.1") — matches the convention
+        // workspace-bound (e.g. "4.23.2") — matches the convention
         // used by the Step::Intro version line above.
         let panel_title = format!("AtomCode · v{}", env!("CARGO_PKG_VERSION"));
         out.extend(draw_panel(
