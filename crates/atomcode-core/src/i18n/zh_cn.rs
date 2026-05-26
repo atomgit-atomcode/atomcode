@@ -665,6 +665,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("列出 marketplace 失败：{error}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
+        Msg::PluginAlreadyInstalled { id } =>
+            format!("  插件 `{id}` 已安装。\n  PS: 如需重新安装，请先执行 `/plugin uninstall {id}`，然后再执行 `/plugin install {id}`\n").into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("已卸载 `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>

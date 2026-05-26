@@ -452,6 +452,7 @@ pub enum Msg<'a> {
     PluginMarketplaceUpdating { name: &'a str },
     PluginMarketplaceListFailed { error: &'a str },
     PluginInstalling { plugin: &'a str, marketplace: &'a str },
+    PluginAlreadyInstalled { id: &'a str },
     PluginUninstalled { plugin: &'a str, marketplace: &'a str },
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },

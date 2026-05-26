@@ -1,4 +1,24 @@
 use anyhow::{anyhow, bail, Context, Result};
+
+/// Error returned by [`install`] when the plugin is already present in
+/// `installed_plugins.json`. Carries the canonical plugin id so the
+/// caller can render a friendly reinstall hint.
+#[derive(Debug)]
+pub struct AlreadyInstalledError {
+    pub id: String,
+}
+
+impl std::fmt::Display for AlreadyInstalledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "plugin `{}` is already installed.\nPS: To reinstall, first run `/plugin uninstall {}` then `/plugin install {}`",
+            self.id, self.id, self.id
+        )
+    }
+}
+
+impl std::error::Error for AlreadyInstalledError {}
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -302,7 +322,7 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
             let abs = paths::plugins_root().unwrap().join(&plugin_dir_rel);
             std::fs::remove_dir_all(&abs).ok();
         }
-        bail!("plugin `{}` already installed; uninstall first", id);
+        return Err(AlreadyInstalledError { id: id.clone() }.into());
     }
     installed.plugins.insert(
         id.clone(),

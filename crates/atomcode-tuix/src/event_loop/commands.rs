@@ -1761,10 +1761,18 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 tokio::task::spawn_blocking(move || {
                     let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
                         Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
-                        Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
-                            op: "install".into(),
-                            msg: format!("{:#}", e),
-                        },
+                        Err(e) => {
+                            if let Some(_aie) = e.downcast_ref::<atomcode_core::plugin::installer::AlreadyInstalledError>() {
+                                atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                    id: _aie.id.clone(),
+                                }
+                            } else {
+                                atomcode_core::plugin::PluginJobEvent::Failed {
+                                    op: "install".into(),
+                                    msg: format!("{:#}", e),
+                                }
+                            }
+                        }
                     };
                     let _ = tx.send(ev);
                 });

@@ -5554,6 +5554,11 @@ pub(super) fn handle_plugin_job_event(
         PluginJobEvent::Failed { op, msg } => {
             renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
         }
+        PluginJobEvent::PluginAlreadyInstalled { id } => {
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginAlreadyInstalled { id: &id }).into_owned(),
+            ));
+        }
     }
     renderer.flush();
 }

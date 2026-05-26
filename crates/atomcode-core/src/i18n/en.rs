@@ -676,6 +676,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list marketplaces: {error}").into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),
+        Msg::PluginAlreadyInstalled { id } =>
+            format!("  plugin `{id}` is already installed.\n  PS: To reinstall, first run `/plugin uninstall {id}` then `/plugin install {id}`\n").into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("uninstalled `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
