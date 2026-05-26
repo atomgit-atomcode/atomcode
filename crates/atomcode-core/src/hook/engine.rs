@@ -258,6 +258,24 @@ impl HookEngine {
             || !self.on_user_prompt_submit_hooks.is_empty()
     }
 
+    /// 获取各 slot 的 hook 数量统计。
+    pub fn stats(&self) -> super::HookStats {
+        super::HookStats {
+            pre_tool_hooks: self.pre_tool_hooks.len(),
+            post_tool_hooks: self.post_tool_hooks.len(),
+            post_turn_hooks: self.post_turn_hooks.len(),
+            system_prompt_hooks: self.system_prompt_hooks.len(),
+            on_session_start_hooks: self.on_session_start_hooks.len(),
+            on_session_end_hooks: self.on_session_end_hooks.len(),
+            on_error_hooks: self.on_error_hooks.len(),
+            on_user_prompt_submit_hooks: self.on_user_prompt_submit_hooks.len(),
+            on_tool_call_start_hooks: self.on_tool_call_start_hooks.len(),
+            on_model_response_hooks: self.on_model_response_hooks.len(),
+            on_turn_start_hooks: self.on_turn_start_hooks.len(),
+            on_turn_complete_hooks: self.on_turn_complete_hooks.len(),
+        }
+    }
+
     // ── 加载 / 注册内置 Hook ──────────────────────────────────────
 
     /// 统一加载：JSON + TOML + 内置 + Webhook
@@ -446,7 +464,10 @@ impl ShellCommandHook {
 
     /// 执行 shell 命令，返回 stdout（环境变量协议）。
     async fn execute_hook(&self, ctx: &HookContext) -> anyhow::Result<String> {
-        let ctx_json = serde_json::to_string(ctx).unwrap_or_else(|_| "{}".to_string());
+        let ctx_json = serde_json::to_string(ctx).unwrap_or_else(|e| {
+            eprintln!("[Hook Warning] Failed to serialize HookContext to JSON: {}", e);
+            "{}".to_string()
+        });
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
@@ -519,18 +540,6 @@ impl ShellCommandHook {
         Ok(tokio::time::timeout(timeout, fut).await??)
     }
 
-    /// 构建 HookContext，用于传给子进程的环境变量。
-    fn build_context(&self, event: &str, tool_name: Option<&str>) -> HookContext {
-        HookContext {
-            event: event.to_string(),
-            tool_name: tool_name.map(String::from),
-            tool_args: None,
-            tool_result: None,
-            tool_success: None,
-            session_id: String::new(),
-            working_dir: String::new(),
-        }
-    }
 }
 
 impl Hook for ShellCommandHook {

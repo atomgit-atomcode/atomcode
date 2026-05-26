@@ -2060,24 +2060,19 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
 
     match cmd {
         HookCommands::List => {
-            use atomcode_core::hook::HookRegistry;
-            use atomcode_core::hook::config_loader::load_hooks;
+            let mut engine = atomcode_core::hook::HookEngine::new();
+            engine.load_all(&std::env::current_dir().unwrap_or_default());
 
-            let mut registry = HookRegistry::new();
-            load_hooks(&mut registry);
-
-            let stats = registry.stats();
+            let stats = engine.stats();
             let total = stats.pre_tool_hooks
                 + stats.post_tool_hooks
                 + stats.post_turn_hooks
                 + stats.system_prompt_hooks
-                + stats.on_message_received_hooks
-                + stats.on_turn_start_hooks
-                + stats.on_tool_call_start_hooks
-                + stats.on_turn_complete_hooks
                 + stats.on_session_start_hooks
                 + stats.on_session_end_hooks
                 + stats.on_error_hooks
+                + stats.on_user_prompt_submit_hooks
+                + stats.on_tool_call_start_hooks
                 + stats.on_model_response_hooks;
 
             println!("\nLoaded Hooks:");
@@ -2089,23 +2084,14 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                 println!("  {:<30} {:>5}", "Type", "Count");
                 println!("  {:<30} {:>5}", "─".repeat(30), "─".repeat(5));
 
-                if stats.on_message_received_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnMessageReceived", stats.on_message_received_hooks);
-                }
-                if stats.on_turn_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnTurnStart", stats.on_turn_start_hooks);
-                }
-                if stats.on_tool_call_start_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnToolCallStart", stats.on_tool_call_start_hooks);
-                }
                 if stats.pre_tool_hooks > 0 {
                     println!("  {:<30} {:>5}", "PreToolExecution", stats.pre_tool_hooks);
                 }
                 if stats.post_tool_hooks > 0 {
                     println!("  {:<30} {:>5}", "PostToolExecution", stats.post_tool_hooks);
                 }
-                if stats.on_turn_complete_hooks > 0 {
-                    println!("  {:<30} {:>5}", "OnTurnComplete", stats.on_turn_complete_hooks);
+                if stats.on_tool_call_start_hooks > 0 {
+                    println!("  {:<30} {:>5}", "OnToolCallStart", stats.on_tool_call_start_hooks);
                 }
                 if stats.post_turn_hooks > 0 {
                     println!("  {:<30} {:>5}", "PostTurn (legacy)", stats.post_turn_hooks);

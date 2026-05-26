@@ -100,7 +100,7 @@ impl HooksConfig {
         }
     }
 
-    /// 注册所有 webhooks 到 HookEngine
+    /// 注册所有 webhooks 到 HookEngine（按 trigger 过滤，避免冗余注册）
     /// TODO(#914): async_webhook batchers 当前仅创建但未 flush。
     /// 需在 HookEngine 上增加 flush 调度器，定期调用 AsyncWebhookRegistry::flush_batch()。
     pub fn register_webhooks_to_engine(&self, engine: &mut HookEngine) {
@@ -124,21 +124,55 @@ impl HooksConfig {
                 Arc::new(WebhookHook::new(config.clone()))
             };
 
-            engine.register_pre_tool_hook(webhook.clone());
-            engine.register_post_tool_hook(webhook.clone());
-            engine.register_post_turn_hook(webhook.clone());
-            engine.register_system_prompt_hook(webhook.clone());
-            engine.register_on_session_start_hook(webhook.clone());
-            engine.register_on_session_end_hook(webhook.clone());
-            engine.register_on_error_hook(webhook.clone());
-            engine.register_on_tool_call_start_hook(webhook.clone());
-            engine.register_on_model_response_hook(webhook.clone());
+            // 按 trigger 只注册到匹配的 slot（避免 9 个不必要的 Arc clone）
+            Self::register_webhook_by_trigger(engine, &webhook, &config.trigger);
 
             eprintln!("[Webhook] Registered: {} -> {}", config.name, config.url);
         }
 
         if !async_registry.batchers.is_empty() {
             eprintln!("[AsyncWebhook] Registered {} async batchers", async_registry.batchers.len());
+        }
+    }
+
+    /// 按 webhook 的 trigger 字符串注册到对应的 HookEngine slot。
+    /// 支持逗号分隔的多个 trigger（如 "pre_tool,post_tool,error"）。
+    fn register_webhook_by_trigger(
+        engine: &mut HookEngine,
+        webhook: &Arc<WebhookHook>,
+        trigger: &str,
+    ) {
+        let webhook = webhook.clone();
+        let t = trigger.to_lowercase();
+
+        // 注意：WebhookHook 的 trait 实现内部还有自己的 trigger check，
+        // 这里提前过滤以节省 Arc clone + Vec push 开销。
+        if t.contains("pre_tool") || t.contains("before_tool") {
+            engine.register_pre_tool_hook(webhook.clone());
+        }
+        if t.contains("post_tool") || t.contains("after_tool") {
+            engine.register_post_tool_hook(webhook.clone());
+        }
+        if t.contains("post_turn") {
+            engine.register_post_turn_hook(webhook.clone());
+        }
+        if t.contains("system_prompt") {
+            engine.register_system_prompt_hook(webhook.clone());
+        }
+        if t.contains("session_start") {
+            engine.register_on_session_start_hook(webhook.clone());
+        }
+        if t.contains("session_end") {
+            engine.register_on_session_end_hook(webhook.clone());
+        }
+        if t.contains("error") {
+            engine.register_on_error_hook(webhook.clone());
+        }
+        if t.contains("tool_call_start") {
+            engine.register_on_tool_call_start_hook(webhook.clone());
+        }
+        if t.contains("model_response") {
+            engine.register_on_model_response_hook(webhook.clone());
         }
     }
 }

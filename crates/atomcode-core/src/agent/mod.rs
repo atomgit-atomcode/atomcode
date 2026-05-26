@@ -560,6 +560,11 @@ pub struct AgentLoop {
     // Datalog writer — writes per-turn markdown logs to datalog/ directory.
     datalog: crate::turn::datalog::DatalogWriter,
 
+    /// SystemPrompt hook extensions cached before each turn.
+    /// Populated by `refresh_hook_extensions` before calling `build_system_prompt`.
+    /// Vec<String> — empty means no extensions. Reset at session start and on reload.
+    cached_system_prompt_extensions: Vec<String>,
+
     // Channels
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -958,6 +963,7 @@ impl AgentLoop {
             skill_registry,
             reindex_tx: None,
             datalog,
+            cached_system_prompt_extensions: Vec::new(),
             cmd_rx,
             event_tx,
         };
@@ -1754,6 +1760,13 @@ impl AgentLoop {
             // no edits), preventing it from stopping. The warning was interpreted
             // as "keep working" by the model. Stagnation detection was harmful —
             // the prompt guides the model to work efficiently.
+
+            // Refresh hook system-prompt extensions before building the prompt.
+            self.cached_system_prompt_extensions = self
+                .turn_runner
+                .hook_engine
+                .collect_system_prompt_extensions()
+                .await;
 
             let system_prompt = self.build_system_prompt();
             // Per-turn reminder removed: verbatim task now rides on the cadence

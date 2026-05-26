@@ -199,6 +199,19 @@ Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
         // function keeps agent::prompt free of `if model_id.contains(...)`
         // branches — per-model customization now lives in ctx.
 
+        // --- SystemPrompt hook extensions ---
+        // SystemPromptHook 允许用户（通过脚本/webhook）在 system prompt 末尾注入
+        // 自定义内容（如安全策略、命名约定等）。这些扩展由 HookEngine 统一收集。
+        // 此方法为同步（fn build_system_prompt），依赖调用方在调用之前预先调用
+        // refresh_hook_extensions() 收集并缓存扩展。
+        if !self.cached_system_prompt_extensions.is_empty() {
+            prompt.push_str("\n=== HOOK SYSTEM PROMPT EXTENSIONS ===\n");
+            for ext in &self.cached_system_prompt_extensions {
+                prompt.push_str(ext);
+                prompt.push('\n');
+            }
+        }
+
         prompt
     }
 }

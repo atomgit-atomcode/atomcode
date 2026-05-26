@@ -35,7 +35,6 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_core::config::Config;
-use atomcode_core::hook::HookRegistry;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::conversation::Conversation;
 use atomcode_core::lsp::manager::build_lsp_manager;
@@ -2082,11 +2081,8 @@ async fn process_chat_request(
         config: config.clone(),
         ctx: daemon_ctx,
         permission,
-        hook_registry: HookRegistry::new(), // Daemon mode doesn't use hooks for now
+        hook_engine: std::sync::Arc::new(atomcode_core::hook::HookEngine::new()), // Daemon mode doesn't use hooks for now
         recently_edited_files: Vec::new(),
-        hook_executor: std::sync::Arc::new(atomcode_core::hook::executor::HookExecutor::new(
-            atomcode_core::hook::json_config::load_hooks_config(&working_dir),
-        )),
         loop_guard: Default::default(),
     };
 
