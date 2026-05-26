@@ -8770,6 +8770,94 @@ mod tests {
         );
     }
 
+    /// Regression for the "system bell rings on Ctrl+C copy" bug.
+    /// `renderer.copy_selection()` (the Ctrl+C path) must not emit
+    /// `\x07` (BEL) bytes anywhere in its output. Mouse-release copy
+    /// uses `copy_to_clipboard` which falls back to OSC 52 (BEL-
+    /// terminated) on arboard failure — that's expected. Ctrl+C copy
+    /// uses arboard-only and must therefore stay silent.
+    #[test]
+    fn retained_ctrl_c_copy_selection_emits_no_bel() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        // Seed a User row so there's something to select.
+        r.render(UiLine::User("hello world from a body row".into()));
+        r.flush_deferred();
+
+        // Start a selection covering the visible text.
+        let body_height = r.body_bottom_row() as usize;
+        let total = r.body_lines.len();
+        let viewport_start = total.saturating_sub(body_height);
+        let target_row = (viewport_start..total)
+            .find(|&i| !r.body_lines[i].is_empty())
+            .expect("at least one non-empty visible row");
+        r.selection.begin((target_row, 0));
+        r.selection.update((target_row, 10));
+
+        // Clear captured bytes so we only inspect copy_selection output.
+        buf.lock().unwrap().clear();
+        let copied = r.copy_selection();
+        // arboard MAY fail in the test environment (headless CI etc) —
+        // when it does, copy_selection returns false. The invariant
+        // about BEL must hold regardless of whether the copy actually
+        // landed on the system clipboard.
+        let _ = copied;
+        let output = buf.lock().unwrap().clone();
+        assert!(
+            !output.contains(&b'\x07'),
+            "Ctrl+C copy_selection must not emit BEL (\\x07); got bytes: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    /// Regression for the "system bell rings on selection end" bug.
+    /// `end_selection` (mouse-release) calls `copy_to_clipboard` which
+    /// historically wrote OSC 52 first, BEL-terminated and audible on
+    /// iTerm2 / Terminal.app when their visual-bell setting was off.
+    /// The 26efb791 commit switched the order to arboard-first, but
+    /// the OSC 52 fallback path STILL emits a BEL whenever arboard
+    /// fails — that's wrong when arboard is the canonical path on
+    /// every supported desktop platform: a failure is exceptional and
+    /// shouldn't ring the user's terminal.
+    ///
+    /// This test pins the invariant: when arboard succeeds (typical
+    /// case on darwin / linux desktop / windows), `end_selection` must
+    /// not emit BEL bytes.
+    #[test]
+    fn retained_end_selection_emits_no_bel_when_arboard_succeeds() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        r.render(UiLine::User("hello world from a body row".into()));
+        r.flush_deferred();
+
+        let body_height = r.body_bottom_row() as usize;
+        let total = r.body_lines.len();
+        let viewport_start = total.saturating_sub(body_height);
+        let target_row = (viewport_start..total)
+            .find(|&i| !r.body_lines[i].is_empty())
+            .expect("at least one non-empty visible row");
+        r.selection.begin((target_row, 0));
+        r.selection.update((target_row, 10));
+
+        buf.lock().unwrap().clear();
+        r.end_selection();
+        let output = buf.lock().unwrap().clone();
+        // Test environments may not have arboard available — in that
+        // case `copy_to_clipboard` falls back to OSC 52 and we'd
+        // legitimately emit BEL. Skip the assertion in that scenario;
+        // the unconditional assertion lives in the unit test for the
+        // arboard-first path.
+        if arboard::Clipboard::new().is_ok() {
+            assert!(
+                !output.contains(&b'\x07'),
+                "end_selection must not emit BEL when arboard succeeds; got: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    }
+
     /// Regression for the ghost-row-tail bug seen in the user
     /// screenshot. The root cause is a multi-step interaction:
     ///   1. A body row is painted with LONG content. The cell-diff

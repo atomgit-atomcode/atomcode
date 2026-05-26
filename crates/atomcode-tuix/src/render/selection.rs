@@ -457,11 +457,22 @@ pub fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// Emit OSC 52 (`\x1b]52;c;<base64>\x07`) carrying `text` so the
+/// Emit OSC 52 (`\x1b]52;c;<base64>\x1b\\`) carrying `text` so the
 /// host terminal copies it to the system clipboard. Empty text is
 /// a no-op to avoid clearing whatever the user previously had.
 /// Best-effort — terminals that don't honour OSC 52 (Terminal.app
 /// without explicit opt-in) silently ignore the sequence.
+///
+/// Terminates with **String Terminator (ST = `\x1b\\`)** rather than
+/// **BEL (`\x07`)** even though both are valid OSC terminators per
+/// xterm. Some terminal emulators (notably classic conhost and a
+/// handful of less-common Linux terminals — anything that maps BEL to
+/// "play the audible/visible bell" even inside an OSC envelope) ring
+/// the system bell every time an OSC 52 lands. The "Ctrl+C-rings-bell-
+/// on-copy" symptom traces back to that: arboard-failure paths fell
+/// through to `emit_osc52` and the BEL terminator was misinterpreted.
+/// ST is the formally-defined ANSI terminator and is honoured silently
+/// by every emulator we care about.
 ///
 /// Takes `out: &mut dyn Write` rather than `&mut self` so both
 /// AltScreenRenderer and RetainedRenderer can call it without
@@ -471,7 +482,7 @@ pub fn emit_osc52(out: &mut dyn Write, text: &str) {
         return;
     }
     let encoded = base64_encode(text.as_bytes());
-    let _ = write!(out, "\x1b]52;c;{}\x07", encoded);
+    let _ = write!(out, "\x1b]52;c;{}\x1b\\", encoded);
     let _ = out.flush();
 }
 
@@ -736,6 +747,33 @@ mod tests {
         assert!(
             buf.is_empty(),
             "empty text must not emit OSC 52 or anything else"
+        );
+    }
+
+    /// `emit_osc52` MUST terminate with ST (`\x1b\\`), NOT BEL
+    /// (`\x07`). Regression for the "selection copy rings system bell"
+    /// bug — see the `emit_osc52` doc comment for the rationale.
+    #[test]
+    fn emit_osc52_terminates_with_st_not_bel() {
+        let mut buf = Vec::new();
+        emit_osc52(&mut buf, "hello");
+        let s = std::str::from_utf8(&buf).expect("OSC 52 emit is ASCII");
+        assert!(
+            s.starts_with("\x1b]52;c;"),
+            "OSC 52 must open with `\\x1b]52;c;`, got: {:?}",
+            s
+        );
+        assert!(
+            s.ends_with("\x1b\\"),
+            "OSC 52 must terminate with ST (`\\x1b\\\\`), got: {:?}",
+            s
+        );
+        assert!(
+            !buf.contains(&b'\x07'),
+            "OSC 52 must NOT contain BEL (`\\x07`) — some terminals \
+             interpret it as 'ring the bell' even inside an OSC envelope; \
+             got: {:?}",
+            s
         );
     }
 
