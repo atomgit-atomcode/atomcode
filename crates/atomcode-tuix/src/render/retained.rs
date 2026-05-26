@@ -1529,20 +1529,31 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // push_body_prefixed appends fresh committed lines.
             self.live_spinner_active = false;
             let remove = self.inflight_tool_rows.min(self.body_lines.len());
+            // CRITICAL: capture the bottom row BEFORE truncating. With
+            // the top-anchored body model, `body_bottom_row()` returns
+            // `min(body_lines.len(), cap)` — calling it AFTER truncate
+            // would point at the LAST `remove` rows of REMAINING body
+            // content (the rows just above the inflight strip), which
+            // erases real markers instead of the spinner rows we meant
+            // to clear. The pre-truncate bottom is the 1-idx terminal
+            // row of the LAST inflight row, exactly what we want.
+            let bottom_before_truncate = self.body_bottom_row();
             self.body_lines.truncate(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
             self.ensure_scroll_region();
-            let bottom = self.body_bottom_row();
-            if bottom > 0 && remove > 0 {
+            if bottom_before_truncate > 0 && remove > 0 {
                 // Erase ALL terminal rows previously occupied by the
                 // inflight spinner (may be >1 when the command was long
                 // enough to wrap). Without this, the old `⠙ Bash(...)`
                 // row lingers on-screen above the freshly committed
                 // `● Bash(...)` row, producing a visual duplicate.
-                let start_row = bottom.saturating_sub(remove as u16 - 1).max(1);
-                let mut seq = String::with_capacity((bottom - start_row + 1) as usize * 8);
+                let start_row = bottom_before_truncate
+                    .saturating_sub(remove as u16 - 1)
+                    .max(1);
+                let mut seq =
+                    String::with_capacity((bottom_before_truncate - start_row + 1) as usize * 8);
                 use std::fmt::Write as _;
-                for row in start_row..=bottom {
+                for row in start_row..=bottom_before_truncate {
                     let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
                 }
                 let _ = self.out.write_all(seq.as_bytes());
@@ -2972,6 +2983,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // glyphs — so the first ▶ we encounter must be ours.
         // Safe because the agent doesn't append further body rows
         // between `ApprovalNeeded` and the user's Y/A/N reply.
+        //
+        // CRITICAL: capture `bottom` BEFORE the pop loop runs. In the
+        // top-anchored body model, `body_bottom_row()` returns
+        // `min(body_lines.len(), cap)` — calling it AFTER popping
+        // would point at the LAST `popped_count` rows of REMAINING
+        // body content (the rows just above the approval strip), so
+        // the erase would wipe real markers instead of the formerly-
+        // approval rows. Capture once, before mutating body_lines.
+        let bottom_before_pop = self.body_bottom_row();
         let mut popped_count: u16 = 0;
         loop {
             let action = match self.body_lines.last() {
@@ -2999,8 +3019,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             return;
         }
         // Physically wipe the popped rows for instant visual feedback
-        // on Y/A/N. The popped rows sat at the BOTTOM of the body
-        // region — terminal rows `bottom - popped_count + 1 ..= bottom`
+        // on Y/A/N. The popped rows occupied terminal rows
+        // `bottom_before_pop - popped_count + 1 ..= bottom_before_pop`
         // (1-indexed). Erase them row-by-row with `\x1b[K` (EL).
         //
         // Why per-row EL and not `\x1b[J` (ED from cursor): the cursor
@@ -3017,8 +3037,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // next body emit to overwrite in place (no scroll) so
         // `⎿ result` lands directly below the `● Tool` row with no
         // gap.
-        let bottom = self.body_bottom_row();
-        if bottom > 0 {
+        if bottom_before_pop > 0 {
             // Erase the popped body rows (may span multiple terminal
             // lines). Use per-row \x1b[K instead of \x1b[J to avoid
             // erasing the footer rows below the body strip.
@@ -3028,10 +3047,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // repaint — leaving the footer permanently blank.
             // invalidate() below ensures the next flush_deferred()
             // emits a full repaint of every non-blank cell.
-            let start_row = bottom.saturating_sub(popped_count - 1).max(1);
-            let mut seq = String::with_capacity((bottom - start_row + 1) as usize * 8);
+            let start_row = bottom_before_pop.saturating_sub(popped_count - 1).max(1);
+            let mut seq = String::with_capacity((bottom_before_pop - start_row + 1) as usize * 8);
             use std::fmt::Write as _;
-            for row in start_row..=bottom {
+            for row in start_row..=bottom_before_pop {
                 let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
             }
             let _ = self.out.write_all(seq.as_bytes());
@@ -8040,7 +8059,10 @@ mod tests {
         // the live viewport rows [0..body_rows_on_screen). The very last
         // row before the footer should show the latest pushed label.
         let body_rows_on_screen = r.body_bottom_row() as usize;
-        assert!(body_rows_on_screen > 0, "body should occupy at least one row after overflow");
+        assert!(
+            body_rows_on_screen > 0,
+            "body should occupy at least one row after overflow"
+        );
         // Take a sample of the most recent labels and confirm each is
         // present somewhere in the live body region.
         let total = r.body_lines.len();
@@ -8058,8 +8080,7 @@ mod tests {
             if label.is_empty() {
                 continue;
             }
-            let found = (0..body_rows_on_screen)
-                .any(|row| vterm.row_text(row).contains(&label));
+            let found = (0..body_rows_on_screen).any(|row| vterm.row_text(row).contains(&label));
             if found {
                 seen_recent += 1;
             }
@@ -8074,8 +8095,8 @@ mod tests {
         );
         // The oldest row (R000) MUST NOT be in the live viewport
         // (it should have been scrolled out into scrollback).
-        let oldest_visible_in_live = (0..body_rows_on_screen)
-            .any(|row| vterm.row_text(row).contains("R000"));
+        let oldest_visible_in_live =
+            (0..body_rows_on_screen).any(|row| vterm.row_text(row).contains("R000"));
         assert!(
             !oldest_visible_in_live,
             "oldest body row R000 must be off-screen (scrolled into native scrollback) \
@@ -8114,4 +8135,134 @@ mod tests {
         );
     }
 
+    /// Regression (top-anchored body model): `commit_inflight_tool`
+    /// previously read `body_bottom_row()` AFTER truncating the
+    /// inflight rows, so the erase range pointed at the LAST `remove`
+    /// rows of REMAINING body content rather than the rows that
+    /// formerly held the spinner. Cell-diff could not catch the
+    /// regression because the Screen buffer state matched the body
+    /// (we erased the physical terminal but left buffer marks intact).
+    /// User-visible bug: prior body markers vanished from the terminal
+    /// after every tool commit when the body had pre-existing content.
+    #[test]
+    fn retained_commit_inflight_preserves_prior_body() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Seed a full frame so footer is painted (mirrors real boot).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Push N markers as body rows BEFORE the inflight starts.
+        const N: usize = 5;
+        for i in 0..N {
+            r.render(UiLine::AssistantText(format!("MARKER_R{}\n", i)));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Trigger inflight (adds rows AFTER the markers).
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: "ls -la /tmp".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Commit (truncates inflight rows — must NOT clobber markers).
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // All N markers must still be visible on the terminal.
+        for i in 0..N {
+            let label = format!("MARKER_R{}", i);
+            assert!(
+                vterm.any_row(|row| row.contains(&label)),
+                "MARKER_R{} should still be on terminal after commit_inflight_tool, \
+                 but it was erased by the over-erase bug.\ndump:\n{}",
+                i,
+                vterm.dump()
+            );
+        }
+    }
+
+    /// Regression (top-anchored body model): `pop_approval_prompt`
+    /// has the same wrong-row-erase pattern as `commit_inflight_tool`,
+    /// but the bug is masked at the user level by the immediately
+    /// following `screen.invalidate()` that forces a full repaint.
+    /// This test still asserts the post-condition contract — that
+    /// prior body rows remain visible after popping — so a future
+    /// refactor that drops the `invalidate()` shield can't silently
+    /// regress this path. With the over-erase removed (or the math
+    /// corrected) the test passes for the right reason instead of
+    /// being saved by the invalidation hammer.
+    #[test]
+    fn retained_approval_pop_preserves_prior_body() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        const N: usize = 5;
+        for i in 0..N {
+            r.render(UiLine::AssistantText(format!("MARKER_R{}\n", i)));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        r.pop_approval_prompt();
+        // Trigger a repaint cycle (mirrors what happens after Y/A/N).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        for i in 0..N {
+            let label = format!("MARKER_R{}", i);
+            assert!(
+                vterm.any_row(|row| row.contains(&label)),
+                "MARKER_R{} should still be on terminal after pop_approval_prompt.\
+                 \ndump:\n{}",
+                i,
+                vterm.dump()
+            );
+        }
+    }
 }
