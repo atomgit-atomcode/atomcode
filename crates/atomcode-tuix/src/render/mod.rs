@@ -1,5 +1,4 @@
 // crates/atomcode-tuix/src/render/mod.rs
-pub mod alt_screen;
 #[cfg(windows)]
 pub mod conhost;
 pub mod cell;
@@ -271,13 +270,10 @@ pub trait Renderer: Send {
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
 
     /// Scroll the body viewport up (negative `delta`) or down
-    /// (positive `delta`) by `delta` rows. Used by AltScreenRenderer
-    /// to support PageUp / PageDown / arrow-up scrollback navigation
-    /// inside the alt-screen (where the host terminal's native
-    /// scrollback is unavailable).
+    /// (positive `delta`) by `delta` rows.
     ///
     /// Default no-op for renderers that delegate scrollback to the
-    /// host terminal (RetainedRenderer's DECSTBM path; PlainRenderer
+    /// host terminal (RetainedRenderer's append-only path; PlainRenderer
     /// streaming to stdout).
     fn scroll_body(&mut self, _delta: i32) {}
 
@@ -299,7 +295,7 @@ pub trait Renderer: Send {
     ///
     /// This is the Ctrl+C fallback for terminals (Windows Terminal,
     /// conhost) that ignore OSC 52 — the user selects text with the
-    /// mouse, then presses Ctrl+C to copy it. AltScreenRenderer
+    /// mouse, then presses Ctrl+C to copy it. RetainedRenderer
     /// implements this; other backends return `false` (they use the
     /// host terminal's native selection).
     fn copy_selection(&mut self) -> bool {
