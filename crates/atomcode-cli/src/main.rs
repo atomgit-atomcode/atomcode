@@ -51,19 +51,25 @@ use atomcode_telemetry::{
 };
 
 /// Set to `true` at the start of `run_headless` so the panic hook and the
-/// top-level error handler can skip TUI cleanup. In headless mode we never
-/// entered the alternate screen, so calling `LeaveAlternateScreen` would
-/// emit `\x1b[?1049l` to stdout and corrupt pipe-friendly output.
+/// top-level error handler can skip TUI cleanup. In headless mode raw mode
+/// was never enabled, so calling `disable_raw_mode` would be a wasted ioctl
+/// and on Windows can panic if the console handle isn't a real TTY.
 static HEADLESS_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Restore terminal state if (and only if) we ever entered TUI mode.
 /// No-op in headless mode — see [`HEADLESS_MODE`].
+///
+/// TUI mode (v4.23.2+) runs entirely in the primary screen via the
+/// append-only RetainedRenderer — we never emit `\x1b[?1049h`, so there
+/// is no `LeaveAlternateScreen` counterpart to issue here. Mouse mode,
+/// cursor visibility, autowrap and DECSTBM are restored by
+/// `RetainedRenderer::Drop` / `shutdown()`; this hook only owns the
+/// raw-mode toggle.
 fn restore_terminal_if_tui() {
     if HEADLESS_MODE.load(Ordering::Relaxed) {
         return;
     }
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen,);
 }
 
 /// Resolve the working directory at startup. **Always** uses the current
@@ -1582,8 +1588,9 @@ async fn run_headless(
     capture: bool,
     working_dir: PathBuf,
 ) -> Result<(i32, Option<String>)> {
-    // Tell the panic hook / error path to skip TUI cleanup — we never enter
-    // the alternate screen here, so LeaveAlternateScreen would corrupt stdout.
+    // Tell the panic hook / error path to skip TUI cleanup — raw mode was
+    // never enabled here, so `disable_raw_mode` would be a wasted ioctl
+    // (and on Windows can panic when stdin isn't a real console handle).
     HEADLESS_MODE.store(true, Ordering::Relaxed);
 
     let notifications = agent_loop.config.notifications.clone();

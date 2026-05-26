@@ -2409,9 +2409,8 @@ mod tests {
     /// Three layered signals — colour, prefix glyph, suffix text —
     /// because each can fail independently:
     ///   * SGR 31 only fires when the renderer's sanitizer keeps SGR
-    ///     (alt_screen, plain) — retained's strict strip pathway
-    ///     drops the colour but the glyph + text still carry the
-    ///     meaning.
+    ///     (plain) — retained's strict strip pathway drops the colour
+    ///     but the glyph + text still carry the meaning.
     ///   * The `×` glyph (U+00D7 MULTIPLICATION SIGN) is Latin-1 and
     ///     present in every terminal font (unlike U+2717 ✗ which is
     ///     missing from macOS Terminal.app's default font).
