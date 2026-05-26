@@ -2236,6 +2236,24 @@ impl AgentLoop {
                     tokens,
                     truncated,
                 } => {
+                    // Trigger model response hooks (fire-and-forget)
+                    {
+                        let wd = self
+                            .turn_runner
+                            .context
+                            .working_dir
+                            .try_read()
+                            .map(|g| g.display().to_string())
+                            .unwrap_or_default();
+                        let mctx = crate::hook::TurnStartContext {
+                            turn_number: self.turn_count as u32,
+                            session_id: Some(self.session_id.clone()),
+                            working_dir: wd,
+                            phase: format!("{:?}", self.phase).to_lowercase(),
+                            has_file_context: !self.files_edited_this_turn.is_empty(),
+                        };
+                        self.turn_runner.hook_engine.trigger_on_model_response(text, &mctx).await;
+                    }
                     self.turn_tokens += tokens;
                     self.total_tokens += tokens;
                     // Log the final assistant text to datalog (TUI used to do this —
@@ -2434,6 +2452,15 @@ impl AgentLoop {
 
                     if is_official_build_required {
                         self.datalog.log_error(&e);
+                        {
+                            let err_ctx = crate::hook::ErrorContext {
+                                error_type: "codingplan_unavailable".into(),
+                                error_message: e.clone(),
+                                phase: format!("{:?}", self.phase).to_lowercase(),
+                                turn_number: Some(self.turn_count as u32),
+                            };
+                            self.turn_runner.hook_engine.trigger_on_error(&err_ctx).await;
+                        }
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2480,6 +2507,15 @@ impl AgentLoop {
                         continue;
                     } else if is_auth_error {
                         self.datalog.log_error(&e);
+                        {
+                            let err_ctx = crate::hook::ErrorContext {
+                                error_type: "auth_error".into(),
+                                error_message: e.clone(),
+                                phase: format!("{:?}", self.phase).to_lowercase(),
+                                turn_number: Some(self.turn_count as u32),
+                            };
+                            self.turn_runner.hook_engine.trigger_on_error(&err_ctx).await;
+                        }
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),
@@ -2498,6 +2534,15 @@ impl AgentLoop {
                         continue;
                     } else {
                         self.datalog.log_error(&e);
+                        {
+                            let err_ctx = crate::hook::ErrorContext {
+                                error_type: "api_error".into(),
+                                error_message: e.clone(),
+                                phase: format!("{:?}", self.phase).to_lowercase(),
+                                turn_number: Some(self.turn_count as u32),
+                            };
+                            self.turn_runner.hook_engine.trigger_on_error(&err_ctx).await;
+                        }
                         let _ = self.event_tx.send(AgentEvent::Error {
                             error: public_error_message(&e),
                             messages: self.conversation.messages.clone(),

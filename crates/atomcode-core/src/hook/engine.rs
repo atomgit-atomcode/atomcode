@@ -133,7 +133,19 @@ impl HookEngine {
         }
     }
 
-    // ── 触发方法 (6 个有调用点的) ──────────────────────────────────
+    pub fn register_on_turn_start_hook(&mut self, hook: Arc<dyn super::OnTurnStartHook>) {
+        if hook.is_enabled() {
+            self.on_turn_start_hooks.push(hook);
+        }
+    }
+
+    pub fn register_on_turn_complete_hook(&mut self, hook: Arc<dyn super::OnTurnCompleteHook>) {
+        if hook.is_enabled() {
+            self.on_turn_complete_hooks.push(hook);
+        }
+    }
+
+    // ── 触发方法 (8 个有调用点的) ──────────────────────────────────
 
     /// 工具执行前触发所有 PreToolExecutionHook。
     /// 返回:
@@ -497,14 +509,10 @@ impl HookEngine {
 
         // TurnStatsHook: OnTurnStart + OnTurnComplete
         let stats = Arc::new(TurnStatsHook { enabled: true });
-        // OnTurnStartHook is in separate vec — register manually
-        if stats.is_enabled() {
-            self.on_turn_start_hooks.push(stats.clone());
-        }
-        // OnTurnCompleteHook is in separate vec
-        if stats.is_enabled() {
-            self.on_turn_complete_hooks.push(stats.clone());
-        }
+        // TurnStatsHook implements both OnTurnStartHook + OnTurnCompleteHook;
+        // register via public API rather than direct field access.
+        self.register_on_turn_start_hook(stats.clone());
+        self.register_on_turn_complete_hook(stats.clone());
 
         // AutoCommitHook: OnTurnCompleteHook
         let auto_commit = Arc::new(AutoCommitHook {

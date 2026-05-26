@@ -167,12 +167,20 @@ impl HooksConfig {
         if t.contains("error") {
             engine.register_on_error_hook(webhook.clone());
         }
+        if t.contains("turn_start") {
+            engine.register_on_turn_start_hook(webhook.clone());
+        }
+        if t.contains("turn_complete") || t.contains("after_turn") {
+            engine.register_on_turn_complete_hook(webhook.clone());
+        }
         if t.contains("tool_call_start") {
             engine.register_on_tool_call_start_hook(webhook.clone());
         }
         if t.contains("model_response") {
             engine.register_on_model_response_hook(webhook.clone());
         }
+        // Note: "message" / "user_prompt_submit" webhook support requires an
+        // OnMessageReceivedHook slot in HookEngine (TODO: follow-up PR).
     }
 }
 
