@@ -167,74 +167,6 @@ fn clip_cells_to_width(cells: &[Cell], max_cols: usize) -> Vec<Cell> {
     out
 }
 
-/// Apply the selection reverse-video overlay to `cells` in place.
-/// `body_idx` is the absolute `body_lines` index of the row these
-/// cells belong to; `lo`/`hi` are the inclusive (row, col) endpoints
-/// of the active selection, already normalised so that `lo <= hi`.
-///
-/// Cells with `width == 0` (continuation cells for the second column
-/// of a wide glyph) inherit the styling of their preceding real cell
-/// — both halves of a wide cluster either join the selection together
-/// or stay out together, matching the wide-char overlap rule used by
-/// `selection::render_line_with_selection`.
-///
-/// To keep the highlight visually consistent regardless of the
-/// underlying line styling, the overlay REPLACES the cell's style
-/// with a clean reverse-video style (`CellStyle { reverse: true,
-/// ..default() }`) — same intent as the
-/// `\x1b[0m\x1b[7m...\x1b[0m` wrap in `render_line_with_selection`
-/// (reset existing colours, then enable reverse).
-fn apply_selection_overlay(
-    cells: &mut [Cell],
-    body_idx: usize,
-    lo: crate::render::selection::BodyPos,
-    hi: crate::render::selection::BodyPos,
-) {
-    if body_idx < lo.0 || body_idx > hi.0 {
-        return;
-    }
-    // Half-open `[sel_start, sel_end)` matching the wide-char overlap
-    // rule. `hi.1` is the inclusive head column, so end_exclusive =
-    // hi.1 + 1 on the row that contains the head; rows strictly
-    // between lo.0 and hi.0 select to the row's full painted width.
-    let sel_start = if body_idx == lo.0 { lo.1 as usize } else { 0 };
-    let sel_end_excl = if body_idx == hi.0 {
-        (hi.1 as usize).saturating_add(1)
-    } else {
-        usize::MAX
-    };
-    let reverse_style = CellStyle {
-        reverse: true,
-        ..Default::default()
-    };
-    let mut cols = 0usize;
-    let mut last_real_style: Option<CellStyle> = None;
-    for cell in cells.iter_mut() {
-        let w = cell.width as usize;
-        if w == 0 {
-            // Continuation cell — adopt the style of the preceding real
-            // cell so wide-glyph halves stay in lockstep. The real cell
-            // already decided whether to flip to reverse-video; mirror
-            // that decision here. Continuation cells don't emit bytes
-            // (their `width == 0` makes the serialiser skip them), but
-            // the cell-equality check still uses style, and keeping the
-            // halves in sync makes any debug dump consistent.
-            if let Some(s) = &last_real_style {
-                cell.style = s.clone();
-            }
-            continue;
-        }
-        // Cluster spans cols..cols+w. Joins the selection iff that
-        // range overlaps [sel_start, sel_end_excl).
-        let in_sel = cols + w > sel_start && cols < sel_end_excl;
-        if in_sel {
-            cell.style = reverse_style.clone();
-        }
-        last_real_style = Some(cell.style.clone());
-        cols += w;
-    }
-}
-
 /// Cell-based wrap: splits a cell sequence into chunks whose sum
 /// of `cell.width` stays ≤ `max_cols`. Continuation cells (width 0)
 /// travel with their preceding real cell — the combined "grapheme"
@@ -445,10 +377,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// only on one side of the lifecycle).
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
-    /// Mouse text-selection state: anchor, head, and drag-active flag.
-    /// Driven by `begin_selection` / `update_selection` / `end_selection`
-    /// / `copy_selection` trait methods wired in P5.2.
-    selection: crate::render::selection::SelectionState,
     /// Whether to paint the right-side vertical scrollbar. Persisted to
     /// ui-state.toml so the setting survives restarts. Toggled via
     /// `toggle_scrollbar()`. P6.5 uses this field in repaint_body_region.
@@ -529,7 +457,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_group: None,
             #[cfg(windows)]
             prior_console_in_mode,
-            selection: Default::default(),
             show_scrollbar,
         }
     }
@@ -1281,35 +1208,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let visible = total.min(body_height);
         let start = total - visible;
         let body_width = self.effective_body_width();
-        // Extract selection bounds before the draw loop. Doing the
-        // overlay here (rather than as a separate raw-stdout write in
-        // `repaint_body_region`) keeps the cell grid in sync with what
-        // is on the physical terminal: the cell-diff then naturally
-        // emits both the reverse-video on selection cells AND the
-        // un-reverse patches when the selection clears. The previous
-        // direct-write path left `screen.prev_cells` blank for the
-        // selection's space cells (Cell::blank() equals Cell::blank()
-        // regardless of what reverse-video we just painted to stdout),
-        // so subsequent diffs skipped the un-reverse patch and the
-        // stuck blocks remained visible — see regression test
-        // `retained_selection_clears_residual_reverse_on_blank_cells`.
-        let sel_bounds = self.selection.selection.map(|s| {
-            if s.anchor < s.head {
-                (s.anchor, s.head)
-            } else {
-                (s.head, s.anchor)
-            }
-        });
         // Clone the slice before drawing — `screen.draw_row` takes
         // &mut self.screen and the iteration would otherwise double-
         // borrow.
         let rows: Vec<Vec<Cell>> = self.body_lines[start..].to_vec();
         for (i, row) in rows.iter().enumerate() {
-            let mut clipped = clip_cells_to_width(row, body_width);
-            if let Some((lo, hi)) = sel_bounds {
-                let body_idx = start + i;
-                apply_selection_overlay(&mut clipped, body_idx, lo, hi);
-            }
+            let clipped = clip_cells_to_width(row, body_width);
             self.screen.draw_row(i, 0, &clipped);
         }
     }
@@ -2243,15 +2147,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Always paints the body_lines tail (terminal-native scrollback handles
     /// vertical navigation after the append-only refactor).
     ///
-    /// Selection highlight is applied by `paint_body_into_cells` via
-    /// `apply_selection_overlay`, so the cell-diff is the SOLE source of
-    /// truth for body painting — earlier revisions of this function wrote
-    /// per-row CUP+EL+highlighted content directly to `out` first and then
-    /// let the diff run on top, which left stuck reverse-video on blank
+    /// The cell-diff is the SOLE source of truth for body painting — earlier
+    /// revisions wrote per-row CUP+EL+content directly to `out` first and
+    /// then let the diff run on top, which left stuck reverse-video on blank
     /// cells because `Cell::blank()` == `Cell::blank()` skipped the
-    /// un-reverse patch (see regression test
-    /// `retained_selection_clears_residual_reverse_on_blank_cells`). All
-    /// that's left here now is: optional right-edge scrollbar (still
+    /// un-reverse patch. All that's left here now is: optional right-edge
+    /// scrollbar (still
     /// written raw because the scrollbar column sits outside
     /// `effective_body_width` and the diff never touches it), then a
     /// full paint+diff cycle.
@@ -2313,31 +2214,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.dirty = false;
     }
 
-    /// Convert terminal coordinates `(col, row)` (1-indexed row,
-    /// 0-indexed col — matching mouse event coordinates) into
-    /// body_lines coordinates `(body_row_idx, col)`. Returns `None`
-    /// when the position falls outside the body region (row 0 sits
-    /// above the body, row past `body_bottom_row` is inside the
-    /// footer, and rows past the last painted body line are empty).
-    ///
-    /// Append-only model: body is bottom-aligned within the visible
-    /// region — the last entry in `body_lines` always paints at
-    /// `body_bottom_row`. So mapping a screen row back to a body
-    /// index is just `(total - body_height) + (row - 1)`.
-    fn screen_to_body(&self, col: u16, row: u16) -> Option<crate::render::selection::BodyPos> {
-        let bottom = self.body_bottom_row();
-        if row == 0 || row > bottom {
-            return None;
-        }
-        let body_height = bottom as usize;
-        let total = self.body_lines.len();
-        let start = total.saturating_sub(body_height);
-        let body_row = start + (row - 1) as usize;
-        if body_row >= total {
-            return None;
-        }
-        Some((body_row, col))
-    }
 }
 
 impl<W: Write + Send> Renderer for RetainedRenderer<W> {
@@ -3578,36 +3454,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // after the append-only refactor.
     }
 
-    fn begin_selection(&mut self, col: u16, row: u16) {
-        if let Some(pos) = self.screen_to_body(col, row) {
-            self.selection.begin(pos);
-            self.repaint_body_region();
-        } else {
-            self.selection.clear();
-        }
-    }
-
-    fn update_selection(&mut self, col: u16, row: u16) {
-        if let Some(pos) = self.screen_to_body(col, row) {
-            self.selection.update(pos);
-            self.repaint_body_region();
-        }
-    }
-
-    fn end_selection(&mut self) {
-        if let Some(text) = self.selection.end(&self.body_lines) {
-            crate::render::selection::copy_to_clipboard(&mut self.out, &text);
-        }
-    }
-
-    fn copy_selection(&mut self) -> bool {
-        let copied = self.selection.copy(&self.body_lines);
-        if copied {
-            self.repaint_body_region();
-        }
-        copied
-    }
-
     fn on_resize(&mut self, cols: u16, rows: u16) {
         // No-op if size unchanged. Some terminals fire `Resize` for
         // shape changes that don't actually alter the cell grid (tab
@@ -3698,21 +3544,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 }
 
 impl<W: Write + Send> Drop for RetainedRenderer<W> {
-    /// Belt-and-suspenders mouse-capture release. `shutdown()` already
-    /// runs on graceful exit, but a panic anywhere above this layer
-    /// (e.g. inside `paint_frame`, channel send failures, OOM in a
-    /// downstream consumer) bypasses `shutdown()` and leaves the host
-    /// shell receiving SGR mouse reports (`\x1b[<0;X;YM`) as stdin
-    /// garbage every time the user clicks. Without this Drop, retained
-    /// leaves the terminal in a broken state on any panic after
-    /// `with_writer` ran.
+    /// Belt-and-suspenders cleanup for the panic path. `shutdown()`
+    /// already runs on graceful exit, but a panic anywhere above this
+    /// layer (e.g. inside `paint_frame`, channel send failures, OOM in
+    /// a downstream consumer) bypasses `shutdown()` and would otherwise
+    /// leave the host shell with: SGR mouse reports landing as stdin
+    /// garbage on every click, a hidden cursor (spinner DECTCEM off
+    /// never restored), autowrap off, or a leftover DECSTBM scroll
+    /// region. Without this Drop, retained leaves the terminal in a
+    /// broken state on any panic after `with_writer` ran.
     ///
     /// Minimal cleanup only — no paint, no flush retries, no body
-    /// promotion. The mouse mode toggle is idempotent: `shutdown()`
-    /// emits the same bytes earlier on the graceful path, and the
-    /// terminal accepts the duplicate disable as a no-op.
+    /// promotion. All sequences are idempotent: `shutdown()` emits the
+    /// same bytes earlier on the graceful path, and the terminal
+    /// accepts the duplicates as no-ops.
     fn drop(&mut self) {
-        let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
+        // Mouse-mode disable + cursor show (DECTCEM) + autowrap on
+        // (DECAWM) + release any DECSTBM scroll region. The latter
+        // three mirror `shutdown()`'s force-restore so a panic mid-
+        // spinner doesn't leak DECTCEM-off into the parent shell.
+        let _ = self
+            .out
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?7h\x1b[r");
         #[cfg(windows)]
         if let Some(prior) = self.prior_console_in_mode.take() {
             crate::render::conhost::restore_conhost_console_in_mode(prior);
@@ -8099,68 +7952,6 @@ mod tests {
     }
 
     /// Contract inverted from the original `retained_drag_selection_
-    /// survives_wheel_noop_contract`: that test pinned `?1002h` MUST
-    /// be emitted at startup so drag selection worked, accepting the
-    /// trade-off that wheel events went through us. We've now chosen
-    /// the opposite trade-off: `?1002h` is NOT emitted, the terminal
-    /// keeps wheel + native drag-select + cmd+C, and atomcode's
-    /// in-renderer drag selection becomes effectively dead (no
-    /// external code path can fire begin/update/end_selection since
-    /// mouse events never arrive). The internal selection API still
-    /// works when called directly — Task 7.1 will collapse it.
-    #[test]
-    fn retained_drag_selection_api_still_callable_but_terminal_owns_wheel() {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let sink = CapturingSink(buf.clone());
-        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
-        // Startup MUST NOT enable button-event tracking — the whole
-        // point of this change is to let the terminal own the mouse.
-        let startup = buf.lock().unwrap().clone();
-        let s = String::from_utf8_lossy(&startup);
-        assert!(
-            !s.contains("\x1b[?1002h"),
-            "?1002h must NOT be enabled — terminal-native wheel / cmd+drag \
-             selection / cmd+C copy take over: {:?}",
-            s
-        );
-        // The selection API on the struct is still callable directly
-        // (selection.rs has not been deleted yet — Task 7.1). It just
-        // never fires from interactive events because crossterm gets
-        // no mouse-protocol bytes from stdin.
-        for i in 0..10 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        assert!(r.selection.selection.is_none());
-        r.begin_selection(3, 1);
-        r.update_selection(10, 1);
-        assert!(
-            r.selection.selection.is_some(),
-            "selection API must remain callable directly even though it's no \
-             longer wired to mouse events"
-        );
-        r.end_selection();
-    }
-
-    #[test]
-    fn retained_begin_selection_records_anchor() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        for i in 0..5 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        r.begin_selection(3, 1);
-        assert!(r.selection.selection.is_some());
-    }
-
-    #[test]
-    fn retained_copy_selection_writes_clipboard() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        r.render(UiLine::User("hello world".into()));
-        // Anchor at body row 0 col 0, head at col 5.
-        r.selection.begin((0, 0));
-        r.selection.update((0, 5));
-        assert!(r.copy_selection(), "expected non-empty selection to copy");
-    }
-
     /// Live scrollback feed: once body_lines exceeds the visible cap,
     /// every subsequent `emit_body_line_inner` must precede its own
     /// body-row emit with a "park at (h,1) + LF" sequence — that's the
@@ -8317,141 +8108,6 @@ mod tests {
             !oldest_visible_in_live,
             "oldest body row R000 must be off-screen (scrolled into native scrollback) \
              after pushing 2*cap rows\ndump:\n{}",
-            vterm.dump()
-        );
-    }
-
-    #[test]
-    fn retained_selection_highlight_emits_reverse_video() {
-        let (mut r, buf) = new_capturing(80, 24);
-        // Push enough lines so body overflows the 24-row terminal — the
-        // tail (last body_height rows) is what repaint_body_region will paint.
-        for i in 0..30 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        // Locate a non-empty visible row in body_lines (User pushes both a
-        // content row and a blank spacer; we need to pick the content one).
-        let body_height = r.body_bottom_row() as usize;
-        let total = r.body_lines.len();
-        let viewport_start = total.saturating_sub(body_height);
-        let target_row = (viewport_start..total)
-            .find(|&i| !r.body_lines[i].is_empty())
-            .expect("at least one non-empty visible row");
-        // Clear captured bytes so we only inspect repaint_body_region output.
-        buf.lock().unwrap().clear();
-        r.selection.begin((target_row, 0));
-        r.selection.update((target_row, 5));
-        r.repaint_body_region();
-        let output = buf.lock().unwrap().clone();
-        let s = String::from_utf8_lossy(&output);
-        assert!(
-            s.contains("\x1b[7m"),
-            "selection paint must include reverse-video SGR \\x1b[7m: {:?}",
-            s
-        );
-    }
-
-    /// Regression: `repaint_body_region` would write the per-row
-    /// reverse-video selection bytes directly to `out`, then call
-    /// `screen.invalidate()` + `paint_frame` + `render_diff`. The
-    /// follow-up diff emitted patches for non-blank cells (letters)
-    /// so they got over-painted with plain content, but for cells
-    /// that happen to be `Cell::blank()` (the spaces *inside* the
-    /// selection range — e.g. the space between "hello" and "world")
-    /// `prev_cells` blank == `cells` blank → no patch → the reverse-
-    /// video stayed stuck on the physical terminal even after the
-    /// next body row arrived or the next `repaint_body_region` ran
-    /// without an active selection.
-    ///
-    /// Repro: select a row containing internal spaces, drop the
-    /// selection (clear state), then trigger a fresh paint cycle.
-    /// The terminal must show no reverse-video cells in the body.
-    #[test]
-    fn retained_selection_clears_residual_reverse_on_blank_cells() {
-        let w: u16 = 80;
-        let h: u16 = 24;
-        let (mut r, buf) = new_capturing(w, h);
-        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
-        let status = status_basic();
-
-        // Seed a frame so footer is anchored.
-        r.render(UiLine::InputPrompt {
-            buf: String::new(),
-            cursor_byte: 0,
-            menu: None,
-            status: status.clone(),
-            attachments: Vec::new(),
-        });
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Push a User row with internal spaces. The chevron is at col 0,
-        // a space at col 1 (pad after chevron, plain CellStyle == blank),
-        // then "hello world test sentence" with spaces at cols 7, 13,
-        // and 18 — those are blank cells inside the row.
-        r.render(UiLine::User("hello world test sentence".into()));
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // Find the body row that holds our text.
-        let body_height = r.body_bottom_row() as usize;
-        let total = r.body_lines.len();
-        let viewport_start = total.saturating_sub(body_height);
-        let target_row = (viewport_start..total)
-            .find(|&i| {
-                let row_text: String =
-                    r.body_lines[i].iter().map(|c| c.ch).collect();
-                row_text.contains("hello world")
-            })
-            .expect("target user row must be visible");
-        // Screen row (1-indexed) of the body row holding our text.
-        let screen_row_1idx = (target_row - viewport_start + 1) as u16;
-
-        // Drag-select across the row including the internal spaces.
-        r.begin_selection(0, screen_row_1idx);
-        r.update_selection(30, screen_row_1idx);
-        // While the drag is live the terminal should show the reverse
-        // video — sanity check (not the regression assertion).
-        drain_into_vterm(&buf, &mut vterm);
-        let live_reverse_present = (0..(body_height as usize)).any(|row_0idx| {
-            (0..(w as usize)).any(|c| vterm.cell_at(row_0idx, c).reverse)
-        });
-        assert!(
-            live_reverse_present,
-            "sanity: during active selection some body cells must be reverse-video"
-        );
-
-        // Release the mouse: end_selection clears `active` but keeps
-        // the selection drawn. Then simulate "selection should be gone"
-        // by explicitly clearing and pushing a new body row — the user
-        // perceives the residual blocks as "stuck" because subsequent
-        // paint cycles never erase them.
-        r.end_selection();
-        r.selection.clear();
-        // A new body row arrives (assistant response). This goes through
-        // emit_body_line_inner + flush_deferred → paint_frame →
-        // render_diff. Per the bug, the diff cannot wipe the residual
-        // reverse-video on blank cells because prev_cells already shows
-        // those positions as blank.
-        r.render(UiLine::AssistantText("ok\n".into()));
-        r.flush_deferred();
-        drain_into_vterm(&buf, &mut vterm);
-
-        // After the new row + repaint, NO cell in the body region should
-        // still be reverse-video.
-        let mut stuck: Vec<(usize, usize, char)> = Vec::new();
-        for row_0idx in 0..(body_height as usize) {
-            for col_0idx in 0..(w as usize) {
-                let cell = vterm.cell_at(row_0idx, col_0idx);
-                if cell.reverse {
-                    stuck.push((row_0idx, col_0idx, cell.ch));
-                }
-            }
-        }
-        assert!(
-            stuck.is_empty(),
-            "residual reverse-video cells stuck in body after selection cleared + new row pushed: {:?}\ndump:\n{}",
-            stuck,
             vterm.dump()
         );
     }
@@ -8815,94 +8471,6 @@ mod tests {
             row_text,
             vterm.dump()
         );
-    }
-
-    /// Regression for the "system bell rings on Ctrl+C copy" bug.
-    /// `renderer.copy_selection()` (the Ctrl+C path) must not emit
-    /// `\x07` (BEL) bytes anywhere in its output. Mouse-release copy
-    /// uses `copy_to_clipboard` which falls back to OSC 52 (BEL-
-    /// terminated) on arboard failure — that's expected. Ctrl+C copy
-    /// uses arboard-only and must therefore stay silent.
-    #[test]
-    fn retained_ctrl_c_copy_selection_emits_no_bel() {
-        let w: u16 = 80;
-        let h: u16 = 24;
-        let (mut r, buf) = new_capturing(w, h);
-        // Seed a User row so there's something to select.
-        r.render(UiLine::User("hello world from a body row".into()));
-        r.flush_deferred();
-
-        // Start a selection covering the visible text.
-        let body_height = r.body_bottom_row() as usize;
-        let total = r.body_lines.len();
-        let viewport_start = total.saturating_sub(body_height);
-        let target_row = (viewport_start..total)
-            .find(|&i| !r.body_lines[i].is_empty())
-            .expect("at least one non-empty visible row");
-        r.selection.begin((target_row, 0));
-        r.selection.update((target_row, 10));
-
-        // Clear captured bytes so we only inspect copy_selection output.
-        buf.lock().unwrap().clear();
-        let copied = r.copy_selection();
-        // arboard MAY fail in the test environment (headless CI etc) —
-        // when it does, copy_selection returns false. The invariant
-        // about BEL must hold regardless of whether the copy actually
-        // landed on the system clipboard.
-        let _ = copied;
-        let output = buf.lock().unwrap().clone();
-        assert!(
-            !output.contains(&b'\x07'),
-            "Ctrl+C copy_selection must not emit BEL (\\x07); got bytes: {:?}",
-            String::from_utf8_lossy(&output)
-        );
-    }
-
-    /// Regression for the "system bell rings on selection end" bug.
-    /// `end_selection` (mouse-release) calls `copy_to_clipboard` which
-    /// historically wrote OSC 52 first, BEL-terminated and audible on
-    /// iTerm2 / Terminal.app when their visual-bell setting was off.
-    /// The 26efb791 commit switched the order to arboard-first, but
-    /// the OSC 52 fallback path STILL emits a BEL whenever arboard
-    /// fails — that's wrong when arboard is the canonical path on
-    /// every supported desktop platform: a failure is exceptional and
-    /// shouldn't ring the user's terminal.
-    ///
-    /// This test pins the invariant: when arboard succeeds (typical
-    /// case on darwin / linux desktop / windows), `end_selection` must
-    /// not emit BEL bytes.
-    #[test]
-    fn retained_end_selection_emits_no_bel_when_arboard_succeeds() {
-        let w: u16 = 80;
-        let h: u16 = 24;
-        let (mut r, buf) = new_capturing(w, h);
-        r.render(UiLine::User("hello world from a body row".into()));
-        r.flush_deferred();
-
-        let body_height = r.body_bottom_row() as usize;
-        let total = r.body_lines.len();
-        let viewport_start = total.saturating_sub(body_height);
-        let target_row = (viewport_start..total)
-            .find(|&i| !r.body_lines[i].is_empty())
-            .expect("at least one non-empty visible row");
-        r.selection.begin((target_row, 0));
-        r.selection.update((target_row, 10));
-
-        buf.lock().unwrap().clear();
-        r.end_selection();
-        let output = buf.lock().unwrap().clone();
-        // Test environments may not have arboard available — in that
-        // case `copy_to_clipboard` falls back to OSC 52 and we'd
-        // legitimately emit BEL. Skip the assertion in that scenario;
-        // the unconditional assertion lives in the unit test for the
-        // arboard-first path.
-        if arboard::Clipboard::new().is_ok() {
-            assert!(
-                !output.contains(&b'\x07'),
-                "end_selection must not emit BEL when arboard succeeds; got: {:?}",
-                String::from_utf8_lossy(&output)
-            );
-        }
     }
 
     /// Regression for the ghost-row-tail bug seen in the user

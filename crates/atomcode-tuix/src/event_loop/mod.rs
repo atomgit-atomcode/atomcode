@@ -2495,16 +2495,6 @@ pub struct App {
     /// session. Flipped to `true` after the first render; subsequent
     /// redraws skip the check entirely.
     pub setup_hint_shown: bool,
-    /// Timestamp of the last Ctrl+C that was consumed by `copy_selection()`
-    /// via the Windows OS-level signal handler. On Windows, the OS Ctrl+C
-    /// signal fires *before* the keyboard event arrives in the input
-    /// buffer (biased `tokio::select!` prioritises the signal arm), so
-    /// after the signal handler copies the selection, the keyboard event
-    /// still shows up in `handle_input` and would trigger Cancel/exit.
-    /// This timestamp lets the keyboard path detect and suppress that
-    /// stale echo within a short debounce window.
-    #[cfg(windows)]
-    pub last_ctrl_c_copy: Option<std::time::Instant>,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -2526,8 +2516,6 @@ impl App {
             setup_pending: false,
             reasoning_buffer: String::new(),
             setup_hint_shown: false,
-            #[cfg(windows)]
-            last_ctrl_c_copy: None,
         }
     }
 }
@@ -3211,21 +3199,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // when that path is silent. Single-press exit: skips the
             // 2-press confirm because if we got here, the user has no
             // working keyboard route to confirm with anyway.
-            //
-            // However, on Windows the OS Ctrl+C signal fires *before*
-            // the keyboard event arrives in the input buffer (and the
-            // `biased` select gives this arm priority), so when the
-            // user has a mouse selection active they expect Ctrl+C to
-            // *copy* — not exit. Try copy_selection first; only fall
-            // through to Shutdown when there's nothing selected.
             Some(()) = win_ctrl_c.recv() => {
-                if renderer.copy_selection() {
-                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> copy_selection (had selection)");
-                    // Stamp so the keyboard-event echo (which arrives
-                    // shortly after via input_rx) knows to suppress
-                    // itself instead of triggering Cancel/exit.
-                    app.last_ctrl_c_copy = Some(std::time::Instant::now());
-                } else if matches!(app.state.phase, UiPhase::Streaming) {
+                if matches!(app.state.phase, UiPhase::Streaming) {
                     // In Streaming phase, Ctrl+C should cancel the
                     // running turn (matching keyboard-path behaviour)
                     // rather than shut down the whole application.
@@ -3745,39 +3720,18 @@ fn handle_input(
             InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
             InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
             InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
-            InputEvent::MouseDown { col, row } => format!("mouse_down({},{})", col, row),
-            InputEvent::MouseDrag { col, row } => format!("mouse_drag({},{})", col, row),
-            InputEvent::MouseUp => "mouse_up".into(),
         }
     );
 
     match ev {
         InputEvent::MouseScroll(delta) => {
-            // Mouse wheel routing:
-            //   * RetainedRenderer — no-op. Body rows that scroll off
-            //     the top are promoted to the host terminal's native
-            //     scrollback, so vertical navigation belongs to the
-            //     terminal. We still RECEIVE the wheel event here
-            //     because `?1002h` (enabled for drag selection)
-            //     consumes wheel ticks; users reach scrollback via the
-            //     terminal-level bypass (Shift+wheel in iTerm2 /
-            //     Terminal.app, Cmd+↑ for page-wise history), which
-            //     the terminal resolves BEFORE the event reaches us.
-            //   * PlainRenderer    — no-op (no mouse capture at all,
-            //     wheel reaches the terminal directly).
+            // Mouse wheel is a no-op: SGR mouse capture (`?1002h` /
+            // `?1006h`) is intentionally NOT enabled, so wheel ticks
+            // resolve at the terminal level (native scrollback) before
+            // reaching us. This arm survives only as a defensive
+            // catch-all for terminals that forward wheel events
+            // outside the SGR mouse protocol.
             renderer.scroll_body(delta);
-        }
-        InputEvent::MouseDown { col, row } => {
-            // Anchor a new selection. Only RetainedRenderer responds
-            // (it owns mouse capture); PlainRenderer no-ops since the
-            // host terminal still does native drag-to-select there.
-            renderer.begin_selection(col, row);
-        }
-        InputEvent::MouseDrag { col, row } => {
-            renderer.update_selection(col, row);
-        }
-        InputEvent::MouseUp => {
-            renderer.end_selection();
         }
         InputEvent::Resize(mut cols, mut rows) => {
             // Coalesce burst-fired SIGWINCH events. gnome-terminal /
@@ -3999,44 +3953,6 @@ fn handle_input(
             // scrollback, so these keys default to a no-op there.
             // We intercept BEFORE phase dispatch so scrolling works in
             // Idle / Streaming alike.
-
-            // ── Ctrl+C: copy selection ──────────────────────────────
-            // On Windows, OSC 52 is not supported by Windows Terminal /
-            // conhost, so the user cannot copy text by mouse-selecting
-            // alone (end_selection's OSC 52 write is silently ignored).
-            // Ctrl+C is the user's natural instinct to copy selected
-            // text. We intercept it here: if the retained renderer has
-            // a live selection, copy its text to the system clipboard
-            // via arboard and clear the selection. If no selection exists,
-            // fall through to the normal Cancel behaviour.
-            //
-            // This also helps on macOS / Linux when the user prefers
-            // Ctrl+C / Cmd+C over the mouse-release OSC 52 auto-copy,
-            // or when the terminal ignores OSC 52 (macOS Terminal.app
-            // without the opt-in setting).
-            if code == crossterm::event::KeyCode::Char('c')
-                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
-                && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
-            {
-                // Windows: the OS Ctrl+C signal handler may have already
-                // consumed this Ctrl+C as a copy (see the `win_ctrl_c`
-                // select arm above). The keyboard event arrives shortly
-                // after via input_rx. If the signal handler stamped
-                // `last_ctrl_c_copy` within the last 500 ms, suppress
-                // the keyboard echo so it doesn't trigger Cancel/exit.
-                #[cfg(windows)]
-                if let Some(ts) = app.last_ctrl_c_copy.take() {
-                    if ts.elapsed() < Duration::from_millis(500) {
-                        crate::tuix_trace!("KEY", "ctrl+c keyboard echo suppressed (OS signal already handled copy)");
-                        return Ok(());
-                    }
-                }
-                if renderer.copy_selection() {
-                    return Ok(());
-                }
-                // No selection — fall through to Cancel below.
-            }
 
             // Ctrl+V: pull the system clipboard image and attach as
             // `[Image #N]` — independent of whether the host terminal

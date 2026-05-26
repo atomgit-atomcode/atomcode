@@ -69,17 +69,6 @@ enum RenderCmd {
     ScrollToNextMessage,
     ScrollToPrevUserMessage,
     ScrollToNextUserMessage,
-    /// Mouse-drag selection lifecycle. Forwarded to the inner renderer;
-    /// only RetainedRenderer acts on these (PlainRenderer no-ops).
-    /// `(col, row)` are 0-indexed terminal cells.
-    BeginSelection(u16, u16),
-    UpdateSelection(u16, u16),
-    EndSelection,
-    /// Copy the current selection to the system clipboard (arboard).
-    /// Returns `true` via the ACK channel if a non-empty selection was
-    /// copied. Used by Ctrl+C to copy selected text on Windows where
-    /// OSC 52 is not supported.
-    CopySelection(mpsc::Sender<bool>),
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -220,26 +209,6 @@ impl Renderer for TaskRenderer {
         let _ = self.cmd_tx.send(RenderCmd::ScrollToNextUserMessage);
     }
 
-    fn begin_selection(&mut self, col: u16, row: u16) {
-        let _ = self.cmd_tx.send(RenderCmd::BeginSelection(col, row));
-    }
-
-    fn update_selection(&mut self, col: u16, row: u16) {
-        let _ = self.cmd_tx.send(RenderCmd::UpdateSelection(col, row));
-    }
-
-    fn end_selection(&mut self) {
-        let _ = self.cmd_tx.send(RenderCmd::EndSelection);
-    }
-
-    fn copy_selection(&mut self) -> bool {
-        let (ack_tx, ack_rx) = mpsc::channel();
-        if self.cmd_tx.send(RenderCmd::CopySelection(ack_tx)).is_err() {
-            return false;
-        }
-        ack_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
-    }
-
     fn toggle_scrollbar(&mut self) -> bool {
         self.ack(AckOp::ToggleScrollbar);
         // Read the new state back from persisted ui-state (best-effort)
@@ -324,19 +293,6 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             }
             RenderCmd::ScrollToNextUserMessage => {
                 inner.scroll_to_next_user_message();
-            }
-            RenderCmd::BeginSelection(col, row) => {
-                inner.begin_selection(col, row);
-            }
-            RenderCmd::UpdateSelection(col, row) => {
-                inner.update_selection(col, row);
-            }
-            RenderCmd::EndSelection => {
-                inner.end_selection();
-            }
-            RenderCmd::CopySelection(ack) => {
-                let result = inner.copy_selection();
-                let _ = ack.send(result);
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();

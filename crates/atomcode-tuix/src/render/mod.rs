@@ -7,7 +7,6 @@ pub mod qr;
 pub mod retained;
 pub mod screen;
 pub mod scrollbar;
-pub mod selection;
 pub mod theme;
 pub mod ui_state;
 pub mod worker;
@@ -278,26 +277,6 @@ pub trait Renderer: Send {
     /// scrollback. Used for Home / End key handling.
     fn scroll_body_to_top(&mut self) {}
     fn scroll_body_to_bottom(&mut self) {}
-
-    /// Mouse text-selection hooks. RetainedRenderer owns mouse capture
-    /// and overrides these to paint the selection overlay; PlainRenderer
-    /// keeps the host terminal's native selection behaviour and no-ops.
-    fn begin_selection(&mut self, _col: u16, _row: u16) {}
-    fn update_selection(&mut self, _col: u16, _row: u16) {}
-    fn end_selection(&mut self) {}
-
-    /// Copy the current mouse-selection text to the system clipboard
-    /// (using arboard, not OSC 52) and clear the selection highlight.
-    /// Returns `true` if a non-empty selection was copied.
-    ///
-    /// This is the Ctrl+C fallback for terminals (Windows Terminal,
-    /// conhost) that ignore OSC 52 — the user selects text with the
-    /// mouse, then presses Ctrl+C to copy it. RetainedRenderer
-    /// implements this; PlainRenderer returns `false` (it uses the
-    /// host terminal's native selection).
-    fn copy_selection(&mut self) -> bool {
-        false
-    }
 
     /// Update the cached welcome banner's model / working_dir fields in
     /// place and trigger a repaint of the banner rows. Used after the
