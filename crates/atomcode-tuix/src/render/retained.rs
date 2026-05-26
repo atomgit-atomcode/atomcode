@@ -2316,11 +2316,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.dirty = false;
     }
 
-    /// Convert terminal coordinates `(col, row)` (1-indexed row, 0-indexed col
-    /// matching mouse event coordinates) to body_lines coordinates
-    /// `(body_row_idx, col)`. Returns `None` when the position falls outside
-    /// the body region (row 0 is above the body, row > body_bottom is the
-    /// footer, body_row past body_lines end is empty space).
+    /// Convert terminal coordinates `(col, row)` (1-indexed row,
+    /// 0-indexed col — matching mouse event coordinates) into
+    /// body_lines coordinates `(body_row_idx, col)`. Returns `None`
+    /// when the position falls outside the body region (row 0 sits
+    /// above the body, row past `body_bottom_row` is inside the
+    /// footer, and rows past the last painted body line are empty).
+    ///
+    /// Append-only model: body is bottom-aligned within the visible
+    /// region — the last entry in `body_lines` always paints at
+    /// `body_bottom_row`. So mapping a screen row back to a body
+    /// index is just `(total - body_height) + (row - 1)`.
     fn screen_to_body(&self, col: u16, row: u16) -> Option<crate::render::selection::BodyPos> {
         let bottom = self.body_bottom_row();
         if row == 0 || row > bottom {
@@ -2328,8 +2334,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let body_height = bottom as usize;
         let total = self.body_lines.len();
-        let viewport_start = total.saturating_sub(body_height);
-        let body_row = viewport_start + (row - 1) as usize;
+        let start = total.saturating_sub(body_height);
+        let body_row = start + (row - 1) as usize;
         if body_row >= total {
             return None;
         }

@@ -1,11 +1,13 @@
-//! Shared text-selection module used by both AltScreenRenderer and
-//! RetainedRenderer. Owns: anchor/head pos, drag tracking, range
-//! computation, line rendering with reverse-video highlight, OSC 52
-//! emission and arboard fallback for Ctrl+C copy.
+//! Text-selection module used by RetainedRenderer. Owns: anchor/head
+//! pos, drag tracking, range computation, line rendering with
+//! reverse-video highlight, OSC 52 emission and arboard fallback for
+//! Ctrl+C copy.
 //!
-//! Each renderer holds a `SelectionState` and implements `BodyLineView`
-//! over its native body buffer type (`Vec<String>` for alt-screen,
-//! `Vec<Vec<Cell>>` for retained).
+//! The renderer holds a `SelectionState` and the body buffer
+//! (`Vec<Vec<Cell>>`) implements `BodyLineView` so the selection
+//! helpers can read line text without caring about cell-level styling.
+//! A `Vec<String>` impl is also provided so the unit tests can drive
+//! the API with plain-string fixtures.
 
 use std::borrow::Cow;
 use std::io::Write;
@@ -37,7 +39,9 @@ pub trait BodyLineView {
     fn line_text(&self, idx: usize) -> Cow<'_, str>;
 }
 
-// Impl for the alt-screen body_lines type.
+// `Vec<String>` impl: kept for the unit tests in this module that
+// drive selection logic with plain-string fixtures. The live renderer
+// uses the `Vec<Vec<Cell>>` impl below.
 impl BodyLineView for Vec<String> {
     fn line_count(&self) -> usize {
         self.len()
@@ -474,9 +478,9 @@ pub fn base64_encode(input: &[u8]) -> String {
 /// ST is the formally-defined ANSI terminator and is honoured silently
 /// by every emulator we care about.
 ///
-/// Takes `out: &mut dyn Write` rather than `&mut self` so both
-/// AltScreenRenderer and RetainedRenderer can call it without
-/// needing a shared struct.
+/// Takes `out: &mut dyn Write` rather than `&mut self` so the
+/// renderer can call it without needing the selection module to know
+/// about the renderer struct shape.
 pub fn emit_osc52(out: &mut dyn Write, text: &str) {
     if text.is_empty() {
         return;
