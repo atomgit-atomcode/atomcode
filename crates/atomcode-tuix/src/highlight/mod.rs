@@ -24,18 +24,29 @@ use crate::terminal::TerminalCaps;
 
 pub mod theme;
 
+// ── Dormant syntect infrastructure ───────────────────────────────────
+//
+// Everything between here and `highlight_block` is the per-token
+// highlighter that `highlight_block` no longer calls. Kept compiling
+// (under `#[allow(dead_code)]`) so Step 2 can decide to either delete
+// it or revive it cleanly. See `highlight_block`'s doc for the why.
+
 /// Lazily-built syntect syntax set (covers the ~120 default Sublime syntaxes
 /// that ship with syntect). Loaded once on first use; cost is ~5-10ms and
 /// happens before the first tinted code block.
+#[allow(dead_code)]
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 
 /// Lazily-built syntect themes — one per palette. `theme.rs`'s runtime
 /// `MODE` selects which is returned per highlight call. Both initialised
 /// on first use; the unused one stays uncompiled until the user flips
 /// to it (effectively never in single-session use).
+#[allow(dead_code)]
 static ATOMCODE_THEME_DARK: OnceLock<Theme> = OnceLock::new();
+#[allow(dead_code)]
 static ATOMCODE_THEME_LIGHT: OnceLock<Theme> = OnceLock::new();
 
+#[allow(dead_code)]
 fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
 }
@@ -44,8 +55,10 @@ fn syntax_set() -> &'static SyntaxSet {
 /// strings emitted by `theme.rs`'s accessor fns — the test
 /// `palette_rgbs_match_theme_sgr_strings` pins this invariant so any
 /// future drift breaks the build.
+#[allow(dead_code)]
 struct Rgb(u8, u8, u8);
 
+#[allow(dead_code)]
 struct CodePalette {
     keyword: Rgb,
     string: Rgb,
@@ -55,6 +68,7 @@ struct CodePalette {
     type_: Rgb,
 }
 
+#[allow(dead_code)]
 const DARK: CodePalette = CodePalette {
     keyword:  Rgb(198, 120, 221),
     string:   Rgb(152, 195, 121),
@@ -73,6 +87,7 @@ const DARK: CodePalette = CodePalette {
 /// scope→colour mapping as `DARK` so syntect's TextMate selectors
 /// don't need re-tuning. Must stay in lockstep with `theme.rs`'s
 /// per-token accessor SGR strings.
+#[allow(dead_code)]
 const LIGHT: CodePalette = CodePalette {
     keyword:  Rgb(74, 0, 114),    // #4A0072
     string:   Rgb(0, 100, 0),     // #006400
@@ -82,6 +97,7 @@ const LIGHT: CodePalette = CodePalette {
     type_:    Rgb(91, 58, 0),     // #5B3A00
 };
 
+#[allow(dead_code)]
 fn atomcode_theme() -> &'static Theme {
     // `theme::set_theme_mode(true)` flips `MODE`; we read it here to
     // pick the right OnceLock-cached Theme. Each variant is built at
@@ -105,6 +121,7 @@ fn atomcode_theme() -> &'static Theme {
 ///
 /// Default foreground is set to the sentinel Color { a: 0 } so that chunks
 /// not matching any scope above can be detected and emitted without ANSI.
+#[allow(dead_code)]
 fn build_atomcode_theme(p: &CodePalette) -> Theme {
     let item = |scope_str: &str, c: &Rgb, italic: bool| ThemeItem {
         scope: ScopeSelectors::from_str(scope_str).expect("valid scope selector"),
@@ -143,21 +160,28 @@ fn build_atomcode_theme(p: &CodePalette) -> Theme {
     }
 }
 
-/// Highlight a complete fenced code block and return the indented, ANSI-tinted
-/// multi-line string ready for `push_markdown_body`.
+/// Highlight a complete fenced code block.
+///
+/// Returns the source with a 2-space left indent and **no per-token colour**.
+/// The syntect machinery below this function is kept (currently dormant)
+/// behind an `#[allow(dead_code)]` so a follow-up commit can either remove
+/// it cleanly or revive it under a config flag — see Step 2 of the plan.
+///
+/// Why no per-token colour: macOS Terminal.app paints selection as a
+/// semi-transparent grey overlay on top of the cell's foreground colour.
+/// Truecolor token tints (blue function names, sand type names, purple
+/// keywords) composite to near-overlay luminance and become unreadable
+/// inside a selection rectangle. Default fg survives the overlay because
+/// the terminal flips it to a high-contrast counterpart. iTerm2 doesn't
+/// have this problem (selection is true reverse-video there), so the
+/// failure was Terminal.app-specific, but the fix — drop the per-token
+/// colour — is universal. See the `opencode` TUI's `markdownCodeBlock: fg`
+/// for the same design choice in another project.
 pub fn highlight_block(
-    lang_hint: Option<&str>,
+    _lang_hint: Option<&str>,
     source: &str,
-    caps: TerminalCaps,
+    _caps: TerminalCaps,
 ) -> String {
-    if !caps.colors {
-        return indent_plain(source);
-    }
-    if let Some(lang) = lang_hint {
-        if let Some(tinted) = highlight_with_syntect(source, lang) {
-            return indent_lines(&tinted);
-        }
-    }
     indent_plain(source)
 }
 
@@ -165,6 +189,7 @@ pub fn highlight_block(
 /// `Some(tinted)` on success or `None` if the language isn't recognized.
 /// Panics inside syntect are caught and converted to `None` so the renderer
 /// can't crash a streaming reply.
+#[allow(dead_code)]
 fn highlight_with_syntect(source: &str, lang: &str) -> Option<String> {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -236,6 +261,7 @@ fn indent_plain(source: &str) -> String {
 
 /// Per-line "  " indent for tinted output. ANSI escapes ride along inside
 /// each line — terminals don't count escape bytes as columns.
+#[allow(dead_code)]
 fn indent_lines(tinted: &str) -> String {
     let mut out = String::with_capacity(tinted.len() + 32);
     let mut first = true;
@@ -319,72 +345,34 @@ mod tests {
     }
 
     #[test]
-    fn rust_keyword_gets_keyword_color() {
-        // `fn` and `let` should be highlighted as keywords via syntect.
-        // Theme maps `keyword` AND `storage` scopes to KEYWORD color, so
-        // both flow-control keywords and storage keywords land in purple.
-        let out = highlight_block(Some("rust"), "fn main() { let x = 1; }", caps_color());
-        assert!(
-            out.contains(theme::keyword()),
-            "expected keyword color in tinted rust output, got: {:?}",
-            out
-        );
-    }
-
-    #[test]
-    fn python_keyword_gets_keyword_color() {
-        let out = highlight_block(Some("python"), "def foo():\n    return 1", caps_color());
-        assert!(
-            out.contains(theme::keyword()),
-            "expected keyword color in tinted python output, got: {:?}",
-            out
-        );
-    }
-
-    #[test]
-    fn rust_string_literal_gets_string_color() {
-        let out = highlight_block(Some("rust"), r#"let s = "hello";"#, caps_color());
-        assert!(
-            out.contains(theme::string()),
-            "expected string color: {:?}",
-            out
-        );
-    }
-
-    #[test]
-    fn rust_number_gets_number_color() {
-        let out = highlight_block(Some("rust"), "let n = 42;", caps_color());
-        assert!(
-            out.contains(theme::number()),
-            "expected number color: {:?}",
-            out
-        );
-    }
-
-    #[test]
-    fn rust_comment_gets_comment_color() {
-        let out = highlight_block(Some("rust"), "// a comment\nlet x = 1;", caps_color());
-        // COMMENT is "\x1b[3;38;2;124;132;153m" — italic prefix is part of the constant,
-        // BUT we may emit italic separately. Check for the truecolor body of COMMENT.
-        let comment_body = "\x1b[38;2;124;132;153m";
-        let comment_full = theme::comment();
-        assert!(
-            out.contains(comment_body) || out.contains(comment_full),
-            "expected comment color in some form: {:?}",
-            out
-        );
-    }
-
-    #[test]
-    fn rust_multiline_string_classified_as_single_string() {
-        // syntect must keep multi-line context — both lines of a multi-line
-        // raw string should be inside the string-color span.
-        let src = "let s = \"line1\nline2\";";
-        let out = highlight_block(Some("rust"), src, caps_color());
-        let lines: Vec<_> = out.split('\n').collect();
-        assert_eq!(lines.len(), 2, "expected 2 output lines, got: {:?}", out);
-        assert!(lines[0].contains(theme::string()), "line0 missing string color: {:?}", lines[0]);
-        assert!(lines[1].contains(theme::string()), "line1 missing string color: {:?}", lines[1]);
+    fn known_lang_with_colors_still_emits_plain_indent_no_ansi() {
+        // Plan-0 contract: `highlight_block` never paints per-token colour,
+        // regardless of `lang_hint` or `caps.colors`. This consolidates the
+        // historical per-language colour-assertion tests (rust keyword /
+        // python keyword / rust string / rust number / rust comment /
+        // rust multi-line string) into one negative assertion. The dormant
+        // syntect path under `#[allow(dead_code)]` MUST stay unreachable.
+        let cases: &[(&str, &str)] = &[
+            ("rust",   "fn main() { let x = 1; }"),
+            ("python", "def foo():\n    return 1"),
+            ("rust",   r#"let s = "hello";"#),
+            ("rust",   "let n = 42;"),
+            ("rust",   "// a comment\nlet x = 1;"),
+            ("rust",   "let s = \"line1\nline2\";"),
+        ];
+        for (lang, src) in cases {
+            let out = highlight_block(Some(lang), src, caps_color());
+            assert!(
+                !out.contains('\x1b'),
+                "lang={lang} src={src:?}: expected zero ANSI bytes, got: {out:?}",
+            );
+            for (i, line) in out.split('\n').enumerate() {
+                assert!(
+                    line.starts_with("  "),
+                    "lang={lang} src={src:?}: line {i} missing 2-space indent: {line:?}",
+                );
+            }
+        }
     }
 
     #[test]
