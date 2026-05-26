@@ -1582,14 +1582,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// (i.e. the index the NEXT `push_body_row` will occupy).
     /// Called before any push in the render arm that starts a new message.
     fn mark_message(&mut self, kind: crate::render::MarkKind) {
-        // retained doesn't soft-wrap into multiple body rows (each
-        // build_one_row produces exactly one Vec<Cell>), so raw_idx
-        // mirrors line_idx. The field exists for alt_screen's reflow
-        // path — see render/mod.rs MessageMark doc.
         let line_idx = self.body_lines.len();
         self.message_marks.push(crate::render::MessageMark {
             line_idx,
-            raw_idx: line_idx,
             kind,
         });
     }

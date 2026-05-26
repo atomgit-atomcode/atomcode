@@ -146,6 +146,17 @@ fn scrollback_rows_from_env() -> usize {
         .unwrap_or(DEFAULT_SCROLLBACK_ROWS)
 }
 
+/// Message boundary marker used internally by `AltScreenRenderer`.
+/// Mirrors the shared `crate::render::MessageMark` but adds `raw_idx`
+/// so `reflow_body_lines` can re-derive `line_idx` after rewrapping
+/// `raw_body_lines` at a new width.
+#[derive(Debug, Clone, Copy)]
+struct AltMessageMark {
+    line_idx: usize,
+    raw_idx: usize,
+    kind: crate::render::MarkKind,
+}
+
 /// Alt-screen anchored renderer. See module-level doc.
 pub struct AltScreenRenderer<W: Write + Send> {
     out: W,
@@ -174,7 +185,7 @@ pub struct AltScreenRenderer<W: Write + Send> {
     body_lines: Vec<String>,
     /// Message boundary markers for "jump to prev/next message" navigation.
     /// Tracks which line_idx marks the start of a User / Assistant / ToolCall / ToolResult message.
-    message_marks: Vec<crate::render::MessageMark>,
+    message_marks: Vec<AltMessageMark>,
     /// True if the last mark pushed was `MarkKind::Assistant`. Used to de-duplicate
     /// marks for multi-chunk `UiLine::AssistantText` streams — only the first chunk
     /// of a turn gets a new mark; subsequent chunks within the same assistant turn are silent.
@@ -511,7 +522,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         // — without it, marks would point at pre-reflow body positions
         // and Alt+↑/↓ would land on the wrong rows after `on_resize` or
         // `/scrollbar` toggle.
-        self.message_marks.push(crate::render::MessageMark {
+        self.message_marks.push(AltMessageMark {
             line_idx: self.body_lines.len(),
             raw_idx: self.raw_body_lines.len(),
             kind,
