@@ -142,7 +142,6 @@ impl HooksConfig {
         webhook: &Arc<WebhookHook>,
         trigger: &str,
     ) {
-        let webhook = webhook.clone();
         let t = trigger.to_lowercase();
 
         // 注意：WebhookHook 的 trait 实现内部还有自己的 trigger check，

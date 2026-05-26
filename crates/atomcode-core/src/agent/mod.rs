@@ -1046,9 +1046,12 @@ impl AgentLoop {
             provider_name: self.config.default_provider.clone(),
         };
         let session_msgs = self.turn_runner.hook_engine.trigger_session_start(&session_ctx).await;
-        for msg in session_msgs {
-            // TODO: integrate with TUI via AgentEvent::SystemInfo variant
-            eprintln!("[Hook SessionStart] {}", msg);
+        if !session_msgs.is_empty() {
+            // SessionStart hook Modified(msg) are collected and merged into the
+            // cached system-prompt extensions so the LLM sees them.  Unlike
+            // SystemPromptHook (which runs every turn), these are injected once
+            // at session start and persist for the session lifetime.
+            self.cached_system_prompt_extensions.extend(session_msgs);
         }
 
         while let Some(cmd) = self.cmd_rx.recv().await {
@@ -1729,6 +1732,25 @@ impl AgentLoop {
                 return;
             }
             self.turn_count += 1;
+
+            // --- 统一 TurnStart Hook (fire-and-forget) ---
+            {
+                let wd = self
+                    .turn_runner
+                    .context
+                    .working_dir
+                    .try_read()
+                    .map(|g| g.display().to_string())
+                    .unwrap_or_default();
+                let turn_ctx = crate::hook::TurnStartContext {
+                    turn_number: self.turn_count as u32,
+                    session_id: Some(self.session_id.clone()),
+                    working_dir: wd,
+                    phase: format!("{:?}", self.phase).to_lowercase(),
+                    has_file_context: !self.files_edited_this_turn.is_empty(),
+                };
+                self.turn_runner.hook_engine.trigger_on_turn_start(&turn_ctx).await;
+            }
 
             // Decrement diagnosis read-only counter each turn.
             if self.diagnosis_read_only_turns > 0 {
@@ -2944,6 +2966,34 @@ impl AgentLoop {
         let duration = self.turn_start.map(|t| t.elapsed()).unwrap_or_default();
         self.turn_start = None;
         self.phase = AgentPhase::Idle;
+
+        // --- 统一 TurnComplete Hook (fire-and-forget) ---
+        {
+            let stop_str = format!("{:?}", stop_reason).to_lowercase();
+            let wd_str = self
+                .turn_runner
+                .context
+                .working_dir
+                .try_read()
+                .map(|g| g.display().to_string())
+                .unwrap_or_default();
+            let turn_complete_ctx = crate::hook::TurnCompleteContext {
+                turn_number: self.turn_count as u32,
+                result_type: stop_str,
+                tokens_used: self.turn_tokens,
+                tool_calls: self.tool_call_count,
+                duration_ms: duration.as_millis() as u64,
+                truncated: false,
+                edited_files: self.files_edited_this_turn.clone(),
+            };
+            // fire-and-forget: spawn to avoid blocking the sync finish_turn
+            let engine = self.turn_runner.hook_engine.clone();
+            let ctx = turn_complete_ctx.clone();
+            tokio::spawn(async move {
+                engine.trigger_on_turn_complete(&ctx).await;
+            });
+        }
+
         let _ = self.event_tx.send(AgentEvent::TurnComplete {
             duration,
             total_tokens: self.turn_tokens,

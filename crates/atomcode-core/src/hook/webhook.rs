@@ -228,7 +228,7 @@ pub struct WebhookResponse {
 #[async_trait]
 impl OnMessageReceivedHook for WebhookHook {
     async fn on_message_received(&self, ctx: &UserMessageContext) -> HookResult {
-        if !self.config.trigger.contains("message") {
+        if !self.config.trigger.to_lowercase().contains("message") {
             return HookResult::Ok;
         }
 
@@ -249,7 +249,7 @@ impl OnMessageReceivedHook for WebhookHook {
 #[async_trait]
 impl OnTurnStartHook for WebhookHook {
     async fn on_turn_start(&self, ctx: &TurnStartContext) -> HookResult {
-        if !self.config.trigger.contains("turn_start") {
+        if !self.config.trigger.to_lowercase().contains("turn_start") {
             return HookResult::Ok;
         }
 
@@ -270,7 +270,7 @@ impl OnTurnStartHook for WebhookHook {
 #[async_trait]
 impl OnToolCallStartHook for WebhookHook {
     async fn on_tool_call_start(&self, ctx: &ToolCallStartContext) -> HookResult {
-        if !self.config.trigger.contains("tool_call_start") {
+        if !self.config.trigger.to_lowercase().contains("tool_call_start") {
             return HookResult::Ok;
         }
 
@@ -291,7 +291,8 @@ impl OnToolCallStartHook for WebhookHook {
 #[async_trait]
 impl PreToolExecutionHook for WebhookHook {
     async fn on_pre_execute(&self, ctx: &HookCtx) -> HookResult {
-        if !self.config.trigger.contains("pre_tool") && !self.config.trigger.contains("before_tool") {
+        let t = self.config.trigger.to_lowercase();
+        if !t.contains("pre_tool") && !t.contains("before_tool") {
             return HookResult::Ok;
         }
 
@@ -312,7 +313,8 @@ impl PreToolExecutionHook for WebhookHook {
 #[async_trait]
 impl PostToolExecutionHook for WebhookHook {
     async fn on_post_execute(&self, ctx: &HookCtx, result_ctx: &ToolResultContext) -> HookResult {
-        if !self.config.trigger.contains("post_tool") && !self.config.trigger.contains("after_tool") {
+        let t = self.config.trigger.to_lowercase();
+        if !t.contains("post_tool") && !t.contains("after_tool") {
             return HookResult::Ok;
         }
 
@@ -334,7 +336,8 @@ impl PostToolExecutionHook for WebhookHook {
 #[async_trait]
 impl OnTurnCompleteHook for WebhookHook {
     async fn on_turn_complete(&self, ctx: &TurnCompleteContext) -> HookResult {
-        if !self.config.trigger.contains("turn_complete") && !self.config.trigger.contains("after_turn") {
+        let t = self.config.trigger.to_lowercase();
+        if !t.contains("turn_complete") && !t.contains("after_turn") {
             return HookResult::Ok;
         }
 
@@ -355,7 +358,7 @@ impl OnTurnCompleteHook for WebhookHook {
 #[async_trait]
 impl PostTurnHook for WebhookHook {
     async fn on_post_turn(&self, ctx: &HookCtx, turn_result: &str) -> HookResult {
-        if !self.config.trigger.contains("post_turn") {
+        if !self.config.trigger.to_lowercase().contains("post_turn") {
             return HookResult::Ok;
         }
 
@@ -377,7 +380,7 @@ impl PostTurnHook for WebhookHook {
 #[async_trait]
 impl OnSessionStartHook for WebhookHook {
     async fn on_session_start(&self, ctx: &SessionContext) -> HookResult {
-        if !self.config.trigger.contains("session_start") {
+        if !self.config.trigger.to_lowercase().contains("session_start") {
             return HookResult::Ok;
         }
 
@@ -398,7 +401,7 @@ impl OnSessionStartHook for WebhookHook {
 #[async_trait]
 impl OnSessionEndHook for WebhookHook {
     async fn on_session_end(&self, ctx: &SessionContext) -> HookResult {
-        if !self.config.trigger.contains("session_end") {
+        if !self.config.trigger.to_lowercase().contains("session_end") {
             return HookResult::Ok;
         }
 
@@ -419,7 +422,7 @@ impl OnSessionEndHook for WebhookHook {
 #[async_trait]
 impl OnErrorHook for WebhookHook {
     async fn on_error(&self, ctx: &ErrorContext) -> HookResult {
-        if !self.config.trigger.contains("error") {
+        if !self.config.trigger.to_lowercase().contains("error") {
             return HookResult::Ok;
         }
 
@@ -440,7 +443,7 @@ impl OnErrorHook for WebhookHook {
 #[async_trait]
 impl OnModelResponseHook for WebhookHook {
     async fn on_model_response(&self, response: &str, turn_ctx: &TurnStartContext) -> HookResult {
-        if !self.config.trigger.contains("model_response") {
+        if !self.config.trigger.to_lowercase().contains("model_response") {
             return HookResult::Ok;
         }
 
@@ -462,7 +465,7 @@ impl OnModelResponseHook for WebhookHook {
 #[async_trait]
 impl SystemPromptHook for WebhookHook {
     async fn extend_system_prompt(&self) -> Option<String> {
-        if !self.config.trigger.contains("system_prompt") {
+        if !self.config.trigger.to_lowercase().contains("system_prompt") {
             return None;
         }
 

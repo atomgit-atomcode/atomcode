@@ -1332,6 +1332,15 @@ impl TurnRunner {
             working_dir.to_string_lossy().to_string(),
         );
 
+        // --- 统一 ToolCallStart Hook (fire-and-forget) ---
+        let tc_start_ctx = crate::hook::ToolCallStartContext {
+            tool_name: call.name.clone(),
+            tool_args: call.arguments.clone(),
+            call_id: call.id.clone(),
+            turn_number: 0, // turn_number 由上层 (AgentLoop) 通过 TurnStart 提供; 这里用 0 占位
+        };
+        self.hook_engine.trigger_on_tool_call_start(&tc_start_ctx).await;
+
         let mut final_args = call.arguments.clone();
         match self.hook_engine.trigger_pre_tool_use(&pr_hook_ctx).await {
             Ok(Some(new_args)) => {

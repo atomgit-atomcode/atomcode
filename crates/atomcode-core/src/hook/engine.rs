@@ -18,12 +18,13 @@ use tokio::process::Command;
 use super::config::matches_tool;
 use super::json_config::load_hooks_config;
 use super::{
-    Hook, HookConfig, HookContext, HookCtx, HookEvent, HookResult, PreHookResult,
-    PreToolExecutionHook, PostToolExecutionHook, PostTurnHook, SystemPromptHook,
-    OnSessionStartHook, OnSessionEndHook, OnErrorHook, OnUserPromptSubmitHook,
-    OnToolCallStartHook, OnModelResponseHook,
-    ToolResultContext, UserPromptHookResult, UserPromptSubmitPayload,
-    UserPromptSubmitOutput, UserPromptSubmitResult,
+    ErrorContext, Hook, HookConfig, HookContext, HookCtx, HookEvent, HookResult,
+    PreHookResult, PreToolExecutionHook, PostToolExecutionHook, PostTurnHook,
+    SystemPromptHook, OnSessionStartHook, OnSessionEndHook, OnErrorHook,
+    OnUserPromptSubmitHook, OnToolCallStartHook, OnModelResponseHook,
+    ToolCallStartContext, ToolResultContext, TurnCompleteContext, TurnStartContext,
+    UserPromptHookResult, UserPromptSubmitPayload, UserPromptSubmitOutput,
+    UserPromptSubmitResult,
 };
 
 // ============================================================================
@@ -159,26 +160,46 @@ impl HookEngine {
         Ok(modified_args)
     }
 
-    /// 工具执行后触发所有 PostToolExecutionHook (fire-and-forget)。
-    /// 注意：PostToolUse 是完全 fire-and-forget 的——工具已经执行完毕，
-    /// 此时 Denied/Modified 等语义无实际效果，仅记录 warning 到 stderr。
-    /// 这与 PreToolUse（可阻断/修改）有本质区别，是 CC 兼容的设计意图。
+    /// 工具执行后并发触发所有 PostToolExecutionHook (fire-and-forget)。
+    /// PostToolUse hook 之间无顺序依赖，并发执行避免单个超时阻塞后续 hook。
     pub async fn trigger_post_tool_use(&self, ctx: &HookCtx, result_ctx: &ToolResultContext) {
-        for hook in &self.post_tool_hooks {
-            let result = hook.on_post_execute(ctx, result_ctx).await;
-            match result {
-                HookResult::Warning(msg) => eprintln!("[Hook Warning] {}: {}", hook.name(), msg),
-                HookResult::Denied(reason) => eprintln!("[Hook Denied] {}: {}", hook.name(), reason),
-                _ => {}
-            }
-        }
+        let futures: Vec<_> = self
+            .post_tool_hooks
+            .iter()
+            .map(|hook| async move {
+                let result = hook.on_post_execute(ctx, result_ctx).await;
+                match result {
+                    HookResult::Warning(msg) => {
+                        eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    }
+                    HookResult::Denied(reason) => {
+                        eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    }
+                    _ => {}
+                }
+            })
+            .collect();
+        futures::future::join_all(futures).await;
     }
 
-    /// Turn 完成后触发所有 PostTurnHook。
+    /// Turn 完成后触发所有 PostTurnHook (concurrent fire-and-forget)。
     pub async fn trigger_post_turn(&self, ctx: &HookCtx, turn_result: &str) {
-        for hook in &self.post_turn_hooks {
-            let _ = hook.on_post_turn(ctx, turn_result).await;
-        }
+        let futures: Vec<_> = self
+            .post_turn_hooks
+            .iter()
+            .map(|hook| async move {
+                match hook.on_post_turn(ctx, turn_result).await {
+                    HookResult::Warning(msg) => {
+                        eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    }
+                    HookResult::Denied(reason) => {
+                        eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    }
+                    _ => {}
+                }
+            })
+            .collect();
+        futures::future::join_all(futures).await;
     }
 
     /// 会话开始时触发所有 OnSessionStartHook。
@@ -246,6 +267,86 @@ impl HookEngine {
         parts
     }
 
+    /// Turn 开始时触发所有 OnTurnStartHook (fire-and-forget)。
+    pub async fn trigger_on_turn_start(&self, ctx: &TurnStartContext) {
+        for hook in &self.on_turn_start_hooks {
+            match hook.on_turn_start(ctx).await {
+                HookResult::Warning(msg) => {
+                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                }
+                HookResult::Denied(reason) => {
+                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 工具调用开始时触发所有 OnToolCallStartHook (fire-and-forget)。
+    pub async fn trigger_on_tool_call_start(&self, ctx: &ToolCallStartContext) {
+        for hook in &self.on_tool_call_start_hooks {
+            match hook.on_tool_call_start(ctx).await {
+                HookResult::Warning(msg) => {
+                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                }
+                HookResult::Denied(reason) => {
+                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Turn 完成时触发所有 OnTurnCompleteHook (fire-and-forget)。
+    pub async fn trigger_on_turn_complete(&self, ctx: &TurnCompleteContext) {
+        for hook in &self.on_turn_complete_hooks {
+            match hook.on_turn_complete(ctx).await {
+                HookResult::Warning(msg) => {
+                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                }
+                HookResult::Denied(reason) => {
+                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                }
+                HookResult::Modified(msg) => {
+                    eprintln!("[Hook Modified] {}: {}", hook.name(), msg)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 模型响应后触发所有 OnModelResponseHook (fire-and-forget)。
+    pub async fn trigger_on_model_response(
+        &self, response: &str, turn_ctx: &TurnStartContext,
+    ) {
+        for hook in &self.on_model_response_hooks {
+            match hook.on_model_response(response, turn_ctx).await {
+                HookResult::Warning(msg) => {
+                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                }
+                HookResult::Denied(reason) => {
+                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 错误发生时触发所有 OnErrorHook (fire-and-forget)。
+    pub async fn trigger_on_error(&self, ctx: &ErrorContext) {
+        for hook in &self.on_error_hooks {
+            match hook.on_error(ctx).await {
+                HookResult::Warning(msg) => {
+                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                }
+                HookResult::Denied(reason) => {
+                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 是否有任何注册的 hook。
     pub fn has_any(&self) -> bool {
         !self.pre_tool_hooks.is_empty()
@@ -256,6 +357,10 @@ impl HookEngine {
             || !self.on_session_end_hooks.is_empty()
             || !self.on_error_hooks.is_empty()
             || !self.on_user_prompt_submit_hooks.is_empty()
+            || !self.on_turn_start_hooks.is_empty()
+            || !self.on_turn_complete_hooks.is_empty()
+            || !self.on_tool_call_start_hooks.is_empty()
+            || !self.on_model_response_hooks.is_empty()
     }
 
     /// 获取各 slot 的 hook 数量统计。
