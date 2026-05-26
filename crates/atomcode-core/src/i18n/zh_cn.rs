@@ -28,20 +28,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpStepSkipped { reason } =>
             format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✗ 登录失败 — {}\n", error).into(),
+            format!("  × 登录失败 — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
             format!("  ✓ CodingPlan 已领取 — {}（CodingPlan {}）\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "成功".into(),
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan 已领取 — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✗ CodingPlan 领取失败 — {}\n", error).into(),
+            format!("  × CodingPlan 领取失败 — {}\n", error).into(),
         Msg::CpClaimTierSucceeded { tier } =>
             format!("  ✓ CodingPlan {} 领取成功\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
             format!("  ✓ CodingPlan {} 已领取\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  ✗ CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
             format!("  ✓ 已添加 {} 个 Provider：\n", count).into(),
         Msg::CpLocked { name } =>
@@ -49,8 +49,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             // 是亮色）让终端按当前主题映射 —— Solarized / Dracula /
             // 浅色模式都会落到各自的「红」上，不会被一个写死的 RGB
             // 锁住。retained 渲染器走严格 sanitizer 会把 SGR 剥光，
-            // 但 `✗ … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
-            format!("      \x1b[31m✗ {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
+            // 但 `× … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
+            format!("      \x1b[31m× {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  （默认）".into(),
@@ -63,7 +63,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpModelsSkipped { reason } =>
             format!("  ✓ 模型步骤已跳过 — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✗ 模型步骤失败 — {}\n", error).into(),
+            format!("  × 模型步骤失败 — {}\n", error).into(),
         Msg::CpStatusHeader =>
             "  ✓ CodingPlan 状态：\n".into(),
         Msg::CpPlanPending { plan } =>
@@ -75,6 +75,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::CpUsageLine { usage, reset_at, duration } =>
             format!("      用量：{}  ·  重置于 {}（{} 后）\n", usage, reset_at, duration).into(),
+        Msg::CpMonthlyQuotaExhausted { reset_at, duration } =>
+            format!("      ⚠ 本月用量已耗尽  ·  重置于 {}（{} 后）\n", reset_at, duration).into(),
         Msg::CpWindowQuotaExhausted =>
             "      ⚠ 当前窗口配额已耗尽\n".into(),
         Msg::CpWindowQuotaHint { hint } =>
@@ -146,7 +148,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusInstructionPresent { path, label } =>
             format!("    ✓ {} ({})\n", path, label).into(),
         Msg::StatusInstructionMissing { label } =>
-            format!("    ✗ {} — 未找到\n", label).into(),
+            format!("    × {} — 未找到\n", label).into(),
 
         // ── /login 完成提示 ──
         Msg::LoginSignedInWithCpHint { name, username } =>
@@ -327,7 +329,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueCreated { number, title, url } =>
             format!("  [issue] ✓ 已创建 #{number}：{title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
-            format!("  [issue] ✗ 创建失败：{error}\n").into(),
+            format!("  [issue] × 创建失败：{error}\n").into(),
         Msg::IssueRequiredField { field } =>
             format!("（必填 — 请输入 {field}，或按 Esc 取消）").into(),
 
@@ -572,11 +574,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServerConnected { name } =>
             format!("✓ MCP 服务 '{name}' 已连接").into(),
         Msg::McpServerFailed { name, error } =>
-            format!("✗ MCP 服务 '{name}' 失败：{error}").into(),
+            format!("× MCP 服务 '{name}' 失败：{error}").into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP 服务 '{name}' 已为 .{ext} 启动").into(),
         Msg::LspServerFailed { name, ext, error } =>
-            format!("✗ LSP 服务 '{name}'（.{ext}）失败：{error}").into(),
+            format!("× LSP 服务 '{name}'（.{ext}）失败：{error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>
@@ -637,7 +639,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SetupSkippedRow { kind, slug, reason } =>
             format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
         Msg::SetupFailedRow { kind, slug, error } =>
-            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+            format!("  × {}:{} — {}\n", kind, slug, error).into(),
         Msg::CmdSetupTip =>
             "\u{1f4a1} 提示：运行 \x1b[1;96m/setup\x1b[0m 可自动为该项目配置 hooks、skills 和 MCP。".into(),
         Msg::CmdSetupRunning =>

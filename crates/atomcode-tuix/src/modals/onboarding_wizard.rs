@@ -826,7 +826,7 @@ impl OnboardingWizard {
             // start_login failed at construction. Surface the cause
             // so the user knows whether to check network, broker, or
             // their own clock; offer Enter-to-retry below.
-            content.push(center("✗ 无法生成登录链接"));
+            content.push(center("× 无法生成登录链接"));
             content.push(String::new());
             // Error reason may be long; just left-align with indent
             // rather than centre — easier to scan.

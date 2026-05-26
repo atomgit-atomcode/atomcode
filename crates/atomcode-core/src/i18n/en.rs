@@ -28,20 +28,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpStepSkipped { reason } =>
             format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✗ Login failed — {}\n", error).into(),
+            format!("  × Login failed — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
             format!("  ✓ CodingPlan claimed — {} (CodingPlan {})\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "success".into(),
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan already claimed — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✗ CodingPlan claim failed — {}\n", error).into(),
+            format!("  × CodingPlan claim failed — {}\n", error).into(),
         Msg::CpClaimTierSucceeded { tier } =>
             format!("  ✓ CodingPlan {} claimed\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
             format!("  ✓ CodingPlan {} already claimed\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  ✗ CodingPlan {} claim failed — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} claim failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>
             format!("  ✓ Added {} provider{}:\n", count, plural_s).into(),
         Msg::CpLocked { name } =>
@@ -50,11 +50,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             // theme palette decides the exact shade — Solarized,
             // Dracula, light-mode, etc. all map this onto their
             // own "red" rather than a hard-coded RGB the user can't
-            // tune. The `✗ … (requires Pro plan or higher)` text inside is
+            // tune. The `× … (requires Pro plan or higher)` text inside is
             // a redundant signal so retained-mode terminals (which
             // strip SGR via the strict sanitizer path) still get
             // the meaning, just without the colour.
-            format!("      \x1b[31m✗ {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
+            format!("      \x1b[31m× {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  (default)".into(),
@@ -67,7 +67,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpModelsSkipped { reason } =>
             format!("  ✓ Models step skipped — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✗ Models step failed — {}\n", error).into(),
+            format!("  × Models step failed — {}\n", error).into(),
         Msg::CpStatusHeader =>
             "  ✓ CodingPlan status:\n".into(),
         Msg::CpPlanPending { plan } =>
@@ -79,6 +79,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::CpUsageLine { usage, reset_at, duration } =>
             format!("      Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
+        Msg::CpMonthlyQuotaExhausted { reset_at, duration } =>
+            format!("      ⚠ Monthly quota exhausted  ·  resets at {} (in {})\n", reset_at, duration).into(),
         Msg::CpWindowQuotaExhausted =>
             "      ⚠ Current window quota exhausted\n".into(),
         Msg::CpWindowQuotaHint { hint } =>
@@ -154,7 +156,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusInstructionPresent { path, label } =>
             format!("    ✓ {} ({})\n", path, label).into(),
         Msg::StatusInstructionMissing { label } =>
-            format!("    ✗ {} — not found\n", label).into(),
+            format!("    × {} — not found\n", label).into(),
 
         // ── /login completion ──
         Msg::LoginSignedInWithCpHint { name, username } =>
@@ -336,7 +338,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueCreated { number, title, url } =>
             format!("  [issue] ✓ created #{number}: {title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
-            format!("  [issue] ✗ create failed: {error}\n").into(),
+            format!("  [issue] × create failed: {error}\n").into(),
         Msg::IssueRequiredField { field } =>
             format!("(required — type a {field} or Esc to cancel)").into(),
 
@@ -583,11 +585,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServerConnected { name } =>
             format!("✓ MCP server '{name}' connected").into(),
         Msg::McpServerFailed { name, error } =>
-            format!("✗ MCP server '{name}' failed: {error}").into(),
+            format!("× MCP server '{name}' failed: {error}").into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP server '{name}' started for .{ext}").into(),
         Msg::LspServerFailed { name, ext, error } =>
-            format!("✗ LSP server '{name}' for .{ext} failed: {error}").into(),
+            format!("× LSP server '{name}' for .{ext} failed: {error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>
@@ -648,7 +650,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SetupSkippedRow { kind, slug, reason } =>
             format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
         Msg::SetupFailedRow { kind, slug, error } =>
-            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+            format!("  × {}:{} — {}\n", kind, slug, error).into(),
         Msg::CmdSetupTip =>
             "\u{1f4a1} Tip: Run \x1b[1;96m/setup\x1b[0m to auto-configure hooks, skills, and MCP for this project.".into(),
         Msg::CmdSetupRunning =>

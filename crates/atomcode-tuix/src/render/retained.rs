@@ -7712,7 +7712,7 @@ mod tests {
         // close. PAD_COL (2 spaces) on the left is added by
         // push_body_text_sgr; the template-level 6-space indent stays
         // on the visible side.
-        let line = "      \x1b[31m✗ GLM-5.1  (requires Pro plan or higher)\x1b[39m\n";
+        let line = "      \x1b[31m× GLM-5.1  (requires Pro plan or higher)\x1b[39m\n";
         r.render(UiLine::CommandOutput(line.into()));
 
         // Find the row containing the locked-model name and check

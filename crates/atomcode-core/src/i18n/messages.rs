@@ -70,6 +70,7 @@ pub enum Msg<'a> {
         total_days: i32,
     },
     CpUsageLine { usage: &'a str, reset_at: &'a str, duration: &'a str },
+    CpMonthlyQuotaExhausted { reset_at: &'a str, duration: &'a str },
     CpWindowQuotaExhausted,
     CpWindowQuotaHint { hint: &'a str },
     CpStatusFetchSkipped { reason: &'a str },
@@ -421,7 +422,7 @@ pub enum Msg<'a> {
     SetupInstalledRow { kind: &'a str, slug: &'a str, path: &'a str },
     /// Per-item skipped row: "  - skill:xyz (hash match)"
     SetupSkippedRow { kind: &'a str, slug: &'a str, reason: &'a str },
-    /// Per-item failed row: "  ✗ mcp:xyz — error message"
+    /// Per-item failed row: "  × mcp:xyz — error message"
     SetupFailedRow { kind: &'a str, slug: &'a str, error: &'a str },
     /// "💡 Tip: Run /setup …" — first-run hint shown above the prompt
     /// when the project has no setup state yet.
