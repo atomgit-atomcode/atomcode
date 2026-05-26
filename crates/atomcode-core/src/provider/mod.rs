@@ -86,7 +86,10 @@ pub trait LlmProvider: Send + Sync {
 /// workspace-wide `ATOMCODE_USER_AGENT` (`atomcode/<version>`) — see the
 /// constant's doc-comment for why lowercasing matters on the LLM gateway.
 /// `skip_tls_verify` disables TLS certificate verification when true.
-pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool) -> reqwest::Client {
+pub(super) fn build_http_client(
+    ua_override: Option<&str>,
+    skip_tls_verify: bool,
+) -> reqwest::Client {
     let ua = ua_override.unwrap_or(crate::ATOMCODE_USER_AGENT);
     let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -136,11 +139,7 @@ pub(super) fn build_http_client(ua_override: Option<&str>, skip_tls_verify: bool
 /// compact form keeps "429" inline AND the inner `<msg>` typically
 /// carries "rate" / "rate limit" — so the auto-retry backoff path
 /// fires identically against the new format.
-pub(super) fn format_http_error(
-    status: reqwest::StatusCode,
-    url: &str,
-    msg: &str,
-) -> String {
+pub(super) fn format_http_error(status: reqwest::StatusCode, url: &str, msg: &str) -> String {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         format!("[429] {}", msg)
     } else {
@@ -624,8 +623,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-
-}
+        }
     }
 
     #[test]

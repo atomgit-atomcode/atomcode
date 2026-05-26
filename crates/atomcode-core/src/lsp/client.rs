@@ -665,8 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_action_uses_did_open_then_did_change_versions() {
-        let opened: RwLock<HashMap<PathBuf, OpenDocumentState>> =
-            RwLock::new(HashMap::new());
+        let opened: RwLock<HashMap<PathBuf, OpenDocumentState>> = RwLock::new(HashMap::new());
         let path = PathBuf::from("/tmp/test.rs");
 
         let first = LspClient::next_sync_action(&opened, &path, "rust").await;

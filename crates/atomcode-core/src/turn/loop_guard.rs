@@ -59,8 +59,7 @@ const WINDOW: usize = 32;
 /// Tools whose successful execution counts as "progress" — when one
 /// fires with a previously-unseen key, the loop guard resets so any
 /// prior read-only repeats no longer count toward the threshold.
-const STATE_CHANGING: &[&str] =
-    &["edit_file", "write_file", "create_file", "search_replace"];
+const STATE_CHANGING: &[&str] = &["edit_file", "write_file", "create_file", "search_replace"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
@@ -123,8 +122,9 @@ impl LoopGuardState {
             return LoopGuardDecision::Allow;
         }
         let first = matches[0];
-        let all_same =
-            matches.iter().all(|e| e.output_hash == first.output_hash && e.success == first.success);
+        let all_same = matches
+            .iter()
+            .all(|e| e.output_hash == first.output_hash && e.success == first.success);
         if !all_same {
             return LoopGuardDecision::Allow;
         }
@@ -353,7 +353,11 @@ mod tests {
         }
         // 6th attempt: HARD_THRESHOLD reached, block regardless of drift.
         let d = g.check("bash", args);
-        assert!(block(&d), "expected hard-cap Block on 6th call, got {:?}", d);
+        assert!(
+            block(&d),
+            "expected hard-cap Block on 6th call, got {:?}",
+            d
+        );
         if let LoopGuardDecision::Block(msg) = d {
             assert!(
                 msg.contains("Output varies slightly"),
@@ -402,7 +406,11 @@ mod tests {
         g.record("glob", v2, out, true);
         // v3 is the same call by intent → must block.
         let d = g.check("glob", v3);
-        assert!(block(&d), "expected Block on JSON-variant repeat, got {:?}", d);
+        assert!(
+            block(&d),
+            "expected Block on JSON-variant repeat, got {:?}",
+            d
+        );
     }
 
     #[test]

@@ -45,8 +45,7 @@ impl PlanType {
 
     /// Cascade order: highest tier first. Used by `step_claim` to walk
     /// `Max → Pro → Lite` and stop at the first successful claim.
-    pub const CASCADE_ORDER: &'static [PlanType] =
-        &[PlanType::Max, PlanType::Pro, PlanType::Lite];
+    pub const CASCADE_ORDER: &'static [PlanType] = &[PlanType::Max, PlanType::Pro, PlanType::Lite];
 }
 
 /// `POST /api/v5/coding-plan/claim-v2` response.

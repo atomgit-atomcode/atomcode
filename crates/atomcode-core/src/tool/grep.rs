@@ -71,8 +71,7 @@ impl Tool for GrepTool {
             Err(_) => return self.approval(args),
         };
         let raw_path = parsed.path.as_deref().unwrap_or(".");
-        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read)
-        {
+        match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Read) {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }

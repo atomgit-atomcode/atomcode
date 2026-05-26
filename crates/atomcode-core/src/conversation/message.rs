@@ -515,8 +515,16 @@ mod tests {
         };
         let tokens = msg.estimate_tokens();
         // No images: "hello world" = 11 chars -> 11/4 = 2 (max with 1) + 0*1600 + 4 = 6
-        assert!(tokens < 100, "no-image multipart should have small token count, got {}", tokens);
-        assert!(tokens >= 5, "should have at least text + overhead, got {}", tokens);
+        assert!(
+            tokens < 100,
+            "no-image multipart should have small token count, got {}",
+            tokens
+        );
+        assert!(
+            tokens >= 5,
+            "should have at least text + overhead, got {}",
+            tokens
+        );
     }
 
     #[test]

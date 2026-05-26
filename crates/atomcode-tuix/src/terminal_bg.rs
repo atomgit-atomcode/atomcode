@@ -88,7 +88,11 @@ fn detect_light_unix(timeout: Duration) -> Option<bool> {
 
     // Phase 1.
     loop {
-        let deadline = if saw_osc_start { extended_deadline } else { initial_deadline };
+        let deadline = if saw_osc_start {
+            extended_deadline
+        } else {
+            initial_deadline
+        };
         let mut chunk = [0u8; 128];
         // SAFETY: chunk is stack-allocated and lives for the call; fd
         // is owned by stdin for the process lifetime.

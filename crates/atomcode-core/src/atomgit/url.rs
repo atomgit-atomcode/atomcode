@@ -140,8 +140,7 @@ fn split_owner_repo(path: &str) -> Option<RepoRef> {
 ///   * `Err(...)` — the git command itself failed unexpectedly.
 pub fn detect_cwd_atomgit_repo(cwd: &std::path::Path) -> std::io::Result<Option<RepoRef>> {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(["remote", "get-url", "origin"])
-        .current_dir(cwd);
+    cmd.args(["remote", "get-url", "origin"]).current_dir(cwd);
     crate::process_utils::suppress_console_window_sync(&mut cmd);
     let output = cmd.output()?;
     if !output.status.success() {
@@ -243,8 +242,8 @@ mod tests {
 
     #[test]
     fn parses_gitcode_mirror_issue_url() {
-        let r = IssueRef::parse("https://gitcode.com/atomgit_atomcode/atomcode/issues/340")
-            .unwrap();
+        let r =
+            IssueRef::parse("https://gitcode.com/atomgit_atomcode/atomcode/issues/340").unwrap();
         assert_eq!(r.owner, "atomgit_atomcode");
         assert_eq!(r.repo, "atomcode");
         assert_eq!(r.number, 340);

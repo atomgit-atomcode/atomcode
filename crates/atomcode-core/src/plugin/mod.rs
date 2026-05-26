@@ -30,5 +30,8 @@ pub enum PluginJobEvent {
     PluginInstalled(installer::InstalledPluginInfo),
     /// Generic failure: `op` is one of "add" / "update" / "install" so the
     /// renderer can produce the same human message as the prior sync path.
-    Failed { op: String, msg: String },
+    Failed {
+        op: String,
+        msg: String,
+    },
 }

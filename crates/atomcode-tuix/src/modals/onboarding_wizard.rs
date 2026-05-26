@@ -25,7 +25,16 @@ use unicode_width::UnicodeWidthStr;
 /// `←` all return width 1 from `unicode-width` but conhost allocates
 /// them slightly wider in practice, so the right `│` lands at a
 /// different column on every row that contains one.
-fn box_chars(unicode_symbols: bool) -> (&'static str, &'static str, &'static str, &'static str, &'static str, &'static str) {
+fn box_chars(
+    unicode_symbols: bool,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
     if unicode_symbols {
         ("┌", "┐", "└", "┘", "─", "│")
     } else {
@@ -324,8 +333,7 @@ pub struct OnboardingWizard {
     /// completing the in-browser consent and auto-close the modal —
     /// no manual Enter required. `None` after a take, after an Esc,
     /// or when `start_login()` itself errored at construction.
-    pub(super) pending_session:
-        Option<atomcode_core::auth::oauth::LoginSession>,
+    pub(super) pending_session: Option<atomcode_core::auth::oauth::LoginSession>,
 }
 
 impl OnboardingWizard {
@@ -403,9 +411,7 @@ impl OnboardingWizard {
     /// already took it). Called exactly once per QR session by
     /// `event_loop::run_loop`'s first-launch setup; subsequent calls
     /// return None and are harmless.
-    pub fn take_pending_session(
-        &mut self,
-    ) -> Option<atomcode_core::auth::oauth::LoginSession> {
+    pub fn take_pending_session(&mut self) -> Option<atomcode_core::auth::oauth::LoginSession> {
         self.pending_session.take()
     }
 
@@ -442,11 +448,7 @@ impl OnboardingWizard {
     /// the world. The Modal::handle_key wrapper (Task 6) calls this,
     /// then performs the i18n / config / flag side effects based on
     /// the returned `PureOutcome`.
-    pub(super) fn handle_key_pure(
-        &mut self,
-        code: KeyCode,
-        _mods: KeyModifiers,
-    ) -> PureOutcome {
+    pub(super) fn handle_key_pure(&mut self, code: KeyCode, _mods: KeyModifiers) -> PureOutcome {
         use Step::*;
         match (self.step, code) {
             // Confirm
@@ -600,11 +602,16 @@ impl OnboardingWizard {
             // the letter bodies. Each row is 49 cells; 12-col
             // leading pad centres the 49-wide logo inside
             // draw_panel's 74-col content area (12 + 49 + 13 = 74).
-            content.push("             ███  █████  ███  █     █  ████  ███  ████  █████".to_string());
-            content.push("            █   █   █   █   █ ██   ██ █     █   █ █   █ █    ".to_string());
-            content.push("            █████   █   █   █ █ █ █ █ █     █   █ █   █ ████ ".to_string());
-            content.push("            █   █   █   █   █ █  █  █ █     █   █ █   █ █    ".to_string());
-            content.push("            █   █   █    ███  █     █  ████  ███  ████  █████".to_string());
+            content
+                .push("             ███  █████  ███  █     █  ████  ███  ████  █████".to_string());
+            content
+                .push("            █   █   █   █   █ ██   ██ █     █   █ █   █ █    ".to_string());
+            content
+                .push("            █████   █   █   █ █ █ █ █ █     █   █ █   █ ████ ".to_string());
+            content
+                .push("            █   █   █   █   █ █  █  █ █     █   █ █   █ █    ".to_string());
+            content
+                .push("            █   █   █    ███  █     █  ████  ███  ████  █████".to_string());
             content.push(String::new());
             content.push(
                 t(Msg::OnboardingIntroVersionLine {
@@ -800,11 +807,7 @@ impl OnboardingWizard {
     /// so the user can paste it into a browser on a different machine.
     /// QR glyphs render as `□` tofu on Windows legacy conhost / `LANG=C`
     /// and a tofu QR is silently unscannable — better to show nothing.
-    pub(super) fn draw_qr_login_lines(
-        &self,
-        term_cols: u16,
-        unicode_symbols: bool,
-    ) -> Vec<String> {
+    pub(super) fn draw_qr_login_lines(&self, term_cols: u16, unicode_symbols: bool) -> Vec<String> {
         let panel_width = (term_cols as usize).min(80);
         let inner_width = panel_width.saturating_sub(4);
         // Cells available for content inside the panel's `│ <2sp> ... <2sp> │`
@@ -940,9 +943,7 @@ impl crate::modals::Modal for OnboardingWizard {
                     let msg = crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
                         error: &e.to_string(),
                     });
-                    renderer.render(crate::render::UiLine::CommandOutput(
-                        format!("{}\n", msg),
-                    ));
+                    renderer.render(crate::render::UiLine::CommandOutput(format!("{}\n", msg)));
                 }
                 self.step = Step::Setup;
                 renderer.clear_screen();
@@ -1058,10 +1059,30 @@ impl crate::modals::Modal for OnboardingWizard {
                 let msg = crate::i18n::t(crate::i18n::Msg::OnboardingConfirmClear).into_owned();
                 vec![if unicode { msg } else { ascii_fallback(&msg) }]
             }
-            Step::Intro => center_lines(self.draw_intro_lines(cols, rows, unicode), panel_width, cols, rows),
-            Step::Language => center_lines(self.draw_language_lines(cols, unicode), panel_width, cols, rows),
-            Step::Setup => center_lines(self.draw_setup_lines(cols, unicode), panel_width, cols, rows),
-            Step::QrLogin => center_lines(self.draw_qr_login_lines(cols, unicode), panel_width, cols, rows),
+            Step::Intro => center_lines(
+                self.draw_intro_lines(cols, rows, unicode),
+                panel_width,
+                cols,
+                rows,
+            ),
+            Step::Language => center_lines(
+                self.draw_language_lines(cols, unicode),
+                panel_width,
+                cols,
+                rows,
+            ),
+            Step::Setup => center_lines(
+                self.draw_setup_lines(cols, unicode),
+                panel_width,
+                cols,
+                rows,
+            ),
+            Step::QrLogin => center_lines(
+                self.draw_qr_login_lines(cols, unicode),
+                panel_width,
+                cols,
+                rows,
+            ),
         };
         for line in lines {
             // No trailing `\n` — the retained renderer's
@@ -1397,10 +1418,7 @@ mod tests {
             .join("\n");
         // ASCII logo signature: M's row 3 collapses to alternating
         // `█ █ █ █`, unique to the new pure-block design.
-        assert!(
-            joined.contains("█ █ █ █"),
-            "logo missing: {joined}"
-        );
+        assert!(joined.contains("█ █ █ █"), "logo missing: {joined}");
         assert!(joined.contains("Version "));
         assert!(joined.contains("Multi-step agent loop"));
         assert!(joined.contains("Connects to any OpenAI"));
@@ -1765,7 +1783,11 @@ mod tests {
             .map(|r| vt.row_text(r))
             .filter(|r| r.contains("[1]") || r.contains("[2]") || r.contains("[3]"))
             .collect();
-        assert_eq!(rows_with_bracket.len(), 3, "expected 3 option rows, got {rows_with_bracket:?}");
+        assert_eq!(
+            rows_with_bracket.len(),
+            3,
+            "expected 3 option rows, got {rows_with_bracket:?}"
+        );
         // Bullet position (●/○) — all three rows must place it at
         // the same column index. Locate via find().
         let bullet_cols: Vec<Option<usize>> = rows_with_bracket
@@ -1773,7 +1795,9 @@ mod tests {
             .map(|r| r.find('●').or_else(|| r.find('○')))
             .collect();
         assert!(
-            bullet_cols.iter().all(|c| c.is_some() && *c == bullet_cols[0]),
+            bullet_cols
+                .iter()
+                .all(|c| c.is_some() && *c == bullet_cols[0]),
             "bullet column drift across rows: {bullet_cols:?}"
         );
     }
@@ -1826,7 +1850,11 @@ mod tests {
             30,
             false,
         );
-        let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         // Box-drawing glyphs gone, ASCII fallbacks in their place.
         assert!(!joined.contains('┌'), "U+250C leaked: {:?}", joined);
         assert!(!joined.contains('┐'), "U+2510 leaked: {:?}", joined);
@@ -1848,7 +1876,11 @@ mod tests {
     fn draw_panel_ascii_fallback_substitutes_decorative_chars_in_content() {
         let content = vec!["● filled".into(), "○ open · mid · ← back • bullet".into()];
         let lines = draw_panel("X", &content, "Y", 60, false);
-        let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         for bad in ['●', '○', '·', '←', '•'] {
             assert!(
                 !joined.contains(bad),
@@ -1870,7 +1902,11 @@ mod tests {
         let _g = atomcode_core::i18n::test_lock();
         atomcode_core::i18n::set_locale(atomcode_core::i18n::Locale::En);
         let lines = OnboardingWizard::new().draw_setup_lines(80, false);
-        let joined: String = lines.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+        let joined: String = lines
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         for bad in ['┌', '┐', '└', '┘', '─', '│', '●', '○', '·', '←', '•'] {
             assert!(
                 !joined.contains(bad),
@@ -1900,7 +1936,11 @@ mod tests {
             .map(|l| strip_sgr(l))
             .filter(|l| l.contains('|') || l.contains('+'))
             .collect();
-        assert!(bordered.len() >= 3, "expected top + content + bottom: {:?}", bordered);
+        assert!(
+            bordered.len() >= 3,
+            "expected top + content + bottom: {:?}",
+            bordered
+        );
         let widths: std::collections::HashSet<usize> = bordered
             .iter()
             .map(|l| UnicodeWidthStr::width(l.as_str()))
@@ -2004,8 +2044,13 @@ mod tests {
         // unintended menu-navigation semantics on this single-page
         // screen.
         let mut w = qr_wizard_with_url("https://acs.atomgit.com/s/AbC123");
-        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Left,
-                     KeyCode::Char('1'), KeyCode::Char('a')] {
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Char('1'),
+            KeyCode::Char('a'),
+        ] {
             assert_eq!(
                 w.handle_key_pure(code, KeyModifiers::NONE),
                 PureOutcome::Noop,

@@ -44,10 +44,7 @@ pub enum TurnEvent {
     },
     /// Real-time output chunk from a running tool (e.g., bash command).
     /// Sent during tool execution before ToolCallResult.
-    ToolOutputChunk {
-        call_id: String,
-        chunk: String,
-    },
+    ToolOutputChunk { call_id: String, chunk: String },
     /// Tool call completed.
     /// `call_id` must equal the `id` emitted with the corresponding `ToolCallStarted`.
     ToolCallResult {

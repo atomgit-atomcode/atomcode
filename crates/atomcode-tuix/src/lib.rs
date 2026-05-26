@@ -174,8 +174,12 @@ pub async fn run(
     working_dir: std::path::PathBuf,
     session_to_continue: Option<atomcode_core::session::Session>,
     mcp_registry: Option<std::sync::Arc<atomcode_core::mcp::McpRegistry>>,
-    mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
-    lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
+    mcp_connect_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>,
+    >,
+    lsp_connect_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>,
+    >,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
 ) -> Result<()> {
     let mut caps = TerminalCaps::probe();
@@ -337,10 +341,8 @@ pub async fn run(
         atomcode_core::config::UiTheme::Dark => false,
         atomcode_core::config::UiTheme::Auto => {
             if caps.colors {
-                crate::terminal_bg::detect_light(
-                    std::time::Duration::from_millis(100),
-                )
-                .unwrap_or(false)
+                crate::terminal_bg::detect_light(std::time::Duration::from_millis(100))
+                    .unwrap_or(false)
             } else {
                 false
             }
@@ -449,8 +451,7 @@ pub async fn run(
     // with a hardcoded Unix path is gone — Windows used to fall here
     // and then fail to write to `/tmp`.
     let history = {
-        let path = History::default_path()
-            .unwrap_or_else(crate::platform::history_path);
+        let path = History::default_path().unwrap_or_else(crate::platform::history_path);
         let cache = crate::platform::image_cache_dir();
         crate::input::history::History::load_with_cache(path, cache)
     };
@@ -651,7 +652,10 @@ pub async fn run(
     if let Ok(event_loop::ExitReason::UpgradeRestart { exe }) = &result {
         // Set env var so the new process can show a one-time "upgraded" banner
         // on the welcome screen.
-        std::env::set_var("ATOMCODE_UPGRADED_FROM", format!("v{}", env!("CARGO_PKG_VERSION")));
+        std::env::set_var(
+            "ATOMCODE_UPGRADED_FROM",
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+        );
         match atomcode_core::self_update::re_exec_self(Some(exe)) {
             Ok(_infallible) => unreachable!("re_exec_self returned Ok"),
             Err(e) => {

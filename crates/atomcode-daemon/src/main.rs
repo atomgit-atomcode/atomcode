@@ -34,12 +34,14 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use atomcode_core::auth;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::lsp::manager::build_lsp_manager;
 use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
+use atomcode_core::telemetry_bootstrap::detect_repo_origin;
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
@@ -47,11 +49,8 @@ use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode}
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
-    CliOverride, CurrentContext, Event, RepoOrigin, SessionMode,
-    Telemetry, TelemetryState,
+    CliOverride, CurrentContext, Event, RepoOrigin, SessionMode, Telemetry, TelemetryState,
 };
-use atomcode_core::auth;
-use atomcode_core::telemetry_bootstrap::detect_repo_origin;
 
 // ============================================================================
 // Shared DTOs for P0 API endpoints
@@ -1111,7 +1110,12 @@ async fn change_dir(
         }
 
         let hash = hash_path(&new_path);
-        state.telemetry.track(Event::UseCommand { type_: "cd".into(), success: Some(true), error_kind: None, error_data: None });
+        state.telemetry.track(Event::UseCommand {
+            type_: "cd".into(),
+            success: Some(true),
+            error_kind: None,
+            error_data: None,
+        });
 
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
@@ -1339,7 +1343,12 @@ async fn delete_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match delete_session_file(&hash, &id) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into(), success: Some(true), error_kind: None, error_data: None });
+                state_clone.telemetry.track(Event::UseCommand {
+                    type_: "delete_session".into(),
+                    success: Some(true),
+                    error_kind: None,
+                    error_data: None,
+                });
                 let msg = format!("Session {} deleted successfully", id);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -1398,7 +1407,12 @@ async fn rename_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         match rename_session_file(&hash, &id, &req.name) {
             Ok(()) => {
-                state_clone.telemetry.track(Event::UseCommand { type_: "rename".into(), success: Some(true), error_kind: None, error_data: None });
+                state_clone.telemetry.track(Event::UseCommand {
+                    type_: "rename".into(),
+                    success: Some(true),
+                    error_kind: None,
+                    error_data: None,
+                });
                 let msg = format!("Session {} renamed to '{}'", id, req.name);
                 (StatusCode::OK, Json(msg)).into_response()
             }
@@ -1487,7 +1501,11 @@ pub enum ChatEvent {
     ReasoningDelta { content: String },
     /// Tool call started
     #[serde(rename = "tool_start")]
-    ToolCallStarted { id: String, name: String, arguments: String },
+    ToolCallStarted {
+        id: String,
+        name: String,
+        arguments: String,
+    },
     /// Real-time tool output chunk
     #[serde(rename = "tool_output")]
     ToolOutputChunk { chunk: String },
@@ -1776,7 +1794,10 @@ async fn chat_stream(
     Json(mut req): Json<ChatRequest>,
 ) -> impl IntoResponse {
     // Parse session UUID for telemetry scope
-    let session_uuid = req.session_id.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let session_uuid = req
+        .session_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
     // Use current project working directory if not specified
     if req.working_dir.is_none() {
@@ -1809,7 +1830,9 @@ async fn chat_stream(
     // Use the request's working_dir to detect repo_origin dynamically (not the
     // startup-time cached value), because the user may switch projects via /cd.
     let chat_repo_origin = detect_repo_origin(
-        req.working_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."))
+        req.working_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(".")),
     );
     let ctx_for_task = CurrentContext {
         mode: Some(client_mode),
@@ -1840,7 +1863,8 @@ async fn chat_stream(
             if let Some(sid) = session_id {
                 chat_tasks.write().await.remove(&sid);
             }
-        }).await;
+        })
+        .await;
     });
 
     // Track active SSE connections for idle timeout using a Drop guard
@@ -1859,7 +1883,7 @@ async fn chat_stream(
     let conn_guard = SseConnectionGuard(active_conns);
     let guarded_stream = stream.chain(futures::stream::once(async move {
         drop(conn_guard); // explicitly drop to decrement
-        // This event is never actually sent because the stream ends here
+                          // This event is never actually sent because the stream ends here
         Ok(axum::response::sse::Event::default().comment("bye"))
     }));
 
@@ -1933,8 +1957,11 @@ async fn process_chat_request(
     }));
     conversation.lock().await.add_user_message(&req.message);
     // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
-    let mut tool_context =
-        ToolContext::with_telemetry(working_dir.clone(), req.session_id.as_deref().unwrap_or("default"), telemetry);
+    let mut tool_context = ToolContext::with_telemetry(
+        working_dir.clone(),
+        req.session_id.as_deref().unwrap_or("default"),
+        telemetry,
+    );
     let mut tool_registry = ToolRegistry::new();
     // Honour ATOMCODE_DISABLE_TOOLS env var at daemon startup too, matching
     // the CLI's --disable-tools behaviour. Comma-separated tool names.
@@ -2004,7 +2031,9 @@ async fn process_chat_request(
             drop(cache);
             // Cache miss — create new registry for this project
             let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
-            new_registry.wait_for_initial_connections(Duration::from_secs(5)).await;
+            new_registry
+                .wait_for_initial_connections(Duration::from_secs(5))
+                .await;
             // Store in cache
             let mut cache = mcp_cache.write().await;
             // Evict LRU if cache is full
@@ -2017,10 +2046,13 @@ async fn process_chat_request(
                     cache.remove(&oldest_key);
                 }
             }
-            cache.insert(working_dir.clone(), CachedMcpRegistry {
-                registry: new_registry.clone(),
-                last_used: std::time::Instant::now(),
-            });
+            cache.insert(
+                working_dir.clone(),
+                CachedMcpRegistry {
+                    registry: new_registry.clone(),
+                    last_used: std::time::Instant::now(),
+                },
+            );
             new_registry
         }
     };
@@ -2071,8 +2103,7 @@ async fn process_chat_request(
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: true,
-
-})
+            })
         }
     };
     let mut turn_runner = TurnRunner {
@@ -2090,7 +2121,8 @@ async fn process_chat_request(
     };
 
     // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
-    let system_prompt = build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
+    let system_prompt =
+        build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
     // Create turn event channel
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
 
@@ -2133,35 +2165,36 @@ async fn process_chat_request(
     // Run turn(s) in background task - may need multiple turns if tools are used
     tokio::spawn(async move {
         CurrentContext::scope(tel_ctx, || async move {
-        let mut conv = conversation_clone.lock().await;
+            let mut conv = conversation_clone.lock().await;
 
-        // Loop until LLM produces text without tool calls
-        loop {
-            let result = turn_runner
-                .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
-                .await;
+            // Loop until LLM produces text without tool calls
+            loop {
+                let result = turn_runner
+                    .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
+                    .await;
 
-            match result {
-                TurnResult::Responded { .. } => {
-                    // LLM produced text, turn is complete
-                    break;
-                }
-                TurnResult::UsedTools { .. } => {
-                    // Truncation of tool outputs is handled inside
-                    // TurnRunner::run_with_filter now. Nothing to do
-                    // here — just loop back for the next LLM call.
-                    continue;
-                }
-                TurnResult::Failed(e) => {
-                    let _ = turn_tx.send(TurnEvent::Error(e));
-                    break;
-                }
-                TurnResult::Cancelled => {
-                    break;
+                match result {
+                    TurnResult::Responded { .. } => {
+                        // LLM produced text, turn is complete
+                        break;
+                    }
+                    TurnResult::UsedTools { .. } => {
+                        // Truncation of tool outputs is handled inside
+                        // TurnRunner::run_with_filter now. Nothing to do
+                        // here — just loop back for the next LLM call.
+                        continue;
+                    }
+                    TurnResult::Failed(e) => {
+                        let _ = turn_tx.send(TurnEvent::Error(e));
+                        break;
+                    }
+                    TurnResult::Cancelled => {
+                        break;
+                    }
                 }
             }
-        }
-        }).await;
+        })
+        .await;
     });
 
     // Forward turn events to chat events
@@ -2503,7 +2536,12 @@ async fn stop_chat(
         // Cancel the chat task if it exists
         if let Some(cancel_token) = state_clone.chat_tasks.read().await.get(&req.session_id) {
             cancel_token.cancel();
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
+            state_clone.telemetry.track(Event::UseCommand {
+                type_: "stop".into(),
+                success: Some(true),
+                error_kind: None,
+                error_data: None,
+            });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2513,7 +2551,12 @@ async fn stop_chat(
             )
         } else {
             // Session wasn't running, but we marked it as stopped
-            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
+            state_clone.telemetry.track(Event::UseCommand {
+                type_: "stop".into(),
+                success: Some(true),
+                error_kind: None,
+                error_data: None,
+            });
             (
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
@@ -2530,9 +2573,7 @@ async fn stop_chat(
 }
 
 /// GET /chat/active - Return list of session IDs currently generating
-async fn active_chat_sessions(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn active_chat_sessions(State(state): State<AppState>) -> impl IntoResponse {
     let sessions: Vec<String> = state.chat_tasks.read().await.keys().cloned().collect();
     Json(sessions)
 }
@@ -2658,12 +2699,15 @@ fn install_panic_hook(telemetry: Arc<Telemetry>) {
             thread: std::thread::current().name().unwrap_or("unknown").into(),
             backtrace_top_5: frames,
             error_kind: Some("panic".to_string()),
-            error_data: Some(serde_json::json!({
-                "session_duration_secs": telemetry.uptime().as_secs() as u32,
-                "turns_completed": null,
-                "last_tool_name": null,
-                "last_event": null,
-            }).to_string()),
+            error_data: Some(
+                serde_json::json!({
+                    "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                    "turns_completed": null,
+                    "last_tool_name": null,
+                    "last_event": null,
+                })
+                .to_string(),
+            ),
         });
         default_hook(info); // R9.4: preserve stderr output
     }));
@@ -2791,9 +2835,18 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
     // 0 = disabled; non-zero values are clamped to a minimum of 60s to prevent
     // accidental rapid cycling from misconfigured environments.
     let raw_timeout = idle_timeout
-        .or_else(|| std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT").ok()?.parse().ok())
+        .or_else(|| {
+            std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT")
+                .ok()?
+                .parse()
+                .ok()
+        })
         .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
-    let timeout = if raw_timeout == 0 { 0 } else { raw_timeout.max(60) };
+    let timeout = if raw_timeout == 0 {
+        0
+    } else {
+        raw_timeout.max(60)
+    };
 
     let mode = match client_mode.as_deref() {
         Some("vscode") => SessionMode::Vscode,
@@ -2801,7 +2854,13 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
         _ => SessionMode::Ide,
     };
 
-    (host.unwrap_or_else(|| DEFAULT_HOST.to_string()), port.unwrap_or(DEFAULT_PORT), cli_override, timeout, mode)
+    (
+        host.unwrap_or_else(|| DEFAULT_HOST.to_string()),
+        port.unwrap_or(DEFAULT_PORT),
+        cli_override,
+        timeout,
+        mode,
+    )
 }
 
 #[tokio::main]
@@ -2814,7 +2873,9 @@ async fn main() {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-        unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
     }
 
     // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/atomcode/sessions)
@@ -2832,7 +2893,12 @@ async fn main() {
 
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
     let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
-    let resolved = resolve(&cfg_telemetry, &cli_override, Config::config_dir(), &ProcessEnv);
+    let resolved = resolve(
+        &cfg_telemetry,
+        &cli_override,
+        Config::config_dir(),
+        &ProcessEnv,
+    );
 
     // Step 3: Print telemetry status line (R2.6)
     match &resolved.state {

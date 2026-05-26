@@ -295,7 +295,10 @@ mod tests {
             term_program: Some("vscode".to_string()),
             ..env()
         });
-        assert!(caps.unicode_symbols, "VS Code's integrated terminal is fine");
+        assert!(
+            caps.unicode_symbols,
+            "VS Code's integrated terminal is fine"
+        );
     }
 
     #[test]

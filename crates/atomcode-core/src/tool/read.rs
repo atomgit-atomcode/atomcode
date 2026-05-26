@@ -468,10 +468,10 @@ impl Tool for ReadFileTool {
             // via the upstream `store_hit` branch — no model-visible
             // metadata in the result.
             if let Some(mtime) = disk_mtime {
-                ctx.read_cache.write().await.insert(
-                    cache_key.clone(),
-                    (mtime, skeleton.clone(), 1),
-                );
+                ctx.read_cache
+                    .write()
+                    .await
+                    .insert(cache_key.clone(), (mtime, skeleton.clone(), 1));
             }
             return Ok(ToolResult {
                 call_id: String::new(),
@@ -1336,8 +1336,14 @@ mod tests {
         let path = write_n_line_file(&dir, "big.rs", 200);
         let ctx = ToolContext::new(dir.path().to_path_buf());
         let args1 = format!(r#"{{"file_path":"{}"}}"#, path.display());
-        let args2 = format!(r#"{{"file_path":"{}","offset":50,"limit":10}}"#, path.display());
-        let args3 = format!(r#"{{"file_path":"{}","offset":100,"limit":10}}"#, path.display());
+        let args2 = format!(
+            r#"{{"file_path":"{}","offset":50,"limit":10}}"#,
+            path.display()
+        );
+        let args3 = format!(
+            r#"{{"file_path":"{}","offset":100,"limit":10}}"#,
+            path.display()
+        );
         let r1 = ReadFileTool.execute(&args1, &ctx).await.unwrap();
         let r2 = ReadFileTool.execute(&args2, &ctx).await.unwrap();
         let r3 = ReadFileTool.execute(&args3, &ctx).await.unwrap();

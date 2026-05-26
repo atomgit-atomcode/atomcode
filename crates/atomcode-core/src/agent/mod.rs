@@ -46,7 +46,8 @@ pub enum AgentCommand {
     SendMessage {
         text: String,
         images: Vec<crate::conversation::message::ImagePart>,
-        #[allow(dead_code)] // used in 2026-05-09 vision-preprocessor retry; agent reflects on Failed
+        #[allow(dead_code)]
+        // used in 2026-05-09 vision-preprocessor retry; agent reflects on Failed
         image_markers: Vec<usize>,
     },
     /// Cancel current operation.
@@ -296,10 +297,7 @@ pub enum AgentEvent {
     /// conversation history for the main model. `vl_key` is the provider
     /// key from config; `char_count` is `text.chars().count()` so users
     /// can spot zero/near-zero outputs that would mislead the main model.
-    VisionPreprocessSuccess {
-        vl_key: String,
-        char_count: usize,
-    },
+    VisionPreprocessSuccess { vl_key: String, char_count: usize },
     /// Sub-agent batch began. `tasks` is the ordered list of children
     /// the dispatcher is about to fork — same order as the resulting
     /// `SubAgentTaskDone`/`SubAgentTaskFailed` events will arrive in,
@@ -881,14 +879,13 @@ impl AgentLoop {
                     max_tokens: None,
                     thinking_type: None,
                     thinking_keep: None,
-                reasoning_history: None,
-                reasoning_effort: None,
-                thinking_enabled: None,
+                    reasoning_history: None,
+                    reasoning_effort: None,
+                    thinking_enabled: None,
                     thinking_budget: None,
                     skip_tls_verify: false,
                     ephemeral: true,
-
-}),
+                }),
             };
 
         let hooks = crate::hook::json_config::load_hooks_config(&working_dir);
@@ -1048,7 +1045,11 @@ impl AgentLoop {
 
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
-                AgentCommand::SendMessage { text, images, image_markers } => {
+                AgentCommand::SendMessage {
+                    text,
+                    images,
+                    image_markers,
+                } => {
                     self.handle_send_message(text, images, image_markers).await;
                 }
                 AgentCommand::Cancel => {
@@ -1177,8 +1178,7 @@ impl AgentLoop {
                     // Set messages from a resumed session.
                     // Rebuild turn_tracker so the context builder can use
                     // proper turn-based windowing instead of the fallback path.
-                    let turn_tracker =
-                        crate::conversation::turn::TurnTracker::rebuild(&messages);
+                    let turn_tracker = crate::conversation::turn::TurnTracker::rebuild(&messages);
                     self.conversation.messages = messages;
                     self.conversation.turn_tracker = turn_tracker;
                 }
@@ -1575,7 +1575,8 @@ impl AgentLoop {
         let mut vision_warning: Option<String> = None;
         let (clean, images) = if !images.is_empty() {
             use crate::vision_preprocessor::{maybe_preprocess, PreprocessOutcome};
-            match maybe_preprocess(&self.config, &*self.turn_runner.provider, &clean, &images).await {
+            match maybe_preprocess(&self.config, &*self.turn_runner.provider, &clean, &images).await
+            {
                 PreprocessOutcome::Skipped => (clean, images),
                 PreprocessOutcome::Replaced { text, vl_key } => {
                     // Surface a one-line success notice (provider key in
@@ -1631,7 +1632,11 @@ impl AgentLoop {
             let msg = Message {
                 role: Role::User,
                 content: MessageContent::MultiPart {
-                    text: if clean.is_empty() { None } else { Some(clean.clone()) },
+                    text: if clean.is_empty() {
+                        None
+                    } else {
+                        Some(clean.clone())
+                    },
                     images,
                 },
             };
@@ -2429,15 +2434,13 @@ impl AgentLoop {
                         // open-weight models often enforce far less than
                         // the configured ctx_window — without parsing the
                         // rejection we'd compact toward the wrong target.
-                        let limit = extract_provider_ctx_limit(&e)
-                            .unwrap_or_else(|| self.ctx.ctx_window());
+                        let limit =
+                            extract_provider_ctx_limit(&e).unwrap_or_else(|| self.ctx.ctx_window());
                         // 5K safety buffer — leaves room for the streaming
                         // response and one round of tool results before the
                         // next compact would be needed.
                         let target = limit.saturating_sub(5_000);
-                        let recovered = self
-                            .emergency_compact_to_target(target, &sys_prompt)
-                            .await;
+                        let recovered = self.emergency_compact_to_target(target, &sys_prompt).await;
                         let msg = if recovered {
                             "\n[Context overflow — recovered via layered compact, retrying...]\n"
                                 .to_string()
@@ -2727,7 +2730,12 @@ impl AgentLoop {
     ) -> bool {
         let sys_tokens = system_prompt.len() / 4 + 4;
         let estimate = |conv: &Conversation| -> usize {
-            sys_tokens + conv.messages.iter().map(|m| m.estimate_tokens()).sum::<usize>()
+            sys_tokens
+                + conv
+                    .messages
+                    .iter()
+                    .map(|m| m.estimate_tokens())
+                    .sum::<usize>()
         };
 
         if estimate(&self.conversation) <= target_tokens {
@@ -2818,10 +2826,11 @@ impl AgentLoop {
                 })
                 .into_owned(),
             ));
-            let (msgs, _) =
-                self.ctx
-                    .build_messages(&self.conversation, &system_prompt, "");
-            self.emit_rich_context_stats(&self.conversation, &msgs).await;
+            let (msgs, _) = self
+                .ctx
+                .build_messages(&self.conversation, &system_prompt, "");
+            self.emit_rich_context_stats(&self.conversation, &msgs)
+                .await;
             return;
         }
 
@@ -2974,7 +2983,6 @@ impl AgentLoop {
     // an entire class of mis-fire failures (read-only turns dispatching
     // 6 fork sub-agents that fake edits or no-op).
 }
-
 
 fn track_tool_modified_files(
     tool_name: &str,
@@ -3625,7 +3633,8 @@ mod classifier_tests {
     #[test]
     fn extract_glm_proxy_ctx_limit() {
         // From the actual datalog that motivated D2.
-        let msg = "API error (400 Bad Request) at `http://115.120.18.212:18005/v1/chat/completions`: \
+        let msg =
+            "API error (400 Bad Request) at `http://115.120.18.212:18005/v1/chat/completions`: \
                    {\"error\":{\"message\":\"This model's maximum context length is 65536 tokens. \
                    However, you requested 15210 output tokens and your prompt contains at least \
                    50327 input tokens, for a total of at least 65537 tokens.\"}}";
@@ -3662,7 +3671,7 @@ mod classifier_tests {
 
     // ── D2 emergency compact tier helpers ──
 
-    use crate::conversation::{Conversation, message::MessageContent};
+    use crate::conversation::{message::MessageContent, Conversation};
     use crate::tool::{ToolCall, ToolResult};
 
     /// Build a synthetic conversation with `n_turns` turns, each carrying
@@ -3807,7 +3816,10 @@ mod classifier_tests {
             .messages
             .iter()
             .any(|m| matches!(m.role, crate::conversation::message::Role::User));
-        assert!(has_user, "last user message must survive even at tight budget");
+        assert!(
+            has_user,
+            "last user message must survive even at tight budget"
+        );
     }
 
     #[test]
@@ -3913,7 +3925,9 @@ mod classifier_tests {
         assert!(!is_codingplan_unavailable_error(
             "API error (500 Internal Server Error) at `https://api.openai.com/v1/chat/completions`"
         ));
-        assert!(!is_codingplan_unavailable_error("Stream timeout: no event for 300s"));
+        assert!(!is_codingplan_unavailable_error(
+            "Stream timeout: no event for 300s"
+        ));
         assert!(!is_codingplan_unavailable_error(""));
     }
 
@@ -3931,7 +3945,9 @@ mod classifier_tests {
     /// it.
     #[test]
     fn rate_limit_error_detects_chinese_gateway_patterns() {
-        assert!(is_rate_limited_error("模型「GLM-5.1」的请求负载过高，请稍后再试。"));
+        assert!(is_rate_limited_error(
+            "模型「GLM-5.1」的请求负载过高，请稍后再试。"
+        ));
         assert!(is_rate_limited_error("请求过于频繁，请稍后再试"));
         assert!(is_rate_limited_error("服务繁忙"));
         assert!(is_rate_limited_error("当前已被限流"));
@@ -3939,7 +3955,9 @@ mod classifier_tests {
         // limit just because it mentions "请稍后再试" alone
         // (which is generic Chinese "try again later").
         assert!(!is_rate_limited_error("请稍后再试"));
-        assert!(!is_rate_limited_error("API error (500 Internal Server Error)"));
+        assert!(!is_rate_limited_error(
+            "API error (500 Internal Server Error)"
+        ));
     }
 
     #[test]
@@ -4131,4 +4149,3 @@ mod bash_deleted_file_tracking_tests {
         );
     }
 }
-

@@ -153,7 +153,8 @@ impl Conversation {
     /// This prevents "messages illegal" API errors from unpaired calls.
     fn backfill_cancelled_tool_results(&mut self) {
         // Collect call_ids that already have results (both inline and ref variants).
-        let mut seen_result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_result_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for msg in &self.messages {
             if let Some(call_id) = msg.tool_result_call_id() {
                 seen_result_ids.insert(call_id.to_string());
@@ -710,10 +711,13 @@ pub fn looks_corrupted(text: &str) -> Option<&'static str> {
 
     // Signal 2: C0 control bytes other than \t \n \r. Real model output
     // never contains these; provider bug or transport corruption.
-    let bad_ctrl = text.chars().filter(|&c| {
-        let cp = c as u32;
-        cp < 0x20 && cp != 0x09 && cp != 0x0A && cp != 0x0D
-    }).count();
+    let bad_ctrl = text
+        .chars()
+        .filter(|&c| {
+            let cp = c as u32;
+            cp < 0x20 && cp != 0x09 && cp != 0x0A && cp != 0x0D
+        })
+        .count();
     if bad_ctrl > 0 {
         return Some("c0_control_bytes");
     }
@@ -725,10 +729,13 @@ pub fn looks_corrupted(text: &str) -> Option<&'static str> {
     // 0xC4 0x8E etc. East Asian text is in U+4E00+ ranges and never
     // triggers this signal. 40% threshold also rejects legitimate short
     // Czech words like `čaj` (33%) while catching the fixture.
-    let latin_ext_a = text.chars().filter(|&c| {
-        let cp = c as u32;
-        (0x0100..=0x017F).contains(&cp)
-    }).count();
+    let latin_ext_a = text
+        .chars()
+        .filter(|&c| {
+            let cp = c as u32;
+            (0x0100..=0x017F).contains(&cp)
+        })
+        .count();
     if latin_ext_a * 10 > total_chars * 4 {
         return Some("latin_extended_a_mojibake");
     }
@@ -773,7 +780,7 @@ fn is_typographic_repeat_safe(c: char) -> bool {
         || cp == 0x2026                    // …  ellipsis
         || cp == 0x2022                    // •  bullet
         || cp == 0x25E6                    // ◦  white bullet
-        || cp == 0x00B7                    // ·  middle dot
+        || cp == 0x00B7 // ·  middle dot
 }
 
 #[cfg(test)]
@@ -1188,10 +1195,7 @@ mod tests {
     #[test]
     fn looks_corrupted_catches_c0_control_bytes() {
         // \x01 \x02 \x03 = SOH STX ETX, never appear in real text
-        assert_eq!(
-            looks_corrupted("hello\x01world"),
-            Some("c0_control_bytes")
-        );
+        assert_eq!(looks_corrupted("hello\x01world"), Some("c0_control_bytes"));
     }
 
     #[test]
@@ -1255,7 +1259,7 @@ mod tests {
         assert_eq!(looks_corrupted(&"—".repeat(20)), None); // em-dash
         assert_eq!(looks_corrupted(&"…".repeat(20)), None); // ellipsis
         assert_eq!(looks_corrupted(&"•".repeat(10)), None); // bullet
-        // Block elements
+                                                            // Block elements
         assert_eq!(looks_corrupted(&"█".repeat(20)), None);
     }
 
@@ -1453,7 +1457,10 @@ mod tests {
             all_text.contains("write_file") || all_text.contains("index.html"),
             "LLM must see what it already did"
         );
-        assert!(all_text.contains("不要删那行"), "LLM must see the corrective prompt");
+        assert!(
+            all_text.contains("不要删那行"),
+            "LLM must see the corrective prompt"
+        );
     }
 
     #[test]
@@ -1657,7 +1664,10 @@ mod tests {
 
         conv.cancel_current_turn_including_user();
 
-        assert!(conv.stream_buffer.is_none(), "stream_buffer must be cleared");
+        assert!(
+            conv.stream_buffer.is_none(),
+            "stream_buffer must be cleared"
+        );
         assert!(conv.messages.is_empty());
     }
 
@@ -1681,7 +1691,10 @@ mod tests {
 
         conv.cancel_current_turn_including_user();
 
-        assert!(conv.tool_call_buffer.is_none(), "tool_call_buffer must be cleared");
+        assert!(
+            conv.tool_call_buffer.is_none(),
+            "tool_call_buffer must be cleared"
+        );
     }
 
     /// cancel_current_turn_including_user on a completed turn (no active turn)

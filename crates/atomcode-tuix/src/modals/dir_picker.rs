@@ -139,7 +139,7 @@ fn build_menu_payload(p: &DirPicker) -> MenuPayload {
     MenuPayload {
         items,
         selected: p.selected,
-            kind: crate::render::MenuKind::SlashCommand,
+        kind: crate::render::MenuKind::SlashCommand,
     }
 }
 

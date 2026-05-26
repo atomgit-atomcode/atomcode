@@ -453,15 +453,12 @@ impl LlmProvider for ClaudeProvider {
                                         // Spec field is `thinking`; some
                                         // Anthropic-compat proxies put it
                                         // in `text` instead — accept either.
-                                        let chunk = delta
-                                            .thinking
-                                            .as_deref()
-                                            .or(delta.text.as_deref());
+                                        let chunk =
+                                            delta.thinking.as_deref().or(delta.text.as_deref());
                                         if let Some(text) = chunk {
                                             thinking_text.push_str(text);
-                                            let _ = tx.send(Ok(StreamEvent::Reasoning(
-                                                text.to_string(),
-                                            )));
+                                            let _ = tx
+                                                .send(Ok(StreamEvent::Reasoning(text.to_string())));
                                         }
                                     }
                                     "signature_delta" => {
@@ -682,7 +679,15 @@ mod tests {
             parameters: json!({"type": "object"}),
         }];
 
-        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools), false, 10000);
+        let body = ClaudeProvider::build_request_body(
+            "model",
+            8192,
+            None,
+            vec![],
+            Some(&tools),
+            false,
+            10000,
+        );
 
         let arr = body["tools"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -692,7 +697,15 @@ mod tests {
     #[test]
     fn test_empty_tools_no_tools_field() {
         let tools: Vec<ToolDef> = vec![];
-        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], Some(&tools), false, 10000);
+        let body = ClaudeProvider::build_request_body(
+            "model",
+            8192,
+            None,
+            vec![],
+            Some(&tools),
+            false,
+            10000,
+        );
         assert!(
             body.get("tools").is_none(),
             "Empty tools should not add tools field"
@@ -701,7 +714,8 @@ mod tests {
 
     #[test]
     fn test_no_system_no_system_field() {
-        let body = ClaudeProvider::build_request_body("model", 8192, None, vec![], None, false, 10000);
+        let body =
+            ClaudeProvider::build_request_body("model", 8192, None, vec![], None, false, 10000);
         assert!(
             body.get("system").is_none(),
             "No system prompt should not add system field"
@@ -711,9 +725,13 @@ mod tests {
     #[test]
     fn build_request_body_with_thinking() {
         let body = ClaudeProvider::build_request_body(
-            "claude-sonnet-4", 16384,
-            Some("system".into()), vec![json!({"role":"user","content":"hi"})],
-            None, true, 10000,
+            "claude-sonnet-4",
+            16384,
+            Some("system".into()),
+            vec![json!({"role":"user","content":"hi"})],
+            None,
+            true,
+            10000,
         );
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 10000);
@@ -723,8 +741,13 @@ mod tests {
     #[test]
     fn build_request_body_adjusts_max_tokens_for_thinking() {
         let body = ClaudeProvider::build_request_body(
-            "claude-sonnet-4", 8000,
-            None, vec![], None, true, 10000,
+            "claude-sonnet-4",
+            8000,
+            None,
+            vec![],
+            None,
+            true,
+            10000,
         );
         assert_eq!(body["max_tokens"], 14096); // bumped: 10000+4096 > 8000
     }
@@ -732,8 +755,13 @@ mod tests {
     #[test]
     fn build_request_body_without_thinking() {
         let body = ClaudeProvider::build_request_body(
-            "claude-sonnet-4", 16384,
-            None, vec![], None, false, 10000,
+            "claude-sonnet-4",
+            16384,
+            None,
+            vec![],
+            None,
+            false,
+            10000,
         );
         assert!(body.get("thinking").is_none());
     }
@@ -844,7 +872,9 @@ mod tests {
         let user_msg = &msgs[0];
         assert_eq!(user_msg["role"], "user");
 
-        let content = user_msg["content"].as_array().expect("content should be array");
+        let content = user_msg["content"]
+            .as_array()
+            .expect("content should be array");
         assert_eq!(content.len(), 2); // 1 image + 1 text
 
         assert_eq!(content[0]["type"], "image");
@@ -872,7 +902,9 @@ mod tests {
         }];
 
         let (_system, msgs) = ClaudeProvider::format_messages(&messages);
-        let content = msgs[0]["content"].as_array().expect("content should be array");
+        let content = msgs[0]["content"]
+            .as_array()
+            .expect("content should be array");
 
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "image");
@@ -901,7 +933,9 @@ mod tests {
         }];
 
         let (_system, msgs) = ClaudeProvider::format_messages(&messages);
-        let content = msgs[0]["content"].as_array().expect("content should be array");
+        let content = msgs[0]["content"]
+            .as_array()
+            .expect("content should be array");
 
         assert_eq!(content.len(), 3); // 2 images + 1 text
         assert_eq!(content[0]["type"], "image");

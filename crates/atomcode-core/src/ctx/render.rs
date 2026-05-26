@@ -266,8 +266,7 @@ pub fn build_messages(
     // long-session token savings (kicks in around ~25K tokens of
     // history); the 70%-of-budget floor protects small-context models
     // from compacting too eagerly.
-    let microcompact_threshold =
-        ((token_budget as u64 * 4 * 70 / 100) as usize).min(100_000);
+    let microcompact_threshold = ((token_budget as u64 * 4 * 70 / 100) as usize).min(100_000);
     microcompact(&mut result, conv.messages.len(), microcompact_threshold);
 
     replace_stale_reads(&mut result);
@@ -753,9 +752,7 @@ pub(crate) fn build_compact_stub(tool_name: &str, output: &str, success: bool) -
 /// Build a `call_id -> tool_name` lookup from a slice of messages. The
 /// `MessageContent::AssistantWithToolCalls` variant carries the model's
 /// own tool name; this is what we surface in stubs.
-fn build_call_id_to_tool_map(
-    msgs: &[Message],
-) -> std::collections::HashMap<String, String> {
+fn build_call_id_to_tool_map(msgs: &[Message]) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     for msg in msgs {
         if let MessageContent::AssistantWithToolCalls { tool_calls, .. } = &msg.content {
@@ -849,10 +846,7 @@ fn microcompact(msgs: &mut Vec<Message>, _total_msg_count: usize, threshold_char
     // Anchor on the last User message — everything after it is the
     // ACTIVE turn and must stay full. If no User message (cold start
     // / system-only), there's nothing to compress yet.
-    let current_turn_start = match msgs
-        .iter()
-        .rposition(|m| matches!(m.role, Role::User))
-    {
+    let current_turn_start = match msgs.iter().rposition(|m| matches!(m.role, Role::User)) {
         Some(i) => i,
         None => return,
     };
@@ -1251,8 +1245,10 @@ mod tests {
         // consecutive User msgs, which would collapse 15 calls into 1).
         let mut conv = Conversation::new();
         for i in 0..8 {
-            conv.messages.push(Message::new(Role::User, format!("u{}", i)));
-            conv.messages.push(Message::new(Role::Assistant, format!("a{}", i)));
+            conv.messages
+                .push(Message::new(Role::User, format!("u{}", i)));
+            conv.messages
+                .push(Message::new(Role::Assistant, format!("a{}", i)));
         }
         assert_eq!(conv.messages.len(), 16);
         assert!(!needs_compression(&conv, 0, 131_072));
@@ -1622,10 +1618,7 @@ mod tests {
         // grep and an unknown tool name use the same template — no
         // special-case match arms inside microcompact (read_file is
         // exempted; see `microcompact_skips_read_file_*`).
-        for (id, expected_label) in [
-            ("c_grep", "grep"),
-            ("c_mcp", "mcp_remote.exec"),
-        ] {
+        for (id, expected_label) in [("c_grep", "grep"), ("c_mcp", "mcp_remote.exec")] {
             let body = find_by_id(id).unwrap_or_else(|| panic!("{} must survive", id));
             assert!(
                 body.starts_with(&format!("[{} ok: ", expected_label)),
@@ -1650,7 +1643,8 @@ mod tests {
     /// origin" to "actual error: ...".
     #[test]
     fn build_compact_stub_skips_bash_elapsed_metadata() {
-        let bash_failure = "[elapsed: 1.9s, exit: 101]\nerror: cannot find type `Foo` in this scope";
+        let bash_failure =
+            "[elapsed: 1.9s, exit: 101]\nerror: cannot find type `Foo` in this scope";
         let stub = build_compact_stub("bash", bash_failure, false);
         assert!(
             stub.contains("error: cannot find type"),
@@ -2505,9 +2499,21 @@ mod tests {
         conv.add_assistant_tool_calls(
             None,
             vec![
-                ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() },
-                ToolCall { id: "c2".into(), name: "bash".into(), arguments: "{}".into() },
-                ToolCall { id: "c3".into(), name: "bash".into(), arguments: "{}".into() },
+                ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "c3".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
             ],
             None,
         );
@@ -2831,5 +2837,4 @@ mod tests {
              before={before_tokens}, after={after_tokens}"
         );
     }
-
 }

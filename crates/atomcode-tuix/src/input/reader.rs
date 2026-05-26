@@ -496,7 +496,13 @@ fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
     // tick can arrive as `Moved` or another variant we silently drop,
     // and without this top-of-function trace there's no way to tell
     // "no mouse events arriving" from "events arriving but ignored".
-    crate::tuix_trace!("RD", "mouse kind={:?} col={} row={}", m.kind, m.column, m.row);
+    crate::tuix_trace!(
+        "RD",
+        "mouse kind={:?} col={} row={}",
+        m.kind,
+        m.column,
+        m.row
+    );
     match m.kind {
         crossterm::event::MouseEventKind::ScrollUp => {
             crate::tuix_trace!("RD", "mouse scroll up");
@@ -643,7 +649,9 @@ mod tests {
     fn text_with_newline_burst_is_paste() {
         assert!(is_paste_burst(&['h', 'i', '\n']));
         assert!(is_paste_burst(&['\n', 'h', 'i']));
-        assert!(is_paste_burst(&['l', 'i', 'n', 'e', '1', '\n', 'l', 'i', 'n', 'e', '2']));
+        assert!(is_paste_burst(&[
+            'l', 'i', 'n', 'e', '1', '\n', 'l', 'i', 'n', 'e', '2'
+        ]));
     }
 
     /// Bursts without any newline fall through to per-key handling
@@ -663,7 +671,9 @@ mod tests {
     fn ime_commit_storm_is_not_paste() {
         // Real-world reproduction from the user screenshot: typing
         // `首页中的` via IME emits `首 \n 页 \n 中 \n 的 \n`.
-        assert!(!is_paste_burst(&['首', '\n', '页', '\n', '中', '\n', '的', '\n']));
+        assert!(!is_paste_burst(&[
+            '首', '\n', '页', '\n', '中', '\n', '的', '\n'
+        ]));
         // Bare CJK without trailing newline — same shape, also rejected.
         assert!(!is_paste_burst(&['首', '\n', '页', '\n', '中']));
         // ASCII char-per-line bursts also caught (rare keyboard

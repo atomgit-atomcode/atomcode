@@ -182,19 +182,13 @@ mod tests {
     fn keep_sgr_still_strips_cursor_csi() {
         // Cursor moves (\x1b[2J, \x1b[H, \x1b[6n) and any non-SGR CSI
         // are still rejected even on the SGR-allowing path.
-        assert_eq!(
-            scrub_controls_keep_sgr("\x1b[2J\x1b[Hhi\x1b[6n"),
-            "hi"
-        );
+        assert_eq!(scrub_controls_keep_sgr("\x1b[2J\x1b[Hhi\x1b[6n"), "hi");
     }
 
     #[test]
     fn keep_sgr_still_strips_osc() {
         // OSC payloads (clipboard injection, set title) stay rejected.
-        assert_eq!(
-            scrub_controls_keep_sgr("\x1b]0;pwned\x07safe"),
-            "safe"
-        );
+        assert_eq!(scrub_controls_keep_sgr("\x1b]0;pwned\x07safe"), "safe");
     }
 
     #[test]

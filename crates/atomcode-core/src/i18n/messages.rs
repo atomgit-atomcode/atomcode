@@ -10,7 +10,9 @@ pub enum Msg<'a> {
     WelcomeOptionSkipHint,
 
     // ── /codingplan ──
-    CodingPlanSetupFailed { error: &'a str },
+    CodingPlanSetupFailed {
+        error: &'a str,
+    },
     /// Emitted inline by /codingplan and `atomcode codingplan` when the
     /// stored OAuth token comes back 401 from the CodingPlan API
     /// mid-flow. We re-run the same OAuth dance `/login` uses, save the
@@ -29,51 +31,102 @@ pub enum Msg<'a> {
     ChatAuthExpired,
     // SetupReport renderer (core/coding_plan/setup.rs)
     CpSetupHeader,
-    CpLoggedIn { who: &'a str, username: &'a str, email: &'a str },
-    CpStepSkipped { reason: &'a str },
-    CpLoginFailed { error: &'a str },
-    CpClaimed { message: &'a str, plan_type: &'a str },
+    CpLoggedIn {
+        who: &'a str,
+        username: &'a str,
+        email: &'a str,
+    },
+    CpStepSkipped {
+        reason: &'a str,
+    },
+    CpLoginFailed {
+        error: &'a str,
+    },
+    CpClaimed {
+        message: &'a str,
+        plan_type: &'a str,
+    },
     CpClaimSuccessFallback,
-    CpAlreadyClaimed { reason: &'a str },
-    CpClaimFailed { error: &'a str },
+    CpAlreadyClaimed {
+        reason: &'a str,
+    },
+    CpClaimFailed {
+        error: &'a str,
+    },
     /// Per-tier cascade row — winning tier, fresh claim.
     /// Example (zh-CN): `  ✓ CodingPlan Lite 领取成功`
-    CpClaimTierSucceeded { tier: &'a str },
+    CpClaimTierSucceeded {
+        tier: &'a str,
+    },
     /// Per-tier cascade row — winning tier, server reported the user
     /// already holds this tier or higher (`duplicate=true`).
-    CpClaimTierAlreadyHeld { tier: &'a str },
+    CpClaimTierAlreadyHeld {
+        tier: &'a str,
+    },
     /// Per-tier cascade row — tier was refused (2xx with success=
     /// false / 5xx / transport). `reason` is the server's human-
     /// readable message (e.g. `额度已满`, `暂无开放`) or a short
     /// rendering of the transport error.
-    CpClaimTierFailed { tier: &'a str, reason: &'a str },
-    CpAddedProviders { count: usize, plural_s: &'a str },
+    CpClaimTierFailed {
+        tier: &'a str,
+        reason: &'a str,
+    },
+    CpAddedProviders {
+        count: usize,
+        plural_s: &'a str,
+    },
     /// Locked-model row. `name` is expected to be pre-decorated with
     /// U+0336 combining strikethrough by the caller (see
     /// `coding_plan::setup::strikethrough`), so the template itself
     /// stays a plain `format!` and survives every renderer's CSI
     /// scrubber without needing SGR escapes.
-    CpLocked { name: &'a str },
-    CpProviderRow { provider: &'a str, model: &'a str, default_suffix: &'a str },
+    CpLocked {
+        name: &'a str,
+    },
+    CpProviderRow {
+        provider: &'a str,
+        model: &'a str,
+        default_suffix: &'a str,
+    },
     CpDefaultSuffix,
-    CpVisionAuto { kind: &'a str },
-    CpVisionUserSupplied { kind: &'a str },
+    CpVisionAuto {
+        kind: &'a str,
+    },
+    CpVisionUserSupplied {
+        kind: &'a str,
+    },
     CpVisionCleared,
-    CpModelsSkipped { reason: &'a str },
-    CpModelsFailed { error: &'a str },
+    CpModelsSkipped {
+        reason: &'a str,
+    },
+    CpModelsFailed {
+        error: &'a str,
+    },
     CpStatusHeader,
-    CpPlanPending { plan: &'a str },
+    CpPlanPending {
+        plan: &'a str,
+    },
     CpPlanActive {
         plan: &'a str,
         expires_at: &'a str,
         remaining_days: i32,
         total_days: i32,
     },
-    CpUsageLine { usage: &'a str, reset_at: &'a str, duration: &'a str },
+    CpUsageLine {
+        usage: &'a str,
+        reset_at: &'a str,
+        duration: &'a str,
+    },
     CpWindowQuotaExhausted,
-    CpWindowQuotaHint { hint: &'a str },
-    CpStatusFetchSkipped { reason: &'a str },
-    CpStatusFetchFailed { error: &'a str },
+    CpWindowQuotaHint {
+        hint: &'a str,
+    },
+    CpStatusFetchSkipped {
+        reason: &'a str,
+    },
+    CpStatusFetchFailed {
+        error: &'a str,
+    },
     /// Open-source build attempted to use a CodingPlan provider. The
     /// signing capability is not present in this build, so the request
     /// can't reach the AtomGit LLM gateway. Surface a clear hint
@@ -104,11 +157,15 @@ pub enum Msg<'a> {
     CpUpgradeRequired,
 
     // i18n self-errors
-    ErrUnsupportedLocale { input: &'a str },
+    ErrUnsupportedLocale {
+        input: &'a str,
+    },
 
     // ── Status bar (build_status) ──
     StatusNoProvider,
-    StatusUpgradeHint { version: &'a str },
+    StatusUpgradeHint {
+        version: &'a str,
+    },
     StatusModelNotConfigured,
     /// macOS / Linux variant: "Image in clipboard · ctrl+v to paste".
     /// Ctrl+V is intercepted by Windows Terminal / conhost before
@@ -121,9 +178,16 @@ pub enum Msg<'a> {
     StatusClipboardImageHintSlash,
 
     // ── /status command body ──
-    StatusBody { model: &'a str, dir: &'a str, config: &'a str, tokens: usize },
+    StatusBody {
+        model: &'a str,
+        dir: &'a str,
+        config: &'a str,
+        tokens: usize,
+    },
     StatusCpNotSignedIn,
-    StatusCpFetchFailed { error: &'a str },
+    StatusCpFetchFailed {
+        error: &'a str,
+    },
     StatusCpNoActive,
     StatusCpLine {
         plan: &'a str,
@@ -131,15 +195,29 @@ pub enum Msg<'a> {
         remaining_days: i32,
         total_days: i32,
     },
-    StatusCpUsage { usage: &'a str, reset_at: &'a str, seconds: i64 },
+    StatusCpUsage {
+        usage: &'a str,
+        reset_at: &'a str,
+        seconds: i64,
+    },
     StatusCpWindowExhausted,
-    StatusCpWindowHint { hint: &'a str },
+    StatusCpWindowHint {
+        hint: &'a str,
+    },
     StatusInstructionFilesHeader,
-    StatusInstructionPresent { path: &'a str, label: &'a str },
-    StatusInstructionMissing { label: &'a str },
+    StatusInstructionPresent {
+        path: &'a str,
+        label: &'a str,
+    },
+    StatusInstructionMissing {
+        label: &'a str,
+    },
 
     // ── /login completion ──
-    LoginSignedInWithCpHint { name: &'a str, username: &'a str },
+    LoginSignedInWithCpHint {
+        name: &'a str,
+        username: &'a str,
+    },
 
     // ── Help / commands ──
     HelpAvailableCommands,
@@ -161,24 +239,43 @@ pub enum Msg<'a> {
     ProviderMenuSetDefault,
     ProviderMenuSetDefaultDesc,
     ProviderNoProviders,
-    ProviderDeleteConfirm { name: &'a str },
-    ProviderDeleted { name: &'a str },
+    ProviderDeleteConfirm {
+        name: &'a str,
+    },
+    ProviderDeleted {
+        name: &'a str,
+    },
     ProviderDeleteKept,
-    ProviderDefaultSet { name: &'a str },
-    ProviderAdded { name: &'a str, model: &'a str },
-    ProviderUpdated { name: &'a str },
+    ProviderDefaultSet {
+        name: &'a str,
+    },
+    ProviderAdded {
+        name: &'a str,
+        model: &'a str,
+    },
+    ProviderUpdated {
+        name: &'a str,
+    },
     ProviderStepName,
     ProviderStepType,
-    ProviderStepTypeWithHint { current: &'a str },
+    ProviderStepTypeWithHint {
+        current: &'a str,
+    },
     ProviderStepBaseUrl,
-    ProviderStepBaseUrlWithHint { current: &'a str },
+    ProviderStepBaseUrlWithHint {
+        current: &'a str,
+    },
     ProviderDefaultHint,
     ProviderStepApiKey,
-    ProviderStepApiKeyWithHint { hint: &'a str },
+    ProviderStepApiKeyWithHint {
+        hint: &'a str,
+    },
     ProviderStepApiKeySet,
     ProviderStepApiKeyUnset,
     ProviderStepModel,
-    ProviderStepModelWithHint { current: &'a str },
+    ProviderStepModelWithHint {
+        current: &'a str,
+    },
     ProviderNameEmpty,
     ProviderUnknownType,
     ProviderUnknownTypeEdit,
@@ -186,40 +283,85 @@ pub enum Msg<'a> {
     ProviderEditKeep,
 
     // ── Model picker ──
-    ModelSwitched { provider: &'a str, model: &'a str },
+    ModelSwitched {
+        provider: &'a str,
+        model: &'a str,
+    },
 
     // ── Session picker ──
-    SessionLoadFailed { error: &'a str },
-    SessionResumedLabel { name: &'a str },
+    SessionLoadFailed {
+        error: &'a str,
+    },
+    SessionResumedLabel {
+        name: &'a str,
+    },
     SessionTimeJustNow,
-    SessionTimeMinAgo { n: u64 },
-    SessionTimeHourAgo { n: u64 },
-    SessionTimeDayAgo { n: u64 },
-    SessionMsgCount { count: usize },
+    SessionTimeMinAgo {
+        n: u64,
+    },
+    SessionTimeHourAgo {
+        n: u64,
+    },
+    SessionTimeDayAgo {
+        n: u64,
+    },
+    SessionMsgCount {
+        count: usize,
+    },
     SessionNameEmpty,
-    SessionNameTooLong { max: usize },
+    SessionNameTooLong {
+        max: usize,
+    },
     SessionNameControlChars,
-    SessionListFailed { error: &'a str },
-    SessionRenamed { old: &'a str, new: &'a str },
-    SessionSaveFailed { error: &'a str },
+    SessionListFailed {
+        error: &'a str,
+    },
+    SessionRenamed {
+        old: &'a str,
+        new: &'a str,
+    },
+    SessionSaveFailed {
+        error: &'a str,
+    },
     SessionNoneSelected,
-    SessionRenameEditing { buffer: &'a str },
+    SessionRenameEditing {
+        buffer: &'a str,
+    },
 
     // ── Dir picker ──
     DirCurrent,
-    DirNotExists { path: &'a str },
-    DirChanged { path: &'a str },
-    DirNotADirectory { path: &'a str },
+    DirNotExists {
+        path: &'a str,
+    },
+    DirChanged {
+        path: &'a str,
+    },
+    DirNotADirectory {
+        path: &'a str,
+    },
 
     // ── Issue wizard ──
     IssueCancelled,
-    IssueNewOn { owner: &'a str, repo: &'a str },
+    IssueNewOn {
+        owner: &'a str,
+        repo: &'a str,
+    },
     IssueStep1,
     IssueStep2,
-    IssueTitleConfirmed { title: &'a str },
-    IssueRequiredField { field: &'a str },
-    IssueCreated { number: u64, title: &'a str, url: &'a str },
-    IssueCreateFailed { error: &'a str },
+    IssueTitleConfirmed {
+        title: &'a str,
+    },
+    IssueRequiredField {
+        field: &'a str,
+    },
+    IssueCreated {
+        number: u64,
+        title: &'a str,
+        url: &'a str,
+    },
+    IssueCreateFailed {
+        error: &'a str,
+    },
 
     // ── Language ──
     /// Confirmation rendered to scrollback after the user picks a
@@ -227,7 +369,10 @@ pub enum Msg<'a> {
     /// leading "  " indent and trailing "\n" so the call site is just
     /// `renderer.render(UiLine::CommandOutput(t(Msg::LanguageSwitched
     /// { ... }).into_owned()))`.
-    LanguageSwitched { label: &'a str, locale: &'a str },
+    LanguageSwitched {
+        label: &'a str,
+        locale: &'a str,
+    },
 
     // ── Idle / onboarding hints ──
     /// "type something, or press " (text before the slash)
@@ -257,20 +402,34 @@ pub enum Msg<'a> {
     CmdNewSession,
     CmdNoProviders,
     CmdNoSessions,
-    CmdUnknownCommand { name: &'a str },
-    CmdLoginFailed { error: &'a str },
+    CmdUnknownCommand {
+        name: &'a str,
+    },
+    CmdLoginFailed {
+        error: &'a str,
+    },
     CmdLogoutDone,
-    CmdLogoutFailed { error: &'a str },
+    CmdLogoutFailed {
+        error: &'a str,
+    },
     CmdWhoamiNotSignedIn,
-    CmdReloadDone { provider: &'a str, model: &'a str },
-    CmdReloadFailed { error: &'a str },
+    CmdReloadDone {
+        provider: &'a str,
+        model: &'a str,
+    },
+    CmdReloadFailed {
+        error: &'a str,
+    },
     CmdUndoNotSupported,
     CmdNoChanges,
     CmdCheckingUpdate,
     CmdNoActiveProvider,
 
     // ── Approval prompt ──
-    ApprovalPromptAlt { tool: &'a str, detail: &'a str },
+    ApprovalPromptAlt {
+        tool: &'a str,
+        detail: &'a str,
+    },
     ApprovalWaitingLabel,
     ApprovalAllow,
     ApprovalAlways,
@@ -278,18 +437,40 @@ pub enum Msg<'a> {
 
     // ── Cancelled / Error prefix ──
     Cancelled,
-    ErrorPrefix { msg: &'a str },
+    ErrorPrefix {
+        msg: &'a str,
+    },
 
     // ── Upgrade messages ──
-    UpgradeSuccess { from: &'a str, to: &'a str },
-    UpgradeManifestFetched { version: &'a str },
-    UpgradeDownloading { pct: i32, bytes: u64, total: u64 },
+    UpgradeSuccess {
+        from: &'a str,
+        to: &'a str,
+    },
+    UpgradeManifestFetched {
+        version: &'a str,
+    },
+    UpgradeDownloading {
+        pct: i32,
+        bytes: u64,
+        total: u64,
+    },
     UpgradeVerifying,
     UpgradeReplacing,
-    UpgradeDone { version: &'a str, backup: &'a str },
-    UpgradeAlreadyLatest { current: &'a str, latest: &'a str },
-    UpgradeFailed { error: &'a str },
-    UpgradeRolledBack { exe: &'a str, backup: &'a str },
+    UpgradeDone {
+        version: &'a str,
+        backup: &'a str,
+    },
+    UpgradeAlreadyLatest {
+        current: &'a str,
+        latest: &'a str,
+    },
+    UpgradeFailed {
+        error: &'a str,
+    },
+    UpgradeRolledBack {
+        exe: &'a str,
+        backup: &'a str,
+    },
 
     // ── Terminal keyboard hints ──
     KbdHintMacos,
@@ -300,12 +481,19 @@ pub enum Msg<'a> {
     LegacyConhostFallback,
 
     // ── Background task ──
-    BackgroundComplete { turns: usize },
-    BackgroundFailed { turns: usize },
+    BackgroundComplete {
+        turns: usize,
+    },
+    BackgroundFailed {
+        turns: usize,
+    },
     BackgroundFilesEdited,
 
     // ── /config command ──
-    ConfigProviderLabel { provider: &'a str, path: &'a str },
+    ConfigProviderLabel {
+        provider: &'a str,
+        path: &'a str,
+    },
 
     // ── /cost command ──
     CostReport {
@@ -318,11 +506,21 @@ pub enum Msg<'a> {
     },
 
     // ── /think command ──
-    ThinkStatus { status: &'a str, budget: u32, provider: &'a str },
-    ThinkEnabled { budget: u32 },
+    ThinkStatus {
+        status: &'a str,
+        budget: u32,
+        provider: &'a str,
+    },
+    ThinkEnabled {
+        budget: u32,
+    },
     ThinkDisabled,
-    ThinkBudgetSet { n: u32 },
-    ThinkBudgetTooSmall { n: u32 },
+    ThinkBudgetSet {
+        n: u32,
+    },
+    ThinkBudgetTooSmall {
+        n: u32,
+    },
     ThinkBudgetUsage,
     ThinkUsage,
 
@@ -334,72 +532,148 @@ pub enum Msg<'a> {
     BackgroundUsage,
 
     // ── /init ──
-    InitAlreadyExists { path: &'a str },
-    InitWrote { path: &'a str, bytes: usize },
-    InitFailed { error: &'a str },
+    InitAlreadyExists {
+        path: &'a str,
+    },
+    InitWrote {
+        path: &'a str,
+        bytes: usize,
+    },
+    InitFailed {
+        error: &'a str,
+    },
 
     // ── /cd ──
-    CdWorkingDir { cwd: &'a str },
+    CdWorkingDir {
+        cwd: &'a str,
+    },
 
     // ── /diff ──
-    DiffFailed { error: &'a str },
+    DiffFailed {
+        error: &'a str,
+    },
 
     // ── /upgrade ──
-    UpgradeUnknownArg { arg: &'a str },
+    UpgradeUnknownArg {
+        arg: &'a str,
+    },
 
     // ── /skills ──
     SkillsNone,
     SkillsAvailable,
-    SkillUnknown { name: &'a str },
+    SkillUnknown {
+        name: &'a str,
+    },
 
     // ── /mcp ──
-    McpReloading { count: usize },
+    McpReloading {
+        count: usize,
+    },
     McpConnecting,
-    McpConnectingServer { name: &'a str },
+    McpConnectingServer {
+        name: &'a str,
+    },
     McpNoServersConfigured,
-    McpClearedReconnecting { removed: usize },
-    McpClearedNoServers { removed: usize },
+    McpClearedReconnecting {
+        removed: usize,
+    },
+    McpClearedNoServers {
+        removed: usize,
+    },
     McpToolsUsage,
-    McpToolsListing { server: &'a str },
+    McpToolsListing {
+        server: &'a str,
+    },
     McpNoRegistry,
     McpServersHeader,
-    McpReloadFailed { error: &'a str },
+    McpReloadFailed {
+        error: &'a str,
+    },
     // /mcp login / logout
     McpOAuthLoginUsage,
     McpOAuthLogoutUsage,
-    McpOAuthLoadConfigFailed { error: &'a str },
-    McpOAuthServerNotFound { server: &'a str },
-    McpOAuthStarting { server: &'a str },
-    McpOAuthSaved { provider: &'a str, server: &'a str },
-    McpOAuthFailed { error: &'a str },
-    McpOAuthTokenRemoved { server: &'a str },
-    McpOAuthNoToken { server: &'a str },
-    McpOAuthLogoutFailed { error: &'a str },
+    McpOAuthLoadConfigFailed {
+        error: &'a str,
+    },
+    McpOAuthServerNotFound {
+        server: &'a str,
+    },
+    McpOAuthStarting {
+        server: &'a str,
+    },
+    McpOAuthSaved {
+        provider: &'a str,
+        server: &'a str,
+    },
+    McpOAuthFailed {
+        error: &'a str,
+    },
+    McpOAuthTokenRemoved {
+        server: &'a str,
+    },
+    McpOAuthNoToken {
+        server: &'a str,
+    },
+    McpOAuthLogoutFailed {
+        error: &'a str,
+    },
     // MCP / LSP server connect feedback (event handler output)
-    McpServerConnected { name: &'a str },
-    McpServerFailed { name: &'a str, error: &'a str },
-    LspServerStarted { name: &'a str, ext: &'a str },
-    LspServerFailed { name: &'a str, ext: &'a str, error: &'a str },
+    McpServerConnected {
+        name: &'a str,
+    },
+    McpServerFailed {
+        name: &'a str,
+        error: &'a str,
+    },
+    LspServerStarted {
+        name: &'a str,
+        ext: &'a str,
+    },
+    LspServerFailed {
+        name: &'a str,
+        ext: &'a str,
+        error: &'a str,
+    },
 
     // ── /worktree ──
     WorktreeUsage,
     WorktreeCreateUsage,
-    WorktreeCreated { branch: &'a str, base: &'a str, path: &'a str },
-    WorktreeCreateFailed { error: &'a str },
+    WorktreeCreated {
+        branch: &'a str,
+        base: &'a str,
+        path: &'a str,
+    },
+    WorktreeCreateFailed {
+        error: &'a str,
+    },
     WorktreeNoActive,
-    WorktreeListFailed { error: &'a str },
+    WorktreeListFailed {
+        error: &'a str,
+    },
     WorktreeActiveHeader,
     WorktreeHasChanges,
     WorktreeClean,
     WorktreeCurrent,
-    WorktreeDoneBack { path: &'a str },
-    WorktreeDoneMergeHint { branch: &'a str },
+    WorktreeDoneBack {
+        path: &'a str,
+    },
+    WorktreeDoneMergeHint {
+        branch: &'a str,
+    },
     WorktreeNoSession,
     WorktreeCleanupUsage,
-    WorktreeCleaned { branch: &'a str },
-    WorktreeCleanedSwitched { path: &'a str },
-    WorktreeCleanupUncommitted { branch: &'a str },
-    WorktreeCleanupFailed { error: &'a str },
+    WorktreeCleaned {
+        branch: &'a str,
+    },
+    WorktreeCleanedSwitched {
+        path: &'a str,
+    },
+    WorktreeCleanupUncommitted {
+        branch: &'a str,
+    },
+    WorktreeCleanupFailed {
+        error: &'a str,
+    },
 
     // ── /help commands (custom commands subcommand) ──
     HelpCustomCommandsHeader,
@@ -410,7 +684,12 @@ pub enum Msg<'a> {
 
     // ── /setup ──
     /// Header line: "✅ Setup complete — 3 installed, 1 skipped, 0 failed · 120ms"
-    SetupHeader { installed: usize, skipped: usize, failed: usize, duration_ms: u64 },
+    SetupHeader {
+        installed: usize,
+        skipped: usize,
+        failed: usize,
+        duration_ms: u64,
+    },
     /// "Installed:" section label in setup report.
     SetupInstalledLabel,
     /// "Skipped:" section label in setup report.
@@ -418,20 +697,36 @@ pub enum Msg<'a> {
     /// "Failed:" section label in setup report.
     SetupFailedLabel,
     /// Per-item installed row: "  ✓ skill:atomcode-automation-recommender → /path"
-    SetupInstalledRow { kind: &'a str, slug: &'a str, path: &'a str },
+    SetupInstalledRow {
+        kind: &'a str,
+        slug: &'a str,
+        path: &'a str,
+    },
     /// Per-item skipped row: "  - skill:xyz (hash match)"
-    SetupSkippedRow { kind: &'a str, slug: &'a str, reason: &'a str },
+    SetupSkippedRow {
+        kind: &'a str,
+        slug: &'a str,
+        reason: &'a str,
+    },
     /// Per-item failed row: "  ✗ mcp:xyz — error message"
-    SetupFailedRow { kind: &'a str, slug: &'a str, error: &'a str },
+    SetupFailedRow {
+        kind: &'a str,
+        slug: &'a str,
+        error: &'a str,
+    },
     /// "💡 Tip: Run /setup …" — first-run hint shown above the prompt
     /// when the project has no setup state yet.
     CmdSetupTip,
     /// "Running atomcode setup..." — shown while setup is in progress.
     CmdSetupRunning,
     /// "Skills reloaded — N available" — after setup completes and skills are reloaded.
-    CmdSetupSkillsReloaded { count: usize },
+    CmdSetupSkillsReloaded {
+        count: usize,
+    },
     /// "setup error: {e}" — when setup::run returns an error.
-    CmdSetupError { error: &'a str },
+    CmdSetupError {
+        error: &'a str,
+    },
     /// "Running setup skill..." — after seeds installed and skill is auto-invoked.
     CmdSetupRunningSkill,
     /// "Setup skill not found..." — when the setup skill cannot be resolved or expanded.
@@ -446,15 +741,35 @@ pub enum Msg<'a> {
     PluginMarketplacesHeader,
     PluginNoInstalled,
     PluginInstalledHeader,
-    PluginMarketplaceCloning { url: &'a str },
-    PluginMarketplaceRemoved { name: &'a str },
-    PluginMarketplaceRemoveFailed { error: &'a str },
-    PluginMarketplaceUpdating { name: &'a str },
-    PluginMarketplaceListFailed { error: &'a str },
-    PluginInstalling { plugin: &'a str, marketplace: &'a str },
-    PluginUninstalled { plugin: &'a str, marketplace: &'a str },
-    PluginUninstallFailed { error: &'a str },
-    PluginListFailed { error: &'a str },
+    PluginMarketplaceCloning {
+        url: &'a str,
+    },
+    PluginMarketplaceRemoved {
+        name: &'a str,
+    },
+    PluginMarketplaceRemoveFailed {
+        error: &'a str,
+    },
+    PluginMarketplaceUpdating {
+        name: &'a str,
+    },
+    PluginMarketplaceListFailed {
+        error: &'a str,
+    },
+    PluginInstalling {
+        plugin: &'a str,
+        marketplace: &'a str,
+    },
+    PluginUninstalled {
+        plugin: &'a str,
+        marketplace: &'a str,
+    },
+    PluginUninstallFailed {
+        error: &'a str,
+    },
+    PluginListFailed {
+        error: &'a str,
+    },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
     CmdDescSetup,
@@ -511,7 +826,9 @@ pub enum Msg<'a> {
     CmdPasteNoImage,
 
     // ── config save failed ──
-    ConfigSaveFailed { error: &'a str },
+    ConfigSaveFailed {
+        error: &'a str,
+    },
 
     // ── OnboardingWizard (multi-step first-run + `/welcome`). Spec:
     //    docs/superpowers/specs/2026-05-11-welcome-wizard-redesign-design.md
@@ -519,7 +836,9 @@ pub enum Msg<'a> {
     OnboardingStepHeaderLanguage,
     OnboardingStepHeaderSetup,
     OnboardingPanelTitle,
-    OnboardingIntroVersionLine { v: &'a str },
+    OnboardingIntroVersionLine {
+        v: &'a str,
+    },
     OnboardingIntroBullet1,
     OnboardingIntroBullet2,
     OnboardingIntroBullet3,
@@ -544,7 +863,9 @@ pub enum Msg<'a> {
     /// (zh-CN). The model key trails as a dim suffix in the renderer
     /// — kept out of this message so the wrapper styling stays
     /// renderer-side.
-    VisionPreprocessSuccess { char_count: usize },
+    VisionPreprocessSuccess {
+        char_count: usize,
+    },
 
     /// TurnComplete separator summary, e.g.
     ///   `✓ Shipped · 3 rounds · 2 tools · 6.8s · 285 tokens`
@@ -591,7 +912,9 @@ pub enum Msg<'a> {
     CtxLabelColdZone,
     CtxLabelMessages,
     CtxLabelFree,
-    CtxMessagesInWindow { n: usize },
+    CtxMessagesInWindow {
+        n: usize,
+    },
     CtxSystemPromptHeader,
     CtxSystemPromptEmpty,
     /// Used in the "used/window tokens (pct)" line below the bar.
@@ -600,13 +923,22 @@ pub enum Msg<'a> {
     // ── /compact ──
     CompactNothingShort,
     CompactStarting,
-    CompactNothingNoSavings { before: &'a str, after: &'a str },
-    CompactDropped { messages: usize, before: &'a str, after: &'a str },
+    CompactNothingNoSavings {
+        before: &'a str,
+        after: &'a str,
+    },
+    CompactDropped {
+        messages: usize,
+        before: &'a str,
+        after: &'a str,
+    },
 
     /// Surfaced when the user pastes/attaches an image but the active
     /// model can't accept images AND no `vision_preprocessor_provider`
     /// is configured. `model` is the current model identifier.
-    ModelNoImageSupport { model: &'a str },
+    ModelNoImageSupport {
+        model: &'a str,
+    },
 
     /// Confirmation hint after the first Ctrl+C on an empty buffer.
     /// "  (press Ctrl+C again to exit)\n" — leading indent + trailing
@@ -629,7 +961,13 @@ pub enum Msg<'a> {
     BgListHeader,
     /// Row format for `/bg list`. `state` is the localised state label,
     /// `age` is the humanised age string, `summary` is the session name.
-    BgListRow { slot: usize, short_id: &'a str, state: &'a str, age: &'a str, summary: &'a str },
+    BgListRow {
+        slot: usize,
+        short_id: &'a str,
+        state: &'a str,
+        age: &'a str,
+        summary: &'a str,
+    },
     /// Localised label for `RuntimeState::Running`.
     BgStateRunning,
     /// Localised label for `RuntimeState::Idle`.
@@ -643,40 +981,71 @@ pub enum Msg<'a> {
     /// Age string: less than 60 seconds.
     BgAgeNow,
     /// Age string: minutes. `n` is the number of minutes.
-    BgAgeMinutes { n: u64 },
+    BgAgeMinutes {
+        n: u64,
+    },
     /// Age string: hours. `n` is the number of hours.
-    BgAgeHours { n: u64 },
+    BgAgeHours {
+        n: u64,
+    },
     /// Age string: days. `n` is the number of days.
-    BgAgeDays { n: u64 },
+    BgAgeDays {
+        n: u64,
+    },
     /// Error: too many background slots. `max` is the slot limit.
-    BgSlotLimitReached { max: usize },
+    BgSlotLimitReached {
+        max: usize,
+    },
     /// Output after `/bg` sends the current session to background.
     /// `new_id` is the new foreground session short id,
     /// `slot` is the background slot number,
     /// `old_id` is the backgrounded session short id,
     /// `state` is the localised runtime state.
-    BgBackgroundCurrent { new_id: &'a str, slot: usize, old_id: &'a str, state: &'a str },
+    BgBackgroundCurrent {
+        new_id: &'a str,
+        slot: usize,
+        old_id: &'a str,
+        state: &'a str,
+    },
     /// Error: invalid slot number. `slot` is the requested slot,
     /// `available` is the number of available slots.
-    BgInvalidSlot { slot: usize, available: usize },
+    BgInvalidSlot {
+        slot: usize,
+        available: usize,
+    },
     /// Error: background slot has no runtime client.
     BgNoRuntimeClient,
     /// Output after `/bg <N>` resumes a background session.
     /// `slot` is the resumed slot, `short_id` is the session short id.
-    BgResumed { slot: usize, short_id: &'a str },
+    BgResumed {
+        slot: usize,
+        short_id: &'a str,
+    },
     /// When resuming moves the previous foreground into a background slot.
     /// `slot` is the new background slot number.
-    BgPreviousForegroundMoved { slot: usize },
+    BgPreviousForegroundMoved {
+        slot: usize,
+    },
     /// Output after `/bg drop <N>`. `slot` is the dropped slot,
     /// `short_id` is the session short id.
-    BgDropped { slot: usize, short_id: &'a str },
+    BgDropped {
+        slot: usize,
+        short_id: &'a str,
+    },
     /// Output after `/background <task>` starts a one-shot task.
     /// `slot` is the background slot, `short_id` is the session short id.
-    BgTaskStarted { slot: usize, short_id: &'a str },
+    BgTaskStarted {
+        slot: usize,
+        short_id: &'a str,
+    },
     /// Background task timed out. `secs` is the timeout in seconds.
-    BgTaskTimedOut { secs: u64 },
+    BgTaskTimedOut {
+        secs: u64,
+    },
     /// Background task internal error. `error` is the error message.
-    BgTaskError { error: &'a str },
+    BgTaskError {
+        error: &'a str,
+    },
     /// Background task was cancelled.
     BgTaskCancelled,
     /// Background task finished but produced no summary text.

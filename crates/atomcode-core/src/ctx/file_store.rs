@@ -35,7 +35,6 @@ pub struct FileEntry {
     pub line_count: usize,
 }
 
-
 /// Process-local file content store.
 ///
 /// `Default` constructs an empty store. Wrap in `Arc<RwLock<>>` for the
@@ -149,7 +148,6 @@ impl FileStore {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
 }
 
 /// Derive a stable id from path + content. Same content at the same
@@ -197,7 +195,10 @@ mod tests {
         // Old id displaced by new — only the latest survives.
         assert!(s.get(&id1).is_none());
         assert!(s.get(&id2).is_some());
-        assert_eq!(s.store_id_for_path(std::path::Path::new("/x.rs")), Some(id2.as_str()));
+        assert_eq!(
+            s.store_id_for_path(std::path::Path::new("/x.rs")),
+            Some(id2.as_str())
+        );
     }
 
     #[test]
@@ -291,5 +292,4 @@ mod tests {
             derive_id(std::path::Path::new("/b"), "x"),
         );
     }
-
 }

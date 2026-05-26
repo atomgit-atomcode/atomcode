@@ -174,14 +174,13 @@ fn context_builds_with_turn_tracking_after_set_messages() {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
+        reasoning_history: None,
+        reasoning_effort: None,
+        thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
-
-};
+    };
     let ctx_builder = DefaultCtx::new(&provider_config);
 
     let (built_msgs, stats) =
@@ -250,14 +249,13 @@ fn context_uses_fallback_when_turn_tracker_is_empty() {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
+        reasoning_history: None,
+        reasoning_effort: None,
+        thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
-
-};
+    };
     let ctx_builder = DefaultCtx::new(&provider_config);
 
     let (built_msgs, _stats) =
@@ -375,7 +373,8 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 tool_calls: vec![ToolCall {
                     id: "c3".into(),
                     name: "edit_file".into(),
-                    arguments: r#"{"file_path":"/tmp/x.rs","old_string":"foo","new_string":"bar"}"#.into(),
+                    arguments: r#"{"file_path":"/tmp/x.rs","old_string":"foo","new_string":"bar"}"#
+                        .into(),
                 }],
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
@@ -450,14 +449,13 @@ fn restored_context_contains_same_user_messages_as_original() {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
+        reasoning_history: None,
+        reasoning_effort: None,
+        thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
-
-};
+    };
     let ctx_builder = DefaultCtx::new(&provider_config);
     let system_prompt = "You are a helpful assistant.";
 
@@ -522,14 +520,13 @@ fn empty_turn_tracker_loses_windowing_precision() {
         max_tokens: None,
         thinking_type: None,
         thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
+        reasoning_history: None,
+        reasoning_effort: None,
+        thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: true,
-
-};
+    };
     let ctx_builder = DefaultCtx::new(&provider_config);
 
     let conv = build_multi_turn_conversation(3);
@@ -544,8 +541,8 @@ fn empty_turn_tracker_loses_windowing_precision() {
         turn_tracker: tracker,
         cold_summaries: Vec::new(),
     };
-    let (_, stats_with_tracker) = ctx_builder
-        .build_messages(&restored_conv, "You are a helpful assistant.", "");
+    let (_, stats_with_tracker) =
+        ctx_builder.build_messages(&restored_conv, "You are a helpful assistant.", "");
 
     // Without turn tracker (the old bug)
     let buggy_conv = Conversation {
@@ -555,8 +552,8 @@ fn empty_turn_tracker_loses_windowing_precision() {
         turn_tracker: TurnTracker::new(),
         cold_summaries: Vec::new(),
     };
-    let (_, stats_without_tracker) = ctx_builder
-        .build_messages(&buggy_conv, "You are a helpful assistant.", "");
+    let (_, stats_without_tracker) =
+        ctx_builder.build_messages(&buggy_conv, "You are a helpful assistant.", "");
 
     // With tracker: total_messages should be populated from turn-based windowing
     // Without tracker: total_messages may be 0 (default) from the fallback path

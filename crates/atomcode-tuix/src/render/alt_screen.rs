@@ -229,11 +229,7 @@ fn render_line_with_selection(
 /// falls in `[sel_start, sel_end)`, dropping all CSI escapes. Used by
 /// `extract_selection_text` to assemble what gets written to the
 /// clipboard. Wide-char rule matches `render_line_with_selection`.
-fn extract_line_selection_text(
-    line: &str,
-    sel_start: usize,
-    sel_end: usize,
-) -> String {
+fn extract_line_selection_text(line: &str, sel_start: usize, sel_end: usize) -> String {
     if sel_end <= sel_start {
         return String::new();
     }
@@ -267,8 +263,7 @@ fn extract_line_selection_text(
 /// payload is one user-selected text blob per drag-release, kilobytes
 /// at most, and the alphabet is fixed.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     let mut chunks = input.chunks_exact(3);
     for chunk in &mut chunks {
@@ -520,8 +515,8 @@ impl AltScreenRenderer<BufWriter<Stdout>> {
 #[cfg(windows)]
 fn enable_conhost_mouse_capture() -> Option<u32> {
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS,
-        ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT, STD_INPUT_HANDLE,
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT,
+        ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT, STD_INPUT_HANDLE,
     };
     unsafe {
         let h = GetStdHandle(STD_INPUT_HANDLE);
@@ -538,8 +533,9 @@ fn enable_conhost_mouse_capture() -> Option<u32> {
             crate::tuix_trace!("REN", "conhost-mouse: GetConsoleMode failed: {}", err);
             return None;
         }
-        let new_mode = (original | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
-            & !ENABLE_QUICK_EDIT_MODE;
+        let new_mode =
+            (original | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
+                & !ENABLE_QUICK_EDIT_MODE;
         if SetConsoleMode(h, new_mode) == 0 {
             let err = std::io::Error::last_os_error();
             crate::tuix_trace!(
@@ -722,7 +718,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                     restore_conhost_console_in_mode(prior);
                 }
             }
-            let _ = self.out.write_all(b"\x1b[?25h\x1b[?12h\x1b[?1006l\x1b[?1002l\x1b[?1049l");
+            let _ = self
+                .out
+                .write_all(b"\x1b[?25h\x1b[?12h\x1b[?1006l\x1b[?1002l\x1b[?1049l");
             let _ = self.out.flush();
             self.alt_screen_active = false;
         }
@@ -841,9 +839,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
                 // SGR pair eat into the visible-content budget — a
                 // 80-col line with one colour span would lose 5+
                 // trailing visible chars.
-                let painted = match sel_bounds.and_then(|(lo, hi)| {
-                    selection_col_range_for_line(body_idx, lo, hi, line)
-                }) {
+                let painted = match sel_bounds
+                    .and_then(|(lo, hi)| selection_col_range_for_line(body_idx, lo, hi, line))
+                {
                     Some((s, e)) => render_line_with_selection(line, max_cols, s, e),
                     None => truncate_to_width_sgr_aware(line, max_cols),
                 };
@@ -934,9 +932,7 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let mut parts = Vec::with_capacity(hi.0 - lo.0 + 1);
         for line_idx in lo.0..=hi.0.min(total - 1) {
             let line = &self.body_lines[line_idx];
-            let Some((s, e)) =
-                selection_col_range_for_line(line_idx, lo, hi, line)
-            else {
+            let Some((s, e)) = selection_col_range_for_line(line_idx, lo, hi, line) else {
                 parts.push(String::new());
                 continue;
             };
@@ -1124,7 +1120,11 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let cup = format!("\x1b[{};1H\x1b[K", input_row);
         let _ = self.out.write_all(cup.as_bytes());
         let chev = self.caps.prompt_chevron();
-        let buf_str = self.pending_input.as_ref().map(|(b, _)| b.as_str()).unwrap_or("");
+        let buf_str = self
+            .pending_input
+            .as_ref()
+            .map(|(b, _)| b.as_str())
+            .unwrap_or("");
         let cursor_byte = self
             .pending_input
             .as_ref()
@@ -1224,7 +1224,9 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             } else if menu.selected < 4 {
                 0
             } else {
-                (menu.selected + 1).saturating_sub(4).min(len.saturating_sub(4))
+                (menu.selected + 1)
+                    .saturating_sub(4)
+                    .min(len.saturating_sub(4))
             };
             let end = (offset + 4).min(len);
             for (i, (name, desc)) in menu.items[offset..end].iter().enumerate() {
@@ -1310,12 +1312,17 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             .as_ref()
             .map(|s| crate::width::display_width(s) + 1)
             .unwrap_or(0);
-        let sep_w = if !model.is_empty() && !cwd_full.is_empty() { 3 } else { 0 };
+        let sep_w = if !model.is_empty() && !cwd_full.is_empty() {
+            3
+        } else {
+            0
+        };
         let left_max = (self.width as usize).saturating_sub(mode_badge_w);
         let cwd_budget = left_max
             .saturating_sub(crate::width::display_width(&model))
             .saturating_sub(sep_w);
-        let cwd = if !cwd_full.is_empty() && cwd_budget > 0
+        let cwd = if !cwd_full.is_empty()
+            && cwd_budget > 0
             && crate::width::display_width(&cwd_full) > cwd_budget
         {
             crate::width::truncate_path(&cwd_full, cwd_budget)
@@ -1467,7 +1474,11 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let chev_width = chev.chars().count();
         let max_cols = (self.width as usize).saturating_sub(chev_width);
         let cursor_byte = cursor_byte.min(buf_str.len());
-        let nl_marker = if self.caps.unicode_symbols { "↵" } else { "\\n" };
+        let nl_marker = if self.caps.unicode_symbols {
+            "↵"
+        } else {
+            "\\n"
+        };
         let prefix_safe = scrub_controls(&buf_str[..cursor_byte]).replace('\n', nl_marker);
         let cursor_col_in_buf = display_width(&prefix_safe);
         let visible_cursor_col = if cursor_col_in_buf < max_cols {
@@ -1568,7 +1579,10 @@ impl<W: Write + Send> AltScreenRenderer<W> {
         let dashes_left = "─".repeat(left);
         let dashes_right = "─".repeat(right);
         if self.caps.colors {
-            format!("{}{}{}{}{}", SGR_DIM, dashes_left, label_text, dashes_right, SGR_RESET)
+            format!(
+                "{}{}{}{}{}",
+                SGR_DIM, dashes_left, label_text, dashes_right, SGR_RESET
+            )
         } else {
             format!("{}{}{}", dashes_left, label_text, dashes_right)
         }
@@ -1584,8 +1598,16 @@ impl<W: Write + Send> AltScreenRenderer<W> {
     ///   /provider  to add a custom model
     ///   (blank)
     fn push_welcome(&mut self, model: &str, working_dir: &str) {
-        let diamond = if self.caps.unicode_symbols { "\u{25c6}" } else { "*" };
-        let bullet = if self.caps.unicode_symbols { "\u{2219}" } else { "*" };
+        let diamond = if self.caps.unicode_symbols {
+            "\u{25c6}"
+        } else {
+            "*"
+        };
+        let bullet = if self.caps.unicode_symbols {
+            "\u{2219}"
+        } else {
+            "*"
+        };
         // Title row with right-aligned version + license. Fill the
         // gap with spaces so v4.x.y · MIT lands at the right edge.
         let version = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -1629,19 +1651,33 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let hint_line = if self.caps.colors {
                 let hint_a = format!(
                     "{}{}{}{}{}{}{}{}{}",
-                    SGR_DIM, t(Msg::IdleHintPrefix), SGR_RESET,
-                    SGR_CYAN, t(Msg::IdleHintSlash), SGR_RESET,
-                    SGR_DIM, t(Msg::IdleHintSuffix), SGR_RESET,
+                    SGR_DIM,
+                    t(Msg::IdleHintPrefix),
+                    SGR_RESET,
+                    SGR_CYAN,
+                    t(Msg::IdleHintSlash),
+                    SGR_RESET,
+                    SGR_DIM,
+                    t(Msg::IdleHintSuffix),
+                    SGR_RESET,
                 );
                 let hint_b = format!(
                     "{}{}{}  {}{}{}",
-                    SGR_CYAN, t(Msg::IdleHintProvider), SGR_RESET,
-                    SGR_DIM, t(Msg::IdleHintProviderSuffix), SGR_RESET,
+                    SGR_CYAN,
+                    t(Msg::IdleHintProvider),
+                    SGR_RESET,
+                    SGR_DIM,
+                    t(Msg::IdleHintProviderSuffix),
+                    SGR_RESET,
                 );
                 let hint_c = format!(
                     "{}{}{}  {}{}{}",
-                    SGR_CYAN, t(Msg::IdleHintCodingplan), SGR_RESET,
-                    SGR_DIM, t(Msg::IdleHintCodingplanSuffix), SGR_RESET,
+                    SGR_CYAN,
+                    t(Msg::IdleHintCodingplan),
+                    SGR_RESET,
+                    SGR_DIM,
+                    t(Msg::IdleHintCodingplanSuffix),
+                    SGR_RESET,
                 );
                 format!("{}   {}   {}", hint_a, hint_b, hint_c)
             } else {
@@ -1657,9 +1693,15 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let hint_a = if self.caps.colors {
                 format!(
                     "{}{}{}{}{}{}{}{}{}",
-                    SGR_DIM, t(Msg::IdleHintPrefix), SGR_RESET,
-                    SGR_CYAN, t(Msg::IdleHintSlash), SGR_RESET,
-                    SGR_DIM, t(Msg::IdleHintSuffix), SGR_RESET,
+                    SGR_DIM,
+                    t(Msg::IdleHintPrefix),
+                    SGR_RESET,
+                    SGR_CYAN,
+                    t(Msg::IdleHintSlash),
+                    SGR_RESET,
+                    SGR_DIM,
+                    t(Msg::IdleHintSuffix),
+                    SGR_RESET,
                 )
             } else {
                 t(Msg::IdleHintFull).into_owned()
@@ -1668,8 +1710,12 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let hint_b = if self.caps.colors {
                 format!(
                     "{}{}{}  {}{}{}",
-                    SGR_CYAN, t(Msg::IdleHintProvider), SGR_RESET,
-                    SGR_DIM, t(Msg::IdleHintProviderSuffix), SGR_RESET,
+                    SGR_CYAN,
+                    t(Msg::IdleHintProvider),
+                    SGR_RESET,
+                    SGR_DIM,
+                    t(Msg::IdleHintProviderSuffix),
+                    SGR_RESET,
                 )
             } else {
                 t(Msg::IdleHintProviderFull).into_owned()
@@ -1678,8 +1724,12 @@ impl<W: Write + Send> AltScreenRenderer<W> {
             let hint_c = if self.caps.colors {
                 format!(
                     "{}{}{}  {}{}{}",
-                    SGR_CYAN, t(Msg::IdleHintCodingplan), SGR_RESET,
-                    SGR_DIM, t(Msg::IdleHintCodingplanSuffix), SGR_RESET,
+                    SGR_CYAN,
+                    t(Msg::IdleHintCodingplan),
+                    SGR_RESET,
+                    SGR_DIM,
+                    t(Msg::IdleHintCodingplanSuffix),
+                    SGR_RESET,
                 )
             } else {
                 t(Msg::IdleHintCodingplanFull).into_owned()
@@ -1953,8 +2003,7 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             }
 
             // ── body: tools & diffs ──
-            UiLine::ToolCall { name, detail }
-            | UiLine::ToolCallInFlight { name, detail, .. } => {
+            UiLine::ToolCall { name, detail } | UiLine::ToolCallInFlight { name, detail, .. } => {
                 self.push_tool_call(&name, &detail);
             }
             UiLine::ToolCallCommit { .. } => {
@@ -1962,7 +2011,11 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 // pushes ToolCallInFlight as a static row already, so
                 // there's nothing to freeze yet.
             }
-            UiLine::ToolGroupRender { batch_id: _, header, children } => {
+            UiLine::ToolGroupRender {
+                batch_id: _,
+                header,
+                children,
+            } => {
                 // alt-screen mirrors retained's append-style without
                 // the in-place ✓ rewrite (alt-screen layout is
                 // virtual-buffer based; live-group rewrite would need
@@ -1984,7 +2037,11 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                     self.push_styled_command_output(&c.text, SGR_GREY);
                 }
             }
-            UiLine::ToolGroupChildUpdate { batch_id: _, call_id: _, new_text } => {
+            UiLine::ToolGroupChildUpdate {
+                batch_id: _,
+                call_id: _,
+                new_text,
+            } => {
                 // Update inherits the muted child styling so the row
                 // stays visually subordinate after the result lands.
                 self.push_styled_command_output(&new_text, SGR_GREY);
@@ -2266,7 +2323,11 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         // pinned-bottom state lands one page above the tail (not
         // anchored at 0 because the buffer might be much longer than
         // one page).
-        let current_top = if self.sticky_bottom { max_top } else { self.viewport_top };
+        let current_top = if self.sticky_bottom {
+            max_top
+        } else {
+            self.viewport_top
+        };
         let new_top: usize = if delta < 0 {
             current_top.saturating_sub(delta.unsigned_abs() as usize)
         } else {
@@ -2361,7 +2422,10 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
         // selection (so a stray click also acts as "deselect").
         match self.screen_to_body(col, row) {
             Some(pos) => {
-                self.selection = Some(Selection { anchor: pos, head: pos });
+                self.selection = Some(Selection {
+                    anchor: pos,
+                    head: pos,
+                });
                 self.selection_active = true;
             }
             None => {
@@ -2470,12 +2534,36 @@ mod tests {
         let r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
         drop(r);
         let s = String::from_utf8_lossy(&buf);
-        assert!(s.contains("\x1b[?1049h"), "alt-screen ENTER missing. got: {:?}", s);
-        assert!(s.contains("\x1b[?1002h"), "mouse-mode ENTER (1002h) missing. got: {:?}", s);
-        assert!(s.contains("\x1b[?1006h"), "mouse-mode ENTER (1006h) missing. got: {:?}", s);
-        assert!(s.contains("\x1b[?1049l"), "alt-screen LEAVE missing. got: {:?}", s);
-        assert!(s.contains("\x1b[?1002l"), "mouse-mode LEAVE (1002l) missing. got: {:?}", s);
-        assert!(s.contains("\x1b[?1006l"), "mouse-mode LEAVE (1006l) missing. got: {:?}", s);
+        assert!(
+            s.contains("\x1b[?1049h"),
+            "alt-screen ENTER missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[?1002h"),
+            "mouse-mode ENTER (1002h) missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[?1006h"),
+            "mouse-mode ENTER (1006h) missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[?1049l"),
+            "alt-screen LEAVE missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[?1002l"),
+            "mouse-mode LEAVE (1002l) missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[?1006l"),
+            "mouse-mode LEAVE (1006l) missing. got: {:?}",
+            s
+        );
     }
 
     /// Welcome pushes 4 rows (title, working_dir, model, blank) into
@@ -2575,10 +2663,26 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("hi"), "user echo missing. got: {:?}", s);
-        assert!(s.contains("hello there"), "assistant text missing. got: {:?}", s);
-        assert!(s.contains("read_file"), "tool call name missing. got: {:?}", s);
-        assert!(s.contains("ok"), "tool result summary missing. got: {:?}", s);
-        assert!(s.contains("[Error: boom]"), "error line missing. got: {:?}", s);
+        assert!(
+            s.contains("hello there"),
+            "assistant text missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("read_file"),
+            "tool call name missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("ok"),
+            "tool result summary missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("[Error: boom]"),
+            "error line missing. got: {:?}",
+            s
+        );
     }
 
     /// Each body push produces a paint cycle that EL-clears every row
@@ -2729,7 +2833,11 @@ mod tests {
             "bold SGR opener missing — markdown didn't fire. got: {:?}",
             row
         );
-        assert!(row.contains("bold"), "literal text retained. got: {:?}", row);
+        assert!(
+            row.contains("bold"),
+            "literal text retained. got: {:?}",
+            row
+        );
         drop(r);
     }
 
@@ -2776,7 +2884,11 @@ mod tests {
             0,
             "body line inside open fence must buffer, not push"
         );
-        assert_eq!(r.md_state.code_buf.len(), 1, "code_buf must hold the body line");
+        assert_eq!(
+            r.md_state.code_buf.len(),
+            1,
+            "code_buf must hold the body line"
+        );
         assert!(r.md_state.in_code_block);
 
         r.render(UiLine::AssistantText("```\n".into()));
@@ -2784,7 +2896,10 @@ mod tests {
         // pushed containing the flushed (highlighted-or-plain) block.
         assert!(!r.md_state.in_code_block, "code-block state must flip off");
         assert!(r.md_state.code_buf.is_empty(), "code_buf must be drained");
-        assert!(r.body_lines.len() >= 1, "close fence must flush at least one body row");
+        assert!(
+            r.body_lines.len() >= 1,
+            "close fence must flush at least one body row"
+        );
         drop(r);
     }
 
@@ -2842,7 +2957,11 @@ mod tests {
         r.flush();
         drop(r);
         let s = String::from_utf8_lossy(&buf);
-        assert!(s.contains("\x1b[8;1H"), "input row CUP at row 8 missing. got: {:?}", s);
+        assert!(
+            s.contains("\x1b[8;1H"),
+            "input row CUP at row 8 missing. got: {:?}",
+            s
+        );
         assert!(s.contains("hello"), "input buf missing. got: {:?}", s);
         // Cursor at row 8 col 8 (chevron 2 cols + 5 buf chars + 1 for
         // 1-indexed) followed by show-cursor.
@@ -2872,7 +2991,11 @@ mod tests {
         r.flush();
         drop(r);
         let s = String::from_utf8_lossy(&buf);
-        assert!(s.contains("\x1b[10;1H"), "status row CUP at row 10 missing. got: {:?}", s);
+        assert!(
+            s.contains("\x1b[10;1H"),
+            "status row CUP at row 10 missing. got: {:?}",
+            s
+        );
         assert!(
             s.contains("claude-opus-4-7 \u{00b7} /tmp/proj"),
             "status content missing. got: {:?}",
@@ -2900,15 +3023,27 @@ mod tests {
         let s = String::from_utf8_lossy(&buf);
         // top_rule at row 7, bot_rule at row 9. Each row has 20 ━.
         let twenty_heavy = "━".repeat(20);
-        assert!(s.contains("\x1b[7;1H"), "top rule row CUP missing. got: {:?}", s);
-        assert!(s.contains("\x1b[9;1H"), "bot rule row CUP missing. got: {:?}", s);
+        assert!(
+            s.contains("\x1b[7;1H"),
+            "top rule row CUP missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("\x1b[9;1H"),
+            "bot rule row CUP missing. got: {:?}",
+            s
+        );
         assert!(
             s.contains(&twenty_heavy),
             "20 ━ chars missing. got: {:?}",
             s
         );
         // Bright cyan (96) — matches retained's `Palette::BORDER`.
-        assert!(s.contains("\x1b[96m"), "rule should be bright cyan. got: {:?}", s);
+        assert!(
+            s.contains("\x1b[96m"),
+            "rule should be bright cyan. got: {:?}",
+            s
+        );
     }
 
     /// `wrap_to_width_sgr_aware` is the soft-wrap helper that keeps long
@@ -2932,7 +3067,11 @@ mod tests {
         // concatenation must reproduce the input byte-for-byte.
         let url = "https://atomgit.com/oauth/authorize?client_id=85a8b0099b4144a19a7542d5cc90fdcc&redirect_uri=https%3A%2F%2Facs.atomgit.com%2Fcallback&response_type=code&state=atomcode_1777469916784730326_e2d348c6072a47beb1b0b414f25c8ef6&scope=user_info+projects";
         let chunks = wrap_to_width_sgr_aware(url, 80);
-        assert!(chunks.len() >= 3, "URL must wrap into ≥3 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "URL must wrap into ≥3 chunks, got {}",
+            chunks.len()
+        );
         for c in &chunks {
             assert!(
                 line_display_width_sgr_aware(c) <= 80,
@@ -2947,8 +3086,14 @@ mod tests {
         let with_sgr = format!("\x1b[31m{}\x1b[0m", "x".repeat(10));
         let chunks = wrap_to_width_sgr_aware(&with_sgr, 5);
         assert_eq!(chunks.len(), 2, "10 visible chars at width 5 → 2 chunks");
-        assert!(chunks[0].contains("\x1b[31m"), "opening SGR stays in first chunk");
-        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), with_sgr.len());
+        assert!(
+            chunks[0].contains("\x1b[31m"),
+            "opening SGR stays in first chunk"
+        );
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).sum::<usize>(),
+            with_sgr.len()
+        );
 
         // Wide CJK glyph (2 cells) at the boundary wraps cleanly
         // instead of being split across chunks.
@@ -2970,7 +3115,10 @@ mod tests {
         let mut buf = Vec::new();
         let mut r = AltScreenRenderer::with_writer(&mut buf, caps_default(), 80, 24);
         let url = "https://atomgit.com/oauth/authorize?client_id=85a8b0099b4144a19a7542d5cc90fdcc&redirect_uri=https%3A%2F%2Facs.atomgit.com%2Fcallback&response_type=code&state=atomcode_1777469916784730326_e2d348c6072a47beb1b0b414f25c8ef6&scope=user_info+projects";
-        let body = format!("  Open this URL in any browser to sign in to AtomGit:\n  {}\n", url);
+        let body = format!(
+            "  Open this URL in any browser to sign in to AtomGit:\n  {}\n",
+            url
+        );
         r.render(UiLine::CommandOutput(body));
         r.flush();
         // Header line + ≥3 wrapped URL rows + trailing blank.
@@ -3016,7 +3164,7 @@ mod tests {
                     ("exit".into(), "leave".into()),
                 ],
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
             attachments: Vec::new(),
@@ -3041,7 +3189,7 @@ mod tests {
                     ("exit".into(), "leave".into()),
                 ],
                 selected: 1,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
             attachments: Vec::new(),
@@ -3085,7 +3233,7 @@ mod tests {
                     ("second".into(), "short".into()),
                 ],
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: crate::render::StatusLine::default(),
             attachments: Vec::new(),
@@ -3133,7 +3281,11 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("AtomCode"));
-        assert!(s.contains("MIT"), "license MIT missing from banner. got: {:?}", s);
+        assert!(
+            s.contains("MIT"),
+            "license MIT missing from banner. got: {:?}",
+            s
+        );
         assert!(s.contains("type something"), "hint A missing. got: {:?}", s);
         assert!(s.contains("/provider"), "hint B missing. got: {:?}", s);
     }
@@ -3152,8 +3304,16 @@ mod tests {
         drop(r);
         let s = String::from_utf8_lossy(&buf);
         // Spinner row CUP at row 8 + label.
-        assert!(s.contains("\x1b[8;1H"), "spinner row CUP missing. got: {:?}", s);
-        assert!(s.contains("Thinking"), "spinner label missing. got: {:?}", s);
+        assert!(
+            s.contains("\x1b[8;1H"),
+            "spinner row CUP missing. got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("Thinking"),
+            "spinner label missing. got: {:?}",
+            s
+        );
     }
 
     /// The spinner FRAME (the rotating glyph) must be coloured brand
@@ -3208,7 +3368,10 @@ mod tests {
         });
         assert!(r.pending_spinner.is_some(), "spinner should be active");
         r.render(UiLine::ClearTransient);
-        assert!(r.pending_spinner.is_none(), "ClearTransient must drop spinner");
+        assert!(
+            r.pending_spinner.is_none(),
+            "ClearTransient must drop spinner"
+        );
         drop(r);
     }
 
@@ -3253,9 +3416,7 @@ mod tests {
         );
         // Badge precedes the dim model/cwd run — confirm the magenta SGR
         // appears earlier in the byte stream than the dim SGR (\x1b[2m).
-        let badge_pos = s
-            .find("\x1b[95m")
-            .expect("magenta SGR must be present");
+        let badge_pos = s.find("\x1b[95m").expect("magenta SGR must be present");
         let dim_pos = s
             .find("\x1b[2m")
             .expect("dim SGR (status body) must be present");
@@ -3784,7 +3945,8 @@ mod tests {
         // Hide-cursor (`\x1b[?25l`) must precede the body row CUP
         // sequences — proves we hide before painting, not after.
         let hide_pos = s.find("\x1b[?25l").expect("hide-cursor sequence missing");
-        let first_body_cup = s.find("\x1b[1;1H\x1b[K")
+        let first_body_cup = s
+            .find("\x1b[1;1H\x1b[K")
             .expect("body row 1 CUP+EL missing");
         assert!(
             hide_pos < first_body_cup,
@@ -3931,9 +4093,21 @@ mod tests {
     fn render_line_with_selection_emits_reverse_video() {
         let line = "hello world";
         let out = render_line_with_selection(line, 80, 0, 5);
-        assert!(out.starts_with("\x1b[0m\x1b[7m"), "should open with reset+reverse. got: {:?}", out);
-        assert!(out.contains("hello"), "selected text missing. got: {:?}", out);
-        assert!(out.contains("\x1b[0m world"), "post-selection plain text missing. got: {:?}", out);
+        assert!(
+            out.starts_with("\x1b[0m\x1b[7m"),
+            "should open with reset+reverse. got: {:?}",
+            out
+        );
+        assert!(
+            out.contains("hello"),
+            "selected text missing. got: {:?}",
+            out
+        );
+        assert!(
+            out.contains("\x1b[0m world"),
+            "post-selection plain text missing. got: {:?}",
+            out
+        );
     }
 
     /// A CSI escape *inside* the selection range must be dropped
@@ -3957,7 +4131,11 @@ mod tests {
         // at selection end. The interior `\x1b[0m` from the source
         // line MUST be dropped; if it leaked through we'd see 3.
         let resets = out.matches("\x1b[0m").count();
-        assert_eq!(resets, 2, "expected open-reset + close-reset only. got: {:?}", out);
+        assert_eq!(
+            resets, 2,
+            "expected open-reset + close-reset only. got: {:?}",
+            out
+        );
     }
 
     /// Empty selection range collapses to a plain SGR-aware truncate.
@@ -4090,7 +4268,10 @@ mod tests {
         // body_height = 5, footer starts at row 5. Press at row 7
         // (in the input box / status area).
         r.begin_selection(0, 7);
-        assert!(r.selection.is_none(), "footer press must not start a selection");
+        assert!(
+            r.selection.is_none(),
+            "footer press must not start a selection"
+        );
         assert!(!r.selection_active);
         drop(r);
     }
@@ -4193,7 +4374,11 @@ mod tests {
         let text = r.extract_selection_text();
         // Line 0: from col 2 to EOL of "first row" (9 cols) = "rst row"
         // Line 1: from col 0 to col 4 (head+1) of "second row" = "seco"
-        assert_eq!(text, "rst row\nseco", "multi-line extract mismatch: {:?}", text);
+        assert_eq!(
+            text, "rst row\nseco",
+            "multi-line extract mismatch: {:?}",
+            text
+        );
         drop(r);
     }
 

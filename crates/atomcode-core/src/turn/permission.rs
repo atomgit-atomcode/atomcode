@@ -172,7 +172,11 @@ mod tests {
     async fn test_auto_bypass_allows_all() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::BypassAll);
         assert!(matches!(
-            d.decide(&make_call("bash"), &ApprovalRequirement::RequireApproval("dangerous".into())).await,
+            d.decide(
+                &make_call("bash"),
+                &ApprovalRequirement::RequireApproval("dangerous".into())
+            )
+            .await,
             PermissionDecision::Allow
         ));
     }
@@ -181,7 +185,11 @@ mod tests {
     async fn test_auto_deny_denies_all() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::DenyAll);
         assert!(matches!(
-            d.decide(&make_call("bash"), &ApprovalRequirement::RequireApproval("dangerous".into())).await,
+            d.decide(
+                &make_call("bash"),
+                &ApprovalRequirement::RequireApproval("dangerous".into())
+            )
+            .await,
             PermissionDecision::Deny
         ));
     }
@@ -190,15 +198,27 @@ mod tests {
     async fn test_auto_accept_edits_allows_write() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::AcceptEdits);
         assert!(matches!(
-            d.decide(&make_call("create_file"), &ApprovalRequirement::RequireApproval("write".into())).await,
+            d.decide(
+                &make_call("create_file"),
+                &ApprovalRequirement::RequireApproval("write".into())
+            )
+            .await,
             PermissionDecision::Allow
         ));
         assert!(matches!(
-            d.decide(&make_call("edit_file"), &ApprovalRequirement::RequireApproval("edit".into())).await,
+            d.decide(
+                &make_call("edit_file"),
+                &ApprovalRequirement::RequireApproval("edit".into())
+            )
+            .await,
             PermissionDecision::Allow
         ));
         assert!(matches!(
-            d.decide(&make_call("search_replace"), &ApprovalRequirement::RequireApproval("sr".into())).await,
+            d.decide(
+                &make_call("search_replace"),
+                &ApprovalRequirement::RequireApproval("sr".into())
+            )
+            .await,
             PermissionDecision::Allow
         ));
     }
@@ -207,7 +227,11 @@ mod tests {
     async fn test_auto_accept_edits_denies_bash() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::AcceptEdits);
         assert!(matches!(
-            d.decide(&make_call("bash"), &ApprovalRequirement::RequireApproval("dangerous".into())).await,
+            d.decide(
+                &make_call("bash"),
+                &ApprovalRequirement::RequireApproval("dangerous".into())
+            )
+            .await,
             PermissionDecision::Deny
         ));
     }
@@ -263,7 +287,11 @@ mod tests {
         drop(req_rx); // close request channel
         let call = make_call("bash");
         assert!(matches!(
-            d.decide(&call, &ApprovalRequirement::RequireApproval("dangerous".into())).await,
+            d.decide(
+                &call,
+                &ApprovalRequirement::RequireApproval("dangerous".into())
+            )
+            .await,
             PermissionDecision::Deny
         ));
     }
@@ -283,7 +311,12 @@ mod tests {
 
         // Should return Allow immediately from PermissionStore,
         // WITHOUT sending a request on the channel (channel is not even read).
-        let decision = d.decide(&call, &ApprovalRequirement::RequireApproval("dangerous".into())).await;
+        let decision = d
+            .decide(
+                &call,
+                &ApprovalRequirement::RequireApproval("dangerous".into()),
+            )
+            .await;
         assert!(matches!(decision, PermissionDecision::Allow));
     }
 
@@ -317,14 +350,20 @@ mod tests {
     fn test_will_auto_approve_auto_bypass() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::BypassAll);
         let call = make_call("bash");
-        assert!(d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("dangerous".into())));
+        assert!(d.will_auto_approve(
+            &call,
+            &ApprovalRequirement::RequireApproval("dangerous".into())
+        ));
     }
 
     #[test]
     fn test_will_auto_approve_auto_deny() {
         let d = AutoPermissionDecider::new(AutoPermissionMode::DenyAll);
         let call = make_call("bash");
-        assert!(!d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("dangerous".into())));
+        assert!(!d.will_auto_approve(
+            &call,
+            &ApprovalRequirement::RequireApproval("dangerous".into())
+        ));
     }
 
     #[test]
@@ -332,8 +371,14 @@ mod tests {
         let d = AutoPermissionDecider::new(AutoPermissionMode::AcceptEdits);
         let edit_call = make_call("edit_file");
         let bash_call = make_call("bash");
-        assert!(d.will_auto_approve(&edit_call, &ApprovalRequirement::RequireApproval("write".into())));
-        assert!(!d.will_auto_approve(&bash_call, &ApprovalRequirement::RequireApproval("dangerous".into())));
+        assert!(d.will_auto_approve(
+            &edit_call,
+            &ApprovalRequirement::RequireApproval("write".into())
+        ));
+        assert!(!d.will_auto_approve(
+            &bash_call,
+            &ApprovalRequirement::RequireApproval("dangerous".into())
+        ));
     }
 
     #[test]
@@ -345,7 +390,10 @@ mod tests {
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
         let call = make_call("bash");
         // No session grant → will NOT auto-approve
-        assert!(!d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("dangerous".into())));
+        assert!(!d.will_auto_approve(
+            &call,
+            &ApprovalRequirement::RequireApproval("dangerous".into())
+        ));
     }
 
     #[test]
@@ -358,7 +406,10 @@ mod tests {
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
         let call = make_call("bash");
         // Session grant exists → WILL auto-approve
-        assert!(d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("dangerous".into())));
+        assert!(d.will_auto_approve(
+            &call,
+            &ApprovalRequirement::RequireApproval("dangerous".into())
+        ));
     }
 
     #[test]
@@ -372,7 +423,10 @@ mod tests {
         store.write().unwrap().grant_session("bash");
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
         let call = make_call("bash");
-        assert!(!d.will_auto_approve(&call, &ApprovalRequirement::RequireApprovalAlways("sensitive".into())));
+        assert!(!d.will_auto_approve(
+            &call,
+            &ApprovalRequirement::RequireApprovalAlways("sensitive".into())
+        ));
     }
 
     #[test]
@@ -384,7 +438,10 @@ mod tests {
             std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
         let call = make_call("bash");
-        assert!(!d.will_auto_approve(&call, &ApprovalRequirement::RequireApprovalAlways("sensitive".into())));
+        assert!(!d.will_auto_approve(
+            &call,
+            &ApprovalRequirement::RequireApprovalAlways("sensitive".into())
+        ));
     }
 
     #[test]
@@ -397,7 +454,10 @@ mod tests {
         store.write().unwrap().grant_session("bash");
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
         let call = make_call("mcp__zouwu__query");
-        assert!(!d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("mcp tool".into())));
+        assert!(!d.will_auto_approve(
+            &call,
+            &ApprovalRequirement::RequireApproval("mcp tool".into())
+        ));
     }
 
     #[test]
@@ -409,9 +469,15 @@ mod tests {
         let store =
             std::sync::Arc::new(std::sync::RwLock::new(crate::tool::PermissionStore::new()));
         // Simulate: user pressed [A] for this MCP tool in a previous call
-        store.write().unwrap().grant_session("mcp__zouwu-mcp-server__query_requirements");
+        store
+            .write()
+            .unwrap()
+            .grant_session("mcp__zouwu-mcp-server__query_requirements");
         let d = InteractivePermissionDecider::new(req_tx, resp_rx, store);
         let call = make_call("mcp__zouwu-mcp-server__query_requirements");
-        assert!(d.will_auto_approve(&call, &ApprovalRequirement::RequireApproval("mcp tool".into())));
+        assert!(d.will_auto_approve(
+            &call,
+            &ApprovalRequirement::RequireApproval("mcp tool".into())
+        ));
     }
 }

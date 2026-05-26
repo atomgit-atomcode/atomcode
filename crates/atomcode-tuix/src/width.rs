@@ -401,10 +401,7 @@ mod tests {
     #[test]
     fn truncate_path_cjk_segment() {
         // CJK project name: "项目" = 4 cols, ".../项目" = 8 cols.
-        assert_eq!(
-            truncate_path("~/Documents/工作/项目", 20),
-            ".../项目"
-        );
+        assert_eq!(truncate_path("~/Documents/工作/项目", 20), ".../项目");
     }
 
     #[test]
@@ -421,7 +418,12 @@ mod tests {
         // it must fit in a 10-col budget with no wrap.
         let tinted = "\x1b[38;2;198;120;221mlet\x1b[23;39m x = 1;";
         let chunks = wrap_line_to_width(tinted, 10);
-        assert_eq!(chunks.len(), 1, "must not wrap when visible width fits, got: {:?}", chunks);
+        assert_eq!(
+            chunks.len(),
+            1,
+            "must not wrap when visible width fits, got: {:?}",
+            chunks
+        );
         // The tinted line is returned verbatim — escapes still present.
         assert!(chunks[0].contains("\x1b[38;2;198;120;221m"));
     }

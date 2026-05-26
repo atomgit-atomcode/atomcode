@@ -126,7 +126,11 @@ impl Modal for ModelPicker {
                     );
                 }
                 renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::ModelSwitched { provider: &chosen, model: &display }).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::ModelSwitched {
+                        provider: &chosen,
+                        model: &display,
+                    })
+                    .into_owned(),
                 ));
                 renderer.flush();
                 Ok(ModalAction::Close)

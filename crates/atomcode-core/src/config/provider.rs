@@ -160,7 +160,10 @@ mod tests {
             api_key = "sk-test"
         "#;
         let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse");
-        assert!(!cfg.skip_tls_verify, "skip_tls_verify should default to false");
+        assert!(
+            !cfg.skip_tls_verify,
+            "skip_tls_verify should default to false"
+        );
     }
 
     #[test]
@@ -195,9 +198,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-
-
-};
+        };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
             !serialized.contains("skip_tls_verify"),
@@ -224,9 +225,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: true,
             ephemeral: false,
-
-
-};
+        };
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(
             serialized.contains("skip_tls_verify = true"),

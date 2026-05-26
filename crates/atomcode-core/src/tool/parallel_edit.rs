@@ -165,8 +165,9 @@ impl Tool for ParallelEditTool {
                 // tool in the first place).
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output: "parallel_edit_files unavailable: tool registry not wired in this context."
-                        .to_string(),
+                    output:
+                        "parallel_edit_files unavailable: tool registry not wired in this context."
+                            .to_string(),
                     success: false,
                 });
             }
@@ -212,8 +213,7 @@ impl Tool for ParallelEditTool {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| sib_path.clone());
-                let skeleton: String =
-                    sib_content.lines().take(30).collect::<Vec<_>>().join("\n");
+                let skeleton: String = sib_content.lines().take(30).collect::<Vec<_>>().join("\n");
                 siblings.push_str(&format!("### {}\n```\n{}\n```\n\n", short, skeleton));
             }
             tasks.push(sub_agent::SubAgentTask {
@@ -298,8 +298,7 @@ impl Tool for ParallelEditTool {
         // is the final answer.
         if let Some((cmd, build_dir)) = find_build_command(&working_dir) {
             let mut build_cmd = tokio::process::Command::new("sh");
-            build_cmd.args(["-c", &cmd])
-                .current_dir(&build_dir);
+            build_cmd.args(["-c", &cmd]).current_dir(&build_dir);
             crate::process_utils::suppress_console_window(&mut build_cmd);
             let output = build_cmd.output().await;
             if let Ok(out) = output {
@@ -416,13 +415,8 @@ mod validate_args_tests {
             &self,
             _messages: &[crate::conversation::message::Message],
             _tools: Option<&[crate::tool::ToolDef]>,
-        ) -> anyhow::Result<
-            Pin<
-                Box<
-                    dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send,
-                >,
-            >,
-        > {
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>>>
+        {
             unimplemented!()
         }
         fn model_name(&self) -> &str {
@@ -535,7 +529,11 @@ mod validate_args_tests {
     fn rejects_unparseable_json() {
         let args = "not json at all";
         let err = tool().validate_args(args).unwrap_err();
-        assert!(err.contains("parallel_edit_files arguments"), "got: {}", err);
+        assert!(
+            err.contains("parallel_edit_files arguments"),
+            "got: {}",
+            err
+        );
     }
 
     // ── dedup-suffix logic ──

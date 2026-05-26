@@ -82,8 +82,7 @@ mod tests {
         // QR as a parallelogram and break phone scanning. Pin
         // uniform width so any future renderer swap can't silently
         // regress this.
-        let lines =
-            render_for_terminal("https://example.com", true).expect("render must succeed");
+        let lines = render_for_terminal("https://example.com", true).expect("render must succeed");
         let first = lines[0].chars().count();
         for (i, row) in lines.iter().enumerate() {
             assert_eq!(

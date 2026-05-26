@@ -42,7 +42,10 @@ pub async fn run_background_task(
     {
         Ok(result) => result,
         Err(_) => AgentEvent::BackgroundComplete {
-            summary: t(Msg::BgTaskTimedOut { secs: BACKGROUND_TIMEOUT.as_secs() }).into_owned(),
+            summary: t(Msg::BgTaskTimedOut {
+                secs: BACKGROUND_TIMEOUT.as_secs(),
+            })
+            .into_owned(),
             files_edited: vec![],
             turns: 0,
             success: false,
@@ -67,14 +70,23 @@ async fn run_background_inner(
     // api_key, base_url, model, and context_window from it. Only the tool
     // set is restricted; config fields are read-only and pose no risk.
     let bg_tools = crate::tool::ToolRegistry::new();
-    let essential = ["read_file", "write_file", "edit_file", "glob", "grep", "list_directory", "search_replace"];
+    let essential = [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "list_directory",
+        "search_replace",
+    ];
     for name in &essential {
         if let Some(tool) = tools.get(name).await {
             bg_tools.register_arc(name.to_string(), tool).await;
         }
     }
 
-    let bg_working_dir = bg_context.working_dir
+    let bg_working_dir = bg_context
+        .working_dir
         .try_read()
         .map(|g| g.clone())
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -88,9 +100,7 @@ async fn run_background_inner(
         ctx,
         permission,
         recently_edited_files: Vec::new(),
-        hook_executor: std::sync::Arc::new(
-            crate::hook::executor::HookExecutor::new(hooks)
-        ),
+        hook_executor: std::sync::Arc::new(crate::hook::executor::HookExecutor::new(hooks)),
         loop_guard: Default::default(),
     };
 
@@ -129,7 +139,10 @@ async fn run_background_inner(
             }
             TurnResult::Failed(e) => {
                 return AgentEvent::BackgroundComplete {
-                    summary: t(Msg::BgTaskError { error: &e.to_string() }).into_owned(),
+                    summary: t(Msg::BgTaskError {
+                        error: &e.to_string(),
+                    })
+                    .into_owned(),
                     files_edited: std::mem::take(&mut runner.recently_edited_files),
                     turns,
                     success: false,

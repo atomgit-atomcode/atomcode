@@ -164,7 +164,11 @@ fn default_hook_type() -> String {
 
 impl PluginManifest {
     pub fn skills_path(&self) -> &str {
-        self.skills.as_ref().map(|p| p.first()).filter(|s| !s.is_empty()).unwrap_or("skills")
+        self.skills
+            .as_ref()
+            .map(|p| p.first())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("skills")
     }
     /// All skills paths declared in the manifest.
     ///
@@ -178,13 +182,25 @@ impl PluginManifest {
             Some(PathOrList::One(s)) if s.is_empty() => vec!["skills"],
             Some(PathOrList::One(s)) => vec![s.as_str()],
             Some(PathOrList::Many(v)) => {
-                let paths: Vec<&str> = v.iter().map(String::as_str).filter(|s| !s.is_empty()).collect();
-                if paths.is_empty() { vec!["skills"] } else { paths }
+                let paths: Vec<&str> = v
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if paths.is_empty() {
+                    vec!["skills"]
+                } else {
+                    paths
+                }
             }
         }
     }
     pub fn commands_path(&self) -> &str {
-        self.commands.as_ref().map(|p| p.first()).filter(|s| !s.is_empty()).unwrap_or("commands")
+        self.commands
+            .as_ref()
+            .map(|p| p.first())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("commands")
     }
     /// Path to a legacy `hooks.json`. Returns the default "hooks.json" both
     /// when the field is absent AND when it is the inline CC form (which has
@@ -210,13 +226,16 @@ impl PluginManifest {
 /// Returns `Ok(None)` when neither file exists (single-plugin fallback caller).
 /// Returns `Err` when a file exists but cannot be parsed (fail closed).
 pub fn load_marketplace_manifest(marketplace_root: &Path) -> Result<Option<MarketplaceManifest>> {
-    for rel in [".atomcode-plugin/marketplace.json", ".claude-plugin/marketplace.json"] {
+    for rel in [
+        ".atomcode-plugin/marketplace.json",
+        ".claude-plugin/marketplace.json",
+    ] {
         let path = marketplace_root.join(rel);
         if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("read {}", path.display()))?;
-            let manifest: MarketplaceManifest = serde_json::from_str(&raw)
-                .with_context(|| format!("parse {}", path.display()))?;
+            let manifest: MarketplaceManifest =
+                serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
             return Ok(Some(manifest));
         }
     }
@@ -239,8 +258,8 @@ pub fn load_plugin_manifest(plugin_dir: &Path) -> Result<PluginManifest> {
         if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("read {}", path.display()))?;
-            let manifest: PluginManifest = serde_json::from_str(&raw)
-                .with_context(|| format!("parse {}", path.display()))?;
+            let manifest: PluginManifest =
+                serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
             return Ok(manifest);
         }
     }
@@ -359,7 +378,8 @@ mod tests {
 
     #[test]
     fn parses_object_source_local() {
-        let raw = r#"{"name":"mp","plugins":[{"name":"p","source":{"source":"local","path":"/tmp/x"}}]}"#;
+        let raw =
+            r#"{"name":"mp","plugins":[{"name":"p","source":{"source":"local","path":"/tmp/x"}}]}"#;
         let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
         match &m.plugins[0].source {
             PluginSource::External(ExternalSource::Local { path }) => assert_eq!(path, "/tmp/x"),

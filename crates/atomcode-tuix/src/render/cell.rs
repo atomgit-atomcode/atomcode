@@ -174,11 +174,7 @@ pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
 /// Non-SGR CSI sequences (cursor moves, DSR, etc.) are silently
 /// dropped — they should have been scrubbed upstream; this is
 /// belt-and-suspenders.
-pub fn push_str_cells_sgr(
-    row: &mut Vec<Cell>,
-    s: &str,
-    mut working_style: CellStyle,
-) -> CellStyle {
+pub fn push_str_cells_sgr(row: &mut Vec<Cell>, s: &str, mut working_style: CellStyle) -> CellStyle {
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
@@ -453,10 +449,8 @@ fn emit_sgr_transition(out: &mut Vec<u8>, from: Option<&CellStyle>, to: &CellSty
     let faint_off = from.faint && !to.faint;
     let fg_change = from.fg != to.fg;
 
-    let needs_reset = bold_off
-        || reverse_off
-        || faint_off
-        || (from.fg.is_some() && to.fg.is_none());
+    let needs_reset =
+        bold_off || reverse_off || faint_off || (from.fg.is_some() && to.fg.is_none());
 
     if needs_reset {
         out.extend_from_slice(b"\x1b[0m");

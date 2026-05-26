@@ -208,7 +208,10 @@ fn build_turn_terminal_notification_text(
     turn: &TurnNotification<'_>,
 ) -> (Cow<'static, str>, String) {
     let (title, mut body) = build_system_notification_text(turn);
-    if matches!(app, TerminalApp::Kitty | TerminalApp::WezTerm | TerminalApp::Ghostty) {
+    if matches!(
+        app,
+        TerminalApp::Kitty | TerminalApp::WezTerm | TerminalApp::Ghostty
+    ) {
         if let Some(scope) = turn
             .working_dir
             .and_then(|p| p.file_name())

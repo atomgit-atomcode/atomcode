@@ -433,12 +433,14 @@ mod tests {
     #[test]
     fn auto_name_uses_first_real_user_message() {
         let mut session = Session::new(PathBuf::from("/tmp/test"));
-        session
-            .messages
-            .push(Message::new(Role::User, "[System meta · not a user message]\nignored"));
-        session
-            .messages
-            .push(Message::new(Role::User, "帮我修复 VS Code 会话标题自动命名的问题\n更多内容"));
+        session.messages.push(Message::new(
+            Role::User,
+            "[System meta · not a user message]\nignored",
+        ));
+        session.messages.push(Message::new(
+            Role::User,
+            "帮我修复 VS Code 会话标题自动命名的问题\n更多内容",
+        ));
 
         session.auto_name_from_messages();
 
@@ -449,7 +451,9 @@ mod tests {
     fn auto_name_preserves_user_renamed_session() {
         let mut session = Session::new(PathBuf::from("/tmp/test"));
         session.rename("手动命名".to_string());
-        session.messages.push(Message::new(Role::User, "新的用户消息"));
+        session
+            .messages
+            .push(Message::new(Role::User, "新的用户消息"));
 
         session.auto_name_from_messages();
 
@@ -459,15 +463,23 @@ mod tests {
     #[test]
     fn rename_sets_user_renamed_flag() {
         let mut session = Session::new(PathBuf::from("/tmp/test"));
-        assert!(!session.user_renamed, "fresh session must not be flagged as user-renamed");
+        assert!(
+            !session.user_renamed,
+            "fresh session must not be flagged as user-renamed"
+        );
         session.rename("我的会话".to_string());
-        assert!(session.user_renamed, "rename() must mark the session as user-renamed");
+        assert!(
+            session.user_renamed,
+            "rename() must mark the session as user-renamed"
+        );
     }
 
     #[test]
     fn auto_name_does_not_set_user_renamed_flag() {
         let mut session = Session::new(PathBuf::from("/tmp/test"));
-        session.messages.push(Message::new(Role::User, "first message body"));
+        session
+            .messages
+            .push(Message::new(Role::User, "first message body"));
         session.auto_name_from_messages();
         assert_eq!(session.name, "first message body");
         assert!(

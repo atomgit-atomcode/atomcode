@@ -91,10 +91,7 @@ impl TurnRunner {
         //                   default-host table lives next to the schema.
         //   model         = LlmProvider::model_name() — the wire-level model
         //                   string sent to the API.
-        let pcfg = self
-            .config
-            .providers
-            .get(&self.config.default_provider);
+        let pcfg = self.config.providers.get(&self.config.default_provider);
         let vendor = pcfg.map(|p| p.provider_type.clone());
         let host = pcfg.and_then(|p| {
             atomcode_telemetry::resolve_provider_host(&p.provider_type, p.base_url.as_deref())
@@ -267,8 +264,7 @@ impl TurnRunner {
         // `finalize_stream_with_tool_calls_and_thinking` so the next
         // request can echo them back — Anthropic 400s otherwise (`The
         // content[].thinking in the thinking mode must be passed back`).
-        let mut thinking_blocks: Vec<crate::conversation::message::ThinkingBlock> =
-            Vec::new();
+        let mut thinking_blocks: Vec<crate::conversation::message::ThinkingBlock> = Vec::new();
         let mut total_tokens: usize = 0;
         // Telemetry: per-turn token counters populated from StreamEvent::Usage.
         let mut tel_input_tokens: u32 = 0;
@@ -284,11 +280,11 @@ impl TurnRunner {
                 let result = $result;
                 let messages_count = $conv.messages.len() as u32;
                 // system_tokens: estimate from the system prompt string
-                let system_tokens: u32 =
-                    crate::conversation::message::Message::new(
-                        crate::conversation::message::Role::System,
-                        system_prompt,
-                    ).estimate_tokens() as u32;
+                let system_tokens: u32 = crate::conversation::message::Message::new(
+                    crate::conversation::message::Role::System,
+                    system_prompt,
+                )
+                .estimate_tokens() as u32;
                 // tool_def_tokens: direct measurement from tool definitions sent to the LLM.
                 // Each ToolDef contributes name + description + JSON-serialized parameters.
                 let tool_def_tokens: u32 = tool_defs
@@ -310,11 +306,13 @@ impl TurnRunner {
                 let message_tokens: u32 = $conv
                     .messages
                     .iter()
-                    .filter(|m| matches!(
-                        m.role,
-                        crate::conversation::message::Role::User
-                            | crate::conversation::message::Role::Assistant
-                    ))
+                    .filter(|m| {
+                        matches!(
+                            m.role,
+                            crate::conversation::message::Role::User
+                                | crate::conversation::message::Role::Assistant
+                        )
+                    })
                     .map(|m| m.estimate_tokens() as u32)
                     .sum();
                 let (error_kind, error_data) = if result.is_failed() {
@@ -953,7 +951,9 @@ impl TurnRunner {
             // Dup-in-batch was already short-circuited above (before the
             // ToolCallStarted emit), so by the time we reach here this is
             // a real, non-duplicate call to execute.
-            let result = self.execute_single_tool(call, event_tx, &cancel, &conversation.messages).await;
+            let result = self
+                .execute_single_tool(call, event_tx, &cancel, &conversation.messages)
+                .await;
             if active_batch_id.is_some() && result.success {
                 batch_ok_count += 1;
             }
@@ -1111,7 +1111,10 @@ impl TurnRunner {
             // No alias match — try case-insensitive lookup in registry
             if self.tools.get(&call.name).await.is_some() {
                 call.name.clone()
-            } else if let Some(name) = self.tools.iter().await
+            } else if let Some(name) = self
+                .tools
+                .iter()
+                .await
                 .find(|(k, _)| k.eq_ignore_ascii_case(&call.name))
                 .map(|(k, _)| k)
             {
@@ -1127,7 +1130,10 @@ impl TurnRunner {
         let tool = match self.tools.get(&corrected_name).await {
             Some(t) => t,
             None => {
-                let available: String = self.tools.iter().await
+                let available: String = self
+                    .tools
+                    .iter()
+                    .await
                     .map(|(name, _)| name)
                     .collect::<Vec<String>>()
                     .join(", ");
@@ -1215,11 +1221,14 @@ impl TurnRunner {
                 success: false,
                 duration_ms: 0,
                 error_kind: Some(ToolErrorKind::InvalidArgs),
-                error_data: Some(serde_json::json!({
-                    "tool_name": corrected_name,
-                    "reason": reason,
-                    "args_summary": build_args_summary(&corrected_name, &call.arguments),
-                }).to_string()),
+                error_data: Some(
+                    serde_json::json!({
+                        "tool_name": corrected_name,
+                        "reason": reason,
+                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                    })
+                    .to_string(),
+                ),
             });
             return ToolResult {
                 call_id: call.id.clone(),
@@ -1272,19 +1281,22 @@ impl TurnRunner {
                     success: false,
                     duration: std::time::Duration::ZERO,
                 });
-            self.context.telemetry.track(TelemetryEvent::ToolCall {
-                name: corrected_name.clone(),
-                success: false,
-                duration_ms: 0,
-                error_kind: Some(ToolErrorKind::DeniedByUser),
-                error_data: Some(serde_json::json!({
-                    "tool_name": corrected_name,
-                    "duration_ms": 0,
-                    "args_summary": build_args_summary(&corrected_name, &call.arguments),
-                    "approval_reason": reason,
-                    "reason": "User denied tool execution",
-                }).to_string()),
-            });
+                self.context.telemetry.track(TelemetryEvent::ToolCall {
+                    name: corrected_name.clone(),
+                    success: false,
+                    duration_ms: 0,
+                    error_kind: Some(ToolErrorKind::DeniedByUser),
+                    error_data: Some(
+                        serde_json::json!({
+                            "tool_name": corrected_name,
+                            "duration_ms": 0,
+                            "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                            "approval_reason": reason,
+                            "reason": "User denied tool execution",
+                        })
+                        .to_string(),
+                    ),
+                });
                 return ToolResult {
                     call_id: call.id.clone(),
                     output,
@@ -1302,7 +1314,10 @@ impl TurnRunner {
                 None,
                 None,
             );
-            let pre_result = self.hook_executor.run_pre_tool_use(&call.name, &hook_ctx).await;
+            let pre_result = self
+                .hook_executor
+                .run_pre_tool_use(&call.name, &hook_ctx)
+                .await;
             match pre_result {
                 crate::hook::PreHookResult::Block { reason } => {
                     let output = format!("Blocked by hook: {}", reason);
@@ -1430,7 +1445,9 @@ impl TurnRunner {
                 Some(&tool_result.output),
                 Some(tool_result.success),
             );
-            self.hook_executor.run_post_tool_use(&call.name, &hook_ctx).await;
+            self.hook_executor
+                .run_post_tool_use(&call.name, &hook_ctx)
+                .await;
         }
 
         let _ = event_tx.send(TurnEvent::ToolCallResult {
@@ -1451,16 +1468,22 @@ impl TurnRunner {
             200,
         );
         // Detect warning: exit 0 (success) but stderr present.
-        let has_stderr = tool_result.output.contains("STDERR:")
-            || tool_result.output.contains("[stderr]");
+        let has_stderr =
+            tool_result.output.contains("STDERR:") || tool_result.output.contains("[stderr]");
         let (error_kind, error_data) = if !tool_result.success {
-            (Some(ToolErrorKind::ExecutionFailed), Some(serde_json::json!({
-                "tool_name": corrected_name,
-                "duration_ms": duration.as_millis() as u32,
-                "args_summary": build_args_summary(&corrected_name, &call.arguments),
-                "output_tail": output_tail,
-                "reason": "Tool execution returned an error",
-            }).to_string()))
+            (
+                Some(ToolErrorKind::ExecutionFailed),
+                Some(
+                    serde_json::json!({
+                        "tool_name": corrected_name,
+                        "duration_ms": duration.as_millis() as u32,
+                        "args_summary": build_args_summary(&corrected_name, &call.arguments),
+                        "output_tail": output_tail,
+                        "reason": "Tool execution returned an error",
+                    })
+                    .to_string(),
+                ),
+            )
         } else if has_stderr {
             (Some(ToolErrorKind::Warning), Some(serde_json::json!({
                 "tool_name": corrected_name,
@@ -1588,7 +1611,8 @@ fn name_looks_corrupt(name: &str) -> bool {
     if name.len() > 96 {
         return true;
     }
-    name.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '=' | '<' | '>'))
+    name.chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '=' | '<' | '>'))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1995,7 +2019,6 @@ fn merge_edit_calls(calls: &mut Vec<ToolCall>) -> Vec<String> {
     removed_ids
 }
 
-
 #[cfg(test)]
 mod is_only_placeholder_filler_tests {
     use super::is_only_placeholder_filler;
@@ -2032,7 +2055,10 @@ mod is_only_placeholder_filler_tests {
     fn placeholders_with_whitespace_are_filler() {
         // Some gateways insert chunk delimiters (newlines, spaces)
         // between repeated placeholder echoes. Filler regardless.
-        let mixed = format!("{}\n{}  {}", REASONING_PLACEHOLDER, REASONING_PLACEHOLDER, REASONING_PLACEHOLDER);
+        let mixed = format!(
+            "{}\n{}  {}",
+            REASONING_PLACEHOLDER, REASONING_PLACEHOLDER, REASONING_PLACEHOLDER
+        );
         assert!(is_only_placeholder_filler(&mixed));
     }
 
@@ -2106,7 +2132,10 @@ mod normalize_tool_args_tests {
         // we don't accidentally dedup unrelated calls.)
         let raw = "not even json {{{";
         assert_eq!(normalize_tool_args(raw), raw);
-        assert_ne!(normalize_tool_args("garbage A"), normalize_tool_args("garbage B"));
+        assert_ne!(
+            normalize_tool_args("garbage A"),
+            normalize_tool_args("garbage B")
+        );
     }
 }
 
@@ -2419,8 +2448,16 @@ mod tool_call_text_rescue_tests {
         // order so the second JSON call gets the second XML's args, not the
         // first one's reused.
         let mut calls = vec![
-            tc("c1", "edit_file", r#"{"file_path":"a.rs","new_string":"a_new"}"#),
-            tc("c2", "edit_file", r#"{"file_path":"b.rs","new_string":"b_new"}"#),
+            tc(
+                "c1",
+                "edit_file",
+                r#"{"file_path":"a.rs","new_string":"a_new"}"#,
+            ),
+            tc(
+                "c2",
+                "edit_file",
+                r#"{"file_path":"b.rs","new_string":"b_new"}"#,
+            ),
         ];
         let xml_pool = vec![
             tc(
@@ -2514,13 +2551,13 @@ pub(crate) fn build_llm_error_data(
 
     // ── Build a concise, scrubbed error message ───────────────────
     // Strip the raw JSON body that some providers append after a colon.
-    let home = std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h));
-    let cwd = std::env::var("PWD").ok().map(|c| std::path::PathBuf::from(c));
-    let message_raw = scrub::scrub_path(
-        reason,
-        home.as_deref(),
-        cwd.as_deref(),
-    );
+    let home = std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h));
+    let cwd = std::env::var("PWD")
+        .ok()
+        .map(|c| std::path::PathBuf::from(c));
+    let message_raw = scrub::scrub_path(reason, home.as_deref(), cwd.as_deref());
     let message = scrub::truncate_head(&message_raw, 200);
 
     let base = || -> serde_json::Value {
@@ -2608,7 +2645,10 @@ pub(crate) fn build_llm_error_data(
             obj.insert("sent_tokens".into(), serde_json::json!(sent_tokens));
             obj.insert("system_tokens".into(), serde_json::json!(system_tokens));
             obj.insert("tool_def_tokens".into(), serde_json::json!(tool_def_tokens));
-            obj.insert("tool_result_tokens".into(), serde_json::json!(tool_result_tokens));
+            obj.insert(
+                "tool_result_tokens".into(),
+                serde_json::json!(tool_result_tokens),
+            );
             obj.insert("message_tokens".into(), serde_json::json!(message_tokens));
             obj.insert("messages_count".into(), serde_json::json!(messages_count));
             m
@@ -2657,7 +2697,11 @@ pub(crate) fn classify_llm_error(reason: &str) -> LlmErrorKind {
         LlmErrorKind::StreamInterrupted
     } else if r.contains("context") || r.contains("max_tokens") || r.contains("token limit") {
         LlmErrorKind::ContextOverflow
-    } else if r.contains("connect") || r.contains("dns") || r.contains("network") || r.contains("timeout") {
+    } else if r.contains("connect")
+        || r.contains("dns")
+        || r.contains("network")
+        || r.contains("timeout")
+    {
         LlmErrorKind::NetworkError
     } else {
         LlmErrorKind::Other
@@ -2679,11 +2723,14 @@ pub(crate) fn build_args_summary(tool_name: &str, args: &str) -> String {
                         serde_json::Value::Number(n) => n.to_string(),
                         serde_json::Value::Bool(b) => b.to_string(),
                         serde_json::Value::Null => "null".to_string(),
-                        _ => format!("<{}>", match v {
-                            serde_json::Value::Array(_) => "array",
-                            serde_json::Value::Object(_) => "object",
-                            _ => "value",
-                        }),
+                        _ => format!(
+                            "<{}>",
+                            match v {
+                                serde_json::Value::Array(_) => "array",
+                                serde_json::Value::Object(_) => "object",
+                                _ => "value",
+                            }
+                        ),
                     };
                     format!("{}={}", k, val_str)
                 })
@@ -2692,5 +2739,9 @@ pub(crate) fn build_args_summary(tool_name: &str, args: &str) -> String {
         }
     }
     // Fallback: truncate raw args
-    format!("{}({})", tool_name, atomcode_telemetry::scrub::truncate_head(args, 100))
+    format!(
+        "{}({})",
+        tool_name,
+        atomcode_telemetry::scrub::truncate_head(args, 100)
+    )
 }

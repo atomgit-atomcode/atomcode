@@ -32,8 +32,8 @@ impl FromStr for Locale {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "en" | "english" => Ok(Locale::En),
-            "zh" | "zh_cn" | "zh-cn" | "chinese" | "简体中文"
-            | "zh_tw" | "zh-tw" | "zh_hk" | "zh-hk" | "繁體中文" => Ok(Locale::ZhCn),
+            "zh" | "zh_cn" | "zh-cn" | "chinese" | "简体中文" | "zh_tw" | "zh-tw" | "zh_hk"
+            | "zh-hk" | "繁體中文" => Ok(Locale::ZhCn),
             other => Err(format!("unsupported locale: {other}")),
         }
     }
@@ -45,8 +45,14 @@ mod tests {
 
     #[test]
     fn display_round_trips_through_from_str() {
-        assert_eq!(Locale::En.to_string().parse::<Locale>().unwrap(), Locale::En);
-        assert_eq!(Locale::ZhCn.to_string().parse::<Locale>().unwrap(), Locale::ZhCn);
+        assert_eq!(
+            Locale::En.to_string().parse::<Locale>().unwrap(),
+            Locale::En
+        );
+        assert_eq!(
+            Locale::ZhCn.to_string().parse::<Locale>().unwrap(),
+            Locale::ZhCn
+        );
     }
 
     #[test]

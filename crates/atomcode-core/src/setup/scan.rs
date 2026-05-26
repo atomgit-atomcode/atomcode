@@ -23,9 +23,8 @@ pub fn scan(project_root: &Path) -> ProjectSignals {
     s.test_frameworks = derive_test_frameworks(project_root, &s.markers);
     s.root_tree = collect_root_tree(project_root);
     s.readme_head = read_readme_head(project_root);
-    s.signals_hash = compute_signals_hash(
-        &s.markers.iter().map(|m| m.path.clone()).collect::<Vec<_>>(),
-    );
+    s.signals_hash =
+        compute_signals_hash(&s.markers.iter().map(|m| m.path.clone()).collect::<Vec<_>>());
     s
 }
 
@@ -51,11 +50,17 @@ fn collect_markers(root: &Path) -> Vec<Marker> {
     for (name, kind) in probes {
         let p = root.join(name);
         if p.exists() {
-            found.push(Marker { path: p, kind: *kind });
+            found.push(Marker {
+                path: p,
+                kind: *kind,
+            });
         }
     }
     if root.join(".git").is_dir() {
-        found.push(Marker { path: root.join(".git"), kind: MarkerKind::GitDir });
+        found.push(Marker {
+            path: root.join(".git"),
+            kind: MarkerKind::GitDir,
+        });
     }
     if root.join(".github/workflows").is_dir() {
         found.push(Marker {
@@ -64,7 +69,10 @@ fn collect_markers(root: &Path) -> Vec<Marker> {
         });
     }
     if root.join("prisma").is_dir() {
-        found.push(Marker { path: root.join("prisma"), kind: MarkerKind::PrismaDir });
+        found.push(Marker {
+            path: root.join("prisma"),
+            kind: MarkerKind::PrismaDir,
+        });
     }
     // k8s heuristic — top-level k8s/ or helm/ dir.
     if root.join("k8s").is_dir() || root.join("helm").is_dir() {
@@ -73,7 +81,10 @@ fn collect_markers(root: &Path) -> Vec<Marker> {
         } else {
             root.join("helm")
         };
-        found.push(Marker { path, kind: MarkerKind::K8sManifest });
+        found.push(Marker {
+            path,
+            kind: MarkerKind::K8sManifest,
+        });
     }
     found
 }
@@ -182,12 +193,14 @@ fn derive_vcs(root: &Path) -> VcsInfo {
     if !root.join(".git").exists() {
         return VcsInfo::None;
     }
-    let remote = std::fs::read_to_string(root.join(".git/config")).ok().and_then(|cfg| {
-        cfg.lines()
-            .find(|l| l.trim().starts_with("url"))
-            .and_then(|l| l.split('=').nth(1))
-            .map(|s| s.trim().to_string())
-    });
+    let remote = std::fs::read_to_string(root.join(".git/config"))
+        .ok()
+        .and_then(|cfg| {
+            cfg.lines()
+                .find(|l| l.trim().starts_with("url"))
+                .and_then(|l| l.split('=').nth(1))
+                .map(|s| s.trim().to_string())
+        });
     VcsInfo::Git { remote }
 }
 
@@ -197,7 +210,9 @@ fn derive_ci(root: &Path) -> CiInfo {
         let count = std::fs::read_dir(&workflows)
             .map(|it| it.filter_map(|e| e.ok()).count())
             .unwrap_or(0);
-        return CiInfo::GhActions { workflow_count: count };
+        return CiInfo::GhActions {
+            workflow_count: count,
+        };
     }
     if root.join(".gitlab-ci.yml").exists() {
         return CiInfo::GitLab;

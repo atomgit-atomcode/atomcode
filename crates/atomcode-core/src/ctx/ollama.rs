@@ -151,8 +151,7 @@ mod tests {
             thinking_budget: None,
             skip_tls_verify: false,
             ephemeral: false,
-
-}
+        }
     }
 
     #[test]

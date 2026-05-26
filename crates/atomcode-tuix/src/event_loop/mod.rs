@@ -35,8 +35,8 @@ use atomcode_core::session::{SessionId, SessionManager};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
-use base64::Engine;
 use atomcode_core::conversation::message::ImagePart;
+use base64::Engine;
 
 use crate::commands::{parse_slash_line, CommandRegistry};
 use crate::input::history::History;
@@ -181,7 +181,11 @@ fn ext_for_mt(mt: &str) -> &'static str {
 /// already exists (cache is content-addressable). Failures are
 /// trace-logged and swallowed — the in-memory pending_images path is
 /// the source of truth for the current submit.
-fn cache_write_image(cache_dir: &std::path::Path, img: &atomcode_core::conversation::message::ImagePart, hash: u64) {
+fn cache_write_image(
+    cache_dir: &std::path::Path,
+    img: &atomcode_core::conversation::message::ImagePart,
+    hash: u64,
+) {
     let path = cache_dir.join(format!("{:016x}.{}", hash, ext_for_mt(&img.media_type)));
     if path.exists() {
         return;
@@ -250,7 +254,9 @@ pub(crate) fn compute_input_attachments(
             let mut n: usize = 0;
             let mut had_digit = false;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
-                n = n.saturating_mul(10).saturating_add((bytes[j] - b'0') as usize);
+                n = n
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] - b'0') as usize);
                 j += 1;
                 had_digit = true;
             }
@@ -295,19 +301,18 @@ pub(crate) fn hydrate_recalled_attachments(
                     &format!("[Image #{}]", new_marker),
                 );
                 let hash_u64 = u64::from_str_radix(&refed.hash, 16).unwrap_or(0);
-                state.pending_images.push(atomcode_core::conversation::message::ImagePart {
-                    media_type: refed.mt.clone(),
-                    data: base64::engine::general_purpose::STANDARD.encode(&raw),
-                });
+                state
+                    .pending_images
+                    .push(atomcode_core::conversation::message::ImagePart {
+                        media_type: refed.mt.clone(),
+                        data: base64::engine::general_purpose::STANDARD.encode(&raw),
+                    });
                 state.pending_image_hashes.push(hash_u64);
                 state.pending_image_markers.push(new_marker);
             }
             Err(_) => {
                 *line = line.replace(&format!("[Image #{}]", refed.n), "");
-                notices.push(format!(
-                    "[Image #{}] 缓存已丢失，已从消息中移除",
-                    refed.n
-                ));
+                notices.push(format!("[Image #{}] 缓存已丢失，已从消息中移除", refed.n));
             }
         }
     }
@@ -608,7 +613,10 @@ mod compute_input_attachments_tests {
     fn typed_marker_with_no_pending_emits_no_preview() {
         let s = UiState::default();
         let attachments = compute_input_attachments(&s, "I typed [Image #99] literally");
-        assert!(attachments.is_empty(), "literal text must not surface a preview row");
+        assert!(
+            attachments.is_empty(),
+            "literal text must not surface a preview row"
+        );
     }
 
     #[test]
@@ -618,7 +626,10 @@ mod compute_input_attachments_tests {
         let with_marker = compute_input_attachments(&s, "see [Image #1]");
         assert_eq!(with_marker, vec![1]);
         let without_marker = compute_input_attachments(&s, "no marker now");
-        assert!(without_marker.is_empty(), "removing marker text must drop preview row");
+        assert!(
+            without_marker.is_empty(),
+            "removing marker text must drop preview row"
+        );
     }
 
     #[test]
@@ -626,7 +637,11 @@ mod compute_input_attachments_tests {
         let mut s = UiState::default();
         s.pending_image_markers.push(2);
         let attachments = compute_input_attachments(&s, "[Image #2] then [Image #2] again");
-        assert_eq!(attachments, vec![2], "same marker referenced twice must surface a single preview row");
+        assert_eq!(
+            attachments,
+            vec![2],
+            "same marker referenced twice must surface a single preview row"
+        );
     }
 
     #[test]
@@ -635,7 +650,11 @@ mod compute_input_attachments_tests {
         s.pending_image_markers.push(5);
         s.pending_recalled_attachments.push(recalled(3));
         let attachments = compute_input_attachments(&s, "first [Image #5] then [Image #3]");
-        assert_eq!(attachments, vec![5, 3], "preview rows follow buffer text order, not source order");
+        assert_eq!(
+            attachments,
+            vec![5, 3],
+            "preview rows follow buffer text order, not source order"
+        );
     }
 }
 
@@ -697,9 +716,8 @@ pub struct LoopCtx {
     /// TurnComplete (30s cooldown). Read on every redraw to construct
     /// the right-aligned usage hint when usage_percent ≥ 80% and the
     /// current model is on a CodingPlan provider.
-    pub usage_slot: std::sync::Arc<
-        std::sync::Mutex<Option<atomcode_core::coding_plan::types::UsageInfo>>,
-    >,
+    pub usage_slot:
+        std::sync::Arc<std::sync::Mutex<Option<atomcode_core::coding_plan::types::UsageInfo>>>,
     /// Last time `usage_monitor::spawn_check` was invoked. Used to
     /// enforce `usage_monitor::USAGE_COOLDOWN` on TurnComplete-triggered
     /// refreshes. `None` = no check has run yet this session.
@@ -787,7 +805,8 @@ pub struct LoopCtx {
     /// so the manager's start failures land in scrollback as `✗ LSP server
     /// 'rust-analyzer' for .rs failed: ...` instead of leaking to stderr
     /// and printing inside the input box.
-    pub lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
+    pub lsp_connect_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
@@ -1248,8 +1267,8 @@ impl Buffer {
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        self.cursor =
-            prev_line_start + byte_offset_at_col(&self.text[prev_line_start..prev_line_end], target_col);
+        self.cursor = prev_line_start
+            + byte_offset_at_col(&self.text[prev_line_start..prev_line_end], target_col);
         true
     }
 
@@ -1276,8 +1295,8 @@ impl Buffer {
             .find('\n')
             .map(|i| next_line_start + i)
             .unwrap_or(self.text.len());
-        self.cursor =
-            next_line_start + byte_offset_at_col(&self.text[next_line_start..next_line_end], target_col);
+        self.cursor = next_line_start
+            + byte_offset_at_col(&self.text[next_line_start..next_line_end], target_col);
         true
     }
 }
@@ -1408,7 +1427,10 @@ mod buffer_tests {
             "expand-before-clear must surface the body: {}",
             &expanded[..expanded.len().min(120)]
         );
-        assert!(b.pastes.is_empty(), "clear after expand must still empty the registry");
+        assert!(
+            b.pastes.is_empty(),
+            "clear after expand must still empty the registry"
+        );
     }
 
     #[test]
@@ -1487,7 +1509,8 @@ mod menu_tests {
     fn slash_prefix_returns_all_commands() {
         let reg = CommandRegistry::builtin();
         let custom = CustomCommandRegistry::empty();
-        let items = build_menu_items("/", 0, &reg, &custom, None, None).expect("menu should show for '/'");
+        let items =
+            build_menu_items("/", 0, &reg, &custom, None, None).expect("menu should show for '/'");
         assert!(!items.is_empty(), "builtin registry should have commands");
     }
 
@@ -1631,7 +1654,15 @@ mod menu_tests {
         skills.register(skill_fixture("skills:brainstorming", "Brainstorm", true));
         let lock = std::sync::RwLock::new(skills);
 
-        assert!(build_menu_items("/skills brainstorming why", 0, &reg, &custom, Some(&lock), None).is_none());
+        assert!(build_menu_items(
+            "/skills brainstorming why",
+            0,
+            &reg,
+            &custom,
+            Some(&lock),
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -1661,7 +1692,8 @@ mod menu_tests {
         let custom = CustomCommandRegistry::empty();
         let with_none = build_menu_items("/", 0, &reg, &custom, None, None).unwrap();
         let empty_skills = std::sync::RwLock::new(atomcode_core::skill::SkillRegistry::new());
-        let with_empty = build_menu_items("/", 0, &reg, &custom, Some(&empty_skills), None).unwrap();
+        let with_empty =
+            build_menu_items("/", 0, &reg, &custom, Some(&empty_skills), None).unwrap();
         assert_eq!(
             with_none.len(),
             with_empty.len(),
@@ -1679,7 +1711,10 @@ mod menu_tests {
     fn history_prev_parks_cursor_at_zero_and_marks_history_mode() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "/session foo".into(),
+            images: vec![],
+        }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
 
@@ -1791,7 +1826,10 @@ mod menu_tests {
     fn history_next_back_to_stash_restores_cursor_to_end() {
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "/session foo".into(),
+            images: vec![],
+        }];
 
         // Type a partial draft, then scroll into history and back out.
         let _ = buf.apply(Action::Insert('h'), &history, &reg);
@@ -1813,7 +1851,10 @@ mod menu_tests {
         // re-appear naturally once the user starts editing the recall.
         let mut buf = Buffer::new();
         let reg = CommandRegistry::builtin();
-        let history = vec![crate::input::history::HistoryEntry { text: "/session foo".into(), images: vec![] }];
+        let history = vec![crate::input::history::HistoryEntry {
+            text: "/session foo".into(),
+            images: vec![],
+        }];
 
         let _ = buf.apply(Action::HistoryPrev, &history, &reg);
         assert!(buf.is_in_history());
@@ -1825,7 +1866,10 @@ mod menu_tests {
     fn sync_recalled_attachments_mirrors_buffer_history_idx() {
         use crate::input::history::{HistoryEntry, HistoryImageRef};
         let history: Vec<HistoryEntry> = vec![
-            HistoryEntry { text: "no img".into(), images: vec![] },
+            HistoryEntry {
+                text: "no img".into(),
+                images: vec![],
+            },
             HistoryEntry {
                 text: "with img".into(),
                 images: vec![HistoryImageRef {
@@ -2076,7 +2120,10 @@ mod menu_tests {
         assert_eq!(state.pending_images.len(), 1);
         assert_eq!(line, "describe [Image #1]"); // first paste this session
         assert_eq!(state.pending_image_markers, vec![1]);
-        assert!(line.contains("[Image #1]"), "marker survives in line for the survival filter");
+        assert!(
+            line.contains("[Image #1]"),
+            "marker survives in line for the survival filter"
+        );
     }
 }
 
@@ -2127,7 +2174,10 @@ mod tool_format_tests {
         assert_eq!(display_tool_name_short("edit_file"), "Edit");
         assert_eq!(display_tool_name_short("create_file"), "Create");
         assert_eq!(display_tool_name_short("list_directory"), "List");
-        assert_eq!(display_tool_name_short("parallel_edit_files"), "ParallelEdit");
+        assert_eq!(
+            display_tool_name_short("parallel_edit_files"),
+            "ParallelEdit"
+        );
         // Suffixes not in strip list pass through.
         assert_eq!(display_tool_name_short("bash"), "Bash");
         assert_eq!(display_tool_name_short("grep"), "Grep");
@@ -2586,7 +2636,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         std::env::remove_var("ATOMCODE_UPGRADED_FROM");
         let current = format!("v{}", env!("CARGO_PKG_VERSION"));
         renderer.render(UiLine::CommandOutput(
-            crate::i18n::t(crate::i18n::Msg::UpgradeSuccess { from: &prev, to: &current }).into_owned(),
+            crate::i18n::t(crate::i18n::Msg::UpgradeSuccess {
+                from: &prev,
+                to: &current,
+            })
+            .into_owned(),
         ));
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
@@ -3997,14 +4051,16 @@ fn handle_input(
                                             number: created.number,
                                             title: &created.title,
                                             url: &shown_url,
-                                        }).into_owned(),
+                                        })
+                                        .into_owned(),
                                     ));
                                 }
                                 Err(e) => {
                                     renderer.render(UiLine::CommandOutput(
                                         crate::i18n::t(crate::i18n::Msg::IssueCreateFailed {
                                             error: &format!("{:#}", e),
-                                        }).into_owned(),
+                                        })
+                                        .into_owned(),
                                     ));
                                 }
                             }
@@ -4076,7 +4132,10 @@ fn handle_input(
                 #[cfg(windows)]
                 if let Some(ts) = app.last_ctrl_c_copy.take() {
                     if ts.elapsed() < Duration::from_millis(500) {
-                        crate::tuix_trace!("KEY", "ctrl+c keyboard echo suppressed (OS signal already handled copy)");
+                        crate::tuix_trace!(
+                            "KEY",
+                            "ctrl+c keyboard echo suppressed (OS signal already handled copy)"
+                        );
                         return Ok(());
                     }
                 }
@@ -4109,10 +4168,8 @@ fn handle_input(
             // (e.g. terminal-emulator-defined Ctrl+Shift+V "Paste as
             // Plain Text") still pass through to whatever else might
             // bind them in the future.
-            if matches!(
-                app.state.phase,
-                UiPhase::Idle | UiPhase::Streaming
-            ) && code == crossterm::event::KeyCode::Char('v')
+            if matches!(app.state.phase, UiPhase::Idle | UiPhase::Streaming)
+                && code == crossterm::event::KeyCode::Char('v')
                 && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                 && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
                 && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
@@ -4264,9 +4321,7 @@ fn build_menu_items(
 ) -> Option<Vec<(String, String)>> {
     // `@`-mention branch — checked first so it takes priority over any
     // `/` interpretation.
-    if let (Some(idx), Some(token)) =
-        (file_index, file_index::detect_at_mention(buf, cursor))
-    {
+    if let (Some(idx), Some(token)) = (file_index, file_index::detect_at_mention(buf, cursor)) {
         let (scope_dir, filter) = file_index::split_token(&token);
         let entries = idx.filter(&scope_dir, &filter);
         if entries.is_empty() {
@@ -4417,7 +4472,14 @@ fn handle_idle_key(
     let menu_items = if app.buf.is_in_history() {
         None
     } else {
-        build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
+        build_menu_items(
+            &app.buf.text,
+            app.buf.cursor,
+            &ctx.commands,
+            &ctx.custom_commands,
+            Some(&ctx.skill_registry),
+            Some(&ctx.file_index),
+        )
     };
     if let Some(items) = &menu_items {
         // Clamp selection in range.
@@ -4758,7 +4820,14 @@ fn handle_idle_key(
             let items = if app.buf.is_in_history() {
                 None
             } else {
-                build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
+                build_menu_items(
+                    &app.buf.text,
+                    app.buf.cursor,
+                    &ctx.commands,
+                    &ctx.custom_commands,
+                    Some(&ctx.skill_registry),
+                    Some(&ctx.file_index),
+                )
             };
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
@@ -5084,7 +5153,10 @@ mod parse_already_latest_versions_tests {
     #[test]
     fn extracts_both_versions() {
         let s = "already on v4.22.2 (latest is v4.22.2). Pass --force to reinstall.";
-        assert_eq!(parse_already_latest_versions(s), Some(("v4.22.2", "v4.22.2")));
+        assert_eq!(
+            parse_already_latest_versions(s),
+            Some(("v4.22.2", "v4.22.2"))
+        );
     }
     #[test]
     fn rejects_unrelated_strings() {
@@ -5173,7 +5245,12 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 .send(AgentCommand::ReloadConfig(ctx.config.clone()));
         }
         Err(e) => {
-            renderer.render(UiLine::Error(crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed { error: &format!("{}", e) }).into_owned()));
+            renderer.render(UiLine::Error(
+                crate::i18n::t(crate::i18n::Msg::ConfigSaveFailed {
+                    error: &format!("{}", e),
+                })
+                .into_owned(),
+            ));
             renderer.flush();
         }
     }
@@ -5329,7 +5406,14 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index));
+    let menu_items = build_menu_items(
+        &app.buf.text,
+        app.buf.cursor,
+        &ctx.commands,
+        &ctx.custom_commands,
+        Some(&ctx.skill_registry),
+        Some(&ctx.file_index),
+    );
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -5423,7 +5507,14 @@ fn handle_streaming_key(
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)) {
+            if let Some(items) = build_menu_items(
+                &app.buf.text,
+                app.buf.cursor,
+                &ctx.commands,
+                &ctx.custom_commands,
+                Some(&ctx.skill_registry),
+                Some(&ctx.file_index),
+            ) {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
@@ -5496,7 +5587,8 @@ fn handle_streaming_key(
             // dropped on dispatch.
             let mut line = line;
             let cache_dir_for_hydrate = crate::platform::image_cache_dir();
-            for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir_for_hydrate) {
+            for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir_for_hydrate)
+            {
                 renderer.render(UiLine::Warning(n));
             }
             let expanded = app.buf.expand_pastes(&line);
@@ -5710,7 +5802,8 @@ pub(super) fn handle_upgrade_event(
         UpgradeEvent::ManifestFetched { version } => {
             *last_pct = -1;
             renderer.render(UiLine::CommandOutput(
-                crate::i18n::t(crate::i18n::Msg::UpgradeManifestFetched { version: &version }).into_owned(),
+                crate::i18n::t(crate::i18n::Msg::UpgradeManifestFetched { version: &version })
+                    .into_owned(),
             ));
         }
         UpgradeEvent::Downloading { bytes, total } => {
@@ -5726,7 +5819,8 @@ pub(super) fn handle_upgrade_event(
                 // since there's no in-place update here.
                 if pct == 25 || pct == 50 || pct == 75 || pct == 100 {
                     renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::UpgradeDownloading { pct, bytes, total }).into_owned(),
+                        crate::i18n::t(crate::i18n::Msg::UpgradeDownloading { pct, bytes, total })
+                            .into_owned(),
                     ));
                 }
             }
@@ -5741,12 +5835,17 @@ pub(super) fn handle_upgrade_event(
                 crate::i18n::t(crate::i18n::Msg::UpgradeReplacing).into_owned(),
             ));
         }
-        UpgradeEvent::Done { version, backup, exe } => {
+        UpgradeEvent::Done {
+            version,
+            backup,
+            exe,
+        } => {
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::UpgradeDone {
                     version: &version,
                     backup: &backup.display().to_string(),
-                }).into_owned(),
+                })
+                .into_owned(),
             ));
             // Push the hint in the status bar to match the new reality —
             // the little "↑ vX" arrow goes away for this session.
@@ -5773,10 +5872,11 @@ pub(super) fn handle_upgrade_event(
                     &format!("{}: ", atomcode_core::self_update::ALREADY_LATEST),
                     "",
                 );
-                let (current, latest) = parse_already_latest_versions(&friendly)
-                    .unwrap_or(("?", "?"));
+                let (current, latest) =
+                    parse_already_latest_versions(&friendly).unwrap_or(("?", "?"));
                 renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::UpgradeAlreadyLatest { current, latest }).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::UpgradeAlreadyLatest { current, latest })
+                        .into_owned(),
                 ));
             } else {
                 renderer.render(UiLine::Error(
@@ -5789,7 +5889,8 @@ pub(super) fn handle_upgrade_event(
                 crate::i18n::t(crate::i18n::Msg::UpgradeRolledBack {
                     exe: &exe.display().to_string(),
                     backup: &backup.display().to_string(),
-                }).into_owned(),
+                })
+                .into_owned(),
             ));
             *done = Some(exe);
             ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
@@ -5936,11 +6037,7 @@ fn handle_agent_event(
                 // visual consistency with the initial child row.
                 let prefix = pending_tools
                     .remove(&call_id)
-                    .map(|(_, det, _)| format!(
-                        "{}({})",
-                        display_tool_name_short(&name),
-                        det
-                    ))
+                    .map(|(_, det, _)| format!("{}({})", display_tool_name_short(&name), det))
                     .unwrap_or_else(|| display_tool_name_short(&name));
                 renderer.render(UiLine::ToolGroupChildUpdate {
                     batch_id,
@@ -6063,7 +6160,10 @@ fn handle_agent_event(
             let _ = name;
         }
         AgentEvent::ApprovalNeeded {
-            tool_name, call, messages, ..
+            tool_name,
+            call,
+            messages,
+            ..
         } => {
             // Persist mid-turn messages to session so /bg can recover
             // the conversation even when the turn hasn't finished yet.
@@ -6215,10 +6315,7 @@ fn handle_agent_event(
                     .unwrap_or(true);
                 if cooled {
                     ctx.usage_last_check_at = Some(std::time::Instant::now());
-                    usage_monitor::spawn_check(
-                        ctx.usage_slot.clone(),
-                        ctx.wake_tx.clone(),
-                    );
+                    usage_monitor::spawn_check(ctx.usage_slot.clone(), ctx.wake_tx.clone());
                 }
             }
 
@@ -6330,10 +6427,7 @@ fn handle_agent_event(
             // mislead the main model into "image failed" responses.
             let msg = crate::i18n::t(crate::i18n::Msg::VisionPreprocessSuccess { char_count })
                 .into_owned();
-            renderer.render(UiLine::VisionPreprocessSuccess {
-                msg,
-                model: vl_key,
-            });
+            renderer.render(UiLine::VisionPreprocessSuccess { msg, model: vl_key });
             renderer.flush();
         }
         AgentEvent::RestorePendingImages { images, markers } => {
@@ -6496,7 +6590,10 @@ fn handle_agent_event(
                 .collect();
             let disambiguated = disambiguate_batch_details(
                 &calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-                &calls.iter().map(|c| c.arguments.as_str()).collect::<Vec<_>>(),
+                &calls
+                    .iter()
+                    .map(|c| c.arguments.as_str())
+                    .collect::<Vec<_>>(),
                 &raw_details,
             );
             let children: Vec<crate::render::ToolGroupChild> = calls
@@ -6522,9 +6619,7 @@ fn handle_agent_event(
 
             let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
             for cid in &call_ids {
-                state
-                    .call_id_to_batch
-                    .insert(cid.clone(), batch_id.clone());
+                state.call_id_to_batch.insert(cid.clone(), batch_id.clone());
             }
             // Pre-populate `pending_tools` with the disambiguated detail
             // so that subsequent ToolCallStarted / ApprovalNeeded events
@@ -6538,10 +6633,9 @@ fn handle_agent_event(
                     (display_tool_name_short(&c.name), detail.clone(), true),
                 );
             }
-            state.active_tool_batches.insert(
-                batch_id.clone(),
-                crate::state::ActiveToolBatch { call_ids },
-            );
+            state
+                .active_tool_batches
+                .insert(batch_id.clone(), crate::state::ActiveToolBatch { call_ids });
         }
         AgentEvent::ToolBatchCompleted {
             batch_id,
@@ -6587,13 +6681,23 @@ fn handle_agent_event(
             // view. State tracking still happens via DispatchStart's
             // task list. Nothing to render here.
         }
-        AgentEvent::SubAgentTaskDone { index: _, elapsed_ms: _, turns: _, summary: _ } => {
+        AgentEvent::SubAgentTaskDone {
+            index: _,
+            elapsed_ms: _,
+            turns: _,
+            summary: _,
+        } => {
             // Per-task done lines suppressed — final count shows in
             // DispatchEnd summary. Still tick the counter so the
             // aggregate `N/M ok` reflects this completion.
             state.on_sub_agent_task_done();
         }
-        AgentEvent::SubAgentTaskFailed { index, elapsed_ms, turns: _, reason } => {
+        AgentEvent::SubAgentTaskFailed {
+            index,
+            elapsed_ms,
+            turns: _,
+            reason,
+        } => {
             // Failures KEEP their per-task line. Rationale: the user
             // needs to know which sub-agent failed for diagnosis;
             // collapsing into "1 fail" leaves them blind. Successes
@@ -6608,7 +6712,11 @@ fn handle_agent_event(
                     info.path,
                     info.dedup_suffix,
                     fmt_elapsed(elapsed_ms),
-                    if short_reason.is_empty() { "failed" } else { short_reason }
+                    if short_reason.is_empty() {
+                        "failed"
+                    } else {
+                        short_reason
+                    }
                 )));
                 renderer.flush();
             }
@@ -6650,7 +6758,12 @@ fn handle_agent_event(
             }
             state.on_sub_agent_dispatch_end();
         }
-        AgentEvent::BackgroundComplete { summary, files_edited, turns, success } => {
+        AgentEvent::BackgroundComplete {
+            summary,
+            files_edited,
+            turns,
+            success,
+        } => {
             let header = if success {
                 crate::i18n::t(crate::i18n::Msg::BackgroundComplete { turns }).into_owned()
             } else {
@@ -6711,8 +6824,10 @@ fn persist_current_session(
     // assume "the session was lost" with no idea anything went wrong.
     if let Err(e) = ctx.session_manager.save(&ctx.current_session) {
         renderer.render(UiLine::Error(
-            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed { error: &e.to_string() })
-                .into_owned(),
+            crate::i18n::t(crate::i18n::Msg::SessionSaveFailed {
+                error: &e.to_string(),
+            })
+            .into_owned(),
         ));
         renderer.flush();
     }
@@ -6867,16 +6982,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // Always check and clear expired transient_hint, even when another
     // hint is active — otherwise a transient hint set while a monitor
     // warning is visible would never expire.
-    let transient_active: Option<String> =
-        ctx.transient_hint.lock().ok().and_then(|mut g| {
-            let h = g.as_ref()?;
-            if h.deadline > std::time::Instant::now() {
-                Some(h.text.clone())
-            } else {
-                *g = None;
-                None
-            }
-        });
+    let transient_active: Option<String> = ctx.transient_hint.lock().ok().and_then(|mut g| {
+        let h = g.as_ref()?;
+        if h.deadline > std::time::Instant::now() {
+            Some(h.text.clone())
+        } else {
+            *g = None;
+            None
+        }
+    });
     // Priority: transient hint (user-action feedback) > no-provider
     // (Warning) > CodingPlan drift (Warning) > CodingPlan usage hint
     // (Info ≥80%, Warning ≥95%) > upgrade banner.
@@ -6919,7 +7033,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             .and_then(|g| g.clone())
             .map(|v| {
                 (
-                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v }).into_owned(),
+                    crate::i18n::t(crate::i18n::Msg::StatusUpgradeHint { version: &v })
+                        .into_owned(),
                     crate::render::HintSeverity::Info,
                 )
             })
@@ -6996,14 +7111,26 @@ fn draw_spinner_now(
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
-    let menu = build_menu_items(&buf.text, buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)).map(|items| {
+    let menu = build_menu_items(
+        &buf.text,
+        buf.cursor,
+        &ctx.commands,
+        &ctx.custom_commands,
+        Some(&ctx.skill_registry),
+        Some(&ctx.file_index),
+    )
+    .map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
         let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
             crate::render::MenuKind::AtMention
         } else {
             crate::render::MenuKind::SlashCommand
         };
-        crate::render::MenuPayload { items, selected, kind }
+        crate::render::MenuPayload {
+            items,
+            selected,
+            kind,
+        }
     });
     let attachments = compute_input_attachments(state, &buf.text);
     renderer.render(UiLine::StreamingBox {
@@ -7226,7 +7353,9 @@ fn disambiguate_batch_details(
         let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
         match name {
             "read_file" | "edit_file" | "write_file" | "create_file" | "list_symbols"
-            | "blast_radius" | "file_dependencies" => get_str("file_path").or_else(|| get_str("file")),
+            | "blast_radius" | "file_dependencies" => {
+                get_str("file_path").or_else(|| get_str("file"))
+            }
             "search_replace" => get_str("file_path").or_else(|| get_str("file")),
             "read_symbol" => get_str("file_path"),
             _ => None,
@@ -7244,8 +7373,7 @@ fn disambiguate_batch_details(
     let mut result = raw_details.to_vec();
 
     // Collect groups of indices that share the same raw_detail.
-    let mut groups: std::collections::HashMap<&str, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for (i, d) in raw_details.iter().enumerate() {
         groups.entry(d.as_str()).or_default().push(i);
     }
@@ -7262,15 +7390,19 @@ fn disambiguate_batch_details(
             // Strategy: progressively add parent path components until
             // all entries are unique. Start with 1 parent component
             // (e.g. `a/SKILL.md`), then 2 (`b/a/SKILL.md`), etc.
-            let paths: Vec<&str> = indices.iter().map(|&i| full_paths[i].as_deref().unwrap()).collect();
+            let paths: Vec<&str> = indices
+                .iter()
+                .map(|&i| full_paths[i].as_deref().unwrap())
+                .collect();
             let mut depth = 1usize;
-            let max_depth = paths.iter().map(|p| p.matches('/').count()).max().unwrap_or(0);
+            let max_depth = paths
+                .iter()
+                .map(|p| p.matches('/').count())
+                .max()
+                .unwrap_or(0);
 
             loop {
-                let candidates: Vec<String> = paths
-                    .iter()
-                    .map(|p| tail_path(p, depth))
-                    .collect();
+                let candidates: Vec<String> = paths.iter().map(|p| tail_path(p, depth)).collect();
 
                 let all_unique = {
                     let mut s = std::collections::HashSet::new();
@@ -7279,10 +7411,7 @@ fn disambiguate_batch_details(
 
                 if all_unique || depth >= max_depth {
                     for (i, &idx) in indices.iter().enumerate() {
-                        result[idx] = crate::width::truncate_with_ellipsis(
-                            &candidates[i],
-                            100,
-                        );
+                        result[idx] = crate::width::truncate_with_ellipsis(&candidates[i], 100);
                     }
                     break;
                 }

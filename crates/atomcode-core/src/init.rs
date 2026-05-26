@@ -63,10 +63,18 @@ fn detect_project(dir: &Path) -> (Vec<String>, Vec<String>) {
         }
         // Detect framework
         if let Ok(pkg) = std::fs::read_to_string(dir.join("package.json")) {
-            if pkg.contains("\"react\"") { stack.push("React".to_string()); }
-            if pkg.contains("\"vue\"") { stack.push("Vue".to_string()); }
-            if pkg.contains("\"next\"") { stack.push("Next.js".to_string()); }
-            if pkg.contains("\"typescript\"") { stack.push("TypeScript".to_string()); }
+            if pkg.contains("\"react\"") {
+                stack.push("React".to_string());
+            }
+            if pkg.contains("\"vue\"") {
+                stack.push("Vue".to_string());
+            }
+            if pkg.contains("\"next\"") {
+                stack.push("Next.js".to_string());
+            }
+            if pkg.contains("\"typescript\"") {
+                stack.push("TypeScript".to_string());
+            }
         }
     }
     if dir.join("pom.xml").exists() {
@@ -131,7 +139,11 @@ mod tests {
     #[test]
     fn test_node_project() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"react":"^18"}}"#).unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{"react":"^18"}}"#,
+        )
+        .unwrap();
         let result = generate_project_instructions(tmp.path());
         assert!(result.contains("Node.js"));
         assert!(result.contains("React"));
@@ -141,7 +153,11 @@ mod tests {
     #[test]
     fn test_python_project() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"test\"").unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"test\"",
+        )
+        .unwrap();
         let result = generate_project_instructions(tmp.path());
         assert!(result.contains("Python"));
         assert!(result.contains("pytest"));

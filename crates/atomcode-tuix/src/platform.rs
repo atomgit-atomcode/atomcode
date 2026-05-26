@@ -228,10 +228,7 @@ mod tests {
     #[test]
     fn collapse_home_windows_exact_home() {
         let home = std::path::Path::new(r"C:\Users\username");
-        assert_eq!(
-            collapse_home_with(r"C:\Users\username", Some(home)),
-            "~"
-        );
+        assert_eq!(collapse_home_with(r"C:\Users\username", Some(home)), "~");
     }
 
     /// Regression test for the slice-offset bug in the Windows
@@ -252,10 +249,7 @@ mod tests {
     fn collapse_home_windows_deeply_nested_path() {
         let home = std::path::Path::new(r"C:\Users\hao");
         assert_eq!(
-            collapse_home_with(
-                r"C:\Users\hao\Documents\WPSDrive\NotLoginPage",
-                Some(home),
-            ),
+            collapse_home_with(r"C:\Users\hao\Documents\WPSDrive\NotLoginPage", Some(home),),
             "~/Documents/WPSDrive/NotLoginPage"
         );
     }

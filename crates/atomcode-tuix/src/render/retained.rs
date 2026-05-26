@@ -795,10 +795,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // a brand-colored badge so the user sees at a glance that file
         // edits / shell are gated. Build (default) is None and adds
         // nothing.
-        let mode_badge: Option<String> = status
-            .mode_indicator
-            .as_ref()
-            .map(|s| scrub_controls(s));
+        let mode_badge: Option<String> = status.mode_indicator.as_ref().map(|s| scrub_controls(s));
         let mode_badge_w = mode_badge
             .as_ref()
             .map(|s| crate::width::display_width(s) + 1) // +1 for the trailing space separator
@@ -848,13 +845,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         if !status.cwd.is_empty() {
             let cwd_full = scrub_controls(&status.cwd);
-            let cwd_display = if cwd_budget > 0 && crate::width::display_width(&cwd_full) > cwd_budget {
-                crate::width::truncate_path(&cwd_full, cwd_budget)
-            } else if cwd_budget == 0 {
-                crate::width::truncate_path(&cwd_full, left_max)
-            } else {
-                cwd_full
-            };
+            let cwd_display =
+                if cwd_budget > 0 && crate::width::display_width(&cwd_full) > cwd_budget {
+                    crate::width::truncate_path(&cwd_full, cwd_budget)
+                } else if cwd_budget == 0 {
+                    crate::width::truncate_path(&cwd_full, left_max)
+                } else {
+                    cwd_full
+                };
             parts.push(cwd_display);
         }
         if !ctx_str.is_empty() {
@@ -988,10 +986,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let footer_top = h.saturating_sub(total_rows);
 
         // Pre-build every row vector (immutable borrows of self).
-        let top_rule = self.build_top_rule_with_badge(
-            input_rule_width,
-            self.status.session_name.as_deref(),
-        );
+        let top_rule =
+            self.build_top_rule_with_badge(input_rule_width, self.status.session_name.as_deref());
         let middle_cells: Vec<Vec<Cell>> = lines
             .iter()
             .enumerate()
@@ -1004,11 +1000,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             None
         };
-        let menu_kind = self
-            .menu
-            .as_ref()
-            .map(|m| m.kind)
-            .unwrap_or_default();
+        let menu_kind = self.menu.as_ref().map(|m| m.kind).unwrap_or_default();
         let menu_cells: Vec<Vec<Cell>> = menu_items
             .iter()
             .enumerate()
@@ -2618,7 +2610,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // inline (issue #454). Otherwise, emit chips on a
                 // separate line so they remain visible.
                 let safe_tool_label = crate::sanitize::scrub_controls(&tool_label);
-                let mut prefixed_rows = self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
+                let mut prefixed_rows =
+                    self.build_prefixed_rows(&waiting, &warn, &safe_tool_label, &warn);
                 let screen_w = self.screen.width() as usize;
                 let last_row_w: usize = prefixed_rows
                     .last()
@@ -3470,7 +3463,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/project/atomcode".into(),
             ctx_used: 0,
-                ctx_window: 0,
+            ctx_window: 0,
             hint: None,
             mode_indicator: None,
             session_name: None,
@@ -3493,7 +3486,7 @@ mod tests {
             model: "glm-5".into(),
             cwd: "~/proj".into(),
             ctx_used: 0,
-                ctx_window: 0,
+            ctx_window: 0,
             hint: None,
             mode_indicator: Some("PLAN".into()),
             session_name: None,
@@ -3671,7 +3664,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -3697,7 +3690,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -4058,10 +4051,7 @@ mod tests {
         // First render: pushes scroll-style (prev_rows=0 → fallback path).
         r.render_inflight_tool("⠋", "bash", detail, "");
         let bytes_after_first = buf.lock().unwrap().len();
-        assert!(
-            bytes_after_first > 0,
-            "first render must emit some bytes"
-        );
+        assert!(bytes_after_first > 0, "first render must emit some bytes");
 
         // Drain so subsequent measurements are tick-only.
         buf.lock().unwrap().clear();
@@ -4430,7 +4420,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -5067,16 +5057,20 @@ mod tests {
             drain_into_vterm(&buf, &mut vterm);
 
             let tool_row = (0..vterm.height() as usize)
-                .find(|&i| {
-                    vterm.row_text(i).contains("●") && vterm.row_text(i).contains(tool_name)
-                })
+                .find(|&i| vterm.row_text(i).contains("●") && vterm.row_text(i).contains(tool_name))
                 .unwrap_or_else(|| {
-                    panic!("[{tool_name}] tool call row missing\ndump:\n{}", vterm.dump())
+                    panic!(
+                        "[{tool_name}] tool call row missing\ndump:\n{}",
+                        vterm.dump()
+                    )
                 });
             let result_row = (0..vterm.height() as usize)
                 .find(|&i| vterm.row_text(i).contains("└"))
                 .unwrap_or_else(|| {
-                    panic!("[{tool_name}] tool result row missing\ndump:\n{}", vterm.dump())
+                    panic!(
+                        "[{tool_name}] tool result row missing\ndump:\n{}",
+                        vterm.dump()
+                    )
                 });
 
             let first_char = tool_name.chars().next().unwrap();
@@ -5097,7 +5091,8 @@ mod tests {
                     )
                 });
             assert_eq!(
-                arrow_col, name_col,
+                arrow_col,
+                name_col,
                 "[{tool_name}] result '└' col {} must match tool name {:?} col {} \
                  (tool row: {:?}, result row: {:?})",
                 arrow_col,
@@ -5301,7 +5296,9 @@ mod tests {
     fn retained_command_output_internal_newlines_split_into_rows() {
         let (mut r, _buf) = new_capturing(80, 24);
         let before = r.body_lines.len();
-        r.render(UiLine::CommandOutput("line one\nline two\nline three".into()));
+        r.render(UiLine::CommandOutput(
+            "line one\nline two\nline three".into(),
+        ));
         let pushed = r.body_lines.len() - before;
         assert_eq!(
             pushed, 3,
@@ -6403,7 +6400,7 @@ mod tests {
             menu: Some(MenuPayload {
                 items: items.clone(),
                 selected: 0,
-                    kind: crate::render::MenuKind::SlashCommand,
+                kind: crate::render::MenuKind::SlashCommand,
             }),
             status: status.clone(),
             attachments: Vec::new(),
@@ -7010,7 +7007,8 @@ mod tests {
                         cell.style.fg,
                         Some(Color::DarkRed),
                         "cell '{}' in locked row must carry DarkRed fg, got {:?}",
-                        cell.ch, cell.style.fg,
+                        cell.ch,
+                        cell.style.fg,
                     );
                 }
                 found_red = true;
@@ -7111,18 +7109,26 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         // Debug: print body_lines around the tool and result rows.
-        let tool_idx = r.body_lines.iter().rposition(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("Bash") && text.contains("rm -f")
-        }).expect("● Bash row should exist in body_lines");
+        let tool_idx = r
+            .body_lines
+            .iter()
+            .rposition(|row| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("Bash") && text.contains("rm -f")
+            })
+            .expect("● Bash row should exist in body_lines");
 
-        let result_idx = r.body_lines.iter().rposition(|row| {
-            let text: String = row.iter().map(|c| c.ch).collect();
-            text.contains("elapsed")
-        }).expect("└ result row should exist in body_lines");
+        let result_idx = r
+            .body_lines
+            .iter()
+            .rposition(|row| {
+                let text: String = row.iter().map(|c| c.ch).collect();
+                text.contains("elapsed")
+            })
+            .expect("└ result row should exist in body_lines");
 
         eprintln!("body_lines around tool row:");
-        for i in tool_idx.saturating_sub(2)..=result_idx+2 {
+        for i in tool_idx.saturating_sub(2)..=result_idx + 2 {
             if let Some(row) = r.body_lines.get(i) {
                 let text: String = row.iter().map(|c| c.ch).collect();
                 eprintln!("  [{}] {:?} (blank={})", i, text, row.is_empty());
@@ -7136,9 +7142,15 @@ mod tests {
             tool_idx + 1,
             "result row should be immediately after tool row, but found gap.\n\
              body_lines around tool row:\n  {:?}\n  {:?}\n  {:?}",
-            r.body_lines.get(tool_idx).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
-            r.body_lines.get(tool_idx + 1).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
-            r.body_lines.get(tool_idx + 2).map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines
+                .get(tool_idx)
+                .map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines
+                .get(tool_idx + 1)
+                .map(|row| row.iter().map(|c| c.ch).collect::<String>()),
+            r.body_lines
+                .get(tool_idx + 2)
+                .map(|row| row.iter().map(|c| c.ch).collect::<String>()),
         );
 
         // Also check the virtual terminal: the ● Bash row and └ result row
@@ -7218,7 +7230,9 @@ mod tests {
 
         // Check body_lines: there should be exactly one row with "● Bash"
         // and NO row with a spinner glyph (⠙ or similar Braille pattern).
-        let bash_rows: Vec<_> = r.body_lines.iter()
+        let bash_rows: Vec<_> = r
+            .body_lines
+            .iter()
             .enumerate()
             .filter(|(_, row)| {
                 let text: String = row.iter().map(|c| c.ch).collect();
@@ -7231,7 +7245,10 @@ mod tests {
             1,
             "there should be exactly 1 Bash row in body_lines, found {}:\n{:?}",
             bash_rows.len(),
-            bash_rows.iter().map(|(i, row)| (i, row.iter().map(|c| c.ch).collect::<String>())).collect::<Vec<_>>(),
+            bash_rows
+                .iter()
+                .map(|(i, row)| (i, row.iter().map(|c| c.ch).collect::<String>()))
+                .collect::<Vec<_>>(),
         );
 
         // The committed row should start with ● (U+25CF), not a spinner glyph.

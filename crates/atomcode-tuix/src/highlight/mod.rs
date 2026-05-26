@@ -56,12 +56,12 @@ struct CodePalette {
 }
 
 const DARK: CodePalette = CodePalette {
-    keyword:  Rgb(198, 120, 221),
-    string:   Rgb(152, 195, 121),
-    number:   Rgb(209, 154, 102),
-    comment:  Rgb(124, 132, 153),
+    keyword: Rgb(198, 120, 221),
+    string: Rgb(152, 195, 121),
+    number: Rgb(209, 154, 102),
+    comment: Rgb(124, 132, 153),
     function: Rgb(97, 175, 239),
-    type_:    Rgb(229, 192, 123),
+    type_: Rgb(229, 192, 123),
 };
 
 /// `Light` palette: dark, saturated variants hitting ≥ 11:1 contrast
@@ -74,12 +74,12 @@ const DARK: CodePalette = CodePalette {
 /// don't need re-tuning. Must stay in lockstep with `theme.rs`'s
 /// per-token accessor SGR strings.
 const LIGHT: CodePalette = CodePalette {
-    keyword:  Rgb(74, 0, 114),    // #4A0072
-    string:   Rgb(0, 100, 0),     // #006400
-    number:   Rgb(102, 51, 0),    // #663300
-    comment:  Rgb(74, 80, 96),    // #4A5060 (kept moderate — comments stay secondary)
-    function: Rgb(0, 33, 113),    // #002171
-    type_:    Rgb(91, 58, 0),     // #5B3A00
+    keyword: Rgb(74, 0, 114),  // #4A0072
+    string: Rgb(0, 100, 0),    // #006400
+    number: Rgb(102, 51, 0),   // #663300
+    comment: Rgb(74, 80, 96),  // #4A5060 (kept moderate — comments stay secondary)
+    function: Rgb(0, 33, 113), // #002171
+    type_: Rgb(91, 58, 0),     // #5B3A00
 };
 
 fn atomcode_theme() -> &'static Theme {
@@ -109,7 +109,12 @@ fn build_atomcode_theme(p: &CodePalette) -> Theme {
     let item = |scope_str: &str, c: &Rgb, italic: bool| ThemeItem {
         scope: ScopeSelectors::from_str(scope_str).expect("valid scope selector"),
         style: StyleModifier {
-            foreground: Some(Color { r: c.0, g: c.1, b: c.2, a: 0xFF }),
+            foreground: Some(Color {
+                r: c.0,
+                g: c.1,
+                b: c.2,
+                a: 0xFF,
+            }),
             background: None,
             font_style: if italic {
                 Some(FontStyle::ITALIC)
@@ -125,7 +130,12 @@ fn build_atomcode_theme(p: &CodePalette) -> Theme {
             // Sentinel default fg. alpha=0 means "we don't paint this chunk."
             // The highlight loop reads style.foreground.a to distinguish
             // matched-scope text from passthrough.
-            foreground: Some(Color { r: 0, g: 0, b: 0, a: 0 }),
+            foreground: Some(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            }),
             ..ThemeSettings::default()
         },
         scopes: vec![
@@ -145,11 +155,7 @@ fn build_atomcode_theme(p: &CodePalette) -> Theme {
 
 /// Highlight a complete fenced code block and return the indented, ANSI-tinted
 /// multi-line string ready for `push_markdown_body`.
-pub fn highlight_block(
-    lang_hint: Option<&str>,
-    source: &str,
-    caps: TerminalCaps,
-) -> String {
+pub fn highlight_block(lang_hint: Option<&str>, source: &str, caps: TerminalCaps) -> String {
     if !caps.colors {
         return indent_plain(source);
     }
@@ -383,8 +389,16 @@ mod tests {
         let out = highlight_block(Some("rust"), src, caps_color());
         let lines: Vec<_> = out.split('\n').collect();
         assert_eq!(lines.len(), 2, "expected 2 output lines, got: {:?}", out);
-        assert!(lines[0].contains(theme::string()), "line0 missing string color: {:?}", lines[0]);
-        assert!(lines[1].contains(theme::string()), "line1 missing string color: {:?}", lines[1]);
+        assert!(
+            lines[0].contains(theme::string()),
+            "line0 missing string color: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(theme::string()),
+            "line1 missing string color: {:?}",
+            lines[1]
+        );
     }
 
     #[test]
@@ -393,13 +407,21 @@ mod tests {
         // Our catch_unwind wrapper must keep us alive and return plain indent.
         let nasty = "(".repeat(10_000);
         let out = highlight_block(Some("rust"), &nasty, caps_color());
-        assert!(out.starts_with("  "), "must still produce indented output: {:?}", &out[..50.min(out.len())]);
+        assert!(
+            out.starts_with("  "),
+            "must still produce indented output: {:?}",
+            &out[..50.min(out.len())]
+        );
     }
 
     #[test]
     fn unknown_lang_after_syntect_returns_plain_indent() {
         // syntect's find_syntax_by_token returns None for unknown -> plain indent.
-        let out = highlight_block(Some("frobnicate-xyz-not-a-language"), "x = 42", caps_color());
+        let out = highlight_block(
+            Some("frobnicate-xyz-not-a-language"),
+            "x = 42",
+            caps_color(),
+        );
         assert_eq!(out, "  x = 42");
     }
 }

@@ -865,15 +865,16 @@ pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
 /// constraints); caller should surface the error and keep running with
 /// the old binary rather than exiting silently.
 pub fn re_exec_self(override_exe: Option<&Path>) -> Result<std::convert::Infallible> {
-    let exe = override_exe
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| current_exe_path().unwrap_or_else(|_| {
+    let exe = override_exe.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        current_exe_path().unwrap_or_else(|_| {
             // Fallback: if we can't resolve current_exe AND no override,
             // try argv[0] as a last resort.
-            std::env::args_os().next()
+            std::env::args_os()
+                .next()
                 .map(PathBuf::from)
                 .unwrap_or_default()
-        }));
+        })
+    });
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
 
     #[cfg(unix)]

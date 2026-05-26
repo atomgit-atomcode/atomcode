@@ -502,13 +502,16 @@ pub fn render_bg_list(slots: &BackgroundSlots) -> String {
     }
     let mut out = t(Msg::BgListHeader).into_owned();
     for row in slots.list_rows() {
-        out.push_str(&t(Msg::BgListRow {
-            slot: row.slot,
-            short_id: &row.short_id,
-            state: &row.state.localised(),
-            age: &humanize_age(row.created_at),
-            summary: &row.summary,
-        }).into_owned());
+        out.push_str(
+            &t(Msg::BgListRow {
+                slot: row.slot,
+                short_id: &row.short_id,
+                state: &row.state.localised(),
+                age: &humanize_age(row.created_at),
+                summary: &row.summary,
+            })
+            .into_owned(),
+        );
     }
     out
 }

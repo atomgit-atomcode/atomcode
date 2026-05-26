@@ -34,7 +34,8 @@ impl MemoryStore {
                     let bytes = fs::read(&self.path).unwrap_or_default();
                     let start = bytes.len().saturating_sub(MAX_MEMORY_FILE_SIZE as usize);
                     // Scan forward to the next newline to avoid splitting UTF-8 chars
-                    let safe_start = bytes[start..].iter()
+                    let safe_start = bytes[start..]
+                        .iter()
                         .position(|&b| b == b'\n')
                         .map(|pos| start + pos + 1)
                         .unwrap_or(start);
@@ -112,7 +113,11 @@ impl MemoryStore {
             .collect()
     }
 
-    pub fn merged_for_prompt(global: &MemoryStore, project: &MemoryStore, project_name: &str) -> String {
+    pub fn merged_for_prompt(
+        global: &MemoryStore,
+        project: &MemoryStore,
+        project_name: &str,
+    ) -> String {
         let global_entries = global.load();
         let project_entries = project.load();
 
@@ -120,7 +125,9 @@ impl MemoryStore {
             return String::new();
         }
 
-        let mut result = String::from("=== MEMORY ===\nThe user has asked you to remember these facts and preferences:\n");
+        let mut result = String::from(
+            "=== MEMORY ===\nThe user has asked you to remember these facts and preferences:\n",
+        );
 
         if !global_entries.is_empty() {
             result.push_str("\n[Global]\n");

@@ -603,11 +603,7 @@ impl Config {
                     anyhow::anyhow!("No providers configured — run /codingplan or /provider")
                 })
         };
-        let name: &str = if name.is_empty() {
-            fallback()?
-        } else {
-            name
-        };
+        let name: &str = if name.is_empty() { fallback()? } else { name };
         match self.providers.get(name) {
             Some(p) => Ok(p),
             None => {
@@ -677,7 +673,10 @@ mod tests {
             diagnostics_settle_delay_ms: 150,
         });
         migrate_legacy_lsp_default(&mut cfg);
-        assert!(!cfg.lsp.enabled, "auto-written shape must reset to disabled");
+        assert!(
+            !cfg.lsp.enabled,
+            "auto-written shape must reset to disabled"
+        );
         assert!(!cfg.lsp.auto_detect);
     }
 
@@ -724,7 +723,10 @@ mod tests {
             diagnostics_settle_delay_ms: 150,
         });
         migrate_legacy_lsp_default(&mut cfg3);
-        assert!(cfg3.lsp.enabled, "auto_detect=false means user picked manual; keep");
+        assert!(
+            cfg3.lsp.enabled,
+            "auto_detect=false means user picked manual; keep"
+        );
     }
 
     /// Already-disabled config: migration must be a no-op (don't flip
@@ -932,14 +934,13 @@ mod tests {
                 max_tokens: None,
                 thinking_type: None,
                 thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
-
-},
+            },
         );
         cfg.save(&tmp).unwrap();
         let text = std::fs::read_to_string(&tmp).unwrap();
@@ -1146,9 +1147,9 @@ mod tests {
                 max_tokens: None,
                 thinking_type: None,
                 thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
@@ -1212,9 +1213,9 @@ mod tests {
                 max_tokens: None,
                 thinking_type: None,
                 thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,
@@ -1284,9 +1285,9 @@ mod tests {
                 max_tokens: None,
                 thinking_type: None,
                 thinking_keep: None,
-            reasoning_history: None,
-            reasoning_effort: None,
-            thinking_enabled: None,
+                reasoning_history: None,
+                reasoning_effort: None,
+                thinking_enabled: None,
                 thinking_budget: None,
                 skip_tls_verify: false,
                 ephemeral: false,

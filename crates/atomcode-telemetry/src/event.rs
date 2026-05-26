@@ -516,7 +516,8 @@ mod tests {
                         "tool_name": "edit_file",
                         "reason": "User rejected file write",
                         "resolution": "Confirm the edit when prompted"
-                    }).to_string(),
+                    })
+                    .to_string(),
                 ),
             },
         };
@@ -560,8 +561,14 @@ mod tests {
         assert_eq!(v["error_kind"], "warning");
         let ed: serde_json::Value =
             serde_json::from_str(v["error_data"].as_str().unwrap()).unwrap();
-        assert_eq!(ed["reason"], "Command succeeded (exit 0) but produced stderr output");
-        assert_eq!(ed["resolution"], "Review stderr for potential issues; the command may not have had the intended effect");
+        assert_eq!(
+            ed["reason"],
+            "Command succeeded (exit 0) but produced stderr output"
+        );
+        assert_eq!(
+            ed["resolution"],
+            "Review stderr for potential issues; the command may not have had the intended effect"
+        );
     }
 
     #[test]
@@ -603,7 +610,8 @@ mod tests {
                         "transport": "sse",
                         "reason": "Connection timed out after 5s",
                         "resolution": "Check MCP server URL and network connectivity"
-                    }).to_string(),
+                    })
+                    .to_string(),
                 ),
             },
         };
@@ -616,7 +624,10 @@ mod tests {
         let ed: serde_json::Value =
             serde_json::from_str(v["error_data"].as_str().unwrap()).unwrap();
         assert_eq!(ed["reason"], "Connection timed out after 5s");
-        assert_eq!(ed["resolution"], "Check MCP server URL and network connectivity");
+        assert_eq!(
+            ed["resolution"],
+            "Check MCP server URL and network connectivity"
+        );
     }
 
     #[test]
@@ -656,7 +667,8 @@ mod tests {
                         "turns_completed": 5,
                         "last_tool_name": "bash",
                         "last_event": "llm_chat"
-                    }).to_string(),
+                    })
+                    .to_string(),
                 ),
             },
         };
@@ -745,10 +757,7 @@ mod tests {
 
     #[test]
     fn session_mode_ide_serializes_as_ide() {
-        assert_eq!(
-            serde_json::to_string(&SessionMode::Ide).unwrap(),
-            "\"ide\""
-        );
+        assert_eq!(serde_json::to_string(&SessionMode::Ide).unwrap(), "\"ide\"");
     }
 }
 

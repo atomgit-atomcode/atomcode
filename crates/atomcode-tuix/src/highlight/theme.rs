@@ -32,7 +32,10 @@ static MODE: AtomicU8 = AtomicU8::new(MODE_DARK);
 /// Switch the palette. Idempotent. Call once during startup before the
 /// first markdown / highlight emission.
 pub fn set_theme_mode(light: bool) {
-    MODE.store(if light { MODE_LIGHT } else { MODE_DARK }, Ordering::Relaxed);
+    MODE.store(
+        if light { MODE_LIGHT } else { MODE_DARK },
+        Ordering::Relaxed,
+    );
 }
 
 #[inline]
@@ -69,26 +72,42 @@ pub fn is_light_for_render() -> bool {
 /// (≥ 13:1 on white — earlier `#7B1FA2` at 8.7:1 read soft on Mac
 /// Terminal where colours render less crisp than iTerm2).
 pub fn keyword() -> &'static str {
-    if is_light() { "\x1b[38;2;74;0;114m" } else { "\x1b[38;2;198;120;221m" }
+    if is_light() {
+        "\x1b[38;2;74;0;114m"
+    } else {
+        "\x1b[38;2;198;120;221m"
+    }
 }
 
 /// `dark`: green `#98C379`. `light`: dark green `#006400` (≥ 13:1 —
 /// greens read soft at any given luminance, so light pushes past the
 /// other tokens' contrast budget to compensate).
 pub fn string() -> &'static str {
-    if is_light() { "\x1b[38;2;0;100;0m" } else { "\x1b[38;2;152;195;121m" }
+    if is_light() {
+        "\x1b[38;2;0;100;0m"
+    } else {
+        "\x1b[38;2;152;195;121m"
+    }
 }
 
 /// `dark`: amber `#D19A66`. `light`: dark chestnut `#663300` (≥ 11:1).
 pub fn number() -> &'static str {
-    if is_light() { "\x1b[38;2;102;51;0m" } else { "\x1b[38;2;209;154;102m" }
+    if is_light() {
+        "\x1b[38;2;102;51;0m"
+    } else {
+        "\x1b[38;2;209;154;102m"
+    }
 }
 
 /// `dark`: slate gray `#7C8499` + italic. `light`: slate `#4A5060` +
 /// italic — kept moderately desaturated because comments should read
 /// "secondary" relative to the code, not "main attraction."
 pub fn comment() -> &'static str {
-    if is_light() { "\x1b[3;38;2;74;80;96m" } else { "\x1b[3;38;2;124;132;153m" }
+    if is_light() {
+        "\x1b[3;38;2;74;80;96m"
+    } else {
+        "\x1b[3;38;2;124;132;153m"
+    }
 }
 
 /// `dark`: blue `#61AFEF`. `light`: very dark navy `#002171` (≥ 14:1 —
@@ -96,21 +115,33 @@ pub fn comment() -> &'static str {
 /// the original `fn main` screenshot regression lived, old `#61AFEF`
 /// at 2.04:1 made `main` invisible).
 pub fn function() -> &'static str {
-    if is_light() { "\x1b[38;2;0;33;113m" } else { "\x1b[38;2;97;175;239m" }
+    if is_light() {
+        "\x1b[38;2;0;33;113m"
+    } else {
+        "\x1b[38;2;97;175;239m"
+    }
 }
 
 /// `dark`: sand `#E5C07B`. `light`: dark walnut `#5B3A00` (≥ 11:1) —
 /// distinct hue from `number`'s chestnut so type names don't visually
 /// collide with literals on a line like `let x: U32 = 42`.
 pub fn type_color() -> &'static str {
-    if is_light() { "\x1b[38;2;91;58;0m" } else { "\x1b[38;2;229;192;123m" }
+    if is_light() {
+        "\x1b[38;2;91;58;0m"
+    } else {
+        "\x1b[38;2;229;192;123m"
+    }
 }
 
 /// Both palettes intentionally use terminal default fg.
-pub fn variable() -> &'static str { "" }
+pub fn variable() -> &'static str {
+    ""
+}
 
 /// Both palettes intentionally use terminal default fg.
-pub fn punctuation() -> &'static str { "" }
+pub fn punctuation() -> &'static str {
+    ""
+}
 
 /// Closes color + italic. Use after every wrapped token span.
 /// SGR 23 = italic off, SGR 39 = default foreground.
@@ -124,7 +155,11 @@ pub const RESET: &str = "\x1b[23;39m";
 /// on white in most light-theme terminal profiles; blue still maps to a
 /// dark, readable variant on light profiles.
 pub fn md_heading_open() -> &'static str {
-    if is_light() { "\x1b[1;34m" } else { "\x1b[1;96m" }
+    if is_light() {
+        "\x1b[1;34m"
+    } else {
+        "\x1b[1;96m"
+    }
 }
 
 /// Close heading: bold off + fg default (SGR 22;39). Theme-invariant.
@@ -135,7 +170,11 @@ pub const MD_HEADING_CLOSE: &str = "\x1b[22;39m";
 /// `light`: bold + standard magenta (SGR 1;35) — distinct from headings,
 /// terminal profiles map 35 to a dark magenta that's readable on white.
 pub fn md_inline_code_open() -> &'static str {
-    if is_light() { "\x1b[1;35m" } else { "\x1b[1;96m" }
+    if is_light() {
+        "\x1b[1;35m"
+    } else {
+        "\x1b[1;96m"
+    }
 }
 
 /// Close inline code: bold off + fg default. Theme-invariant.
@@ -220,10 +259,18 @@ mod tests {
 
     #[test]
     fn comment_includes_italic_attr_in_both_palettes() {
-        with_dark(|| assert!(comment().starts_with("\x1b[3;38;2;"),
-                             "dark comment must lead with SGR 3 + truecolor"));
-        with_light(|| assert!(comment().starts_with("\x1b[3;38;2;"),
-                              "light comment must lead with SGR 3 + truecolor"));
+        with_dark(|| {
+            assert!(
+                comment().starts_with("\x1b[3;38;2;"),
+                "dark comment must lead with SGR 3 + truecolor"
+            )
+        });
+        with_light(|| {
+            assert!(
+                comment().starts_with("\x1b[3;38;2;"),
+                "light comment must lead with SGR 3 + truecolor"
+            )
+        });
     }
 
     #[test]

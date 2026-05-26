@@ -11,8 +11,8 @@ pub fn validate_git_url(url: &str) -> Result<()> {
         return Ok(());
     }
 
-    let parsed = Url::parse(url)
-        .map_err(|_| anyhow!("unsupported or malformed git url: {}", url))?;
+    let parsed =
+        Url::parse(url).map_err(|_| anyhow!("unsupported or malformed git url: {}", url))?;
     match parsed.scheme() {
         "http" | "https" | "ssh" => {
             if parsed.host_str().is_none() {
@@ -68,8 +68,8 @@ fn last_path_segment(url: &str) -> Option<&str> {
 ///   git@github.com:o/bar         → bar
 pub fn infer_marketplace_name_from_url(url: &str) -> Result<String> {
     let trimmed = normalize_name_source(url);
-    let last = last_path_segment(trimmed)
-        .ok_or_else(|| anyhow!("cannot infer name from url: {}", url))?;
+    let last =
+        last_path_segment(trimmed).ok_or_else(|| anyhow!("cannot infer name from url: {}", url))?;
     Ok(last.to_string())
 }
 

@@ -31,8 +31,7 @@ use super::marketplace::{add_marketplace, list_marketplaces, update_marketplace}
 /// Public git URL for the default skills marketplace. The plugin
 /// installer dispatches on the SOURCE field (the URL we cloned from),
 /// so this string is the identity of the "default skills" entry.
-pub const DEFAULT_SKILLS_URL: &str =
-    "https://atomgit.com/atomgit_atomcode/atomcode-skills.git";
+pub const DEFAULT_SKILLS_URL: &str = "https://atomgit.com/atomgit_atomcode/atomcode-skills.git";
 
 /// Versioned bootstrap marker. Bump the `_v1` suffix when introducing
 /// a new bootstrap step (e.g. a second default marketplace, or a

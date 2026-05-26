@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use super::messages::Msg;
+use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {

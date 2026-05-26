@@ -16,7 +16,9 @@ use std::path::PathBuf;
 
 use super::{bg_runtime, save_and_reload, LoopCtx};
 use crate::i18n::{t, Msg};
-use crate::modals::{DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
+use crate::modals::{
+    DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker,
+};
 use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
@@ -56,8 +58,7 @@ fn build_oauth_provider() -> ProviderConfig {
         thinking_budget: None,
         skip_tls_verify: false,
         ephemeral: false,
-
-}
+    }
 }
 
 fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
@@ -90,8 +91,8 @@ fn bind_telemetry_to_session(ctx: &LoopCtx, session: &Session) {
 /// `ToolResult` entries.  Returns `(display_name, detail)` of the first
 /// unpaired tool call, or `None` if all tool calls have results.
 fn find_pending_approval(session: &Session) -> Option<(String, String)> {
-    use atomcode_core::conversation::message::{MessageContent, Role};
     use crate::event_loop::format_tool_detail;
+    use atomcode_core::conversation::message::{MessageContent, Role};
 
     // Collect all call_ids that already have a ToolResult.
     let mut answered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -103,10 +104,8 @@ fn find_pending_approval(session: &Session) -> Option<(String, String)> {
 
     // Walk messages in reverse to find the most recent unpaired tool call.
     for m in session.messages.iter().rev() {
-        if let (
-            Role::Assistant,
-            MessageContent::AssistantWithToolCalls { tool_calls, .. },
-        ) = (&m.role, &m.content)
+        if let (Role::Assistant, MessageContent::AssistantWithToolCalls { tool_calls, .. }) =
+            (&m.role, &m.content)
         {
             for tc in tool_calls.iter().rev() {
                 if !answered_ids.contains(&tc.id) {
@@ -175,7 +174,12 @@ pub fn validate_session_name(name: &str) -> Option<String> {
         return Some(t(Msg::SessionNameEmpty).into_owned());
     }
     if trimmed.chars().count() > MAX_SESSION_NAME_LEN {
-        return Some(t(Msg::SessionNameTooLong { max: MAX_SESSION_NAME_LEN }).into_owned());
+        return Some(
+            t(Msg::SessionNameTooLong {
+                max: MAX_SESSION_NAME_LEN,
+            })
+            .into_owned(),
+        );
     }
     if trimmed.chars().any(char::is_control) {
         return Some(t(Msg::SessionNameControlChars).into_owned());
@@ -193,9 +197,12 @@ pub fn perform_session_rename(
         return Err(err);
     }
     let new_name = new_name.trim().to_string();
-    let session = session_manager
-        .load(session_id)
-        .map_err(|e| t(Msg::SessionLoadFailed { error: &e.to_string() }).into_owned())?;
+    let session = session_manager.load(session_id).map_err(|e| {
+        t(Msg::SessionLoadFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
     let old_name = session.name.clone();
     let renamed_session = atomcode_core::session::Session {
         name: new_name.clone(),
@@ -206,9 +213,12 @@ pub fn perform_session_rename(
         user_renamed: true,
         ..session
     };
-    session_manager
-        .save(&renamed_session)
-        .map_err(|e| t(Msg::SessionSaveFailed { error: &e.to_string() }).into_owned())?;
+    session_manager.save(&renamed_session).map_err(|e| {
+        t(Msg::SessionSaveFailed {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })?;
     Ok((old_name, new_name))
 }
 
@@ -226,7 +236,9 @@ fn render_instruction_status_block(working_dir: &std::path::Path) -> String {
                 path: &p.display().to_string(),
                 label: level.label(),
             })),
-            None => out.push_str(&t(Msg::StatusInstructionMissing { label: level.label() })),
+            None => out.push_str(&t(Msg::StatusInstructionMissing {
+                label: level.label(),
+            })),
         }
     }
     out
@@ -263,7 +275,12 @@ pub(super) fn execute_slash_command(
     {
         use atomcode_telemetry::Event;
         let cmd_name = cmd.trim_start_matches('/').to_string();
-        ctx.telemetry.track(Event::UseCommand { type_: cmd_name, success: Some(true), error_kind: None, error_data: None });
+        ctx.telemetry.track(Event::UseCommand {
+            type_: cmd_name,
+            success: Some(true),
+            error_kind: None,
+            error_data: None,
+        });
     }
 
     match cmd {
@@ -301,9 +318,7 @@ pub(super) fn execute_slash_command(
             // i18n string owns column alignment so translators can adjust
             // per locale without touching this arm. /help complements
             // this with the slash-command list.
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::KeybindingsHelp).into_owned(),
-            ));
+            renderer.render(UiLine::CommandOutput(t(Msg::KeybindingsHelp).into_owned()));
             renderer.flush();
         }
         "plan" => {
@@ -329,7 +344,8 @@ pub(super) fn execute_slash_command(
             let mut txt = t(Msg::ConfigProviderLabel {
                 provider: &ctx.config.default_provider,
                 path: &config_path,
-            }).into_owned();
+            })
+            .into_owned();
             // Body: one minimal runnable example + pointer to the full
             // reference so users know where to get Claude / OpenAI /
             // Ollama variants without flooding the terminal here.
@@ -373,15 +389,12 @@ pub(super) fn execute_slash_command(
                     ctx.model_name = new_model.clone();
                     // Sync reasoning_effort from the new provider; clear
                     // for non-DeepSeek models so stale values don't persist.
-                    let applicable = new_cfg
-                        .providers
-                        .get(&new_default)
-                        .map_or(false, |p| {
-                            atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
-                                &p.model,
-                                p.base_url.as_deref().unwrap_or(""),
-                            )
-                        });
+                    let applicable = new_cfg.providers.get(&new_default).map_or(false, |p| {
+                        atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
+                            &p.model,
+                            p.base_url.as_deref().unwrap_or(""),
+                        )
+                    });
                     ctx.reasoning_effort = if applicable {
                         new_cfg
                             .providers
@@ -397,8 +410,10 @@ pub(super) fn execute_slash_command(
                         .ok();
                     renderer.render(UiLine::CommandOutput(
                         t(Msg::CmdReloadDone {
-                            provider: &new_default, model: &new_model,
-                        }).into_owned(),
+                            provider: &new_default,
+                            model: &new_model,
+                        })
+                        .into_owned(),
                     ));
                 }
                 Err(e) => {
@@ -459,16 +474,12 @@ pub(super) fn execute_slash_command(
                 model: ctx.model_name.clone(),
                 working_dir: dir_display,
             });
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::CmdNewSession).into_owned(),
-            ));
+            renderer.render(UiLine::CommandOutput(t(Msg::CmdNewSession).into_owned()));
             renderer.flush();
         }
         "model" => {
             if ctx.config.providers.is_empty() {
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::CmdNoProviders).into_owned(),
-                ));
+                renderer.render(UiLine::CommandOutput(t(Msg::CmdNoProviders).into_owned()));
                 renderer.flush();
             } else {
                 *active_modal = Some(Box::new(ModelPicker::open(&ctx.config)));
@@ -515,9 +526,7 @@ pub(super) fn execute_slash_command(
             Ok(all) => {
                 let sessions: Vec<_> = all.into_iter().filter(|s| s.message_count > 0).collect();
                 if sessions.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::CmdNoSessions).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::CmdNoSessions).into_owned()));
                     renderer.flush();
                 } else {
                     *active_modal = Some(Box::new(SessionPicker::open(sessions)));
@@ -525,7 +534,10 @@ pub(super) fn execute_slash_command(
             }
             Err(e) => {
                 renderer.render(UiLine::Error(
-                    t(Msg::SessionListFailed { error: &e.to_string() }).into_owned(),
+                    t(Msg::SessionListFailed {
+                        error: &e.to_string(),
+                    })
+                    .into_owned(),
                 ));
                 renderer.flush();
             }
@@ -546,8 +558,11 @@ pub(super) fn execute_slash_command(
                 match ctx.session_manager.save(&ctx.current_session) {
                     Ok(()) => {
                         renderer.render(UiLine::CommandOutput(
-                            t(Msg::SessionRenamed { old: &old_name, new: &new_name })
-                                .into_owned(),
+                            t(Msg::SessionRenamed {
+                                old: &old_name,
+                                new: &new_name,
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                     }
@@ -556,8 +571,10 @@ pub(super) fn execute_slash_command(
                         // still reports the original name.
                         ctx.current_session.name = old_name;
                         renderer.render(UiLine::Error(
-                            t(Msg::SessionSaveFailed { error: &e.to_string() })
-                                .into_owned(),
+                            t(Msg::SessionSaveFailed {
+                                error: &e.to_string(),
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                     }
@@ -577,7 +594,8 @@ pub(super) fn execute_slash_command(
                 dir: &ctx.working_dir.display().to_string(),
                 config: &Config::default_path().display().to_string(),
                 tokens: state.total_tokens,
-            }).into_owned();
+            })
+            .into_owned();
             txt.push_str(&render_codingplan_status_for_status_cmd());
 
             txt.push('\n');
@@ -601,7 +619,12 @@ pub(super) fn execute_slash_command(
                     }));
                 }
                 Err(e) => {
-                    renderer.render(UiLine::Error(t(Msg::DiffFailed { error: &format!("{}", e) }).into_owned()));
+                    renderer.render(UiLine::Error(
+                        t(Msg::DiffFailed {
+                            error: &format!("{}", e),
+                        })
+                        .into_owned(),
+                    ));
                 }
             }
             renderer.flush();
@@ -634,7 +657,8 @@ pub(super) fn execute_slash_command(
                     cache_rate,
                     total,
                     cost: &cost_str,
-                }).into_owned(),
+                })
+                .into_owned(),
             ));
             renderer.flush();
         }
@@ -731,9 +755,7 @@ pub(super) fn execute_slash_command(
                         .agent
                         .cmd_tx
                         .send(AgentCommand::ReloadConfig(ctx.config.clone()));
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::CmdLogoutDone).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::CmdLogoutDone).into_owned()));
                 }
                 Err(e) => {
                     let msg = format!("{}", e);
@@ -891,7 +913,10 @@ pub(super) fn execute_slash_command(
                     sync_bg_foreground(ctx);
                     if !ctx.bg_manager.has_capacity() {
                         renderer.render(UiLine::Error(
-                            t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                            t(Msg::BgSlotLimitReached {
+                                max: bg_runtime::MAX_BACKGROUND_SLOTS,
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
@@ -931,7 +956,8 @@ pub(super) fn execute_slash_command(
                             slot,
                             old_id: &old_short_id,
                             state: &old_state.localised(),
-                        }).into_owned(),
+                        })
+                        .into_owned(),
                     ));
                 }
                 bg_runtime::BgCommand::Resume(slot) => {
@@ -943,7 +969,11 @@ pub(super) fn execute_slash_command(
                         Ok(outcome) => outcome,
                         Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
                             renderer.render(UiLine::Error(
-                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                                t(Msg::BgInvalidSlot {
+                                    slot,
+                                    available: len,
+                                })
+                                .into_owned(),
                             ));
                             renderer.flush();
                             return Ok(());
@@ -957,9 +987,7 @@ pub(super) fn execute_slash_command(
                         }
                     };
                     let Some(client) = outcome.resumed_client else {
-                        renderer.render(UiLine::Error(
-                            t(Msg::BgNoRuntimeClient).into_owned(),
-                        ));
+                        renderer.render(UiLine::Error(t(Msg::BgNoRuntimeClient).into_owned()));
                         renderer.flush();
                         return Ok(());
                     };
@@ -982,14 +1010,26 @@ pub(super) fn execute_slash_command(
                     // lack corresponding ToolResult entries.
                     let pending_approval = find_pending_approval(&ctx.current_session);
                     if let Some((tool_name, detail)) = pending_approval {
-                        renderer.render(UiLine::ApprovalPrompt { tool: tool_name, detail });
+                        renderer.render(UiLine::ApprovalPrompt {
+                            tool: tool_name,
+                            detail,
+                        });
                         state.on_approval_needed("");
                     }
 
                     let short_id = ctx.current_session.short_id().to_string();
-                    let mut msg = t(Msg::BgResumed { slot, short_id: &short_id }).into_owned();
+                    let mut msg = t(Msg::BgResumed {
+                        slot,
+                        short_id: &short_id,
+                    })
+                    .into_owned();
                     if let Some(previous_slot) = outcome.previous_foreground_slot {
-                        msg.push_str(&t(Msg::BgPreviousForegroundMoved { slot: previous_slot }).into_owned());
+                        msg.push_str(
+                            &t(Msg::BgPreviousForegroundMoved {
+                                slot: previous_slot,
+                            })
+                            .into_owned(),
+                        );
                     }
                     renderer.render(UiLine::CommandOutput(msg));
                 }
@@ -998,7 +1038,11 @@ pub(super) fn execute_slash_command(
                         Ok(dropped) => dropped,
                         Err(bg_runtime::BgError::InvalidSlot { slot, len }) => {
                             renderer.render(UiLine::Error(
-                                t(Msg::BgInvalidSlot { slot, available: len }).into_owned(),
+                                t(Msg::BgInvalidSlot {
+                                    slot,
+                                    available: len,
+                                })
+                                .into_owned(),
                             ));
                             renderer.flush();
                             return Ok(());
@@ -1015,7 +1059,11 @@ pub(super) fn execute_slash_command(
                     }
                     let short_id = dropped.session.short_id().to_string();
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::BgDropped { slot, short_id: &short_id }).into_owned(),
+                        t(Msg::BgDropped {
+                            slot,
+                            short_id: &short_id,
+                        })
+                        .into_owned(),
                     ));
                 }
             }
@@ -1026,15 +1074,16 @@ pub(super) fn execute_slash_command(
             // real background runtime, keep the current foreground active.
             let task = arg.trim();
             if task.is_empty() {
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::BackgroundUsage).into_owned(),
-                ));
+                renderer.render(UiLine::CommandOutput(t(Msg::BackgroundUsage).into_owned()));
                 renderer.flush();
                 return Ok(());
             }
             if !ctx.bg_manager.has_capacity() {
                 renderer.render(UiLine::Error(
-                    t(Msg::BgSlotLimitReached { max: bg_runtime::MAX_BACKGROUND_SLOTS }).into_owned(),
+                    t(Msg::BgSlotLimitReached {
+                        max: bg_runtime::MAX_BACKGROUND_SLOTS,
+                    })
+                    .into_owned(),
                 ));
                 renderer.flush();
                 return Ok(());
@@ -1061,10 +1110,18 @@ pub(super) fn execute_slash_command(
             };
             client
                 .cmd_tx
-                .send(AgentCommand::SendMessage { text: task.to_string(), images: Vec::new(), image_markers: Vec::new() })
+                .send(AgentCommand::SendMessage {
+                    text: task.to_string(),
+                    images: Vec::new(),
+                    image_markers: Vec::new(),
+                })
                 .ok();
             renderer.render(UiLine::CommandOutput(
-                t(Msg::BgTaskStarted { slot, short_id: &short_id }).into_owned(),
+                t(Msg::BgTaskStarted {
+                    slot,
+                    short_id: &short_id,
+                })
+                .into_owned(),
             ));
             renderer.flush();
         }
@@ -1088,7 +1145,11 @@ pub(super) fn execute_slash_command(
                 Ok(()) => {
                     let path_str = target.display().to_string();
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::InitWrote { path: &path_str, bytes: content.len() }).into_owned(),
+                        t(Msg::InitWrote {
+                            path: &path_str,
+                            bytes: content.len(),
+                        })
+                        .into_owned(),
                     ));
                     // Confirm the file is reachable for the prompt-builder by
                     // re-running the same load that `/status` uses. If the
@@ -1096,13 +1157,16 @@ pub(super) fn execute_slash_command(
                     // the user knows immediately — instead of asking the AI
                     // a question and trying to infer load state from its
                     // answer.
-                    renderer.render(UiLine::CommandOutput(
-                        render_instruction_status_block(&ctx.working_dir),
-                    ));
+                    renderer.render(UiLine::CommandOutput(render_instruction_status_block(
+                        &ctx.working_dir,
+                    )));
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::InitFailed { error: &format!("{}", e) }).into_owned(),
+                        t(Msg::InitFailed {
+                            error: &format!("{}", e),
+                        })
+                        .into_owned(),
                     ));
                 }
             }
@@ -1123,7 +1187,10 @@ pub(super) fn execute_slash_command(
                     Ok(configs) => configs,
                     Err(e) => {
                         renderer.render(UiLine::Error(
-                            t(Msg::McpOAuthLoadConfigFailed { error: &format!("{:#}", e) }).into_owned(),
+                            t(Msg::McpOAuthLoadConfigFailed {
+                                error: &format!("{:#}", e),
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
@@ -1163,10 +1230,17 @@ pub(super) fn execute_slash_command(
                 });
                 match result {
                     Ok(token) => renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpOAuthSaved { provider: &token.provider, server }).into_owned(),
+                        t(Msg::McpOAuthSaved {
+                            provider: &token.provider,
+                            server,
+                        })
+                        .into_owned(),
                     )),
                     Err(e) => renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::McpOAuthFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     )),
                 }
                 renderer.flush();
@@ -1190,7 +1264,10 @@ pub(super) fn execute_slash_command(
                         t(Msg::McpOAuthNoToken { server }).into_owned(),
                     )),
                     Err(e) => renderer.render(UiLine::Error(
-                        t(Msg::McpOAuthLogoutFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::McpOAuthLogoutFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     )),
                 }
                 renderer.flush();
@@ -1204,14 +1281,20 @@ pub(super) fn execute_slash_command(
                     Ok(c) => c,
                     Err(e) => {
                         renderer.render(UiLine::Error(
-                            t(Msg::McpReloadFailed { error: &format!("{:#}", e) }).into_owned(),
+                            t(Msg::McpReloadFailed {
+                                error: &format!("{:#}", e),
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
                     }
                 };
 
-                let mut header = t(Msg::McpReloading { count: configs.len() }).into_owned();
+                let mut header = t(Msg::McpReloading {
+                    count: configs.len(),
+                })
+                .into_owned();
 
                 if !configs.is_empty() {
                     header.push_str(&t(Msg::McpConnecting));
@@ -1278,9 +1361,7 @@ pub(super) fn execute_slash_command(
             if let Some(rest) = sub.strip_prefix("tools") {
                 let server = rest.trim();
                 if server.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpToolsUsage).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::McpToolsUsage).into_owned()));
                     renderer.flush();
                     return Ok(());
                 }
@@ -1327,12 +1408,13 @@ pub(super) fn execute_slash_command(
                         }
                     });
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpToolsListing { server: &server_for_msg }).into_owned(),
+                        t(Msg::McpToolsListing {
+                            server: &server_for_msg,
+                        })
+                        .into_owned(),
                     ));
                 } else {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::McpNoRegistry).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::McpNoRegistry).into_owned()));
                 }
                 renderer.flush();
                 return Ok(());
@@ -1385,9 +1467,7 @@ pub(super) fn execute_slash_command(
             let provider = ctx.config.providers.get_mut(&provider_name);
             match provider {
                 None => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::CmdNoActiveProvider).into_owned(),
-                    ));
+                    renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
                     renderer.flush();
                 }
                 Some(p) => {
@@ -1397,7 +1477,12 @@ pub(super) fn execute_slash_command(
                         let budget = p.thinking_budget.unwrap_or(10_000);
                         let status = if enabled { "enabled" } else { "disabled" };
                         renderer.render(UiLine::CommandOutput(
-                            t(Msg::ThinkStatus { status, budget, provider: &provider_name }).into_owned(),
+                            t(Msg::ThinkStatus {
+                                status,
+                                budget,
+                                provider: &provider_name,
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
                     } else if sub == "on" {
@@ -1411,9 +1496,7 @@ pub(super) fn execute_slash_command(
                     } else if sub == "off" {
                         p.thinking_enabled = Some(false);
                         save_and_reload(ctx, renderer);
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::ThinkDisabled).into_owned(),
-                        ));
+                        renderer.render(UiLine::CommandOutput(t(Msg::ThinkDisabled).into_owned()));
                         renderer.flush();
                     } else if let Some(rest) = sub.strip_prefix("budget") {
                         let num_str = rest.trim();
@@ -1433,17 +1516,14 @@ pub(super) fn execute_slash_command(
                                 renderer.flush();
                             }
                             Err(_) => {
-                                renderer.render(UiLine::Error(
-                                    t(Msg::ThinkBudgetUsage).into_owned(),
-                                ));
+                                renderer
+                                    .render(UiLine::Error(t(Msg::ThinkBudgetUsage).into_owned()));
 
                                 renderer.flush();
                             }
                         }
                     } else {
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::ThinkUsage).into_owned(),
-                        ));
+                        renderer.render(UiLine::CommandOutput(t(Msg::ThinkUsage).into_owned()));
                         renderer.flush();
                     }
                 }
@@ -1454,9 +1534,7 @@ pub(super) fn execute_slash_command(
             let provider = ctx.config.providers.get_mut(&provider_name);
             match provider {
                 None => {
-                    renderer.render(UiLine::Error(
-                        t(Msg::CmdNoActiveProvider).into_owned(),
-                    ));
+                    renderer.render(UiLine::Error(t(Msg::CmdNoActiveProvider).into_owned()));
                     renderer.flush();
                 }
                 Some(p) => {
@@ -1485,7 +1563,8 @@ pub(super) fn execute_slash_command(
                             if let Ok(mut g) = ctx.transient_hint.lock() {
                                 *g = Some(crate::event_loop::TransientHint {
                                     text: t(Msg::ReasoningEffortNoEffect).into_owned(),
-                                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                                    deadline: std::time::Instant::now()
+                                        + std::time::Duration::from_secs(5),
                                 });
                             }
                             return Ok(());
@@ -1541,9 +1620,7 @@ pub(super) fn execute_slash_command(
                     })
                     .unwrap_or_default();
                 if lines.is_empty() {
-                    renderer.render(UiLine::CommandOutput(
-                        t(Msg::SkillsNone).into_owned(),
-                    ));
+                    renderer.render(UiLine::CommandOutput(t(Msg::SkillsNone).into_owned()));
                 } else {
                     renderer.render(UiLine::CommandOutput(format!(
                         "{}{}\n",
@@ -1565,7 +1642,11 @@ pub(super) fn execute_slash_command(
                 if let Some(rendered) = expand_skill(ctx, skill_name, skill_args) {
                     ctx.agent
                         .cmd_tx
-                        .send(AgentCommand::SendMessage { text: rendered, images: vec![], image_markers: vec![] })
+                        .send(AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
                         .ok();
                     state.on_submit();
                 } else {
@@ -1603,16 +1684,12 @@ pub(super) fn execute_slash_command(
                         .ok();
                     state.on_submit();
                 } else {
-                    renderer.render(UiLine::Error(
-                        t(Msg::CmdSetupSkillMissing).into_owned(),
-                    ));
+                    renderer.render(UiLine::Error(t(Msg::CmdSetupSkillMissing).into_owned()));
                     renderer.flush();
                 }
             } else {
                 // First run: install seeds, reload, then invoke.
-                renderer.render(UiLine::CommandOutput(
-                    t(Msg::CmdSetupRunning).into_owned(),
-                ));
+                renderer.render(UiLine::CommandOutput(t(Msg::CmdSetupRunning).into_owned()));
                 renderer.flush();
 
                 let project_root = ctx.working_dir.clone();
@@ -1621,9 +1698,7 @@ pub(super) fn execute_slash_command(
                 // `setup::run` is synchronous (file I/O only). Run it on the
                 // current thread via `block_in_place` to avoid blocking the
                 // tokio runtime — no `block_on` needed since it's not async.
-                let result = tokio::task::block_in_place(|| {
-                    atomcode_core::setup::run(opts)
-                });
+                let result = tokio::task::block_in_place(|| atomcode_core::setup::run(opts));
 
                 match result {
                     Ok(report) => {
@@ -1636,7 +1711,10 @@ pub(super) fn execute_slash_command(
                         // to restart AtomCode to see them in /skills.
                         let (skills_loaded, _) = super::reload_plugins(ctx);
                         renderer.render(UiLine::CommandOutput(
-                            t(Msg::CmdSetupSkillsReloaded { count: skills_loaded }).into_owned(),
+                            t(Msg::CmdSetupSkillsReloaded {
+                                count: skills_loaded,
+                            })
+                            .into_owned(),
                         ));
                         renderer.flush();
 
@@ -1659,15 +1737,17 @@ pub(super) fn execute_slash_command(
                                 .ok();
                             state.on_submit();
                         } else {
-                            renderer.render(UiLine::Error(
-                                t(Msg::CmdSetupSkillMissing).into_owned(),
-                            ));
+                            renderer
+                                .render(UiLine::Error(t(Msg::CmdSetupSkillMissing).into_owned()));
                             renderer.flush();
                         }
                     }
                     Err(e) => {
                         renderer.render(UiLine::Error(
-                            t(Msg::CmdSetupError { error: &e.to_string() }).into_owned(),
+                            t(Msg::CmdSetupError {
+                                error: &e.to_string(),
+                            })
+                            .into_owned(),
                         ));
                     }
                 }
@@ -1682,36 +1762,73 @@ pub(super) fn execute_slash_command(
             if let Some(rendered) = ctx.custom_commands.render(other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage { text: rendered, images: vec![], image_markers: vec![] })
+                    .send(AgentCommand::SendMessage {
+                        text: rendered,
+                        images: vec![],
+                        image_markers: vec![],
+                    })
                     .ok();
                 state.on_submit();
             } else if let Some(rendered) = expand_skill(ctx, other, arg) {
                 ctx.agent
                     .cmd_tx
-                    .send(AgentCommand::SendMessage { text: rendered, images: vec![], image_markers: vec![] })
+                    .send(AgentCommand::SendMessage {
+                        text: rendered,
+                        images: vec![],
+                        image_markers: vec![],
+                    })
                     .ok();
                 state.on_submit();
             } else {
                 // Unknown command — emit failure telemetry
                 let available_commands: Vec<&str> = vec![
-                    "help", "quit", "exit", "clear", "compact", "reload", "config",
-                    "plan", "build", "session", "model", "language", "resume",
-                    "rename", "provider", "status", "diff", "undo", "cost",
-                    "context", "remember", "forget", "memory", "login", "logout",
-                    "whoami", "upgrade", "issue", "cd", "bg", "codingplan",
+                    "help",
+                    "quit",
+                    "exit",
+                    "clear",
+                    "compact",
+                    "reload",
+                    "config",
+                    "plan",
+                    "build",
+                    "session",
+                    "model",
+                    "language",
+                    "resume",
+                    "rename",
+                    "provider",
+                    "status",
+                    "diff",
+                    "undo",
+                    "cost",
+                    "context",
+                    "remember",
+                    "forget",
+                    "memory",
+                    "login",
+                    "logout",
+                    "whoami",
+                    "upgrade",
+                    "issue",
+                    "cd",
+                    "bg",
+                    "codingplan",
                 ];
                 ctx.telemetry.track(atomcode_telemetry::Event::UseCommand {
                     type_: other.to_string(),
                     success: Some(false),
                     error_kind: Some(atomcode_telemetry::UseCommandErrorKind::NotFound),
-                    error_data: Some(serde_json::json!({
-                        "command": other,
-                        "duration_ms": 0,
-                        "message": format!("Unknown command: {}", other),
-                        "reason": "用户输入了不存在的斜杠命令",
-                        "resolution": "使用 /help 查看所有可用命令",
-                        "available_commands": available_commands,
-                    }).to_string()),
+                    error_data: Some(
+                        serde_json::json!({
+                            "command": other,
+                            "duration_ms": 0,
+                            "message": format!("Unknown command: {}", other),
+                            "reason": "用户输入了不存在的斜杠命令",
+                            "resolution": "使用 /help 查看所有可用命令",
+                            "available_commands": available_commands,
+                        })
+                        .to_string(),
+                    ),
                 });
                 renderer.render(UiLine::Error(
                     t(Msg::CmdUnknownCommand { name: other }).into_owned(),
@@ -1764,10 +1881,15 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                     // consumed by handle_plugin_job_event and rendered there.
                     let url = arg.to_string();
                     let tx = ctx.plugin_job_tx.clone();
-                    ok(renderer, t(Msg::PluginMarketplaceCloning { url: &url }).into_owned());
+                    ok(
+                        renderer,
+                        t(Msg::PluginMarketplaceCloning { url: &url }).into_owned(),
+                    );
                     tokio::task::spawn_blocking(move || {
                         let ev = match atomcode_core::plugin::marketplace::add_marketplace(&url) {
-                            Ok(info) => atomcode_core::plugin::PluginJobEvent::MarketplaceAdded(info),
+                            Ok(info) => {
+                                atomcode_core::plugin::PluginJobEvent::MarketplaceAdded(info)
+                            }
                             Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
                                 op: "add marketplace".into(),
                                 msg: format!("{:#}", e),
@@ -1779,17 +1901,32 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 "remove" => match atomcode_core::plugin::marketplace::remove_marketplace(arg) {
                     Ok(()) => {
                         super::reload_plugins(ctx);
-                        ok(renderer, t(Msg::PluginMarketplaceRemoved { name: arg }).into_owned());
+                        ok(
+                            renderer,
+                            t(Msg::PluginMarketplaceRemoved { name: arg }).into_owned(),
+                        );
                     }
-                    Err(e) => err(renderer, t(Msg::PluginMarketplaceRemoveFailed { error: &e.to_string() }).into_owned()),
+                    Err(e) => err(
+                        renderer,
+                        t(Msg::PluginMarketplaceRemoveFailed {
+                            error: &e.to_string(),
+                        })
+                        .into_owned(),
+                    ),
                 },
                 "update" => {
                     let name = arg.to_string();
                     let tx = ctx.plugin_job_tx.clone();
-                    ok(renderer, t(Msg::PluginMarketplaceUpdating { name: &name }).into_owned());
+                    ok(
+                        renderer,
+                        t(Msg::PluginMarketplaceUpdating { name: &name }).into_owned(),
+                    );
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name) {
-                            Ok(info) => atomcode_core::plugin::PluginJobEvent::MarketplaceUpdated(info),
+                        let ev = match atomcode_core::plugin::marketplace::update_marketplace(&name)
+                        {
+                            Ok(info) => {
+                                atomcode_core::plugin::PluginJobEvent::MarketplaceUpdated(info)
+                            }
                             Err(e) => atomcode_core::plugin::PluginJobEvent::Failed {
                                 op: "update marketplace".into(),
                                 msg: format!("{:#}", e),
@@ -1813,18 +1950,19 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                                 m.plugins.len()
                             ));
                         }
-                        renderer.render(UiLine::CommandOutput(format!(
-                            "  {}\n",
-                            lines.join("\n  ")
-                        )));
+                        renderer
+                            .render(UiLine::CommandOutput(format!("  {}\n", lines.join("\n  "))));
                         renderer.flush();
                     }
-                    Err(e) => err(renderer, t(Msg::PluginMarketplaceListFailed { error: &e.to_string() }).into_owned()),
+                    Err(e) => err(
+                        renderer,
+                        t(Msg::PluginMarketplaceListFailed {
+                            error: &e.to_string(),
+                        })
+                        .into_owned(),
+                    ),
                 },
-                _ => err(
-                    renderer,
-                    t(Msg::PluginMarketplaceUsage).into_owned(),
-                ),
+                _ => err(renderer, t(Msg::PluginMarketplaceUsage).into_owned()),
             }
         }
         "install" => match parse_plugin_at_marketplace(parts.next().unwrap_or("").trim()) {
@@ -1834,7 +1972,14 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
                 // (state-file edit only) but still go through the same
                 // codepath for consistency.
                 let tx = ctx.plugin_job_tx.clone();
-                ok(renderer, t(Msg::PluginInstalling { plugin: &plugin, marketplace: &mp }).into_owned());
+                ok(
+                    renderer,
+                    t(Msg::PluginInstalling {
+                        plugin: &plugin,
+                        marketplace: &mp,
+                    })
+                    .into_owned(),
+                );
                 tokio::task::spawn_blocking(move || {
                     let ev = match atomcode_core::plugin::installer::install(&plugin, &mp) {
                         Ok(info) => atomcode_core::plugin::PluginJobEvent::PluginInstalled(info),
@@ -1852,14 +1997,24 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             Some((plugin, mp)) => match atomcode_core::plugin::installer::uninstall(&plugin, &mp) {
                 Ok(()) => {
                     super::reload_plugins(ctx);
-                    ok(renderer, t(Msg::PluginUninstalled { plugin: &plugin, marketplace: &mp }).into_owned());
+                    ok(
+                        renderer,
+                        t(Msg::PluginUninstalled {
+                            plugin: &plugin,
+                            marketplace: &mp,
+                        })
+                        .into_owned(),
+                    );
                 }
-                Err(e) => err(renderer, t(Msg::PluginUninstallFailed { error: &e.to_string() }).into_owned()),
+                Err(e) => err(
+                    renderer,
+                    t(Msg::PluginUninstallFailed {
+                        error: &e.to_string(),
+                    })
+                    .into_owned(),
+                ),
             },
-            None => err(
-                renderer,
-                t(Msg::PluginUninstallUsage).into_owned(),
-            ),
+            None => err(renderer, t(Msg::PluginUninstallUsage).into_owned()),
         },
         "list" => match atomcode_core::plugin::installer::list_installed() {
             Ok(items) if items.is_empty() => {
@@ -1868,20 +2023,23 @@ fn handle_plugin(arg: &str, ctx: &mut super::LoopCtx, renderer: &mut dyn Rendere
             Ok(items) => {
                 let mut lines = vec![t(Msg::PluginInstalledHeader).into_owned()];
                 for p in items {
-                    lines.push(format!("  {}@{}  {}", p.plugin, p.marketplace, p.plugin_dir));
+                    lines.push(format!(
+                        "  {}@{}  {}",
+                        p.plugin, p.marketplace, p.plugin_dir
+                    ));
                 }
-                renderer.render(UiLine::CommandOutput(format!(
-                    "  {}\n",
-                    lines.join("\n  ")
-                )));
+                renderer.render(UiLine::CommandOutput(format!("  {}\n", lines.join("\n  "))));
                 renderer.flush();
             }
-            Err(e) => err(renderer, t(Msg::PluginListFailed { error: &e.to_string() }).into_owned()),
+            Err(e) => err(
+                renderer,
+                t(Msg::PluginListFailed {
+                    error: &e.to_string(),
+                })
+                .into_owned(),
+            ),
         },
-        _ => err(
-            renderer,
-            t(Msg::PluginUsage).into_owned(),
-        ),
+        _ => err(renderer, t(Msg::PluginUsage).into_owned()),
     }
 }
 
@@ -1921,7 +2079,10 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 Ok(mgr) => mgr,
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeCreateFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeCreateFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -1934,12 +2095,20 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                     apply_cd(ctx, wt.path.clone());
                     let path_str = wt.path.display().to_string();
                     renderer.render(UiLine::CommandOutput(
-                        t(Msg::WorktreeCreated { branch: &wt.branch, base: &wt.base_branch, path: &path_str }).into_owned(),
+                        t(Msg::WorktreeCreated {
+                            branch: &wt.branch,
+                            base: &wt.base_branch,
+                            path: &path_str,
+                        })
+                        .into_owned(),
                     ));
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeCreateFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeCreateFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                 }
             }
@@ -1950,7 +2119,10 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 Ok(mgr) => mgr,
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeListFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeListFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -1959,10 +2131,8 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             match mgr.list() {
                 Ok(worktrees) => {
                     if worktrees.is_empty() {
-                        renderer.render(UiLine::CommandOutput(
-                            t(Msg::WorktreeNoActive).into_owned(),
-                        ));
-
+                        renderer
+                            .render(UiLine::CommandOutput(t(Msg::WorktreeNoActive).into_owned()));
                     } else {
                         let mut txt = t(Msg::WorktreeActiveHeader).into_owned();
                         for (branch, path, has_changes) in &worktrees {
@@ -1993,7 +2163,10 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 }
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeListFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeListFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                 }
             }
@@ -2043,7 +2216,10 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
                 Ok(mgr) => mgr,
                 Err(e) => {
                     renderer.render(UiLine::Error(
-                        t(Msg::WorktreeCleanupFailed { error: &format!("{:#}", e) }).into_owned(),
+                        t(Msg::WorktreeCleanupFailed {
+                            error: &format!("{:#}", e),
+                        })
+                        .into_owned(),
                     ));
                     renderer.flush();
                     return Ok(());
@@ -2096,9 +2272,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
             renderer.flush();
         }
         _ => {
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::WorktreeUsage).into_owned(),
-            ));
+            renderer.render(UiLine::CommandOutput(t(Msg::WorktreeUsage).into_owned()));
             renderer.flush();
         }
     }
@@ -2161,7 +2335,10 @@ fn render_codingplan_status_for_status_cmd() -> String {
     let status = match client.status_v2() {
         Ok(s) => s,
         Err(e) => {
-            return t(Msg::StatusCpFetchFailed { error: &format!("{:#}", e) }).into_owned();
+            return t(Msg::StatusCpFetchFailed {
+                error: &format!("{:#}", e),
+            })
+            .into_owned();
         }
     };
     let plan = match &status.codingplan_free {
@@ -2176,7 +2353,8 @@ fn render_codingplan_status_for_status_cmd() -> String {
         expires_at: &plan.expires_at,
         remaining_days: plan.remaining_days,
         total_days: plan.total_days,
-    }).into_owned();
+    })
+    .into_owned();
     if let Some(u) = &status.current_usage {
         out.push_str(&t(Msg::StatusCpUsage {
             usage: &u.display_desc(),
@@ -2331,7 +2509,9 @@ fn format_context_report(
         msgs_p = pct(messages),
         free_s = k(free),
         free_p = pct(free),
-        msg_count = t(Msg::CtxMessagesInWindow { n: snap.total_messages }),
+        msg_count = t(Msg::CtxMessagesInWindow {
+            n: snap.total_messages
+        }),
     );
 
     // `/context prompt` — append the full system-prompt bytes the last
@@ -2400,7 +2580,11 @@ pub(crate) fn launch_fixissue(
             fixissue_buffer.clear();
             ctx.agent
                 .cmd_tx
-                .send(AgentCommand::SendMessage { text: prompt, images: vec![], image_markers: vec![] })
+                .send(AgentCommand::SendMessage {
+                    text: prompt,
+                    images: vec![],
+                    image_markers: vec![],
+                })
                 .ok();
             state.on_submit();
         }
@@ -2503,7 +2687,10 @@ fn resolve_cd(
         .canonicalize()
         .map_err(|e| format!("{}: {}", target.display(), e))?;
     if !canon.is_dir() {
-        return Err(t(Msg::DirNotADirectory { path: &canon.display().to_string() }).into_owned());
+        return Err(t(Msg::DirNotADirectory {
+            path: &canon.display().to_string(),
+        })
+        .into_owned());
     }
     Ok(canon)
 }
@@ -2739,10 +2926,7 @@ mod compose_login_chrome_tests {
         let _g = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::i18n::Locale::En);
         let s = compose_login_chrome_inner(URL, false, true);
-        assert!(
-            !s.contains(URL),
-            "URL must not appear when omit_url:\n{s}"
-        );
+        assert!(!s.contains(URL), "URL must not appear when omit_url:\n{s}");
         assert!(
             s.contains("Unicode-capable terminal"),
             "must guide the user to a unicode terminal:\n{s}"
@@ -2889,13 +3073,17 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
                 t(Msg::LoginSignedInWithCpHint {
                     name: &name,
                     username: &auth.user.username,
-                }).into_owned(),
+                })
+                .into_owned(),
             ));
             renderer.flush();
         }
         Err(e) => {
             renderer.render(UiLine::Error(
-                t(Msg::CmdLoginFailed { error: &e.to_string() }).into_owned(),
+                t(Msg::CmdLoginFailed {
+                    error: &e.to_string(),
+                })
+                .into_owned(),
             ));
             renderer.flush();
         }
@@ -2922,7 +3110,10 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
             // skip the rest of setup since claim/models/status all
             // need a token.
             renderer.render(UiLine::Error(
-                t(Msg::CodingPlanSetupFailed { error: &e.to_string() }).into_owned(),
+                t(Msg::CodingPlanSetupFailed {
+                    error: &e.to_string(),
+                })
+                .into_owned(),
             ));
             renderer.flush();
             return Ok(());
@@ -2943,9 +3134,7 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
     // manually what `/codingplan` could do itself.
     let mut report = atomcode_core::coding_plan::run(&mut ctx.config, Some(&ctx.telemetry));
     if matches!(&report, Ok(r) if r.auth_expired) {
-        renderer.render(UiLine::CommandOutput(
-            t(Msg::CpReauthAfter401).into_owned(),
-        ));
+        renderer.render(UiLine::CommandOutput(t(Msg::CpReauthAfter401).into_owned()));
         renderer.flush();
         match run_oauth_with_renderer(renderer, ctx)
             .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|_| auth))
@@ -2962,7 +3151,10 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
                     renderer.render(UiLine::CommandOutput(r.render()));
                 }
                 renderer.render(UiLine::Error(
-                    t(Msg::CodingPlanSetupFailed { error: &e.to_string() }).into_owned(),
+                    t(Msg::CodingPlanSetupFailed {
+                        error: &e.to_string(),
+                    })
+                    .into_owned(),
                 ));
                 renderer.flush();
                 return Ok(());
@@ -3016,7 +3208,10 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
         }
         Err(e) => {
             renderer.render(UiLine::Error(
-                t(Msg::CodingPlanSetupFailed { error: &format!("{:#}", e) }).into_owned(),
+                t(Msg::CodingPlanSetupFailed {
+                    error: &format!("{:#}", e),
+                })
+                .into_owned(),
             ));
             renderer.flush();
         }

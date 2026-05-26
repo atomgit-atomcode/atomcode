@@ -517,7 +517,10 @@ impl UiState {
     }
 
     fn refresh_sub_agent_label(&mut self) {
-        self.spinner_label = format!("Sub-agents {}/{}", self.sub_agent_done, self.sub_agent_total);
+        self.spinner_label = format!(
+            "Sub-agents {}/{}",
+            self.sub_agent_done, self.sub_agent_total
+        );
     }
 
     /// End the dispatch — clears descriptors so subsequent thinks/tools
@@ -695,10 +698,11 @@ mod tests {
         // Turn 1: simulate paste sites' increment-then-push pattern.
         s.session_image_count += 1;
         let n1 = s.session_image_count;
-        s.pending_images.push(atomcode_core::conversation::message::ImagePart {
-            media_type: "image/png".into(),
-            data: "AAAA".into(),
-        });
+        s.pending_images
+            .push(atomcode_core::conversation::message::ImagePart {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            });
         s.pending_image_hashes.push(0xdead_beef);
         // Submit drains pending_images / hashes (mirrors event_loop logic).
         let _ = std::mem::take(&mut s.pending_images);
@@ -855,7 +859,9 @@ mod tests {
         s.on_submit();
         s.on_tool_call_started("read_file");
         assert!(s.spinner_label.contains("read_file"));
-        let tasks = (0..6).map(|i| task_info(&format!("a{}.rs", i), "")).collect();
+        let tasks = (0..6)
+            .map(|i| task_info(&format!("a{}.rs", i), ""))
+            .collect();
         s.on_sub_agent_dispatch_start(tasks);
         assert_eq!(s.spinner_label, "Sub-agents 0/6");
     }
