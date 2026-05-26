@@ -31,6 +31,9 @@ use super::{
 // ============================================================================
 
 pub struct HookEngine {
+    // TODO(#913): 当前 HookEngine 承担注册表+执行器+加载器+查询 4 种职责。
+    // 未来体量超过 1000 行后可考虑拆分为 HookRegistry（注册/查询）+
+    // HookExecutor（执行）+ HookLoader（加载）三个独立 struct。
     pre_tool_hooks: Vec<Arc<dyn PreToolExecutionHook>>,
     post_tool_hooks: Vec<Arc<dyn PostToolExecutionHook>>,
     post_turn_hooks: Vec<Arc<dyn PostTurnHook>>,
@@ -157,6 +160,9 @@ impl HookEngine {
     }
 
     /// 工具执行后触发所有 PostToolExecutionHook (fire-and-forget)。
+    /// 注意：PostToolUse 是完全 fire-and-forget 的——工具已经执行完毕，
+    /// 此时 Denied/Modified 等语义无实际效果，仅记录 warning 到 stderr。
+    /// 这与 PreToolUse（可阻断/修改）有本质区别，是 CC 兼容的设计意图。
     pub async fn trigger_post_tool_use(&self, ctx: &HookCtx, result_ctx: &ToolResultContext) {
         for hook in &self.post_tool_hooks {
             let result = hook.on_post_execute(ctx, result_ctx).await;
@@ -255,6 +261,9 @@ impl HookEngine {
     // ── 加载 / 注册内置 Hook ──────────────────────────────────────
 
     /// 统一加载：JSON + TOML + 内置 + Webhook
+    ///
+    /// 注意：当前 `load_all` 每次从磁盘重新加载全部 hook，不维护跨 reload 状态。
+    /// 如果未来 hook 需要维护持久状态（rate limiter、缓存），应改为增量 `reload`。
     pub fn load_all(&mut self, working_dir: &Path) {
         // 1. JSON 配置 (老 CC 兼容系统)
         self.load_json_hooks(working_dir);

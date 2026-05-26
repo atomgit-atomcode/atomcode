@@ -101,6 +101,8 @@ impl HooksConfig {
     }
 
     /// 注册所有 webhooks 到 HookEngine
+    /// TODO(#914): async_webhook batchers 当前仅创建但未 flush。
+    /// 需在 HookEngine 上增加 flush 调度器，定期调用 AsyncWebhookRegistry::flush_batch()。
     pub fn register_webhooks_to_engine(&self, engine: &mut HookEngine) {
         let mut async_registry = AsyncWebhookRegistry::new();
 
