@@ -114,8 +114,89 @@ impl Tool for ParallelEditTool {
         }
     }
 
-    fn approval(&self, _args: &str) -> ApprovalRequirement {
+    fn approval(&self, args: &str) -> ApprovalRequirement {
+        // Mirror edit_file's sensitive-path check for every file in the
+        // dispatch. A single sensitive target is enough to require approval
+        // — the user should know that parallel_edit_files is about to
+        // modify .env, id_rsa, /etc/hosts, etc. Without this check,
+        // parallel_edit_files bypasses all of edit_file's safety gates
+        // (the exact class of vulnerability the bash rmdir incident
+        // exposed: a tool with AutoApprove that can reach paths other
+        // tools protect).
+        let parsed = match serde_json::from_str::<ParallelEditArgs>(args) {
+            Ok(p) => p,
+            Err(_) => {
+                // Fail-closed: can't verify safety without parsing.
+                return ApprovalRequirement::RequireApproval(
+                    "Could not parse parallel_edit_files arguments for safety check.".to_string(),
+                );
+            }
+        };
+
+        for f in &parsed.files {
+            if super::is_sensitive_input_path(&f.path) {
+                return ApprovalRequirement::RequireApproval(
+                    format!(
+                        "Editing sensitive path via parallel dispatch: {}",
+                        f.path
+                    ),
+                );
+            }
+        }
+
         ApprovalRequirement::AutoApprove
+    }
+
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        // Same two-layer merge as edit_file::approval_with_context:
+        //   Layer 1 (approval): sensitive-path detection (.env, id_rsa, …)
+        //   Layer 2 (approval_for_path): out-of-workspace write detection
+        // When a file is in-workspace but sensitive, approval_for_path
+        // returns AutoApprove and the base's RequireApproval MUST be
+        // upgraded to RequireApprovalAlways — otherwise a prior session
+        // [A] on parallel_edit_files would let the model edit an
+        // in-workspace .env without prompting.
+        let base = self.approval(args);
+        let parsed = match serde_json::from_str::<ParallelEditArgs>(args) {
+            Ok(p) => p,
+            Err(_) => return base,
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return base,
+        };
+
+        // Check every file for out-of-workspace access. A single
+        // out-of-workspace target is enough to require approval.
+        for f in &parsed.files {
+            match super::approval_for_path(
+                &f.path,
+                &working_dir,
+                super::ExternalPathAction::Write,
+            ) {
+                Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                    return ApprovalRequirement::RequireApprovalAlways(reason);
+                }
+                Ok(ApprovalRequirement::RequireApproval(reason)) => {
+                    return ApprovalRequirement::RequireApproval(reason);
+                }
+                Ok(ApprovalRequirement::AutoApprove) => {
+                    // In-workspace path — fall through to the base merge
+                    // below (sensitive in-workspace paths need upgrading).
+                }
+                Err(_) => return base,
+            }
+        }
+
+        // Merge: if approval() flagged a sensitive in-workspace path,
+        // upgrade RequireApproval → RequireApprovalAlways so session
+        // grants cannot bypass it.
+        match base {
+            ApprovalRequirement::RequireApproval(reason) => {
+                ApprovalRequirement::RequireApprovalAlways(reason)
+            }
+            other => other,
+        }
     }
 
     fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
@@ -577,5 +658,142 @@ mod validate_args_tests {
         assert_eq!(infos[0].path, "a.rs");
         assert_eq!(infos[1].path, "b.rs");
         assert_eq!(infos[2].path, "a.rs");
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use crate::tool::{ApprovalRequirement, Tool, ToolContext};
+    use std::pin::Pin;
+    use tokio::sync::mpsc;
+
+    struct StubProvider;
+
+    impl LlmProvider for StubProvider {
+        fn chat_stream(
+            &self,
+            _messages: &[crate::conversation::message::Message],
+            _tools: Option<&[crate::tool::ToolDef]>,
+        ) -> anyhow::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = anyhow::Result<crate::stream::StreamEvent>> + Send,
+                >,
+            >,
+        > {
+            unimplemented!()
+        }
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    fn blank_config() -> Config {
+        Config {
+            default_provider: String::new(),
+            default_workdir: None,
+            providers: std::collections::HashMap::new(),
+            datalog: Default::default(),
+            auto_update: true,
+            notifications: Default::default(),
+            telemetry: Default::default(),
+            lsp: Default::default(),
+            auto_commit: false,
+            subagent: Default::default(),
+            vision_preprocessor_provider: None,
+            language: None,
+            ui: Default::default(),
+            plugin: Default::default(),
+        }
+    }
+
+    fn tool() -> ParallelEditTool {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ParallelEditTool {
+            provider: Arc::new(StubProvider),
+            config: blank_config(),
+            event_tx: tx,
+        }
+    }
+
+    // ── approval() — sensitive path detection ──
+
+    #[test]
+    fn approval_auto_approves_normal_files() {
+        let args = r#"{"files":[{"path":"a.rs","instruction":"edit"},{"path":"b.rs","instruction":"edit"}]}"#;
+        assert!(matches!(
+            tool().approval(args),
+            ApprovalRequirement::AutoApprove
+        ));
+    }
+
+    #[test]
+    fn approval_flags_sensitive_env_file() {
+        let args = r#"{"files":[{"path":".env","instruction":"edit"},{"path":"b.rs","instruction":"edit"}]}"#;
+        let result = tool().approval(args);
+        assert!(
+            matches!(result, ApprovalRequirement::RequireApproval(ref r) if r.contains("sensitive")),
+            "expected RequireApproval(sensitive..) for .env"
+        );
+    }
+
+    #[test]
+    fn approval_flags_sensitive_ssh_key() {
+        let args = r#"{"files":[{"path":"a.rs","instruction":"edit"},{"path":"id_rsa","instruction":"edit"}]}"#;
+        let result = tool().approval(args);
+        assert!(
+            matches!(result, ApprovalRequirement::RequireApproval(_)),
+            "expected RequireApproval for id_rsa"
+        );
+    }
+
+    #[test]
+    fn approval_flags_pem_extension() {
+        let args = r#"{"files":[{"path":"cert.pem","instruction":"edit"},{"path":"b.rs","instruction":"edit"}]}"#;
+        let result = tool().approval(args);
+        assert!(
+            matches!(result, ApprovalRequirement::RequireApproval(_)),
+            "expected RequireApproval for .pem"
+        );
+    }
+
+    #[test]
+    fn approval_fail_closed_on_invalid_json() {
+        let result = tool().approval("not json");
+        assert!(
+            matches!(result, ApprovalRequirement::RequireApproval(_)),
+            "expected RequireApproval for unparseable args"
+        );
+    }
+
+    // ── approval_with_context() — out-of-workspace detection ──
+
+    #[test]
+    fn approval_with_context_flags_out_of_workspace_write() {
+        let t = tool();
+        let ctx = ToolContext::new(std::env::current_dir().unwrap());
+        // /etc/hosts is outside any project workspace and sensitive
+        let args = r#"{"files":[{"path":"/etc/hosts","instruction":"edit"},{"path":"b.rs","instruction":"edit"}]}"#;
+        let result = t.approval_with_context(args, &ctx);
+        assert!(
+            matches!(result, ApprovalRequirement::RequireApprovalAlways(_)),
+            "expected RequireApprovalAlways for out-of-workspace write"
+        );
+    }
+
+    #[test]
+    fn approval_with_context_upgrades_sensitive_in_workspace_to_always() {
+        let t = tool();
+        let ctx = ToolContext::new(std::env::current_dir().unwrap());
+        // .env in-workspace: approval() returns RequireApproval,
+        // approval_for_path returns AutoApprove (in-workspace) →
+        // merge upgrades to RequireApprovalAlways.
+        let args = r#"{"files":[{"path":".env","instruction":"edit"},{"path":"b.rs","instruction":"edit"}]}"#;
+        let result = t.approval_with_context(args, &ctx);
+        assert!(
+            matches!(result, ApprovalRequirement::RequireApprovalAlways(_)),
+            "expected RequireApprovalAlways for in-workspace sensitive path"
+        );
     }
 }

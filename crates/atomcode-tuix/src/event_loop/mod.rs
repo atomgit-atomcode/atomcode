@@ -2221,6 +2221,34 @@ mod tool_format_tests {
         );
     }
 
+    #[test]
+    fn format_tool_detail_parallel_edit_files_shows_basenames() {
+        let args = r#"{"files":[{"path":"/src/server/api.rs","instruction":"add log"},{"path":"/src/client/mod.rs","instruction":"add log"},{"path":"/src/config/mod.rs","instruction":"add log"}],"contract":"use tracing"}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "api.rs, mod.rs, mod.rs");
+    }
+
+    #[test]
+    fn format_tool_detail_parallel_edit_files_two_files() {
+        let args = r#"{"files":[{"path":"a.rs","instruction":"add X"},{"path":"b.rs","instruction":"wire X"}]}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "a.rs, b.rs");
+    }
+
+    #[test]
+    fn format_tool_detail_parallel_edit_files_empty_files_array() {
+        let args = r#"{"files":[]}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn format_tool_detail_parallel_edit_files_missing_files_key() {
+        let args = r#"{"contract":"use tracing"}"#;
+        let out = format_tool_detail("parallel_edit_files", args);
+        assert_eq!(out, "");
+    }
+
     // ── disambiguate_batch_details tests (issue #437) ──
 
     #[test]
@@ -7039,6 +7067,26 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 (None, Some(r)) => crate::width::truncate_with_ellipsis(r, 100),
                 (Some(s), None) => crate::width::truncate_with_ellipsis(s, 100),
                 _ => String::new(),
+            }
+        }
+        "parallel_edit_files" => {
+            // Show the list of target file basenames so the user can see
+            // WHAT will be edited at a glance in the approval prompt —
+            // mirroring how Bash(rm -rf /path) tells the user exactly
+            // which command needs approval. Without this, the approval
+            // prompt just shows "ParallelEditFiles:" with no detail,
+            // leaving the user blind to the scope of the dispatch.
+            if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
+                let names: Vec<String> = files
+                    .iter()
+                    .filter_map(|entry| {
+                        entry.get("path").and_then(|p| p.as_str()).map(|s| basename(s))
+                    })
+                    .collect();
+                let detail = names.join(", ");
+                crate::width::truncate_with_ellipsis(&detail, 200)
+            } else {
+                String::new()
             }
         }
         "use_skill" => get_str("name").unwrap_or_default(),
