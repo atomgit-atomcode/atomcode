@@ -596,6 +596,10 @@ impl LlmProvider for OpenAiProvider {
             let mut auth_retry_used = false;
             'retry: loop {
                 attempt += 1;
+                // Serialize once per outer-loop iteration. The body content
+                // does NOT change between inner retries — only the signing
+                // headers do (fresh nonce/ts/sig per attempt to avoid
+                // SIG_REPLAY / SIG_STALE from the atomgit-gateway).
                 let body_bytes = match serde_json::to_vec(&body) {
                     Ok(b) => b,
                     Err(e) => {
@@ -605,27 +609,49 @@ impl LlmProvider for OpenAiProvider {
                         return;
                     }
                 };
-                let extra_headers = match build_codingplan_headers(&base_url_for_signing, &body_bytes, None) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        let _ = tx.send(Ok(StreamEvent::Error(format!("{e:#}"))));
-                        return;
-                    }
-                };
                 // Snapshot the current token. After a successful auth
                 // refresh below, the shared `api_key` will hold the new
                 // value and the next iteration picks it up here.
                 let current_token = api_key.read().await.clone();
-                let mut request = client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {}", current_token))
-                    .header("Content-Type", "application/json")
-                    .body(body_bytes);
-                for (name, value) in extra_headers {
-                    request = request.header(name, value);
-                }
 
-                let response = match crate::provider::retry::send_with_retry(request, &policy).await
+                // Build a factory closure that re-signs on every inner
+                // retry attempt. Each call to the factory generates a
+                // fresh nonce + timestamp + HMAC signature via
+                // `build_codingplan_headers`, preventing SIG_REPLAY
+                // (server's nonce cache holds the first attempt's nonce)
+                // and SIG_STALE (cumulative backoff pushes ts past the
+                // 300 s freshness window).
+                //
+                // On signing failure during a retry we fall back to
+                // empty extra headers (no panic, worst case we get a
+                // fresh 403 which the caller already handles). The
+                // initial request has already been signed successfully
+                // at this point, so retries are the only code path that
+                // can reach the fallback.
+                let url_for_factory = url.clone();
+                let body_for_factory = body_bytes.clone();
+                let base_url_clone = base_url_for_signing.clone();
+                let client_for_factory = client.clone();
+                let token_for_factory = current_token.clone();
+                let resign = move || -> reqwest::RequestBuilder {
+                    let extra_headers = build_codingplan_headers(
+                        &base_url_clone,
+                        &body_for_factory,
+                        None,
+                    )
+                    .unwrap_or_default();
+                    let mut req = client_for_factory
+                        .post(&url_for_factory)
+                        .header("Authorization", format!("Bearer {}", token_for_factory))
+                        .header("Content-Type", "application/json")
+                        .body(body_for_factory.clone());
+                    for (name, value) in extra_headers {
+                        req = req.header(name, value);
+                    }
+                    req
+                };
+
+                let response = match crate::provider::retry::send_with_retry_resign(resign, &policy).await
                 {
                     Ok(resp) => resp,
                     Err(e) => {
