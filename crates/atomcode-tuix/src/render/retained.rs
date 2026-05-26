@@ -9147,6 +9147,56 @@ mod tests {
         );
     }
 
+    /// Defense-in-depth: no cell in a Java code block (after the full
+    /// `AssistantText` → `flush_assistant_remainder` →
+    /// `push_markdown_body` → `parse_markdown_to_cells` pipeline) may
+    /// carry `style.reverse == true`. This is the guard against any
+    /// future change that lets reverse-video bleed onto syntax-
+    /// highlighted code (the "green background blocks" symptom the user
+    /// reported when a stray SGR 7 from earlier output couldn't be
+    /// cleared by `theme::RESET = "\x1b[23;39m"` because the latter
+    /// only clears italic + fg, not reverse).
+    ///
+    /// Current code already passes this — none of the syntect, markdown,
+    /// or render paths emit SGR 7 onto body cells; the test exists as
+    /// a regression net so any future addition of `\x1b[7m` upstream
+    /// of `parse_markdown_to_cells` trips here instead of silently
+    /// rendering reverse-video on every code-block cell.
+    #[test]
+    fn retained_java_code_block_has_no_reverse_video_cells() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let stream = "Here is some Java:\n\
+                     \n\
+                     ```java\n\
+                     int[] arr = {0, 1, 4, 3};\n\
+                     String s = null;\n\
+                     void foo(int x, Object y) { return null; }\n\
+                     ```\n\
+                     \n\
+                     Closing prose.\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::AssistantLineBreak);
+
+        let mut reverse_cells: Vec<(usize, usize, char)> = Vec::new();
+        for (row_idx, row) in r.body_lines.iter().enumerate() {
+            for (col_idx, cell) in row.iter().enumerate() {
+                if cell.style.reverse {
+                    reverse_cells.push((row_idx, col_idx, cell.ch));
+                }
+            }
+        }
+        assert!(
+            reverse_cells.is_empty(),
+            "no body cell from a syntax-highlighted code block may carry \
+             reverse-video — found {:?}. The class of bug this guards: \
+             SGR 7 leaks in from earlier output and the highlighter's \
+             RESET (`\\x1b[23;39m`) doesn't clear reverse, so the entire \
+             code block renders with swapped fg/bg (green-on-default for \
+             string tokens, etc.).",
+            reverse_cells,
+        );
+    }
+
     /// Regression: end-of-turn burst over the overflow boundary used to
     /// duplicate every overflow-pushed row on the physical terminal.
     ///
