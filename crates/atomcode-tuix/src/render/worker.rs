@@ -56,8 +56,9 @@ enum RenderCmd {
     /// Remove the tail ApprovalPrompt body row (fire-and-forget).
     PopApprovalPrompt,
     /// Scroll the body viewport by `delta` rows. Negative = up,
-    /// positive = down. AltScreenRenderer mutates viewport_top;
-    /// other renderers default to no-op.
+    /// positive = down. RetainedRenderer's append-only path leaves
+    /// scrollback to the host terminal, so this is effectively a
+    /// trait no-op everywhere today.
     ScrollBody(i32),
     /// Jump body viewport to absolute top / bottom of scrollback.
     ScrollBodyToTop,
@@ -69,8 +70,8 @@ enum RenderCmd {
     ScrollToPrevUserMessage,
     ScrollToNextUserMessage,
     /// Mouse-drag selection lifecycle. Forwarded to the inner renderer;
-    /// only AltScreenRenderer acts on these. `(col, row)` are 0-indexed
-    /// terminal cells.
+    /// only RetainedRenderer acts on these (PlainRenderer no-ops).
+    /// `(col, row)` are 0-indexed terminal cells.
     BeginSelection(u16, u16),
     UpdateSelection(u16, u16),
     EndSelection,

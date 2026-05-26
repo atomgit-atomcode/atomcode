@@ -196,14 +196,13 @@ const FOOTER_ROWS: usize = 5;
 /// for SGR width because draw_panel-shaped output already commits
 /// to a known width.
 ///
-/// Both renderers (retained's DECSTBM region + alt_screen with
-/// sticky_bottom) anchor body content to the body region's BOTTOM:
-/// when total pushed rows < body_height, the auto-empty rows
-/// appear ABOVE the content, not below. So top-padding alone just
-/// stacks redundant blanks against the existing auto-empty strip
-/// while the panel stays glued to the footer. Filling the region
-/// to exactly body_height with top_blanks + content + bottom_blanks
-/// pushes the panel into the actual middle row in both renderers.
+/// RetainedRenderer anchors body content to the body region's BOTTOM:
+/// when total pushed rows < body_height, the auto-empty rows appear
+/// ABOVE the content, not below. So top-padding alone just stacks
+/// redundant blanks against the existing auto-empty strip while the
+/// panel stays glued to the footer. Filling the region to exactly
+/// body_height with top_blanks + content + bottom_blanks pushes the
+/// panel into the actual middle row.
 ///
 /// Each rendered line keeps its own SGR; we prepend bare spaces,
 /// which contribute no styling, so colour spans on the original

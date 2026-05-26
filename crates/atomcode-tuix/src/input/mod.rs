@@ -21,9 +21,11 @@ pub enum InputEvent {
     Resize(u16, u16),
     /// Mouse scroll wheel. `delta` lines: negative = up (older
     /// content), positive = down (newer). Only emitted when the
-    /// active renderer has enabled mouse capture (currently
-    /// AltScreenRenderer only — RetainedRenderer relies on host-
-    /// terminal scrollback, PlainRenderer doesn't pin a UI).
+    /// active renderer has enabled mouse capture (RetainedRenderer
+    /// turns it on for drag-selection; PlainRenderer doesn't pin a
+    /// UI). RetainedRenderer relies on the host terminal's native
+    /// scrollback for wheel-driven history scrolling, so this event
+    /// is effectively a no-op there.
     MouseScroll(i32),
     /// Mouse primary button pressed at terminal cell `(col, row)`.
     MouseDown { col: u16, row: u16 },

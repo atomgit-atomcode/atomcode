@@ -184,13 +184,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Down                             下一条输入
 
   ── 翻看输出 ──
-    PageUp / PageDown                上下翻一页（10 行）
-    Shift+↑ / Shift+↓                上下翻一行
-    Alt+↑ / Alt+↓                    跳到上/下一条消息 ***
-    Ctrl+↑ / Ctrl+↓                  跳到上/下一条自己发的消息
-    Home / End                       跳到最顶 / 跳回最新
-    鼠标滚轮                          上下滚（atomcode 接管）
-    Shift+拖鼠标                      用宿主终端选择文本（绕过 atomcode）
+    用终端原生 scrollback（cmd+↑/↓、鼠标滚轮、tmux copy-mode 等都生效）
+    鼠标拖选 + Ctrl+C                复制（atomcode 不接管鼠标）
 
   ── 显示 ──
     /scrollbar                       切换右侧滚动条显示
@@ -216,9 +211,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
      Windows Terminal / Ghostty / Warp。其他终端（包括 macOS
      Apple Terminal、默认 xterm、GNOME Terminal、VS Code 集成
      终端）不区分 Shift+Enter 与 Enter，请用 Ctrl+J 或 \ + Enter。
-  *** Alt+↑/↓ macOS Apple Terminal 需在
-      Settings → Profiles → Keyboard 启用 "Use Option as Meta key"
-      才会发送修饰键。其他终端默认即可。
 
   提示：输入 /help 查看完整斜杠命令列表。
 "#.into(),
@@ -432,23 +424,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ 终端不支持增强键盘协议。\n    请使用 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
         Msg::KbdHintOther =>
             "  ⚠ 终端不支持增强键盘协议。\n    请使用 Alt+Enter 或 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
-
-        // ── JediTerm / conhost 回退 ──
-        Msg::JediTermFallback =>
-            "  ⓘ 检测到 JetBrains IDE 终端 — 运行在备用屏幕模式下。\n    \
-            使用鼠标滚轮、PageUp/PageDown 或 Shift+Up/Down 滚动历史。\n    \
-            AtomCode 运行期间无法使用宿主终端的原生回滚；\n    \
-            退出后宿主终端将恢复到 AtomCode 之前的状态。\n    \
-            设置 ATOMCODE_PLAIN=1 使用基础 CI 风格输出，或\n    \
-            设置 ATOMCODE_RETAIN=1 绕过此回退（可能导致对齐问题）。\n\n".into(),
-        Msg::LegacyConhostFallback =>
-            "  ⓘ 检测到旧版 Windows 控制台 — 运行在备用屏幕模式下。\n    \
-            使用鼠标滚轮、PageUp/PageDown 或 Shift+Up/Down 滚动历史。\n    \
-            AtomCode 运行期间无法使用宿主终端的原生回滚。\n    \
-            要获得完整的宿主终端回滚支持，请安装 Windows Terminal\n    \
-            （免费，Microsoft Store）、ConEmu、Alacritty 或 WezTerm。\n    \
-            设置 ATOMCODE_PLAIN=1 使用基础输出，或设置 ATOMCODE_RETAIN=1\n    \
-            绕过此回退（滚动时可能出现重复内容）。\n\n".into(),
 
         // ── 后台任务 ──
         Msg::BackgroundComplete { turns } =>

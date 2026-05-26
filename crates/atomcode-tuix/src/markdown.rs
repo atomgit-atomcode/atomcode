@@ -20,13 +20,9 @@ pub struct MdState {
     pub table_buf: Vec<String>,
     /// Lines accumulated between an opening and closing code fence.
     /// Flushed through `highlight::highlight_block` on close fence so
-    /// the syntax highlighter sees the whole block at once. Code thus
-    /// appears in one chunk at fence close rather than streaming
-    /// line-by-line.
+    /// the code block appears in one chunk at fence close rather than
+    /// streaming line-by-line.
     pub code_buf: Vec<String>,
-    /// Language tag captured from the opening fence (`"rust"` from
-    /// ```` ```rust ````). `None` for fences with no tag.
-    pub code_lang: Option<String>,
 }
 
 impl MdState {
@@ -37,7 +33,6 @@ impl MdState {
         self.in_code_block = false;
         self.table_buf.clear();
         self.code_buf.clear();
-        self.code_lang = None;
     }
 }
 
@@ -109,25 +104,20 @@ pub fn render_line_with_width(
     // block comments correctly.
     //
     // CLOSE fence: flush the buffered block through `highlight::highlight_block`,
-    // which handles caps gating (no-color path returns plain 2-space-indented
-    // text, matching the pre-existing CC-style behavior).
+    // which under plan-0 unconditionally emits 2-space-indented plain text
+    // (no per-token colour — see that function's doc for the rationale).
     if is_fence(trimmed) {
         if state.in_code_block {
             // CLOSE
             let source = state.code_buf.join("\n");
-            let highlighted = crate::highlight::highlight_block(
-                state.code_lang.as_deref(),
-                &source,
-                caps,
-            );
+            let highlighted = crate::highlight::highlight_block(&source);
             state.in_code_block = false;
             state.code_buf.clear();
-            state.code_lang = None;
             return Some(prepend(highlighted));
         } else {
-            // OPEN — extract optional language tag.
+            // OPEN — language tag on the fence is ignored under plan-0
+            // (the highlighter is colour-free regardless of language).
             state.in_code_block = true;
-            state.code_lang = parse_fence_lang(trimmed);
             state.code_buf.clear();
             return prefix_only();
         }
@@ -217,14 +207,9 @@ pub fn finalize_with_width(
 
     let code_part = if state.in_code_block && !state.code_buf.is_empty() {
         let source = state.code_buf.join("\n");
-        let highlighted = crate::highlight::highlight_block(
-            state.code_lang.as_deref(),
-            &source,
-            caps,
-        );
+        let highlighted = crate::highlight::highlight_block(&source);
         state.in_code_block = false;
         state.code_buf.clear();
-        state.code_lang = None;
         Some(highlighted)
     } else {
         None
@@ -597,28 +582,6 @@ fn is_fence(trimmed: &str) -> bool {
     }
 }
 
-/// Extract the language tag from an opening fence line. Handles both
-/// backtick and tilde fences; returns `None` if no tag is present or
-/// the line is just the fence character.
-///
-/// Examples:
-///   "```rust"        -> Some("rust")
-///   "```rust  "      -> Some("rust")
-///   "```Rust"        -> Some("rust")     ← lowercased
-///   "```"            -> None
-///   "~~~python"      -> Some("python")
-fn parse_fence_lang(trimmed: &str) -> Option<String> {
-    let after = trimmed
-        .trim_start_matches('`')
-        .trim_start_matches('~')
-        .trim();
-    if after.is_empty() {
-        None
-    } else {
-        Some(after.to_lowercase())
-    }
-}
-
 fn is_hrule(trimmed: &str) -> bool {
     if trimmed.len() < 3 {
         return false;
@@ -780,29 +743,31 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_block_colors_on_emits_truecolor_for_known_lang() {
-        // With colors enabled and a known language tag, the close-fence
-        // flush must include at least one truecolor SGR (theme color).
-        // We don't assert exact bytes — the palette is intentionally
-        // free to evolve in `highlight::theme`.
+    fn fenced_code_block_known_lang_emits_plain_indent_no_ansi() {
+        // Plan-0 contract (see `highlight_block`'s doc): even with colors
+        // enabled and a known language tag, the close-fence flush emits
+        // plain 2-space-indented source with zero ANSI. Per-token
+        // colouring was dropped because macOS Terminal.app's selection
+        // overlay made truecolor tokens unreadable inside selections.
         let mut state = MdState::new();
         let _ = render_line("```rust", &mut state, caps());
         assert!(render_line("fn main() {}", &mut state, caps()).is_none());
         let out = render_line("```", &mut state, caps()).unwrap();
-        assert!(out.contains("  "), "indent preserved: {:?}", out);
+        assert!(out.contains("  fn main() {}"), "indent + body preserved: {:?}", out);
         assert!(
-            out.contains("\x1b[38;2;"),
-            "expected at least one truecolor SGR, got: {:?}",
+            !out.contains('\x1b'),
+            "expected zero ANSI bytes under plan-0, got: {:?}",
             out
         );
     }
 
     #[test]
-    fn fenced_code_block_unknown_lang_falls_back_to_plain_indent() {
-        // Unknown lang tag → syntect's find_syntax_by_token returns None
-        // → dispatch falls through to plain indent. No ANSI emitted even
-        // though caps.colors is true. Matches the design's "no fallback
-        // module" decision (syntect's lookup is the gate).
+    fn fenced_code_block_unknown_lang_emits_plain_indent() {
+        // Plan-0: regardless of lang tag (known, unknown, or absent),
+        // the body is emitted verbatim with a 2-space indent and zero
+        // ANSI. This test pins the unknown-lang case specifically;
+        // the known-lang case is covered by
+        // `fenced_code_block_known_lang_emits_plain_indent_no_ansi`.
         let mut state = MdState::new();
         let _ = render_line("```frobnicate", &mut state, caps());
         assert!(render_line(r#"x = "hello""#, &mut state, caps()).is_none());
@@ -1141,33 +1106,32 @@ mod tests {
     }
 
     #[test]
-    fn mdstate_default_has_empty_code_buf_and_no_lang() {
+    fn mdstate_default_has_empty_code_buf() {
         let s = MdState::new();
         assert!(s.code_buf.is_empty(), "code_buf must start empty");
-        assert!(s.code_lang.is_none(), "code_lang must start None");
+        assert!(!s.in_code_block, "in_code_block must start false");
     }
 
     #[test]
-    fn mdstate_reset_clears_code_buf_and_lang() {
+    fn mdstate_reset_clears_code_buf() {
         let mut s = MdState::new();
         s.code_buf.push("dirty".into());
-        s.code_lang = Some("rust".into());
         s.in_code_block = true;
         s.reset();
         assert!(s.code_buf.is_empty(), "reset must clear code_buf");
-        assert!(s.code_lang.is_none(), "reset must clear code_lang");
         assert!(!s.in_code_block, "reset must clear in_code_block");
     }
 
     #[test]
-    fn fence_open_with_lang_captures_lang_and_buffers_lines() {
+    fn fence_open_with_lang_tag_buffers_lines_without_emit() {
+        // Under plan-0 the lang tag is ignored entirely (no language-
+        // dependent path remains). We only assert that the fence
+        // transitions state into `in_code_block` and accumulates body
+        // lines silently until the close fence flushes.
         let mut st = MdState::new();
-        // Open fence with `rust` tag — language captured, no body output yet.
         assert!(render_line("```rust", &mut st, caps()).is_none());
-        assert_eq!(st.code_lang.as_deref(), Some("rust"));
         assert!(st.in_code_block);
 
-        // Body lines accumulate to code_buf, no output emitted yet.
         assert!(render_line("let x = 1;", &mut st, caps()).is_none());
         assert!(render_line("let y = 2;", &mut st, caps()).is_none());
         assert_eq!(st.code_buf.len(), 2);
@@ -1175,12 +1139,6 @@ mod tests {
 
     #[test]
     fn fence_close_flushes_buffered_block_as_one_chunk() {
-        // Use plain_caps so the substring checks see the literal source text
-        // — with truecolor caps, syntect interleaves ANSI escapes between
-        // every token boundary (keywords/identifiers/operators each get
-        // their own SGR pair), so `out.contains("let x = 1;")` won't match.
-        // The colored path is covered separately by
-        // `fence_close_with_colors_produces_truecolor_ansi`.
         let mut st = MdState::new();
         assert!(render_line("```rust", &mut st, plain_caps()).is_none());
         assert!(render_line("let x = 1;", &mut st, plain_caps()).is_none());
@@ -1195,20 +1153,24 @@ mod tests {
         // State is reset for the next block.
         assert!(!st.in_code_block);
         assert!(st.code_buf.is_empty());
-        assert!(st.code_lang.is_none());
     }
 
     #[test]
-    fn fence_close_with_colors_produces_truecolor_ansi() {
+    fn fence_close_with_colors_emits_plain_indent_no_ansi() {
+        // Plan-0: even with `caps.colors == true`, code-block flush
+        // emits the body with a 2-space indent and zero ANSI. See
+        // `highlight::highlight_block`'s doc for why per-token colour
+        // was dropped (Terminal.app selection-overlay readability).
         let mut st = MdState::new();
         render_line("```rust", &mut st, caps());
         render_line("fn main() {}", &mut st, caps());
         let out = render_line("```", &mut st, caps()).unwrap();
         assert!(
-            out.contains("\x1b[38;2;"),
-            "tinted output must contain a truecolor SGR, got: {:?}",
+            !out.contains('\x1b'),
+            "code-block output must contain zero ANSI under plan-0, got: {:?}",
             out
         );
+        assert!(out.contains("  fn main() {}"), "indent + body preserved: {:?}", out);
     }
 
     #[test]
@@ -1222,18 +1184,10 @@ mod tests {
     }
 
     #[test]
-    fn fence_open_with_no_lang_tag_buffers_with_none_lang() {
+    fn fence_open_with_no_lang_tag_buffers() {
         let mut st = MdState::new();
         assert!(render_line("```", &mut st, caps()).is_none());
-        assert_eq!(st.code_lang, None);
         assert!(st.in_code_block);
-    }
-
-    #[test]
-    fn lang_tag_with_trailing_whitespace_is_trimmed() {
-        let mut st = MdState::new();
-        render_line("```rust  ", &mut st, caps());
-        assert_eq!(st.code_lang.as_deref(), Some("rust"));
     }
 
     #[test]
@@ -1247,20 +1201,11 @@ mod tests {
         // No close fence.
 
         let out = finalize(&mut st, caps()).expect("unclosed block must emit something");
-        // Use plain caps for substring check: syntect interleaves ANSI between
-        // tokens so "let x = 1;" never appears contiguously in tinted output.
-        // The colored-output path is already covered by Task 6's tests; here we
-        // just verify the body survives at all.
-        let mut st_plain = MdState::new();
-        render_line("```rust", &mut st_plain, plain_caps());
-        render_line("let x = 1;", &mut st_plain, plain_caps());
-        render_line("let y = 2;", &mut st_plain, plain_caps());
-        let out_plain = finalize(&mut st_plain, plain_caps()).expect("unclosed block must emit");
-        assert!(out_plain.contains("let x = 1;"), "got: {:?}", out_plain);
-        assert!(out_plain.contains("let y = 2;"), "got: {:?}", out_plain);
-
-        // Tinted path: at least some output (non-empty) and state cleared.
-        assert!(!out.is_empty());
+        // Under plan-0 the body is emitted verbatim (2-space indent, no
+        // ANSI), so the source lines are contiguous and substring-checkable
+        // directly without bouncing through `plain_caps()`.
+        assert!(out.contains("let x = 1;"), "got: {:?}", out);
+        assert!(out.contains("let y = 2;"), "got: {:?}", out);
         assert!(st.code_buf.is_empty());
         assert!(!st.in_code_block);
     }

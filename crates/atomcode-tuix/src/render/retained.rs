@@ -24,7 +24,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
-use super::cell::{push_str_cells, serialize_row, serialize_row_clipped, Cell, CellStyle};
+use super::cell::{push_str_cells, serialize_row, Cell, CellStyle};
 use super::screen::Screen;
 use super::theme::{role, Role};
 use super::{MenuPayload, Renderer, StatusLine, UiLine};
@@ -167,6 +167,74 @@ fn clip_cells_to_width(cells: &[Cell], max_cols: usize) -> Vec<Cell> {
     out
 }
 
+/// Apply the selection reverse-video overlay to `cells` in place.
+/// `body_idx` is the absolute `body_lines` index of the row these
+/// cells belong to; `lo`/`hi` are the inclusive (row, col) endpoints
+/// of the active selection, already normalised so that `lo <= hi`.
+///
+/// Cells with `width == 0` (continuation cells for the second column
+/// of a wide glyph) inherit the styling of their preceding real cell
+/// — both halves of a wide cluster either join the selection together
+/// or stay out together, matching the wide-char overlap rule used by
+/// `selection::render_line_with_selection`.
+///
+/// To keep the highlight visually consistent regardless of the
+/// underlying line styling, the overlay REPLACES the cell's style
+/// with a clean reverse-video style (`CellStyle { reverse: true,
+/// ..default() }`) — same intent as the
+/// `\x1b[0m\x1b[7m...\x1b[0m` wrap in `render_line_with_selection`
+/// (reset existing colours, then enable reverse).
+fn apply_selection_overlay(
+    cells: &mut [Cell],
+    body_idx: usize,
+    lo: crate::render::selection::BodyPos,
+    hi: crate::render::selection::BodyPos,
+) {
+    if body_idx < lo.0 || body_idx > hi.0 {
+        return;
+    }
+    // Half-open `[sel_start, sel_end)` matching the wide-char overlap
+    // rule. `hi.1` is the inclusive head column, so end_exclusive =
+    // hi.1 + 1 on the row that contains the head; rows strictly
+    // between lo.0 and hi.0 select to the row's full painted width.
+    let sel_start = if body_idx == lo.0 { lo.1 as usize } else { 0 };
+    let sel_end_excl = if body_idx == hi.0 {
+        (hi.1 as usize).saturating_add(1)
+    } else {
+        usize::MAX
+    };
+    let reverse_style = CellStyle {
+        reverse: true,
+        ..Default::default()
+    };
+    let mut cols = 0usize;
+    let mut last_real_style: Option<CellStyle> = None;
+    for cell in cells.iter_mut() {
+        let w = cell.width as usize;
+        if w == 0 {
+            // Continuation cell — adopt the style of the preceding real
+            // cell so wide-glyph halves stay in lockstep. The real cell
+            // already decided whether to flip to reverse-video; mirror
+            // that decision here. Continuation cells don't emit bytes
+            // (their `width == 0` makes the serialiser skip them), but
+            // the cell-equality check still uses style, and keeping the
+            // halves in sync makes any debug dump consistent.
+            if let Some(s) = &last_real_style {
+                cell.style = s.clone();
+            }
+            continue;
+        }
+        // Cluster spans cols..cols+w. Joins the selection iff that
+        // range overlaps [sel_start, sel_end_excl).
+        let in_sel = cols + w > sel_start && cols < sel_end_excl;
+        if in_sel {
+            cell.style = reverse_style.clone();
+        }
+        last_real_style = Some(cell.style.clone());
+        cols += w;
+    }
+}
+
 /// Cell-based wrap: splits a cell sequence into chunks whose sum
 /// of `cell.width` stays ≤ `max_cols`. Continuation cells (width 0)
 /// travel with their preceding real cell — the combined "grapheme"
@@ -287,14 +355,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// of a turn gets a new mark; subsequent chunks within the same assistant turn are silent.
     /// Cleared whenever a User / ToolCall / ToolCallInFlight / TurnSeparator fires.
     last_mark_was_assistant: bool,
-    /// True iff user has scrolled away from the tail. While true, body
-    /// emit suppresses terminal writes and paint_body redraws from
-    /// body_lines[viewport_top..] via CUP+EL instead of DECSTBM \n.
-    view_mode: bool,
-    /// Top body_lines index visible at body region top, when view_mode = true.
-    viewport_top: usize,
-    /// True iff viewport_top >= max_top (auto-tail). Drives view_mode entry/exit.
-    sticky_bottom: bool,
     /// Line-buffer for streaming assistant text — chunks accumulate
     /// here until a `\n` boundary, at which point the completed
     /// physical line is appended to `body_lines`.
@@ -324,12 +384,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// full-frame, guaranteeing the terminal re-processes the
     /// rule regardless of diff skip.
     last_painted_footer_rows: usize,
-    /// Bottom row (1-indexed) of the currently-set DECSTBM region.
-    /// `None` means "no region set" (terminal default = full screen).
-    /// Updated by `ensure_scroll_region()` before any body/footer
-    /// paint so `\n` in the body-emit path only scrolls body rows,
-    /// leaving the footer strip below untouched.
-    scroll_region_bottom: Option<u16>,
     /// Set by `pop_approval_prompt` so the immediately-following
     /// body-line emit overwrites the approval row in place instead of
     /// scrolling the region up one row. Without this, the ToolResult
@@ -382,10 +436,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// have scrolled out of the visible body strip).
     live_group: Option<LiveGroup>,
     /// Windows only: the STD_INPUT_HANDLE console mode value saved by
-    /// `enable_conhost_mouse_capture` at startup / resume. Restored by
-    /// `restore_conhost_console_in_mode` on suspend / shutdown so the
-    /// parent shell gets its quick-edit / line-input flags back exactly
-    /// as they were (not "approximated" by crossterm's snapshot).
+    /// `enable_conhost_mouse_capture`. Currently always `None` — mouse
+    /// capture is intentionally disabled (see `with_writer` comment),
+    /// so there's nothing to restore. Field retained because the
+    /// suspend / shutdown paths still defensively call
+    /// `restore_conhost_console_in_mode` if it ever became `Some`
+    /// (belt-and-suspenders against a future re-enable being added
+    /// only on one side of the lifecycle).
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
     /// Mouse text-selection state: anchor, head, and drag-active flag.
@@ -429,13 +486,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // doesn't remain visible above the atomcode viewport and mix with
         // the atomcode session transcript. `\x1b[3J` only affects scrollback;
         // it does not touch the visible screen rows.
-        // Enable button-event tracking (`\x1b[?1002h`) and SGR-extended
-        // coordinates (`\x1b[?1006h`) so scroll wheel events route through
-        // the terminal's mouse event stream (needed for Phase 4 scroll support).
-        let _ = out.write_all(b"\x1b[3J\x1b[?1002h\x1b[?1006h");
+        //
+        // Mouse capture (`\x1b[?1002h` button-event + `\x1b[?1006h` SGR
+        // coords) is intentionally NOT enabled here. We defer mouse wheel,
+        // cmd+drag selection, and cmd+C copy to the terminal's native
+        // handling — matches Claude Code's UX model. Trade-off: atomcode's
+        // reverse-video drag selection and arboard/OSC52 clipboard write
+        // path are no longer reachable from interactive events. The
+        // disable-on-shutdown (`?1002l`/`?1006l`) sequences below are
+        // preserved as defensive hygiene against any other actor (a child
+        // process that exited weirdly, a prior atomcode run that
+        // panicked before Drop) having left capture on.
+        let _ = out.write_all(b"\x1b[3J");
         let _ = out.flush();
         #[cfg(windows)]
-        let prior_console_in_mode = crate::render::conhost::enable_conhost_mouse_capture();
+        // Conhost mouse capture intentionally skipped — see comment
+        // above re: deferring to terminal-native selection/wheel/copy.
+        let prior_console_in_mode: Option<u32> = None;
         let show_scrollbar = crate::render::ui_state::load().ui.show_scrollbar;
         Self {
             out,
@@ -449,14 +516,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
             body_lines: Vec::new(),
             message_marks: Vec::new(),
             last_mark_was_assistant: false,
-            view_mode: false,
-            viewport_top: 0,
-            sticky_bottom: true,
             assistant_line_buf: String::new(),
             md_state: crate::markdown::MdState::new(),
             dirty: false,
             last_painted_footer_rows: 0,
-            scroll_region_bottom: None,
             skip_body_scroll_count: 0,
             welcome_banner: None,
             welcome_line_count: 0,
@@ -604,7 +667,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return;
         }
 
-        self.ensure_scroll_region();
         let bottom = self.body_bottom_row();
         let inplace_ok = prev_rows > 0 && n == prev_rows && bottom >= n as u16;
         if inplace_ok {
@@ -612,27 +674,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // (bottom - n + 1 ..= bottom). Update model state by
             // swapping the trailing slice; then walk each terminal row
             // with a position + erase + write triple.
-            //
-            // view_mode guard: when the user has scrolled up, the body
-            // region on screen shows scrolled-back content, NOT the
-            // inflight rows. Writing CUP+EL+content to those screen
-            // rows would clobber what the user is reading. Keep the
-            // buffer in sync (so exit-view repaint shows the latest
-            // spinner state) but skip the terminal write.
             let keep = self.body_lines.len().saturating_sub(prev_rows);
             self.body_lines.truncate(keep);
             let first = bottom - n as u16 + 1;
             for row in &new_rows {
                 self.body_lines.push(row.clone());
             }
-            if !self.view_mode {
-                for (i, row) in new_rows.iter().enumerate() {
-                    let r = first + i as u16;
-                    let seq = format!("\x1b[{};1H\x1b[2K", r);
-                    let _ = self.out.write_all(seq.as_bytes());
-                    let bytes = serialize_row(row);
-                    let _ = self.out.write_all(&bytes);
-                }
+            for (i, row) in new_rows.iter().enumerate() {
+                let r = first + i as u16;
+                let seq = format!("\x1b[{};1H\x1b[2K", r);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(row);
+                let _ = self.out.write_all(&bytes);
             }
         } else {
             // First render or row-count mismatch — fall back to scroll-push.
@@ -686,11 +739,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Top-rule variant that may overlay a session-name pill on the
-    /// right side. Mirrors the alt-screen renderer's top-rule overlay
-    /// so both render paths show CC-style per-conversation badge. The
+    /// right side. Produces the CC-style per-conversation badge. The
     /// bot_rule keeps using `build_rule_row` (no badge there).
     ///
-    /// Budget mirrors `alt_screen::paint_footer`:
+    /// Budget:
     ///   right_margin  = 2 cells
     ///   pill_padding  = 2 cells (one space each side of the name)
     ///   min_rule_left = 8 cells (keep some ─ on the left so the box
@@ -1048,7 +1100,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || self.status.hint.is_some();
         let status_rows = if has_status { 1 } else { 0 };
         let total_rows = 1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows;
-        let footer_top = h.saturating_sub(total_rows);
+        // Append-only: footer sits directly below the last body row,
+        // not pinned to the screen bottom. `body_lines.len()` is the
+        // row offset (0-indexed) of the next free row; the footer
+        // starts there. When body+footer would exceed screen height,
+        // the cap kicks in and the footer pins to `h - total_rows` —
+        // the terminal's native scrollback absorbs any further body
+        // growth via the LF in `emit_body_line_inner`.
+        let body_rows_on_screen = self.body_lines.len().min(h.saturating_sub(total_rows));
+        let footer_top = body_rows_on_screen;
 
         // Pre-build every row vector (immutable borrows of self).
         let top_rule = self.build_top_rule_with_badge(
@@ -1189,22 +1249,98 @@ impl<W: Write + Send> RetainedRenderer<W> {
         1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows
     }
 
-    /// Single-entry-point for painting a full frame. Body is already
-    /// on-screen (written append-style by `emit_body_line`), so the
-    /// frame paint just refreshes the footer strip + DECSTBM region.
+    /// Single-entry-point for painting a full frame. Append-only
+    /// model: body is also painted into screen cells (in addition to
+    /// being emitted via `\n` for scrollback), so the cell-diff
+    /// stays consistent when the footer shifts row position as body
+    /// grows. Without this, the cell-diff would emit blanks at the
+    /// rows where prior footer cells lived — wiping the body row
+    /// we just wrote there.
     fn paint_frame(&mut self) {
-        self.ensure_scroll_region();
+        self.paint_body_into_cells();
         self.paint_footer();
     }
 
-    /// 1-indexed row of the bottom line of the body area (= top of
-    /// the footer strip minus 1). `0` means "footer occupies the
-    /// whole viewport" — in that pathological case we skip body
-    /// emit entirely rather than clobber the footer.
+    /// Append-only model: copy the body_lines tail into screen.cells
+    /// at rows `[0, body_rows_on_screen)`. Width-clipped to the
+    /// effective body width so wide rows don't bleed into the
+    /// scrollbar column. Mirrors the geometry math in `paint_footer`
+    /// so the body+footer together exactly span `[0, body_rows + total_rows)`.
+    fn paint_body_into_cells(&mut self) {
+        let w = self.screen.width() as usize;
+        let h = self.screen.height() as usize;
+        if h == 0 || w == 0 || self.body_lines.is_empty() {
+            return;
+        }
+        let footer_rows = self.current_footer_rows();
+        let body_height = h.saturating_sub(footer_rows);
+        if body_height == 0 {
+            return;
+        }
+        let total = self.body_lines.len();
+        let visible = total.min(body_height);
+        let start = total - visible;
+        let body_width = self.effective_body_width();
+        // Extract selection bounds before the draw loop. Doing the
+        // overlay here (rather than as a separate raw-stdout write in
+        // `repaint_body_region`) keeps the cell grid in sync with what
+        // is on the physical terminal: the cell-diff then naturally
+        // emits both the reverse-video on selection cells AND the
+        // un-reverse patches when the selection clears. The previous
+        // direct-write path left `screen.prev_cells` blank for the
+        // selection's space cells (Cell::blank() equals Cell::blank()
+        // regardless of what reverse-video we just painted to stdout),
+        // so subsequent diffs skipped the un-reverse patch and the
+        // stuck blocks remained visible — see regression test
+        // `retained_selection_clears_residual_reverse_on_blank_cells`.
+        let sel_bounds = self.selection.selection.map(|s| {
+            if s.anchor < s.head {
+                (s.anchor, s.head)
+            } else {
+                (s.head, s.anchor)
+            }
+        });
+        // Clone the slice before drawing — `screen.draw_row` takes
+        // &mut self.screen and the iteration would otherwise double-
+        // borrow.
+        let rows: Vec<Vec<Cell>> = self.body_lines[start..].to_vec();
+        for (i, row) in rows.iter().enumerate() {
+            let mut clipped = clip_cells_to_width(row, body_width);
+            if let Some((lo, hi)) = sel_bounds {
+                let body_idx = start + i;
+                apply_selection_overlay(&mut clipped, body_idx, lo, hi);
+            }
+            self.screen.draw_row(i, 0, &clipped);
+        }
+    }
+
+    /// 1-indexed row where the LAST EXISTING body row sits on
+    /// screen. `0` means "no body rows on screen yet" — callers
+    /// that operate on the existing tail (live spinner update,
+    /// commit_inflight_tool erase, etc.) should treat 0 as
+    /// "nothing to do".
+    ///
+    /// Append-only model: body grows downward from row 0 until it
+    /// hits the viewport cap (`h - footer_rows`); past that, the
+    /// terminal's native scrollback absorbs new rows so the last
+    /// visible row always sits at `min(body_lines.len(), h - footer_rows)`.
     fn body_bottom_row(&self) -> u16 {
         let h = self.screen.height() as usize;
         let footer_rows = self.current_footer_rows();
-        h.saturating_sub(footer_rows) as u16
+        let cap = h.saturating_sub(footer_rows);
+        self.body_lines.len().min(cap) as u16
+    }
+
+    /// 1-indexed row where the NEXT body emit would land. When the
+    /// body still has room, this is `body_lines.len() + 1`. Once
+    /// the body fills the viewport, this saturates at the cap so
+    /// the LF in `emit_body_line_inner` triggers terminal-native
+    /// scrolling (the oldest visible row promotes to scrollback).
+    fn next_body_emit_row(&self) -> u16 {
+        let h = self.screen.height() as usize;
+        let footer_rows = self.current_footer_rows();
+        let cap = h.saturating_sub(footer_rows);
+        (self.body_lines.len() + 1).min(cap) as u16
     }
 
     /// Effective body width: paint reserves the rightmost column for
@@ -1215,8 +1351,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// continuation cell makes the cluster render as mojibake).
     ///
     /// We reserve based on `show_scrollbar` alone (not on runtime
-    /// overflow) to match `effective_body_width` semantics in
-    /// `alt_screen.rs` — the small predictability win of always-reserve
+    /// overflow) — the small predictability win of always-reserve
     /// is worth one col of body area when scrollbar is on but content
     /// hasn't overflowed yet.
     fn effective_body_width(&self) -> usize {
@@ -1228,229 +1363,135 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Sync the terminal's DECSTBM scroll region with the current
-    /// body_bottom. Called at the top of `paint_frame` and before
-    /// every body-line emit so `\n` in `emit_body_line` only scrolls
-    /// the body strip — the footer stays pinned below.
+    /// Append-only model: emit one body row via the
+    /// "CUP-to-footer-top → erase-to-end-of-screen → write-row + LF"
+    /// cycle. The cursor before this call is somewhere inside the
+    /// footer (parked there by the last `paint_footer` →
+    /// `render_diff`), so we use ABSOLUTE CUP — relative moves would
+    /// land at the wrong row.
     ///
-    /// When the footer grows (body shrinks), we just shrink the
-    /// region: the footer's own cell-diff paint will overwrite any
-    /// body text that now lives in footer rows. When the footer
-    /// shrinks (body grows), rows that were formerly footer need
-    /// a physical wipe — easier to just clear+reflow the body
-    /// tail than to track which rows dirty; viewport-only clear
-    /// preserves scrollback.
-    fn ensure_scroll_region(&mut self) {
-        let bottom = self.body_bottom_row();
-        if bottom == 0 {
-            // Footer fills the viewport; release any region so
-            // subsequent paints behave like classic full-screen.
-            if self.scroll_region_bottom.is_some() {
-                let _ = self.out.write_all(b"\x1b[r");
-                self.scroll_region_bottom = None;
-            }
-            return;
-        }
-        if self.scroll_region_bottom == Some(bottom) {
-            return;
-        }
-        // Capture the old region bottom BEFORE swapping in the new
-        // value — needed by the repaint branch below to know which
-        // rows may still hold stale body glyphs.
-        let prev_bottom = self.scroll_region_bottom;
-        let changed = matches!(prev_bottom, Some(prev) if prev != bottom);
-        // Set the new region. 1-indexed, inclusive: `\x1b[1;N r`.
-        // Pre-format into one buffer so the write hits the stream as
-        // a single call — BufWriter's `write!` can fragment into 3-4
-        // tiny write calls otherwise (Display adapter path), which
-        // the chunk-counting test harness then observes as separate
-        // "chunks" below the 512 B threshold.
-        let seq = format!("\x1b[1;{}r", bottom);
-        let _ = self.out.write_all(seq.as_bytes());
-        self.scroll_region_bottom = Some(bottom);
-        if changed {
-            // Region shifted (footer grew or shrank). The visible
-            // body rows are now misaligned with body_lines — either
-            // stale body glyphs sit in what are now footer rows, or
-            // new blank rows opened up above the footer. Repaint
-            // the body in place so the viewport matches body_lines.
-            //
-            // CRITICAL — two constraints that together rule out the
-            // obvious "2J + re-emit" approach:
-            //
-            //  1. No `\n`-based re-emit. `emit_body_line_inner` writes
-            //     LF at region bottom, which promotes the region-top
-            //     row into scrollback on every call. Each cached body
-            //     row already scrolled into scrollback once during its
-            //     original emit; re-emitting via LF here duplicates
-            //     those rows in scrollback (user report: "往上翻会看
-            //     到重复内容残留" after `/model`).
-            //
-            //  2. No `\x1b[2J`. macOS Terminal.app, iTerm2, and xterm
-            //     with `cbScrollback` copy every non-blank visible row
-            //     into scrollback when processing ED. That means the
-            //     very first footer-height transition after startup
-            //     (status line appears, body_bottom shrinks by 1)
-            //     shoves the whole welcome banner into scrollback
-            //     before we get a chance to repaint it (user report:
-            //     "首次启动都出现了两次，上面的不带输入框").
-            //
-            // Instead: paint the tail of body_lines at absolute
-            // positions with per-row EL (`\x1b[K`) for any stale
-            // content, invalidate the cell cache so the footer diff
-            // repaints rows fresh below body_bottom, and explicitly
-            // erase the narrow "transition zone" — rows that changed
-            // zone between old and new layouts and can't rely on
-            // either writer to clean them:
-            //
-            //  * SHRINK: rows (new_bottom+1)..=prev_bottom were body,
-            //    now footer. Footer diff would paint blank cells for
-            //    those rows (e.g., the spinner slot when no spinner
-            //    is active), but invalidated prev_cells are also
-            //    blank → diff skips blank→blank and stale body
-            //    glyphs persist. Symptom of the first-startup bug:
-            //    welcome's last row "leaks" into the spinner slot.
-            //
-            //  * GROW: rows (prev_body_top)..(new_body_top) were the
-            //    top of the old body but now sit above the new body
-            //    anchor and aren't covered by either painter
-            //    ("zombie zone" — fixed the `/` then Esc ghost
-            //    regression).
-            //
-            // Per-row EL is row-local (no scroll, no ED) so it can't
-            // leak content into scrollback the way `\x1b[2J` does on
-            // macOS Terminal.app / iTerm2.
-            let cap = bottom as usize;
-            let total = self.body_lines.len();
-            let start = total.saturating_sub(cap);
-            let visible_count = total - start;
-
-            if let Some(prev) = prev_bottom.map(|v| v as usize) {
-                // Erase the union of old and new footer regions
-                // (rows min(prev,cap)+1 ..= h).
-                //
-                // Why the full union: the footer writer after this
-                // runs `invalidate()` (prev_cells all blank) and
-                // then only emits patches where new cells differ
-                // from blank. `pad_row_to_width` fills middle /
-                // spinner / absent-menu rows with default-style
-                // blanks — those match prev blanks → no erase
-                // patches. Meanwhile the terminal still holds the
-                // prior frame's top_rule / bot_rule `─`-filled
-                // cells at rows that are now blank in the new
-                // layout.
-                //
-                // Two symptoms this protects against:
-                //   * SHRINK: `❯ 1─────` — new middle content sits
-                //     at an absolute row that used to be top_rule;
-                //     the rule tail bleeds through.
-                //   * GROW: Shift+Enter then delete leaves an
-                //     extra ─── line above the input box — the
-                //     old top_rule row lands on the new spinner
-                //     slot (paint_footer writes a blank row there
-                //     when no spinner is active), cell diff sees
-                //     blank→blank, stale rule persists.
-                //
-                // Cost: a small handful of CUP+EL pairs per footer
-                // resize (not per frame). EL is row-local → no
-                // scroll, no scrollback pollution.
-                let screen_h = self.screen.height() as usize;
-                let transition_start = prev.min(cap) + 1;
-                for row in transition_start..=screen_h {
-                    let seq = format!("\x1b[{};1H\x1b[K", row);
-                    let _ = self.out.write_all(seq.as_bytes());
-                }
-
-                // Grow case only: the "zombie zone" above the new
-                // body anchor — rows that held the top of the old
-                // body but sit above the new body position and
-                // aren't covered by either body paint or footer
-                // diff. Fixed the menu-close ghost welcome
-                // regression.
-                if prev < cap && visible_count > 0 {
-                    let prev_body_top = prev.saturating_sub(visible_count) + 1;
-                    let new_body_top = cap.saturating_sub(visible_count) + 1;
-                    if prev_body_top < new_body_top {
-                        for row in prev_body_top..new_body_top {
-                            let seq = format!("\x1b[{};1H\x1b[K", row);
-                            let _ = self.out.write_all(seq.as_bytes());
-                        }
-                    }
-                }
-            }
-
-            self.screen.invalidate();
-
-            // view_mode guard: paint_body owns the body region from
-            // viewport_top..viewport_top+body_height and would clobber
-            // whatever we write here. Skip the tail-anchored repaint
-            // — paint_body's next call will refresh the viewport based
-            // on the new region geometry. Without this guard, slash-
-            // menu open / model change / spinner-row appearance during
-            // scroll-up overwrite the scrolled view.
-            if !self.view_mode {
-                let start_row = (cap - visible_count) as u16 + 1;
-                // Clone once; serialize_row borrows immutably, the
-                // write borrows &mut self.out which is disjoint from
-                // body_lines.
-                let rows: Vec<Vec<Cell>> = self.body_lines[start..].to_vec();
-                for (i, row) in rows.iter().enumerate() {
-                    let seq = format!("\x1b[{};1H\x1b[K", start_row + i as u16);
-                    let _ = self.out.write_all(seq.as_bytes());
-                    let bytes = serialize_row(row);
-                    let _ = self.out.write_all(&bytes);
-                }
-                // Park the cursor at the bottom of the body region so
-                // the next `emit_body_line_inner` (with `\n` at bottom)
-                // behaves the same as if the region had been stable all
-                // along.
-                let seq = format!("\x1b[{};1H", bottom);
-                let _ = self.out.write_all(seq.as_bytes());
-            }
-        }
-    }
-
-    /// Write one body row to stdout at the bottom of the scroll
-    /// region, scrolling the region up one line (oldest line enters
-    /// scrollback, DECSTBM contains the scroll to the body strip).
-    /// Assumes `ensure_scroll_region` has already set the region.
+    /// The `bottom` parameter is retained for source compatibility
+    /// with callers (`push_body_row`, `resume_from_external` body
+    /// re-emit) but unused in the new model — position is computed
+    /// from `body_lines.len()` and the screen geometry.
     ///
-    /// When `skip_body_scroll_count` is non-zero (see `pop_approval_prompt`),
-    /// the LF is skipped — the new row overwrites whatever was sitting
-    /// at body_bottom (typically the freshly-popped approval prompt)
-    /// so the visual flow `▸ Tool` → `⎿ result` has no gap.
-    fn emit_body_line_inner(&mut self, row: &[Cell], bottom: u16) {
-        if self.view_mode {
-            // In view_mode the body_lines buffer is the source of truth and
-            // paint_body repaints from buffer. Don't write to terminal here —
-            // we'd overwrite scrolled-away content.
-            return;
-        }
-        // `\x1b[K` (EL — erase from cursor to end of line) runs AFTER
-        // reposition and BEFORE writing the row. ECMA-48 says SU at
-        // bottom of a scroll region must blank the new bottom row, but
-        // Terminal.app and iTerm2 both leave stale cells there when the
-        // source content was wider than the new row. Without the
-        // explicit erase, short rows (e.g., "> hi", "(cancelled)", an
-        // empty spacer) let the previous row's tail bleed through —
-        // classic symptom was `/provider  to add a custom model` from
-        // the welcome banner leaking past shorter subsequent rows.
+    /// `skip_body_scroll_count` is consumed (decremented) so callers
+    /// that set it stay backwards-compatible, but the value no
+    /// longer changes behaviour: in append-only mode, popping rows
+    /// from `body_lines` (the trigger that arms `skip_body_scroll_count`
+    /// in `pop_approval_prompt` / `commit_inflight_tool`) naturally
+    /// shrinks the body region, and subsequent pushes naturally
+    /// fill the freed slots via the next `paint_frame` cell-diff.
+    /// The field will be deleted in a follow-up cleanup commit.
+    fn emit_body_line_inner(&mut self, row: &[Cell], _bottom: u16) {
         if self.skip_body_scroll_count > 0 {
-            // In-place overwrite: position + erase, no LF (so the
-            // body region isn't shifted up; the prior approval prompt
-            // at body_bottom gets replaced cleanly). Each skipped
-            // scroll closes one row of the gap left by
-            // pop_approval_prompt.
-            let target = bottom.saturating_sub(self.skip_body_scroll_count - 1);
-            let seq = format!("\x1b[{};1H\x1b[K", target);
-            let _ = self.out.write_all(seq.as_bytes());
             self.skip_body_scroll_count -= 1;
-        } else {
-            let seq = format!("\x1b[{};1H\n\x1b[{};1H\x1b[K", bottom, bottom);
-            let _ = self.out.write_all(seq.as_bytes());
         }
+        let h = self.screen.height() as usize;
+        let footer_rows = self.current_footer_rows();
+        if h == 0 {
+            return;
+        }
+        let cap = h.saturating_sub(footer_rows);
+        if cap == 0 {
+            // Footer fills the entire viewport — no room for body.
+            return;
+        }
+        // Live scrollback feed: when this push would put body_lines.len()
+        // above the visible cap, the oldest currently-visible row must
+        // leave the viewport. Without help, the cell-diff just overwrites
+        // it in place — the row vanishes without ever entering the host
+        // terminal's native scrollback, so `cmd+↑` / mouse-wheel during
+        // the session show nothing above the atomcode frame.
+        //
+        // Fix: position the cursor at the absolute last screen row and
+        // emit LF. Terminals interpret LF at the bottom row as "scroll
+        // the entire visible area up by 1, the row that was at the top
+        // enters scrollback, the bottom row becomes blank". The cursor
+        // lands at (h, 1) afterwards.
+        //
+        // The internal cells / prev_cells cache must mirror this
+        // shift, otherwise the next paint_frame's cell-diff treats the
+        // shift as "the whole frame moved" and emits a redundant
+        // full-frame redraw. `screen.shift_prev_up(1)` performs the
+        // same logical rotate on prev_cells so the diff stays small
+        // (only the slot where the new body row lands plus the freshly
+        // re-laid-out footer differ).
+        //
+        // `body_lines.len() >= cap` is the entry condition because
+        // `push_body_row` calls `emit_body_line_inner` BEFORE pushing
+        // the new row. With len == cap-1, the push lands at index
+        // cap-1 (still inside the visible region). With len == cap,
+        // the push would land at index cap (just past the visible
+        // region) — at that exact moment the oldest visible row
+        // (index 0 in the visible tail = `body_lines[len-cap]`) needs
+        // to scroll out.
+        let overflow = self.body_lines.len() >= cap;
+        if overflow {
+            let scroll_seq = format!("\x1b[{};1H\n", h);
+            let _ = self.out.write_all(scroll_seq.as_bytes());
+            self.screen.shift_prev_up(1);
+        }
+        // 1-indexed row where the NEW body line should land on the
+        // physical terminal. Two cases:
+        //
+        //   - Non-overflow (body still has room): the new row goes at
+        //     the next-empty body slot = `body_lines.len() + 1`.
+        //     `footer_top_1idx` equals this value because the footer
+        //     sat directly below the previous tail.
+        //
+        //   - Overflow: the bottom-LF scroll above shifted the entire
+        //     visible area UP by 1, so the old footer's top_rule no
+        //     longer sits at `cap + 1` — it sits at `cap`. The new
+        //     body row should land at `cap` (the freshly-blanked
+        //     bottom-most body slot, i.e. just above where the new
+        //     footer will repaint to). Writing at `cap + 1` here
+        //     (the pre-fix formula) put the new row UNDER where the
+        //     body's last visible slot should be — paint_frame's
+        //     cell-diff then re-emitted the same row at `cap`, but
+        //     the original ghost write at `cap + 1` survived as
+        //     stale glyphs at columns the cell-diff's prev-cells
+        //     pair (after shift_prev_up) considered blank-vs-blank,
+        //     so no overwrite patch fired. Net effect: every
+        //     overflow-pushed row appeared TWICE — once at its
+        //     intended position via the cell-diff, and once at the
+        //     ghost row(s) above it that successive overflow shifts
+        //     pushed up into the visible body region.
+        //     See regression test `retained_overflow_does_not_duplicate_last_body_row`.
+        let target_1idx = if overflow {
+            cap as u16
+        } else {
+            (self.body_lines.len() + 1) as u16
+        };
+        // CUP to target → ED 0 (erases everything from target down,
+        // freeing the rows below for the new body line + the
+        // follow-up cell-diff's footer rewrite). Pre-format into one
+        // buffer so the write hits stdout as one call — the
+        // chunk-counting test harness asserts on chunk boundaries.
+        let seq = format!("\x1b[{};1H\x1b[0J", target_1idx);
+        let _ = self.out.write_all(seq.as_bytes());
+        // Write the body row at target, then LF. The LF advances cursor
+        // within the screen (no scroll) because target is always
+        // strictly less than `h` (cap < h since footer_rows >= 1).
         let bytes = serialize_row(row);
         let _ = self.out.write_all(&bytes);
+        let _ = self.out.write_all(b"\n");
+        // ED 0 above blanked the physical terminal from `target_1idx`
+        // down — but `screen.prev_cells` still holds whatever was there
+        // last frame. Without resyncing, the next `render_diff` may
+        // suppress a patch for a row whose newly-laid-out cells happen
+        // to be byte-equal to the now-stale prev cells (the classic
+        // case: the new footer's top_rule lining up with the old
+        // footer's bot_rule — both are full rows of `─` in identical
+        // style, so the diff sees "no change" and emits nothing, but
+        // the physical terminal is blank there because the ED 0 wiped
+        // it). Resync prev_cells to mirror the ED so the diff sees the
+        // real delta and emits the necessary patches.
+        let footer_top_0idx = target_1idx.saturating_sub(1) as usize;
+        self.screen.invalidate_rows_from(footer_top_0idx);
+        // Mark dirty so the next 5ms `paint_frame` tick redraws
+        // the footer below the new body row via the cell-diff path.
+        self.dirty = true;
     }
 
     /// Erase the live spinner if one is active: pop the transient
@@ -1474,18 +1515,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.live_spinner_active = false;
         // The cursor will be re-shown on the next paint_footer (which
         // sees live_spinner_active=false and calls set_cursor_visible(true)).
+        // After pop, the spinner row's screen slot is `next_body_emit_row`
+        // (1-indexed) — that's where the spinner was and where the next
+        // body emit will land. EL it now for immediate visual feedback;
+        // the next `paint_frame` cell-diff also redraws this region but
+        // the explicit erase removes any flash between pop and next tick.
         self.body_lines.pop();
-        // Skip terminal write in view_mode — paint_body owns the body
-        // region; writing CUP+EL here would overwrite the scrolled content
-        // at body_bottom_row().  The buffer cleanup above still runs so the
-        // buffer is correct when the user exits view_mode.
-        if self.view_mode {
-            return true;
-        }
-        self.ensure_scroll_region();
-        let bottom = self.body_bottom_row();
-        if bottom > 0 {
-            let seq = format!("\x1b[{};1H\x1b[K", bottom);
+        let target = self.next_body_emit_row();
+        if target > 0 {
+            let seq = format!("\x1b[{};1H\x1b[K", target);
             let _ = self.out.write_all(seq.as_bytes());
         }
         true
@@ -1509,20 +1547,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // unrelated row that took the group child's screen position.
         self.live_group = None;
         if self.clear_live_spinner() {
-            // In-place overwrite at `body_bottom` — `emit_body_line_inner`
-            // honours this flag to skip its LF and just CUP+EL+write at
-            // the current bottom row. That way the slot previously held
-            // by the spinner becomes the slot for this new body row,
-            // with no intervening blank line.
+            // `clear_live_spinner` already popped the spinner row from
+            // `body_lines`. In append-only mode the next emit naturally
+            // lands in the freed slot (footer_top shifted up by 1, the
+            // new row pushes it back down). `skip_body_scroll_count`
+            // remains armed for source-compat with callers that consult
+            // it; its decrement path is now a no-op (kept to avoid a
+            // bigger refactor in this combined commit).
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
         }
-        // Region might be stale (first call after resume, or footer
-        // just changed); sync before emit so the LF in emit_body_line
-        // scrolls only within the body strip.
-        self.ensure_scroll_region();
-        let bottom = self.body_bottom_row();
-        if bottom > 0 {
-            self.emit_body_line_inner(&row, bottom);
+        // Append-only: `next_body_emit_row` checks the cap; emit is
+        // a no-op when the footer occupies the whole viewport.
+        // Unlike the old DECSTBM model we always emit on the first
+        // push (no `bottom > 0` short-circuit) because emit_body_line
+        // computes its own target row from `body_lines.len()`.
+        if self.next_body_emit_row() > 0 {
+            self.emit_body_line_inner(&row, 0);
         }
         self.body_lines.push(row);
         if self.body_lines.len() > MAX_SCROLLBACK_ROWS {
@@ -1540,14 +1580,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// (i.e. the index the NEXT `push_body_row` will occupy).
     /// Called before any push in the render arm that starts a new message.
     fn mark_message(&mut self, kind: crate::render::MarkKind) {
-        // retained doesn't soft-wrap into multiple body rows (each
-        // build_one_row produces exactly one Vec<Cell>), so raw_idx
-        // mirrors line_idx. The field exists for alt_screen's reflow
-        // path — see render/mod.rs MessageMark doc.
         let line_idx = self.body_lines.len();
         self.message_marks.push(crate::render::MessageMark {
             line_idx,
-            raw_idx: line_idx,
             kind,
         });
     }
@@ -1564,13 +1599,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             if let Some(last) = self.body_lines.last_mut() {
                 *last = row_cells.clone();
             }
-            // Skip terminal write in view_mode — paint_body owns the body
-            // region and would otherwise see this CUP+EL overwrite the
-            // scrolled content at body_bottom_row().
-            if self.view_mode {
-                return;
-            }
-            self.ensure_scroll_region();
             let bottom = self.body_bottom_row();
             if bottom > 0 {
                 let seq = format!("\x1b[{};1H\x1b[K", bottom);
@@ -1615,20 +1643,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // push_body_prefixed appends fresh committed lines.
             self.live_spinner_active = false;
             let remove = self.inflight_tool_rows.min(self.body_lines.len());
+            // CRITICAL: capture the bottom row BEFORE truncating. With
+            // the top-anchored body model, `body_bottom_row()` returns
+            // `min(body_lines.len(), cap)` — calling it AFTER truncate
+            // would point at the LAST `remove` rows of REMAINING body
+            // content (the rows just above the inflight strip), which
+            // erases real markers instead of the spinner rows we meant
+            // to clear. The pre-truncate bottom is the 1-idx terminal
+            // row of the LAST inflight row, exactly what we want.
+            let bottom_before_truncate = self.body_bottom_row();
             self.body_lines.truncate(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
-            self.ensure_scroll_region();
-            let bottom = self.body_bottom_row();
-            if bottom > 0 && remove > 0 {
+            if bottom_before_truncate > 0 && remove > 0 {
                 // Erase ALL terminal rows previously occupied by the
                 // inflight spinner (may be >1 when the command was long
                 // enough to wrap). Without this, the old `⠙ Bash(...)`
                 // row lingers on-screen above the freshly committed
                 // `● Bash(...)` row, producing a visual duplicate.
-                let start_row = bottom.saturating_sub(remove as u16 - 1).max(1);
-                let mut seq = String::with_capacity((bottom - start_row + 1) as usize * 8);
+                let start_row = bottom_before_truncate
+                    .saturating_sub(remove as u16 - 1)
+                    .max(1);
+                let mut seq =
+                    String::with_capacity((bottom_before_truncate - start_row + 1) as usize * 8);
                 use std::fmt::Write as _;
-                for row in start_row..=bottom {
+                for row in start_row..=bottom_before_truncate {
                     let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
                 }
                 let _ = self.out.write_all(seq.as_bytes());
@@ -1658,11 +1696,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Copy the visible body tail into the host terminal's native
-    /// scrollback before we wipe the viewport on exit. Retained mode
-    /// keeps the newest body rows pinned on screen behind a fixed
-    /// footer; those rows have not naturally scrolled off yet, so a
-    /// plain viewport clear would make the bottom of the transcript
-    /// disappear after `/quit`.
+    /// scrollback before we wipe the viewport on exit. Append-only
+    /// model: body lives at the top of the viewport, so we repaint
+    /// the tail at rows [1..=n], position the cursor at the bottom
+    /// row of the terminal, and emit N LFs — each LF pushes the
+    /// top row of the visible viewport into scrollback. After this
+    /// runs `shutdown` proceeds to wipe the (now mostly blank)
+    /// viewport, so it's fine that the footer also scrolls off.
     fn promote_visible_body_to_scrollback(&mut self) {
         let bottom = self.body_bottom_row() as usize;
         if bottom == 0 || self.body_lines.is_empty() {
@@ -1672,7 +1712,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let screen_w = self.screen.width() as usize;
         let screen_h = self.screen.height() as usize;
         let n = self.body_lines.len().min(bottom);
-        if n == 1 && screen_h < 2 {
+        if n == 0 {
             return;
         }
         let start = self.body_lines.len() - n;
@@ -1681,30 +1721,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .map(|row| clip_cells_to_width(row, screen_w))
             .collect();
 
-        // Repaint the visible transcript tail at the top of a temporary
-        // top-anchored scroll region, then LF each row out of that
-        // region. Top-anchored DECSTBM is the path terminals promote
-        // into native scrollback; absolute repainting itself has no
-        // scrollback side effect.
-        let region_bottom = if n == 1 { 2 } else { n } as u16;
-        let seq = format!("\x1b[1;{}r", region_bottom);
-        let _ = self.out.write_all(seq.as_bytes());
+        // Repaint the tail at the top of the viewport (rows 1..=n).
         for (i, row) in rows.iter().enumerate() {
             let seq = format!("\x1b[{};1H\x1b[K", i + 1);
             let _ = self.out.write_all(seq.as_bytes());
             let bytes = serialize_row(row);
             let _ = self.out.write_all(&bytes);
         }
-        if region_bottom as usize > n {
-            let seq = format!("\x1b[{};1H\x1b[K", region_bottom);
-            let _ = self.out.write_all(seq.as_bytes());
-        }
-        let seq = format!("\x1b[{};1H", region_bottom);
+        // Park the cursor at the very bottom row of the terminal,
+        // then emit N LFs. Each LF at the screen's last row triggers
+        // a full-viewport scroll: the topmost row enters scrollback.
+        // After N LFs all the rows we just painted have promoted.
+        let park = screen_h.max(1) as u16;
+        let seq = format!("\x1b[{};1H", park);
         let _ = self.out.write_all(seq.as_bytes());
         for _ in 0..n {
             let _ = self.out.write_all(b"\n");
         }
-        self.scroll_region_bottom = Some(region_bottom);
     }
 
     /// Wrap `text` to content width and push each wrapped chunk as
@@ -2178,7 +2211,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
 
         // Trailing blank so subsequent async events (MCP "已连接",
         // upgrade hints, etc.) don't butt up against the hint row.
-        // Mirrors alt_screen's push_welcome trailing blank.
         rows.push(Vec::new());
 
         rows
@@ -2208,11 +2240,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Force a fresh paint of body region rows from body_lines.
-    /// In view_mode: paint body_lines[viewport_top..viewport_top+body_height].
-    /// Out of view_mode (just exited): paint body_lines tail.
-    /// Always uses CUP+EL+content per row; never emits LF.
-    /// Rows that fall within the active selection are rendered with reverse-video
-    /// highlight via `render_line_with_selection`.
+    /// Always paints the body_lines tail (terminal-native scrollback handles
+    /// vertical navigation after the append-only refactor).
+    ///
+    /// Selection highlight is applied by `paint_body_into_cells` via
+    /// `apply_selection_overlay`, so the cell-diff is the SOLE source of
+    /// truth for body painting — earlier revisions of this function wrote
+    /// per-row CUP+EL+highlighted content directly to `out` first and then
+    /// let the diff run on top, which left stuck reverse-video on blank
+    /// cells because `Cell::blank()` == `Cell::blank()` skipped the
+    /// un-reverse patch (see regression test
+    /// `retained_selection_clears_residual_reverse_on_blank_cells`). All
+    /// that's left here now is: optional right-edge scrollbar (still
+    /// written raw because the scrollbar column sits outside
+    /// `effective_body_width` and the diff never touches it), then a
+    /// full paint+diff cycle.
     fn repaint_body_region(&mut self) {
         let bottom = self.body_bottom_row();
         if bottom == 0 || self.body_lines.is_empty() {
@@ -2220,70 +2262,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let body_height = bottom as usize;
         let total = self.body_lines.len();
-        let start = if self.view_mode {
-            self.viewport_top.min(total.saturating_sub(1))
-        } else {
-            total.saturating_sub(body_height)
-        };
-        let end = (start + body_height).min(total);
-        // Extract selection bounds before the loop to avoid borrow conflicts.
-        use crate::render::selection::selection_col_range_for_line;
-        let sel = self.selection.selection.map(|s| {
-            if s.anchor < s.head {
-                (s.anchor, s.head)
-            } else {
-                (s.head, s.anchor)
-            }
-        });
-        // Use effective_body_width — same column budget as alt_screen,
-        // so a wide cluster never lands under the scrollbar column.
-        // `serialize_row_clipped` drops a cluster whole if it would
-        // straddle the budget; `render_line_with_selection` already
-        // honours its `max_cols` arg cluster-aware.
-        let body_width = self.effective_body_width();
-        // Clone the slice to avoid simultaneous borrow of self.
-        let rows: Vec<Vec<Cell>> = self.body_lines[start..end].to_vec();
-        for (i, row) in rows.iter().enumerate() {
-            let target_row = 1 + i as u16;
-            let seq = format!("\x1b[{};1H\x1b[K", target_row);
-            let _ = self.out.write_all(seq.as_bytes());
-            let body_idx = start + i;
-            let row_text: String = row.iter().filter(|c| c.width > 0).map(|c| c.ch).collect();
-            // If selection covers this row, emit with reverse-video highlight.
-            let sel_range = sel.and_then(|(lo, hi)| {
-                let lo_us = (lo.0, lo.1 as usize);
-                let hi_us = (hi.0, hi.1 as usize);
-                selection_col_range_for_line(body_idx, lo_us, hi_us, &row_text)
-            });
-            if let Some((sel_start, sel_end)) = sel_range {
-                let highlighted = crate::render::selection::render_line_with_selection(
-                    &row_text, body_width, sel_start, sel_end,
-                );
-                let _ = self.out.write_all(highlighted.as_bytes());
-            } else {
-                let bytes = serialize_row_clipped(row, body_width);
-                let _ = self.out.write_all(&bytes);
-            }
-        }
-        // Clear any rows below content (when body_lines is short).
-        for i in (end - start)..body_height {
-            let target_row = 1 + i as u16;
-            let seq = format!("\x1b[{};1H\x1b[K", target_row);
-            let _ = self.out.write_all(seq.as_bytes());
-        }
-        // Paint right-edge scrollbar (mirrors alt-screen paint_body logic).
-        // The scrollbar naturally overpaints whatever body content extended to
-        // the rightmost column — option (b) from the plan, acceptable for now.
-        let viewport_start = if self.view_mode {
-            self.viewport_top
-        } else {
-            total.saturating_sub(body_height)
-        };
+        // Paint right-edge scrollbar via raw stdout. The scrollbar column
+        // sits in `screen.width()` (1-indexed), i.e. one past
+        // `effective_body_width()`, so body cells never overlap with it
+        // and the cell-diff doesn't see it. After the append-only
+        // refactor we're always anchored at the bottom, so pass
+        // sticky_bottom=true unconditionally.
+        let viewport_start = total.saturating_sub(body_height);
         let scrollbar_shape = crate::render::scrollbar::compute(
             total,
             body_height,
             viewport_start,
-            self.sticky_bottom,
+            true,
             self.show_scrollbar,
         );
         if let Some(shape) = &scrollbar_shape {
@@ -2298,12 +2288,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let seq = format!("\x1b[{};{}H{}", target_row, scrollbar_col, glyph);
                 let _ = self.out.write_all(seq.as_bytes());
             }
+            let _ = self.out.flush();
         }
-        let _ = self.out.flush();
-        self.screen.invalidate();
         // Re-anchor the terminal cursor at the input prompt. Three-step
         // belt-and-suspenders:
-        //   (1) paint_frame writes footer cells (incl. screen.set_cursor)
+        //   (1) paint_frame writes body+footer cells (incl. screen.set_cursor)
         //   (2) render_diff emits patches + cursor CUP + visibility toggle
         //   (3) explicit final CUP to wherever set_cursor parked
         // The explicit final CUP exists because real-world iTerm2 was
@@ -2324,11 +2313,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.dirty = false;
     }
 
-    /// Convert terminal coordinates `(col, row)` (1-indexed row, 0-indexed col
-    /// matching mouse event coordinates) to body_lines coordinates
-    /// `(body_row_idx, col)`. Returns `None` when the position falls outside
-    /// the body region (row 0 is above the body, row > body_bottom is the
-    /// footer, body_row past body_lines end is empty space).
+    /// Convert terminal coordinates `(col, row)` (1-indexed row,
+    /// 0-indexed col — matching mouse event coordinates) into
+    /// body_lines coordinates `(body_row_idx, col)`. Returns `None`
+    /// when the position falls outside the body region (row 0 sits
+    /// above the body, row past `body_bottom_row` is inside the
+    /// footer, and rows past the last painted body line are empty).
+    ///
+    /// Append-only model: body is bottom-aligned within the visible
+    /// region — the last entry in `body_lines` always paints at
+    /// `body_bottom_row`. So mapping a screen row back to a body
+    /// index is just `(total - body_height) + (row - 1)`.
     fn screen_to_body(&self, col: u16, row: u16) -> Option<crate::render::selection::BodyPos> {
         let bottom = self.body_bottom_row();
         if row == 0 || row > bottom {
@@ -2336,38 +2331,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         let body_height = bottom as usize;
         let total = self.body_lines.len();
-        let viewport_start = if self.view_mode {
-            self.viewport_top
-        } else {
-            total.saturating_sub(body_height)
-        };
-        let body_row = viewport_start + (row - 1) as usize;
+        let start = total.saturating_sub(body_height);
+        let body_row = start + (row - 1) as usize;
         if body_row >= total {
             return None;
         }
         Some((body_row, col))
-    }
-
-    /// Exit view_mode unconditionally, restoring sticky-bottom state.
-    /// Call at the start of any operation that invalidates the current
-    /// viewport (reset, clear, resize, approval prompt).
-    fn exit_view_mode(&mut self) {
-        if self.view_mode {
-            self.view_mode = false;
-            self.sticky_bottom = true;
-            self.viewport_top = 0;
-        }
-    }
-
-    /// Jump the body viewport to an absolute line index, clamping to
-    /// max_top. Used by the scroll_to_prev/next_message family.
-    fn scroll_body_to(&mut self, target: usize) {
-        let body_height = self.body_bottom_row() as usize;
-        let max_top = self.body_lines.len().saturating_sub(body_height);
-        self.viewport_top = target.min(max_top);
-        self.sticky_bottom = self.viewport_top >= max_top;
-        self.view_mode = !self.sticky_bottom;
-        self.repaint_body_region();
     }
 }
 
@@ -2479,8 +2448,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // body text. Previously we used `Role::Muted`, but when
                 // MUTED_DARK was widened from SGR 90 → 37 (so tool-batch
                 // child rows stay readable on Warp dark), this rule lost
-                // its contrast against assistant text. Mirrors the SGR_DIM
-                // approach `alt_screen::build_turn_separator` already uses.
+                // its contrast against assistant text. Fix: keep fg at
+                // terminal default and only layer SGR 2 on top.
                 let rule = self.style_faint(Role::Secondary);
                 for _ in 0..left {
                     row.push(Cell {
@@ -2688,20 +2657,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     *slot = new_row.clone();
                 }
 
-                // view_mode guard: in scroll-up mode the body region
-                // shows scrolled-back content; writing the live-update
-                // CUP+EL to its absolute screen row would overwrite the
-                // user's view. Buffer above is already updated, so
-                // paint_body will show the latest state on exit.
-                if self.view_mode {
-                    return;
-                }
-
                 // Compute terminal row position. body_bottom_row is the
                 // bottom of the visible body strip; the live-group
                 // children sit just above it. body_lines maps to
                 // terminal rows from `body_bottom - (len-1)` upwards.
-                self.ensure_scroll_region();
                 let bottom = self.body_bottom_row();
                 if bottom == 0 {
                     return;
@@ -2913,7 +2872,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
             // ── body: approval / errors / command output ──
             UiLine::ApprovalPrompt { tool, detail } => {
-                self.exit_view_mode();
                 let warn = self.style_bold(Role::Warning);
                 let plain = CellStyle::default();
                 let chip = |c: Color| CellStyle {
@@ -3016,8 +2974,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // attributes survive (e.g. the `/codingplan` red
                 // locked-model row). `push_body_text_sgr` parses
                 // those escapes into `CellStyle` mutations so the
-                // cell pipeline renders the same colours alt_screen
-                // and plain do.
+                // cell pipeline renders the same colours that the
+                // plain renderer streams to stdout.
                 let safe = crate::sanitize::scrub_controls_keep_sgr(&text);
                 self.push_body_text_sgr(&safe);
             }
@@ -3045,22 +3003,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // paragraph separation.
                 if self.body_lines.last().map_or(false, |r| r.is_empty()) {
                     self.body_lines.pop();
-                    // view_mode guard: in scroll-up the absolute bottom
-                    // row holds scrolled content. Erasing it here would
-                    // wipe the user's view. Also skip
-                    // skip_body_scroll_count — emit_body_line_inner
-                    // already short-circuits in view_mode, so the LF-
-                    // skip mechanism is irrelevant.
-                    if !self.view_mode {
-                        self.ensure_scroll_region();
-                        let bottom = self.body_bottom_row();
-                        if bottom > 0 {
-                            let seq = format!("\x1b[{};1H\x1b[K", bottom);
-                            let _ = self.out.write_all(seq.as_bytes());
-                        }
-                        self.skip_body_scroll_count =
-                            self.skip_body_scroll_count.saturating_add(1);
+                    let bottom = self.body_bottom_row();
+                    if bottom > 0 {
+                        let seq = format!("\x1b[{};1H\x1b[K", bottom);
+                        let _ = self.out.write_all(seq.as_bytes());
                     }
+                    self.skip_body_scroll_count =
+                        self.skip_body_scroll_count.saturating_add(1);
                 }
                 let body = format!("└ [Image #{}]", n);
                 self.push_body_text(&body, &self.style_for(Role::Muted));
@@ -3113,6 +3062,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // glyphs — so the first ▶ we encounter must be ours.
         // Safe because the agent doesn't append further body rows
         // between `ApprovalNeeded` and the user's Y/A/N reply.
+        //
+        // CRITICAL: capture `bottom` BEFORE the pop loop runs. In the
+        // top-anchored body model, `body_bottom_row()` returns
+        // `min(body_lines.len(), cap)` — calling it AFTER popping
+        // would point at the LAST `popped_count` rows of REMAINING
+        // body content (the rows just above the approval strip), so
+        // the erase would wipe real markers instead of the formerly-
+        // approval rows. Capture once, before mutating body_lines.
+        let bottom_before_pop = self.body_bottom_row();
         let mut popped_count: u16 = 0;
         loop {
             let action = match self.body_lines.last() {
@@ -3140,8 +3098,8 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             return;
         }
         // Physically wipe the popped rows for instant visual feedback
-        // on Y/A/N. The popped rows sat at the BOTTOM of the body
-        // region — terminal rows `bottom - popped_count + 1 ..= bottom`
+        // on Y/A/N. The popped rows occupied terminal rows
+        // `bottom_before_pop - popped_count + 1 ..= bottom_before_pop`
         // (1-indexed). Erase them row-by-row with `\x1b[K` (EL).
         //
         // Why per-row EL and not `\x1b[J` (ED from cursor): the cursor
@@ -3158,8 +3116,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // next body emit to overwrite in place (no scroll) so
         // `⎿ result` lands directly below the `● Tool` row with no
         // gap.
-        let bottom = self.body_bottom_row();
-        if bottom > 0 {
+        if bottom_before_pop > 0 {
             // Erase the popped body rows (may span multiple terminal
             // lines). Use per-row \x1b[K instead of \x1b[J to avoid
             // erasing the footer rows below the body strip.
@@ -3169,10 +3126,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             // repaint — leaving the footer permanently blank.
             // invalidate() below ensures the next flush_deferred()
             // emits a full repaint of every non-blank cell.
-            let start_row = bottom.saturating_sub(popped_count - 1).max(1);
-            let mut seq = String::with_capacity((bottom - start_row + 1) as usize * 8);
+            let start_row = bottom_before_pop.saturating_sub(popped_count - 1).max(1);
+            let mut seq = String::with_capacity((bottom_before_pop - start_row + 1) as usize * 8);
             use std::fmt::Write as _;
-            for row in start_row..=bottom {
+            for row in start_row..=bottom_before_pop {
                 let _ = write!(seq, "\x1b[{};1H\x1b[K", row);
             }
             let _ = self.out.write_all(seq.as_bytes());
@@ -3212,20 +3169,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if n == 0 {
             return;
         }
-        // body_lines tail is bottom-anchored: body_lines[i] sits at
-        // terminal row `bottom - n + i + 1` (1-indexed). Rows whose
-        // computed position would be <= 0 are already in scrollback.
+        // Append-only top-anchored: body_lines[i] sits at terminal
+        // row `i - (n - bottom) + 1` (1-indexed) where `bottom` is
+        // the visible body row count. When body hasn't overflowed
+        // (n <= bottom), every welcome line lives on-screen. When
+        // body has overflowed, welcome lines whose offset falls
+        // below the viewport top have scrolled past and aren't
+        // reachable for in-place refresh.
         let mut seq: Vec<u8> = Vec::with_capacity(self.welcome_line_count * 64);
         seq.extend_from_slice(b"\x1b7");
         let mut wrote = false;
+        let viewport_start = n.saturating_sub(bottom);
         for i in 0..self.welcome_line_count.min(n) {
-            // Saturating math: avoid underflow when n > bottom and i
-            // falls in the off-screen prefix. We *want* the result to
-            // be 0 in that case so the row is skipped below.
-            let abs = (bottom + i + 1).checked_sub(n).unwrap_or(0);
-            if abs == 0 {
+            if i < viewport_start {
+                // Welcome line has scrolled past the viewport top.
                 continue;
             }
+            let abs = (i - viewport_start) + 1;
             use std::io::Write as _;
             let _ = write!(&mut seq, "\x1b[{};1H\x1b[K", abs);
             let bytes = serialize_row(&self.body_lines[i]);
@@ -3234,22 +3194,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         seq.extend_from_slice(b"\x1b8");
         if wrote {
-            // view_mode guard: the absolute screen rows we'd target
-            // here currently show body content from viewport_top..,
-            // not the welcome banner (which is body_lines[0..K]). If
-            // viewport_top == 0 (rare — user scrolled to very top),
-            // paint_body will render the banner on its next pass from
-            // body_lines (which we already updated above). Either way,
-            // surgical absolute-row writes here clobber the wrong rows.
-            if !self.view_mode {
-                let _ = self.out.write_all(&seq);
-                let _ = self.out.flush();
-                // Cells on those rows now hold the new content —
-                // invalidate the diff cache so the next frame doesn't
-                // decide the row is unchanged based on the stale
-                // snapshot.
-                self.screen.invalidate();
-            }
+            let _ = self.out.write_all(&seq);
+            let _ = self.out.flush();
+            // Cells on those rows now hold the new content —
+            // invalidate the diff cache so the next frame doesn't
+            // decide the row is unchanged based on the stale
+            // snapshot.
+            self.screen.invalidate();
         }
         self.dirty = true;
     }
@@ -3296,12 +3247,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
-        self.scroll_region_bottom = None;
         let _ = self.out.flush();
     }
 
     fn reset(&mut self) {
-        self.exit_view_mode();
         // Terminal-side wipe + full state reset. `body_lines` is
         // also dropped so post-reset the screen truly starts clean
         // (old transcript stays in the terminal's own scrollback).
@@ -3317,11 +3266,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // builds and can promote visible rows to scrollback rather
         // than clearing. EL (`\x1b[K`) is row-local with no scroll
         // or scrollback semantics, so a CUP+EL per row is
-        // unambiguous everywhere (same technique as
-        // `ensure_scroll_region`'s resize path).
+        // unambiguous everywhere (same technique used by
+        // `on_resize` and `clear_screen`).
         //
-        // Release DECSTBM first so EL isn't constrained by the
-        // prior scroll region.
+        // Release DECSTBM first so EL isn't constrained by any
+        // scroll region a child process may have left set.
         let _ = self.out.write_all(b"\x1b[r");
         let h = self.screen.height() as usize;
         let mut seq = String::with_capacity(h * 8 + 8);
@@ -3336,8 +3285,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.assistant_line_buf.clear();
         self.md_state.reset();
         self.last_painted_footer_rows = 0;
-        self.scroll_region_bottom = None;
         let _ = self.out.flush();
+        // Force cold-start CUP+EL on next paint to wipe pre-reset stdout writes.
+        self.screen.invalidate();
     }
 
     fn clear_screen(&mut self) {
@@ -3350,10 +3300,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
 
     fn suspend_for_external(&mut self) {
         // Disable mouse capture so the external child process (OAuth browser,
-        // shell prompt, etc.) runs with a clean terminal state. Mirrors the
-        // disable order in alt_screen::leave_alt_screen: SGR first, then
-        // button-event. Mouse mode must be off before raw_mode is disabled,
-        // so the child process sees the terminal with mouse disabled.
+        // shell prompt, etc.) runs with a clean terminal state. Disable order:
+        // SGR first, then button-event. Mouse mode must be off before
+        // raw_mode is disabled, so the child process sees the terminal with
+        // mouse disabled.
         let _ = self.out.write_all(b"\x1b[?1006l\x1b[?1002l");
         #[cfg(windows)]
         if let Some(prior) = self.prior_console_in_mode.take() {
@@ -3379,7 +3329,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let position_row = body_bottom.saturating_add(1);
         let seq = format!("\x1b[r\x1b[{};1H\x1b[J\x1b[?7h", position_row);
         let _ = self.out.write_all(seq.as_bytes());
-        self.scroll_region_bottom = None;
         // Footer is wiped — record that so the next paint after
         // resume doesn't try to diff against stale footer state.
         self.last_painted_footer_rows = 0;
@@ -3444,11 +3393,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
         self.screen.invalidate();
-        self.scroll_region_bottom = None;
         let _ = self.out.flush();
         // Re-emit body tail so the view matches `body_lines` again.
-        // Cold-start the region by cloning the tail first (avoid the
-        // borrow clash with `emit_body_line_inner(&mut self, ...)`).
+        // Append-only top-anchored: tail lives at rows [first_row, bottom];
+        // per-row absolute CUP + EL + content avoids any LF (no
+        // scrollback pollution) and mirrors the same machinery on_resize
+        // uses.
         let bottom = self.body_bottom_row();
         if bottom > 0 {
             let tail: Vec<Vec<Cell>> = {
@@ -3458,24 +3408,28 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     .cloned()
                     .collect()
             };
-            // Set region up front so each LF scrolls within the body
-            // strip rather than the whole viewport.
-            let _ = write!(self.out, "\x1b[1;{}r", bottom);
-            self.scroll_region_bottom = Some(bottom);
-            for row in &tail {
-                self.emit_body_line_inner(row, bottom);
+            let n = tail.len() as u16;
+            let first_row = bottom.saturating_sub(n) + 1;
+            for (i, row) in tail.iter().enumerate() {
+                let seq = format!("\x1b[{};1H\x1b[K", first_row + i as u16);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(row);
+                let _ = self.out.write_all(&bytes);
             }
         }
         let _ = self.out.flush();
-        // Re-enable mouse capture after resume, mirroring the disable in
-        // suspend_for_external and the enable in with_writer. Mouse re-enable
-        // order: button-event first, then SGR coords (opposite of disable).
-        // This ensures the user has a clean alt-screen-like state with mouse
-        // hooked and working.
-        let _ = self.out.write_all(b"\x1b[?1002h\x1b[?1006h");
+        // Mouse capture intentionally NOT re-enabled on resume. We deferred
+        // mouse wheel / cmd+drag selection / cmd+C copy to the terminal's
+        // native handling at startup (see with_writer comment), so resume
+        // must keep that contract — re-enabling here would suddenly steal
+        // wheel events back from the terminal after the user returned from
+        // an external subprocess. The matching disable in
+        // suspend_for_external is still emitted so any subprocess that
+        // somehow turned capture on during its run gets cleaned up here.
         #[cfg(windows)]
         {
-            self.prior_console_in_mode = crate::render::conhost::enable_conhost_mouse_capture();
+            // Mirror the lib-level decision: leave conhost mode alone.
+            self.prior_console_in_mode = None;
         }
         let _ = self.out.flush();
     }
@@ -3577,123 +3531,51 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.flush();
     }
 
-    fn scroll_body(&mut self, delta: i32) {
-        let body_height = self.body_bottom_row() as usize;
-        let total = self.body_lines.len();
-        let max_top = total.saturating_sub(body_height);
-        if max_top == 0 {
-            // Nothing to scroll; stay sticky.
-            self.sticky_bottom = true;
-            self.view_mode = false;
-            return;
-        }
-        let current_top = if self.sticky_bottom {
-            max_top
-        } else {
-            self.viewport_top
-        };
-        let new_top: usize = if delta < 0 {
-            current_top.saturating_sub(delta.unsigned_abs() as usize)
-        } else {
-            (current_top + delta as usize).min(max_top)
-        };
-        self.viewport_top = new_top;
-        self.sticky_bottom = new_top >= max_top;
-        let was_view = self.view_mode;
-        self.view_mode = !self.sticky_bottom;
-        // Entering view_mode invalidates any in-progress drag selection
-        // — the anchor was recorded against the sticky-bottom layout,
-        // but body rows now shift relative to viewport_top. Without a
-        // clear, the next mouse-move applies stale anchor against new
-        // coords and paints highlight on rows the user didn't drag.
-        // Spec line 293 said "selection 状态保留" but the visual
-        // promise is impossible to keep across the layout change.
-        if !was_view && self.view_mode {
-            self.selection.clear();
-        }
-        // Trigger paint. When transitioning out of view_mode (was_view=true,
-        // view_mode=false), the next paint_body must repaint the body tail
-        // without a `\n` scroll (handled in P3.5).
-        if was_view != self.view_mode || self.view_mode {
-            self.repaint_body_region();
-        }
+    fn scroll_body(&mut self, _delta: i32) {
+        // No-op by design. After the append-only refactor body rows
+        // live in the host terminal's native scrollback once they
+        // scroll off the visible region, so vertical navigation is the
+        // terminal's job.
+        //
+        // Mouse capture is now intentionally disabled at startup
+        // (see `with_writer`), so crossterm never emits Event::Mouse
+        // events on stdin and this method effectively never gets
+        // called from interactive use. The terminal handles wheel
+        // ticks directly — scrollback via plain wheel, native
+        // selection via drag, copy via cmd+C — which is the whole
+        // point of the trade-off.
+        //
+        // See regression test `retained_scroll_body_is_noop_to_preserve_native_scrollback`.
     }
 
     fn scroll_body_to_top(&mut self) {
-        // Drive incrementally via scroll_body — the jump-style direct write
-        // surfaced a render bug (manual QA: body region went blank + footer
-        // disappeared on Home). The incremental path is well-exercised by
-        // PageUp/Shift+Up/wheel and avoids whatever boundary case the
-        // direct-write path was hitting.
-        let body_height = self.body_bottom_row() as usize;
-        if body_height == 0 { return; }
-        // Step by body_height (full page) per iteration; cap iterations at
-        // max_scrollback_rows / body_height + 1 as a safety belt against
-        // any case where scroll_body doesn't decrement viewport_top as
-        // expected (shouldn't happen, but better than infinite loop).
-        let max_iter = (MAX_SCROLLBACK_ROWS / body_height.max(1)) + 1;
-        for _ in 0..max_iter {
-            if !self.view_mode && !self.sticky_bottom { /* unreachable but guard */ break; }
-            // Stop once we've reached the top: viewport_top == 0 AND we're
-            // in view_mode (not on the no-overflow short-circuit path).
-            if self.view_mode && self.viewport_top == 0 { break; }
-            self.scroll_body(-(body_height as i32));
-            if !self.view_mode { break; } // hit no-overflow path
-        }
+        // No-op: terminal-native scrollback handles vertical navigation
+        // after the append-only refactor.
     }
 
     fn scroll_body_to_bottom(&mut self) {
-        // Mirror scroll_body_to_top: drive incrementally via scroll_body for
-        // consistency. End is reported working in manual QA but keep the
-        // same code path so no edge case sneaks in later.
-        let body_height = self.body_bottom_row() as usize;
-        if body_height == 0 { return; }
-        let max_iter = (MAX_SCROLLBACK_ROWS / body_height.max(1)) + 1;
-        for _ in 0..max_iter {
-            if self.sticky_bottom { break; }
-            self.scroll_body(body_height as i32);
-            if self.sticky_bottom { break; }
-        }
+        // No-op: terminal-native scrollback handles vertical navigation
+        // after the append-only refactor.
     }
 
     fn scroll_to_prev_message(&mut self) {
-        let body_height = self.body_bottom_row() as usize;
-        let max_top = self.body_lines.len().saturating_sub(body_height);
-        let effective_top = if self.sticky_bottom { max_top } else { self.viewport_top };
-        let target = self.message_marks.iter().rev()
-            .find(|m| m.line_idx < effective_top)
-            .map(|m| m.line_idx);
-        if let Some(t) = target { self.scroll_body_to(t); }
+        // No-op: terminal-native scrollback handles vertical navigation
+        // after the append-only refactor.
     }
 
     fn scroll_to_next_message(&mut self) {
-        let body_height = self.body_bottom_row() as usize;
-        let max_top = self.body_lines.len().saturating_sub(body_height);
-        let effective_top = if self.sticky_bottom { max_top } else { self.viewport_top };
-        let target = self.message_marks.iter()
-            .find(|m| m.line_idx > effective_top)
-            .map(|m| m.line_idx);
-        if let Some(t) = target { self.scroll_body_to(t); }
+        // No-op: terminal-native scrollback handles vertical navigation
+        // after the append-only refactor.
     }
 
     fn scroll_to_prev_user_message(&mut self) {
-        let body_height = self.body_bottom_row() as usize;
-        let max_top = self.body_lines.len().saturating_sub(body_height);
-        let effective_top = if self.sticky_bottom { max_top } else { self.viewport_top };
-        let target = self.message_marks.iter().rev()
-            .find(|m| m.line_idx < effective_top && m.kind == crate::render::MarkKind::User)
-            .map(|m| m.line_idx);
-        if let Some(t) = target { self.scroll_body_to(t); }
+        // No-op: terminal-native scrollback handles vertical navigation
+        // after the append-only refactor.
     }
 
     fn scroll_to_next_user_message(&mut self) {
-        let body_height = self.body_bottom_row() as usize;
-        let max_top = self.body_lines.len().saturating_sub(body_height);
-        let effective_top = if self.sticky_bottom { max_top } else { self.viewport_top };
-        let target = self.message_marks.iter()
-            .find(|m| m.line_idx > effective_top && m.kind == crate::render::MarkKind::User)
-            .map(|m| m.line_idx);
-        if let Some(t) = target { self.scroll_body_to(t); }
+        // No-op: terminal-native scrollback handles vertical navigation
+        // after the append-only refactor.
     }
 
     fn begin_selection(&mut self, col: u16, row: u16) {
@@ -3738,7 +3620,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if cols == self.screen.width() && rows == self.screen.height() {
             return;
         }
-        self.exit_view_mode();
         // Terminal-side wipe: resize leaves pre-resize chars at old
         // absolute positions. Use per-row CUP+EL instead of `\x1b[2J`
         // for the same reason as `reset()` — iTerm2 3.5+ has been
@@ -3757,7 +3638,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
-        self.scroll_region_bottom = None;
         self.screen.resize(cols, rows);
         // Rebuild the semantic welcome banner against the new width so
         // its right-aligned version/license pair stays adaptive after
@@ -3786,18 +3666,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     .map(|row| clip_cells_to_width(row, screen_w))
                     .collect()
             };
-            let _ = write!(self.out, "\x1b[1;{}r", bottom);
-            self.scroll_region_bottom = Some(bottom);
-            // Direct CUP per row instead of `emit_body_line_inner`'s
-            // LF-at-bottom scroll. LF inside the DECSTBM `[1, bottom]`
-            // region pushes the top row out — and since we just erased
-            // every row, that top row is blank. A full tail-repaint
-            // would therefore inject `tail.len() - 1` blank rows into
-            // scrollback. User symptom: after resizing smaller, the
-            // scrollback above the current page fills with empty rows
-            // for every resize event. Positioning absolutely with
-            // `\x1b[row;1H` skips the scroll entirely and leaves
-            // scrollback untouched.
+            // Append-only: body lives at the top of the viewport, so
+            // we draw the tail at absolute rows [1, n] without any
+            // DECSTBM region. Per-row CUP + EL + content; never an
+            // LF (which could nudge content into scrollback).
             let n = tail.len() as u16;
             let first_row = bottom.saturating_sub(n) + 1;
             for (i, row) in tail.iter().enumerate() {
@@ -3831,10 +3703,9 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
     /// (e.g. inside `paint_frame`, channel send failures, OOM in a
     /// downstream consumer) bypasses `shutdown()` and leaves the host
     /// shell receiving SGR mouse reports (`\x1b[<0;X;YM`) as stdin
-    /// garbage every time the user clicks. AltScreenRenderer already
-    /// has the equivalent Drop at alt_screen.rs:2208; without this
-    /// retained leaves the terminal in a broken state on any panic
-    /// after `with_writer` ran.
+    /// garbage every time the user clicks. Without this Drop, retained
+    /// leaves the terminal in a broken state on any panic after
+    /// `with_writer` ran.
     ///
     /// Minimal cleanup only — no paint, no flush retries, no body
     /// promotion. The mouse mode toggle is idempotent: `shutdown()`
@@ -4830,7 +4701,10 @@ mod tests {
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
-        assert!(vterm.row_text(21).contains("originaltag"));
+        // Append-only layout: body is empty, footer hugs the top of
+        // the screen. Middle row holding "originaltag" sits at row 1
+        // (top_rule=0, middle=1, bot_rule=2, status=3).
+        assert!(vterm.row_text(1).contains("originaltag"));
 
         // Resize + then push a frame with EMPTY input so the new
         // layout has no legitimate reason to contain "originaltag".
@@ -4903,10 +4777,21 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // bot_rule is always at absolute row H-2 = 22 (0-indexed).
-        // Input box is now flush-left/right (no PAD_COL) — every col
-        // 0..w should be '─' on the screen.
-        let bot_rule_row = 22;
+        // Append-only layout: footer follows body (empty here) from
+        // the top. We don't pin bot_rule to H-2 anymore — find the
+        // LAST full-width '─' row dynamically (top_rule is the same
+        // glyph but earlier; bot_rule is the one followed by status).
+        // Input box is flush-left/right (no PAD_COL) — every col
+        // 0..w should be '─' on whichever row holds the bot_rule.
+        let bot_rule_row = (0..24usize)
+            .rev()
+            .find(|&r| (0..40usize).all(|c| vterm.cell_at(r, c).ch == '─'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no full-width rule row found; dump:\n{}",
+                    vterm.dump()
+                )
+            });
         for col in 0..40usize {
             let cell = vterm.cell_at(bot_rule_row, col);
             assert_eq!(
@@ -4953,15 +4838,14 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Screen h=24, footer 5 rows = [19, 23]:
-        //   row 19: spinner blank, row 20: top rule,
-        //   row 21: middle, row 22: bot rule, row 23: status.
+        // Append-only layout: body empty, footer hugs the top.
+        // Footer 4 rows: top_rule=0, middle=1, bot_rule=2, status=3.
         // "你是谁" in middle row (col 0-indexed, flush-left now):
         //   col 0 '❯', col 1 ' ',
         //   col 2 '你' (cols 2-3, right half blank), col 4 '是',
         //   col 6 '谁'.
         //   (caps_with_color has unicode_symbols=true so prompt_chevron() is "❯ ".)
-        let middle_row = 21;
+        let middle_row = 1;
         assert_eq!(vterm.cell_at(middle_row, 0).ch, '\u{276f}');
         assert_eq!(vterm.cell_at(middle_row, 1).ch, ' ');
         assert_eq!(
@@ -5017,18 +4901,18 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Footer with menu = 1 spinner + 2 rules + 1 middle + 4 menu
-        // + 1 status = 9 rows. Layout from screen_h=24:
-        //   row 15: spinner blank
-        //   row 16: top rule
-        //   row 17: middle ("  > /")
-        //   row 18: bot rule
-        //   rows 19-22: menu rows (selected @ 19)
-        //   row 23: status
+        // Append-only layout: body empty, footer hugs the top.
+        // Footer with menu = top_rule + middle + bot_rule + 4 menu
+        // + status = 8 rows. Layout from row 0:
+        //   row 0: top rule
+        //   row 1: middle ("❯ /")
+        //   row 2: bot rule
+        //   rows 3-6: menu rows (selected @ 3)
+        //   row 7: status
         //
-        // Inspect menu row 0 (row 19): reverse-video strip starting
+        // Inspect menu row 0 (row 3): reverse-video strip starting
         // from PAD_COL, with "▸" marker present.
-        let menu0_row = 19;
+        let menu0_row = 3;
         let row_text = vterm.row_text(menu0_row);
         assert!(
             row_text.contains("▸"),
@@ -5050,9 +4934,9 @@ mod tests {
             arrow_col, cell
         );
 
-        // Non-selected row (menu row 1 = screen row 20) must NOT be
+        // Non-selected row (menu row 1 = screen row 4) must NOT be
         // reverse-video.
-        let row1_text = vterm.row_text(20);
+        let row1_text = vterm.row_text(4);
         assert!(
             row1_text.contains("/provider"),
             "menu row 1 missing: {:?}",
@@ -5060,7 +4944,7 @@ mod tests {
         );
         let provider_col = row1_text.find('/').unwrap();
         assert!(
-            !vterm.cell_at(20, provider_col).reverse,
+            !vterm.cell_at(4, provider_col).reverse,
             "non-selected menu row should not be reverse-video"
         );
     }
@@ -5090,14 +4974,13 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Body bottom-anchored: 7 welcome rows (title + cwd + model
-        // + blank + 3 hint rows) + footer 5 rows on a 24-row screen →
-        // body occupies rows 12-18, footer 19-23. Verify each
-        // expected piece exists somewhere in the body region.
-        let found_brand = (12..=18).any(|r| vterm.row_text(r).contains("AtomCode"));
-        let found_cwd = (12..=18).any(|r| vterm.row_text(r).contains("~/p/a"));
-        let found_model = (12..=18).any(|r| vterm.row_text(r).contains("glm-5"));
-        let found_hint = (12..=18).any(|r| vterm.row_text(r).contains("browse commands"));
+        // Append-only top-anchored: 7 welcome rows occupy rows 0..=6,
+        // footer 4 rows occupies rows 7..=10, blank below. Verify
+        // each expected piece exists somewhere in the body region.
+        let found_brand = (0..=6).any(|r| vterm.row_text(r).contains("AtomCode"));
+        let found_cwd = (0..=6).any(|r| vterm.row_text(r).contains("~/p/a"));
+        let found_model = (0..=6).any(|r| vterm.row_text(r).contains("glm-5"));
+        let found_hint = (0..=6).any(|r| vterm.row_text(r).contains("browse commands"));
         assert!(
             found_brand && found_cwd && found_model && found_hint,
             "welcome rows missing (brand={} cwd={} model={} hint={})\ndump:\n{}",
@@ -5878,8 +5761,7 @@ mod tests {
     /// SGR 37 (light gray) so child rows of tool batches read on Warp
     /// dark, but reusing `Role::Muted` here made the `resumed:` rule
     /// blend into body text. The fix: this rule is decoration, so it
-    /// should use the same SGR-2 dim that alt_screen uses, leaving fg
-    /// at terminal default.
+    /// uses SGR-2 dim and leaves fg at terminal default.
     ///
     /// Two complementary assertions are needed: the vterm grid only
     /// tracks fg/bold/reverse (no faint/dim field), so `cell.fg.is_none()`
@@ -6229,32 +6111,29 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Spinner must appear on the LAST body row (just above the
-        // footer's top_rule), with the frame at col 0.
-        // Footer with 4 rows on h=24 → top_rule at row 20 (0-idx),
-        // so last body row = 0-idx row 19.
-        let spinner_row = vterm.row_text(19);
+        // Append-only top-anchored: spinner is the only body row,
+        // sits at row 0; footer follows at rows 1..=4 (top_rule=1,
+        // middle=2, bot_rule=3, status=4).
+        let spinner_row = vterm.row_text(0);
         assert!(
             spinner_row.contains("⠋") && spinner_row.contains("Thinking"),
-            "spinner not found on last body row (got {:?}):\n{}",
+            "spinner not found on first body row (got {:?}):\n{}",
             spinner_row,
             vterm.dump()
         );
         // Frame glyph at absolute col 0 — flush-left with body paragraphs.
         assert_eq!(
-            vterm.cell_at(19, 0).ch,
+            vterm.cell_at(0, 0).ch,
             '⠋',
             "expected frame at col 0, found {:?}:\n{}",
-            vterm.cell_at(19, 0).ch,
+            vterm.cell_at(0, 0).ch,
             vterm.dump()
         );
 
-        // Footer no longer hosts the spinner — the row right above
-        // top_rule (which USED to be the spinner slot) must be empty
-        // of any spinner glyphs. With the new footer geometry
-        // (4 rows: top_rule / middle / bot_rule / status on h=24),
-        // row 20 is top_rule and the ex-spinner slot no longer exists.
-        let top_rule_row = vterm.row_text(20);
+        // Footer no longer hosts the spinner — the top_rule row
+        // (which USED to share a slot with the spinner) must be empty
+        // of any spinner glyphs.
+        let top_rule_row = vterm.row_text(1);
         assert!(
             !top_rule_row.contains("Thinking"),
             "footer row still carries spinner label: {:?}:\n{}",
@@ -6353,7 +6232,7 @@ mod tests {
 
         // And removed from history: body_lines should not carry a
         // lingering spinner entry that would re-surface on
-        // ensure_scroll_region repaints or resize.
+        // repaint or resize.
         let spinner_in_history = r.body_lines.iter().any(|row| {
             let text: String = row.iter().map(|c| c.ch).collect();
             text.contains("Pondering")
@@ -6700,10 +6579,12 @@ mod tests {
         // Inspect the newly-emitted frame (prev_cells after swap).
         let h = r.screen.height() as usize;
         let footer_rows = r.current_footer_rows();
-        let footer_top = h - footer_rows;
+        // Append-only: footer sits at body_rows_on_screen (= 0 here
+        // since body_lines is empty), not at the screen bottom.
+        let footer_top = r.body_lines.len().min(h.saturating_sub(footer_rows));
         // Layout: top_rule + middle×N + bot_rule + status (spinner no
         // longer reserves a footer row — lives in body now).
-        // With 2-row middle: bot_rule at footer_top + 1 + 2 = footer_top + 3
+        // With 2-row middle: bot_rule at footer_top + 1 + 2 = footer_top + 3.
         // text_budget = w - 2 ("> " prefix) = 38 for w=40.
         let (lines, _, _) = crate::width::wrap_with_cursor(&long, 40 - 2, long.len());
         assert!(lines.len() >= 2, "test setup: expected wrap");
@@ -7132,9 +7013,10 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Close menu (Esc). Footer shrinks back to 4, welcome
-        // re-paints via `ensure_scroll_region`'s grew branch →
-        // back to 0-idx rows 12..=19.
+        // Close menu (Esc). Footer shrinks back to 4 — the cell-diff
+        // path repaints. In append-only mode body is top-anchored so
+        // welcome rows don't change row position; this just verifies
+        // we don't accidentally duplicate them on the grid.
         r.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -7145,39 +7027,46 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Welcome brand at row 12 post-close. Row 8 (where brand
-        // lived mid-menu) must be blank now — the zombie-zone erase
-        // must have cleaned it.
-        assert!(
-            vterm.row_text(12).contains("AtomCode"),
-            "menu-close: welcome brand missing at row 12:\n{}",
+        // Welcome brand must appear EXACTLY once on the grid (top-
+        // anchored layout makes ghost rows from the OLD bottom-anchored
+        // re-paint impossible, but we keep the invariant pinned).
+        let brand_rows = (0..24)
+            .filter(|r| vterm.row_text(*r).contains("AtomCode"))
+            .count();
+        assert_eq!(
+            brand_rows, 1,
+            "menu-close: welcome brand should appear exactly once \
+             (got {}):\n{}",
+            brand_rows,
             vterm.dump()
         );
-        assert!(
-            !vterm.row_text(8).contains("AtomCode"),
-            "menu-close: row 8 still shows ghost welcome brand:\n{}",
-            vterm.dump()
-        );
-        // Same for cwd row (was 0-idx row 9 mid-menu, moves to 13).
-        assert!(
-            !vterm.row_text(9).contains("project"),
-            "menu-close: row 9 still shows ghost cwd:\n{}",
+        // Use the `∙ ` prefix unique to the welcome cwd row so we
+        // don't also match the status row's `model · cwd` glue.
+        let cwd_rows = (0..24)
+            .filter(|r| vterm.row_text(*r).contains("∙ ~/project"))
+            .count();
+        assert_eq!(
+            cwd_rows, 1,
+            "menu-close: welcome cwd should appear exactly once \
+             (got {}):\n{}",
+            cwd_rows,
             vterm.dump()
         );
     }
 
     /// Regression for user report: after `/model` switched providers,
     /// scrolling up showed the welcome banner + prior messages
-    /// duplicated in scrollback. Root cause: `/model` changes the
-    /// status-line text, which can change the footer height (status
-    /// wraps, or spinner/menu rows differ between frames). When
-    /// `current_footer_rows()` shifts, `ensure_scroll_region`'s
-    /// shrunk/grew branches clear the viewport and re-emit every
-    /// cached body row through `emit_body_line_inner` — which uses
+    /// duplicated in scrollback. Root cause (historical, pre
+    /// append-only refactor): `/model` changes the status-line text,
+    /// which can change the footer height (status wraps, or
+    /// spinner/menu rows differ between frames). When
+    /// `current_footer_rows()` shifted, the DECSTBM
+    /// shrunk/grew branches cleared the viewport and re-emitted every
+    /// cached body row through `emit_body_line_inner` — which used
     /// `\n` at the region bottom, scrolling the top row into
     /// terminal scrollback. Any cached body row that had already
-    /// entered scrollback during its original emit now enters a
-    /// second time: a duplicate the user sees on scroll-up.
+    /// entered scrollback during its original emit then entered a
+    /// second time: a duplicate the user saw on scroll-up.
     ///
     /// Repro: fill body past the viewport so a known welcome line
     /// lives in scrollback once, then change the footer height by
@@ -7211,8 +7100,11 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Fingerprint: welcome hint is unique and we pushed it
-        // early enough that it's sitting in scrollback by now.
+        // Fingerprint: welcome hint is unique. In the append-only
+        // refactor scrollback isn't fed during overflow (cell-diff
+        // visually shifts older rows off-screen instead of LF-scroll);
+        // the invariant we still pin is "footer geometry changes
+        // must not spuriously feed scrollback either".
         let hint = "to add a custom model";
         let count_hint = |vt: &crate::test_term::VirtualTerminal| {
             vt.scrollback_texts()
@@ -7220,22 +7112,13 @@ mod tests {
                 .filter(|row| row.contains(hint))
                 .count()
         };
-        assert_eq!(
-            count_hint(&vterm),
-            1,
-            "baseline: hint should sit in scrollback exactly once \
-             after normal emits (got {}):\n{}",
-            count_hint(&vterm),
-            vterm.scrollback_texts().join("\n")
-        );
+        let baseline_hint = count_hint(&vterm);
         let sb_before = vterm.scrollback_len();
 
         // Footer height change: long buffer wraps the middle to 3
         // rows (text budget = 80 - 6 = 74 cols; 200 'x' → 3 rows).
-        // body_bottom shrinks → ensure_scroll_region's shrunk branch
-        // fires. Before the fix, this re-emits every cached body
-        // row via `\n`-scroll, pushing overflow into scrollback a
-        // second time.
+        // The footer grows, body region shrinks. Cell-diff path
+        // repaints — no LFs, no scrollback feed.
         let long: String = "x".repeat(200);
         r.render(UiLine::InputPrompt {
             buf: long.clone(),
@@ -7247,20 +7130,19 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
+        // Hint count must not grow — anything > baseline is a
+        // spurious re-feed during the footer transition.
         assert_eq!(
             count_hint(&vterm),
-            1,
+            baseline_hint,
             "footer growth duplicated welcome hint in scrollback \
-             (got {} copies):\nscrollback:\n{}",
+             (was {}, now {}):\nscrollback:\n{}",
+            baseline_hint,
             count_hint(&vterm),
             vterm.scrollback_texts().join("\n")
         );
-        // Broader sanity: no body row should have been pushed into
-        // scrollback by the repaint itself. The footer grew by N
-        // rows, which means the visible body shrank by N rows — the
-        // terminal's native region-shrink does not push rows to
-        // scrollback, only LFs at the bottom do. So the only way
-        // scrollback_len grew here is via the buggy re-emit.
+        // Broader sanity: scrollback length must not grow during a
+        // pure footer-geometry change.
         assert_eq!(
             vterm.scrollback_len(),
             sb_before,
@@ -7318,8 +7200,9 @@ mod tests {
     /// Regression for user report: on first startup the welcome
     /// banner rendered TWICE — once at the top of the viewport
     /// (pushed into scrollback, no input box) and once at the bottom
-    /// above the input box. Root cause: `ensure_scroll_region` used
-    /// `\x1b[2J` to wipe the viewport before re-painting the body.
+    /// above the input box. Root cause (historical, pre append-only
+    /// refactor): the DECSTBM resize path used `\x1b[2J` to wipe the
+    /// viewport before re-painting the body.
     /// macOS Terminal.app and iTerm2 (and xterm with `cbScrollback`)
     /// copy every non-blank visible row into scrollback when
     /// processing ED — so the 6 welcome rows painted during the
@@ -8075,243 +7958,45 @@ mod tests {
     }
 
     #[test]
-    fn retained_scroll_up_enters_view_mode() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        for i in 0..30 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        assert!(r.sticky_bottom);
-        assert!(!r.view_mode);
-        r.scroll_body(-3);
-        assert!(r.view_mode, "scroll up must enter view_mode");
-        assert!(!r.sticky_bottom);
-    }
-
-    #[test]
-    fn retained_scroll_to_bottom_exits_view_mode() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        for i in 0..30 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        r.scroll_body(-5);
-        assert!(r.view_mode);
-        r.scroll_body_to_bottom();
-        assert!(!r.view_mode);
-        assert!(r.sticky_bottom);
-    }
-
-    #[test]
-    fn retained_scroll_up_then_to_top_lands_at_zero() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        for i in 0..30 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        r.scroll_body_to_top();
-        assert_eq!(r.viewport_top, 0);
-        assert!(r.view_mode);
-    }
-
-    #[test]
-    fn retained_scroll_to_top_does_not_blank_body() {
-        let (mut r, buf) = new_capturing(80, 24);
-        // Push enough lines to force overflow
-        for i in 0..50 { r.render(UiLine::User(format!("L{}", i))); }
-        buf.lock().unwrap().clear();
-        r.scroll_body_to_top();
-        // After scroll_to_top, viewport_top must be 0
-        assert_eq!(r.viewport_top, 0);
-        assert!(r.view_mode);
-        // And the terminal output must contain some body content
-        // (the first User line's text "L0" should be visible)
-        let locked = buf.lock().unwrap();
-        let s = String::from_utf8_lossy(&locked);
-        assert!(s.contains("L0") || s.contains("L 0"),
-            "after scroll_to_top, body should show top content; output was: {:?}",
-            &s[..s.len().min(400)]);
-    }
-
-    #[test]
-    fn retained_view_mode_suppresses_terminal_writes() {
-        let (mut r, buf) = new_capturing(80, 24);
-        // Get into view_mode
-        for i in 0..30 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        r.scroll_body(-5);
-        assert!(r.view_mode);
-        let bytes_before = buf.lock().unwrap().len();
-        // Push more content; terminal write count should not grow (view paint
-        // is idempotent and we already painted in scroll_body).
-        r.render(UiLine::User("after view".into()));
-        // Snapshot to drop the lock before further mutation
-        let new_bytes = buf.lock().unwrap()[bytes_before..].to_vec();
-        let s = String::from_utf8_lossy(&new_bytes);
-        assert!(!s.contains('\n'), "view_mode must NOT emit \\n scroll: {:?}", s);
-        // body_lines should still grow.
-        let non_empty = r.body_lines.iter().filter(|row| !row.is_empty()).count();
-        assert!(non_empty >= 31, "expected body_lines to keep growing in view_mode, got {}", non_empty);
-    }
-
-    /// push_or_update_live_spinner and clear_live_spinner must NOT write CUP/EL
-    /// sequences to the terminal when view_mode is active.  paint_body owns the
-    /// body region in that state; direct spinner writes would overwrite the
-    /// scrolled content painted there.
-    ///
-    /// The buffer update (body_lines) must still happen so that the buffer is
-    /// correct when the user exits view_mode.
-    #[test]
-    fn retained_view_mode_suppresses_spinner_terminal_writes() {
-        let (mut r, buf) = new_capturing(80, 24);
-        let status = status_basic();
-
-        // Push enough lines that we have room to scroll up.
-        for i in 0..30 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        r.scroll_body(-5);
-        assert!(r.view_mode, "precondition: scroll_body(-5) must enter view_mode");
-
-        let body_len_before = r.body_lines.len();
-        let bytes_before = buf.lock().unwrap().len();
-
-        // First spinner tick — goes through the push-new-row branch of
-        // push_or_update_live_spinner (live_spinner_active is false).
-        r.render(UiLine::StreamingBox {
-            buf: String::new(),
-            cursor_byte: 0,
-            frame: "⠋",
-            label: "Thinking".into(),
-            status: status.clone(),
-            menu: None,
-            attachments: Vec::new(),
-        });
-
-        // Second tick — goes through the update-in-place branch.
-        r.render(UiLine::StreamingBox {
-            buf: String::new(),
-            cursor_byte: 0,
-            frame: "⠙",
-            label: "Thinking".into(),
-            status: status.clone(),
-            menu: None,
-            attachments: Vec::new(),
-        });
-
-        let new_bytes = buf.lock().unwrap()[bytes_before..].to_vec();
-        let s = String::from_utf8_lossy(&new_bytes);
-
-        // The spinner tick must not write its frame/label glyphs to the
-        // terminal in view_mode.  repaint_body_region (triggered by
-        // push_body_row → ensure_scroll_region) is allowed to write CUP+EL
-        // sequences to repaint the viewport; what is forbidden is the
-        // push_or_update_live_spinner direct write that places the spinner
-        // content at body_bottom_row, overwriting scrolled content.
-        //
-        // Check: the spinner frame glyphs ("⠋", "⠙") and label ("Thinking")
-        // must not appear in the terminal output during view_mode.
+    fn retained_with_writer_does_not_enable_mouse_capture() {
+        // Contract inverted: mouse capture is intentionally disabled at
+        // startup so wheel / cmd+drag selection / cmd+C copy stay with
+        // the terminal's native handling. Previously this test asserted
+        // ?1002h/?1006h were emitted at startup; that behaviour was
+        // removed by the "disable mouse capture, defer to terminal-
+        // native selection/wheel" change.
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        // Snapshot startup bytes BEFORE Drop emits the disable sequence.
+        let startup = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&startup);
         assert!(
-            !s.contains("Thinking"),
-            "spinner label must not be written to terminal in view_mode; got: {:?}",
+            !s.contains("\x1b[?1002h"),
+            "startup must NOT enable button-event tracking — defer to terminal-native wheel/selection: {:?}",
             s
         );
         assert!(
-            !s.contains('⠋') && !s.contains('⠙'),
-            "spinner frame glyphs must not be written to terminal in view_mode; got: {:?}",
+            !s.contains("\x1b[?1006h"),
+            "startup must NOT enable SGR mouse coords — defer to terminal-native wheel/selection: {:?}",
             s
         );
-
-        // Buffer must still be updated so view_mode exit produces the right paint.
-        // The spinner row should have been pushed (body_lines grew by 1 total —
-        // the second tick replaces in place so no extra row).
-        assert!(
-            r.body_lines.len() > body_len_before,
-            "body_lines must grow despite view_mode (got {} before, {} after)",
-            body_len_before,
-            r.body_lines.len()
-        );
-        assert!(
-            r.live_spinner_active,
-            "live_spinner_active must be true after spinner ticks in view_mode"
-        );
-
-        // Now drive clear_live_spinner via a user turn start (which calls
-        // clear_live_spinner internally when it commits the spinner row).
-        // We capture the bytes after this point.
-        let bytes_before_clear = buf.lock().unwrap().len();
-        // Feeding a TurnComplete-equivalent: render a user line, which
-        // calls push_body_row → clear_live_spinner.
-        r.render(UiLine::User("done".into()));
-        let clear_bytes = buf.lock().unwrap()[bytes_before_clear..].to_vec();
-        let _cs = String::from_utf8_lossy(&clear_bytes);
-        // clear_live_spinner's direct CUP+EL targeting body_bottom must be
-        // suppressed in view_mode.  Any repaint triggered by view-mode-exit
-        // (not the case here since we're still in view_mode) is a separate
-        // path.  Here we just verify no stray spinner glyphs are emitted.
-        // The primary check is that the spinner frame/label (which would
-        // appear on any residual write from push_or_update_live_spinner)
-        // were already asserted absent above; here we just double-check
-        // live_spinner_active is now false (clear succeeded in buffer).
-        assert!(
-            !r.live_spinner_active,
-            "live_spinner_active must be false after clear; got true"
-        );
-    }
-
-    #[test]
-    fn retained_reset_clears_view_mode() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        for i in 0..30 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        r.scroll_body(-5);
-        assert!(r.view_mode);
-        r.reset();
-        assert!(!r.view_mode);
-        assert!(r.sticky_bottom);
-    }
-
-    #[test]
-    fn retained_resize_clears_view_mode() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        for i in 0..30 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        r.scroll_body(-5);
-        assert!(r.view_mode);
-        r.on_resize(100, 30);
-        assert!(!r.view_mode);
-    }
-
-    #[test]
-    fn retained_approval_prompt_forces_view_exit() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        for i in 0..30 {
-            r.render(UiLine::User(format!("L{}", i)));
-        }
-        r.scroll_body(-5);
-        assert!(r.view_mode);
-        r.render(UiLine::ApprovalPrompt {
-            tool: "Bash".into(),
-            detail: "ls".into(),
-        });
-        assert!(!r.view_mode, "approval prompt must force exit from view_mode");
-    }
-
-    #[test]
-    fn retained_with_writer_enables_mouse_capture() {
-        let mut buf = Vec::new();
-        let r = RetainedRenderer::with_writer(&mut buf, caps_with_color(), 80, 24);
-        // Drop the renderer FIRST — its Drop impl emits the mouse-OFF
-        // sequence, and the borrow checker won't let us read `buf` while
-        // `r` still holds a mutable borrow.
         drop(r);
-        let s = String::from_utf8_lossy(&buf);
-        assert!(s.contains("\x1b[?1002h"), "must enable button-event tracking: {:?}", s);
-        assert!(s.contains("\x1b[?1006h"), "must enable SGR coordinates: {:?}", s);
-        // Belt-and-suspenders: confirm Drop also emitted the disable
-        // sequence (same contract alt_screen tests pin at alt_screen.rs:2244).
-        assert!(s.contains("\x1b[?1002l"), "Drop must emit mouse-mode disable (1002l): {:?}", s);
-        assert!(s.contains("\x1b[?1006l"), "Drop must emit mouse-mode disable (1006l): {:?}", s);
+        // Drop must still emit the disable sequence as a defensive
+        // hygiene measure (clears any stale capture state inherited
+        // from a prior process or panicked atomcode run).
+        let after_drop_bytes = buf.lock().unwrap().clone();
+        let after_drop = String::from_utf8_lossy(&after_drop_bytes);
+        assert!(
+            after_drop.contains("\x1b[?1002l"),
+            "Drop must emit mouse-mode disable (1002l) defensively: {:?}",
+            after_drop
+        );
+        assert!(
+            after_drop.contains("\x1b[?1006l"),
+            "Drop must emit mouse-mode disable (1006l) defensively: {:?}",
+            after_drop
+        );
     }
 
     #[test]
@@ -8328,7 +8013,12 @@ mod tests {
     }
 
     #[test]
-    fn retained_resume_reenables_mouse_capture() {
+    fn retained_resume_does_not_reenable_mouse_capture() {
+        // Contract inverted: resume must NOT re-enable mouse capture,
+        // because startup never enabled it. Re-enabling here would
+        // suddenly steal wheel events back from the terminal after the
+        // user returns from an external subprocess (OAuth browser,
+        // shell prompt), breaking the deferred-to-terminal contract.
         let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(buf.clone());
         let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
@@ -8337,8 +8027,16 @@ mod tests {
         r.resume_from_external();
         let bytes = buf.lock().unwrap().clone();
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("\x1b[?1002h"), "resume must re-enable button-event: {:?}", s);
-        assert!(s.contains("\x1b[?1006h"), "resume must re-enable SGR: {:?}", s);
+        assert!(
+            !s.contains("\x1b[?1002h"),
+            "resume must NOT re-enable button-event tracking — defer to terminal: {:?}",
+            s
+        );
+        assert!(
+            !s.contains("\x1b[?1006h"),
+            "resume must NOT re-enable SGR mouse coords — defer to terminal: {:?}",
+            s
+        );
     }
 
     #[test]
@@ -8353,6 +8051,94 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("\x1b[?1002l"), "shutdown must disable button-event: {:?}", s);
         assert!(s.contains("\x1b[?1006l"), "shutdown must disable SGR coords: {:?}", s);
+    }
+
+    /// Pins the Issue-1 contract: when a mouse-wheel tick reaches
+    /// `RetainedRenderer::scroll_body`, it must do nothing. We
+    /// receive the event because `?1002h` (enabled for drag
+    /// selection) consumes wheel ticks from the SGR mouse stream,
+    /// but acting on the event would only shift OUR cell grid — the
+    /// host terminal's scrollback would still be unreachable. The
+    /// user-facing scrollback path is the terminal-level Shift+wheel
+    /// / Cmd+↑ bypass, which the terminal resolves BEFORE the event
+    /// hits our stdin.
+    ///
+    /// Regression guard: a future change that wires this method up
+    /// to body movement would silently break "Shift+wheel scrolls
+    /// the terminal" because the body would also jump, and would
+    /// pollute scrollback because emit-side LFs would push stale
+    /// rows into history.
+    #[test]
+    fn retained_scroll_body_is_noop_to_preserve_native_scrollback() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        // Seed enough body content that any naive scroll attempt
+        // would have something to emit (we want to assert that even
+        // with rows present, scroll_body writes nothing).
+        for i in 0..40 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        r.flush_deferred();
+        // Capture the byte count right BEFORE the wheel arrives so
+        // anything emitted by the wheel call shows up as a delta.
+        let before = buf.lock().unwrap().len();
+        // Simulate a few wheel ticks in each direction.
+        r.scroll_body(-3);
+        r.scroll_body(3);
+        r.scroll_body(-1);
+        r.scroll_body(1);
+        let after = buf.lock().unwrap().len();
+        assert_eq!(
+            before, after,
+            "scroll_body must NOT write any bytes — wheel scroll belongs to the \
+             terminal's native scrollback via Shift+wheel / Cmd+↑. Emitted {} \
+             unexpected bytes.",
+            after - before
+        );
+    }
+
+    /// Contract inverted from the original `retained_drag_selection_
+    /// survives_wheel_noop_contract`: that test pinned `?1002h` MUST
+    /// be emitted at startup so drag selection worked, accepting the
+    /// trade-off that wheel events went through us. We've now chosen
+    /// the opposite trade-off: `?1002h` is NOT emitted, the terminal
+    /// keeps wheel + native drag-select + cmd+C, and atomcode's
+    /// in-renderer drag selection becomes effectively dead (no
+    /// external code path can fire begin/update/end_selection since
+    /// mouse events never arrive). The internal selection API still
+    /// works when called directly — Task 7.1 will collapse it.
+    #[test]
+    fn retained_drag_selection_api_still_callable_but_terminal_owns_wheel() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(buf.clone());
+        let mut r = RetainedRenderer::with_writer(sink, caps_with_color(), 80, 24);
+        // Startup MUST NOT enable button-event tracking — the whole
+        // point of this change is to let the terminal own the mouse.
+        let startup = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&startup);
+        assert!(
+            !s.contains("\x1b[?1002h"),
+            "?1002h must NOT be enabled — terminal-native wheel / cmd+drag \
+             selection / cmd+C copy take over: {:?}",
+            s
+        );
+        // The selection API on the struct is still callable directly
+        // (selection.rs has not been deleted yet — Task 7.1). It just
+        // never fires from interactive events because crossterm gets
+        // no mouse-protocol bytes from stdin.
+        for i in 0..10 {
+            r.render(UiLine::User(format!("L{}", i)));
+        }
+        assert!(r.selection.selection.is_none());
+        r.begin_selection(3, 1);
+        r.update_selection(10, 1);
+        assert!(
+            r.selection.selection.is_some(),
+            "selection API must remain callable directly even though it's no \
+             longer wired to mouse events"
+        );
+        r.end_selection();
     }
 
     #[test]
@@ -8375,51 +8161,186 @@ mod tests {
         assert!(r.copy_selection(), "expected non-empty selection to copy");
     }
 
+    /// Live scrollback feed: once body_lines exceeds the visible cap,
+    /// every subsequent `emit_body_line_inner` must precede its own
+    /// body-row emit with a "park at (h,1) + LF" sequence — that's the
+    /// instruction terminals interpret as "scroll the entire visible
+    /// area up by 1, top row enters native scrollback". The user
+    /// experience this unlocks is `cmd+↑` / mouse-wheel during the
+    /// atomcode session showing history above the live viewport.
     #[test]
-    fn retained_scrollbar_paints_when_enabled_in_view_mode() {
-        let (mut r, buf) = new_capturing(80, 10);
-        r.show_scrollbar = true;
-        for i in 0..30 { r.render(UiLine::User(format!("R{:02}", i))); }
-        r.scroll_body(-3);  // enter view_mode + repaint_body_region
-        let binding = buf.lock().unwrap();
-        let s = String::from_utf8_lossy(&binding);
-        assert!(s.contains("█"), "thumb missing in view paint: {:?}", s);
+    fn retained_overflow_pushes_oldest_to_scrollback() {
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(80, h);
+        // Seed footer state so current_footer_rows() is stable.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        // Fill the body up to the cap (no overflow expected yet) so we
+        // know exactly when the first scrollback feed should land.
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+        for i in 0..cap {
+            r.render(UiLine::AssistantText(format!("filler {}\n", i)));
+        }
+        r.flush_deferred();
+        // Reset the capture so subsequent overflow events are isolated.
+        buf.lock().unwrap().clear();
+        // One more body line — body_lines.len() is now == cap at entry
+        // to emit_body_line_inner, so it must trigger the bottom-LF
+        // scroll BEFORE its own row emit.
+        r.render(UiLine::AssistantText("overflow row\n".into()));
+        r.flush_deferred();
+        let captured = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&captured);
+        let expected = format!("\x1b[{};1H\n", h);
+        assert!(
+            s.contains(&expected),
+            "overflow emit must include bottom-row LF scroll trigger {:?}\nfull: {:?}",
+            expected,
+            s
+        );
     }
 
+    /// Sub-cap pushes must NOT touch the bottom row — that would scroll
+    /// content the user can still see into native scrollback prematurely,
+    /// duplicating rows between the visible area and the scrollback view.
+    /// The bottom-LF is reserved for genuine overflow moments only.
     #[test]
-    fn retained_scroll_to_prev_message_works_from_sticky_bottom() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        // Push enough lines so body overflows (otherwise no marks above tail to jump to)
-        for i in 0..30 { r.render(UiLine::User(format!("u{}", i))); }
-        // Confirm we're at sticky_bottom (default after enough content)
-        assert!(r.sticky_bottom);
-        let viewport_top_before = r.viewport_top;
-        r.scroll_to_prev_message();
-        // After the jump, view_mode should be entered (we left the tail)
-        assert!(r.view_mode, "alt+up at sticky bottom should enter view_mode");
-        // And viewport_top should have moved up (toward an earlier mark)
-        assert!(r.viewport_top < r.body_lines.len() - r.body_bottom_row() as usize,
-            "viewport_top should be less than max_top after jumping back");
-        let _ = viewport_top_before;
+    fn retained_below_cap_does_not_scroll_terminal() {
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(80, h);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+        // Push strictly fewer body rows than cap so emit_body_line_inner
+        // never enters the overflow branch.
+        let push_count = cap.saturating_sub(2);
+        buf.lock().unwrap().clear();
+        for i in 0..push_count {
+            r.render(UiLine::AssistantText(format!("row {}\n", i)));
+        }
+        r.flush_deferred();
+        let captured = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&captured);
+        let forbidden = format!("\x1b[{};1H\n", h);
+        assert!(
+            !s.contains(&forbidden),
+            "below-cap pushes must not emit bottom-LF scroll {:?}\nfull: {:?}",
+            forbidden,
+            s
+        );
+    }
+
+    /// After overflow has happened, the visible body region must still
+    /// show the MOST RECENT body_height rows of `body_lines`, with the
+    /// footer immediately below — i.e. the scroll-up-then-repaint dance
+    /// must leave the on-screen state identical to "if the cap had never
+    /// been exceeded and we just painted the tail directly". Without the
+    /// `shift_prev_up` sync the cell-diff would produce a smeared frame
+    /// (stale top row + duplicate row at the bottom).
+    #[test]
+    fn retained_overflow_keeps_visible_body_correct() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+        // Push 2x cap rows to guarantee overflow events have fired.
+        for i in 0..(cap * 2) {
+            r.render(UiLine::AssistantText(format!("R{:03}\n", i)));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The body_lines tail's most recent labels MUST be visible on
+        // the live viewport rows [0..body_rows_on_screen). The very last
+        // row before the footer should show the latest pushed label.
+        let body_rows_on_screen = r.body_bottom_row() as usize;
+        assert!(
+            body_rows_on_screen > 0,
+            "body should occupy at least one row after overflow"
+        );
+        // Take a sample of the most recent labels and confirm each is
+        // present somewhere in the live body region.
+        let total = r.body_lines.len();
+        // The body_lines that actually live in the screen tail.
+        let tail_start = total.saturating_sub(body_rows_on_screen);
+        let mut seen_recent = 0;
+        for idx in tail_start..total {
+            // Recover the label by scanning body_lines for the printable chars.
+            let label: String = r.body_lines[idx]
+                .iter()
+                .filter(|c| c.width > 0)
+                .map(|c| c.ch)
+                .collect();
+            let label = label.trim().to_string();
+            if label.is_empty() {
+                continue;
+            }
+            let found = (0..body_rows_on_screen).any(|row| vterm.row_text(row).contains(&label));
+            if found {
+                seen_recent += 1;
+            }
+        }
+        assert!(
+            seen_recent >= 1,
+            "expected at least one recent body row visible on screen after overflow; \
+             body_rows_on_screen={} total={}\ndump:\n{}",
+            body_rows_on_screen,
+            total,
+            vterm.dump()
+        );
+        // The oldest row (R000) MUST NOT be in the live viewport
+        // (it should have been scrolled out into scrollback).
+        let oldest_visible_in_live =
+            (0..body_rows_on_screen).any(|row| vterm.row_text(row).contains("R000"));
+        assert!(
+            !oldest_visible_in_live,
+            "oldest body row R000 must be off-screen (scrolled into native scrollback) \
+             after pushing 2*cap rows\ndump:\n{}",
+            vterm.dump()
+        );
     }
 
     #[test]
     fn retained_selection_highlight_emits_reverse_video() {
         let (mut r, buf) = new_capturing(80, 24);
-        // Push enough lines so body overflows the 24-row terminal → scroll enters view_mode.
+        // Push enough lines so body overflows the 24-row terminal — the
+        // tail (last body_height rows) is what repaint_body_region will paint.
         for i in 0..30 {
             r.render(UiLine::User(format!("L{}", i)));
         }
-        // Scroll up: with 30 body lines and ~23-row body this reliably enters view_mode.
-        r.scroll_body(-5);
-        assert!(r.view_mode, "precondition: scroll_body(-5) must enter view_mode");
-        // Determine which body rows are visible: viewport_top .. viewport_top + body_height.
-        let viewport_top = r.viewport_top;
+        // Locate a non-empty visible row in body_lines (User pushes both a
+        // content row and a blank spacer; we need to pick the content one).
+        let body_height = r.body_bottom_row() as usize;
+        let total = r.body_lines.len();
+        let viewport_start = total.saturating_sub(body_height);
+        let target_row = (viewport_start..total)
+            .find(|&i| !r.body_lines[i].is_empty())
+            .expect("at least one non-empty visible row");
         // Clear captured bytes so we only inspect repaint_body_region output.
         buf.lock().unwrap().clear();
-        // Select the first visible row (viewport_top) — guaranteed to be in the painted range.
-        r.selection.begin((viewport_top, 0));
-        r.selection.update((viewport_top, 5));
+        r.selection.begin((target_row, 0));
+        r.selection.update((target_row, 5));
         r.repaint_body_region();
         let output = buf.lock().unwrap().clone();
         let s = String::from_utf8_lossy(&output);
@@ -8430,61 +8351,932 @@ mod tests {
         );
     }
 
+    /// Regression: `repaint_body_region` would write the per-row
+    /// reverse-video selection bytes directly to `out`, then call
+    /// `screen.invalidate()` + `paint_frame` + `render_diff`. The
+    /// follow-up diff emitted patches for non-blank cells (letters)
+    /// so they got over-painted with plain content, but for cells
+    /// that happen to be `Cell::blank()` (the spaces *inside* the
+    /// selection range — e.g. the space between "hello" and "world")
+    /// `prev_cells` blank == `cells` blank → no patch → the reverse-
+    /// video stayed stuck on the physical terminal even after the
+    /// next body row arrived or the next `repaint_body_region` ran
+    /// without an active selection.
+    ///
+    /// Repro: select a row containing internal spaces, drop the
+    /// selection (clear state), then trigger a fresh paint cycle.
+    /// The terminal must show no reverse-video cells in the body.
     #[test]
-    fn retained_scroll_body_re_anchors_cursor_to_input() {
-        let (mut r, buf) = new_capturing(80, 24);
-        // Push enough lines to force overflow + show the input box
-        for i in 0..40 { r.render(UiLine::User(format!("L{}", i))); }
-        // Establish a known input prompt so paint_footer has something to anchor against
+    fn retained_selection_clears_residual_reverse_on_blank_cells() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Seed a frame so footer is anchored.
         r.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
             menu: None,
-            status: status_basic(),
+            status: status.clone(),
             attachments: Vec::new(),
         });
-        buf.lock().unwrap().clear();
-        r.scroll_body(-3);
-        let bytes = buf.lock().unwrap().clone();
-        let s = String::from_utf8_lossy(&bytes);
-        // After scroll, the LAST cursor positioning escape in the output
-        // should target a row inside the footer region (i.e., > body_bottom_row).
-        // Find the last CUP escape: \x1b[{row};{col}H
-        let mut last_cup_row: Option<u16> = None;
-        let mut idx = 0;
-        while idx < s.len() {
-            if let Some(esc_at) = s[idx..].find("\x1b[") {
-                let after = idx + esc_at + 2;
-                // Parse {row};{col}H or {row};{col}{letter}
-                let tail = &s[after..];
-                if let Some(h_pos) = tail.find('H') {
-                    let inner = &tail[..h_pos];
-                    if let Some((row_s, _)) = inner.split_once(';') {
-                        if let Ok(row) = row_s.parse::<u16>() {
-                            last_cup_row = Some(row);
-                        }
-                    }
-                    idx = after + h_pos + 1;
-                    continue;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Push a User row with internal spaces. The chevron is at col 0,
+        // a space at col 1 (pad after chevron, plain CellStyle == blank),
+        // then "hello world test sentence" with spaces at cols 7, 13,
+        // and 18 — those are blank cells inside the row.
+        r.render(UiLine::User("hello world test sentence".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Find the body row that holds our text.
+        let body_height = r.body_bottom_row() as usize;
+        let total = r.body_lines.len();
+        let viewport_start = total.saturating_sub(body_height);
+        let target_row = (viewport_start..total)
+            .find(|&i| {
+                let row_text: String =
+                    r.body_lines[i].iter().map(|c| c.ch).collect();
+                row_text.contains("hello world")
+            })
+            .expect("target user row must be visible");
+        // Screen row (1-indexed) of the body row holding our text.
+        let screen_row_1idx = (target_row - viewport_start + 1) as u16;
+
+        // Drag-select across the row including the internal spaces.
+        r.begin_selection(0, screen_row_1idx);
+        r.update_selection(30, screen_row_1idx);
+        // While the drag is live the terminal should show the reverse
+        // video — sanity check (not the regression assertion).
+        drain_into_vterm(&buf, &mut vterm);
+        let live_reverse_present = (0..(body_height as usize)).any(|row_0idx| {
+            (0..(w as usize)).any(|c| vterm.cell_at(row_0idx, c).reverse)
+        });
+        assert!(
+            live_reverse_present,
+            "sanity: during active selection some body cells must be reverse-video"
+        );
+
+        // Release the mouse: end_selection clears `active` but keeps
+        // the selection drawn. Then simulate "selection should be gone"
+        // by explicitly clearing and pushing a new body row — the user
+        // perceives the residual blocks as "stuck" because subsequent
+        // paint cycles never erase them.
+        r.end_selection();
+        r.selection.clear();
+        // A new body row arrives (assistant response). This goes through
+        // emit_body_line_inner + flush_deferred → paint_frame →
+        // render_diff. Per the bug, the diff cannot wipe the residual
+        // reverse-video on blank cells because prev_cells already shows
+        // those positions as blank.
+        r.render(UiLine::AssistantText("ok\n".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // After the new row + repaint, NO cell in the body region should
+        // still be reverse-video.
+        let mut stuck: Vec<(usize, usize, char)> = Vec::new();
+        for row_0idx in 0..(body_height as usize) {
+            for col_0idx in 0..(w as usize) {
+                let cell = vterm.cell_at(row_0idx, col_0idx);
+                if cell.reverse {
+                    stuck.push((row_0idx, col_0idx, cell.ch));
                 }
             }
-            break;
         }
-        let body_bottom = r.body_bottom_row();
-        let last_row = last_cup_row.unwrap_or(0);
         assert!(
-            last_row > body_bottom,
-            "after scroll, last cursor CUP should land in footer (> body_bottom={}), got row={}; bytes tail: {:?}",
-            body_bottom,
-            last_row,
-            &s[s.len().saturating_sub(200)..]
+            stuck.is_empty(),
+            "residual reverse-video cells stuck in body after selection cleared + new row pushed: {:?}\ndump:\n{}",
+            stuck,
+            vterm.dump()
         );
     }
 
+    /// Regression (top-anchored body model): `commit_inflight_tool`
+    /// previously read `body_bottom_row()` AFTER truncating the
+    /// inflight rows, so the erase range pointed at the LAST `remove`
+    /// rows of REMAINING body content rather than the rows that
+    /// formerly held the spinner. Cell-diff could not catch the
+    /// regression because the Screen buffer state matched the body
+    /// (we erased the physical terminal but left buffer marks intact).
+    /// User-visible bug: prior body markers vanished from the terminal
+    /// after every tool commit when the body had pre-existing content.
     #[test]
-    fn retained_scroll_body_emits_trailing_cursor_cup() {
-        let (mut r, buf) = new_capturing(80, 24);
-        for i in 0..40 { r.render(UiLine::User(format!("L{}", i))); }
+    fn retained_commit_inflight_preserves_prior_body() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Seed a full frame so footer is painted (mirrors real boot).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Push N markers as body rows BEFORE the inflight starts.
+        const N: usize = 5;
+        for i in 0..N {
+            r.render(UiLine::AssistantText(format!("MARKER_R{}\n", i)));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Trigger inflight (adds rows AFTER the markers).
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-1".into(),
+            name: "Bash".into(),
+            detail: "ls -la /tmp".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Commit (truncates inflight rows — must NOT clobber markers).
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-1".into()),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // All N markers must still be visible on the terminal.
+        for i in 0..N {
+            let label = format!("MARKER_R{}", i);
+            assert!(
+                vterm.any_row(|row| row.contains(&label)),
+                "MARKER_R{} should still be on terminal after commit_inflight_tool, \
+                 but it was erased by the over-erase bug.\ndump:\n{}",
+                i,
+                vterm.dump()
+            );
+        }
+    }
+
+    /// Regression (top-anchored body model): `pop_approval_prompt`
+    /// has the same wrong-row-erase pattern as `commit_inflight_tool`,
+    /// but the bug is masked at the user level by the immediately
+    /// following `screen.invalidate()` that forces a full repaint.
+    /// This test still asserts the post-condition contract — that
+    /// prior body rows remain visible after popping — so a future
+    /// refactor that drops the `invalidate()` shield can't silently
+    /// regress this path. With the over-erase removed (or the math
+    /// corrected) the test passes for the right reason instead of
+    /// being saved by the invalidation hammer.
+    #[test]
+    fn retained_approval_pop_preserves_prior_body() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        const N: usize = 5;
+        for i in 0..N {
+            r.render(UiLine::AssistantText(format!("MARKER_R{}\n", i)));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        r.render(UiLine::ApprovalPrompt {
+            tool: "bash".into(),
+            detail: "ls".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        r.pop_approval_prompt();
+        // Trigger a repaint cycle (mirrors what happens after Y/A/N).
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        for i in 0..N {
+            let label = format!("MARKER_R{}", i);
+            assert!(
+                vterm.any_row(|row| row.contains(&label)),
+                "MARKER_R{} should still be on terminal after pop_approval_prompt.\
+                 \ndump:\n{}",
+                i,
+                vterm.dump()
+            );
+        }
+    }
+
+    /// Regression for the "missing top rule after /model switch" bug.
+    ///
+    /// Reproduction sequence (mirrors the real /model flow):
+    ///   1. Steady-state InputPrompt (no menu) — paint, drain.
+    ///   2. Open the slash menu (4 items) via InputPrompt with menu=Some —
+    ///      paint, drain. Footer grows from 4 rows to 8 (top+middle+bot+
+    ///      4 menu + status).
+    ///   3. Close the menu via InputPrompt with menu=None AND immediately
+    ///      push a body row ("已切换到 …") in the SAME tick — no
+    ///      flush_deferred between the two so they coalesce into one
+    ///      paint cycle.
+    ///   4. flush_deferred → drain into vterm.
+    ///
+    /// Expected post-condition: the footer's top_rule lives at the row
+    /// immediately above the input prompt `>`, and reads as a row full of
+    /// `─` (or at least starts with `─`). The bug renders this row blank
+    /// because `emit_body_line_inner` wrote the body row + LF directly to
+    /// the terminal (advancing cursor past footer_top), then the next
+    /// paint's cell-diff suppressed the top_rule emit on the rows whose
+    /// prev_cells still held the (now-stale) menu content from before the
+    /// close.
+    #[test]
+    fn retained_top_rule_visible_after_menu_close_and_body_push() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Step 1: baseline InputPrompt, no menu.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Step 2: open the slash menu (4 items, mirrors /model entry).
+        let items: Vec<(String, String)> = vec![
+            ("model".into(), "Switch model".into()),
+            ("provider".into(), "Add provider".into()),
+            ("session".into(), "New session".into()),
+            ("resume".into(), "Resume session".into()),
+        ];
+        r.render(UiLine::InputPrompt {
+            buf: "/model".into(),
+            cursor_byte: 6,
+            menu: Some(MenuPayload {
+                items: items.clone(),
+                selected: 0,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Step 3a: user selects an item — menu closes via InputPrompt with
+        // menu=None. State is updated but we DON'T flush_deferred yet —
+        // in the real /model path the slash-handler immediately follows
+        // up with the "已切换到 …" body row in the same event_loop tick.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+
+        // Step 3b: slash handler emits the confirmation body row. This
+        // is the line the user actually saw on screen.
+        r.render(UiLine::CommandOutput(
+            "  已切换到 AtomGit-deepseek-v4-flash · deepseek-v4-flash\n".into(),
+        ));
+
+        // Step 4: coalesce + paint + drain.
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Post-condition: locate the input-prompt row (the one starting
+        // with the chevron) and assert the row IMMEDIATELY ABOVE it is a
+        // full-width rule. With unicode + colors enabled, the chevron is
+        // '❯'. Pad column varies, so we search the whole grid.
+        let prompt_row = (0..h as usize)
+            .find(|&row| {
+                let text = vterm.row_text(row);
+                text.contains('\u{276f}')
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no prompt-bearing row found post-menu-close;\ndump:\n{}",
+                    vterm.dump()
+                )
+            });
+        assert!(
+            prompt_row >= 1,
+            "prompt row {} has no row above it for top_rule;\ndump:\n{}",
+            prompt_row,
+            vterm.dump()
+        );
+        let top_rule_row = prompt_row - 1;
+        let dashes = (0..w as usize)
+            .filter(|&c| vterm.cell_at(top_rule_row, c).ch == '\u{2500}')
+            .count();
+        assert!(
+            dashes >= (w as usize / 2),
+            "top_rule above prompt row {} (i.e. row {}) is blank/short — only {} '─' dashes.\n\
+             top_rule row text: {:?}\n\
+             dump:\n{}",
+            prompt_row,
+            top_rule_row,
+            dashes,
+            vterm.row_text(top_rule_row),
+            vterm.dump()
+        );
+    }
+
+    /// Regression: body rows painted via `paint_body_into_cells` were
+    /// only writing `clipped.len()` cells into `screen.cells[i]`, leaving
+    /// the trailing `[clipped.len(), width)` columns untouched. The diff
+    /// against `prev_cells` then emitted blanks correctly... in theory.
+    ///
+    /// In practice — and only when the body overflows the visible cap so
+    /// `emit_body_line_inner`'s scroll-then-shift_prev_up path runs — the
+    /// shift rotates `prev_cells` such that the new logical body row's
+    /// slot in `prev_cells` holds the SAME body row's content from the
+    /// last frame (the prior row shifted into its position is its own
+    /// previous representation). So the diff sees "row content
+    /// unchanged" for the slot and emits zero patches for it — including
+    /// no blanks for the trailing columns that the body row never wrote.
+    ///
+    /// When the body line is then REPLACED with shorter content (e.g.
+    /// `commit_inflight_tool` swapping a wrapped 3-row spinner for a
+    /// single committed row; the spinner row was 60-cols wide, the
+    /// commit row is 24-cols), the right-edge fragment of the old row
+    /// stays on the physical terminal because no blank patches were
+    /// emitted for those columns.
+    ///
+    /// Reproduction here is more direct: push a LONG body row, paint;
+    /// then directly replace `body_lines.last()` with a SHORT row (the
+    /// same shape `push_or_update_live_spinner`'s in-place update does),
+    /// re-paint, and verify the right edge of the row is BLANK in the
+    /// vterm grid — not the trailing fragment of the long row.
+    #[test]
+    fn retained_short_row_replacing_long_row_clears_trailing_cells_via_vterm() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Frame 1: seed the footer.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Push a LONG body row that fits on a single terminal row
+        // (body width on an 80-col terminal with no scrollbar is 80 - 4
+        // = 76 cells after `push_body_text`'s PAD_COL=2 padding on each
+        // side; pick a payload that lands a unique trailing marker near
+        // the right edge so we can spot it later).
+        let long_marker = "ENDMARKER";
+        let long_payload =
+            format!("write_file(/long/path/to/file.md) {}", long_marker);
+        // Sanity: ensure the payload fits in a single body row so we
+        // don't accidentally land the marker on a wrapped second row.
+        assert!(
+            long_payload.len() <= (w as usize - 2 * 2),
+            "long payload must fit one body row to make the test deterministic"
+        );
+        r.render(UiLine::CommandOutput(long_payload.clone()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Locate the body row that holds our long content on the
+        // physical terminal grid.
+        let body_height = r.body_bottom_row() as usize;
+        let long_screen_row = (0..body_height)
+            .find(|&row_0idx| vterm.row_text(row_0idx).contains(long_marker))
+            .unwrap_or_else(|| {
+                panic!(
+                    "long row should be visible in vterm\nbody_height={}, body_lines.len()={}\ndump:\n{}",
+                    body_height,
+                    r.body_lines.len(),
+                    vterm.dump()
+                )
+            });
+
+        // Replace the in-memory body row with a SHORTER row and re-paint
+        // via the normal paint pipeline. (Mirrors the shape of
+        // `commit_inflight_tool` and similar paths that swap a long
+        // wrapped row for a short committed one without going through
+        // emit_body_line_inner / EL erase.)
+        let short = {
+            let mut row: Vec<Cell> = Vec::new();
+            push_str_cells(&mut row, "  write_file(file.md)", &CellStyle::default());
+            row
+        };
+        if let Some(last) = r.body_lines.last_mut() {
+            *last = short;
+        }
+        // Mark dirty so the next flush actually runs paint_frame.
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Assert: the marker from the long row must be GONE from the
+        // physical terminal — the trailing cells where it lived must
+        // have been blanked by the paint cycle.
+        let row_text = vterm.row_text(long_screen_row);
+        assert!(
+            !row_text.contains(long_marker),
+            "ghost fragment {:?} still on screen at row {}\nrow text: {:?}\ndump:\n{}",
+            long_marker,
+            long_screen_row,
+            row_text,
+            vterm.dump()
+        );
+    }
+
+    /// Regression for the "system bell rings on Ctrl+C copy" bug.
+    /// `renderer.copy_selection()` (the Ctrl+C path) must not emit
+    /// `\x07` (BEL) bytes anywhere in its output. Mouse-release copy
+    /// uses `copy_to_clipboard` which falls back to OSC 52 (BEL-
+    /// terminated) on arboard failure — that's expected. Ctrl+C copy
+    /// uses arboard-only and must therefore stay silent.
+    #[test]
+    fn retained_ctrl_c_copy_selection_emits_no_bel() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        // Seed a User row so there's something to select.
+        r.render(UiLine::User("hello world from a body row".into()));
+        r.flush_deferred();
+
+        // Start a selection covering the visible text.
+        let body_height = r.body_bottom_row() as usize;
+        let total = r.body_lines.len();
+        let viewport_start = total.saturating_sub(body_height);
+        let target_row = (viewport_start..total)
+            .find(|&i| !r.body_lines[i].is_empty())
+            .expect("at least one non-empty visible row");
+        r.selection.begin((target_row, 0));
+        r.selection.update((target_row, 10));
+
+        // Clear captured bytes so we only inspect copy_selection output.
+        buf.lock().unwrap().clear();
+        let copied = r.copy_selection();
+        // arboard MAY fail in the test environment (headless CI etc) —
+        // when it does, copy_selection returns false. The invariant
+        // about BEL must hold regardless of whether the copy actually
+        // landed on the system clipboard.
+        let _ = copied;
+        let output = buf.lock().unwrap().clone();
+        assert!(
+            !output.contains(&b'\x07'),
+            "Ctrl+C copy_selection must not emit BEL (\\x07); got bytes: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    /// Regression for the "system bell rings on selection end" bug.
+    /// `end_selection` (mouse-release) calls `copy_to_clipboard` which
+    /// historically wrote OSC 52 first, BEL-terminated and audible on
+    /// iTerm2 / Terminal.app when their visual-bell setting was off.
+    /// The 26efb791 commit switched the order to arboard-first, but
+    /// the OSC 52 fallback path STILL emits a BEL whenever arboard
+    /// fails — that's wrong when arboard is the canonical path on
+    /// every supported desktop platform: a failure is exceptional and
+    /// shouldn't ring the user's terminal.
+    ///
+    /// This test pins the invariant: when arboard succeeds (typical
+    /// case on darwin / linux desktop / windows), `end_selection` must
+    /// not emit BEL bytes.
+    #[test]
+    fn retained_end_selection_emits_no_bel_when_arboard_succeeds() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        r.render(UiLine::User("hello world from a body row".into()));
+        r.flush_deferred();
+
+        let body_height = r.body_bottom_row() as usize;
+        let total = r.body_lines.len();
+        let viewport_start = total.saturating_sub(body_height);
+        let target_row = (viewport_start..total)
+            .find(|&i| !r.body_lines[i].is_empty())
+            .expect("at least one non-empty visible row");
+        r.selection.begin((target_row, 0));
+        r.selection.update((target_row, 10));
+
+        buf.lock().unwrap().clear();
+        r.end_selection();
+        let output = buf.lock().unwrap().clone();
+        // Test environments may not have arboard available — in that
+        // case `copy_to_clipboard` falls back to OSC 52 and we'd
+        // legitimately emit BEL. Skip the assertion in that scenario;
+        // the unconditional assertion lives in the unit test for the
+        // arboard-first path.
+        if arboard::Clipboard::new().is_ok() {
+            assert!(
+                !output.contains(&b'\x07'),
+                "end_selection must not emit BEL when arboard succeeds; got: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    }
+
+    /// Regression for the ghost-row-tail bug seen in the user
+    /// screenshot. The root cause is a multi-step interaction:
+    ///   1. A body row is painted with LONG content. The cell-diff
+    ///      emits the LONG cells; after the swap, `prev_cells` holds
+    ///      `[LONG content][trailing blanks]` and physical terminal
+    ///      mirrors that exactly.
+    ///   2. Something invokes `screen.invalidate()` (or a path that
+    ///      effectively zeroes the relevant `prev_cells` rows) — the
+    ///      cell-diff cache now claims "no content anywhere", but the
+    ///      physical terminal is unchanged.
+    ///   3. The body row is replaced with SHORTER content and the
+    ///      next paint runs. `paint_body_into_cells` only writes the
+    ///      short cells into `screen.cells[i][0..short_len]`, leaving
+    ///      `cells[i][short_len..w]` blank from `screen.clear()`.
+    ///   4. The diff for trailing cols sees `cells = blank` and
+    ///      `prev_cells = blank` (post-invalidate) → no patch emitted.
+    ///      Physical terminal STILL holds `[LONG content tail]` at
+    ///      those cols → user sees `[SHORT][ghost trail of LONG]`.
+    ///
+    /// `paint_body_into_cells` must pad each body row to the
+    /// effective body width before `draw_row` and the invalidate
+    /// callers must physically erase the affected rows; together this
+    /// keeps cells / prev_cells / terminal byte-aligned across the
+    /// invalidate-then-shrink boundary.
+    #[test]
+    fn retained_paint_body_clears_trailing_after_invalidate_with_shorter_row_via_vterm() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Seed the footer.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Frame 1: push a LONG body row through the normal paint path.
+        let long_marker = "LONG_TAIL_ZZZ";
+        let mut long_row: Vec<Cell> = Vec::new();
+        push_str_cells(
+            &mut long_row,
+            &format!("body_payload {}", long_marker),
+            &CellStyle::default(),
+        );
+        // Extend to a near-full-width payload so the marker lands well
+        // past where any subsequent short row would reach.
+        let target_len = (w as usize).saturating_sub(2);
+        while long_row.iter().map(|c| c.width as usize).sum::<usize>() < target_len {
+            long_row.push(Cell {
+                ch: 'X',
+                style: CellStyle::default(),
+                width: 1,
+            });
+        }
+        r.push_body_row(long_row);
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Locate the row on the physical grid.
+        let body_height = r.body_bottom_row() as usize;
+        let long_screen_row = (0..body_height)
+            .find(|&row_0idx| vterm.row_text(row_0idx).contains(long_marker))
+            .unwrap_or_else(|| {
+                panic!(
+                    "long row should be visible in vterm\nbody_lines.len()={} body_height={}\ndump:\n{}",
+                    r.body_lines.len(),
+                    body_height,
+                    vterm.dump()
+                )
+            });
+
+        // Frame 2: simulate the invalidate-then-shrink sequence the
+        // bug requires. `pop_approval_prompt` / `refresh_welcome_banner`
+        // both call `screen.invalidate()` to force a cold-start repaint
+        // — verify the bug class by invoking invalidate directly so the
+        // test isolates the rendering invariant (not the specific
+        // caller).
+        r.screen.invalidate();
+        // Replace `body_lines.last()` with a much shorter row.
+        let mut short_row: Vec<Cell> = Vec::new();
+        push_str_cells(&mut short_row, "tiny", &CellStyle::default());
+        if let Some(last) = r.body_lines.last_mut() {
+            *last = short_row;
+        }
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The trailing cells must be blank — no ghost trail from the
+        // LONG row.
+        let after = vterm.row_text(long_screen_row);
+        assert!(
+            !after.contains(long_marker),
+            "trailing fragment {:?} survived at row {} after invalidate+shrink: {:?}\ndump:\n{}",
+            long_marker,
+            long_screen_row,
+            after,
+            vterm.dump()
+        );
+        let right_edge = vterm.cell_at(long_screen_row, (w - 5) as usize);
+        assert_eq!(
+            right_edge.ch, ' ',
+            "right-edge cell at row {} col {} should be blank, got {:?}\ndump:\n{}",
+            long_screen_row,
+            w - 5,
+            right_edge,
+            vterm.dump()
+        );
+    }
+
+    /// Variant of the test above that DIRECTLY exercises the
+    /// `paint_body_into_cells` short-row-after-long-row case at the
+    /// screen.cells layer (no `body_lines.last_mut()` shenanigans),
+    /// using `repaint_body_region` to drive the paint pipeline twice
+    /// against a body_lines slot whose content was just shortened.
+    #[test]
+    fn retained_paint_body_short_row_clears_trailing_cells_via_vterm() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Seed the footer.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Push a long body row directly. Use a uniquely identifiable
+        // tail marker.
+        let long_marker = "RIGHT_EDGE_TAIL_ZZZ";
+        let mut long_row: Vec<Cell> = Vec::new();
+        push_str_cells(
+            &mut long_row,
+            &format!("short_payload {}", long_marker),
+            &CellStyle::default(),
+        );
+        // Force the row to be exactly the full effective body width by
+        // padding with trailing spaces — same shape a CommandOutput row
+        // would have when it exhausts the wrap budget. This is the case
+        // where prev_cells would otherwise be wide enough that the diff
+        // sees changes across the WHOLE row when we shorten.
+        let target_len = (w as usize).saturating_sub(2 * 2);
+        while long_row.iter().map(|c| c.width as usize).sum::<usize>() < target_len {
+            long_row.push(Cell {
+                ch: 'X',
+                style: CellStyle::default(),
+                width: 1,
+            });
+        }
+        r.push_body_row(long_row);
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The long row should be on the screen.
+        let body_height = r.body_bottom_row() as usize;
+        let long_screen_row = (0..body_height)
+            .find(|&row_0idx| vterm.row_text(row_0idx).contains(long_marker))
+            .unwrap_or_else(|| {
+                panic!(
+                    "long row should be visible in vterm\nbody_lines.len()={} body_height={}\ndump:\n{}",
+                    r.body_lines.len(),
+                    body_height,
+                    vterm.dump()
+                )
+            });
+
+        // Replace `body_lines.last()` with a much shorter row.
+        let mut short_row: Vec<Cell> = Vec::new();
+        push_str_cells(&mut short_row, "tiny", &CellStyle::default());
+        if let Some(last) = r.body_lines.last_mut() {
+            *last = short_row;
+        }
+        r.dirty = true;
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The trailing cells of long_screen_row must be wiped.
+        let after = vterm.row_text(long_screen_row);
+        assert!(
+            !after.contains(long_marker),
+            "trailing fragment {:?} survived at row {}: {:?}\ndump:\n{}",
+            long_marker,
+            long_screen_row,
+            after,
+            vterm.dump()
+        );
+        // Also: cells past the short row's content should be SPACE.
+        let cell_at_right_edge = vterm.cell_at(long_screen_row, (w - 5) as usize);
+        assert_eq!(
+            cell_at_right_edge.ch, ' ',
+            "right-edge cell at row {} col {} should be blank, got {:?}\ndump:\n{}",
+            long_screen_row,
+            w - 5,
+            cell_at_right_edge,
+            vterm.dump()
+        );
+    }
+
+    /// Defense-in-depth: no cell in a Java code block (after the full
+    /// `AssistantText` → `flush_assistant_remainder` →
+    /// `push_markdown_body` → `parse_markdown_to_cells` pipeline) may
+    /// carry `style.reverse == true`. This is the guard against any
+    /// future change that lets reverse-video bleed onto syntax-
+    /// highlighted code (the "green background blocks" symptom the user
+    /// reported when a stray SGR 7 from earlier output couldn't be
+    /// cleared by the historical `theme::RESET = "\x1b[23;39m"` — that
+    /// only cleared italic + fg, not reverse. `RESET` has since been
+    /// promoted to a full SGR 0 reset; see
+    /// `markdown_stream_does_not_leak_reverse_across_tokens` below for
+    /// the unit-level proof.).
+    ///
+    /// Current code already passes this — none of the syntect, markdown,
+    /// or render paths emit SGR 7 onto body cells; the test exists as
+    /// a regression net so any future addition of `\x1b[7m` upstream
+    /// of `parse_markdown_to_cells` trips here instead of silently
+    /// rendering reverse-video on every code-block cell.
+    #[test]
+    fn retained_java_code_block_has_no_reverse_video_cells() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        let stream = "Here is some Java:\n\
+                     \n\
+                     ```java\n\
+                     int[] arr = {0, 1, 4, 3};\n\
+                     String s = null;\n\
+                     void foo(int x, Object y) { return null; }\n\
+                     ```\n\
+                     \n\
+                     Closing prose.\n";
+        r.render(UiLine::AssistantText(stream.into()));
+        r.render(UiLine::AssistantLineBreak);
+
+        let mut reverse_cells: Vec<(usize, usize, char)> = Vec::new();
+        for (row_idx, row) in r.body_lines.iter().enumerate() {
+            for (col_idx, cell) in row.iter().enumerate() {
+                if cell.style.reverse {
+                    reverse_cells.push((row_idx, col_idx, cell.ch));
+                }
+            }
+        }
+        assert!(
+            reverse_cells.is_empty(),
+            "no body cell from a syntax-highlighted code block may carry \
+             reverse-video — found {:?}. The class of bug this guards: \
+             SGR 7 leaks in from earlier output and the highlighter's \
+             RESET (`\\x1b[23;39m`) doesn't clear reverse, so the entire \
+             code block renders with swapped fg/bg (green-on-default for \
+             string tokens, etc.).",
+            reverse_cells,
+        );
+    }
+
+    /// Unit-level regression for the `theme::RESET` under-clearing bug.
+    ///
+    /// Pre-fix `RESET` was `\x1b[23;39m` (italic-off + default-fg only).
+    /// When upstream UI chrome (ApprovalPrompt Y chip, top-rule session
+    /// pill, etc.) emitted `\x1b[7m` and never explicitly disabled it
+    /// with SGR 27, the working `style` inside `parse_markdown_to_cells`
+    /// carried `reverse=true` across token boundaries. The highlighter's
+    /// per-token RESET could not clear it, so subsequent token cells
+    /// (Number, String, etc.) were baked with `style.reverse == true` —
+    /// rendering as solid coloured blocks on Terminal.app (Terminal.app
+    /// honours SGR state more strictly than iTerm2, which is why the
+    /// bug was Terminal.app-specific even though the bytes were wrong
+    /// everywhere).
+    ///
+    /// This test directly drives `parse_markdown_to_cells` with the
+    /// exact pattern that triggered the leak: turn reverse ON, write
+    /// some text, hit the highlighter's `RESET`, then write a tinted
+    /// Number token. Post-fix (`RESET = "\x1b[0m"`), the Number cell
+    /// must have `style.reverse == false`. Pre-fix, this assertion
+    /// trips because reverse=true leaks past the partial RESET.
+    #[test]
+    fn markdown_stream_does_not_leak_reverse_across_tokens() {
+        // Pattern: reverse-ON, "Y", theme::RESET, then a Number token
+        // wrapped with truecolor open + theme::RESET close — mirrors how
+        // an ApprovalPrompt chip's reverse state could leak into a
+        // syntect-highlighted code block.
+        let stream = format!(
+            "\x1b[7mY{reset}\x1b[38;2;209;154;102m42{reset}",
+            reset = crate::highlight::theme::RESET,
+        );
+
+        let lines = parse_markdown_to_cells(&stream);
+        assert_eq!(lines.len(), 1, "expected single line, got {:?}", lines);
+        let row = &lines[0];
+
+        // Find the Number-token cells (chars '4' and '2').
+        let number_cells: Vec<&Cell> =
+            row.iter().filter(|c| c.ch == '4' || c.ch == '2').collect();
+        assert_eq!(
+            number_cells.len(),
+            2,
+            "expected the two Number-token cells, got row: {:?}",
+            row,
+        );
+
+        for cell in &number_cells {
+            assert!(
+                !cell.style.reverse,
+                "Number-token cell {:?} must NOT carry reverse=true — \
+                 the highlighter's RESET must fully clear SGR state \
+                 (including SGR 7 reverse) emitted upstream. If this \
+                 fires, `theme::RESET` likely regressed back to a partial \
+                 close like `\\x1b[23;39m` that only clears italic + fg.",
+                cell,
+            );
+        }
+
+        // Sanity: the leading "Y" cell DOES carry reverse — confirms the
+        // SGR 7 actually took effect and the test isn't trivially green
+        // because reverse never made it into the style stream.
+        let y_cell = row
+            .iter()
+            .find(|c| c.ch == 'Y')
+            .expect("expected the leading reverse-Y cell, got row: {:?}");
+        assert!(
+            y_cell.style.reverse,
+            "control: the upstream `Y` cell must carry reverse=true so we \
+             know the SGR 7 entered the style stream. If THIS fires, the \
+             test setup is broken — not the fix.",
+        );
+    }
+
+    /// Regression: end-of-turn burst over the overflow boundary used to
+    /// duplicate every overflow-pushed row on the physical terminal.
+    ///
+    /// Real-world repro (user screenshot):
+    ///   "以上就是 Java 语法高亮的完整速查……"   ← duplicated
+    ///   "以上就是 Java 语法高亮的完整速查……"
+    ///   "✓ Done · 1 轮 · 0 工具 · …"           ← duplicated
+    ///   "✓ Done · 1 轮 · 0 工具 · …"
+    ///
+    /// Mechanism: `emit_body_line_inner` direct-wrote the new body row
+    /// at row `footer_top_1idx = cap + 1` (one row BELOW where the body
+    /// tail should actually live after the bottom-LF scroll shifted the
+    /// footer up by 1). The follow-up `paint_frame` cell-diff then
+    /// painted the same row at row `cap` (correct). The ghost write at
+    /// `cap + 1` survived because successive overflow pushes shifted it
+    /// up into the visible body region, and the cell-diff couldn't
+    /// erase the ghost glyphs at columns where `prev_cells` (post
+    /// `shift_prev_up`) and `cells` (post `paint_body_into_cells`)
+    /// both held blanks — the bug class `850a8a47` flagged for blank-
+    /// cell diff suppression, applied here to "stale glyph from earlier
+    /// emit's wrong-row write" instead of "stale reverse-video bit".
+    ///
+    /// Test: simulate the burst (final assistant paragraph + 3-row
+    /// TurnSeparator), confirm each marker text appears EXACTLY once
+    /// in the visible body region. Pre-fix this asserts at 2x; post-
+    /// fix it stays at 1x.
+    #[test]
+    fn retained_overflow_burst_does_not_duplicate_tail_rows() {
+        let w: u16 = 80;
+        let h: u16 = 12;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+
         r.render(UiLine::InputPrompt {
             buf: String::new(),
             cursor_byte: 0,
@@ -8492,41 +9284,172 @@ mod tests {
             status: status_basic(),
             attachments: Vec::new(),
         });
-        buf.lock().unwrap().clear();
-        r.scroll_body(-3);
-        let bytes = buf.lock().unwrap().clone();
-        // The very last CUP-shaped sequence (\x1b[N;MH) in the output should
-        // target a row > body_bottom_row (i.e., inside the footer region).
-        // We assert by scanning from the END backwards for the first CUP.
-        let s = String::from_utf8_lossy(&bytes);
-        let body_bottom = r.body_bottom_row();
-        let mut found_cup_row: Option<u16> = None;
-        let mut idx = s.len();
-        // Walk backwards searching for "\x1b[" then ";...H".
-        while idx > 2 {
-            if let Some(pos) = s[..idx].rfind("\x1b[") {
-                let tail = &s[pos+2..];
-                if let Some(h_pos) = tail.find('H') {
-                    let inner = &tail[..h_pos];
-                    if let Some((row_s, _col_s)) = inner.split_once(';') {
-                        if let Ok(row) = row_s.parse::<u16>() {
-                            found_cup_row = Some(row);
-                            break;
-                        }
-                    }
-                }
-                idx = pos;
-            } else {
-                break;
-            }
+        r.flush_deferred();
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+
+        // Fill body exactly to cap with filler so the upcoming burst
+        // is guaranteed to ride the overflow branch every push.
+        for i in 0..cap {
+            r.render(UiLine::AssistantText(format!("filler {}\n", i)));
         }
-        let last_cup_row = found_cup_row.unwrap_or(0);
-        assert!(
-            last_cup_row > body_bottom,
-            "trailing CUP after scroll must point inside footer (>{}); got row={}; tail bytes: {:?}",
-            body_bottom,
-            last_cup_row,
-            &s[s.len().saturating_sub(120)..]
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // Burst: final paragraph chunk (line-terminated so it flushes
+        // inside `flush_assistant_lines`) + TurnSeparator (which pushes
+        // three rows: blank spacer / rule_with_label / blank spacer).
+        // No `flush_deferred` between pushes so the cell-diff sees the
+        // accumulated `shift_prev_up`/`invalidate_rows_from` state ALL
+        // AT ONCE — exactly how a real end-of-turn burst arrives.
+        r.render(UiLine::AssistantText("ENDPARA_UNIQUE\n".into()));
+        r.render(UiLine::TurnSeparator {
+            label: "DONE_LABEL_UNIQUE".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Count occurrences on the entire screen (body + footer). The
+        // duplicate ghost lands in the body region, never on a footer
+        // row — but we scan the whole screen so a regression that
+        // displaces the dup elsewhere still trips this test.
+        let count = |needle: &str| -> usize {
+            (0..h as usize)
+                .filter(|&row_0idx| vterm.row_text(row_0idx).contains(needle))
+                .count()
+        };
+        let occ_para = count("ENDPARA_UNIQUE");
+        let occ_label = count("DONE_LABEL_UNIQUE");
+        assert_eq!(
+            occ_para, 1,
+            "ENDPARA_UNIQUE must appear EXACTLY once after end-of-turn \
+             overflow burst (found {}). Pre-fix this was 2 — the \
+             overflow direct-write landed at row cap+1 (one below the \
+             body tail) and the follow-up cell-diff painted the same \
+             row at cap; the ghost at cap+1 then got shifted up into \
+             the visible body region by successive overflow pushes.\ndump:\n{}",
+            occ_para,
+            vterm.dump()
         );
+        assert_eq!(
+            occ_label, 1,
+            "DONE_LABEL_UNIQUE must appear EXACTLY once after end-of-turn \
+             overflow burst (found {}). See ENDPARA_UNIQUE assertion \
+             above for the mechanism.\ndump:\n{}",
+            occ_label,
+            vterm.dump()
+        );
+    }
+
+    /// Regression: `/resume` replay calls `reset()` then direct-writes
+    /// historical rows via `emit_body_line_inner` BEFORE the next
+    /// `paint_frame` tick. Pre-fix, `reset()` rebuilt `screen` with a
+    /// fresh blank `prev_cells` AND blank `cells` but left
+    /// `physical_dirty = false`, so the first post-reset render_diff
+    /// skipped the cold-start CUP+EL preamble. Stale-column glyphs
+    /// from the replay direct-writes then survived in the physical
+    /// terminal — the cell-diff saw `prev_blank == new_blank` at
+    /// trailing columns and emitted no patch — and the next streaming
+    /// overflow burst ghosted those fragments into the visible body,
+    /// producing duplicated tail rows ONLY after `/resume` (never
+    /// after `/new`, whose `body_lines` starts empty so no replay
+    /// direct-writes have populated the physical terminal).
+    ///
+    /// Fix: `reset()` ends with `screen.invalidate()` so the next
+    /// `render_diff` begins with the cold-start preamble (per-row
+    /// CUP+EL across every row) and wipes everything before patches
+    /// land. From that point on `prev_cells` correctly mirrors
+    /// physical and the existing db346457 overflow-target fix works
+    /// for resumed sessions the same way it does for fresh ones.
+    ///
+    /// We test the contract at the byte-stream level: after `reset()`,
+    /// the next `render_diff` MUST emit the per-row CUP+EL preamble.
+    /// This mirrors `screen::tests::invalidate_prepends_per_row_clear_on_next_diff`
+    /// but at the renderer boundary (the public reset API), so a
+    /// future refactor that drops the `invalidate()` call here can't
+    /// silently regress the contract by relying on Screen-internal
+    /// invariants the renderer never enforced.
+    #[test]
+    fn retained_post_reset_replay_then_burst_does_not_duplicate_tail() {
+        let w: u16 = 40;
+        let h: u16 = 8;
+        let (mut r, buf) = new_capturing(w, h);
+
+        // Warm the renderer: push some body content + paint so
+        // `prev_cells` is NOT all-blank when reset() runs. Without
+        // this the bug is hidden — Screen::new() already starts with
+        // blank prev_cells, so a "no invalidate" reset wouldn't show
+        // any difference on the FIRST post-reset diff. Real-world
+        // /resume always runs against a populated prev_cells (the
+        // pre-resume session painted something), so the warm-up is
+        // load-bearing for reproducing the bug class.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::AssistantText("pre-resume content\n".into()));
+        r.flush_deferred();
+        buf.lock().unwrap().clear();
+
+        // /resume hard reset. Pre-fix this rebuilt Screen with
+        // `physical_dirty = false`; post-fix it ends with
+        // `screen.invalidate()` so the next diff cold-starts.
+        r.reset();
+
+        // Simulate replay phase: push one body row + render the
+        // prompt so paint_frame has something to draw. The exact
+        // content doesn't matter for the cold-start assertion — we
+        // just need to reach `flush_deferred → paint_frame →
+        // render_diff` so the first post-reset diff actually runs.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::AssistantText("replay row 0\n".into()));
+
+        // Snapshot the buffer right before the first post-reset
+        // paint so we can isolate render_diff's output (the
+        // direct-write emits from `emit_body_line_inner` above also
+        // live in `buf` but we want to assert only on what
+        // render_diff produces — that's where the cold-start
+        // preamble must appear).
+        let pre_paint_len = buf.lock().unwrap().len();
+
+        // First post-reset paint tick.
+        r.flush_deferred();
+
+        // Inspect the bytes emitted by the first post-reset
+        // render_diff. Pre-fix, `physical_dirty` was false so
+        // render_diff skipped its cold-start preamble and produced
+        // ONLY cell-diff patches. Post-fix, every row must be
+        // preceded by `CUP(row,1) + EL` somewhere in the output.
+        let post_paint = {
+            let g = buf.lock().unwrap();
+            g[pre_paint_len..].to_vec()
+        };
+        let post_paint_str = String::from_utf8_lossy(&post_paint);
+
+        // The cold-start preamble emits per-row CUP+EL for every row
+        // from 1..=h. Asserting on all of them makes the test robust
+        // against a partial regression (e.g. someone replacing the
+        // loop with a `\x1b[2J` would fail this just like dropping
+        // invalidate() entirely would).
+        for row in 1..=(h as usize) {
+            let needle = format!("\x1b[{};1H\x1b[K", row);
+            assert!(
+                post_paint_str.contains(&needle),
+                "first render_diff after reset() must emit cold-start CUP+EL \
+                 for row {} (pre-fix: physical_dirty=false → preamble skipped \
+                 → stale replay direct-write glyphs survive → next overflow \
+                 ghosts them into visible body as duplicated tail).\nbytes: {:?}",
+                row,
+                post_paint_str
+            );
+        }
     }
 }
