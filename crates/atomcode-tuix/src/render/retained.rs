@@ -384,12 +384,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// full-frame, guaranteeing the terminal re-processes the
     /// rule regardless of diff skip.
     last_painted_footer_rows: usize,
-    /// Bottom row (1-indexed) of the currently-set DECSTBM region.
-    /// `None` means "no region set" (terminal default = full screen).
-    /// Updated by `ensure_scroll_region()` before any body/footer
-    /// paint so `\n` in the body-emit path only scrolls body rows,
-    /// leaving the footer strip below untouched.
-    scroll_region_bottom: Option<u16>,
     /// Set by `pop_approval_prompt` so the immediately-following
     /// body-line emit overwrites the approval row in place instead of
     /// scrolling the region up one row. Without this, the ToolResult
@@ -526,7 +520,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             md_state: crate::markdown::MdState::new(),
             dirty: false,
             last_painted_footer_rows: 0,
-            scroll_region_bottom: None,
             skip_body_scroll_count: 0,
             welcome_banner: None,
             welcome_line_count: 0,
@@ -674,7 +667,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return;
         }
 
-        self.ensure_scroll_region();
         let bottom = self.body_bottom_row();
         let inplace_ok = prev_rows > 0 && n == prev_rows && bottom >= n as u16;
         if inplace_ok {
@@ -1373,17 +1365,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
     }
 
-    /// Stub: append-only refactor (Phase 2) — body lines write directly
-    /// to main screen scrollback via terminal `\n`, no DECSTBM region
-    /// needed. Function and `scroll_region_bottom` field will be
-    /// deleted in Task 4.1 after a parity sanity-check window. The
-    /// `\x1b[r` writes elsewhere (shutdown/reset/clear/suspend) stay —
-    /// they're harmless terminal hygiene that releases any region a
-    /// child process may have set.
-    fn ensure_scroll_region(&mut self) {
-        let _ = self.scroll_region_bottom;
-    }
-
     /// Append-only model: emit one body row via the
     /// "CUP-to-footer-top → erase-to-end-of-screen → write-row + LF"
     /// cycle. The cursor before this call is somewhere inside the
@@ -1625,7 +1606,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             if let Some(last) = self.body_lines.last_mut() {
                 *last = row_cells.clone();
             }
-            self.ensure_scroll_region();
             let bottom = self.body_bottom_row();
             if bottom > 0 {
                 let seq = format!("\x1b[{};1H\x1b[K", bottom);
@@ -1681,7 +1661,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let bottom_before_truncate = self.body_bottom_row();
             self.body_lines.truncate(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
-            self.ensure_scroll_region();
             if bottom_before_truncate > 0 && remove > 0 {
                 // Erase ALL terminal rows previously occupied by the
                 // inflight spinner (may be >1 when the command was long
@@ -2684,7 +2663,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // bottom of the visible body strip; the live-group
                 // children sit just above it. body_lines maps to
                 // terminal rows from `body_bottom - (len-1)` upwards.
-                self.ensure_scroll_region();
                 let bottom = self.body_bottom_row();
                 if bottom == 0 {
                     return;
@@ -3027,7 +3005,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // paragraph separation.
                 if self.body_lines.last().map_or(false, |r| r.is_empty()) {
                     self.body_lines.pop();
-                    self.ensure_scroll_region();
                     let bottom = self.body_bottom_row();
                     if bottom > 0 {
                         let seq = format!("\x1b[{};1H\x1b[K", bottom);
@@ -3272,7 +3249,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
-        self.scroll_region_bottom = None;
         let _ = self.out.flush();
     }
 
@@ -3292,11 +3268,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         // builds and can promote visible rows to scrollback rather
         // than clearing. EL (`\x1b[K`) is row-local with no scroll
         // or scrollback semantics, so a CUP+EL per row is
-        // unambiguous everywhere (same technique as
-        // `ensure_scroll_region`'s resize path).
+        // unambiguous everywhere (same technique used by
+        // `on_resize` and `clear_screen`).
         //
-        // Release DECSTBM first so EL isn't constrained by the
-        // prior scroll region.
+        // Release DECSTBM first so EL isn't constrained by any
+        // scroll region a child process may have left set.
         let _ = self.out.write_all(b"\x1b[r");
         let h = self.screen.height() as usize;
         let mut seq = String::with_capacity(h * 8 + 8);
@@ -3311,7 +3287,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.assistant_line_buf.clear();
         self.md_state.reset();
         self.last_painted_footer_rows = 0;
-        self.scroll_region_bottom = None;
         let _ = self.out.flush();
         // Force cold-start CUP+EL on next paint to wipe pre-reset stdout writes.
         self.screen.invalidate();
@@ -3356,7 +3331,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let position_row = body_bottom.saturating_add(1);
         let seq = format!("\x1b[r\x1b[{};1H\x1b[J\x1b[?7h", position_row);
         let _ = self.out.write_all(seq.as_bytes());
-        self.scroll_region_bottom = None;
         // Footer is wiped — record that so the next paint after
         // resume doesn't try to diff against stale footer state.
         self.last_painted_footer_rows = 0;
@@ -3421,7 +3395,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
         self.screen.invalidate();
-        self.scroll_region_bottom = None;
         let _ = self.out.flush();
         // Re-emit body tail so the view matches `body_lines` again.
         // Append-only top-anchored: tail lives at rows [first_row, bottom];
@@ -3667,7 +3640,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         }
         seq.push_str("\x1b[H");
         let _ = self.out.write_all(seq.as_bytes());
-        self.scroll_region_bottom = None;
         self.screen.resize(cols, rows);
         // Rebuild the semantic welcome banner against the new width so
         // its right-aligned version/license pair stays adaptive after
@@ -6264,7 +6236,7 @@ mod tests {
 
         // And removed from history: body_lines should not carry a
         // lingering spinner entry that would re-surface on
-        // ensure_scroll_region repaints or resize.
+        // repaint or resize.
         let spinner_in_history = r.body_lines.iter().any(|row| {
             let text: String = row.iter().map(|c| c.ch).collect();
             text.contains("Pondering")
@@ -7088,16 +7060,17 @@ mod tests {
 
     /// Regression for user report: after `/model` switched providers,
     /// scrolling up showed the welcome banner + prior messages
-    /// duplicated in scrollback. Root cause: `/model` changes the
-    /// status-line text, which can change the footer height (status
-    /// wraps, or spinner/menu rows differ between frames). When
-    /// `current_footer_rows()` shifts, `ensure_scroll_region`'s
-    /// shrunk/grew branches clear the viewport and re-emit every
-    /// cached body row through `emit_body_line_inner` — which uses
+    /// duplicated in scrollback. Root cause (historical, pre
+    /// append-only refactor): `/model` changes the status-line text,
+    /// which can change the footer height (status wraps, or
+    /// spinner/menu rows differ between frames). When
+    /// `current_footer_rows()` shifted, the DECSTBM
+    /// shrunk/grew branches cleared the viewport and re-emitted every
+    /// cached body row through `emit_body_line_inner` — which used
     /// `\n` at the region bottom, scrolling the top row into
     /// terminal scrollback. Any cached body row that had already
-    /// entered scrollback during its original emit now enters a
-    /// second time: a duplicate the user sees on scroll-up.
+    /// entered scrollback during its original emit then entered a
+    /// second time: a duplicate the user saw on scroll-up.
     ///
     /// Repro: fill body past the viewport so a known welcome line
     /// lives in scrollback once, then change the footer height by
@@ -7231,8 +7204,9 @@ mod tests {
     /// Regression for user report: on first startup the welcome
     /// banner rendered TWICE — once at the top of the viewport
     /// (pushed into scrollback, no input box) and once at the bottom
-    /// above the input box. Root cause: `ensure_scroll_region` used
-    /// `\x1b[2J` to wipe the viewport before re-painting the body.
+    /// above the input box. Root cause (historical, pre append-only
+    /// refactor): the DECSTBM resize path used `\x1b[2J` to wipe the
+    /// viewport before re-painting the body.
     /// macOS Terminal.app and iTerm2 (and xterm with `cbScrollback`)
     /// copy every non-blank visible row into scrollback when
     /// processing ED — so the 6 welcome rows painted during the
