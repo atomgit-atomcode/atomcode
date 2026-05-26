@@ -62,6 +62,13 @@ backend.log
 # diverge between contributors, and shouldn't imply official project rules).
 /CLAUDE.md
 .claude/settings.local.json
+# Scratch space for the local Claude session (issue scrapes, notes,
+# intermediate analysis artifacts). Personal to the contributor and
+# not part of the source tree.
+.claude/atomcode_issues_*.json
+.claude/issues_*.json
+.claude/issues_*.md
+.claude/open_mrs.json
 
 # Local eval harness — kept off version control. Includes scripts,
 # baseline/config TOML (may hold API keys), case inputs, run outputs,
