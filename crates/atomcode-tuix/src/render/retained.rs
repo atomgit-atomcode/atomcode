@@ -6508,8 +6508,19 @@ mod tests {
     }
 
     /// Wide CJK input end-to-end: render "你是谁" from empty, assert
-    /// emit stream contains the three glyphs consecutively (no
-    /// cursor-drift desync between them).
+    /// all three glyphs reach the terminal. Earlier revisions pinned
+    /// CONSECUTIVE emission (no CUP between wide chars) to validate
+    /// the run-packing optimization. That optimization turned out to
+    /// be the root cause of a Windows bug: `unicode-width`'s default
+    /// narrow interpretation of East Asian Ambiguous characters
+    /// disagreed with legacy conhost / xterm.js (which render them at
+    /// 2 cols in CJK locale), so the model-predicted cursor drifted
+    /// from the real cursor and subsequent patches landed at wrong
+    /// columns. `serialize_patches` now forces a CUP before each
+    /// patch following a non-ASCII cell (codepoint >= U+0080), so
+    /// any width-prediction error self-corrects immediately. This
+    /// test only asserts all three glyphs reach the stream — CUP
+    /// interleaving between them is the desired new shape.
     #[test]
     fn retained_wide_char_input_keeps_all() {
         let (mut r, buf) = new_capturing(80, 24);
@@ -6534,11 +6545,14 @@ mod tests {
         r.flush_deferred();
         let stream_bytes = std::mem::take(&mut *buf.lock().unwrap());
         let stream = String::from_utf8_lossy(&stream_bytes).to_string();
-        assert!(
-            stream.contains("你是谁"),
-            "wide chars not consecutive in retained emit stream:\n{}",
-            stream
-        );
+        for ch in ['你', '是', '谁'] {
+            assert!(
+                stream.contains(ch),
+                "wide char {:?} missing from retained emit stream:\n{}",
+                ch,
+                stream
+            );
+        }
     }
 
     /// Mac Terminal.app drops bytes mid-sequence when a single

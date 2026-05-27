@@ -4851,7 +4851,16 @@ fn redraw_with_menu(
         status: build_status(state, ctx),
         attachments,
     });
-    renderer.flush();
+    // Footer-only UiLines (InputPrompt / StreamingBox) update widget
+    // state and set `dirty = true` but emit NO bytes — the real paint
+    // happens on the next `flush_deferred` tick (~5ms cadence,
+    // configured in event_loop's select loop). Calling `renderer.flush()`
+    // here would queue a `RenderCmd::Flush` that hits an empty BufWriter,
+    // which on Linux/macOS terminals is a sub-µs no-op but on Windows
+    // OpenConsole / xterm.js costs 1–3ms per arrow keypress (each Flush
+    // forces a WriteFile syscall + VT-parser cycle in the host). The
+    // 5ms paint tick is well below human perception, so dropping the
+    // explicit flush has zero UX cost and removes the per-key syscall.
 }
 
 /// Synchronize `state.pending_recalled_attachments` with whatever
@@ -4894,7 +4903,10 @@ fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mu
         status: build_status(state, ctx),
         attachments,
     });
-    renderer.flush();
+    // No explicit flush — see `redraw_with_menu` for the rationale
+    // (InputPrompt is footer-only, the 5ms `flush_deferred` tick owns
+    // the actual paint, and `out.flush()` on every keystroke is a
+    // measurable per-keypress syscall on Windows OpenConsole / xterm.js).
 }
 
 /// True iff startup should auto-open the OnboardingWizard:
@@ -6658,13 +6670,31 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     //   3. None.
     let no_provider =
         ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none();
-    // Priority: no-provider (Warning red) > CodingPlan drift monitor
-    // (Warning red) > CodingPlan token-usage hint (Info ≥80%, Warning
-    // ≥95%) > upgrade banner (Info dim). Usage outranks upgrade because
-    // ">80% in this rolling window" is more actionable than "new
-    // version available". Only one hint renders at a time (right-aligned
-    // on the status row).
-    let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
+    // Open-source build pointed at an AtomGit gateway: any chat will
+    // fail-fast with `CpOfficialBuildRequired`. Surface that diagnosis
+    // up front (red, beats every other hint) so the user doesn't have
+    // to type a message to discover the dead-end — `/login` won't help,
+    // only switching to the official build will.
+    let active_base_url = ctx
+        .config
+        .active_provider(None)
+        .ok()
+        .and_then(|p| p.base_url.clone())
+        .unwrap_or_default();
+    let needs_official_build = !atomcode_core::coding_plan::signer_available()
+        && atomcode_core::coding_plan::is_atomgit_gateway(&active_base_url);
+    // Priority: needs-official-build (Warning red) > no-provider (Warning
+    // red) > CodingPlan drift monitor (Warning red) > CodingPlan
+    // token-usage hint (Info ≥80%, Warning ≥95%) > upgrade banner
+    // (Info dim). Usage outranks upgrade because ">80% in this rolling
+    // window" is more actionable than "new version available". Only one
+    // hint renders at a time (right-aligned on the status row).
+    let hint: Option<(String, crate::render::HintSeverity)> = if needs_official_build {
+        Some((
+            crate::i18n::t(crate::i18n::Msg::StatusOfficialBuildRequired).into_owned(),
+            crate::render::HintSeverity::Warning,
+        ))
+    } else if no_provider {
         Some((
             crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
             crate::render::HintSeverity::Warning,

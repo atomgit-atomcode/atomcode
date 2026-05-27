@@ -381,12 +381,44 @@ pub fn serialize_patches(patches: &[Patch]) -> Vec<u8> {
         let encoded = patch.cell.ch.encode_utf8(&mut buf);
         out.extend_from_slice(encoded.as_bytes());
 
-        // Cursor advances by the glyph's display width. For narrow
-        // cells this is +1 (the common case), for wide cells (CJK,
-        // emoji) it's +2 — matching what the terminal actually does
-        // so the next patch's `expected_cursor` comparison is sound.
-        if let Some((r, c)) = expected_cursor {
-            expected_cursor = Some((r, c + patch.cell.width as u16));
+        // Cursor advance: only safe to model-predict for ASCII (U+0000..U+007F).
+        //
+        // Non-ASCII chars are where the renderer's `unicode-width` prediction
+        // can disagree with the terminal's actual rendering width. The two
+        // failure classes we hit in the wild:
+        //
+        //   * East Asian Ambiguous chars (×, ✓, →, •, 1-byte less than 0x80
+        //     but Unicode-wise above 0x80 — yes that's a contradiction by
+        //     codepoint, see below): default `unicode-width` predicts 1 col,
+        //     but legacy conhost + xterm.js in CJK locale render at 2 cols.
+        //   * Wide emoji (💡, etc.): predicted 2 cols, but some Windows
+        //     fonts render at 1 col.
+        //
+        // When prediction is off by N, the next patch's `expected_cursor`
+        // comparison thinks no CUP is needed but the terminal cursor is
+        // actually N cols away from where the model says. Run-packing then
+        // streams subsequent cells straight to stdout at the wrong physical
+        // columns, and the error accumulates across the row — characters
+        // from different source cells get smashed into each other's
+        // positions, producing the "AtomCodePCodingPlan" / "已添加o4G个"
+        // bleed seen on Win11 VSCode pwsh and legacy conhost.
+        //
+        // Pragmatic fix: keep run-packing for ASCII (which every terminal
+        // renders at 1 col, prediction always sound), force a CUP before
+        // the next patch on the same row after any non-ASCII cell. Costs
+        // ~6 extra bytes per non-ASCII cell — for CJK-heavy frames that's
+        // a couple hundred bytes; for ASCII-heavy frames (input box,
+        // status row) zero cost.
+        //
+        // Note: char codepoint, not display width, is the discriminator.
+        // U+00D7 (×) is single-byte UTF-8-encodable to 0xC3 0x97 — its
+        // codepoint 215 is >= 0x80, putting it on the "force CUP" side.
+        if (patch.cell.ch as u32) < 0x80 {
+            if let Some((r, c)) = expected_cursor {
+                expected_cursor = Some((r, c + patch.cell.width as u16));
+            }
+        } else {
+            expected_cursor = None;
         }
     }
 
