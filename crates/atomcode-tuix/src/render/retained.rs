@@ -8315,6 +8315,110 @@ mod tests {
         }
     }
 
+    /// Bug repro: user reports that assistant text rows duplicate in
+    /// the scrollback right before an approval-needed tool call,
+    /// visible on every terminal (macOS Terminal.app, iTerm2, VSCode
+    /// pwsh xterm.js) by scrolling up. Wire-dump confirms the LLM
+    /// only emits each line once. So the duplicate is in body_lines.
+    ///
+    /// This test simulates the most-likely event sequence under load
+    /// — TextDelta chunks token-by-token interleaved with spinner
+    /// ticks, then a ToolCallStreaming → ToolCallStarted → ApprovalNeeded
+    /// burst — and asserts that body_lines never contains two
+    /// adjacent entries with the same content.
+    #[test]
+    fn retained_approval_pending_no_duplicate_body_rows() {
+        let (mut r, _buf) = new_capturing(80, 24);
+
+        // Phase 1: stream assistant text in token-sized chunks.
+        // Real provider streams ~5-30 chars per delta. Insert a
+        // spinner tick every few chunks (mirrors draw_spinner_now
+        // 100ms cadence). The model output for this scenario:
+        //   "副本编辑成功、读回一致、删除 - PASS。\n\n步骤 7 - `search_replace`\n"
+        // followed by a function-calling tool_call (no XML in text).
+        let chunks = [
+            "副本", "编辑", "成功", "、读回", "一致",
+            "、删除 - ", "PASS", "。\n\n",
+            "步骤 7", " - ", "`search_replace`", "\n",
+        ];
+        for (i, chunk) in chunks.iter().enumerate() {
+            r.render(UiLine::AssistantText((*chunk).into()));
+            // Spinner tick every 3 chunks to mirror real cadence
+            // (one tick per ~100ms, deltas arrive ~30ms apart).
+            if i % 3 == 0 {
+                r.render(UiLine::StreamingBox {
+                    buf: String::new(),
+                    cursor_byte: 0,
+                    frame: "⠋",
+                    label: "Pondering · 1s".to_string(),
+                    status: status_basic(),
+                    menu: None,
+                    attachments: Vec::new(),
+                });
+            }
+        }
+        r.flush_deferred();
+
+        // Phase 2: tool_call_started fires.
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-7".into(),
+            name: "WriteFile".into(),
+            detail: "atomcode_smoke_replace.txt".into(),
+        });
+        // Spinner ticks for the inflight tool.
+        for frame in ["⠋", "⠙", "⠹"] {
+            r.render(UiLine::StreamingBox {
+                buf: String::new(),
+                cursor_byte: 0,
+                frame,
+                label: "Pondering · 1s".to_string(),
+                status: status_basic(),
+                menu: None,
+                attachments: Vec::new(),
+            });
+        }
+        r.flush_deferred();
+
+        // Phase 3: ApprovalNeeded fires — commit inflight + prompt.
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("call-7".into()),
+        });
+        r.render(UiLine::ApprovalPrompt {
+            tool: "WriteFile".into(),
+            detail: "atomcode_smoke_replace.txt".into(),
+        });
+        r.flush_deferred();
+
+        // Assert no two adjacent rows have identical non-blank content.
+        let row_texts: Vec<String> = r
+            .body_lines
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect();
+        for w in row_texts.windows(2) {
+            let a = w[0].trim();
+            let b = w[1].trim();
+            if a.is_empty() || b.is_empty() {
+                continue;
+            }
+            assert_ne!(
+                a, b,
+                "adjacent body_lines must not be identical (duplicate-row bug). \
+                 a={:?} b={:?}",
+                a, b
+            );
+        }
+
+        // Specific assertion: "步骤 7" only appears once.
+        let step_7_count = row_texts.iter().filter(|t| t.contains('步')).count();
+        assert_eq!(
+            step_7_count, 1,
+            "step row must appear exactly once in body_lines, found {}: {:?}",
+            step_7_count, row_texts
+        );
+    }
+
     /// Regression for the "missing top rule after /model switch" bug.
     ///
     /// Reproduction sequence (mirrors the real /model flow):
