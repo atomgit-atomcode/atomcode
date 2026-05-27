@@ -1,5 +1,7 @@
 # 异步 Webhook 和批量发送实现总结
 
+> ⚠️ **当前状态警告**：异步 Webhook 的定时 flush 机制尚未完全激活（参见 issue #914）。目前 batcher 已创建但不会自动定期发送。在定时 flush 完成之前，请使用同步 Webhook 替代异步模式。关注后续更新以获取可用通知。
+
 ## 概述
 
 已成功实现异步 Webhook 和批量发送功能，使用后台任务处理 Webhook 请求，避免阻塞 AtomCode 主流程。

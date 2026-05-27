@@ -137,6 +137,7 @@ warning: <message>    # 继续但打印警告
 {"result": "ok", "message": "checked"}
 {"result": "deny", "message": "unsafe path"}
 {"result": "modify", "modified_content": "{\"file_path\": \"/safe\"}"}
+{"result": "warning", "message": "file is large, review carefully"}
 ```
 
 ### 完整配置示例

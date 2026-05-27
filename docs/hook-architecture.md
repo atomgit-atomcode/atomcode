@@ -80,9 +80,9 @@
 │  │ timeout_ms          │     │ script_type  │    │ headers   │  │
 │  │ plugin_root         │     └──────────────┘    └───────────┘  │
 │  │                     │                                         │
-│  │ 实现 6 个 trait:    │  实现 4 个 trait:      通过 engine 注册   │
-│  │ PreToolExecution    │  PreToolExecution     到对应槽位          │
-│  │ PostToolExecution   │  PostToolExecution                      │
+│  │ 实现 6 个 trait:    │  实现 4 个 trait:      实现 12 个 trait:   │
+│  │ PreToolExecution    │  PreToolExecution     (除 OnUserPrompt     │
+│  │ PostToolExecution   │  PostToolExecution     Submit 外全部)    │
 │  │ OnSessionStart      │  PostTurn                               │
 │  │ OnSessionEnd        │  SystemPrompt                           │
 │  │ OnUserPromptSubmit  │                                         │

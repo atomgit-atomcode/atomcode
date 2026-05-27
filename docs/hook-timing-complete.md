@@ -141,7 +141,6 @@ Turn 完成
 
 | # | Hook 时机 | TOML ScriptHook | JSON CC | Webhook | 内置 Hook |
 |---|----------|:---:|:---:|:---:|:---:|
-> ¹ OnMessageReceived：WebhookHook 实现了对应 trait，但引擎尚未注册触发槽位，当前实际不可用。
 | 1 | `OnMessageReceived` | — | — | ✅¹ | — |
 | 2 | `OnTurnStart` | — | — | `turn_start` | `TurnStatsHook` |
 | 3 | `OnTurnComplete` (Turn 完成，含 token 等详细统计) | — | — | `turn_complete` / `after_turn` | `TurnStatsHook` + `AutoCommitHook` |
@@ -155,6 +154,8 @@ Turn 完成
 | 11 | `OnError` | — | — | `error` | `ErrorReportHook` |
 | 12 | `SystemPrompt` | `system_prompt` | — | `system_prompt` | — |
 | 13 | `OnUserPromptSubmit` | — | `user_prompt_submit` | — | — |
+
+> ¹ OnMessageReceived：WebhookHook 实现了对应 trait，但引擎尚未注册触发槽位，当前实际不可用。
 
 ---
 

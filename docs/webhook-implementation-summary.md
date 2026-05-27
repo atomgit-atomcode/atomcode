@@ -58,7 +58,7 @@ pub struct WebhookHook {
    }
    ```
 
-4. **支持所有 Hook 时机（11 个）**
+4. **支持所有 Hook 时机（12 个）**
    - ✅ OnTurnStart
    - ✅ OnToolCallStart
    - ✅ PreToolExecution
@@ -70,6 +70,7 @@ pub struct WebhookHook {
    - ✅ OnError
    - ✅ OnModelResponse
    - ✅ SystemPrompt
+   - ✅ OnMessageReceived
 
 ### 2. 配置加载
 
