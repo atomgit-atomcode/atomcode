@@ -5,6 +5,8 @@
 pub mod background;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
+pub mod parallel_edit;
+pub mod guide;
 pub mod sub_agent;
 pub mod subtask_driver;
 
@@ -89,6 +91,11 @@ pub enum AgentCommand {
     /// tool subset, independent conversation, capped turns + timeout).
     /// Result is returned via `AgentEvent::BackgroundComplete`.
     Background {
+        task: String,
+    },
+    /// Invoke a named subagent. Result comes back via AgentEvent::GuideComplete.
+    InvokeSubAgent {
+        name: String,
         task: String,
     },
     /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
@@ -378,6 +385,17 @@ pub enum AgentEvent {
         /// `handle_send_message` fills this.
         system_prompt: String,
     },
+    /// Subagent activity notification (Q&A event family — distinct from parallel_edit's SubAgentTask*)
+    GuideTurnActivity {
+        subagent: String,
+        message: String,
+    },
+    /// Subagent completed with answer
+    GuideComplete {
+        subagent: String,
+        text: String,
+        truncated: bool,
+    },
 }
 
 /// The current phase of the agent (for UI display).
@@ -497,6 +515,15 @@ pub struct AgentLoop {
     /// ordering so the cleared write is visible to the next dispatcher
     /// check on a different thread.
     background_running: std::sync::Arc<AtomicBool>,
+
+    /// Subagent registry (injected into system prompt after skills)
+    pub subagent_registry: std::sync::Arc<std::sync::RwLock<crate::agent::sub_agent::registry::SubAgentRegistry>>,
+    /// Collected JoinHandles from spawned subagents (aborted on Drop)
+    subagent_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Cancel token for all running subagents — cancelled on shutdown
+    subagent_cancel_token: CancellationToken,
+    /// Concurrency guard: prevents overlapping subagent invocations
+    subagent_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// Discipline tracking — all counters for loop detection, stagnation,
     /// error streaks, and tool usage patterns. Extracted from AgentLoop to
@@ -704,6 +731,15 @@ impl AgentRuntimeFactory {
             skill_registry,
             max_turns: None,
             runtime_counter: std::sync::Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
+impl Drop for AgentLoop {
+    fn drop(&mut self) {
+        self.subagent_cancel_token.cancel();
+        for handle in self.subagent_handles.drain(..) {
+            handle.abort();
         }
     }
 }
@@ -921,6 +957,18 @@ impl AgentLoop {
         // before the first turn's system prompt is assembled.
         let env_snapshot = crate::ctx::EnvSnapshot::capture(&working_dir);
 
+        // Initialize subagent registry and register stock subagents
+        let subagent_registry = std::sync::Arc::new(
+            std::sync::RwLock::new(
+                crate::agent::sub_agent::registry::SubAgentRegistry::new()
+            )
+        );
+        // Register atomcode-guide subagent
+        {
+            let reg = subagent_registry.read().unwrap();
+            let _ = crate::agent::guide::register(&reg);
+        }
+
         let agent = Self {
             conversation,
             tool_registry: shared_tools.clone(),
@@ -945,6 +993,10 @@ impl AgentLoop {
             cancel_token: CancellationToken::new(),
             indexer_cancel: CancellationToken::new(),
             background_running: std::sync::Arc::new(AtomicBool::new(false)),
+            subagent_registry,
+            subagent_handles: Vec::new(),
+            subagent_cancel_token: CancellationToken::new(),
+            subagent_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             discipline_state: DisciplineState::default(),
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
@@ -1006,6 +1058,18 @@ impl AgentLoop {
             };
             self.tool_registry
                 .register_arc("parallel_edit_files".to_string(), std::sync::Arc::new(tool))
+                .await;
+        }
+
+        // Register invoke_subagent tool
+        if self.config.subagent.enabled {
+            self.tool_registry
+                .register_arc("invoke_subagent".to_string(), std::sync::Arc::new(crate::tool::agent::AgentTool::new(
+                    self.turn_runner.provider.clone(),
+                    self.config.clone(),
+                    self.event_tx.clone(),
+                    self.subagent_registry.clone(),
+                )))
                 .await;
         }
 
@@ -1370,6 +1434,9 @@ impl AgentLoop {
                         });
                     }
                 }
+                AgentCommand::InvokeSubAgent { name, task } => {
+                    self.handle_invoke_subagent(name, task).await;
+                }
                 AgentCommand::RefreshContextStats => {
                     let system_prompt = self.build_system_prompt();
                     let (msgs, _) = self
@@ -1417,6 +1484,72 @@ impl AgentLoop {
                 }
             }
         }
+    }
+
+    async fn handle_invoke_subagent(&mut self, name: String, task: String) {
+        if self.subagent_running.swap(true, std::sync::atomic::Ordering::Acquire) {
+            let _ = self.event_tx.send(AgentEvent::Warning(
+                "已有子代理正在运行，请等待完成后再试".to_string()
+            ));
+            return;
+        }
+
+        let registry = self.subagent_registry.clone();
+        let provider = self.turn_runner.provider.clone();
+        let config = std::sync::Arc::new(self.config.clone());
+        let parent_tools = self.turn_runner.tools.clone();
+        let parent_ctx = self.turn_runner.context.clone();
+        let event_tx = self.event_tx.clone();
+        let cancel_token = self.subagent_cancel_token.child_token();
+        let running = self.subagent_running.clone();
+
+        let handle = tokio::spawn(async move {
+            // scopeguard: clear running flag on exit
+            let _guard = scopeguard::guard((), |_| {
+                running.store(false, std::sync::atomic::Ordering::Release);
+            });
+
+            let def = {
+                let reg = registry.read().unwrap();
+                reg.find(&name)
+            };
+
+            let def = match def {
+                Some(d) => d,
+                None => {
+                    let _ = event_tx.send(AgentEvent::Warning(
+                        format!("未找到子代理: {}", name)
+                    ));
+                    return;
+                }
+            };
+
+            let runner = crate::agent::sub_agent::runner::SubAgentRunner::new(
+                provider,
+                config,
+                parent_tools,
+                parent_ctx,
+                event_tx.clone(),
+                cancel_token,
+            );
+
+            match runner.run(def, task).await {
+                Ok(output) => {
+                    let _ = event_tx.send(AgentEvent::GuideComplete {
+                        subagent: name,
+                        text: output.text,
+                        truncated: output.truncated,
+                    });
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AgentEvent::Warning(
+                        format!("子代理错误: {}", e.message)
+                    ));
+                }
+            }
+        });
+
+        self.subagent_handles.push(handle);
     }
 
     // -------------------------------------------------------------------------

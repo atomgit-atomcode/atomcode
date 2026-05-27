@@ -160,6 +160,17 @@ Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
             }
         }
 
+        // Available sub-agents
+        if let Ok(registry) = self.subagent_registry.read() {
+            let agents = registry.list();
+            if !agents.is_empty() {
+                prompt.push_str("\n=== AVAILABLE SUB-AGENTS ===\n");
+                for a in &agents {
+                    prompt.push_str(&format!("- **{}**: {}\n", a.name, a.description));
+                }
+            }
+        }
+
         // Git snapshot (branch / HEAD / status) captured at session start.
         // Empty string when `wd` isn't a git repo — push is a no-op.
         // See `ctx::env` for the snapshot / disclaimer rationale.

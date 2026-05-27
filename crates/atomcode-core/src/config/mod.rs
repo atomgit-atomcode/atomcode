@@ -48,7 +48,7 @@ pub fn platform_rules() -> &'static str {
 }
 
 /// Sub-agent execution policy (enable + resilience knobs).
-/// Drives `agent::sub_agent::SubAgentTask::execute` and the
+/// Drives `agent::parallel_edit::SubAgentTask::execute` and the
 /// `try_sub_agent_dispatch` config gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
