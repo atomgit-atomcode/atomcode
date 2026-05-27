@@ -330,6 +330,27 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// of the gap between the last content row and body_bottom.
     /// Decremented on every `emit_body_line_inner` call.
     skip_body_scroll_count: u16,
+    /// Number of `body_lines` front entries that have already been
+    /// physically promoted to the host terminal's native scrollback via
+    /// the bottom-row LF in `emit_body_line_inner`. Monotonically grows
+    /// (one increment per overflow LF) and only resets in `reset()`.
+    ///
+    /// Why this exists: `body_lines` keeps the full history vector so
+    /// `message_marks` / `welcome_line_count` / `live_group.child_indices`
+    /// can index into it stably. But the VISIBLE window must never include
+    /// rows whose copies already sit in native scrollback — otherwise a
+    /// tail-pop (spinner clear, approval pop, ImageAttachment, inflight
+    /// commit) shrinks `body_lines.len()`, lowers `start = len - cap`,
+    /// and re-exposes a row whose `emit_body_line_inner` LF will then
+    /// promote it to scrollback a SECOND time. Result: adjacent
+    /// duplicates the user sees when scrolling up.
+    ///
+    /// `paint_body_into_cells` floors `start` at `scrolled_off` and the
+    /// overflow check / target row both operate on the live window
+    /// `body_lines.len() - scrolled_off`, which makes the visible
+    /// region monotonically advance through `body_lines` regardless of
+    /// tail mutations.
+    scrolled_off: usize,
     /// Cached semantic welcome payload so resize can rebuild the
     /// startup banner for the new terminal width.
     welcome_banner: Option<(String, String)>,
@@ -486,6 +507,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
             dirty: false,
             last_painted_footer_rows: 0,
             skip_body_scroll_count: 0,
+            scrolled_off: 0,
             welcome_banner: None,
             welcome_line_count: 0,
             live_spinner_active: false,
@@ -626,6 +648,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // Nothing to render (zero-width terminal etc.) — drop any
             // prior inflight rows so state stays consistent.
             let remove = prev_rows.min(self.body_lines.len());
+            crate::tuix_trace!(
+                "BPOP",
+                "site=inflight_zero len_before={} n={} scrolled_off={}",
+                self.body_lines.len(),
+                remove,
+                self.scrolled_off
+            );
             self.body_lines.truncate(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
             return;
@@ -639,6 +668,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // swapping the trailing slice; then walk each terminal row
             // with a position + erase + write triple.
             let keep = self.body_lines.len().saturating_sub(prev_rows);
+            crate::tuix_trace!(
+                "BPOP",
+                "site=inflight_inplace len_before={} n={} scrolled_off={}",
+                self.body_lines.len(),
+                prev_rows,
+                self.scrolled_off
+            );
             self.body_lines.truncate(keep);
             let first = bottom - n as u16 + 1;
             for row in &new_rows {
@@ -680,6 +716,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // via the standard path so DECSTBM scrolling lands them at the
             // bottom of the body region.
             let remove = prev_rows.min(self.body_lines.len());
+            crate::tuix_trace!(
+                "BPOP",
+                "site=inflight_fallback len_before={} n={} scrolled_off={}",
+                self.body_lines.len(),
+                remove,
+                self.scrolled_off
+            );
             self.body_lines.truncate(self.body_lines.len() - remove);
             for row in new_rows {
                 self.push_body_row(row);
@@ -1088,13 +1131,15 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let status_rows = if has_status { 1 } else { 0 };
         let total_rows = 1 + middle_rows + 1 + attachment_rows + menu_rows + status_rows;
         // Append-only: footer sits directly below the last body row,
-        // not pinned to the screen bottom. `body_lines.len()` is the
-        // row offset (0-indexed) of the next free row; the footer
-        // starts there. When body+footer would exceed screen height,
-        // the cap kicks in and the footer pins to `h - total_rows` —
-        // the terminal's native scrollback absorbs any further body
-        // growth via the LF in `emit_body_line_inner`.
-        let body_rows_on_screen = self.body_lines.len().min(h.saturating_sub(total_rows));
+        // not pinned to the screen bottom. The VISIBLE body count is
+        // `body_lines.len() - scrolled_off` (rows before `scrolled_off`
+        // already promoted to native scrollback). When body+footer
+        // would exceed screen height, the cap kicks in and the footer
+        // pins to `h - total_rows` — the terminal's native scrollback
+        // absorbs any further body growth via the LF in
+        // `emit_body_line_inner`.
+        let visible_body_len = self.body_lines.len().saturating_sub(self.scrolled_off);
+        let body_rows_on_screen = visible_body_len.min(h.saturating_sub(total_rows));
         let footer_top = body_rows_on_screen;
 
         // Pre-build every row vector (immutable borrows of self).
@@ -1265,8 +1310,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return;
         }
         let total = self.body_lines.len();
-        let visible = total.min(body_height);
-        let start = total - visible;
+        // Visible window starts no earlier than `scrolled_off` —
+        // anything before that index already lives in native
+        // scrollback and must not be re-painted into the viewport,
+        // otherwise the next overflow LF promotes it a second time
+        // (see `scrolled_off` doc).
+        let start = total
+            .saturating_sub(body_height)
+            .max(self.scrolled_off);
+        if start >= total {
+            return;
+        }
         let body_width = self.effective_body_width();
         // Clone the slice before drawing — `screen.draw_row` takes
         // &mut self.screen and the iteration would otherwise double-
@@ -1287,24 +1341,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// Append-only model: body grows downward from row 0 until it
     /// hits the viewport cap (`h - footer_rows`); past that, the
     /// terminal's native scrollback absorbs new rows so the last
-    /// visible row always sits at `min(body_lines.len(), h - footer_rows)`.
+    /// visible row always sits at `min(visible_body_len, h - footer_rows)`
+    /// where `visible_body_len = body_lines.len() - scrolled_off`.
     fn body_bottom_row(&self) -> u16 {
         let h = self.screen.height() as usize;
         let footer_rows = self.current_footer_rows();
         let cap = h.saturating_sub(footer_rows);
-        self.body_lines.len().min(cap) as u16
+        let visible_len = self.body_lines.len().saturating_sub(self.scrolled_off);
+        visible_len.min(cap) as u16
     }
 
     /// 1-indexed row where the NEXT body emit would land. When the
-    /// body still has room, this is `body_lines.len() + 1`. Once
-    /// the body fills the viewport, this saturates at the cap so
-    /// the LF in `emit_body_line_inner` triggers terminal-native
+    /// visible body still has room, this is `visible_body_len + 1`.
+    /// Once the visible body fills the viewport, this saturates at the
+    /// cap so the LF in `emit_body_line_inner` triggers terminal-native
     /// scrolling (the oldest visible row promotes to scrollback).
     fn next_body_emit_row(&self) -> u16 {
         let h = self.screen.height() as usize;
         let footer_rows = self.current_footer_rows();
         let cap = h.saturating_sub(footer_rows);
-        (self.body_lines.len() + 1).min(cap) as u16
+        let visible_len = self.body_lines.len().saturating_sub(self.scrolled_off);
+        (visible_len + 1).min(cap) as u16
     }
 
     /// Effective body width: paint reserves the rightmost column for
@@ -1382,51 +1439,75 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (only the slot where the new body row lands plus the freshly
         // re-laid-out footer differ).
         //
-        // `body_lines.len() >= cap` is the entry condition because
+        // `visible_len >= cap` is the entry condition because
         // `push_body_row` calls `emit_body_line_inner` BEFORE pushing
-        // the new row. With len == cap-1, the push lands at index
-        // cap-1 (still inside the visible region). With len == cap,
-        // the push would land at index cap (just past the visible
-        // region) — at that exact moment the oldest visible row
-        // (index 0 in the visible tail = `body_lines[len-cap]`) needs
-        // to scroll out.
-        let overflow = self.body_lines.len() >= cap;
-        if overflow {
+        // the new row. With visible_len == cap-1, the push lands at
+        // visible-index cap-1 (still inside the visible region). With
+        // visible_len == cap, the push would land at visible-index cap
+        // (just past the visible region) — at that exact moment the
+        // oldest visible row (`body_lines[scrolled_off]`) needs to
+        // scroll out.
+        //
+        // `visible_len = body_lines.len() - scrolled_off` (NOT raw
+        // `body_lines.len()`): rows at indices `< scrolled_off` already
+        // live in native scrollback from a prior overflow LF. Using raw
+        // len conflates them with visible rows and double-promotes the
+        // front of `body_lines` after a tail pop (spinner clear,
+        // approval pop, ...) — exact mechanism of the user-reported
+        // "duplicate rows in scrollback" bug. See the `scrolled_off`
+        // field doc for the full write-up.
+        let mut visible_len = self.body_lines.len().saturating_sub(self.scrolled_off);
+        let overflow_initial = visible_len >= cap;
+        crate::tuix_trace!(
+            "BEMIT",
+            "len={} scrolled_off={} cap={} visible_len={} overflow={}",
+            self.body_lines.len(),
+            self.scrolled_off,
+            cap,
+            visible_len,
+            overflow_initial
+        );
+        // Catch-up loop, not a single `if`: when `current_footer_rows()`
+        // GROWS between two pushes (slash menu opens, multi-line input
+        // wrap, attachment chip appears), `cap` shrinks but `visible_len`
+        // doesn't — the prior bottom body rows are now logically under
+        // the new footer strip yet still counted as visible. A single LF
+        // (the original behaviour) only promotes ONE row, leaving
+        // `visible_len = cap + N - 1` after the push. Net effect: the
+        // direct write below lands at `target_1idx = visible_len + 1`,
+        // which is BEYOND `cap` and stomps the footer/prompt cells.
+        // Reproducer per BPUSH/BEMIT trace: at slash-menu open + Enter,
+        // footer grows 4→7, cap shrinks 64→61, every /whoami push
+        // emitted at `target_1idx=64` overlapping rows 62/63/64 of the
+        // footer — visible as the screenshot's `❯ /whoami@csdn.net`
+        // (the `cuizk@csdn.net` body row leaked into the user-echo
+        // row's cells). LFing until `visible_len < cap` promotes the
+        // exact excess to scrollback in one shot.
+        while visible_len >= cap {
             let scroll_seq = format!("\x1b[{};1H\n", h);
             let _ = self.out.write_all(scroll_seq.as_bytes());
             self.screen.shift_prev_up(1);
+            // The just-LFed row (front of the visible window) now lives
+            // in native scrollback. Advance the marker so subsequent
+            // pushes don't treat it as visible — and don't re-promote
+            // it on the next overflow LF after an intervening tail pop.
+            self.scrolled_off = self.scrolled_off.saturating_add(1);
+            visible_len -= 1;
         }
         // 1-indexed row where the NEW body line should land on the
-        // physical terminal. Two cases:
+        // physical terminal. After the catch-up loop above
+        // `visible_len < cap` always holds, so `visible_len + 1 ≤ cap`
+        // is the next-empty body slot in both cases (loop ran ⇒
+        // post-loop vl = cap-1, +1 = cap, matches the pre-refactor
+        // overflow branch; loop didn't run ⇒ vl unchanged, +1 = the
+        // natural append slot just under the existing tail). One
+        // formula, no branch.
         //
-        //   - Non-overflow (body still has room): the new row goes at
-        //     the next-empty body slot = `body_lines.len() + 1`.
-        //     `footer_top_1idx` equals this value because the footer
-        //     sat directly below the previous tail.
-        //
-        //   - Overflow: the bottom-LF scroll above shifted the entire
-        //     visible area UP by 1, so the old footer's top_rule no
-        //     longer sits at `cap + 1` — it sits at `cap`. The new
-        //     body row should land at `cap` (the freshly-blanked
-        //     bottom-most body slot, i.e. just above where the new
-        //     footer will repaint to). Writing at `cap + 1` here
-        //     (the pre-fix formula) put the new row UNDER where the
-        //     body's last visible slot should be — paint_frame's
-        //     cell-diff then re-emitted the same row at `cap`, but
-        //     the original ghost write at `cap + 1` survived as
-        //     stale glyphs at columns the cell-diff's prev-cells
-        //     pair (after shift_prev_up) considered blank-vs-blank,
-        //     so no overwrite patch fired. Net effect: every
-        //     overflow-pushed row appeared TWICE — once at its
-        //     intended position via the cell-diff, and once at the
-        //     ghost row(s) above it that successive overflow shifts
-        //     pushed up into the visible body region.
-        //     See regression test `retained_overflow_does_not_duplicate_last_body_row`.
-        let target_1idx = if overflow {
-            cap as u16
-        } else {
-            (self.body_lines.len() + 1) as u16
-        };
+        // The pre-refactor `if overflow { cap }` arm was load-bearing
+        // against a regression where writing at `cap + 1` left a
+        // ghost glyph below the body — the unified formula keeps that
+        // fix intact. See `retained_overflow_does_not_duplicate_last_body_row`.
+        let target_1idx = (visible_len + 1) as u16;
         // CUP to target → ED 0 (erases everything from target down,
         // freeing the rows below for the new body line + the
         // follow-up cell-diff's footer rewrite). Pre-format into one
@@ -1484,6 +1565,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // body emit will land. EL it now for immediate visual feedback;
         // the next `paint_frame` cell-diff also redraws this region but
         // the explicit erase removes any flash between pop and next tick.
+        crate::tuix_trace!(
+            "BPOP",
+            "site=spinner len_before={} n=1 scrolled_off={}",
+            self.body_lines.len(),
+            self.scrolled_off
+        );
         self.body_lines.pop();
         let target = self.next_body_emit_row();
         if target > 0 {
@@ -1519,8 +1606,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 .collect();
             crate::tuix_trace!(
                 "BPUSH",
-                "len={} content={:?}",
+                "len={} scrolled_off={} content={:?}",
                 self.body_lines.len(),
+                self.scrolled_off,
                 snippet
             );
         }
@@ -1557,6 +1645,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             for m in self.message_marks.iter_mut() {
                 m.line_idx -= drain;
             }
+            // `scrolled_off` indexes the same vector — when we drop
+            // front entries, slide it down by the same amount (saturating
+            // because the drained rows were all `< scrolled_off` anyway:
+            // we only ever drain rows that have already been promoted
+            // to native scrollback once `body_lines` exceeds
+            // MAX_SCROLLBACK_ROWS ≫ visible cap).
+            self.scrolled_off = self.scrolled_off.saturating_sub(drain);
+            // welcome_line_count is also a front-anchored index; keep
+            // it consistent or `reflow_welcome_prefix.splice(0..wlc)`
+            // would later splice over non-welcome rows.
+            self.welcome_line_count = self.welcome_line_count.saturating_sub(drain);
         }
     }
 
@@ -1637,6 +1736,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // to clear. The pre-truncate bottom is the 1-idx terminal
             // row of the LAST inflight row, exactly what we want.
             let bottom_before_truncate = self.body_bottom_row();
+            crate::tuix_trace!(
+                "BPOP",
+                "site=commit_inflight len_before={} n={} scrolled_off={}",
+                self.body_lines.len(),
+                remove,
+                self.scrolled_off
+            );
             self.body_lines.truncate(self.body_lines.len() - remove);
             self.inflight_tool_rows = 0;
             if bottom_before_truncate > 0 && remove > 0 {
@@ -2959,6 +3065,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // trailing blank so the next turn's content still has
                 // paragraph separation.
                 if self.body_lines.last().map_or(false, |r| r.is_empty()) {
+                    crate::tuix_trace!(
+                        "BPOP",
+                        "site=image_blank len_before={} n=1 scrolled_off={}",
+                        self.body_lines.len(),
+                        self.scrolled_off
+                    );
                     self.body_lines.pop();
                     let bottom = self.body_bottom_row();
                     if bottom > 0 {
@@ -3054,6 +3166,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         if popped_count == 0 {
             return;
         }
+        crate::tuix_trace!(
+            "BPOP",
+            "site=approval len_after={} n={} scrolled_off={}",
+            self.body_lines.len(),
+            popped_count,
+            self.scrolled_off
+        );
         // Physically wipe the popped rows for instant visual feedback
         // on Y/A/N. The popped rows occupied terminal rows
         // `bottom_before_pop - popped_count + 1 ..= bottom_before_pop`
@@ -3239,6 +3358,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         let _ = self.out.write_all(seq.as_bytes());
         self.screen = Screen::new(self.screen.width(), self.screen.height());
         self.body_lines.clear();
+        self.scrolled_off = 0;
+        self.welcome_line_count = 0;
+        self.message_marks.clear();
         self.assistant_line_buf.clear();
         self.md_state.reset();
         self.last_painted_footer_rows = 0;
@@ -8092,6 +8214,307 @@ mod tests {
         );
     }
 
+    /// Regression for the user-reported "scrolling up shows duplicate
+    /// content" bug on macOS Terminal.app (and reproduced on every
+    /// emulator tested). Each unique body row must enter native
+    /// scrollback at most ONCE across its lifetime, even if intermediate
+    /// tail pops (spinner clear, approval pop, ImageAttachment, inflight
+    /// commit) make `body_lines.len()` re-cross the cap threshold.
+    ///
+    /// Mechanism the bug exploits: after an overflow LF promotes row R
+    /// to native scrollback, R remains at the front of `body_lines`.
+    /// When `body_lines.last()` is popped, `start = len - cap` decreases,
+    /// re-exposing R at viewport row 0. The next push that overflows
+    /// then LFs R into scrollback a SECOND time — duplicate.
+    ///
+    /// Repro sequence: fill body to exactly `cap`, push spinner
+    /// (overflow #1 — promotes the oldest body row), clear spinner via
+    /// InputPrompt (pops the spinner), push one more body row
+    /// (overflow #2 — under the bug, re-promotes the same oldest row).
+    #[test]
+    fn retained_spinner_pop_does_not_duplicate_scrollback() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Seed footer geometry so `cap` is stable.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+
+        // Fill body to exactly cap (no overflow yet — each push has
+        // body_lines.len() < cap at entry to emit_body_line_inner).
+        // Use a uniquely-identifiable first row so we can count its
+        // appearances in scrollback.
+        let probe = "PROBE-ROW-XYZ";
+        r.render(UiLine::AssistantText(format!("{}\n", probe)));
+        for i in 1..cap {
+            r.render(UiLine::AssistantText(format!("filler-{:03}\n", i)));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Spinner push: body_lines.len() == cap, so emit_body_line_inner
+        // takes the overflow branch and LFs the PROBE row into native
+        // scrollback. Count after this should be exactly 1.
+        r.render(UiLine::Spinner {
+            frame: "⠋".into(),
+            label: "Pondering…".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let count_probe = |vt: &crate::test_term::VirtualTerminal| -> usize {
+            vt.scrollback_texts()
+                .iter()
+                .filter(|row| row.contains(probe))
+                .count()
+        };
+        assert_eq!(
+            count_probe(&vterm),
+            1,
+            "after first overflow PROBE should be in scrollback exactly once; got {}.\nscrollback:\n{}",
+            count_probe(&vterm),
+            vterm.scrollback_texts().join("\n")
+        );
+
+        // Idle InputPrompt triggers clear_live_spinner → pops the
+        // transient spinner row. body_lines.len() now drops from cap+1
+        // back to cap. With the bug, the next push will treat the front
+        // row (still PROBE) as if it had never been promoted.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Next body push — overflow #2. With the bug, viewport row 0
+        // is PROBE again (because start went from 1 back to 0 after the
+        // spinner pop), so the LF re-promotes it.
+        r.render(UiLine::AssistantText("after-pop\n".into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        assert_eq!(
+            count_probe(&vterm),
+            1,
+            "PROBE duplicated in scrollback after spinner-pop + push (count={}).\nscrollback:\n{}",
+            count_probe(&vterm),
+            vterm.scrollback_texts().join("\n")
+        );
+    }
+
+    /// Regression for the user-reported "30x duplicate bullet in
+    /// scrollback when expanding window mid-stream" bug on macOS
+    /// Terminal.app. The model streamed each bullet exactly once
+    /// (SSE wire dump verified), but the user expanded the terminal
+    /// window during the stream and saw ~30 copies of the FIRST
+    /// bullet in native scrollback.
+    ///
+    /// Mechanism this test pins: every overflow LF must promote a
+    /// UNIQUE row to scrollback, even when resize events arrive
+    /// interleaved with streaming pushes. Each row's payload should
+    /// appear in scrollback at most once across the entire session,
+    /// regardless of resize cadence.
+    #[test]
+    fn retained_stream_with_resize_larger_does_not_duplicate_scrollback() {
+        let w_small: u16 = 67;
+        let h_small: u16 = 24;
+        let w_large: u16 = 67;
+        let h_large: u16 = 41;
+        let (mut r, buf) = new_capturing(w_small, h_small);
+        // VTerm large enough to absorb post-resize CUPs; we'll cross-
+        // check scrollback duplicates at end.
+        let mut vterm = crate::test_term::VirtualTerminal::new(w_large, h_large);
+        let status = status_basic();
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let cap_small = (h_small as usize).saturating_sub(r.current_footer_rows());
+
+        // Phase 1 — stream PAST the small cap so several overflow LFs
+        // fire and earlier rows promote to native scrollback. Tag the
+        // FIRST bullet uniquely so we can count its scrollback copies.
+        let probe = "BULLET-FIRST-ZZZ";
+        r.render(UiLine::AssistantText(format!("{}\n", probe)));
+        for i in 0..(cap_small + 5) {
+            r.render(UiLine::AssistantText(format!(
+                "filler-bullet-{:03}\n",
+                i
+            )));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let count_probe = |vt: &crate::test_term::VirtualTerminal| -> usize {
+            vt.scrollback_texts()
+                .iter()
+                .filter(|row| row.contains(probe))
+                .count()
+        };
+        // After phase 1, PROBE has been promoted to scrollback (the
+        // overflow ran past it). Must be exactly one copy.
+        let phase1 = count_probe(&vterm);
+        assert!(
+            phase1 <= 1,
+            "phase 1 already duplicated PROBE (count={}).\nscrollback:\n{}",
+            phase1,
+            vterm.scrollback_texts().join("\n")
+        );
+
+        // Phase 2 — resize larger MID-STREAM. This mirrors the user
+        // dragging the bottom edge of their Terminal.app window. The
+        // SIGWINCH coalescer in event_loop dispatches one on_resize
+        // with the final geometry; the renderer must repaint without
+        // re-LFing already-promoted rows.
+        r.on_resize(w_large, h_large);
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Phase 3 — streaming continues on the now-larger window.
+        // These pushes happen on the larger cap, but `scrolled_off`
+        // must still correctly account for rows already in scrollback
+        // so the next overflow (whenever it lands) promotes a UNIQUE
+        // new row, never PROBE again.
+        for i in 0..30 {
+            r.render(UiLine::AssistantText(format!(
+                "post-resize-bullet-{:03}\n",
+                i
+            )));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let count = count_probe(&vterm);
+        assert!(
+            count <= 1,
+            "PROBE duplicated in scrollback after resize-larger + stream (count={}).\nscrollback head:\n{}",
+            count,
+            vterm
+                .scrollback_texts()
+                .iter()
+                .take(50)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Stress test: spinner ticks INTERLEAVED with streaming pushes,
+    /// then a resize-larger lands mid-stream while live_spinner_active
+    /// is still true (model still working). Mimics the user's exact
+    /// repro: "expand window during output". Each unique row must
+    /// promote to scrollback at most once.
+    #[test]
+    fn retained_streaming_spinner_resize_does_not_duplicate_scrollback() {
+        let w_small: u16 = 67;
+        let h_small: u16 = 24;
+        let w_large: u16 = 67;
+        let h_large: u16 = 41;
+        let (mut r, buf) = new_capturing(w_small, h_small);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w_large, h_large);
+        let status = status_basic();
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let cap_small = (h_small as usize).saturating_sub(r.current_footer_rows());
+
+        // Stream a section header + a tagged "first bullet" + filler
+        // bullets, with spinner ticks sprinkled in between (mimics
+        // StreamingBox / Spinner events arriving during streaming).
+        let probe = "BULLET-FIRST-RESIZE";
+        r.render(UiLine::AssistantText("🛠️ 技术特色\n".into()));
+        r.render(UiLine::Spinner {
+            frame: "⠋".into(),
+            label: "Pondering…".into(),
+        });
+        r.render(UiLine::AssistantText(format!("{}\n", probe)));
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Pondering…".into(),
+        });
+        // Push past the small cap to trigger several overflow LFs.
+        for i in 0..(cap_small + 10) {
+            r.render(UiLine::AssistantText(format!(
+                "filler-bullet-{:03}\n",
+                i
+            )));
+            if i % 3 == 0 {
+                r.render(UiLine::Spinner {
+                    frame: "⠹".into(),
+                    label: "Pondering…".into(),
+                });
+            }
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Mid-stream RESIZE LARGER. live_spinner_active is true.
+        r.on_resize(w_large, h_large);
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Keep streaming + spinner ticks after the resize.
+        for i in 0..50 {
+            r.render(UiLine::AssistantText(format!(
+                "post-resize-bullet-{:03}\n",
+                i
+            )));
+            if i % 2 == 0 {
+                r.render(UiLine::Spinner {
+                    frame: "⠸".into(),
+                    label: "Pondering…".into(),
+                });
+            }
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let count = vterm
+            .scrollback_texts()
+            .iter()
+            .filter(|row| row.contains(probe))
+            .count();
+        assert!(
+            count <= 1,
+            "PROBE duplicated in scrollback across streaming + spinner + resize (count={}).\nscrollback head (first 40 lines):\n{}",
+            count,
+            vterm
+                .scrollback_texts()
+                .iter()
+                .take(40)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     /// Sub-cap pushes must NOT touch the bottom row — that would scroll
     /// content the user can still see into native scrollback prematurely,
     /// duplicating rows between the visible area and the scrollback view.
@@ -9216,6 +9639,234 @@ mod tests {
                  ghosts them into visible body as duplicated tail).\nbytes: {:?}",
                 row,
                 post_paint_str
+            );
+        }
+    }
+
+    /// Repro of the real-world `/whoami after big turn` corruption:
+    /// when `current_footer_rows()` grows between two body pushes
+    /// (slash menu opens as the user types `/whoami`, footer grows
+    /// from 4→7 rows, cap shrinks 64→61), the next emit_body_line_inner
+    /// finds `visible_len = 64 > cap = 61`. The pre-fix single-LF path
+    /// only promoted ONE row to scrollback, so subsequent pushes
+    /// computed `target_1idx = visible_len + 1 = 64` and direct-wrote
+    /// body rows OVER the footer/prompt area. Visible artifact: the
+    /// `cuizk@csdn.net` body row leaked into the user-echo line,
+    /// rendering as `❯ /whoami@csdn.net` (per the BPUSH/BEMIT trace
+    /// the user captured: `cap=61 visible_len=64 overflow=true` on
+    /// every /whoami push, never converging).
+    ///
+    /// The catch-up `while visible_len >= cap` loop converges in one
+    /// emit by LFing the exact excess (4 rows in this scenario).
+    #[test]
+    fn retained_footer_grow_then_push_catches_up_no_footer_overlap() {
+        let w: u16 = 92;
+        let h: u16 = 68; // mirrors the user's terminal geometry
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        // Establish footer4 (no menu): top_rule + input + bot_rule + status.
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let cap_before = (h as usize).saturating_sub(r.current_footer_rows());
+
+        // Fill body to exactly `cap_before` visible rows so visible_len = cap.
+        for i in 0..(cap_before + 10) {
+            r.render(UiLine::AssistantText(format!("filler-{:03}\n", i)));
+        }
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Now open the slash menu (3 items + extra footer rows) — same as
+        // typing `/w` in the live binary. This grows footer rows WITHOUT
+        // pushing any body row, so `scrolled_off` stays put while `cap`
+        // shrinks. Mirrors the trace's footer4 → footer7 transition.
+        let menu = Some(crate::render::MenuPayload {
+            items: vec![
+                ("whoami".into(), "Show current user".into()),
+                ("wiki".into(), "Open wiki".into()),
+                ("watch".into(), "Watch mode".into()),
+            ],
+            selected: 0,
+            kind: crate::render::MenuKind::SlashCommand,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: "/w".into(),
+            cursor_byte: 2,
+            menu: menu.clone(),
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let cap_after = (h as usize).saturating_sub(r.current_footer_rows());
+        assert!(
+            cap_after < cap_before,
+            "menu open did not shrink cap (cap_before={}, cap_after={})",
+            cap_before,
+            cap_after
+        );
+
+        // User hits Enter → /whoami runs. Menu stays in state at push
+        // time (the InputPrompt that clears it doesn't fire until AFTER
+        // CommandOutput; see the BPUSH trace). Each push must catch up
+        // the (cap_before - cap_after) excess rows to scrollback so the
+        // direct write never overshoots into the footer region.
+        let whoami_text =
+            "  TheoCui (saulcy)\n  cuizk@csdn.net\n  auth: /Users/theo/.atomcode/auth.toml\n";
+        r.render(UiLine::User("/whoami".into()));
+        r.render(UiLine::CommandOutput(whoami_text.into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The bug's signature: cells from the body's tail end up in the
+        // footer region (rows >= cap). Scan the footer band for any
+        // /whoami payload — if any whoami chars land there, the push
+        // wrote past `cap`.
+        let leak_check = |needle: &str| {
+            // Footer occupies rows >= cap_after when the menu is open at
+            // emit time. After /whoami's InputPrompt re-render the menu
+            // clears, but the LEAKED cells (from direct writes done while
+            // cap was 61) persist as ghost glyphs at those rows.
+            (cap_after..h as usize).any(|row| vterm.row_text(row).contains(needle))
+        };
+        // The most diagnostic payload — the email — is what leaked in
+        // the screenshot. Other whoami rows would also be a leak.
+        assert!(
+            !leak_check("@csdn.net"),
+            "body row leaked into footer region (@csdn.net found in rows {}+).\n\nGrid:\n{}",
+            cap_after,
+            vterm.dump()
+        );
+        assert!(
+            !leak_check("TheoCui"),
+            "TheoCui row leaked into footer region.\n\nGrid:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !leak_check("auth:"),
+            "auth: row leaked into footer region.\n\nGrid:\n{}",
+            vterm.dump()
+        );
+    }
+
+    /// Repro: user runs `/whoami` AFTER the body has already overflowed
+    /// once (screen full from a previous large response). The command
+    /// output is a single `UiLine::CommandOutput` whose payload is a
+    /// 3-line `\n`-separated string ending in `\n`. `push_body_text_sgr`
+    /// splits on `\n` which yields 4 chunks (3 content + 1 trailing
+    /// empty), and each chunk goes through `push_body_row` →
+    /// `emit_body_line_inner`. With body already at `cap`, every push
+    /// triggers an overflow LF.
+    ///
+    /// Each of the 3 visible content lines must appear EXACTLY ONCE
+    /// across (visible grid + scrollback). The user-reported screenshot
+    /// showed e.g. `auth: ...` twice and `TheoCui (saulcy)` rendered in
+    /// the wrong slot — this test pins that invariant.
+    #[test]
+    fn retained_whoami_after_screen_fill_renders_each_line_exactly_once() {
+        let w: u16 = 67;
+        let h: u16 = 41;
+        let (mut r, buf) = new_capturing(w, h);
+        let mut vterm = crate::test_term::VirtualTerminal::new(w, h);
+        let status = status_basic();
+
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let cap = (h as usize).saturating_sub(r.current_footer_rows());
+
+        // Fill body well past cap so several overflow LFs have already
+        // happened — this is what makes `scrolled_off > 0` when the
+        // whoami output starts streaming. Interleave a spinner tick
+        // (mimics the real session's StreamingBox + Spinner cadence).
+        for i in 0..(cap + 10) {
+            r.render(UiLine::AssistantText(format!("filler-bullet-{:03}\n", i)));
+            if i % 4 == 0 {
+                r.render(UiLine::Spinner {
+                    frame: "⠋".into(),
+                    label: "Pondering…".into(),
+                });
+            }
+        }
+        // Mimic real turn-end: line-break + TurnSeparator. The separator
+        // pushes 3 rows (blank, rule, blank) which themselves may cause
+        // additional overflow LFs.
+        r.render(UiLine::AssistantLineBreak);
+        r.render(UiLine::TurnSeparator {
+            label: "✓ Done · 5 轮 · 6 工具 · 26.4s · 1696 tokens".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // User types `/whoami`. The event loop echoes the user input
+        // BEFORE running the command — render that too so the body
+        // state matches the real screenshot.
+        let whoami_text =
+            "  TheoCui (saulcy)\n  cuizk@csdn.net\n  auth: /Users/theo/.atomcode/auth.toml\n";
+        r.render(UiLine::User("/whoami".into()));
+        r.render(UiLine::CommandOutput(whoami_text.into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Second invocation — mimics the screenshot showing the bug
+        // surfaced across BOTH /whoami runs.
+        r.render(UiLine::User("/whoami".into()));
+        r.render(UiLine::CommandOutput(whoami_text.into()));
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        let lines = [
+            "TheoCui (saulcy)",
+            "cuizk@csdn.net",
+            "auth: /Users/theo/.atomcode/auth.toml",
+        ];
+        for line in lines {
+            let scrollback_count = vterm
+                .scrollback_texts()
+                .iter()
+                .filter(|row| row.contains(line))
+                .count();
+            let visible_count = (0..h as usize)
+                .filter(|i| vterm.row_text(*i).contains(line))
+                .count();
+            let total = scrollback_count + visible_count;
+            // Two /whoami invocations × 1 occurrence per line = 2.
+            assert_eq!(
+                total, 2,
+                "line {:?} should appear exactly once after /whoami \
+                 (visible={}, scrollback={})\n\nvisible grid:\n{}\n\n\
+                 scrollback tail:\n{}",
+                line,
+                visible_count,
+                scrollback_count,
+                vterm.dump(),
+                vterm
+                    .scrollback_texts()
+                    .iter()
+                    .rev()
+                    .take(20)
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
             );
         }
     }
