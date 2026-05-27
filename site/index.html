@@ -88,7 +88,25 @@
   .install-tab .ind{font-size:10px;color:var(--green);opacity:0;transition:opacity .2s}
   .install-tab.active .ind{opacity:1}
   .install-body{padding:18px 18px 14px;position:relative}
-  .install-cmd{font-size:13px;color:#e8e8e8;white-space:pre;overflow-x:auto;line-height:1.5}
+  /* `pre-wrap` + `break-word` lets long install URLs (Windows
+     `irm https://…/install.ps1 | iex` is ~94 chars vs ~520 px
+     container) wrap visually instead of triggering Windows' chunky
+     10-12 px default horizontal scrollbar. JS copy uses the
+     underlying string verbatim, so the wrap is purely visual.
+     `overflow-x:auto` + the thin scrollbar style below stay as a
+     belt-and-suspenders for any pathological token that's longer
+     than the container with no break-opportunity. */
+  /* `overflow-y:hidden` explicit: when only `overflow-x:auto` is
+     set, CSS spec promotes the default `overflow-y:visible` to
+     `auto` (can't mix visible with non-visible on the other axis),
+     which silently spawned a vertical scrollbar on any sub-pixel
+     content overhang. Also zero the default `<pre>` margin so the
+     element fits its container snugly. */
+  .install-cmd{font-size:13px;color:#e8e8e8;white-space:pre-wrap;word-break:break-word;overflow-x:auto;overflow-y:hidden;margin:0;line-height:1.5;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent}
+  .install-cmd::-webkit-scrollbar{height:6px}
+  .install-cmd::-webkit-scrollbar-track{background:transparent}
+  .install-cmd::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:3px}
+  .install-cmd::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.3)}
   .install-cmd .accent{color:var(--accent)}
   .install-cmd .str{color:#9ecbff}
   .install-cmd .com{color:rgba(255,255,255,.4)}
