@@ -399,10 +399,6 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// only on one side of the lifecycle).
     #[cfg(windows)]
     prior_console_in_mode: Option<u32>,
-    /// Whether to paint the right-side vertical scrollbar. Persisted to
-    /// ui-state.toml so the setting survives restarts. Toggled via
-    /// `toggle_scrollbar()`. P6.5 uses this field in repaint_body_region.
-    pub show_scrollbar: bool,
 }
 
 /// Tracking state for an active multi-row live group. Populated by
@@ -489,7 +485,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Conhost mouse capture intentionally skipped — see comment
         // above re: deferring to terminal-native selection/wheel/copy.
         let prior_console_in_mode: Option<u32> = None;
-        let show_scrollbar = crate::render::ui_state::load().ui.show_scrollbar;
         Self {
             out,
             caps,
@@ -516,7 +511,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_group: None,
             #[cfg(windows)]
             prior_console_in_mode,
-            show_scrollbar,
         }
     }
 
@@ -1294,10 +1288,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     /// Append-only model: copy the body_lines tail into screen.cells
-    /// at rows `[0, body_rows_on_screen)`. Width-clipped to the
-    /// effective body width so wide rows don't bleed into the
-    /// scrollbar column. Mirrors the geometry math in `paint_footer`
-    /// so the body+footer together exactly span `[0, body_rows + total_rows)`.
+    /// at rows `[0, body_rows_on_screen)`. Width-clipped to the screen
+    /// width. Mirrors the geometry math in `paint_footer` so the
+    /// body+footer together exactly span `[0, body_rows + total_rows)`.
     fn paint_body_into_cells(&mut self) {
         let w = self.screen.width() as usize;
         let h = self.screen.height() as usize;
@@ -1321,7 +1314,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         if start >= total {
             return;
         }
-        let body_width = self.effective_body_width();
+        let body_width = self.screen.width() as usize;
         // Clone the slice before drawing — `screen.draw_row` takes
         // &mut self.screen and the iteration would otherwise double-
         // borrow.
@@ -1362,26 +1355,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let cap = h.saturating_sub(footer_rows);
         let visible_len = self.body_lines.len().saturating_sub(self.scrolled_off);
         (visible_len + 1).min(cap) as u16
-    }
-
-    /// Effective body width: paint reserves the rightmost column for
-    /// the scrollbar glyph when `show_scrollbar` is on, so body content
-    /// must be clipped to `width - 1` to avoid splitting the trailing
-    /// wide cluster (e.g. a CJK char at col `width-1` whose continuation
-    /// cell sits at col `width` — painting the scrollbar over the
-    /// continuation cell makes the cluster render as mojibake).
-    ///
-    /// We reserve based on `show_scrollbar` alone (not on runtime
-    /// overflow) — the small predictability win of always-reserve
-    /// is worth one col of body area when scrollbar is on but content
-    /// hasn't overflowed yet.
-    fn effective_body_width(&self) -> usize {
-        let raw = self.screen.width() as usize;
-        if self.show_scrollbar {
-            raw.saturating_sub(1).max(1)
-        } else {
-            raw
-        }
     }
 
     /// Append-only model: emit one body row via the
@@ -2328,77 +2301,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.body_lines
             .splice(0..self.welcome_line_count, rows.into_iter());
         self.welcome_line_count = new_len;
-    }
-
-    /// Force a fresh paint of body region rows from body_lines.
-    /// Always paints the body_lines tail (terminal-native scrollback handles
-    /// vertical navigation after the append-only refactor).
-    ///
-    /// The cell-diff is the SOLE source of truth for body painting — earlier
-    /// revisions wrote per-row CUP+EL+content directly to `out` first and
-    /// then let the diff run on top, which left stuck reverse-video on blank
-    /// cells because `Cell::blank()` == `Cell::blank()` skipped the
-    /// un-reverse patch. All that's left here now is: optional right-edge
-    /// scrollbar (still
-    /// written raw because the scrollbar column sits outside
-    /// `effective_body_width` and the diff never touches it), then a
-    /// full paint+diff cycle.
-    fn repaint_body_region(&mut self) {
-        let bottom = self.body_bottom_row();
-        if bottom == 0 || self.body_lines.is_empty() {
-            return;
-        }
-        let body_height = bottom as usize;
-        let total = self.body_lines.len();
-        // Paint right-edge scrollbar via raw stdout. The scrollbar column
-        // sits in `screen.width()` (1-indexed), i.e. one past
-        // `effective_body_width()`, so body cells never overlap with it
-        // and the cell-diff doesn't see it. After the append-only
-        // refactor we're always anchored at the bottom, so pass
-        // sticky_bottom=true unconditionally.
-        let viewport_start = total.saturating_sub(body_height);
-        let scrollbar_shape = crate::render::scrollbar::compute(
-            total,
-            body_height,
-            viewport_start,
-            true,
-            self.show_scrollbar,
-        );
-        if let Some(shape) = &scrollbar_shape {
-            let scrollbar_col = self.screen.width();
-            for row_idx in 0..body_height {
-                let target_row = 1 + row_idx as u16;
-                let glyph = if crate::render::scrollbar::is_thumb_row(shape, row_idx) {
-                    "█"
-                } else {
-                    "│"
-                };
-                let seq = format!("\x1b[{};{}H{}", target_row, scrollbar_col, glyph);
-                let _ = self.out.write_all(seq.as_bytes());
-            }
-            let _ = self.out.flush();
-        }
-        // Re-anchor the terminal cursor at the input prompt. Three-step
-        // belt-and-suspenders:
-        //   (1) paint_frame writes body+footer cells (incl. screen.set_cursor)
-        //   (2) render_diff emits patches + cursor CUP + visibility toggle
-        //   (3) explicit final CUP to wherever set_cursor parked
-        // The explicit final CUP exists because real-world iTerm2 was
-        // observed to leave the cursor above the input even though the
-        // test sees the correct last-CUP row; suspect is render_diff's
-        // trailing `\x1b[?25h` somehow obscuring the position on certain
-        // terminal versions. Re-emitting the CUP as the very last write
-        // sidesteps the ambiguity at the cost of one harmless duplicate
-        // escape sequence.
-        self.paint_frame();
-        let bytes = self.screen.render_diff();
-        let _ = self.out.write_all(&bytes);
-        if let Some((r, c)) = self.screen.peek_cursor() {
-            let cup = format!("\x1b[{};{}H", r, c);
-            let _ = self.out.write_all(cup.as_bytes());
-        }
-        let _ = self.out.flush();
-        self.dirty = false;
     }
 
 }
@@ -3735,15 +3637,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
         self.dirty = false;
     }
 
-    fn toggle_scrollbar(&mut self) -> bool {
-        self.show_scrollbar = !self.show_scrollbar;
-        let mut state = crate::render::ui_state::load();
-        state.ui.show_scrollbar = self.show_scrollbar;
-        crate::render::ui_state::save(&state);
-        // Body width changes — force repaint of body region tail
-        self.repaint_body_region();
-        self.show_scrollbar
-    }
 }
 
 impl<W: Write + Send> Drop for RetainedRenderer<W> {
@@ -9216,7 +9109,7 @@ mod tests {
     /// Variant of the test above that DIRECTLY exercises the
     /// `paint_body_into_cells` short-row-after-long-row case at the
     /// screen.cells layer (no `body_lines.last_mut()` shenanigans),
-    /// using `repaint_body_region` to drive the paint pipeline twice
+    /// driving the paint pipeline twice via `flush_deferred()`
     /// against a body_lines slot whose content was just shortened.
     #[test]
     fn retained_paint_body_short_row_clears_trailing_cells_via_vterm() {

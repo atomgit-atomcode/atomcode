@@ -198,9 +198,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     tmux copy-mode — whatever your terminal already provides).
     Drag + Ctrl+C                    Copy text (atomcode does not capture the mouse)
 
-  ── Display ──
-    /scrollbar                       Toggle right-side scrollbar
-
   ── Session ──
     Ctrl+C                           Cancel current turn / dismiss modal
     Ctrl+D                           Exit AtomCode
@@ -734,11 +731,6 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
-        Msg::CmdDescScrollbar => "Toggle the right-side scrollbar".into(),
-
-        // ── Scrollbar UI status ──
-        Msg::ScrollbarOn => "Scrollbar: ON".into(),
-        Msg::ScrollbarOff => "Scrollbar: OFF".into(),
 
         // ── config save failed ──
         Msg::ConfigSaveFailed { error } =>

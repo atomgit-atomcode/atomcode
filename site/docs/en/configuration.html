@@ -81,14 +81,6 @@
       </ul>
       <p>You can also use <code>--config /path/to/config.toml</code> to point at any file. On the first run, if the file is missing, the 3-step wizard walks you through initial setup.</p>
 
-      <h2>UI preferences</h2>
-      <p>TUI display preferences (scrollbar toggle, etc.) live in a separate file, not in <code>config.toml</code>:</p>
-      <ul>
-        <li>macOS / Linux / HarmonyOS PC: <code>~/.atomcode/ui-state.toml</code></li>
-        <li>Windows: <code>%USERPROFILE%\.atomcode\ui-state.toml</code></li>
-      </ul>
-      <p>Maintained automatically by commands like <code>/scrollbar</code> (atomic write — a crash mid-update cannot corrupt it). Normally no manual editing required.</p>
-
       <h2>Minimal example</h2>
       <pre><code>default_provider = "deepseek"
 

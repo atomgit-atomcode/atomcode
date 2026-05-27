@@ -105,7 +105,6 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
-    Command { name: "scrollbar", desc: "Toggle the right-side scrollbar", needs_args: false },
     Command { name: "language", desc: "Switch display language", needs_args: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },
     Command { name: "quit",    desc: "Exit AtomCode", needs_args: false },
@@ -167,7 +166,6 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "think" => Msg::CmdDescThink,
         "help" => Msg::CmdDescHelp,
         "keys" => Msg::CmdDescKeys,
-        "scrollbar" => Msg::CmdDescScrollbar,
         "language" => Msg::CmdDescLanguage,
         "welcome" => Msg::CmdWelcomeDescription,
         "quit" => Msg::CmdDescQuit,
@@ -320,19 +318,6 @@ mod tests {
                 body.contains("Enter"),
                 "KeybindingsHelp ({locale:?}) must list Enter — got:\n{body}"
             );
-        }
-        crate::i18n::set_locale(prev);
-    }
-
-    #[test]
-    fn scrollbar_command_registered_with_i18n_description_in_both_locales() {
-        use crate::i18n::Locale;
-        assert!(BUILTIN_COMMANDS.iter().any(|c| c.name == "scrollbar"));
-        let prev = crate::i18n::current_locale();
-        for locale in [Locale::En, Locale::ZhCn] {
-            crate::i18n::set_locale(locale);
-            let desc = cmd_desc_i18n("scrollbar").expect("CmdDescScrollbar translation");
-            assert!(!desc.trim().is_empty(), "CmdDescScrollbar ({locale:?}) must not be empty");
         }
         crate::i18n::set_locale(prev);
     }

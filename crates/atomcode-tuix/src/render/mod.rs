@@ -6,9 +6,7 @@ pub mod plain;
 pub mod qr;
 pub mod retained;
 pub mod screen;
-pub mod scrollbar;
 pub mod theme;
-pub mod ui_state;
 pub mod worker;
 
 use std::time::Duration;
@@ -290,10 +288,6 @@ pub trait Renderer: Send {
     /// Default no-op: renderers without a retained body buffer can't
     /// edit already-emitted rows in place.
     fn refresh_welcome_banner(&mut self, _model: &str, _working_dir: &str) {}
-
-    /// Toggle the right-side visible scrollbar. Default: no-op for renderers
-    /// that don't have a body region (Plain). Returns the new state — true = now shown.
-    fn toggle_scrollbar(&mut self) -> bool { false }
 
     /// Jump body viewport to the prev/next message boundary. No-op when no
     /// such boundary exists in the configured direction.

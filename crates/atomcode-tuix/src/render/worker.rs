@@ -84,7 +84,6 @@ enum AckOp {
     SuspendForExternal,
     ResumeFromExternal,
     Shutdown,
-    ToggleScrollbar,
 }
 
 /// Renderer facade that forwards every call to a background OS thread.
@@ -208,12 +207,6 @@ impl Renderer for TaskRenderer {
     fn scroll_to_next_user_message(&mut self) {
         let _ = self.cmd_tx.send(RenderCmd::ScrollToNextUserMessage);
     }
-
-    fn toggle_scrollbar(&mut self) -> bool {
-        self.ack(AckOp::ToggleScrollbar);
-        // Read the new state back from persisted ui-state (best-effort)
-        crate::render::ui_state::load().ui.show_scrollbar
-    }
 }
 
 impl Drop for TaskRenderer {
@@ -314,9 +307,6 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
                         // discarded (the sender's next send errors,
                         // which callers treat as "worker gone").
                         return;
-                    }
-                    AckOp::ToggleScrollbar => {
-                        let _ = inner.toggle_scrollbar();
                     }
                 }
                 crate::tuix_trace!("REN", "Ack {:?} dur={}µs", op, t0.elapsed().as_micros());

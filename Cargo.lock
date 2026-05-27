@@ -314,7 +314,6 @@ dependencies = [
  "qrcode",
  "serde",
  "serde_json",
- "serial_test",
  "tempfile",
  "tokio",
  "toml 0.8.23",
