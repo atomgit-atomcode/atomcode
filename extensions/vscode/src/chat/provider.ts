@@ -425,6 +425,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * User can review/edit the text before hitting send.
    */
   public async addToChat(text: string) {
+    if (!text) return;
     let sid = this._focusedPanelId;
 
     if (!sid) {
