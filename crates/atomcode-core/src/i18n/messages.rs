@@ -109,6 +109,11 @@ pub enum Msg<'a> {
 
     // ── Status bar (build_status) ──
     StatusNoProvider,
+    /// Open-source build with an AtomGit-gateway provider configured.
+    /// Sending any chat will fail with `CpOfficialBuildRequired`; this
+    /// hint surfaces the same diagnosis up-front so the user doesn't
+    /// have to type a message to discover the dead-end.
+    StatusOfficialBuildRequired,
     StatusUpgradeHint { version: &'a str },
     StatusModelNotConfigured,
     /// macOS / Linux variant: "Image in clipboard · ctrl+v to paste".

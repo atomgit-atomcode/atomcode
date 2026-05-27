@@ -41,13 +41,23 @@ fn build_codingplan_headers(
         return Ok(Vec::new());
     }
 
-    // `CpAuthRequired` (no stored auth, or empty user.id /
-    // access_token) is a separate failure mode from
-    // `CpOfficialBuildRequired` (open-source build / unavailable
-    // signer). Users on an official build with no `~/.atomcode/auth.toml`
-    // would otherwise see the misleading "need official build"
-    // message — the build IS official, they just haven't logged in
-    // yet. Steer them to `/codingplan` instead.
+    // Order matters: signer availability is checked FIRST.
+    //
+    // An open-source build (no `codingplan-crypto` feature) can never
+    // produce a valid signature — `/login` will not fix that. If we
+    // checked auth first, an open-source user with empty auth.toml
+    // would be told "run /codingplan", they'd log in successfully,
+    // and STILL hit `Unavailable` on the next chat. The signer-first
+    // order gives them the actionable hint (`CpOfficialBuildRequired`)
+    // immediately.
+    //
+    // Official builds (`signer_available() == true`) fall through to
+    // the auth check, so an official user with no `~/.atomcode/auth.toml`
+    // still sees `CpAuthRequired` (the originally-intended UX).
+    if !crypto::signer_available() {
+        return Err(anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired)));
+    }
+
     let (user_id_string, token_string);
     let (user_id, oauth_token) = match override_auth {
         Some((uid, tok)) => (uid, tok),
@@ -574,6 +584,20 @@ impl LlmProvider for OpenAiProvider {
         let base_url_for_signing = self.base_url.clone();
 
         tokio::spawn(async move {
+            // Upfront signing precheck. Without this, the retry factory
+            // below silently `.unwrap_or_default()`s any signing error
+            // (open-source build → empty headers → 403 from gateway with
+            // an unhelpful raw body), so users on an open-source build
+            // pointed at the AtomGit gateway would never see the
+            // actionable `CpOfficialBuildRequired` hint. Run it here
+            // (signer availability + auth state don't depend on body
+            // content, so a zero-byte probe is sufficient) so the
+            // friendly error surfaces BEFORE the first network call.
+            if let Err(e) = build_codingplan_headers(&base_url_for_signing, &[], None) {
+                let _ = tx.send(Ok(StreamEvent::Error(e.to_string())));
+                return;
+            }
+
             // Mid-stream retry: when the provider opens the stream but the
             // chunked body errors out BEFORE any SSE `data:` line is parsed,
             // it's safe to redo the whole request — no text/tool-call has
@@ -2329,5 +2353,26 @@ mod codingplan_signing_tests {
         )
         .expect_err("empty auth must error");
         assert!(!format!("{:#}", err).is_empty());
+    }
+
+    #[cfg(not(feature = "codingplan-crypto"))]
+    #[test]
+    fn open_source_build_errors_official_build_required_before_auth_check() {
+        // Regression guard: when reordering build_codingplan_headers,
+        // the signer-availability check MUST run before any auth lookup
+        // so an open-source user with empty auth gets the actionable
+        // "need official build" hint instead of a misleading "/login"
+        // prompt that would never succeed.
+        let err = build_codingplan_headers(
+            "https://llm-api.atomgit.com/v1",
+            b"{}",
+            Some(("", "")), // empty auth
+        )
+        .expect_err("must error");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("official") || msg.contains("官方"),
+            "open-source + empty-auth must surface the official-build hint, not the auth hint. got: {msg}",
+        );
     }
 }
