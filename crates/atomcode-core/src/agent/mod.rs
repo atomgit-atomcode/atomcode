@@ -965,7 +965,7 @@ impl AgentLoop {
         );
         // Register atomcode-guide subagent
         {
-            let reg = subagent_registry.read().unwrap();
+            let reg = subagent_registry.write().unwrap();
             let _ = crate::agent::guide::register(&reg);
         }
 

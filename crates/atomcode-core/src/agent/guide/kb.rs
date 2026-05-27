@@ -171,6 +171,11 @@ impl KnowledgeBase {
     /// ---
     /// Content body...
     /// ```
+    ///
+    /// Limitations:
+    /// - Frontmatter must start at column 0 (no BOM, no leading whitespace)
+    /// - Keywords only support inline array syntax: keywords: [a, b, c]
+    /// - YAML list syntax (keywords:\n  - a\n  - b) is not supported
     fn parse_md(&self, path: &std::path::Path) -> Result<KnowledgeEntry, String> {
         let raw =
             std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
@@ -273,7 +278,7 @@ impl KnowledgeBase {
             let matched: Vec<usize> = inner
                 .keyword_index
                 .iter()
-                .filter(|(k, _)| k.contains(word))
+                .filter(|(k, _)| k.split_whitespace().any(|kw| kw == word.as_str()))
                 .flat_map(|(_, indices)| indices.iter().copied())
                 .collect();
 
@@ -554,5 +559,57 @@ keywords: [中文, 配置, atomcode]
 
         let rendered = kb.render_for_query("atomcode", 100);
         assert!(rendered.contains("中文标题"));
+    }
+
+    #[test]
+    fn test_search_substring_no_false_positive() {
+        // "at" should NOT match "configuration" with word-boundary matching.
+        // This tests the Fix 4 change from k.contains(word) to word-boundary matching.
+        let (tmp, kb) = create_test_kb(&[(
+            "config.md",
+            r#"---
+title: "Configuration"
+category: "config"
+keywords: [configuration, setup]
+---
+Config docs.
+"#,
+        )]);
+        let _tmp = tmp;
+
+        let hits = kb.search("at");
+        assert!(hits.is_empty(), "'at' should not match keyword 'configuration'");
+
+        // Sanity: actual keyword still matches
+        let hits = kb.search("configuration");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_search_exact_word_only() {
+        let (tmp, kb) = create_test_kb(&[(
+            "test.md",
+            r#"---
+title: "Test"
+category: "test"
+keywords: [con, test]
+---
+Content.
+"#,
+        )]);
+        let _tmp = tmp;
+
+        // "con" should match "con" but NOT "configuration" or "content"
+        let hits = kb.search("con");
+        assert_eq!(hits.len(), 1, "'con' should match keyword 'con'");
+        assert_eq!(kb.get_or_load().entries[hits[0]].title, "Test");
+
+        // "test" should match "test"
+        let hits = kb.search("test");
+        assert_eq!(hits.len(), 1);
+
+        // "testing" should NOT match "test" (exact word match)
+        let hits = kb.search("testing");
+        assert_eq!(hits.len(), 0, "'testing' should not match keyword 'test' (exact word required)");
     }
 }

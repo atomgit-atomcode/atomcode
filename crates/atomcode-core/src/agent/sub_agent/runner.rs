@@ -153,12 +153,10 @@ impl SubAgentRunner {
 
         for turn_idx in 0..max_turns {
             // Send progress notification to the parent agent
-            let _ = self.event_tx.send(AgentEvent::Warning(format!(
-                "[SubAgent: {}] Turn {}/{}",
-                def.name,
-                turn_idx + 1,
-                max_turns
-            )));
+            let _ = self.event_tx.send(AgentEvent::GuideTurnActivity {
+                subagent: def.name.clone(),
+                message: format!("turn {}/{}", turn_idx + 1, max_turns),
+            });
 
             // Fast-path cancellation check (non-blocking)
             if self.cancel_token.is_cancelled() {

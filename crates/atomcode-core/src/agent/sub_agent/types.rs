@@ -42,7 +42,6 @@ pub struct SubAgentDefinition {
     pub max_answer_tokens: usize,
     pub max_knowledge_tokens: usize,
     pub compression_threshold: f64,
-    pub max_invocations_per_turn: usize,
 }
 
 impl Default for SubAgentDefinition {
@@ -59,7 +58,6 @@ impl Default for SubAgentDefinition {
             max_answer_tokens: 4096,
             max_knowledge_tokens: 16_000,
             compression_threshold: 0.9,
-            max_invocations_per_turn: 1,
         }
     }
 }

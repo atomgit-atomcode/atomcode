@@ -1856,12 +1856,10 @@ async fn run_headless(
                 text,
                 truncated,
             } => {
-                if verbose {
-                    close_thinking_line(&mut thinking_line_open);
-                    let snippet = truncate_log_line(&text, 200);
-                    let tag = if truncated { "[truncated]" } else { "" };
-                    eprintln!("[guide-agent {} done] {}{}", subagent, snippet, tag);
-                }
+                close_thinking_line(&mut thinking_line_open);
+                let snippet = truncate_log_line(&text, 200);
+                let tag = if truncated { " [truncated]" } else { "" };
+                eprintln!("[guide-agent {} done] {}{}", subagent, snippet, tag);
             }
         }
     }
