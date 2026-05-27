@@ -995,6 +995,36 @@ mod tests {
         assert!(!s.contains('\\'), "no literal backslash should remain: got {:?}", s);
     }
 
+    /// Reverted-fix regression pin. A previous attempt added a
+    /// "skip if body contains `\n` or `\r` escape" guard to
+    /// `looks_like_windows_path` to defend content-with-embedded-
+    /// path bodies. It broke Windows paths whose own filenames
+    /// start with `n` or `r` — `D:\new`, `D:\node_modules`,
+    /// `D:\readme.txt`, `\nightly\foo`, etc. — because those
+    /// contain a `\` + `n` (or `\r`) byte pair that the guard
+    /// misread as a newline escape. Eval matrix went 14 → 27
+    /// before the revert.
+    ///
+    /// Pin the loose-path case so any future "body shape" guard
+    /// has to keep it working.
+    #[test]
+    fn repair_tool_args_loose_windows_path_with_n_dir_name_still_rewrites() {
+        // Raw JSON: `{"file_path": "D:\new\foo.py"}` — model emits
+        // single-backslash Windows path with a directory called
+        // `new`. The bytes between the inner quotes are `D` `:`
+        // `\` `n` `e` `w` `\` `f` `o` `o` `.` `p` `y`. The pre-
+        // escape pass MUST double the `\n` and `\f` so the path
+        // round-trips, otherwise serde decodes `\n` → newline and
+        // the path turns into `D:<newline>ew<formfeed>oo.py`.
+        let input = "{\"file_path\": \"D:\\new\\foo.py\"}";
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let p = v["file_path"].as_str().unwrap();
+        assert_eq!(p, "D:\\new\\foo.py", "loose Windows path with `\\n` substring must round-trip; got {:?}", p);
+        assert!(!p.contains('\n'), "no real newline must leak through: {:?}", p);
+        assert!(!p.contains('\u{000C}'), "no form feed must leak through: {:?}", p);
+    }
+
     /// Python source like `class A:\n    pass\n` has a single
     /// uppercase letter preceded by whitespace, then `:`, then
     /// `\` from the JSON `\n` escape. The old tail-of-word guard
