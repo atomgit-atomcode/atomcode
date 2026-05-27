@@ -360,6 +360,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::ImageAttachment(_) => "ImageAttachment",
         UiLine::VisionPreprocessSuccess { .. } => "VisionPreprocessSuccess",
         UiLine::TurnSeparator { .. } => "TurnSeparator",
+        UiLine::GuideStatus(_) => "GuideStatus",
     }
 }
 

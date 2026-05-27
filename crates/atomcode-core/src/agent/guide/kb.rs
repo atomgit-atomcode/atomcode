@@ -68,18 +68,16 @@ impl Clone for KnowledgeBase {
 }
 
 impl KnowledgeBase {
-    /// Create a new `KnowledgeBase` rooted at `knowledge/` next to this source file.
+    /// Create a new `KnowledgeBase` with embedded knowledge files.
     ///
-    /// The base directory is resolved at compile time via `CARGO_MANIFEST_DIR`
-    /// so that knowledge files are found regardless of the runtime working directory.
-    pub fn new() -> Self {
-        // env!("CARGO_MANIFEST_DIR") is resolved at compile time to
-        // atomcode-core's Cargo.toml directory.
-        let base_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src/agent/guide/knowledge");
+    /// Files are embedded at compile time via `include_str!` so the
+    /// knowledge base works regardless of the runtime working directory.
+    pub fn embedded() -> Self {
+        let inner = OnceLock::new();
+        let _ = inner.set(Self::load_embedded());
         Self {
-            inner: OnceLock::new(),
-            base_dir,
+            inner,
+            base_dir: PathBuf::new(),
         }
     }
 
@@ -92,7 +90,45 @@ impl KnowledgeBase {
     }
 
     // -----------------------------------------------------------------
-    // Internal loading & parsing
+    // Embedded loading
+    // -----------------------------------------------------------------
+
+    fn load_embedded() -> KnowledgeInner {
+        let files: &[(&str, &str)] = &[
+            ("features.md", include_str!("knowledge/features.md")),
+            ("slash-commands.md", include_str!("knowledge/slash-commands.md")),
+            ("mcp.md", include_str!("knowledge/mcp.md")),
+            ("skills.md", include_str!("knowledge/skills.md")),
+            ("config.md", include_str!("knowledge/config.md")),
+        ];
+
+        let mut entries = Vec::new();
+        let mut keyword_index: HashMap<String, Vec<usize>> = HashMap::new();
+
+        for (name, raw) in files {
+            match Self::parse_raw(name, raw) {
+                Ok(ke) => {
+                    let idx = entries.len();
+                    for kw in &ke.keywords {
+                        keyword_index
+                            .entry(kw.to_lowercase())
+                            .or_default()
+                            .push(idx);
+                    }
+                    entries.push(ke);
+                }
+                Err(e) => {
+                    tracing::warn!("KnowledgeBase: skipping embedded {}: {}", name, e);
+                }
+            }
+        }
+
+        tracing::debug!("KnowledgeBase: loaded {} entries (embedded)", entries.len());
+        KnowledgeInner { entries, keyword_index }
+    }
+
+    // -----------------------------------------------------------------
+    // Disk-based loading (for tests and custom knowledge)
     // -----------------------------------------------------------------
 
     /// Load (or reload) all knowledge entries from disk.
@@ -160,34 +196,24 @@ impl KnowledgeBase {
         }
     }
 
-    /// Parse a single Markdown file with optional YAML frontmatter.
-    ///
-    /// Expected format:
-    /// ```markdown
-    /// ---
-    /// title: "My Title"
-    /// category: "config"
-    /// keywords: [keyword1, keyword2]
-    /// ---
-    /// Content body...
-    /// ```
-    ///
-    /// Limitations:
-    /// - Frontmatter must start at column 0 (no BOM, no leading whitespace)
-    /// - Keywords only support inline array syntax: keywords: [a, b, c]
-    /// - YAML list syntax (keywords:\n  - a\n  - b) is not supported
+    /// Parse a single Markdown file from disk (used in tests).
     fn parse_md(&self, path: &std::path::Path) -> Result<KnowledgeEntry, String> {
         let raw =
             std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
+        Self::parse_raw(&path.to_string_lossy(), &raw)
+    }
 
+    /// Parse Markdown content with optional YAML frontmatter.
+    ///
+    /// `source_name` is used for diagnostics and the entry's path field.
+    fn parse_raw(source_name: &str, raw: &str) -> Result<KnowledgeEntry, String> {
         // Detect and strip YAML frontmatter
-        let (frontmatter, content) = if raw.starts_with("---\n") || raw.starts_with("---\r\n") {
-            // The three dashes and an optional trailing newline
-            let rest = &raw[3..].trim_start_matches(|c| c == '\n' || c == '\r');
+        let raw_trimmed = raw.trim();
+        let (frontmatter, content) = if raw_trimmed.starts_with("---\n") || raw_trimmed.starts_with("---\r\n") {
+            let rest = &raw_trimmed[3..].trim_start_matches(|c| c == '\n' || c == '\r');
             if let Some(end) = rest.find("\n---") {
                 let fm = &rest[..end];
                 let body_section = &rest[end + 4..];
-                // Strip a single leading newline from the body if present
                 let body = body_section
                     .strip_prefix('\n')
                     .unwrap_or(body_section)
@@ -197,7 +223,7 @@ impl KnowledgeBase {
                 return Err("missing closing ---".to_string());
             }
         } else {
-            ("".to_string(), raw.trim().to_string())
+            ("".to_string(), raw_trimmed.to_string())
         };
 
         let mut title = String::new();
@@ -239,7 +265,7 @@ impl KnowledgeBase {
             category,
             keywords,
             content,
-            path: path.to_path_buf(),
+            path: PathBuf::from(source_name),
         })
     }
 
@@ -346,6 +372,12 @@ impl KnowledgeBase {
             out.push_str(&chunk);
         }
         out
+    }
+}
+
+impl crate::agent::sub_agent::types::KnowledgeProvider for KnowledgeBase {
+    fn render_for_query(&self, query: &str, max_tokens: usize) -> String {
+        self.render_for_query(query, max_tokens)
     }
 }
 

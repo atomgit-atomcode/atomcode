@@ -18,8 +18,10 @@ mod services;
 mod tool_dispatch;
 mod verify;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -524,6 +526,8 @@ pub struct AgentLoop {
     subagent_cancel_token: CancellationToken,
     /// Concurrency guard: prevents overlapping subagent invocations
     subagent_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Queue of (name, task) pairs waiting to run after the current subagent
+    pending_subagents: std::sync::Arc<Mutex<VecDeque<(String, String)>>>,
 
     /// Discipline tracking — all counters for loop detection, stagnation,
     /// error streaks, and tool usage patterns. Extracted from AgentLoop to
@@ -997,6 +1001,7 @@ impl AgentLoop {
             subagent_handles: Vec::new(),
             subagent_cancel_token: CancellationToken::new(),
             subagent_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_subagents: Arc::new(Mutex::new(VecDeque::new())),
             discipline_state: DisciplineState::default(),
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
@@ -1488,8 +1493,15 @@ impl AgentLoop {
 
     async fn handle_invoke_subagent(&mut self, name: String, task: String) {
         if self.subagent_running.swap(true, std::sync::atomic::Ordering::Acquire) {
+            self.pending_subagents
+                .lock()
+                .unwrap()
+                .push_back((name, task.clone()));
             let _ = self.event_tx.send(AgentEvent::Warning(
-                "已有子代理正在运行，请等待完成后再试".to_string()
+                format!(
+                    "子代理正在运行中，你的请求已排队（当前队列长度: {}）",
+                    self.pending_subagents.lock().unwrap().len()
+                )
             ));
             return;
         }
@@ -1502,49 +1514,72 @@ impl AgentLoop {
         let event_tx = self.event_tx.clone();
         let cancel_token = self.subagent_cancel_token.child_token();
         let running = self.subagent_running.clone();
+        let pending = self.pending_subagents.clone();
 
         let handle = tokio::spawn(async move {
-            // scopeguard: clear running flag on exit
-            let _guard = scopeguard::guard((), |_| {
-                running.store(false, std::sync::atomic::Ordering::Release);
-            });
+            // Run subagents in a loop, draining the queue after each completion
+            let mut current_name = name;
+            let mut current_task = task;
+            loop {
+                let finished = scopeguard::guard((), |_| {
+                    running.store(false, std::sync::atomic::Ordering::Release);
+                });
 
-            let def = {
-                let reg = registry.read().unwrap();
-                reg.find(&name)
-            };
+                let def = {
+                    let reg = registry.read().unwrap();
+                    reg.find(&current_name)
+                };
 
-            let def = match def {
-                Some(d) => d,
-                None => {
-                    let _ = event_tx.send(AgentEvent::Warning(
-                        format!("未找到子代理: {}", name)
-                    ));
-                    return;
+                let def = match def {
+                    Some(d) => d,
+                    None => {
+                        let _ = event_tx.send(AgentEvent::Warning(
+                            format!("未找到子代理: {}", current_name)
+                        ));
+                        break;
+                    }
+                };
+
+                let runner = crate::agent::sub_agent::runner::SubAgentRunner::new(
+                    provider.clone(),
+                    config.clone(),
+                    parent_tools.clone(),
+                    parent_ctx.clone(),
+                    event_tx.clone(),
+                    cancel_token.clone(),
+                );
+
+                let result = runner.run(def, current_task).await;
+                match result {
+                    Ok(output) => {
+                        let _ = event_tx.send(AgentEvent::GuideComplete {
+                            subagent: current_name,
+                            text: output.text,
+                            truncated: output.truncated,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(AgentEvent::GuideComplete {
+                            subagent: current_name,
+                            text: format!("抱歉，无法回答此问题。{}", e.message),
+                            truncated: false,
+                        });
+                    }
                 }
-            };
 
-            let runner = crate::agent::sub_agent::runner::SubAgentRunner::new(
-                provider,
-                config,
-                parent_tools,
-                parent_ctx,
-                event_tx.clone(),
-                cancel_token,
-            );
-
-            match runner.run(def, task).await {
-                Ok(output) => {
-                    let _ = event_tx.send(AgentEvent::GuideComplete {
-                        subagent: name,
-                        text: output.text,
-                        truncated: output.truncated,
-                    });
-                }
-                Err(e) => {
-                    let _ = event_tx.send(AgentEvent::Warning(
-                        format!("子代理错误: {}", e.message)
-                    ));
+                // Check queue for the next pending request
+                let next = pending.lock().unwrap().pop_front();
+                match next {
+                    Some((next_name, next_task)) => {
+                        current_name = next_name;
+                        current_task = next_task;
+                        // Defuse the guard: keep running=true for next iteration
+                        scopeguard::ScopeGuard::into_inner(finished);
+                    }
+                    None => {
+                        // Guard will clear running and loop exits
+                        break;
+                    }
                 }
             }
         });

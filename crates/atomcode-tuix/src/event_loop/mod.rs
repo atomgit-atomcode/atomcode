@@ -2930,7 +2930,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                 last_spinner_draw = std::time::Instant::now();
             }
@@ -3197,7 +3197,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
-                    if matches!(app.state.phase, UiPhase::Streaming)
+                    if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running
                         && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
@@ -3293,7 +3293,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     // shortly after via input_rx) knows to suppress
                     // itself instead of triggering Cancel/exit.
                     app.last_ctrl_c_copy = Some(std::time::Instant::now());
-                } else if matches!(app.state.phase, UiPhase::Streaming) {
+                } else if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running {
                     // In Streaming phase, Ctrl+C should cancel the
                     // running turn (matching keyboard-path behaviour)
                     // rather than shut down the whole application.
@@ -3315,7 +3315,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                 last_spinner_draw = std::time::Instant::now();
             }
@@ -3577,7 +3577,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
-                    if matches!(app.state.phase, UiPhase::Streaming)
+                    if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running
                         && last_spinner_draw.elapsed() >= Duration::from_millis(100)
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
@@ -3741,7 +3741,7 @@ fn attach_image_to_input(
     let marker = format!("[Image #{}]", n);
     app.buf.text.insert_str(app.buf.cursor, &marker);
     app.buf.cursor += marker.len();
-    if matches!(app.state.phase, UiPhase::Streaming) {
+    if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running {
         draw_spinner_now(
             &mut app.state,
             &app.buf,
@@ -3920,7 +3920,7 @@ fn handle_input(
                     return Ok(());
                 }
                 app.buf.insert_paste(text);
-                if matches!(app.state.phase, UiPhase::Streaming) {
+                if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running {
                     draw_spinner_now(
                         &mut app.state,
                         &app.buf,
@@ -6589,13 +6589,15 @@ fn handle_agent_event(
             renderer.flush();
         }
         AgentEvent::GuideTurnActivity { subagent, message } => {
-            renderer.render(UiLine::CommandOutput(
-                format!("[{}] {}", subagent, message),
+            state.guide_running = true;
+            renderer.render(UiLine::GuideStatus(
+                format!("{} {}", subagent, message),
             ));
             renderer.flush();
         }
-        AgentEvent::GuideComplete { subagent, text, truncated } => {
-            let mut output = format!("[{}]\n{}", subagent, text);
+        AgentEvent::GuideComplete { text, truncated, .. } => {
+            state.guide_running = false;
+            let mut output = text;
             if truncated {
                 output.push_str("\n(truncated)");
             }

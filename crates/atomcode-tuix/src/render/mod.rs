@@ -158,6 +158,9 @@ pub enum UiLine {
     InputCommit,
     /// Slash-command output (arbitrary text, already sanitised by caller).
     CommandOutput(String),
+    /// Live sub-agent status line. Each emission replaces the previous
+    /// `GuideStatus` row in-place — no scrollback accumulation.
+    GuideStatus(String),
     /// Image-attachment echo (`└ [Image #N]`). Emitted right after the
     /// `UiLine::User` row that contains the matching `[Image #N]`
     /// marker, so each renderer can align the `└` glyph at the same

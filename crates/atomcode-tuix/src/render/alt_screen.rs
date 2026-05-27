@@ -2140,6 +2140,9 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             UiLine::CommandOutput(text) => {
                 self.push_command_output(&text);
             }
+            UiLine::GuideStatus(text) => {
+                self.push_command_output(&text);
+            }
             UiLine::ImageAttachment(n) => {
                 // `└` at col 2, aligned under the `[` of `[Image #N]`
                 // in the user-message echo above (push_user prefixes

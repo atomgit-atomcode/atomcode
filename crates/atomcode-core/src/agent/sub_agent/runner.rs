@@ -81,10 +81,25 @@ impl SubAgentRunner {
         );
 
         // ── 2. Build sandboxed ToolContext ─────────────────────────────
-        // Create a TurnEvent channel for tool output streaming. The
-        // receiver is dropped — we don't forward sub-agent TurnEvents
-        // to the parent's event loop.
-        let (turn_event_tx, _turn_event_rx) = mpsc::unbounded_channel::<TurnEvent>();
+        let (turn_event_tx, mut turn_event_rx) = mpsc::unbounded_channel::<TurnEvent>();
+
+        // Forward tool-level activity as concise human-readable progress.
+        // Tool names are mapped to Chinese labels; no arguments or timing.
+        let fwd_tx = self.event_tx.clone();
+        let fwd_name = def.name.clone();
+        tokio::spawn(async move {
+            while let Some(event) = turn_event_rx.recv().await {
+                let label = match &event {
+                    TurnEvent::ToolCallStarted { name, .. } => tool_label(name),
+                    _ => continue,
+                };
+                let _ = fwd_tx.send(AgentEvent::GuideTurnActivity {
+                    subagent: fwd_name.clone(),
+                    message: label.to_string(),
+                });
+            }
+        });
+
         let sandbox_ctx = build_sandbox_context(
             &self.parent_ctx,
             filtered_tools.clone(),
@@ -103,12 +118,12 @@ impl SubAgentRunner {
         //   if conversation.estimate_tokens() > ... { ... }
         let _compression_threshold = def.compression_threshold;
 
-        // ── 4. Inject knowledge base (placeholder) ─────────────────────
-        // TODO: When `KnowledgeRef` is replaced with a concrete type,
-        // inject knowledge as a user message here.  The `knowledge`
-        // field is currently `Option<()>` so there is nothing to inject.
-        if def.knowledge.is_some() {
-            // Knowledge injection is not yet wired; see Task 10.
+        // ── 4. Inject knowledge base content as a user message ──────────
+        if let Some(ref kb) = def.knowledge {
+            let kb_text = kb.render_for_query(&user_task, def.max_knowledge_tokens);
+            if !kb_text.is_empty() {
+                conversation.add_user_message(&kb_text);
+            }
         }
 
         // ── 5. Inject user task as a User message ──────────────────────
@@ -150,13 +165,12 @@ impl SubAgentRunner {
         let mut last_text = String::new();
         let max_turns = def.max_turns.max(1);
 
-        for turn_idx in 0..max_turns {
-            // Send progress notification to the parent agent
-            let _ = self.event_tx.send(AgentEvent::GuideTurnActivity {
-                subagent: def.name.clone(),
-                message: format!("turn {}/{}", turn_idx + 1, max_turns),
-            });
+        let _ = self.event_tx.send(AgentEvent::GuideTurnActivity {
+            subagent: def.name.clone(),
+            message: "思考中...".to_string(),
+        });
 
+        for turn_idx in 0..max_turns {
             // Fast-path cancellation check (non-blocking)
             if self.cancel_token.is_cancelled() {
                 return Err(SubAgentError {
@@ -222,16 +236,29 @@ impl SubAgentRunner {
         }
 
         // ── 10. Truncate answer to fit max_answer_tokens ──────────────
-        // Estimate: 1 token ≈ 4 characters of average text.  This is a
-        // coarse upper-bound; actual tokenisation may vary by model.
         let max_chars = def.max_answer_tokens.saturating_mul(4);
         let truncated = last_text.chars().count() > max_chars;
-        let text = if truncated {
+        let text = if last_text.is_empty() {
+            "抱歉，暂时无法回答此问题。请尝试更具体的提问，或查阅 AtomCode 官方文档。".to_string()
+        } else if truncated {
             last_text.chars().take(max_chars).collect()
         } else {
             last_text
         };
 
         Ok(SubAgentOutput { text, truncated })
+    }
+}
+
+/// Map tool names to human-readable Chinese labels for progress display.
+fn tool_label(name: &str) -> &str {
+    match name {
+        "read_file" => "读取文件中...",
+        "grep" => "搜索代码中...",
+        "glob" => "搜索文件中...",
+        "list_dir" => "浏览目录中...",
+        "web_search" => "搜索网页中...",
+        "web_fetch" => "获取网页中...",
+        _ => "处理中...",
     }
 }

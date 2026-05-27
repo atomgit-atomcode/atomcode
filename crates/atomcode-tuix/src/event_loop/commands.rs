@@ -297,9 +297,14 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "guide" => {
+            let task = if arg.is_empty() {
+                "请介绍 AtomCode 的主要功能和使用方法".to_string()
+            } else {
+                arg.to_string()
+            };
             ctx.agent.cmd_tx.send(AgentCommand::InvokeSubAgent {
                 name: "atomcode-guide".to_string(),
-                task: arg.to_string(),
+                task,
             }).ok();
         }
         "keys" => {

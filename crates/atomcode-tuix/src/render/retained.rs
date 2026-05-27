@@ -351,6 +351,13 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// tool call (rendered via `render_inflight_tool`). Used to replace
     /// those lines on each spinner tick and to clean up on commit.
     inflight_tool_rows: usize,
+    /// Number of body lines occupied by the current GuideStatus row.
+    /// Each GuideStatus emission removes the previous one before pushing,
+    /// so the status line updates in-place without scrollback accumulation.
+    guide_status_rows: usize,
+    /// Current guide subagent status label (None = no guide running).
+    /// The spinner tick loop uses this to prefix an animated frame glyph.
+    guide_status_text: Option<String>,
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
     /// `UiLine::ToolGroupChildUpdate` events resolve `call_id` →
@@ -417,6 +424,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_spinner_active: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
+            guide_status_rows: 0,
+            guide_status_text: None,
             live_group: None,
         }
     }
@@ -585,6 +594,34 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         }
         self.inflight_tool_rows = n;
+    }
+
+    /// Render the guide subagent status line with a spinner frame.
+    /// Replaces the previous GuideStatus row in-place via CUP.
+    fn render_guide_spinner(&mut self, row: Vec<Cell>) {
+        let prev = self.guide_status_rows;
+        let inplace_ok = prev > 0 && prev == 1;
+        if inplace_ok {
+            self.ensure_scroll_region();
+            let bottom = self.body_bottom_row();
+            if bottom >= 1 {
+                let keep = self.body_lines.len().saturating_sub(prev);
+                self.body_lines.truncate(keep);
+                let seq = format!("\x1b[{};1H\x1b[2K", bottom);
+                let _ = self.out.write_all(seq.as_bytes());
+                let bytes = serialize_row(&row);
+                let _ = self.out.write_all(&bytes);
+                self.body_lines.push(row);
+                return;
+            }
+        }
+        // Fallback: remove old row, push new one
+        if prev > 0 {
+            let remove = prev.min(self.body_lines.len());
+            self.body_lines.truncate(self.body_lines.len() - remove);
+        }
+        self.push_body_row(row);
+        self.guide_status_rows = 1;
     }
 
     /// Pad a partially-built row with blank default-style cells until it
@@ -2127,7 +2164,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // and carries the ` · 12s · N queued` metadata; pluck
                 // that suffix off and forward it to render_inflight_tool
                 // so the user gets a time anchor on long bashes.
-                if let Some((_id, name, detail)) = self.inflight_tool.clone() {
+                if let Some(status) = self.guide_status_text.clone() {
+                    let cells = self.build_spinner_body_row(frame, &status);
+                    self.render_guide_spinner(cells);
+                } else if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     let meta = spinner_meta_suffix(&label);
                     self.render_inflight_tool(frame, &name, &detail, meta);
                 } else {
@@ -2136,7 +2176,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
             }
             UiLine::Spinner { frame, label } => {
-                if let Some((_id, name, detail)) = self.inflight_tool.clone() {
+                if let Some(status) = self.guide_status_text.clone() {
+                    let cells = self.build_spinner_body_row(frame, &status);
+                    self.render_guide_spinner(cells);
+                } else if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     let meta = spinner_meta_suffix(&label);
                     self.render_inflight_tool(frame, &name, &detail, meta);
                 } else {
@@ -2691,6 +2734,62 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // and plain do.
                 let safe = crate::sanitize::scrub_controls_keep_sgr(&text);
                 self.push_body_text_sgr(&safe);
+            }
+            UiLine::GuideStatus(text) => {
+                // Store the label for spinner-based animation (the spinner
+                // tick loop reads this and prefixes an animated frame glyph).
+                self.guide_status_text = Some(text.clone());
+
+                // Live status line — each emission replaces the previous
+                // one in-place using CUP (same pattern as inflight_tool).
+                let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+                let mut new_rows: Vec<Vec<Cell>> = Vec::new();
+                if w > 0 {
+                    for phys in text.split('\n') {
+                        for chunk in crate::width::wrap_line_to_width(phys, w) {
+                            let mut row = Vec::new();
+                            push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
+                            let _ = crate::render::cell::push_str_cells_sgr(
+                                &mut row, &chunk, CellStyle::default(),
+                            );
+                            new_rows.push(row);
+                        }
+                    }
+                }
+                let n = new_rows.len();
+                let prev = self.guide_status_rows;
+                let inplace_ok = prev > 0 && n == prev;
+
+                if inplace_ok {
+                    self.ensure_scroll_region();
+                    let bottom = self.body_bottom_row();
+                    if bottom >= n as u16 {
+                        // Remove prev rows from model, swap in new rows.
+                        let keep = self.body_lines.len().saturating_sub(prev);
+                        self.body_lines.truncate(keep);
+                        let first = bottom - n as u16 + 1;
+                        for (i, row) in new_rows.iter().enumerate() {
+                            let r = first + i as u16;
+                            let seq = format!("\x1b[{};1H\x1b[2K", r);
+                            let _ = self.out.write_all(seq.as_bytes());
+                            let bytes = serialize_row(row);
+                            let _ = self.out.write_all(&bytes);
+                            self.body_lines.push(row.clone());
+                        }
+                        self.guide_status_rows = n;
+                        return;
+                    }
+                }
+
+                // First render, row count mismatch, or resize — fallback.
+                if prev > 0 {
+                    let remove = prev.min(self.body_lines.len());
+                    self.body_lines.truncate(self.body_lines.len() - remove);
+                }
+                for row in new_rows {
+                    self.push_body_row(row);
+                }
+                self.guide_status_rows = n;
             }
             UiLine::ImageAttachment(n) => {
                 // `└` at col 2, under the `[` of `[Image #N]` in the

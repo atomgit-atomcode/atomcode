@@ -88,8 +88,20 @@ impl std::fmt::Display for SubAgentError {
 
 impl std::error::Error for SubAgentError {}
 
+/// Knowledge provider trait — renders relevant knowledge content for a query.
+/// Implemented by `guide::KnowledgeBase` and wired at registration time.
+pub trait KnowledgeProvider: Send + Sync {
+    fn render_for_query(&self, query: &str, max_tokens: usize) -> String;
+}
+
+impl std::fmt::Debug for dyn KnowledgeProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KnowledgeProvider")
+    }
+}
+
 /// Placeholder type for KnowledgeBase reference. Will be replaced in Task 5.
-pub type KnowledgeRef = ();
+pub type KnowledgeRef = std::sync::Arc<dyn KnowledgeProvider>;
 
 /// Convenience alias for the result type used throughout the sub-agent API.
 pub type SubAgentOutcome = Result<SubAgentOutput, SubAgentError>;
