@@ -732,6 +732,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescSkills => "Browse loaded skills".into(),
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
+        Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
 
         // ── config save failed ──

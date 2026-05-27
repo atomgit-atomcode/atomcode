@@ -420,6 +420,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this._handleSend(text);
   }
 
+  /**
+   * Add selected text as a draft in the chat input without sending.
+   * User can review/edit the text before hitting send.
+   */
+  public async addToChat(text: string) {
+    let sid = this._focusedPanelId;
+
+    if (!sid) {
+      // Create daemon session first, then open tab with sessionId
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const session = await this._client.createSession(undefined, workspaceFolder);
+      sid = session.id;
+      this._getRuntime(sid).projectHash = session.project_hash;
+      this._panelSessions.set(sid, { sessionId: sid, projectHash: session.project_hash });
+      this.openInTab(sid);
+      await this._refreshSessions();
+    }
+
+    this._postMessage({ type: 'setDraft', text });
+    this.focusInput();
+  }
+
   public async newConversation() {
     let sessionId: string | undefined;
     let projectHash: string | undefined;

@@ -504,6 +504,8 @@ pub enum Msg<'a> {
     /// users whose Ctrl+V is swallowed by Windows Terminal / conhost
     /// before reaching the app, but works on every platform.
     CmdDescPaste,
+    /// Description for the `/guide` slash command — asks atomcode-guide a question.
+    CmdDescGuide,
     /// `/paste` failed because the clipboard holds no image. Shown
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.

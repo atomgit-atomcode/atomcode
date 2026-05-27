@@ -109,6 +109,14 @@ export async function activate(context: vscode.ExtensionContext) {
       const prompt = buildContextualPrompt('Please optimize this code for better performance and readability.', ctx);
       await runCommand('optimize the selected code', () => extensionState.chatProvider.sendEditorCommandMessage(prompt));
     }),
+
+    vscode.commands.registerCommand('atomcode.addToChat', async () => {
+      const ctx = getEditorContext();
+      const text = ctx.selection
+        ? `File: ${ctx.fileName} (${ctx.language || 'unknown'})\n\`\`\`${ctx.language || ''}\n${ctx.selection}\n\`\`\``
+        : '';
+      await runCommand('add selection to chat', () => extensionState.chatProvider.addToChat(text));
+    }),
   ];
   context.subscriptions.push(...cmds);
 

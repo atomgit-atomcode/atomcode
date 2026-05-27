@@ -296,6 +296,12 @@ pub(super) fn execute_slash_command(
             }
             renderer.flush();
         }
+        "guide" => {
+            ctx.agent.cmd_tx.send(AgentCommand::InvokeSubAgent {
+                name: "atomcode-guide".to_string(),
+                task: arg.to_string(),
+            }).ok();
+        }
         "keys" => {
             // Dump the full keyboard-shortcut reference into scrollback.
             // i18n string owns column alignment so translators can adjust

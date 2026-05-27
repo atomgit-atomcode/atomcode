@@ -6588,6 +6588,20 @@ fn handle_agent_event(
             }
             renderer.flush();
         }
+        AgentEvent::GuideTurnActivity { subagent, message } => {
+            renderer.render(UiLine::CommandOutput(
+                format!("[{}] {}", subagent, message),
+            ));
+            renderer.flush();
+        }
+        AgentEvent::GuideComplete { subagent, text, truncated } => {
+            let mut output = format!("[{}]\n{}", subagent, text);
+            if truncated {
+                output.push_str("\n(truncated)");
+            }
+            renderer.render(UiLine::CommandOutput(output));
+            renderer.flush();
+        }
         AgentEvent::MessagesSync { messages } => {
             // Response to AgentCommand::SyncMessages. Persist the
             // snapshot to the current session so /bg can recover

@@ -192,4 +192,5 @@ export type ExtensionMessage =
   | { type: 'setupError'; message: string }
   | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string }
   | { type: 'permissionRequest'; id: string; toolName: string; args: string; isDestructive: boolean }
-  | { type: 'resumeStreaming' };
+  | { type: 'resumeStreaming' }
+  | { type: 'setDraft'; text: string };

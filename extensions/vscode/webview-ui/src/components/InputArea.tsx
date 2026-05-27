@@ -37,6 +37,7 @@ export function InputArea() {
       if (e.data?.type === 'workspaceFiles') {
         setWorkspaceFiles(e.data.files || []);
       }
+      if (e.data?.type === 'setDraft') setText(e.data.text);
     }
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
