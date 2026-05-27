@@ -76,10 +76,9 @@ impl SubAgentRunner {
         user_task: String,
     ) -> SubAgentOutcome {
         // ── 1. Filter tools via the sub-agent's tool policy ────────────
-        let filtered_tools = Arc::new(build_subagent_tools(
-            &self.parent_tools,
-            &def.tools,
-        ));
+        let filtered_tools = Arc::new(
+            build_subagent_tools(&self.parent_tools, &def.tools).await,
+        );
 
         // ── 2. Build sandboxed ToolContext ─────────────────────────────
         // Create a TurnEvent channel for tool output streaming. The

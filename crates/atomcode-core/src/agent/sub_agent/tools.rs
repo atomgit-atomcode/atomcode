@@ -14,7 +14,11 @@ use crate::tool::ToolRegistry;
 /// * `ReadOnly`          — read_file, grep, glob, list_dir.
 /// * `ReadOnlyWithWeb`   — ReadOnly plus web_fetch, web_search.
 /// * `Custom(names)`     — explicit whitelist by tool name.
-pub fn build_subagent_tools(
+///
+/// This function is async because it calls async `ToolRegistry` methods.
+/// It must NOT use `Handle::block_on`, which panics when called from
+/// within an async context (e.g. inside a `tokio::spawn` task).
+pub async fn build_subagent_tools(
     parent_tools: &ToolRegistry,
     policy: &SubAgentToolPolicy,
 ) -> ToolRegistry {
@@ -43,24 +47,18 @@ pub fn build_subagent_tools(
 
     let registry = ToolRegistry::new();
 
-    // ToolRegistry methods (iter, register_arc) are async.  This function
-    // is synchronous by design, so we block on the current tokio runtime —
-    // safe because the agent loop that calls this always runs inside one.
-    let handle = tokio::runtime::Handle::current();
-    handle.block_on(async {
-        let parent_entries: Vec<_> = parent_tools.iter().await.collect();
+    let parent_entries: Vec<_> = parent_tools.iter().await.collect();
 
-        for (name, tool) in parent_entries {
-            // Recursive protection: never propagate invoke_subagent.
-            if name == "invoke_subagent" {
-                continue;
-            }
-            // Only keep tools on the allow-list.
-            if allowed.contains(&name) {
-                registry.register_arc(name, tool).await;
-            }
+    for (name, tool) in parent_entries {
+        // Recursive protection: never propagate invoke_subagent.
+        if name == "invoke_subagent" {
+            continue;
         }
-    });
+        // Only keep tools on the allow-list.
+        if allowed.contains(&name) {
+            registry.register_arc(name, tool).await;
+        }
+    }
 
     registry
 }
