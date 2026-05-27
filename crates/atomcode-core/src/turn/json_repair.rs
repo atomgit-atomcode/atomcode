@@ -116,23 +116,45 @@ fn pre_escape_windows_paths_in_json(s: &str) -> String {
 }
 
 /// True iff `s` contains a Windows drive-letter path prefix
-/// (`[A-Za-z]:[\\/]`) appearing in a path-shaped context.
+/// (`[A-Za-z]:[\\/]`) appearing in a path-shaped context AND the
+/// body looks like it could plausibly be a path (no embedded
+/// newline / carriage-return escapes).
 ///
-/// Required context: the drive letter is at the start of the body,
-/// or the byte before it is `\` (UNC long-path `\\?\D:\…`), `'`,
-/// or `"` (quoted path literal embedded in code). Without this
-/// guard, natural-language strings whose contents happen to match
-/// the alpha-colon-backslash shape — e.g. `class A:\n`, `case X:\n`,
-/// `Section B:\nContent` — would be misread as Windows paths and
-/// every `\n`/`\t` in the body would be doubled to a literal
-/// backslash+letter, corrupting the file. The earlier
-/// "preceded-by-alphabetic" guard only ruled out multi-letter
-/// words like `category:\n`; single-letter labels slipped through
-/// and broke `write_file` on common Python sources.
+/// Required context for the drive letter: at the start of the
+/// body, or the byte before it is `\` (UNC long-path `\\?\D:\…`),
+/// `'`, or `"` (quoted path literal embedded in code). Without
+/// this guard, natural-language strings whose contents happen to
+/// match the alpha-colon-backslash shape — e.g. `class A:\n`,
+/// `case X:\n`, `Section B:\nContent` — would be misread as
+/// Windows paths.
+///
+/// Body-shape guard: if `s` contains the raw byte pair `\` + `n`
+/// or `\` + `r`, treat it as multi-line content (source code,
+/// markdown, prose) — not a path. Real Windows filenames cannot
+/// hold newline or carriage-return characters, so the only way
+/// `\n`/`\r` appears in a path body is via a JSON escape that
+/// `rewrite_windows_path_body` would mistakenly double, turning
+/// every `\n` in the body into a literal backslash+`n` and
+/// writing the file as one line of garbage. The classic miss is
+/// content with an embedded quoted Windows path:
+/// `config = {"log_path": "C:/logs/app.log"}\ndef main():\n…` —
+/// the `C` is preceded by `"` so the preceding-byte guard alone
+/// accepts it, and every `\n` in the function body below gets
+/// doubled. Skipping here costs the path-rewrite rescue for
+/// multi-line bodies (rare); preserves newlines for the common
+/// case of source-code content (frequent and user-visible).
 fn looks_like_windows_path(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.len() < 3 {
         return false;
+    }
+    // Multi-line content guard: any `\n` or `\r` escape pair means
+    // the body cannot be a pure path. Cheap O(n) scan up-front so
+    // long content fields (the common write_file case) reject fast.
+    for w in bytes.windows(2) {
+        if w[0] == b'\\' && (w[1] == b'n' || w[1] == b'r') {
+            return false;
+        }
     }
     for i in 0..bytes.len().saturating_sub(2) {
         if !bytes[i].is_ascii_alphabetic() {
@@ -146,8 +168,8 @@ fn looks_like_windows_path(s: &str) -> bool {
         }
         // Path-context guard: only accept at start of body, or
         // immediately after a path-shaped delimiter. Everything
-        // else (whitespace, alpha, punctuation, JSON escapes) is
-        // a false-positive surface for prose content.
+        // else (whitespace, alpha, punctuation) is a false-positive
+        // surface for short single-line prose.
         if i > 0 {
             let prev = bytes[i - 1];
             if !matches!(prev, b'\\' | b'"' | b'\'') {
@@ -1021,6 +1043,35 @@ mod tests {
             content
         );
         assert_eq!(content, "class A:\n    pass\n");
+    }
+
+    /// Second wave of the same regression: multi-line content that
+    /// happens to embed a quoted single-letter Windows path (very
+    /// common in cross-platform code — `"C:/logs/app.log"`,
+    /// `'D:\data'`) was accepted by the preceding-byte guard
+    /// (`C` is preceded by `"`), then `rewrite_windows_path_body`
+    /// ran on the ENTIRE body and doubled every `\n`/`\t` elsewhere
+    /// in the file. The eval table shows ~10 residual write_file
+    /// errors with the same 1-line-garbage symptom after the first
+    /// fix landed — every one of them is content containing both
+    /// a quoted path AND newlines.
+    ///
+    /// Real Windows filenames cannot contain `\n` or `\r`, so a
+    /// body that contains a `\n` / `\r` escape is by construction
+    /// NOT a pure path and must not be passed through the pre-
+    /// escape rewrite. Pure-path bodies (no embedded newline
+    /// escapes) still go through.
+    #[test]
+    fn repair_tool_args_multiline_content_with_embedded_windows_path() {
+        let input = r#"{"file_path": "/tmp/app.py", "content": "config = {\"log_path\": \"C:/logs/app.log\"}\n\ndef main():\n    pass\n"}"#;
+        let out = repair_tool_args("write_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let content = v["content"].as_str().unwrap();
+        assert_eq!(
+            content,
+            "config = {\"log_path\": \"C:/logs/app.log\"}\n\ndef main():\n    pass\n",
+            "newlines must survive when content contains an embedded quoted Windows path",
+        );
     }
 
     #[test]
