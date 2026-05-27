@@ -75,7 +75,6 @@ Webhook 支持所有 Hook 时机，trigger 字段可以包含以下值：
 
 | trigger 值 | 触发时机 |
 |-----------|---------|
-| `on_message_received` | 用户消息接收时 |
 | `on_turn_start` | Turn 开始前 |
 | `on_tool_call_start` | 工具调用开始时 |
 | `pre_tool` / `before_tool` | 工具执行前 |

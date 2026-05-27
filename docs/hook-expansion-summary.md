@@ -1,5 +1,8 @@
 # Hook 系统扩展实现总结
 
+> ⚠️ 本文档为历史快照，Hook 系统后续又增加了 OnUserPromptSubmit 时机并完全迁移到 HookEngine 架构。
+> 最新完整信息请参考：[Hook 系统总览](./hooks.md) | [实现总结](./hook-implementation-summary.md) | [完整时机列表](./hook-timing-complete.md)
+
 ## 本次扩展内容
 
 ### 1. 新增 8 个工程化 Hook 时机

@@ -211,9 +211,9 @@ flush_interval_ms = 1000
   },
   "events": [
     {
-      "event": "on_tool_call_start",
+      "event": "tool_call_start",
       "hook_name": "audit-log",
-      "trigger": "on_tool_call_start",
+      "trigger": "tool_call_start",
       "context": {
         "tool_name": "edit_file",
         "tool_args": "{...}",
@@ -222,7 +222,7 @@ flush_interval_ms = 1000
       "timestamp_ms": 1234567890123
     },
     {
-      "event": "post_tool_execution",
+      "event": "post_tool",
       "hook_name": "audit-log",
       "trigger": "post_tool",
       "context": {

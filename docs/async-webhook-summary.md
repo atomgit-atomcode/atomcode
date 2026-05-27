@@ -8,7 +8,7 @@
 
 ### 1. 核心模块
 
-**文件**: `crates/atomcode-core/src/hook/async_batcher.rs` (366 行)
+**文件**: `crates/atomcode-core/src/hook/async_batcher.rs` (~534 行)
 
 #### 主要结构
 
@@ -138,7 +138,7 @@ flush_interval_ms = 1000
 
 | 文件 | 类型 | 行数 | 变更 |
 |------|------|------|------|
-| `src/hook/async_batcher.rs` | 新增 | 366 行 | 异步批处理器核心实现 |
+| `src/hook/async_batcher.rs` | 新增 | ~534 行 | 异步批处理器核心实现 |
 | `src/hook/webhook.rs` | 更新 | +30 行 | 集成异步模式 |
 | `src/hook/config_loader.rs` | 更新 | +50 行 | 支持异步配置加载 |
 | `src/hook/mod.rs` | 更新 | +1 行 | 导出异步模块 |
@@ -358,7 +358,7 @@ flush_interval_ms = 1000
 
 ### 完成的工作
 
-1. ✅ **实现异步批处理器核心模块** - 366 行 Rust 代码
+1. ✅ **实现异步批处理器核心模块** - ~534 行 Rust 代码
 2. ✅ **集成到 WebhookHook** - 支持同步/异步模式切换
 3. ✅ **实现事件队列和批量聚合** - mpsc 通道 + tokio 后台任务
 4. ✅ **添加配置选项** - batch_size, flush_interval_ms

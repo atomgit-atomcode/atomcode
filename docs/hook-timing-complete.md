@@ -4,6 +4,8 @@
 
 AtomCode Hook 系统提供了 **13 个关键时机** 的扩展点，覆盖用户消息接收、Turn 执行、工具调用、会话管理等全生命周期。
 
+> **重要**：不同时机通过不同配置方式可用。TOML ScriptHook 仅支持 4 种 trigger，完整列表见下表。
+
 ## 完整 Hook 时机列表
 
 ### 一、消息级别（1 个）
@@ -16,6 +18,8 @@ AtomCode Hook 系统提供了 **13 个关键时机** 的扩展点，覆盖用户
 - 敏感词过滤
 - 自动添加上下文前缀
 - 消息审计日志
+
+> **当前状态**：`OnMessageReceivedHook` trait 已定义，暂未在 HookEngine 中注册触发。仅 WebhookHook 实现了该 trait（需后续 PR 激活）。
 
 ---
 
@@ -76,16 +80,11 @@ AtomCode Hook 系统提供了 **13 个关键时机** 的扩展点，覆盖用户
 
 ---
 
-### 六、内置工程化 Hook（6 个已实现）
+### 六、用户交互级别（1 个）
 
-| # | Hook 名称 | 类型 | 功能 |
-|---|----------|------|------|
-| 1 | `ToolAuditLogHook` | `OnToolCallStart` | 记录所有工具调用到审计日志 |
-| 2 | `TurnStatsHook` | `OnTurnStart` + `OnTurnComplete` | 收集 Turn 级别统计信息 |
-| 3 | `AutoCommitHook` | `OnTurnComplete` | 每 N 个 Turn 自动提交 Git |
-| 4 | `SessionSummaryHook` | `OnSessionStart` + `OnSessionEnd` | 会话结束时生成总结报告 |
-| 5 | `ErrorReportHook` | `OnError` | 记录错误详细信息到日志 |
-| 6 | `ResponseValidationHook` | `OnModelResponse` | 验证模型响应，检测敏感信息 |
+| # | Hook 名称 | 触发时机 | 主要用途 | 可否修改 |
+|---|----------|---------|---------|---------|
+| 13 | `OnUserPromptSubmit` | 用户提交 prompt 时 | 注入上下文、阻止敏感消息 | ✅ 可注入/阻止 |
 
 ---
 
@@ -94,7 +93,7 @@ AtomCode Hook 系统提供了 **13 个关键时机** 的扩展点，覆盖用户
 ```
 用户发送消息
   ↓
-[1] OnMessageReceived (可修改消息)
+[13] OnUserPromptSubmit (可注入/阻止)
   ↓
 开始 Turn
   ↓
@@ -133,71 +132,38 @@ Turn 完成
 
 ---
 
-## 配置示例
+## 可用配置方式矩阵
 
-### hooks.toml
+**关键**：不是所有时机都能通过 TOML ScriptHook 触发。下表列出每个时机的可用配置方式：
 
-```toml
-# 工具调用审计日志
-[[hooks]]
-name = "tool-audit"
-description = "记录所有工具调用"
-trigger = "on_tool_call_start"
-script = "audit_log.sh"
-script_type = "shell"
-enabled = true
-timeout_secs = 2
+| # | Hook 时机 | TOML ScriptHook | JSON CC | Webhook | 内置 Hook |
+|---|----------|:---:|:---:|:---:|:---:|
+| 1 | `OnMessageReceived` | — | — | ✅ | — |
+| 2 | `OnTurnStart` | — | — | `turn_start` | `TurnStatsHook` |
+| 3 | `OnTurnComplete` | — | — | `turn_complete` / `after_turn` | `TurnStatsHook` + `AutoCommitHook` |
+| 4 | `PostTurn` | `post_turn` | — | `post_turn` | — |
+| 5 | `OnModelResponse` | — | — | `model_response` | `ResponseValidationHook` |
+| 6 | `OnToolCallStart` | — | — | `tool_call_start` | `ToolAuditLogHook` |
+| 7 | `PreToolExecution` | `pre_tool` | `pre_tool_use` | `pre_tool` / `before_tool` | — |
+| 8 | `PostToolExecution` | `post_tool` | `post_tool_use` | `post_tool` / `after_tool` | — |
+| 9 | `OnSessionStart` | — | `session_start` | `session_start` | `SessionSummaryHook` |
+| 10 | `OnSessionEnd` | — | `session_end` | `session_end` | `SessionSummaryHook` |
+| 11 | `OnError` | — | — | `error` | `ErrorReportHook` |
+| 12 | `SystemPrompt` | `system_prompt` | — | `system_prompt` | — |
+| 13 | `OnUserPromptSubmit` | — | `user_prompt_submit` | — | — |
 
-# Turn 统计
-[[hooks]]
-name = "turn-stats"
-description = "收集 Turn 统计信息"
-trigger = "on_turn_complete"
-script = "turn_stats.sh"
-script_type = "shell"
-enabled = true
-timeout_secs = 2
+---
 
-# 自动 Git 提交
-[[hooks]]
-name = "auto-commit"
-description = "每 5 个 Turn 自动提交"
-trigger = "on_turn_complete"
-script = "auto_commit.sh"
-script_type = "shell"
-enabled = false
-timeout_secs = 5
+## 内置工程化 Hook（6 个已实现）
 
-# 会话总结
-[[hooks]]
-name = "session-summary"
-description = "会话结束时生成报告"
-trigger = "on_session_end"
-script = "session_summary.sh"
-script_type = "shell"
-enabled = true
-timeout_secs = 3
-
-# 错误上报
-[[hooks]]
-name = "error-report"
-description = "错误详细信息记录"
-trigger = "on_error"
-script = "error_report.sh"
-script_type = "shell"
-enabled = true
-timeout_secs = 2
-
-# 模型响应验证
-[[hooks]]
-name = "response-validation"
-description = "检测敏感信息泄露"
-trigger = "on_model_response"
-script = "validate_response.sh"
-script_type = "shell"
-enabled = true
-timeout_secs = 2
-```
+| # | Hook 名称 | 类型 | 功能 |
+|---|----------|------|------|
+| 1 | `ToolAuditLogHook` | `OnToolCallStart` | 记录所有工具调用到审计日志 |
+| 2 | `TurnStatsHook` | `OnTurnStart` + `OnTurnComplete` | 收集 Turn 级别统计信息 |
+| 3 | `AutoCommitHook` | `OnTurnComplete` | 每 N 个 Turn 自动提交 Git |
+| 4 | `SessionSummaryHook` | `OnSessionStart` + `OnSessionEnd` | 会话结束时生成总结报告 |
+| 5 | `ErrorReportHook` | `OnError` | 记录错误详细信息到日志 |
+| 6 | `ResponseValidationHook` | `OnModelResponse` | 验证模型响应，检测敏感信息 |
 
 ---
 
@@ -210,9 +176,9 @@ timeout_secs = 2
 3. ✅ `PostTurn` - Turn 完成后
 4. ✅ `SystemPrompt` - 系统 Prompt 扩展
 
-### 新增 Hook 时机（8 个）
+### 新增 Hook 时机（9 个）
 
-5. ✨ `OnMessageReceived` - 用户消息接收时
+5. ✨ `OnMessageReceived` - 用户消息接收时（trait 已定义，待激活）
 6. ✨ `OnTurnStart` - Turn 开始前
 7. ✨ `OnToolCallStart` - 工具调用开始时
 8. ✨ `OnTurnComplete` - Turn 完成后（详细信息）
@@ -220,15 +186,7 @@ timeout_secs = 2
 10. ✨ `OnSessionEnd` - 会话结束时
 11. ✨ `OnError` - 错误发生时
 12. ✨ `OnModelResponse` - 模型响应完成后
-
-### 内置 Hook（6 个）
-
-13. ✨ `ToolAuditLogHook` - 工具调用审计
-14. ✨ `TurnStatsHook` - Turn 统计
-15. ✨ `AutoCommitHook` - 自动 Git 提交
-16. ✨ `SessionSummaryHook` - 会话总结
-17. ✨ `ErrorReportHook` - 错误上报
-18. ✨ `ResponseValidationHook` - 响应验证
+13. ✨ `OnUserPromptSubmit` - 用户提交 prompt 时
 
 ---
 
@@ -266,7 +224,7 @@ timeout_secs = 2
 
 ## 安全机制
 
-1. **全局 Hook 优先级高于项目级** - 防止恶意项目覆盖安全设置
+1. **项目 hooks 覆盖全局 hooks**（项目 hooks 后加载，同名覆盖）
 2. **不能绕过权限系统** - Hook 的 deny 不会覆盖用户的 always_allow
 3. **脚本在用户权限下运行** - 注意脚本本身的安全性
-4. **超时保护** - 默认 2 秒，防止 Hook 阻塞主流程
+4. **超时保护** - 默认 2 秒（TOML ScriptHook）/ 10 秒（JSON/Webhook），防止 Hook 阻塞主流程

@@ -8,7 +8,7 @@
 
 ### 1. 核心模块
 
-**文件**: `crates/atomcode-core/src/hook/webhook.rs` (454 行)
+**文件**: `crates/atomcode-core/src/hook/webhook.rs` (~748 行)
 
 #### 主要结构
 
@@ -58,8 +58,7 @@ pub struct WebhookHook {
    }
    ```
 
-4. **支持所有 Hook 时机**
-   - ✅ OnMessageReceived
+4. **支持所有 Hook 时机（11 个）**
    - ✅ OnTurnStart
    - ✅ OnToolCallStart
    - ✅ PreToolExecution
@@ -96,14 +95,14 @@ Authorization = "Bearer YOUR_TOKEN"
 #### 加载逻辑
 
 - 从 `hooks.toml` 的 `[[webhooks]]` 数组加载
-- 自动注册到所有 Hook 时机
+- 根据 trigger 字段匹配注册到对应 HookEngine 槽位
 - 根据 `trigger` 字段过滤实际触发的事件
 
 ### 3. 文件变更
 
 | 文件 | 变更 | 行数 |
 |------|------|------|
-| `src/hook/webhook.rs` | 新增 | 454 行 |
+| `src/hook/webhook.rs` | 新增 | ~748 行 |
 | `src/hook/config_loader.rs` | 更新 | +40 行 |
 | `src/hook/mod.rs` | 更新 | +1 行 |
 | `tests/webhook_test.rs` | 新增 | 78 行 |
@@ -286,8 +285,8 @@ Authorization = "Bearer AUDIT_TOKEN"
 
 ### 完成的工作
 
-1. ✅ **实现 Webhook Hook 核心模块** - 454 行 Rust 代码
-2. ✅ **支持所有 12 个 Hook 时机** - 完整的 HTTP 远程调用
+1. ✅ **实现 Webhook Hook 核心模块** - ~748 行 Rust 代码
+2. ✅ **支持所有 11 个 Hook 时机** - 完整的 HTTP 远程调用
 3. ✅ **实现超时和重试机制** - 指数退避策略
 4. ✅ **支持自定义 Header** - 认证和元数据传递
 5. ✅ **集成配置加载系统** - hooks.toml 配置驱动

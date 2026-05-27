@@ -80,12 +80,13 @@
 │  │ timeout_ms          │     │ script_type  │    │ headers   │  │
 │  │ plugin_root         │     └──────────────┘    └───────────┘  │
 │  │                     │                                         │
-│  │ 实现 5 个 trait:    │  实现 4 个 trait:      通过 engine 注册   │
+│  │ 实现 6 个 trait:    │  实现 4 个 trait:      通过 engine 注册   │
 │  │ PreToolExecution    │  PreToolExecution     到对应槽位          │
 │  │ PostToolExecution   │  PostToolExecution                      │
 │  │ OnSessionStart      │  PostTurn                               │
 │  │ OnSessionEnd        │  SystemPrompt                           │
 │  │ OnUserPromptSubmit  │                                         │
+│  │ OnToolCallStart     │                                         │
 │  └─────────────────────┘                                         │
 │                                                                 │
 │  BuiltInHook (built_in.rs)                                      │
@@ -97,6 +98,9 @@
 │  │ ErrorReportHook      → OnError                             │ │
 │  │ ResponseValidation   → OnModelResponse                     │ │
 │  └────────────────────────────────────────────────────────────┘ │
+│                                                                 │
+│  注意：OnMessageReceivedHook trait 已定义但暂未在 HookEngine 中    │
+│  注册触发，仅 WebhookHook 实现了该 trait（待后续 PR 激活）          │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
