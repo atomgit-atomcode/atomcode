@@ -116,8 +116,19 @@ fn pre_escape_windows_paths_in_json(s: &str) -> String {
 }
 
 /// True iff `s` contains a Windows drive-letter path prefix
-/// (`[A-Za-z]:[\\/]`) where the drive letter stands alone (not the
-/// tail of a longer alphabetic run).
+/// (`[A-Za-z]:[\\/]`) appearing in a path-shaped context.
+///
+/// Required context: the drive letter is at the start of the body,
+/// or the byte before it is `\` (UNC long-path `\\?\D:\…`), `'`,
+/// or `"` (quoted path literal embedded in code). Without this
+/// guard, natural-language strings whose contents happen to match
+/// the alpha-colon-backslash shape — e.g. `class A:\n`, `case X:\n`,
+/// `Section B:\nContent` — would be misread as Windows paths and
+/// every `\n`/`\t` in the body would be doubled to a literal
+/// backslash+letter, corrupting the file. The earlier
+/// "preceded-by-alphabetic" guard only ruled out multi-letter
+/// words like `category:\n`; single-letter labels slipped through
+/// and broke `write_file` on common Python sources.
 fn looks_like_windows_path(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.len() < 3 {
@@ -133,10 +144,15 @@ fn looks_like_windows_path(s: &str) -> bool {
         if bytes[i + 2] != b'\\' && bytes[i + 2] != b'/' {
             continue;
         }
-        // Tail-of-word guard: drive letter is a single char, so the
-        // byte before must NOT be alphabetic (rules out `category:\…`).
-        if i > 0 && bytes[i - 1].is_ascii_alphabetic() {
-            continue;
+        // Path-context guard: only accept at start of body, or
+        // immediately after a path-shaped delimiter. Everything
+        // else (whitespace, alpha, punctuation, JSON escapes) is
+        // a false-positive surface for prose content.
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if !matches!(prev, b'\\' | b'"' | b'\'') {
+                continue;
+            }
         }
         return true;
     }
@@ -977,6 +993,34 @@ mod tests {
         let s = v["label"].as_str().unwrap();
         assert!(s.contains('\n'), "newline should survive: got {:?}", s);
         assert!(!s.contains('\\'), "no literal backslash should remain: got {:?}", s);
+    }
+
+    /// Python source like `class A:\n    pass\n` has a single
+    /// uppercase letter preceded by whitespace, then `:`, then
+    /// `\` from the JSON `\n` escape. The old tail-of-word guard
+    /// only rejected multi-letter words, so single-letter "names"
+    /// (class names, match arms, switch labels) slipped through
+    /// and every `\n`/`\t` in the file body got doubled, writing
+    /// the file as one line of literal `\n` characters. This is
+    /// the v4.23.2 tool-error regression — `notify.py` rewrites
+    /// turned into 1 line of garbage.
+    #[test]
+    fn repair_tool_args_single_letter_label_before_newline_is_not_path() {
+        let input = r#"{"file_path": "/tmp/notify.py", "content": "class A:\n    pass\n"}"#;
+        let out = repair_tool_args("write_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let content = v["content"].as_str().unwrap();
+        assert!(
+            content.contains('\n'),
+            "newline must survive — file becomes 1-line garbage otherwise: got {:?}",
+            content
+        );
+        assert!(
+            !content.contains("\\n"),
+            "literal backslash-n must not appear: got {:?}",
+            content
+        );
+        assert_eq!(content, "class A:\n    pass\n");
     }
 
     #[test]
