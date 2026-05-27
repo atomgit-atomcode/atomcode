@@ -1480,6 +1480,27 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// transient, the new row takes its slot without scrolling other
     /// history up by one.
     fn push_body_row(&mut self, row: Vec<Cell>) {
+        // Diagnostic trace for the user-reported "duplicate rows in
+        // scrollback" bug — every push goes through here, so a single
+        // log point captures the full sequence. Enable via
+        // ATOMCODE_TUIX_LOG=/path. Snippet is the first ~40 chars of
+        // the row's text content so duplicates are visually distinct
+        // in the log.
+        if crate::trace::enabled() {
+            let snippet: String = row
+                .iter()
+                .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                .collect::<String>()
+                .chars()
+                .take(40)
+                .collect();
+            crate::tuix_trace!(
+                "BPUSH",
+                "len={} content={:?}",
+                self.body_lines.len(),
+                snippet
+            );
+        }
         // Any external body push freezes an active live-group: the
         // group's child rows are no longer guaranteed to sit at the
         // bottom (they may have scrolled into native scrollback the
