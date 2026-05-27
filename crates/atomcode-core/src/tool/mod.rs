@@ -873,7 +873,7 @@ impl ToolContext {
     pub async fn notify_lsp_file_changed(&self, path: &Path, content: &str) {
         if let Some(ref lsp) = self.lsp {
             if let Err(e) = lsp.notify_file_changed(path, content).await {
-                eprintln!(
+                tracing::warn!(
                     "[lsp] Failed to refresh diagnostics for {}: {}",
                     path.display(),
                     e

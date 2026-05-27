@@ -158,13 +158,13 @@ impl HookEngine {
             match hook.on_pre_execute(ctx).await {
                 HookResult::Ok => {}
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg);
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg);
                 }
                 HookResult::Denied(reason) => {
                     return Err(format!("{}: {}", hook.name(), reason));
                 }
                 HookResult::Modified(new_args) => {
-                    eprintln!("[Hook Modified] {} modified arguments", hook.name());
+                    tracing::info!("[Hook Modified] {} modified arguments", hook.name());
                     modified_args = Some(new_args);
                 }
             }
@@ -182,10 +182,10 @@ impl HookEngine {
                 let result = hook.on_post_execute(ctx, result_ctx).await;
                 match result {
                     HookResult::Warning(msg) => {
-                        eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                        tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                     }
                     HookResult::Denied(reason) => {
-                        eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                        tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                     }
                     _ => {}
                 }
@@ -202,10 +202,10 @@ impl HookEngine {
             .map(|hook| async move {
                 match hook.on_post_turn(ctx, turn_result).await {
                     HookResult::Warning(msg) => {
-                        eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                        tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                     }
                     HookResult::Denied(reason) => {
-                        eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                        tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                     }
                     _ => {}
                 }
@@ -284,10 +284,10 @@ impl HookEngine {
         for hook in &self.on_turn_start_hooks {
             match hook.on_turn_start(ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 _ => {}
             }
@@ -299,10 +299,10 @@ impl HookEngine {
         for hook in &self.on_tool_call_start_hooks {
             match hook.on_tool_call_start(ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 _ => {}
             }
@@ -314,13 +314,13 @@ impl HookEngine {
         for hook in &self.on_turn_complete_hooks {
             match hook.on_turn_complete(ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 HookResult::Modified(msg) => {
-                    eprintln!("[Hook Modified] {}: {}", hook.name(), msg)
+                    tracing::info!("[Hook Modified] {}: {}", hook.name(), msg)
                 }
                 _ => {}
             }
@@ -334,10 +334,10 @@ impl HookEngine {
         for hook in &self.on_model_response_hooks {
             match hook.on_model_response(response, turn_ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 _ => {}
             }
@@ -349,10 +349,10 @@ impl HookEngine {
         for hook in &self.on_error_hooks {
             match hook.on_error(ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 _ => {}
             }
@@ -420,7 +420,7 @@ impl HookEngine {
             match config.event {
                 HookEvent::Notification => {
                     // Notification 事件无对应 trait, CC 生态中也被静默跳过
-                    eprintln!(
+                    tracing::warn!(
                         "[Hook] Notification hooks not supported, skipping: {}",
                         config.command
                     );
@@ -576,7 +576,7 @@ impl ShellCommandHook {
     /// 执行 shell 命令，返回 stdout（环境变量协议）。
     async fn execute_hook(&self, ctx: &HookContext) -> anyhow::Result<String> {
         let ctx_json = serde_json::to_string(ctx).unwrap_or_else(|e| {
-            eprintln!("[Hook Warning] Failed to serialize HookContext to JSON: {}", e);
+            tracing::warn!("[Hook Warning] Failed to serialize HookContext to JSON: {}", e);
             "{}".to_string()
         });
 

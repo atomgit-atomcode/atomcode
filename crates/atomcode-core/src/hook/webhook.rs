@@ -484,7 +484,7 @@ impl SystemPromptHook for WebhookHook {
                 }
             }
             Err(e) => {
-                eprintln!("[Webhook] {} error: {}", self.config.name, e);
+                tracing::warn!("[Webhook] {} error: {}", self.config.name, e);
                 None
             }
         }
