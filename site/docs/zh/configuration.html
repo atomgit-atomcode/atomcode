@@ -81,6 +81,14 @@
       </ul>
       <p>也可以通过 <code>--config /path/to/config.toml</code> 指定任意路径。首次运行时,若该文件不存在,3 步启动向导会引导你完成初始化。</p>
 
+      <h2>UI 偏好</h2>
+      <p>TUI 显示偏好(滚动条开关等)单独存在一个文件,不和 <code>config.toml</code> 混在一起:</p>
+      <ul>
+        <li>macOS / Linux / HarmonyOS PC:<code>~/.atomcode/ui-state.toml</code></li>
+        <li>Windows:<code>%USERPROFILE%\.atomcode\ui-state.toml</code></li>
+      </ul>
+      <p>由 <code>/scrollbar</code> 等命令自动维护(原子写,崩溃也不会破文件),通常不需要手动编辑。</p>
+
       <h2>最小示例</h2>
       <pre><code>default_provider = "deepseek"
 
