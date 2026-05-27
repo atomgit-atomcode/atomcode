@@ -1,1 +1,422 @@
-# Hook CLI 命令使用指南\n\n## 概述\n\nAtomCode 提供了 `atomcode hooks` 系列 CLI 命令来管理、测试和验证 Hook 配置。\n\n---\n\n## 命令列表\n\n### 1. `atomcode hooks list` - 查看已加载的 Hook\n\n显示所有已加载的 Hook 及其数量统计：\n\n```bash\n$ atomcode hooks list\n\nLoaded Hooks:\n─────────────────────────────────────────────\n  Type                           Count\n  ────────────────────────────── ─────\n  OnToolCallStart                    1\n  PostToolExecution                  2\n  OnTurnComplete                     1\n  OnSessionEnd                       1\n  ────────────────────────────── ─────\n  Total                              5\n\nHook Directories:\n─────────────────────────────────────────────\n  ✓ Global:   ~/.atomcode/hooks\n  ✓ Project:  /path/to/project/.atomcode/hooks\n```\n\n**输出说明**：\n- **Type** - Hook 注册的 trait 槽位名称\n- **Count** - 该槽位注册的 Hook 数量（含内置）\n- **Total** - 已加载的 Hook 总数\n- **Hook Directories** - Hooks 目录状态（✓ 表示存在，✗ 表示不存在）\n\n`Total` 会始终 ≥ 6（因为 6 个内置 Hook 自动注册）。\n\n### 2. `atomcode hooks paths` - 查看配置路径\n\n```bash\n$ atomcode hooks paths\n\nGlobal config:\n  JSON:  ~/.atomcode/hooks.json\n  TOML:  ~/.atomcode/hooks/hooks.toml\n\nProject config:\n  JSON:  /path/to/project/.hooks.json\n  TOML:  /path/to/project/.atomcode/hooks/hooks.toml\n```\n\n### 3. `atomcode hooks test <name>` - 测试单个 Hook\n\n```bash\n$ atomcode hooks test my-hook\n\nTesting hook: my-hook\n  Config:  ~/.atomcode/hooks/hooks.toml\n  Trigger: pre_tool\n  Script:  ~/.atomcode/hooks/my_hook.sh\n  Status:  ✓ enabled\n```\n\n---\n\n## 快速开始\n\n### 步骤 1：创建 Hooks 目录\n\n```bash\n# 全局 Hooks（对所有项目生效）\nmkdir -p ~/.atomcode/hooks\n\n# 项目级 Hooks（仅当前项目生效）\nmkdir -p .atomcode/hooks\n```\n\n### 步骤 2：编写 Hook 脚本\n\n创建 `~/.atomcode/hooks/audit.sh`：\n\n```bash\n#!/bin/bash\n# 读取 JSON 输入\nINPUT=$(cat)\n\n# 解析关键信息\nif command -v jq &> /dev/null; then\n  TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty')\n  TURN=$(echo "$INPUT" | jq -r '.turn_number // 0')\n\n  # 记录到日志文件\n  echo "[$(date)] Turn #$TURN: $TOOL" >> ~/.atomcode_audit.log\nfi\n\n# 返回 ok 表示 hook 执行成功\necho "ok"\n```\n\n赋予执行权限：\n\n```bash\nchmod +x ~/.atomcode/hooks/audit.sh\n```\n\n### 步骤 3：配置 Hook\n\n创建 `~/.atomcode/hooks/hooks.toml`：\n\n```toml\n[[hooks]]\nname = "audit"\ndescription = "记录所有工具调用到审计日志"\ntrigger = "post_tool"\nscript = "audit.sh"\nscript_type = "shell"\nenabled = true\ntimeout_secs = 2\n```\n\n> **重要**：TOML ScriptHook 的 `trigger` 字段只支持 4 个值：`pre_tool`、`post_tool`、`post_turn`、`system_prompt`。其他值（如 `on_turn_complete`）不会被识别。\n\n### 步骤 4：验证 Hook 已加载\n\n```bash\n$ atomcode hooks list\n```\n\n---\n\n## Hook 触发类型\n\n### 用户可在 TOML ScriptHook 中配置的 trigger（4 种）\n\n| trigger 值 | 别名 | 触发时机 | 可影响流程 |\n|-----------|------|---------|:--:|\n| `pre_tool` | `pre_tool_execution` | 工具执行前 | ✅ 可阻止/修改参数 |\n| `post_tool` | `post_tool_execution` | 工具执行后 | ❌ fire-and-forget |\n| `post_turn` | — | Turn 完成后 | ❌ fire-and-forget |\n| `system_prompt` | — | 构建系统 prompt 时 | ✅ 追加指令 |\n\n### 用户可在 JSON CC 配置中使用的 event（5 种）\n\n| event 值 | 触发时机 |\n|----------|---------|\n| `pre_tool_use` | 工具执行前（环境变量协议） |\n| `post_tool_use` | 工具执行后 |\n| `session_start` | 会话启动 |\n| `session_end` | 会话结束 |\n| `user_prompt_submit` | 用户提交 prompt |\n\n### 用户可在 Webhook 中配置的 trigger（11 种，逗号分隔）\n\n| trigger 值 | 别名 | 触发时机 |\n|-----------|------|---------|\n| `pre_tool` | `before_tool` | 工具执行前 |\n| `post_tool` | `after_tool` | 工具执行后 |\n| `post_turn` | — | Turn 完成后（旧版） |\n| `turn_start` | — | Turn 开始前 |\n| `turn_complete` | `after_turn` | Turn 完成后（详细） |\n| `tool_call_start` | — | 工具调用开始时 |\n| `model_response` | — | 模型响应完成后 |\n| `session_start` | — | 会话启动 |\n| `session_end` | — | 会话结束 |\n| `error` | — | 错误发生时 |\n| `system_prompt` | — | 构建系统 prompt 时 |\n\n### 只能通过内置 Hook 或 Webhook 触发的时机\n\n以下时机由于内置 Hook 已覆盖，用户无需手动配置（但可通过 Webhook 接收事件）：\n\n| Hook 类型 | 内置实现 | 功能 |\n|----------|---------|------|\n| `OnToolCallStart` | `ToolAuditLogHook` | 工具调用审计日志 |\n| `OnTurnStart` | `TurnStatsHook` | Turn 开始统计 |\n| `OnTurnComplete` | `TurnStatsHook` + `AutoCommitHook` | Turn 完成统计 & 自动提交 |\n| `OnSessionStart` | `SessionSummaryHook` | 会话开始摘要 |\n| `OnSessionEnd` | `SessionSummaryHook` | 会话结束摘要 |\n| `OnError` | `ErrorReportHook` | 错误详情记录 |\n| `OnModelResponse` | `ResponseValidationHook` | 模型响应验证 |\n\n---\n\n## 配置示例\n\n### TOML ScriptHook（正确写法）\n\n```toml\n# 工具执行前检查\n[[hooks]]\nname = "pre-check"\ndescription = "阻止危险操作"\ntrigger = "pre_tool"\nscript = "check_write.sh"\nscript_type = "shell"\nenabled = true\ntimeout_secs = 3\n\n# 工具执行后通知\n[[hooks]]\nname = "notify"\ndescription = "工具执行后记录日志"\ntrigger = "post_tool"\nscript = "notify.sh"\nscript_type = "shell"\nenabled = true\ntimeout_secs = 2\n\n# Turn 完成后处理\n[[hooks]]\nname = "post-processing"\ndescription = "Turn 完成后执行清理"\ntrigger = "post_turn"\nscript = "cleanup.sh"\nscript_type = "shell"\nenabled = true\ntimeout_secs = 5\n\n# 系统 Prompt 扩展\n[[hooks]]\nname = "rules"\ndescription = "注入项目编码规范"\ntrigger = "system_prompt"\nscript = "inject_rules.py"\nscript_type = "python"\nenabled = true\ntimeout_secs = 2\n```\n\n### 混合配置（脚本 + Webhook + JSON）\n\n```toml\n# hooks.toml\n\n# 本地脚本 Hook\n[[hooks]]\nname = "audit"\ntrigger = "post_tool"\nscript = "audit.sh"\n\n# 同步 Webhook\n[[webhooks]]\nname = "slack-notify"\ntrigger = "pre_tool,post_tool"\nurl = "https://hooks.slack.com/services/XXX"\ntimeout_secs = 10\n\n# 异步批量 Webhook\n[[async_webhooks]]\nname = "audit-log"\ntrigger = "post_tool"\nurl = "https://log.example.com/batch"\nbatch_size = 20\nflush_interval_ms = 1000\n```\n\n---\n\n## 故障排查\n\n### 问题 1：Hook 未加载\n\n**症状**：`atomcode hooks list` 显示自定义 Hook 数量为 0\n\n**排查步骤**：\n\n1. 检查 hooks 目录是否存在：\n   ```bash\n   atomcode hooks paths\n   ```\n\n2. 检查 `hooks.toml` 文件格式：\n   ```bash\n   # 验证 TOML 格式\n   cat ~/.atomcode/hooks/hooks.toml\n   ```\n\n3. 检查 `trigger` 值是否有效：\n   - TOML ScriptHook 只支持：`pre_tool`、`post_tool`、`post_turn`、`system_prompt`\n   - 如果使用了 `on_turn_complete`、`on_tool_call_start` 等值，会被跳过并打印 warning\n\n4. 检查脚本是否有执行权限：\n   ```bash\n   ls -la ~/.atomcode/hooks/*.sh\n   chmod +x ~/.atomcode/hooks/*.sh\n   ```\n\n5. 查看 stderr 输出（Hook 加载日志）：\n   ```bash\n   atomcode -p "test" 2>&1 | grep -i hook\n   ```\n\n### 问题 2：Hook 执行失败\n\n**症状**：Hook 脚本执行后显示警告\n\n**排查步骤**：\n\n1. 手动测试脚本：\n   ```bash\n   echo '{"tool_name":"test","tool_args":"{}"}' | ~/.atomcode/hooks/audit.sh\n   ```\n\n2. 检查脚本输出格式：\n   - 必须输出 `ok` 表示成功\n   - 可输出 `warning: <msg>` 记录警告\n   - 可输出 `deny: <reason>` 拒绝执行\n\n3. 检查超时设置：\n   - TOML ScriptHook 默认超时 2 秒\n   - 复杂脚本可增加 `timeout_secs`\n\n### 问题 3：Windows 路径问题\n\n**症状**：脚本路径解析失败\n\n**解决方案**：\n\n使用正斜杠或双反斜杠：\n\n```toml\n# 正确\nscript = "C:/Users/DonkeyLee/.atomcode/hooks/audit.sh"\nscript = "C:\\Users\\DonkeyLee\\.atomcode\\hooks\\audit.sh"\n\n# 错误\nscript = "C:\Users\DonkeyLee\.atomcode\hooks\audit.sh"\n```\n\n或使用相对路径：\n\n```toml\nscript = "audit.sh"  # 相对于 hooks.toml 所在目录\n```\n\n---\n\n## 最佳实践\n\n### 1. 使用正确 trigger 值\n\n```toml\n# ✅ 正确 — TOML ScriptHook 支持的 4 个 trigger\ntrigger = "pre_tool"\ntrigger = "post_tool"\ntrigger = "post_turn"\ntrigger = "system_prompt"\n\n# ❌ 错误 — 这些值不会被 TOML ScriptHook 识别\ntrigger = "on_tool_call_start"   # 仅内置/Webhook 可用\ntrigger = "on_turn_complete"     # 仅内置/Webhook 可用\ntrigger = "on_session_end"       # 仅 Webhook 可用\n```\n\n### 2. 使用全局 Hooks 做审计\n\n```toml\n# ~/.atomcode/hooks/hooks.toml\n[[hooks]]\nname = "audit"\ntrigger = "post_tool"\nscript = "audit.sh"\nenabled = true\n```\n\n### 3. 使用项目级 Hooks 做定制\n\n```toml\n# <project>/.atomcode/hooks/hooks.toml\n[[hooks]]\nname = "project-specific"\ntrigger = "pre_tool"\nscript = "project_hook.sh"\nenabled = true\n```\n\n> 项目级 hooks 后加载，同名会覆盖全局 hooks。\n\n### 4. 脚本输出使用 JSON（推荐）\n\n```bash\n#!/bin/bash\nINPUT=$(cat)\n\n# 处理...\n\n# 输出 JSON（推荐）\necho '{"result": "ok", "message": "Hook executed successfully"}'\n```\n\n### 5. 错误处理\n\n```bash\n#!/bin/bash\nset -e  # 遇到错误立即退出\n\nINPUT=$(cat)\n\n# 正常处理...\n# 如果失败，输出 deny\nif ! do_something; then\n  echo "deny: operation failed"\n  exit 1\nfi\n\necho "ok"\n```\n\n---\n\n## 相关文档\n\n- [Hook 系统总览](./hooks.md) — 配置方式和 trigger 值汇总\n- [完整时机列表](./hook-timing-complete.md) — 所有 hook 时机及可用配置方式\n- [Webhook 指南](./webhook-guide.md) — HTTP 远程调用\n- [异步 Webhook 指南](./async-webhook-guide.md) — 批量异步发送\n
+# Hook CLI 命令使用指南
+
+## 概述
+
+AtomCode 提供了 `atomcode hooks` 系列 CLI 命令来管理、测试和验证 Hook 配置。
+
+---
+
+## 命令列表
+
+### 1. `atomcode hooks list` - 查看已加载的 Hook
+
+显示所有已加载的 Hook 及其数量统计：
+
+```bash
+$ atomcode hooks list
+
+Loaded Hooks:
+─────────────────────────────────────────────
+  Type                           Count
+  ────────────────────────────── ─────
+  OnToolCallStart                    1
+  PostToolExecution                  2
+  OnTurnComplete                     1
+  OnSessionEnd                       1
+  ────────────────────────────── ─────
+  Total                              5
+
+Hook Directories:
+─────────────────────────────────────────────
+  ✓ Global:   ~/.atomcode/hooks
+  ✓ Project:  /path/to/project/.atomcode/hooks
+```
+
+**输出说明**：
+- **Type** - Hook 注册的 trait 槽位名称
+- **Count** - 该槽位注册的 Hook 数量（含内置）
+- **Total** - 已加载的 Hook 总数
+- **Hook Directories** - Hooks 目录状态（✓ 表示存在，✗ 表示不存在）
+
+`Total` 会始终 ≥ 6（因为 6 个内置 Hook 自动注册）。
+
+### 2. `atomcode hooks paths` - 查看配置路径
+
+```bash
+$ atomcode hooks paths
+
+Global config:
+  JSON:  ~/.atomcode/hooks.json
+  TOML:  ~/.atomcode/hooks/hooks.toml
+
+Project config:
+  JSON:  /path/to/project/.hooks.json
+  TOML:  /path/to/project/.atomcode/hooks/hooks.toml
+```
+
+### 3. `atomcode hooks test <name>` - 测试单个 Hook
+
+```bash
+$ atomcode hooks test my-hook
+
+Testing hook: my-hook
+  Config:  ~/.atomcode/hooks/hooks.toml
+  Trigger: pre_tool
+  Script:  ~/.atomcode/hooks/my_hook.sh
+  Status:  ✓ enabled
+```
+
+---
+
+## 快速开始
+
+### 步骤 1：创建 Hooks 目录
+
+```bash
+# 全局 Hooks（对所有项目生效）
+mkdir -p ~/.atomcode/hooks
+
+# 项目级 Hooks（仅当前项目生效）
+mkdir -p .atomcode/hooks
+```
+
+### 步骤 2：编写 Hook 脚本
+
+创建 `~/.atomcode/hooks/audit.sh`：
+
+```bash
+#!/bin/bash
+# 读取 JSON 输入
+INPUT=$(cat)
+
+# 解析关键信息
+if command -v jq &> /dev/null; then
+  TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty')
+  TURN=$(echo "$INPUT" | jq -r '.turn_number // 0')
+
+  # 记录到日志文件
+  echo "[$(date)] Turn #$TURN: $TOOL" >> ~/.atomcode_audit.log
+fi
+
+# 返回 ok 表示 hook 执行成功
+echo "ok"
+```
+
+赋予执行权限：
+
+```bash
+chmod +x ~/.atomcode/hooks/audit.sh
+```
+
+### 步骤 3：配置 Hook
+
+创建 `~/.atomcode/hooks/hooks.toml`：
+
+```toml
+[[hooks]]
+name = "audit"
+description = "记录所有工具调用到审计日志"
+trigger = "post_tool"
+script = "audit.sh"
+script_type = "shell"
+enabled = true
+timeout_secs = 2
+```
+
+> **重要**：TOML ScriptHook 的 `trigger` 字段只支持 4 个值：`pre_tool`、`post_tool`、`post_turn`、`system_prompt`。其他值（如 `on_turn_complete`）不会被识别。
+
+### 步骤 4：验证 Hook 已加载
+
+```bash
+$ atomcode hooks list
+```
+
+---
+
+## Hook 触发类型
+
+### 用户可在 TOML ScriptHook 中配置的 trigger（4 种）
+
+| trigger 值 | 别名 | 触发时机 | 可影响流程 |
+|-----------|------|---------|:--:|
+| `pre_tool` | `pre_tool_execution` | 工具执行前 | ✅ 可阻止/修改参数 |
+| `post_tool` | `post_tool_execution` | 工具执行后 | ❌ fire-and-forget |
+| `post_turn` | — | Turn 完成后 | ❌ fire-and-forget |
+| `system_prompt` | — | 构建系统 prompt 时 | ✅ 追加指令 |
+
+### 用户可在 JSON CC 配置中使用的 event（5 种）
+
+| event 值 | 触发时机 |
+|----------|---------|
+| `pre_tool_use` | 工具执行前（环境变量协议） |
+| `post_tool_use` | 工具执行后 |
+| `session_start` | 会话启动 |
+| `session_end` | 会话结束 |
+| `user_prompt_submit` | 用户提交 prompt |
+
+### 用户可在 Webhook 中配置的 trigger（12 种，逗号分隔）
+
+| trigger 值 | 别名 | 触发时机 |
+|-----------|------|---------|
+| `pre_tool` | `before_tool` | 工具执行前 |
+| `post_tool` | `after_tool` | 工具执行后 |
+| `post_turn` | — | Turn 完成后（旧版） |
+| `turn_start` | — | Turn 开始前 |
+| `turn_complete` | `after_turn` | Turn 完成后（详细） |
+| `tool_call_start` | — | 工具调用开始时 |
+| `model_response` | — | 模型响应完成后 |
+| `session_start` | — | 会话启动 |
+| `session_end` | — | 会话结束 |
+| `error` | — | 错误发生时 |
+| `system_prompt` | — | 构建系统 prompt 时 |
+| `message` | `message_received` | 用户消息接收时 |
+
+### 只能通过内置 Hook 或 Webhook 触发的时机
+
+以下时机由于内置 Hook 已覆盖，用户无需手动配置（但可通过 Webhook 接收事件）：
+
+| Hook 类型 | 内置实现 | 功能 |
+|----------|---------|------|
+| `OnToolCallStart` | `ToolAuditLogHook` | 工具调用审计日志 |
+| `OnTurnStart` | `TurnStatsHook` | Turn 开始统计 |
+| `OnTurnComplete` | `TurnStatsHook` + `AutoCommitHook` | Turn 完成统计 & 自动提交 |
+| `OnSessionStart` | `SessionSummaryHook` | 会话开始摘要 |
+| `OnSessionEnd` | `SessionSummaryHook` | 会话结束摘要 |
+| `OnError` | `ErrorReportHook` | 错误详情记录 |
+| `OnModelResponse` | `ResponseValidationHook` | 模型响应验证 |
+
+---
+
+## 配置示例
+
+### TOML ScriptHook（正确写法）
+
+```toml
+# 工具执行前检查
+[[hooks]]
+name = "pre-check"
+description = "阻止危险操作"
+trigger = "pre_tool"
+script = "check_write.sh"
+script_type = "shell"
+enabled = true
+timeout_secs = 3
+
+# 工具执行后通知
+[[hooks]]
+name = "notify"
+description = "工具执行后记录日志"
+trigger = "post_tool"
+script = "notify.sh"
+script_type = "shell"
+enabled = true
+timeout_secs = 2
+
+# Turn 完成后处理
+[[hooks]]
+name = "post-processing"
+description = "Turn 完成后执行清理"
+trigger = "post_turn"
+script = "cleanup.sh"
+script_type = "shell"
+enabled = true
+timeout_secs = 5
+
+# 系统 Prompt 扩展
+[[hooks]]
+name = "rules"
+description = "注入项目编码规范"
+trigger = "system_prompt"
+script = "inject_rules.py"
+script_type = "python"
+enabled = true
+timeout_secs = 2
+```
+
+### 混合配置（脚本 + Webhook + JSON）
+
+```toml
+# hooks.toml
+
+# 本地脚本 Hook
+[[hooks]]
+name = "audit"
+trigger = "post_tool"
+script = "audit.sh"
+
+# 同步 Webhook
+[[webhooks]]
+name = "slack-notify"
+trigger = "pre_tool,post_tool"
+url = "https://hooks.slack.com/services/XXX"
+timeout_secs = 10
+
+# 异步批量 Webhook
+[[async_webhooks]]
+name = "audit-log"
+trigger = "post_tool"
+url = "https://log.example.com/batch"
+batch_size = 20
+flush_interval_ms = 1000
+```
+
+---
+
+## 故障排查
+
+### 问题 1：Hook 未加载
+
+**症状**：`atomcode hooks list` 显示自定义 Hook 数量为 0
+
+**排查步骤**：
+
+1. 检查 hooks 目录是否存在：
+   ```bash
+   atomcode hooks paths
+   ```
+
+2. 检查 `hooks.toml` 文件格式：
+   ```bash
+   # 验证 TOML 格式
+   cat ~/.atomcode/hooks/hooks.toml
+   ```
+
+3. 检查 `trigger` 值是否有效：
+   - TOML ScriptHook 只支持：`pre_tool`、`post_tool`、`post_turn`、`system_prompt`
+   - 如果使用了 `on_turn_complete`、`on_tool_call_start` 等值，会被跳过并打印 warning
+
+4. 检查脚本是否有执行权限：
+   ```bash
+   ls -la ~/.atomcode/hooks/*.sh
+   chmod +x ~/.atomcode/hooks/*.sh
+   ```
+
+5. 查看 stderr 输出（Hook 加载日志）：
+   ```bash
+   atomcode -p "test" 2>&1 | grep -i hook
+   ```
+
+### 问题 2：Hook 执行失败
+
+**症状**：Hook 脚本执行后显示警告
+
+**排查步骤**：
+
+1. 手动测试脚本：
+   ```bash
+   echo '{"tool_name":"test","tool_args":"{}"}' | ~/.atomcode/hooks/audit.sh
+   ```
+
+2. 检查脚本输出格式：
+   - 必须输出 `ok` 表示成功
+   - 可输出 `warning: <msg>` 记录警告
+   - 可输出 `deny: <reason>` 拒绝执行
+
+3. 检查超时设置：
+   - TOML ScriptHook 默认超时 2 秒
+   - 复杂脚本可增加 `timeout_secs`
+
+### 问题 3：Windows 路径问题
+
+**症状**：脚本路径解析失败
+
+**解决方案**：
+
+使用正斜杠或双反斜杠：
+
+```toml
+# 正确
+script = "C:/Users/DonkeyLee/.atomcode/hooks/audit.sh"
+script = "C:\\Users\\DonkeyLee\\.atomcode\\hooks\\audit.sh"
+
+# 错误
+script = "C:\Users\DonkeyLee\.atomcode\hooks\audit.sh"
+```
+
+或使用相对路径：
+
+```toml
+script = "audit.sh"  # 相对于 hooks.toml 所在目录
+```
+
+---
+
+## 最佳实践
+
+### 1. 使用正确 trigger 值
+
+```toml
+# ✅ 正确 — TOML ScriptHook 支持的 4 个 trigger
+trigger = "pre_tool"
+trigger = "post_tool"
+trigger = "post_turn"
+trigger = "system_prompt"
+
+# ❌ 错误 — 这些值不会被 TOML ScriptHook 识别
+trigger = "tool_call_start"   # 仅内置/Webhook 可用
+trigger = "turn_complete"     # 仅内置/Webhook 可用
+trigger = "session_end"       # 仅 Webhook 可用
+```
+
+### 2. 使用全局 Hooks 做审计
+
+```toml
+# ~/.atomcode/hooks/hooks.toml
+[[hooks]]
+name = "audit"
+trigger = "post_tool"
+script = "audit.sh"
+enabled = true
+```
+
+### 3. 使用项目级 Hooks 做定制
+
+```toml
+# <project>/.atomcode/hooks/hooks.toml
+[[hooks]]
+name = "project-specific"
+trigger = "pre_tool"
+script = "project_hook.sh"
+enabled = true
+```
+
+> 项目级 hooks 后加载，同名会覆盖全局 hooks。
+
+### 4. 脚本输出使用 JSON（推荐）
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+
+# 处理...
+
+# 输出 JSON（推荐）
+echo '{"result": "ok", "message": "Hook executed successfully"}'
+```
+
+### 5. 错误处理
+
+```bash
+#!/bin/bash
+set -e  # 遇到错误立即退出
+
+INPUT=$(cat)
+
+# 正常处理...
+# 如果失败，输出 deny
+if ! do_something; then
+  echo "deny: operation failed"
+  exit 1
+fi
+
+echo "ok"
+```
+
+---
+
+## 相关文档
+
+- [Hook 系统总览](./hooks.md) — 配置方式和 trigger 值汇总
+- [完整时机列表](./hook-timing-complete.md) — 所有 hook 时机及可用配置方式
+- [Webhook 指南](./webhook-guide.md) — HTTP 远程调用
+- [异步 Webhook 指南](./async-webhook-guide.md) — 批量异步发送

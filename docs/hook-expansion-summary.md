@@ -1,7 +1,6 @@
-# Hook 系统扩展实现总结
+# Hook 系统扩展实现总结（历史快照）
 
-> ⚠️ 本文档为历史快照，Hook 系统后续又增加了 OnUserPromptSubmit 时机并完全迁移到 HookEngine 架构。
-> 最新完整信息请参考：[Hook 系统总览](./hooks.md) | [实现总结](./hook-implementation-summary.md) | [完整时机列表](./hook-timing-complete.md)
+> ⚠️ **本文档是历史快照**，记录扩展阶段的实现细节（12 个时机）。当前系统已进一步演进（新增 `OnUserPromptSubmit`，共 13 个时机）。请以 [Hook 系统总览](./hooks.md) | [实现总结](./hook-implementation-summary.md) | [完整时机列表](./hook-timing-complete.md) 为权威参考。
 
 ## 本次扩展内容
 
@@ -118,7 +117,7 @@ Turn 级别：
   ✨ OnError (错误发生时)
 ```
 
-### 总计：12 个 Hook 时机 + 6 个内置实现
+### 总计：12 个 Hook 时机 + 6 个内置实现（扩展阶段，现已增至 13 个）
 
 ---
 
@@ -206,7 +205,7 @@ echo "ok"
 ```toml
 [[hooks]]
 name = "audit"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 script = "audit.sh"
 script_type = "shell"
 enabled = true

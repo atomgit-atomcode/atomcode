@@ -114,7 +114,7 @@ async fn send_webhook(&self, payload: &serde_json::Value) -> Result<WebhookRespo
 # 同步 Webhook
 [[webhooks]]
 name = "error-alert"
-trigger = "on_error"
+trigger = "error"
 url = "https://alert.example.com/error"
 enabled = true
 
@@ -230,7 +230,7 @@ flush_interval_ms = 100
 # 关键通知（同步，确保不丢失）
 [[webhooks]]
 name = "error-alert"
-trigger = "on_error"
+trigger = "error"
 url = "https://alert.example.com/error"
 enabled = true
 
@@ -245,7 +245,7 @@ flush_interval_ms = 1000
 
 ### 8. 批量请求格式
 
-异步 Webhook 发送的批量请求格式：
+异步 Webhook 发送的批量请求格式（event 字段值与 WebhookHook 事件名一致）：
 
 ```json
 {
@@ -258,7 +258,7 @@ flush_interval_ms = 1000
     {
       "event": "on_tool_call_start",
       "hook_name": "audit-log",
-      "trigger": "on_tool_call_start",
+      "trigger": "tool_call_start",
       "context": {
         "tool_name": "edit_file",
         "tool_args": "{...}",
@@ -281,6 +281,8 @@ flush_interval_ms = 1000
   ]
 }
 ```
+
+> ⚠️ **注意**：`trigger` 字段存储用户配置值（如 `tool_call_start`），`event` 字段存储 WebhookHook 发出的事件名（如 `on_tool_call_start`）。服务端应以 `event` 字段为准做事件类型判断。
 
 ### 9. 测试验证
 

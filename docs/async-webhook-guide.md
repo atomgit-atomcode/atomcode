@@ -1,5 +1,7 @@
 # 异步 Webhook 和批量发送指南
 
+> ⚠️ **当前状态警告**：异步 Webhook 的定时 flush 机制尚未完全激活（参见 issue #914）。目前 batcher 已创建但不会自动定期发送。在定时 flush 完成之前，请使用同步 Webhook 替代异步模式。关注后续更新以获取可用通知。
+
 ## 概述
 
 异步 Webhook 使用后台任务处理 Webhook 请求，避免阻塞 AtomCode 主流程。通过批量发送，可以显著减少 HTTP 请求数量，提高性能。
@@ -129,7 +131,7 @@ Hook 触发 → 加入队列（< 1ms）→ 继续执行
 # 同步模式（每次工具调用都发送）
 [[webhooks]]
 name = "slack-sync"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://hooks.slack.com/services/XXX"
 enabled = true
 
@@ -211,7 +213,7 @@ flush_interval_ms = 1000
   },
   "events": [
     {
-      "event": "tool_call_start",
+      "event": "on_tool_call_start",
       "hook_name": "audit-log",
       "trigger": "tool_call_start",
       "context": {
@@ -222,7 +224,7 @@ flush_interval_ms = 1000
       "timestamp_ms": 1234567890123
     },
     {
-      "event": "post_tool",
+      "event": "post_tool_execution",
       "hook_name": "audit-log",
       "trigger": "post_tool",
       "context": {
@@ -414,7 +416,7 @@ flush_interval_ms = 1000
 # 低频场景：同步
 [[webhooks]]
 name = "low-frequency"
-trigger = "on_session_end"
+trigger = "session_end"
 ```
 
 ### 2. 合理配置批量大小
@@ -435,7 +437,7 @@ trigger = "on_session_end"
 # 错误通知（同步，确保不丢失）
 [[webhooks]]
 name = "error-alert"
-trigger = "on_error"
+trigger = "error"
 url = "https://alert.example.com/error"
 enabled = true
 
@@ -457,7 +459,7 @@ flush_interval_ms = 1000
 [[webhooks]]
 name = "error-alert"
 description = "错误实时通知"
-trigger = "on_error"
+trigger = "error"
 url = "https://alert.example.com/error"
 enabled = true
 timeout_secs = 5

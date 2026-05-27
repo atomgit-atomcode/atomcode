@@ -99,13 +99,13 @@ AgentLoop / TurnRunner
 
 ## 加载顺序与优先级
 
-`HookEngine::load_all()`：
-1. `load_json_hooks()` → ShellCommandHook
-2. `load_toml_hooks()` → ScriptHook + WebhookHook
-3. `register_builtins()` → 6 个内置 Hook
-4. `load_webhook_hooks()` → WebhookHook（async batcher 关联）
+`HookEngine::load_all()` 按以下顺序加载：
+1. **JSON hooks** (`load_json_hooks`) → ShellCommandHook（CC 兼容）
+2. **TOML hooks** (`load_toml_hooks`) → ScriptHook + WebhookHook
+3. **内置 Hook** (`register_builtins`) → 6 个内置 Hook
+4. **Webhook 异步关联** (`load_webhook_hooks`) → AsyncWebhookBatcher 关联
 
-**全局 hooks 先加载，项目 hooks 后加载**（同名覆盖，后加载优先）。
+**全局 hooks 先加载，项目 hooks 后加载**。后加载的同名 hook **覆盖**先前注册的同名 hook（后加载优先）。
 
 ## 关键设计决策
 

@@ -90,6 +90,9 @@ AtomCode Hook 系统提供了 **13 个关键时机** 的扩展点，覆盖用户
 
 ## Hook 执行顺序
 
+> **注意**：下表中编号对应上文的 Hook # 序号，不表示执行先后次序。
+> 执行流按时间线从上到下排列。
+
 ```
 用户发送消息
   ↓
@@ -138,10 +141,11 @@ Turn 完成
 
 | # | Hook 时机 | TOML ScriptHook | JSON CC | Webhook | 内置 Hook |
 |---|----------|:---:|:---:|:---:|:---:|
-| 1 | `OnMessageReceived` | — | — | ✅ | — |
+> ¹ OnMessageReceived：WebhookHook 实现了对应 trait，但引擎尚未注册触发槽位，当前实际不可用。
+| 1 | `OnMessageReceived` | — | — | ✅¹ | — |
 | 2 | `OnTurnStart` | — | — | `turn_start` | `TurnStatsHook` |
-| 3 | `OnTurnComplete` | — | — | `turn_complete` / `after_turn` | `TurnStatsHook` + `AutoCommitHook` |
-| 4 | `PostTurn` | `post_turn` | — | `post_turn` | — |
+| 3 | `OnTurnComplete` (Turn 完成，含 token 等详细统计) | — | — | `turn_complete` / `after_turn` | `TurnStatsHook` + `AutoCommitHook` |
+| 4 | `PostTurn` (Turn 完成，旧版兼容，上下文较少) | `post_turn` | — | `post_turn` | — |
 | 5 | `OnModelResponse` | — | — | `model_response` | `ResponseValidationHook` |
 | 6 | `OnToolCallStart` | — | — | `tool_call_start` | `ToolAuditLogHook` |
 | 7 | `PreToolExecution` | `pre_tool` | `pre_tool_use` | `pre_tool` / `before_tool` | — |

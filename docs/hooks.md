@@ -25,10 +25,14 @@ mkdir -p .atomcode/hooks
 # 通 过 stdin 接收上下文 JSON
 INPUT=$(cat)
 
-# 解析关键信息（可选安装 jq）
+# 解析关键信息（推荐安装 jq：brew install jq / apt-get install jq）
 if command -v jq &> /dev/null; then
     TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty')
     echo "Hook saw tool: $TOOL" >&2
+else
+    # 无 jq 时可用 python 替代：
+    # TOOL=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_name',''))" 2>/dev/null)
+    echo "Hook: raw input received" >&2
 fi
 
 # 返回执行结果
@@ -62,7 +66,7 @@ timeout_secs = 2
 
 ## 配置方式总览
 
-AtomCode 支持 **三种** hook 配置方式：
+AtomCode 支持 **三种** hook 实现，通过两个配置文件管理：
 
 | 方式 | 配置文件 | 实现 | 适用场景 |
 |------|---------|------|---------|
@@ -70,7 +74,12 @@ AtomCode 支持 **三种** hook 配置方式：
 | **TOML Webhook** | `hooks.toml` → `[[webhooks]]` / `[[async_webhooks]]` | HTTP 远程调用 | 云端服务、外部集成 |
 | **JSON CC 兼容** | `.hooks.json` / `hooks.json` | Shell 命令（旧协议） | 兼容 CC 插件 |
 
-> 三种方式可以共存。加载顺序：JSON → TOML → 内置 → Webhook。项目 hooks 覆盖同名全局 hooks。
+> 三种方式可以共存。实际上都是通过 `HookEngine::load_all()` 统一加载：
+> 1. JSON hooks（`hooks.json`）
+> 2. TOML hooks（ScriptHook + WebhookHook，来自 `hooks.toml`）
+> 3. 内置 Hook（Rust 原生，自动注册）
+>
+> 全局 hooks 先加载，项目 hooks 后加载。项目级同名 hook **覆盖**全局同名 hook（后加载优先）。
 
 ---
 
@@ -111,6 +120,8 @@ AtomCode 支持 **三种** hook 配置方式：
 }
 ```
 
+`system_prompt` 的 stdin 输入与 `post_turn` 一致（包含基础上下文，无 `tool_args`/`result_context`）。脚本应将追加的系统 Prompt 内容输出到 stdout（纯文本或 JSON 的 `message` 字段）。
+
 ### 脚本输出格式
 
 ```
@@ -147,9 +158,22 @@ timeout_secs = 3
 
 ### 支持的 trigger 值（逗号分隔多个）
 
-`pre_tool` | `before_tool` | `post_tool` | `after_tool` | `post_turn` |
-`session_start` | `session_end` | `error` | `turn_start` | `turn_complete` |
-`after_turn` | `tool_call_start` | `model_response` | `system_prompt`
+| trigger 值（规范） | 别名 | 触发时机 |
+|-----------|------|---------|
+| `turn_start` | — | Turn 开始前 |
+| `tool_call_start` | — | 工具调用开始时 |
+| `pre_tool` | `before_tool` | 工具执行前 |
+| `post_tool` | `after_tool` | 工具执行后 |
+| `turn_complete` | `after_turn` | Turn 完成后（详细统计） |
+| `post_turn` | — | Turn 完成后（旧版兼容） |
+| `session_start` | — | 会话启动时 |
+| `session_end` | — | 会话结束时 |
+| `error` | — | 错误发生时 |
+| `model_response` | — | 模型响应完成后 |
+| `system_prompt` | — | 系统 Prompt 构建时 |
+| `message` | `message_received` | 用户消息接收时 |
+
+> 使用 **contains 匹配**（逗号分隔多个 trigger）。例如 `trigger = "pre_tool,post_tool"` 会在两个时机都触发。
 
 ### 同步 Webhook
 
@@ -227,7 +251,7 @@ Hook 通过环境变量接收上下文（`ATOMCODE_HOOK_EVENT`、`ATOMCODE_HOOK_
 | `ErrorReportHook` | 错误发生时 | 记录错误详情 |
 | `ResponseValidationHook` | 模型响应后 | 检测敏感信息 |
 
-内置 Hook 自动注册，暂不支持通过配置禁用（后续 CLI 会提供 enable/disable 开关）。
+内置 Hook 自动注册，暂不支持通过配置禁用（后续 CLI 会提供 enable/disable 开关）。同名项目级 hook 无法覆盖内置 Hook（内置 Hook 是 Rust 原生，不在 TOML 配置体系内）。
 
 ---
 

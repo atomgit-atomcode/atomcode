@@ -127,7 +127,7 @@ test result: ok. 3 passed; 0 failed
 [[webhooks]]
 name = "slack-audit"
 description = "记录所有工具调用到 Slack"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
 enabled = true
 timeout_secs = 10
@@ -139,7 +139,7 @@ timeout_secs = 10
 [[webhooks]]
 name = "dingtalk"
 description = "发送通知到钉钉"
-trigger = "on_turn_complete"
+trigger = "turn_complete"
 url = "https://oapi.dingtalk.com/robot/send?access_token=XXX"
 enabled = true
 ```
@@ -150,7 +150,7 @@ enabled = true
 [[webhooks]]
 name = "wechat"
 description = "发送通知到企业微信"
-trigger = "on_error"
+trigger = "error"
 url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=XXX"
 enabled = true
 ```
@@ -161,7 +161,7 @@ enabled = true
 [[webhooks]]
 name = "audit-log"
 description = "发送所有工具调用审计日志"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://log-service.example.com/atomcode/audit"
 enabled = true
 timeout_secs = 5
@@ -213,7 +213,7 @@ Authorization = "Bearer AUDIT_TOKEN"
    ```toml
    [[webhooks]]
    name = "debug"
-   trigger = "on_tool_call_start"
+   trigger = "tool_call_start"
    url = "https://webhook.site/your-unique-id"
    enabled = true
    ```
@@ -248,7 +248,7 @@ enabled = true
 [[webhooks]]
 name = "slack-notify"
 description = "发送工具调用通知到 Slack"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://hooks.slack.com/services/XXX"
 enabled = true
 timeout_secs = 5
@@ -257,7 +257,7 @@ timeout_secs = 5
 [[webhooks]]
 name = "dingtalk"
 description = "Turn 完成通知"
-trigger = "on_turn_complete"
+trigger = "turn_complete"
 url = "https://oapi.dingtalk.com/robot/send?access_token=XXX"
 enabled = true
 
@@ -265,7 +265,7 @@ enabled = true
 [[webhooks]]
 name = "audit-log"
 description = "发送所有工具调用到云端"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://log-service.example.com/audit"
 enabled = true
 retries = 3
