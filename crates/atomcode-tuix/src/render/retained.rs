@@ -681,6 +681,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let bytes = serialize_row(row);
                 let _ = self.out.write_all(&bytes);
             }
+            // Clear the physical terminal from (bottom+1, 1) down to the
+            // bottom of the screen. Without this, when the footer later
+            // grows around the inflight strip (slash menu opens, a wrap
+            // pushes the input box, etc.), the OLD inflight rows that
+            // are no longer body_bottom are still on the physical
+            // terminal — and the next `paint_frame`'s cell-diff against
+            // the BLANKED prev_cells (via `invalidate_rows_from` below)
+            // doesn't emit patches at columns where the new footer rows
+            // hold blank cells (blank-vs-blank is a no-patch). The old
+            // chars leak through wherever new content has spaces.
+            // Mirrors `emit_body_line_inner`'s ED 0 (`\x1b[0J`) after
+            // its CUP+content write — same hazard, same shape of fix.
+            // The screen height bounds `bottom` to <= h-1 (since
+            // footer_rows >= 1 always), so `bottom+1 <= h` and the
+            // CUP target is always on-screen.
+            let clear_below = format!("\x1b[{};1H\x1b[0J", bottom + 1);
+            let _ = self.out.write_all(clear_below.as_bytes());
             // Mirror `emit_body_line_inner`'s prev_cells resync (see
             // its comment for the canonical write-up of this contract).
             // The CUP+EL above blanked the physical terminal in those
@@ -4525,6 +4542,157 @@ mod tests {
             "body_lines grew to {} rows across 50 ticks — should stay at \
              prev_rows count for in-place path",
             r.body_lines.len()
+        );
+    }
+
+    /// Regression: user reports that during Ctrl+O verbose streaming with a
+    /// slash menu open mid-flight, the row that PREVIOUSLY held the inflight
+    /// tool icon leaks chars through the new menu/status content drawn on
+    /// top of it.
+    ///
+    /// Root cause: `render_inflight_tool`'s in-place path uses `\x1b[2K`
+    /// (EL2) to clear ONLY the rows it's about to write, and
+    /// `invalidate_rows_from(first_0idx)` to blank `prev_cells` from the
+    /// new first row downward. When the footer subsequently grows (menu
+    /// opens → footer +4 rows → body shrinks by 4), the OLD inflight rows
+    /// are now BELOW the new body_bottom — but the prior in-place write
+    /// left their physical-terminal chars in place. `cell-diff` then
+    /// compares the NEW frame (footer rows with leading blanks like
+    /// `"  PLAN ..."`) against the BLANKED prev_cells and emits patches
+    /// only for cells that are non-blank in the new frame. Blank-vs-blank
+    /// columns get no patch — the terminal physical content (stale OLD
+    /// inflight chars) survives and shows through wherever the new content
+    /// has a space.
+    ///
+    /// Fix: at the end of `render_inflight_tool`'s in-place path, clear
+    /// the physical terminal below the new inflight rows (`ED 0` at row
+    /// bottom+1) so the next paint's blank cells overlay a known-blank
+    /// physical row instead of stale chars.
+    #[test]
+    fn retained_inflight_ghost_clears_when_footer_grows_around_it() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+
+        // Baseline: empty input, no menu, no body.
+        r.render(UiLine::StreamingBox {
+            buf: String::new(),
+            cursor_byte: 0,
+            frame: "⠋".into(),
+            label: "Pondering".into(),
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+
+        // Fill body to JUST FILL the cap. Footer_rows=4 (top+mid+bot+status),
+        // cap=20. After 20 body lines, body_lines.len()==20, visible_len==20.
+        for i in 0..20 {
+            r.render(UiLine::CommandOutput(format!("filler-{:02}\n", i)));
+        }
+        r.flush_deferred();
+
+        // Now seed an inflight tool. The detail string carries a unique
+        // ASCII marker so we can spot leakage after the menu opens. The
+        // marker is positioned in `Bash(LEAKMARKER...)` so when the menu
+        // row "  /status..." overlays it, the columns past col 8 (the
+        // end of "/status") receive no patches (blank-in-new == blank-
+        // in-blanked-prev) and the marker chars survive on the physical
+        // terminal — visible in `row_text` via the vterm.
+        r.render(UiLine::ToolCallInFlight {
+            id: "call-leak".into(),
+            name: "Bash".into(),
+            detail: "LEAKMARKER_PLACEHOLDER_AAAA".into(),
+        });
+        // Drive an in-place tick so the icon updates via the in-place
+        // path (prev_rows>0). This is what the user's session looks
+        // like every 80ms while the tool runs.
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running Bash".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Sanity: the marker should be at the body's last visible row
+        // (1-indexed row 20 = vterm row index 19). If this assertion
+        // fails, the test setup is wrong (geometry assumption broken)
+        // — not the bug under test.
+        let inflight_row_idx = 19;
+        let pre_open = vterm.row_text(inflight_row_idx);
+        assert!(
+            pre_open.contains("LEAKMARKER"),
+            "test setup broken: expected inflight row at vterm row {} \
+             to carry the marker before menu opens; got: {:?}\n{}",
+            inflight_row_idx + 1,
+            pre_open,
+            vterm.dump()
+        );
+
+        // OPEN THE SLASH MENU — footer_rows grows 4 → 8. body_height
+        // shrinks 20 → 16. body_bottom moves up from row 20 to row 16.
+        // The OLD inflight row 20 is now part of the FOOTER strip (the
+        // first menu item). The new render_inflight_tool's in-place
+        // write goes to row 16; row 20's stale physical chars are NOT
+        // touched by render_inflight_tool, and the next paint's cell-
+        // diff vs blanked prev_cells can't erase them at columns where
+        // the new menu row has spaces.
+        let items: Vec<(String, String)> = vec![
+            ("status".into(), "Show status".into()),
+            ("session".into(), "New session".into()),
+            ("skills".into(), "Show skills".into()),
+            ("settings".into(), "Show settings".into()),
+        ];
+        r.render(UiLine::StreamingBox {
+            buf: "/s".into(),
+            cursor_byte: 2,
+            frame: "⠹".into(),
+            label: "Running Bash".into(),
+            menu: Some(MenuPayload {
+                // Selected=1 → /session selected → first menu row
+                // (/status) is NOT selected, so its col 0 is blank
+                // (the bug-revealing case). A selected first row would
+                // start with '▸' at col 0 and mask the leak there.
+                items,
+                selected: 1,
+                kind: crate::render::MenuKind::SlashCommand,
+            }),
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // The row that used to carry the inflight marker must now hold
+        // ONLY the new menu row content. Any survival of "MARKER" or
+        // "LEAK" chars proves the in-place direct-write didn't clean up
+        // its old physical-terminal position when the footer grew under
+        // it.
+        let post_open = vterm.row_text(inflight_row_idx);
+        assert!(
+            !post_open.contains("MARKER"),
+            "inflight chars leaked through to row {} after menu opened: {:?}\n{}",
+            inflight_row_idx + 1,
+            post_open,
+            vterm.dump()
+        );
+        assert!(
+            !post_open.contains("LEAK"),
+            "inflight 'LEAK' substring survived menu opening at row {}: {:?}\n{}",
+            inflight_row_idx + 1,
+            post_open,
+            vterm.dump()
+        );
+        // Positive check: the new content (menu row '/status') should be
+        // visible at that row — guards against an over-broad fix that
+        // wipes legitimate footer content along with the leak.
+        assert!(
+            post_open.contains("/status"),
+            "menu row '/status' content missing at row {}: {:?}\n{}",
+            inflight_row_idx + 1,
+            post_open,
+            vterm.dump()
         );
     }
 
