@@ -249,7 +249,7 @@ mod format_http_error_tests {
         assert_eq!(
             format_http_error(
                 StatusCode::TOO_MANY_REQUESTS,
-                "https://llm-api.atomgit.com/v1/chat/completions",
+                "https://pre-llm-api-cce.atomgit.com/v1/chat/completions",
                 "codingplan rate limit exceeded for type='Pro'",
             ),
             "[429] codingplan rate limit exceeded for type='Pro'"
@@ -332,7 +332,7 @@ pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> 
                  a trusted AtomGit gateway.\n\
                  Either set an explicit api_key in your config.toml, or use the \
                  AtomGit OAuth flow by setting base_url to \
-                 https://llm-api.atomgit.com/v1",
+                 https://pre-llm-api-cce.atomgit.com/v1",
                 config.provider_type,
             );
         }
@@ -856,7 +856,7 @@ mod tests {
     #[test]
     fn create_provider_delegates_auth_on_trusted_gateway() {
         let result =
-            super::create_provider(&cfg_no_key("openai", Some("https://llm-api.atomgit.com/v1")));
+            super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com/v1")));
         let msg = match &result {
             Err(e) => e.to_string(),
             Ok(_) => "provider constructed (auth.toml exists)".to_string(),
@@ -887,7 +887,7 @@ mod tests {
     /// Malicious subdomain of the trusted host must NOT pass the guard.
     #[test]
     fn create_provider_rejects_no_api_key_on_lookalike_gateway() {
-        let result = super::create_provider(&cfg_no_key("openai", Some("https://llm-api.atomgit.com.evil.com")));
+        let result = super::create_provider(&cfg_no_key("openai", Some("https://pre-llm-api-cce.atomgit.com.evil.com")));
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected Err for lookalike domain"),

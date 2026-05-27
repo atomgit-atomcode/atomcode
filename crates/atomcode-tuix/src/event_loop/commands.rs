@@ -31,7 +31,7 @@ const MAX_RECENT_DIRS: usize = 5;
 
 fn build_oauth_provider() -> ProviderConfig {
     // Post-P3 cutover: default OAuth fallback now points at the new
-    // signed gateway (`llm-api.atomgit.com`). The legacy
+    // signed gateway (`pre-llm-api-cce.atomgit.com`). The legacy
     // `api-ai.gitcode.com` host previously served plaintext as a
     // fallback for open-source builds — that escape hatch closes here
     // because the legacy host is now also signing-enforced (see
@@ -43,7 +43,7 @@ fn build_oauth_provider() -> ProviderConfig {
         provider_type: "openai".to_string(),
         api_key: None,
         model: "MiniMax-M2.7".to_string(),
-        base_url: Some("https://llm-api.atomgit.com/v1".to_string()),
+        base_url: Some("https://pre-llm-api-cce.atomgit.com/v1".to_string()),
         system_prompt: None,
         user_agent: None,
         context_window: 64_000,

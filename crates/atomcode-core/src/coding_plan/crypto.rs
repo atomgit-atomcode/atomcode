@@ -120,11 +120,11 @@ pub fn signer() -> &'static dyn RequestSigner {
 /// HTTP(S) schemes and subdomain spoofs.
 ///
 /// Both production hostnames sign:
-///   * `llm-api.atomgit.com` — current dedicated host.
+///   * `pre-llm-api-cce.atomgit.com` — current dedicated host.
 ///   * `api-ai.gitcode.com`  — pre-P3 host. Kept signing-enforced
 ///     so any legacy provider config silently upgraded to signing
 ///     after the P3 cutover; users with `api-ai.gitcode.com` in their
-///     config get the same protection as `llm-api.atomgit.com` users
+///     config get the same protection as `pre-llm-api-cce.atomgit.com` users
 ///     and don't need to edit their config to migrate.
 pub(crate) fn is_atomgit_gateway(base_url: &str) -> bool {
     let url = match url::Url::parse(base_url) {
@@ -137,7 +137,7 @@ pub(crate) fn is_atomgit_gateway(base_url: &str) -> bool {
     }
     matches!(
         url.host_str(),
-        Some("llm-api.atomgit.com") | Some("api-ai.gitcode.com")
+        Some("pre-llm-api-cce.atomgit.com") | Some("api-ai.gitcode.com")
     )
 }
 
@@ -185,8 +185,8 @@ mod tests {
 
     #[test]
     fn is_atomgit_gateway_matches_official_host() {
-        assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1"));
-        assert!(is_atomgit_gateway("https://llm-api.atomgit.com/v1/chat/completions"));
+        assert!(is_atomgit_gateway("https://pre-llm-api-cce.atomgit.com/v1"));
+        assert!(is_atomgit_gateway("https://pre-llm-api-cce.atomgit.com/v1/chat/completions"));
     }
 
     #[test]
@@ -208,8 +208,8 @@ mod tests {
 
     #[test]
     fn is_atomgit_gateway_rejects_subdomains_and_lookalikes() {
-        assert!(!is_atomgit_gateway("https://llm-api.atomgit.com.evil.example"));
-        assert!(!is_atomgit_gateway("https://evil.llm-api.atomgit.com"));
+        assert!(!is_atomgit_gateway("https://pre-llm-api-cce.atomgit.com.evil.example"));
+        assert!(!is_atomgit_gateway("https://evil.pre-llm-api-cce.atomgit.com"));
         assert!(!is_atomgit_gateway("https://atomgit.com"));
     }
 
@@ -217,6 +217,6 @@ mod tests {
     fn is_atomgit_gateway_rejects_malformed_input() {
         assert!(!is_atomgit_gateway(""));
         assert!(!is_atomgit_gateway("not a url"));
-        assert!(!is_atomgit_gateway("ftp://llm-api.atomgit.com"));
+        assert!(!is_atomgit_gateway("ftp://pre-llm-api-cce.atomgit.com"));
     }
 }

@@ -2230,7 +2230,7 @@ mod codingplan_signing_tests {
         // Open-source build: signer() is UnavailableSigner, so an
         // atomgit-bound request must error with the localised hint.
         let err = build_codingplan_headers(
-            "https://llm-api.atomgit.com/v1",
+            "https://pre-llm-api-cce.atomgit.com/v1",
             b"{}",
             Some(("dummy-user-id", "dummy-token")),
         )
@@ -2245,7 +2245,7 @@ mod codingplan_signing_tests {
     #[test]
     fn build_signed_headers_errors_when_atomgit_host_with_empty_auth() {
         let err = build_codingplan_headers(
-            "https://llm-api.atomgit.com/v1",
+            "https://pre-llm-api-cce.atomgit.com/v1",
             b"{}",
             Some(("", "")),
         )
