@@ -2448,11 +2448,35 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.flush_assistant_lines();
             }
             UiLine::ReasoningText(text) => {
-                // Display reasoning in gray/dimmed style with word wrapping
+                // Display reasoning in faint style with word wrapping.
+                //
+                // Why CellStyle.faint instead of embedding `\x1b[2m...\x1b[0m`
+                // in the text: `push_body_text` calls `push_str_cells`, which
+                // treats every visible char as a width-1 cell — including
+                // the SGR escape bytes ESC, `[`, `2`, `m` if they're in the
+                // string. Cells get pushed at indices 0..N matching the
+                // string's char positions, but when serialized back to
+                // stdout the terminal swallows the SGR sequence without
+                // advancing the cursor, so the cell-index ⇄ terminal-column
+                // invariant breaks by exactly 4 (= len("\x1b[2m")) columns.
+                // Subsequent cell-diff patches CUP to the model-column,
+                // which on screen is 4 cells to the right of the visual
+                // position — producing the "characters scattered into
+                // word boundaries" corruption (e.g. "Now let me start"
+                // rendered as "Now let letsmerstart" because the second
+                // flush's diff patches landed at offset 4, overwriting
+                // the spaces with letters from the new text).
+                // Trace `BPUSH content="  \u{1b}[2m step by step."` showed
+                // the ESC bytes embedded in cells; this fix routes the
+                // faint attribute through `CellStyle` instead, where
+                // `serialize_row` emits SGR around the run without
+                // claiming cell-column space for the bytes.
                 let text = scrub_controls(&text);
-                // Use ANSI dim/gray escape codes
-                let dimmed = format!("\x1b[2m{}\x1b[0m", text);
-                self.push_body_text(&dimmed, &CellStyle::default());
+                let style = CellStyle {
+                    faint: true,
+                    ..CellStyle::default()
+                };
+                self.push_body_text(&text, &style);
             }
             UiLine::AssistantLineBreak => {
                 self.flush_assistant_remainder();
@@ -9534,6 +9558,68 @@ mod tests {
                 post_paint_str
             );
         }
+    }
+
+    /// Regression for the reasoning-text SGR-in-cells corruption: when
+    /// `UiLine::ReasoningText` arrived, the handler wrapped the payload
+    /// in `\x1b[2m...\x1b[0m` and routed it through `push_body_text` →
+    /// `push_str_cells`, which has no SGR awareness. The 4 ESC/[/2/m
+    /// bytes ended up as 4 width-1 cells, but the terminal consumes
+    /// them as SGR without advancing the cursor — so cell index N+4
+    /// landed at visual column N on screen, and subsequent cell-diff
+    /// CUP patches addressed cells by model-column, overshooting their
+    /// visual target by 4. Symptom: words like "Now let me start"
+    /// rendered as "Now let letsmerstart", spaces became letters from
+    /// the next flush's content.
+    ///
+    /// This test pins the invariant: no row produced by ReasoningText
+    /// may contain the ESC byte (0x1b), `[`, `2`, `m`, or `0` as a
+    /// trailing-SGR cell. The faint attribute belongs in `CellStyle`,
+    /// not in the cell payload.
+    #[test]
+    fn retained_reasoning_text_does_not_embed_sgr_bytes_as_cells() {
+        let w: u16 = 80;
+        let h: u16 = 24;
+        let (mut r, _buf) = new_capturing(w, h);
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ReasoningText(
+            "Now let me start executing the 11 steps in order.\n".into(),
+        ));
+        r.flush_deferred();
+
+        // Walk every body row's cells and assert none of them contain
+        // the ESC byte as a glyph. Pre-fix the row built as
+        // `[pad, pad, ESC, [, 2, m, N, o, w, ...]` would fail here on
+        // the third cell (`ch == '\x1b'`).
+        for (row_idx, row) in r.body_lines.iter().enumerate() {
+            for (col_idx, cell) in row.iter().enumerate() {
+                assert_ne!(
+                    cell.ch, '\x1b',
+                    "row {} col {}: ESC byte leaked into a cell — \
+                     reasoning SGR is being injected as text instead of \
+                     CellStyle.faint",
+                    row_idx, col_idx
+                );
+            }
+        }
+
+        // Bonus check: the row that actually contains the reasoning
+        // text should mark its content cells with `faint = true` so
+        // the visual dim style still renders.
+        let has_faint_text = r.body_lines.iter().any(|row| {
+            row.iter().any(|c| c.style.faint && c.ch != ' ')
+        });
+        assert!(
+            has_faint_text,
+            "no faint reasoning cells found — the dim style was lost \
+             when the SGR string approach was removed"
+        );
     }
 
     /// Repro of the real-world `/whoami after big turn` corruption:
