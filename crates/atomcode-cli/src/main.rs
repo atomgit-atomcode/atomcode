@@ -1840,6 +1840,29 @@ async fn run_headless(
             AgentEvent::MessagesSync { .. } => {
                 // Only used by TUI for /bg session persistence; ignore in CLI.
             }
+            AgentEvent::GuideTurnActivity {
+                subagent,
+                message,
+            } => {
+                // Guide agent activity is visible in verbose mode.
+                if verbose {
+                    close_thinking_line(&mut thinking_line_open);
+                    let snippet = truncate_log_line(&message, 200);
+                    eprintln!("[guide-agent {}] {}", subagent, snippet);
+                }
+            }
+            AgentEvent::GuideComplete {
+                subagent,
+                text,
+                truncated,
+            } => {
+                if verbose {
+                    close_thinking_line(&mut thinking_line_open);
+                    let snippet = truncate_log_line(&text, 200);
+                    let tag = if truncated { "[truncated]" } else { "" };
+                    eprintln!("[guide-agent {} done] {}{}", subagent, snippet, tag);
+                }
+            }
         }
     }
 
