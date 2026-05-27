@@ -758,7 +758,18 @@ impl LlmProvider for OpenAiProvider {
                         None
                     };
                 // ────────────────────────────────────────────────────────
+                // (id, name, accumulated_args) per tool-call index.
                 let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+                // Tracks whether StreamEvent::ToolCallStart has already
+                // been emitted for each index. Some providers (GPT-5
+                // family — confirmed via wire-dump 2026-05-27) repeat
+                // the SAME non-empty id on EVERY chunk but only send
+                // function.name on the first chunk. Without an "emitted
+                // once" guard we'd fire ToolCallStart on every chunk;
+                // without a "don't clobber name with empty" guard we'd
+                // overwrite the captured name with `""` from subsequent
+                // chunks where func.name is None.
+                let mut tool_start_emitted: Vec<bool> = Vec::new();
                 let mut last_usage: Option<crate::stream::TokenUsage> = None;
                 let mut saw_data_line = false;
                 let mut saw_valid_chunk = false;
@@ -946,30 +957,60 @@ impl LlmProvider for OpenAiProvider {
                                                 String::new(),
                                                 String::new(),
                                             ));
+                                            tool_start_emitted.push(false);
                                         }
                                         let entry = &mut tool_calls[idx];
+                                        // 1) Capture id only when present + non-empty.
+                                        //    ModelScope sends empty-string id on
+                                        //    increment chunks — skipping keeps the
+                                        //    earlier non-empty value.
                                         if let Some(id) = &tc.id {
-                                            // Some providers (e.g., ModelScope) send empty string id
-                                            // in incremental tool call chunks. Only emit ToolCallStart
-                                            // for non-empty ids.
                                             if !id.is_empty() {
                                                 entry.0 = id.clone();
-                                                if let Some(func) = &tc.function {
-                                                    entry.1 = func.name.clone().unwrap_or_default();
-                                                }
-                                                let _ = tx.send(Ok(StreamEvent::ToolCallStart {
-                                                    id: entry.0.clone(),
-                                                    name: entry.1.clone(),
-                                                }));
                                             }
                                         }
+                                        // 2) Accumulate name + args INDEPENDENTLY of
+                                        //    id presence.
+                                        //    * GPT-5 family (confirmed via wire-dump):
+                                        //      repeats same non-empty id on EVERY chunk
+                                        //      but only sends function.name on chunk 1.
+                                        //      Old code did `entry.1 = func.name.clone()
+                                        //      .unwrap_or_default()` which clobbered the
+                                        //      captured "use_skill" with "" on every
+                                        //      subsequent chunk — final ToolCallDone had
+                                        //      empty name → dropped as malformed.
+                                        //    * Guard `!name.is_empty()` also protects
+                                        //      against any provider that ever sends
+                                        //      `name: ""` placeholder.
                                         if let Some(func) = &tc.function {
+                                            if let Some(name) = &func.name {
+                                                if !name.is_empty() {
+                                                    entry.1 = name.clone();
+                                                }
+                                            }
                                             if let Some(args) = &func.arguments {
                                                 entry.2.push_str(args);
                                                 let _ = tx.send(Ok(StreamEvent::ToolCallDelta(
                                                     args.clone(),
                                                 )));
                                             }
+                                        }
+                                        // 3) Emit ToolCallStart EXACTLY ONCE per index
+                                        //    — as soon as both id AND name are known.
+                                        //    Old code emitted on every chunk where id
+                                        //    was non-empty (N events for an N-chunk
+                                        //    stream); downstream UI handles the
+                                        //    duplicates but it's wasted work + log
+                                        //    noise.
+                                        if !tool_start_emitted[idx]
+                                            && !entry.0.is_empty()
+                                            && !entry.1.is_empty()
+                                        {
+                                            tool_start_emitted[idx] = true;
+                                            let _ = tx.send(Ok(StreamEvent::ToolCallStart {
+                                                id: entry.0.clone(),
+                                                name: entry.1.clone(),
+                                            }));
                                         }
                                     }
                                 }
@@ -994,6 +1035,7 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
+                                            tool_start_emitted.clear();
                                             pending_finish =
                                                 Some(StreamEvent::Done { truncated: false });
                                         }
@@ -1013,6 +1055,7 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
+                                            tool_start_emitted.clear();
                                             pending_finish =
                                                 Some(StreamEvent::Done { truncated: true });
                                         }
@@ -1160,6 +1203,7 @@ impl LlmProvider for OpenAiProvider {
                     )));
                 }
                 tool_calls.clear();
+                tool_start_emitted.clear();
                 let _ = tx.send(Ok(StreamEvent::Delta(
                     "\n[stream ended without close marker — response above may be incomplete]\n"
                         .to_string(),
