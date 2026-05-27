@@ -387,6 +387,14 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                     let _ = self.out.write_all(b"\n");
                 }
             }
+            UiLine::GuideResult(text) => {
+                // In plain mode, emit result as plain text with SGR passthrough.
+                let safe = crate::sanitize::scrub_controls_keep_sgr(&text);
+                let _ = self.out.write_all(safe.as_bytes());
+                if !safe.ends_with('\n') {
+                    let _ = self.out.write_all(b"\n");
+                }
+            }
             UiLine::ImageAttachment(n) => {
                 // Plain mode echoes attachment markers with the same
                 // 2-space indent as the TTY renderers, then a newline.

@@ -2165,8 +2165,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // that suffix off and forward it to render_inflight_tool
                 // so the user gets a time anchor on long bashes.
                 if let Some(status) = self.guide_status_text.clone() {
+                    let is_done = status.starts_with("  ⎿");
+                    let frame = if is_done { " " } else { "⏺" };
                     let cells = self.build_spinner_body_row(frame, &status);
                     self.render_guide_spinner(cells);
+                    if is_done {
+                        self.guide_status_text = None;
+                    }
                 } else if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     let meta = spinner_meta_suffix(&label);
                     self.render_inflight_tool(frame, &name, &detail, meta);
@@ -2177,8 +2182,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::Spinner { frame, label } => {
                 if let Some(status) = self.guide_status_text.clone() {
+                    let is_done = status.starts_with("  ⎿");
+                    let frame = if is_done { " " } else { "⏺" };
                     let cells = self.build_spinner_body_row(frame, &status);
                     self.render_guide_spinner(cells);
+                    if is_done {
+                        self.guide_status_text = None;
+                    }
                 } else if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     let meta = spinner_meta_suffix(&label);
                     self.render_inflight_tool(frame, &name, &detail, meta);
@@ -2790,6 +2800,23 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     self.push_body_row(row);
                 }
                 self.guide_status_rows = n;
+            }
+            UiLine::GuideResult(text) => {
+                let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+                let mut md_state = crate::markdown::MdState::new();
+                for line in text.lines() {
+                    if let Some(rendered) = crate::markdown::render_line_with_width(
+                        line,
+                        &mut md_state,
+                        self.caps,
+                        md_width,
+                    ) {
+                        self.push_markdown_body(&rendered);
+                    }
+                }
+                if let Some(block) = crate::markdown::finalize_with_width(&mut md_state, self.caps, md_width) {
+                    self.push_markdown_body(&block);
+                }
             }
             UiLine::ImageAttachment(n) => {
                 // `└` at col 2, under the `[` of `[Image #N]` in the

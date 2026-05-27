@@ -2143,6 +2143,29 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
             UiLine::GuideStatus(text) => {
                 self.push_command_output(&text);
             }
+            UiLine::GuideResult(text) => {
+                let md_width = self.width as usize;
+                let mut md_state = crate::markdown::MdState::new();
+                for line in text.lines() {
+                    if let Some(rendered) = crate::markdown::render_line_with_width(
+                        line,
+                        &mut md_state,
+                        self.caps,
+                        md_width,
+                    ) {
+                        for sub in rendered.split('\n') {
+                            self.push_body_row_raw(sub.to_string());
+                        }
+                    }
+                }
+                if let Some(tail) =
+                    crate::markdown::finalize_with_width(&mut md_state, self.caps, md_width)
+                {
+                    for sub in tail.split('\n') {
+                        self.push_body_row_raw(sub.to_string());
+                    }
+                }
+            }
             UiLine::ImageAttachment(n) => {
                 // `└` at col 2, aligned under the `[` of `[Image #N]`
                 // in the user-message echo above (push_user prefixes

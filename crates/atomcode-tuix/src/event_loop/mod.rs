@@ -6591,17 +6591,22 @@ fn handle_agent_event(
         AgentEvent::GuideTurnActivity { subagent, message } => {
             state.guide_running = true;
             renderer.render(UiLine::GuideStatus(
-                format!("{} {}", subagent, message),
+                format!("⏺ {} {}", subagent, message),
             ));
             renderer.flush();
         }
         AgentEvent::GuideComplete { text, truncated, .. } => {
             state.guide_running = false;
+            // Freeze the activity indicator with a completion line
+            renderer.render(UiLine::GuideStatus(
+                "  ⎿  已完成".to_string(),
+            ));
+            renderer.flush();
             let mut output = text;
             if truncated {
-                output.push_str("\n(truncated)");
+                output.push_str("\n*(truncated)*");
             }
-            renderer.render(UiLine::CommandOutput(output));
+            renderer.render(UiLine::GuideResult(output));
             renderer.flush();
         }
         AgentEvent::MessagesSync { messages } => {

@@ -361,6 +361,7 @@ fn ui_line_tag(l: &UiLine) -> &'static str {
         UiLine::VisionPreprocessSuccess { .. } => "VisionPreprocessSuccess",
         UiLine::TurnSeparator { .. } => "TurnSeparator",
         UiLine::GuideStatus(_) => "GuideStatus",
+        UiLine::GuideResult(_) => "GuideResult",
     }
 }
 

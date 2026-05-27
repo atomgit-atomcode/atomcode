@@ -160,7 +160,12 @@ pub enum UiLine {
     CommandOutput(String),
     /// Live sub-agent status line. Each emission replaces the previous
     /// `GuideStatus` row in-place — no scrollback accumulation.
+    /// Format: "⏺ subagent message" with animated spinner prefix.
     GuideStatus(String),
+    /// Sub-agent result text (markdown-formatted). Rendered through the
+    /// markdown pipeline so headers, code blocks, and inline styles are
+    /// applied. Emitted after `GuideStatus` when the sub-agent completes.
+    GuideResult(String),
     /// Image-attachment echo (`└ [Image #N]`). Emitted right after the
     /// `UiLine::User` row that contains the matching `[Image #N]`
     /// marker, so each renderer can align the `└` glyph at the same
