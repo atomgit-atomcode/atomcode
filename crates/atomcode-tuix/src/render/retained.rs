@@ -16,6 +16,7 @@
 //                                           ── render_diff → bytes
 //                                           ── out.write_all(bytes)
 
+use std::fs::File;
 use std::io::{BufWriter, Stdout, Write};
 
 use crossterm::event::{
@@ -401,10 +402,46 @@ struct LiveGroup {
     child_indices: std::collections::HashMap<String, usize>,
 }
 
-impl RetainedRenderer<BufWriter<Stdout>> {
+/// Wraps the real stdout writer with an optional mirror file. When
+/// `ATOMCODE_RENDER_DUMP=/path` is set at startup, every byte the
+/// renderer writes to stdout is also appended to that file. Used to
+/// diagnose xterm.js / shell-integration disagreements where the
+/// renderer-model thinks one thing but the on-screen result is
+/// different — having the exact byte stream lets us replay through
+/// any terminal emulator out-of-band. No-op overhead when the env
+/// var is unset (the `None` branch is a single conditional).
+pub struct StdoutTap {
+    inner: BufWriter<Stdout>,
+    mirror: Option<File>,
+}
+
+impl Write for StdoutTap {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(ref mut f) = self.mirror {
+            let _ = f.write_all(buf);
+        }
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(ref mut f) = self.mirror {
+            let _ = f.flush();
+        }
+        self.inner.flush()
+    }
+}
+
+impl RetainedRenderer<StdoutTap> {
     pub fn new(caps: TerminalCaps) -> Self {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-        Self::with_writer(BufWriter::new(std::io::stdout()), caps, w, h)
+        let mirror = std::env::var("ATOMCODE_RENDER_DUMP")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|path| File::create(path).ok());
+        let tap = StdoutTap {
+            inner: BufWriter::new(std::io::stdout()),
+            mirror,
+        };
+        Self::with_writer(tap, caps, w, h)
     }
 }
 
