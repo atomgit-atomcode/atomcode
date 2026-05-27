@@ -396,18 +396,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   public async sendEditorCommandMessage(text: string) {
     let sid = this._focusedPanelId;
+
     if (!sid) {
-      this.openInTab();
-      await new Promise(resolve => setTimeout(resolve, 500));
-      sid = this._focusedPanelId;
-    }
-    if (sid) {
+      // Create daemon session first, then open tab with sessionId
+      // so the panel is properly tracked for message routing.
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const session = await this._client.createSession(undefined, workspaceFolder);
+      sid = session.id;
+      this._getRuntime(sid).projectHash = session.project_hash;
+      this._panelSessions.set(sid, { sessionId: sid, projectHash: session.project_hash });
+      this.openInTab(sid);
+      await this._refreshSessions();
+    } else {
       const rt = this._sessionRuntimes.get(sid);
       if (rt?.isGenerating) {
         this.stopGeneration();
       }
+      await this._ensureSession(sid);
+      this._postMessageToPanel(sid, { type: 'clearChat' });
     }
-    await this._createEditorCommandSession();
+
     this._postMessage({ type: 'userMessage', text });
     await this._handleSend(text);
   }
@@ -661,15 +669,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return session.id;
   }
 
-  private async _createEditorCommandSession() {
-    let sid = this._focusedPanelId;
-    if (!sid) {
-      this.openInTab();
-      return;
-    }
-    this._postMessageToPanel(sid, { type: 'clearChat' });
-    await this._ensureSession(sid);
-  }
 
   public sendEditorContext() {
     this._sendEditorContext();
