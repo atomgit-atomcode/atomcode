@@ -277,6 +277,72 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
     flush_aligned_table_with_width(rows, caps, 0)
 }
 
+/// Split a markdown table row on `|`, honouring:
+///   * `` ` ``…`` ` `` inline code spans (pipes inside are literal, not
+///     separators — so Rust closures `|a, b|`, pattern alternatives
+///     `Foo | Bar`, bash pipes `cat | grep`, Python type unions
+///     `int | str` etc. inside backticks stay in one cell)
+///   * `\|` escape (standard markdown escape for a literal pipe in
+///     a cell)
+///   * Leading/trailing `|` delimiters (stripped so the edges aren't
+///     turned into empty cells)
+///
+/// Returns trimmed cell strings with backticks preserved (downstream
+/// inline formatter handles them). `\|` outside a code span is
+/// rewritten to a literal `|` in the cell so the renderer shows the
+/// pipe glyph without the backslash.
+fn split_table_row(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut cells: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_code = false;
+    let mut i = 0;
+    if !bytes.is_empty() && bytes[0] == b'|' {
+        i = 1;
+    }
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'`' {
+            in_code = !in_code;
+            current.push('`');
+            i += 1;
+            continue;
+        }
+        if !in_code && b == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+            current.push('|');
+            i += 2;
+            continue;
+        }
+        if !in_code && b == b'|' {
+            let rest = &line[i + 1..];
+            if rest.trim().is_empty() {
+                cells.push(current.trim().to_string());
+                current = String::new();
+                break;
+            }
+            cells.push(current.trim().to_string());
+            current = String::new();
+            i += 1;
+            continue;
+        }
+        let ch_len = if b < 128 {
+            1
+        } else {
+            let mut len = 1;
+            while i + len < bytes.len() && (bytes[i + len] & 0xc0) == 0x80 {
+                len += 1;
+            }
+            len
+        };
+        current.push_str(&line[i..i + ch_len]);
+        i += ch_len;
+    }
+    if !current.is_empty() || cells.is_empty() {
+        cells.push(current.trim().to_string());
+    }
+    cells
+}
+
 /// Width-aware variant. When `max_width > 0` and the table can't fit at its
 /// natural column widths, fall back to a flat key/value record format
 /// (`header: cell` per line, blank line between rows) so no information is
@@ -287,14 +353,8 @@ pub fn flush_aligned_table_with_width(
     caps: TerminalCaps,
     max_width: usize,
 ) -> String {
-    // Parse each row: strip leading/trailing '|', split by '|', trim cells.
-    let parsed: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| {
-            let s = r.trim_start_matches('|').trim_end_matches('|');
-            s.split('|').map(|c| c.trim().to_string()).collect()
-        })
-        .collect();
+    // Parse each row honouring code-span pipes + `\|` escape.
+    let parsed: Vec<Vec<String>> = rows.iter().map(|r| split_table_row(r)).collect();
 
     // Identify separator row(s) — cells match `[-: ]+` only.
     let is_sep = |row: &[String]| -> bool {
@@ -678,6 +738,106 @@ mod tests {
             lang: Some("en_US.UTF-8".to_string()),
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn split_table_row_handles_pipe_in_inline_code() {
+        let row = "| 闭包 | `|a, b| b.cmp(&a)` |";
+        assert_eq!(
+            split_table_row(row),
+            vec!["闭包".to_string(), "`|a, b| b.cmp(&a)`".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_handles_multiple_code_spans_with_pipes() {
+        let row = "| `cat | grep` | `int | str` | result |";
+        assert_eq!(
+            split_table_row(row),
+            vec![
+                "`cat | grep`".to_string(),
+                "`int | str`".to_string(),
+                "result".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn split_table_row_honours_backslash_escape() {
+        let row = "| literal \\| pipe | next |";
+        assert_eq!(
+            split_table_row(row),
+            vec!["literal | pipe".to_string(), "next".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_plain_no_codespan_unchanged() {
+        let row = "| a | b | c |";
+        assert_eq!(
+            split_table_row(row),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_no_leading_or_trailing_delim() {
+        let row = "a | b | c";
+        assert_eq!(
+            split_table_row(row),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_empty_cell_preserved() {
+        let row = "| a |  | c |";
+        assert_eq!(
+            split_table_row(row),
+            vec!["a".to_string(), "".to_string(), "c".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_with_cjk_content() {
+        let row = "| 模式匹配 | `Foo | Bar` 多模式 |";
+        assert_eq!(
+            split_table_row(row),
+            vec![
+                "模式匹配".to_string(),
+                "`Foo | Bar` 多模式".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn flush_aligned_table_rust_closure_renders_two_columns() {
+        // End-to-end: a table cell containing a Rust closure should
+        // NOT explode into phantom columns. Before the split_table_row
+        // fix, `|a, b|` inside the cell got split as separators and
+        // the body row showed 4+ vertical bars (header + 3 phantom
+        // separators). After the fix, only the real cell separator
+        // remains: borders + 1 between cell — at most 3 bars total.
+        let rows = vec![
+            "| 元素 | 示例 |".to_string(),
+            "| --- | --- |".to_string(),
+            "| 闭包 | `|a, b| b.cmp(&a)` |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let body_line = out
+            .lines()
+            .find(|l| l.contains("闭包"))
+            .expect("body row missing");
+        // Count only the box-drawing vertical `│` (U+2502) — the
+        // literal ASCII `|` inside the cell content `|a, b|` is
+        // expected and shouldn't be conflated with column borders.
+        let box_bar_count = body_line.chars().filter(|c| *c == '│').count();
+        assert_eq!(
+            box_bar_count, 3,
+            "expected exactly 3 box-drawing bars (left border + 1 sep + right border); \
+             got {} in {:?}",
+            box_bar_count, body_line,
+        );
     }
 
     #[test]
