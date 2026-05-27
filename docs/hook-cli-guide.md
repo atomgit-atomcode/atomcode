@@ -38,7 +38,7 @@ Hook Directories:
 - **Total** - 已加载的 Hook 总数
 - **Hook Directories** - Hooks 目录状态（✓ 表示存在，✗ 表示不存在）
 
-`Total` 会始终 ≥ 6（因为 6 个内置 Hook 自动注册）。
+`Total` 会始终 ≥ 8（6 个内置 Hook 产生 8 次 slot 注册）。
 
 ### 2. `atomcode hooks paths` - 查看配置路径
 
@@ -169,7 +169,9 @@ $ atomcode hooks list
 | `session_end` | — | 会话结束 |
 | `error` | — | 错误发生时 |
 | `system_prompt` | — | 构建系统 prompt 时 |
-| `message` | `message_received` | 用户消息接收时 |
+| `message`² | `message_received` | 用户消息接收时 |
+
+> ² `message`：WebhookHook 已实现对应 trait，但引擎尚未注册触发槽位，当前实际不可用。
 
 ### 只能通过内置 Hook 或 Webhook 触发的时机
 

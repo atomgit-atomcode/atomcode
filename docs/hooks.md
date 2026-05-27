@@ -172,9 +172,11 @@ timeout_secs = 3
 | `error` | — | 错误发生时 |
 | `model_response` | — | 模型响应完成后 |
 | `system_prompt` | — | 系统 Prompt 构建时 |
-| `message` | `message_received` | 用户消息接收时 |
+| `message`² | `message_received` | 用户消息接收时 |
 
 > 使用 **contains 匹配**（逗号分隔多个 trigger）。例如 `trigger = "pre_tool,post_tool"` 会在两个时机都触发。
+>
+> ² `message`：WebhookHook 已实现对应 trait，但引擎尚未注册触发槽位，当前实际不可用。
 
 ### 同步 Webhook
 

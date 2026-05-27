@@ -68,7 +68,7 @@ impl HookEngine {
         }
     }
 
-    // ── 注册方法 (10 个) ──────────────────────────────────────────
+    // ── 注册方法 (12 个) ──────────────────────────────────────────
 
     pub fn register_pre_tool_hook(&mut self, hook: Arc<dyn PreToolExecutionHook>) {
         if hook.is_enabled() {

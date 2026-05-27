@@ -141,7 +141,7 @@ Turn 完成
 
 | # | Hook 时机 | TOML ScriptHook | JSON CC | Webhook | 内置 Hook |
 |---|----------|:---:|:---:|:---:|:---:|
-| 1 | `OnMessageReceived` | — | — | ✅¹ | — |
+| 1 | `OnMessageReceived` | — | — | —¹ | — |
 | 2 | `OnTurnStart` | — | — | `turn_start` | `TurnStatsHook` |
 | 3 | `OnTurnComplete` (Turn 完成，含 token 等详细统计) | — | — | `turn_complete` / `after_turn` | `TurnStatsHook` + `AutoCommitHook` |
 | 4 | `PostTurn` (Turn 完成，旧版兼容，上下文较少) | `post_turn` | — | `post_turn` | — |

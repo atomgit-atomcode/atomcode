@@ -86,8 +86,10 @@ Webhook 支持除 OnUserPromptSubmit 外的所有 Hook 时机（共 12 种），
 | `error` | — | 错误发生时 |
 | `model_response` | — | 模型响应完成后 |
 | `system_prompt` | — | 系统 Prompt 构建时 |
-| `message` | `message_received` | 用户消息接收时 |
+| `message`² | `message_received` | 用户消息接收时 |
 
+> ² `message`：WebhookHook 已实现对应 trait，但引擎尚未注册触发槽位，当前实际不可用。
+>
 > **匹配规则**：使用 **contains（子串包含）** 匹配，因此 `on_turn_start`、`turn_start_hook` 等变体也能工作。但推荐使用上表的规范值，避免歧义。例如 `trigger = "error"` 会匹配所有含 "error" 的 trigger 字符串，如果同时写了 `trigger = "pre_tool,error"`，则该 Webhook 也会在错误事件触发。
 >
 > **注意**：Webhook 会注册到所有触发时机，但只会在 `trigger` 字段匹配时实际发送 HTTP 请求。
