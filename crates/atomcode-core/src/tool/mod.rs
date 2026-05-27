@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod auto_fix;
 pub mod bash;
 pub mod blast_radius;
