@@ -1679,12 +1679,12 @@ impl AgentLoop {
 
         // ── Task boundary cleanup ──
         // New user message = new task. If there's old context from the
-        // previous task (>12 messages), compress it unconditionally.
-        // This prevents dirty-start degradation where 20K+ of stale
+        // previous task, compress it unconditionally.
+        // This prevents dirty-start degradation where stale
         // conversation dilutes the batch prompt for the new task.
         // Unlike maybe_compress_history (which checks the 50% threshold),
-        // this fires at every task boundary regardless of token count.
-        if self.conversation.messages.len() > 12 {
+        // this fires at every task boundary when messages exceed KEEP_MESSAGES.
+        if self.conversation.messages.len() > crate::conversation::KEEP_MESSAGES {
             // Task-boundary compression goes through the active ctx strategy.
             // No LLM call — the compressed content is already
             // one-line-per-round summaries (DefaultCtx) compact enough
