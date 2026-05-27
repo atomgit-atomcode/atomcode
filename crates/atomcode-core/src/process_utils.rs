@@ -8,9 +8,14 @@
 
 /// Apply `CREATE_NO_WINDOW` to a `tokio::process::Command` on Windows.
 /// No-op on other platforms.
+///
+/// `tokio::process::Command::creation_flags` is an inherent method on
+/// Windows — unlike `std::process::Command` it does NOT require the
+/// `std::os::windows::process::CommandExt` trait to be in scope, which
+/// is why this body lacks the `use` statement that
+/// `suppress_console_window_sync` below needs.
 #[cfg(target_os = "windows")]
 pub fn suppress_console_window(cmd: &mut tokio::process::Command) {
-    use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
