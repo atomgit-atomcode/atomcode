@@ -355,7 +355,7 @@ trigger = "system_prompt"
 # ❌ 错误 — 这些值不会被 TOML ScriptHook 识别
 trigger = "tool_call_start"   # 仅内置/Webhook 可用
 trigger = "turn_complete"     # 仅内置/Webhook 可用
-trigger = "session_end"       # 仅 Webhook 可用
+trigger = "session_end"       # 仅 Webhook / JSON CC 可用
 ```
 
 ### 2. 使用全局 Hooks 做审计

@@ -55,8 +55,8 @@
 │                                                                 │
 │  engine.rs · HookEngine                                         │
 │  ├─ load_all(working_dir)    ← 唯一的配置入口                    │
-│  ├─ 10 个 register_* 方法                                       │
-│  └─ 6 个 trigger_* 方法 (async, 顺序遍历 Vec<Arc<dyn Trait>>)    │
+│  ├─ 12 个 register_* 方法                                       │
+│  └─ 12 个 trigger_*/collect_* 方法 (11 trigger_* + 1 collect_*)  │
 │                                                                 │
 │  关于 Arc:                                                       │
 │  TurnRunner 持有 Arc<HookEngine>，AgentLoop 持有同引用。           │

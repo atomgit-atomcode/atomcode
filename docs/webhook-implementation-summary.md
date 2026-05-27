@@ -287,7 +287,7 @@ Authorization = "Bearer AUDIT_TOKEN"
 ### 完成的工作
 
 1. ✅ **实现 Webhook Hook 核心模块** - ~748 行 Rust 代码
-2. ✅ **支持所有 11 个 Hook 时机** - 完整的 HTTP 远程调用
+2. ✅ **支持所有 12 个 Hook 时机** - 完整的 HTTP 远程调用
 3. ✅ **实现超时和重试机制** - 指数退避策略
 4. ✅ **支持自定义 Header** - 认证和元数据传递
 5. ✅ **集成配置加载系统** - hooks.toml 配置驱动

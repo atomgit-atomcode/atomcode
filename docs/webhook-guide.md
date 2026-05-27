@@ -71,7 +71,7 @@ enabled = true
 
 ## 支持的触发时机
 
-Webhook 支持所有 Hook 时机，trigger 字段可以包含以下值（逗号分隔多个）：
+Webhook 支持除 OnUserPromptSubmit 外的所有 Hook 时机（共 12 种），trigger 字段可以包含以下值（逗号分隔多个）：
 
 | trigger 值（规范） | 别名 | 触发时机 |
 |-----------|------|---------|
