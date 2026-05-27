@@ -651,6 +651,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let bytes = serialize_row(row);
                 let _ = self.out.write_all(&bytes);
             }
+            // Mirror `emit_body_line_inner`'s prev_cells resync (see
+            // its comment for the canonical write-up of this contract).
+            // The CUP+EL above blanked the physical terminal in those
+            // rows, and `serialize_row` wrote new content directly to
+            // stdout — but `screen.prev_cells` still holds whatever
+            // the previous frame's diff committed there (typically
+            // stale icon / elapsed-suffix cells from the prior spinner
+            // tick, or body content that occupied this slot before
+            // the inflight series began). Without resyncing, the next
+            // `render_diff` can suppress a patch for a cell whose new
+            // value happens to match the stale prev — leaving the row
+            // inconsistent with what the in-place write produced. The
+            // visible bug is "tool-call name characters show up as
+            // blanks" intermittently, surfacing once an approval
+            // prompt or other footer-expanding event reshuffles the
+            // body geometry and the next paint_frame computes patches
+            // against the wrong baseline. Invalidating the touched
+            // rows forces a full repaint on the next tick — costs
+            // ~N extra patches per spinner tick but keeps the diff
+            // cache in lockstep with the physical terminal.
+            let first_0idx = (first as usize).saturating_sub(1);
+            self.screen.invalidate_rows_from(first_0idx);
+            self.dirty = true;
         } else {
             // First render or row-count mismatch — fall back to scroll-push.
             // Drop any prior inflight rows from model state; push new rows
