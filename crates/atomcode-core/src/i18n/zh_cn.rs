@@ -112,7 +112,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusNoProvider =>
             "未配置 Provider · 使用 /provider 配置".into(),
         Msg::StatusOfficialBuildRequired =>
-            "CodingPlan 需要官方构建 · 前往 atomgit.com/atomgit_atomcode/atomcode/releases 下载".into(),
+            "CodingPlan 需要官方构建".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} 可用 · 使用 /upgrade 升级").into(),
         Msg::StatusModelNotConfigured =>

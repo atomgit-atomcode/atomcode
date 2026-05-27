@@ -120,7 +120,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusNoProvider =>
             "no provider · /provider to configure".into(),
         Msg::StatusOfficialBuildRequired =>
-            "CodingPlan needs the official build · download from atomgit.com/atomgit_atomcode/atomcode/releases".into(),
+            "CodingPlan needs the official build".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} available · /upgrade").into(),
         Msg::StatusModelNotConfigured =>
