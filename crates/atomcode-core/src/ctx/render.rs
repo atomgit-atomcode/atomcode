@@ -131,11 +131,21 @@ pub fn build_messages(
     // 短距离重读在 keep_recent 保护内又压缩不到。两头不讨好。
     // 正确方案需要更深入设计，不在这里做。
 
-    // Safety: if over 80% (or 60K absolute cap), drop oldest turns.
+    // Safety: if over 80% of budget, drop oldest turns.
     // BUT: skip if cold_summaries exist — that means LLM compression just ran
     // and we're looking at the "keep_full=5" survivor set. Dropping those too
     // would wipe ALL context (the bug that caused sent=0 in audit sessions).
-    let budget_80pct = (token_budget * 80 / 100).min(60000);
+    //
+    // Threshold matches the FINAL BYTE CEILING below (line ~326). Earlier this
+    // line was `min(budget × 80%, 60K)`; the 60K cap is from the pre-1M-context
+    // era and made the drop path fire ~16× sooner than the FINAL BYTE CEILING
+    // on a 1M-window model — turning the LLM-compression main path
+    // (`needs_compression` fires at budget − 13K = 987K on 1M) into a fallback
+    // that almost never ran. User-reported symptom: with `context_window = 1M`
+    // configured, `build_messages` clamped its drop budget to 60K and the
+    // model went blind on conversations that should comfortably fit. See the
+    // 2026-05-27 audit screenshot for the data-flow trace.
+    let budget_80pct = token_budget * 80 / 100;
     let total_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
     let mut dropped_tokens = 0usize;
 
@@ -313,9 +323,9 @@ pub fn build_messages(
     }
 
     // ── FINAL BYTE CEILING (last-line-of-defense) ──
-    // microcompact protects the last 20 messages; the 80% drop cap at
-    // line ~181 skips entirely when `cold_summaries` is populated
-    // (legacy protection against a since-fixed pathology). That
+    // microcompact protects the last 20 messages; the 80% drop path
+    // above skips entirely when `cold_summaries` is populated (legacy
+    // protection against a since-fixed pathology). That
     // leaves the recent window with no byte enforcement, so accumulated
     // mid-sized ToolResults can still blow the budget. Single
     // oldest-first forward pass: condense each ToolResult once only
@@ -1284,6 +1294,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: MessageContent::ToolResultRef(big_ref),
+                    synthetic: false,
         };
         // (5 + 10) / 4 + 4 = 7. Pre-fix this was (200000 + 10) / 4 + 4 = 50006.
         assert!(
@@ -1415,6 +1426,86 @@ mod tests {
         assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
         // System prompt must be first
         assert!(matches!(msgs[0].role, Role::System));
+    }
+
+    /// Regression for the 1M-ctx drop-too-early bug: with `token_budget`
+    /// = 1_000_000, a ~200K-token conversation should NOT trigger the
+    /// drop-oldest-turns path (200K is comfortably under 80% = 800K).
+    /// Pre-fix the threshold was `min(budget × 80%, 60K)`, so 200K
+    /// > 60K → `dropped_tokens > 0` and the model saw a pruned
+    /// transcript despite the ostensibly huge context window.
+    ///
+    /// Companion to `test_budgeted_drops_oldest_turns_when_over_budget`
+    /// (small budget, drop fires) — together they pin both ends of the
+    /// scaling: drop must fire at the 80% threshold, not at a fixed
+    /// 60K floor.
+    #[test]
+    fn budgeted_does_not_drop_under_80pct_of_1m_budget() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Build ~200K tokens of conversation: 25 tool results × 8000
+        // tokens each (32000 chars / 4 = 8000). Stays well under 80%
+        // of 1M (= 800K), so no drop should fire.
+        for turn in 0..25 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("call_{}", turn),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"file_path":"/tmp/f_{}.rs"}}"#, turn),
+            };
+            conv.add_assistant_tool_calls(None, vec![call], None);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", turn),
+                output: "x".repeat(32_000),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what?");
+
+        let (_msgs, stats) = build_messages(&conv, "sys", 1_000_000, "");
+        assert_eq!(
+            stats.dropped_tokens, 0,
+            "200K tokens under 1M budget (80%=800K) must not drop \
+             any turns — pre-fix the 60K cap clipped this to 60K and \
+             dropped most of the history despite the 1M window."
+        );
+    }
+
+    /// Companion to the no-drop test above: same 1M budget, but now
+    /// the conversation genuinely exceeds 80% (= 800K). Drop MUST
+    /// fire, otherwise the safety floor is missing.
+    #[test]
+    fn budgeted_drops_when_over_80pct_of_1m_budget() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // ~1M tokens of conversation: 32 tool results × ~32K tokens
+        // each (128K chars / 4 = 32K). Total well above 800K.
+        for turn in 0..32 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("call_{}", turn),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"file_path":"/tmp/f_{}.rs"}}"#, turn),
+            };
+            conv.add_assistant_tool_calls(None, vec![call], None);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", turn),
+                output: "x".repeat(128_000),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what?");
+
+        let (msgs, stats) = build_messages(&conv, "sys", 1_000_000, "");
+        assert!(
+            stats.dropped_tokens > 0,
+            "over-800K conversation on 1M budget must trigger the \
+             80% drop floor"
+        );
+        // Latest user message must still survive (HARD FLOOR invariant).
+        assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
     }
 
     #[test]
@@ -1572,6 +1663,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -1580,6 +1672,7 @@ mod tests {
                     output: format!("first line for {}\n{}", name, "x".repeat(4_000)),
                     success: *success,
                 }),
+                            synthetic: false,
             });
         }
 
@@ -1839,6 +1932,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -1847,6 +1941,7 @@ mod tests {
                     output: format!("[elapsed: 0.0s, exit: 0]\n{}", "p".repeat(4_000)),
                     success: true,
                 }),
+                            synthetic: false,
             });
         }
 
@@ -1866,6 +1961,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -1874,6 +1970,7 @@ mod tests {
                     output: format!("[elapsed: 0.0s, exit: 0]\n{}", "c".repeat(4_000)),
                     success: true,
                 }),
+                            synthetic: false,
             });
         }
 
@@ -2212,6 +2309,7 @@ mod tests {
                     output: "some output".to_string(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message::new(Role::User, "hello"),
         ];
@@ -2240,6 +2338,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2248,6 +2347,7 @@ mod tests {
                     output: "ok".to_string(),
                     success: true,
                 }),
+                            synthetic: false,
             },
         ];
         sanitize_messages(&mut msgs);
@@ -2291,6 +2391,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2299,6 +2400,7 @@ mod tests {
                     output: "ok1".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2307,6 +2409,7 @@ mod tests {
                     output: "ok2".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             // c3 result MISSING — the source of the 400.
             Message::new(Role::User, "second"),
@@ -2346,6 +2449,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2354,6 +2458,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             // a2 missing.
             Message {
@@ -2368,6 +2473,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2376,6 +2482,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
         ];
         sanitize_messages(&mut msgs);
@@ -2417,6 +2524,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2425,6 +2533,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             // c2 missing, conversation ends here.
         ];
@@ -2462,6 +2571,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2470,6 +2580,7 @@ mod tests {
                     output: "ok1".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2478,6 +2589,7 @@ mod tests {
                     output: "ok2".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message::new(Role::Assistant, "done"),
             Message::new(Role::User, "second"),
@@ -2608,6 +2720,7 @@ mod tests {
                         reasoning_content: None,
                         thinking_blocks: Vec::new(),
                     },
+                                    synthetic: false,
                 });
                 msgs.push(Message {
                     role: Role::Tool,
@@ -2616,6 +2729,7 @@ mod tests {
                         output: "x".repeat(1000),
                         success: true,
                     }),
+                                    synthetic: false,
                 });
             }
             msgs

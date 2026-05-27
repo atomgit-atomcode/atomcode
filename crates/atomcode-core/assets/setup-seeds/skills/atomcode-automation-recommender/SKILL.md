@@ -288,7 +288,7 @@ Use the Write tool to create `.atomcode/skills/<name>/SKILL.md` with the reviewe
 **Commands:**
 Use the Write tool to create `.atomcode/commands/<name>.md`.
 
-**After installation**, confirm:
+**After installation**, confirm with the user:
 ```
 ✅ 安装完成！
 

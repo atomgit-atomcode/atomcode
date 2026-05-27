@@ -1,5 +1,6 @@
 // crates/atomcode-tuix/src/render/mod.rs
-pub mod alt_screen;
+#[cfg(windows)]
+pub mod conhost;
 pub mod cell;
 pub mod plain;
 pub mod qr;
@@ -9,6 +10,25 @@ pub mod theme;
 pub mod worker;
 
 use std::time::Duration;
+
+/// Boundary marker for an originated message in the body buffer. Drives
+/// "jump to prev/next message" navigation keys. Marked at push time;
+/// kept in sync when body_lines drains from the front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    User,
+    Assistant,
+    ToolCall,
+    ToolResult,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MessageMark {
+    /// Index into the renderer's visible body buffer (`Vec<Vec<Cell>>`).
+    /// Drives "jump to message" — viewport_top is compared against this.
+    pub line_idx: usize,
+    pub kind: MarkKind,
+}
 
 /// Semantic line to render. Renderer implementations translate this to bytes.
 ///
@@ -237,23 +257,17 @@ pub trait Renderer: Send {
     /// stdout (plain/pipe mode) can't retract them.
     fn pop_approval_prompt(&mut self) {}
 
-    /// Terminal window was resized to `(cols, rows)`. DECSTBM-based
-    /// renderers must re-issue the scroll region (`\x1b[1;H-N r`) so
-    /// the fixed footer stays pinned to the new bottom. Non-DECSTBM
-    /// renderers can treat this as a redraw hint or a no-op.
-    ///
-    /// Default is no-op — backends that don't care about geometry
-    /// (Plain, tests) don't need to override.
+    /// Terminal window was resized to `(cols, rows)`. The retained
+    /// backend uses this to re-flow body width and reposition the
+    /// pinned footer; non-geometry-sensitive backends (Plain, tests)
+    /// keep the no-op default.
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
 
     /// Scroll the body viewport up (negative `delta`) or down
-    /// (positive `delta`) by `delta` rows. Used by AltScreenRenderer
-    /// to support PageUp / PageDown / arrow-up scrollback navigation
-    /// inside the alt-screen (where the host terminal's native
-    /// scrollback is unavailable).
+    /// (positive `delta`) by `delta` rows.
     ///
     /// Default no-op for renderers that delegate scrollback to the
-    /// host terminal (RetainedRenderer's DECSTBM path; PlainRenderer
+    /// host terminal (RetainedRenderer's append-only path; PlainRenderer
     /// streaming to stdout).
     fn scroll_body(&mut self, _delta: i32) {}
 
@@ -261,26 +275,6 @@ pub trait Renderer: Send {
     /// scrollback. Used for Home / End key handling.
     fn scroll_body_to_top(&mut self) {}
     fn scroll_body_to_bottom(&mut self) {}
-
-    /// Mouse text-selection hooks. Backends that own mouse capture can
-    /// override these; streaming/native-scrollback backends keep host
-    /// terminal selection behavior and no-op here.
-    fn begin_selection(&mut self, _col: u16, _row: u16) {}
-    fn update_selection(&mut self, _col: u16, _row: u16) {}
-    fn end_selection(&mut self) {}
-
-    /// Copy the current mouse-selection text to the system clipboard
-    /// (using arboard, not OSC 52) and clear the selection highlight.
-    /// Returns `true` if a non-empty selection was copied.
-    ///
-    /// This is the Ctrl+C fallback for terminals (Windows Terminal,
-    /// conhost) that ignore OSC 52 — the user selects text with the
-    /// mouse, then presses Ctrl+C to copy it. AltScreenRenderer
-    /// implements this; other backends return `false` (they use the
-    /// host terminal's native selection).
-    fn copy_selection(&mut self) -> bool {
-        false
-    }
 
     /// Update the cached welcome banner's model / working_dir fields in
     /// place and trigger a repaint of the banner rows. Used after the
@@ -294,6 +288,13 @@ pub trait Renderer: Send {
     /// Default no-op: renderers without a retained body buffer can't
     /// edit already-emitted rows in place.
     fn refresh_welcome_banner(&mut self, _model: &str, _working_dir: &str) {}
+
+    /// Jump body viewport to the prev/next message boundary. No-op when no
+    /// such boundary exists in the configured direction.
+    fn scroll_to_prev_message(&mut self) {}
+    fn scroll_to_next_message(&mut self) {}
+    fn scroll_to_prev_user_message(&mut self) {}
+    fn scroll_to_next_user_message(&mut self) {}
 }
 
 /// Visual style for the menu popup. Drives whether the renderer prefixes

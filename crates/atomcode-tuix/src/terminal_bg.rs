@@ -224,6 +224,12 @@ unsafe fn poll_read(fd: i32, deadline: std::time::Instant, out: &mut [u8]) -> us
 /// Tolerates leading garbage (pre-existing keystrokes in stdin) by
 /// scanning for `rgb:`. Tolerates trailing garbage (BEL / ST / partial
 /// next response) by stopping at the first non-hex char.
+///
+/// Gated to `unix` + `test` builds: the only non-test caller is
+/// `detect_light_unix`, and Windows has no OSC 11 read path (its
+/// stub `detect_light` returns `None`). Without this gate `cargo
+/// build` on Windows warns `dead_code` here.
+#[cfg(any(unix, test))]
 pub(crate) fn parse_osc11_response(bytes: &[u8]) -> Option<bool> {
     // Allow non-UTF-8 prefix bytes (a stray keystroke could be any
     // byte); slice to the start of `rgb:` and parse from there as
@@ -251,6 +257,11 @@ pub(crate) fn parse_osc11_response(bytes: &[u8]) -> Option<bool> {
 /// hex-digit-prefix-only and normalises to 0..=255 based on observed
 /// width — so `rgb:ff/ff/ff` and `rgb:ffff/ffff/ffff` both come out
 /// as 255.0.
+///
+/// Mirror cfg gate of `parse_osc11_response` — only that function and
+/// the tests reach this helper, so Windows non-test builds would
+/// otherwise flag it as dead code.
+#[cfg(any(unix, test))]
 fn parse_hex_component(s: &str) -> Option<f64> {
     let hex: String = s.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
     if hex.is_empty() {

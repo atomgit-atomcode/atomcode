@@ -1,16 +1,77 @@
 // crates/atomcode-tuix/src/width.rs
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
-/// Terminal column width of a string, CJK-aware.
+/// Display width of a single user-perceived character (grapheme cluster).
+///
+/// `UnicodeWidthChar::width` operates per code point and doesn't know about
+/// ZWJ joiners, variation selectors, skin-tone modifiers, or regional
+/// indicators. Summing per-char widths gives the wrong answer for emoji
+/// sequences that modern terminals render as a single glyph:
+///   - 👨‍👩‍👦 (man + ZWJ + woman + ZWJ + boy) renders as 1 emoji = 2 cols
+///   - ❤️ (heart + VS-16) renders as 1 emoji = 2 cols (VS-16 forces emoji
+///     presentation of an otherwise text-width 1 codepoint)
+///   - 👍🏽 (thumb + skin-tone) renders as 1 emoji = 2 cols
+///   - 🇺🇸 (regional indicators) renders as 1 flag = 2 cols
+///
+/// Cluster width strategy:
+///   - Single code point: width per UnicodeWidthChar (handles CJK, plain
+///     emoji, ASCII, combining marks-as-base, etc.).
+///   - Multi code point + contains any emoji-presentation marker
+///     (ZWJ U+200D, VS-16 U+FE0F, skin-tone U+1F3FB..=U+1F3FF, regional
+///     indicator U+1F1E6..=U+1F1FF): treat as one emoji = 2 cols. This is
+///     the convention iTerm2 / Kitty / WezTerm / Terminal.app (recent)
+///     follow when rendering Unicode emoji clusters.
+///   - Multi code point without an emoji marker (e.g. `a` + combining
+///     grave): take the max per-char width — combining marks contribute 0,
+///     so the result is the base character's width.
+pub(crate) fn cluster_width(g: &str) -> usize {
+    let mut iter = g.chars();
+    let Some(first) = iter.next() else {
+        return 0;
+    };
+    if iter.clone().next().is_none() {
+        return UnicodeWidthChar::width(first).unwrap_or(0);
+    }
+    let mut has_emoji_marker = false;
+    let mut max_w = UnicodeWidthChar::width(first).unwrap_or(0);
+    for c in std::iter::once(first).chain(iter) {
+        match c {
+            '\u{200D}' | '\u{FE0F}' => has_emoji_marker = true,
+            '\u{1F3FB}'..='\u{1F3FF}' => has_emoji_marker = true,
+            '\u{1F1E6}'..='\u{1F1FF}' => has_emoji_marker = true,
+            _ => {}
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w > max_w {
+            max_w = w;
+        }
+    }
+    if has_emoji_marker {
+        2
+    } else {
+        max_w
+    }
+}
+
+/// Terminal column width of a string, CJK- and emoji-cluster-aware.
+///
+/// Walks user-perceived characters (grapheme clusters) rather than raw
+/// code points so multi-codepoint emoji (ZWJ sequences, VS-16, skin-tone
+/// modifiers, regional-indicator flags) report their rendered width — see
+/// [`cluster_width`] for the per-cluster rule.
 pub fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum()
+    s.graphemes(true).map(cluster_width).sum()
 }
 
 /// Split a line (possibly containing SGR escape sequences) into chunks
 /// whose visible display width is at most `max_cols`. SGR bytes pass
 /// through without consuming display columns. Handles CJK/emoji width.
+///
+/// Cluster-aware: walks user-perceived characters (grapheme clusters)
+/// not raw code points, so ZWJ-joined emoji families / VS-16 hearts /
+/// skin-tone modifiers count as a single 2-col cluster and never get
+/// split across a wrap boundary. Mirrors [`truncate_to_width`].
 ///
 /// This is the renderer-side replacement for terminal autowrap: we cannot
 /// trust the terminal to wrap consistently at scroll-region boundaries,
@@ -22,28 +83,41 @@ pub fn wrap_line_to_width(line: &str, max_cols: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut cur_width = 0usize;
-    let mut chars = line.chars().peekable();
 
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // SGR passthrough — doesn't count toward display width.
-            current.push(c);
-            while let Some(&p) = chars.peek() {
-                chars.next();
-                current.push(p);
-                if p.is_ascii_alphabetic() || p == '~' {
+    // Walk by byte cursor so we can special-case SGR escapes (which
+    // span multiple ASCII chars, each its own grapheme) and consume
+    // them as a single non-width unit. Outside SGR, advance grapheme
+    // by grapheme and count `cluster_width`.
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < line.len() {
+        if bytes[i] == 0x1b {
+            let start = i;
+            i += 1;
+            while i < line.len() {
+                let c = bytes[i];
+                i += 1;
+                if c.is_ascii_alphabetic() || c == b'~' {
                     break;
                 }
             }
+            current.push_str(&line[start..i]);
             continue;
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        let next = line[i..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(idx, _)| idx + i)
+            .unwrap_or(line.len());
+        let g = &line[i..next];
+        let w = cluster_width(g);
         if cur_width + w > max_cols && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
             cur_width = 0;
         }
-        current.push(c);
+        current.push_str(g);
         cur_width += w;
+        i = next;
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -72,37 +146,40 @@ pub fn wrap_with_cursor(
     }
     let mut lines: Vec<String> = vec![String::new()];
     let mut col = 0usize;
-    let mut byte = 0usize;
     let mut cursor_row = 0usize;
     let mut cursor_col = 0usize;
     let mut cursor_set = false;
 
-    for c in text.chars() {
-        // Wrap check BEFORE writing the char, so a cursor that lands
-        // at byte==boundary appears on the new row at col 0 rather
-        // than pinned to col `max_cols` on the old row (which would
-        // overlap the right border).
-        if c != '\n' {
-            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+    // Walk grapheme-by-grapheme so emoji clusters / CJK don't get
+    // split mid-cluster at the wrap point. Honours explicit `\n` (a
+    // single-codepoint, single-grapheme entity) as a hard break.
+    for (byte_pos, g) in text.grapheme_indices(true) {
+        let is_newline = g == "\n";
+        // Wrap check BEFORE writing the cluster, so a cursor that
+        // lands at byte_pos == cursor_byte right at the wrap boundary
+        // appears on the new row at col 0 rather than pinned to col
+        // `max_cols` on the old row (which would overlap the right
+        // border).
+        if !is_newline {
+            let w = cluster_width(g);
             if col + w > max_cols && !lines.last().unwrap().is_empty() {
                 lines.push(String::new());
                 col = 0;
             }
         }
-        if !cursor_set && byte == cursor_byte {
+        if !cursor_set && byte_pos == cursor_byte {
             cursor_row = lines.len() - 1;
             cursor_col = col;
             cursor_set = true;
         }
-        if c == '\n' {
+        if is_newline {
             lines.push(String::new());
             col = 0;
         } else {
-            let w = UnicodeWidthChar::width(c).unwrap_or(0);
-            lines.last_mut().unwrap().push(c);
+            let w = cluster_width(g);
+            lines.last_mut().unwrap().push_str(g);
             col += w;
         }
-        byte += c.len_utf8();
     }
 
     // Cursor at end-of-buffer falls through.
@@ -121,8 +198,11 @@ pub fn slice_cols(s: &str, start_col: usize, max_cols: usize) -> String {
     let mut col = 0usize;
     let mut acc = String::new();
     let mut acc_w = 0usize;
-    for c in s.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+    // Cluster-aware: never emit half a grapheme — a mid-cluster slice
+    // would leak a dangling ZWJ/VS-16/skin-tone modifier into the
+    // result and render as gibberish downstream.
+    for g in s.graphemes(true) {
+        let w = cluster_width(g);
         if col + w <= start_col {
             col += w;
         } else if col < start_col {
@@ -131,7 +211,7 @@ pub fn slice_cols(s: &str, start_col: usize, max_cols: usize) -> String {
             if acc_w + w > max_cols {
                 break;
             }
-            acc.push(c);
+            acc.push_str(g);
             acc_w += w;
             col += w;
         }
@@ -140,19 +220,22 @@ pub fn slice_cols(s: &str, start_col: usize, max_cols: usize) -> String {
 }
 
 /// Truncate `s` so its display width is at most `max_cols`.
-/// Guaranteed to return a valid UTF-8 string that never splits a grapheme.
+/// Guaranteed to return a valid UTF-8 string that never splits a grapheme
+/// cluster — important for multi-codepoint emoji where a mid-cluster cut
+/// would leave a dangling ZWJ / VS-16 / skin-tone modifier visible in the
+/// downstream string.
 pub fn truncate_to_width(s: &str, max_cols: usize) -> String {
     if max_cols == 0 {
         return String::new();
     }
     let mut acc = String::with_capacity(s.len());
     let mut cols = 0usize;
-    for c in s.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+    for g in s.graphemes(true) {
+        let w = cluster_width(g);
         if cols + w > max_cols {
             break;
         }
-        acc.push(c);
+        acc.push_str(g);
         cols += w;
     }
     acc
@@ -433,5 +516,146 @@ mod tests {
         let tinted = "\x1b[3;38;2;124;132;153m// comment\x1b[23;39m";
         let chunks = wrap_line_to_width(tinted, 10);
         assert_eq!(chunks.len(), 1);
+    }
+
+    // --- grapheme-cluster width tests ---
+    //
+    // These tests pin terminal-display semantics for multi-codepoint emoji
+    // clusters: ZWJ sequences (family emoji), VS-16 (text→emoji presentation)
+    // and skin-tone modifiers are rendered by modern terminals (iTerm2,
+    // Kitty, WezTerm, recent Terminal.app) as a single emoji of width 2.
+    // Summing per-char widths gives the wrong answer; cursor placement and
+    // truncation must use the cluster-aggregated width.
+
+    #[test]
+    fn display_width_zwj_family_is_one_emoji() {
+        // 👨‍👩‍👦 = U+1F468 U+200D U+1F469 U+200D U+1F466
+        // Sum of per-char widths = 2+0+2+0+2 = 6. As one ZWJ-joined emoji = 2.
+        let family = "👨\u{200D}👩\u{200D}👦";
+        assert_eq!(display_width(family), 2);
+    }
+
+    #[test]
+    fn display_width_heart_with_vs16_is_emoji_width() {
+        // ❤️ = U+2764 (width 1, text presentation) + U+FE0F (VS-16, forces
+        // emoji presentation). Rendered as an emoji = width 2.
+        assert_eq!(display_width("❤\u{FE0F}"), 2);
+    }
+
+    #[test]
+    fn display_width_emoji_with_skin_tone_modifier() {
+        // 👍🏽 = U+1F44D U+1F3FD. Sum = 4; cluster = 2.
+        assert_eq!(display_width("👍\u{1F3FD}"), 2);
+    }
+
+    #[test]
+    fn truncate_to_width_does_not_split_zwj_cluster() {
+        // Cluster has display width 2. Budget of 2 must accept the whole
+        // cluster, not return "👨\u{200D}" (a broken cluster — the trailing
+        // ZWJ leaks into whatever string is concatenated after).
+        let family = "👨\u{200D}👩\u{200D}👦";
+        assert_eq!(truncate_to_width(family, 2), family);
+    }
+
+    #[test]
+    fn truncate_to_width_drops_cluster_that_does_not_fit() {
+        // Budget < cluster width → drop the whole cluster (don't emit half).
+        let family = "👨\u{200D}👩\u{200D}👦";
+        assert_eq!(truncate_to_width(family, 1), "");
+    }
+
+    // --- cluster-aware tests for wrap / slice / wrap_with_cursor ---
+    //
+    // These pin the same "never split a grapheme cluster" property that
+    // truncate_to_width already guarantees, now extended to the wrap and
+    // slice paths. Pre-fix these were per-codepoint and would chop ZWJ
+    // families / VS-16 hearts / skin-tone modifiers mid-cluster, leaving
+    // a dangling joiner visible in the output and corrupting downstream
+    // grapheme counts.
+
+    #[test]
+    fn wrap_line_to_width_does_not_split_zwj_cluster() {
+        // Family = width 2. Budget = 2 → must fit on one chunk.
+        let family = "👨\u{200D}👩\u{200D}👦";
+        let chunks = wrap_line_to_width(family, 2);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], family);
+    }
+
+    #[test]
+    fn wrap_line_to_width_pushes_zwj_cluster_to_next_chunk() {
+        // "ab" (2 cols) + family (2 cols) at budget 2 → "ab" | family,
+        // not "ab👨\u{200D}" with a dangling ZWJ.
+        let family = "👨\u{200D}👩\u{200D}👦";
+        let input = format!("ab{family}");
+        let chunks = wrap_line_to_width(&input, 2);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "ab");
+        assert_eq!(chunks[1], family);
+    }
+
+    #[test]
+    fn wrap_line_to_width_sgr_passthrough_still_works() {
+        // Regression: post-cluster-aware refactor must still treat SGR
+        // as zero-width and pass it through. The visible content is 11
+        // cols ("hello world") at budget 5 → 3 chunks; key assertion is
+        // that chunk 0 contains "hello" AND the SGR open (i.e. the SGR
+        // didn't get counted toward the 5-col budget and force an
+        // earlier wrap).
+        let tinted = "\x1b[38;2;198;120;221mhello\x1b[0m world";
+        let chunks = wrap_line_to_width(tinted, 5);
+        assert!(chunks[0].contains("\x1b[38;2;198;120;221m"));
+        assert!(chunks[0].contains("hello"));
+        // And the SGR open must be present BEFORE "hello" — proving it
+        // was carried verbatim and not split off as its own chunk.
+        let h_pos = chunks[0].find('h').unwrap();
+        let sgr_pos = chunks[0].find("\x1b[").unwrap();
+        assert!(sgr_pos < h_pos, "SGR must precede 'hello' in chunk 0");
+    }
+
+    #[test]
+    fn slice_cols_does_not_split_zwj_cluster() {
+        // "ab👨\u{200D}👩\u{200D}👦cd" — start_col=2 (after "ab"), width=2.
+        // The cluster at col 2-3 must be selected whole, not chopped.
+        let family = "👨\u{200D}👩\u{200D}👦";
+        let input = format!("ab{family}cd");
+        let out = slice_cols(&input, 2, 2);
+        assert_eq!(out, family);
+    }
+
+    #[test]
+    fn slice_cols_cluster_straddling_start_is_skipped() {
+        // start_col=3 falls mid-cluster (cluster spans col 2-3). The
+        // cluster gets skipped (the existing "straddle" branch). Next
+        // chars at col 4 ("c") and 5 ("d") fit in width 2.
+        let family = "👨\u{200D}👩\u{200D}👦";
+        let input = format!("ab{family}cd");
+        let out = slice_cols(&input, 3, 2);
+        assert_eq!(out, "cd");
+    }
+
+    #[test]
+    fn wrap_with_cursor_does_not_split_zwj_cluster() {
+        // Family = width 2 = whole cluster. max_cols=3, prefix "a" (1
+        // col) + family (2 col) = 3 = fits. Cursor after family.
+        let family = "👨\u{200D}👩\u{200D}👦";
+        let input = format!("a{family}");
+        let cursor_byte = input.len();
+        let (lines, r, _c) = wrap_with_cursor(&input, 3, cursor_byte);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], input);
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn wrap_with_cursor_pushes_zwj_cluster_to_new_row() {
+        // max_cols=2, "ab" then family. Family needs 2 cols, "ab" took
+        // both → family goes on row 1 intact.
+        let family = "👨\u{200D}👩\u{200D}👦";
+        let input = format!("ab{family}");
+        let (lines, _r, _c) = wrap_with_cursor(&input, 2, 0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "ab");
+        assert_eq!(lines[1], family);
     }
 }

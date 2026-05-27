@@ -80,6 +80,29 @@ pub enum MessageContent {
 pub struct Message {
     pub role: Role,
     pub content: MessageContent,
+    /// True when this `Role::User` message was authored by the agent
+    /// itself (not the human), and is being routed through the user
+    /// channel for plumbing reasons.
+    ///
+    /// Known sources of synthetic user injections:
+    /// - `[Additional context from user]: ...` — streaming-input append
+    /// - `Output limit hit. ...` — model-truncation self-retry prompt
+    /// - `[Context was compressed. ...]` — post-compaction state summary
+    ///
+    /// Compaction's "sacred message" logic (`hard_truncate_to_target`)
+    /// uses this flag to find the original user prompt instead of the
+    /// most recent synthetic injection — without it, the original
+    /// prompt that anchors `/resume` display gets dropped.
+    ///
+    /// `#[serde(default)]` so sessions saved before this field existed
+    /// load as `false` (i.e., treated as real user messages). Safer
+    /// default for sacred protection — better to over-preserve old
+    /// messages than to mis-classify a real prompt as synthetic.
+    ///
+    /// `#[serde(skip_serializing_if)]` keeps the common case (synthetic
+    /// = false) out of the JSON so existing session files don't bloat.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synthetic: bool,
 }
 
 impl Message {
@@ -87,6 +110,19 @@ impl Message {
         Self {
             role,
             content: MessageContent::Text(content.into()),
+            synthetic: false,
+        }
+    }
+
+    /// Construct a synthetic `Role::User` message — an agent-authored
+    /// injection routed through the user channel (see `Message.synthetic`
+    /// for the full origin list). Compaction filters these out when
+    /// finding the "real" first/last user message to keep sacred.
+    pub fn synthetic_user(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: MessageContent::Text(content.into()),
+            synthetic: true,
         }
     }
 
@@ -191,6 +227,7 @@ impl Message {
                         output: summary,
                         success: r.success,
                     }),
+                                    synthetic: false,
                 }
             }
             // ToolResultRef is already condensed (only holds a summary).
@@ -337,6 +374,7 @@ mod tests {
                 output: output.to_string(),
                 success: true,
             }),
+                    synthetic: false,
         }
     }
 
@@ -470,6 +508,7 @@ mod tests {
                 text: Some("hello".to_string()),
                 images: vec![],
             },
+                    synthetic: false,
         };
         assert_eq!(msg.text(), Some("hello"));
     }
@@ -482,6 +521,7 @@ mod tests {
                 text: None,
                 images: vec![],
             },
+                    synthetic: false,
         };
         assert_eq!(msg.text(), None);
     }
@@ -494,6 +534,7 @@ mod tests {
                 text: Some("short".to_string()),
                 images: vec![sample_image_part(), sample_image_part()],
             },
+                    synthetic: false,
         };
         let tokens = msg.estimate_tokens();
         // 2 images * 1600 = 3200, plus text and message overhead.
@@ -512,6 +553,7 @@ mod tests {
                 text: Some("hello world".to_string()),
                 images: vec![],
             },
+                    synthetic: false,
         };
         let tokens = msg.estimate_tokens();
         // No images: "hello world" = 11 chars -> 11/4 = 2 (max with 1) + 0*1600 + 4 = 6
@@ -527,6 +569,7 @@ mod tests {
                 text: Some("look at this".to_string()),
                 images: vec![sample_image_part()],
             },
+                    synthetic: false,
         };
         assert!(!msg.is_tool_result());
     }
@@ -539,6 +582,7 @@ mod tests {
                 text: Some("analyze this".to_string()),
                 images: vec![sample_image_part()],
             },
+                    synthetic: false,
         };
         let condensed = msg.condensed("");
         match (&msg.content, &condensed.content) {
@@ -559,5 +603,81 @@ mod tests {
             }
             _ => panic!("condensed MultiPart should remain MultiPart"),
         }
+    }
+
+    // ── synthetic field tests ─────────────────────────────────────────
+
+    /// `Message::new` produces a non-synthetic message — the field
+    /// defaults to false for the normal real-user / assistant / tool
+    /// construction path.
+    #[test]
+    fn message_new_is_not_synthetic() {
+        let m = Message::new(Role::User, "hello");
+        assert!(!m.synthetic);
+    }
+
+    /// `Message::synthetic_user` always tags `synthetic = true` and
+    /// uses `Role::User`. Compaction's `hard_truncate_to_target` and
+    /// session naming both filter `!m.synthetic` to find the original
+    /// prompt; this constructor is the canonical way for the agent to
+    /// inject a message through the user channel without lying about
+    /// authorship.
+    #[test]
+    fn synthetic_user_constructor_sets_flag() {
+        let m = Message::synthetic_user("[Context was compressed.] state");
+        assert!(m.synthetic);
+        assert_eq!(m.role, Role::User);
+        assert_eq!(m.text(), Some("[Context was compressed.] state"));
+    }
+
+    /// Sessions saved before `synthetic` existed must load with
+    /// `synthetic = false`. This locks the `#[serde(default)]` attr —
+    /// removing it would break every existing session JSON on disk
+    /// (deserializing would fail with `missing field`).
+    #[test]
+    fn deserializing_legacy_json_without_field_defaults_to_false() {
+        let legacy_json = r#"{
+            "role":"User",
+            "content":{"Text":"first prompt"}
+        }"#;
+        let m: Message = serde_json::from_str(legacy_json)
+            .expect("legacy JSON without `synthetic` field must deserialize");
+        assert!(
+            !m.synthetic,
+            "missing field must default to false, got {}",
+            m.synthetic
+        );
+        assert_eq!(m.text(), Some("first prompt"));
+    }
+
+    /// Serializing a non-synthetic message must NOT emit the
+    /// `"synthetic": false` key — the common case. Keeps existing
+    /// session JSONs slim and avoids bloat. Locks the
+    /// `#[serde(skip_serializing_if = "std::ops::Not::not")]` attr.
+    #[test]
+    fn serializing_non_synthetic_omits_field() {
+        let m = Message::new(Role::User, "hi");
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert!(
+            !json.contains("synthetic"),
+            "non-synthetic messages must not emit the field, got: {}",
+            json
+        );
+    }
+
+    /// Serializing a synthetic message MUST emit `"synthetic": true`
+    /// so the round-trip preserves the agent-authored marker. Locks
+    /// the inverse of the previous test.
+    #[test]
+    fn serializing_synthetic_emits_true() {
+        let m = Message::synthetic_user("[Context was compressed.]");
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert!(
+            json.contains("\"synthetic\":true"),
+            "synthetic messages must round-trip the flag, got: {}",
+            json
+        );
+        let back: Message = serde_json::from_str(&json).expect("roundtrip");
+        assert!(back.synthetic);
     }
 }

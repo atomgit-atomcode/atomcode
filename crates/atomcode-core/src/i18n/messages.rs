@@ -70,6 +70,7 @@ pub enum Msg<'a> {
         total_days: i32,
     },
     CpUsageLine { usage: &'a str, reset_at: &'a str, duration: &'a str },
+    CpMonthlyQuotaExhausted { reset_at: &'a str, duration: &'a str },
     CpWindowQuotaExhausted,
     CpWindowQuotaHint { hint: &'a str },
     CpStatusFetchSkipped { reason: &'a str },
@@ -108,6 +109,11 @@ pub enum Msg<'a> {
 
     // ── Status bar (build_status) ──
     StatusNoProvider,
+    /// Open-source build with an AtomGit-gateway provider configured.
+    /// Sending any chat will fail with `CpOfficialBuildRequired`; this
+    /// hint surfaces the same diagnosis up-front so the user doesn't
+    /// have to type a message to discover the dead-end.
+    StatusOfficialBuildRequired,
     StatusUpgradeHint { version: &'a str },
     StatusModelNotConfigured,
     /// macOS / Linux variant: "Image in clipboard · ctrl+v to paste".
@@ -295,10 +301,6 @@ pub enum Msg<'a> {
     KbdHintMacos,
     KbdHintOther,
 
-    // ── JediTerm / conhost fallback ──
-    JediTermFallback,
-    LegacyConhostFallback,
-
     // ── Background task ──
     BackgroundComplete { turns: usize },
     BackgroundFailed { turns: usize },
@@ -421,7 +423,7 @@ pub enum Msg<'a> {
     SetupInstalledRow { kind: &'a str, slug: &'a str, path: &'a str },
     /// Per-item skipped row: "  - skill:xyz (hash match)"
     SetupSkippedRow { kind: &'a str, slug: &'a str, reason: &'a str },
-    /// Per-item failed row: "  ✗ mcp:xyz — error message"
+    /// Per-item failed row: "  × mcp:xyz — error message"
     SetupFailedRow { kind: &'a str, slug: &'a str, error: &'a str },
     /// "💡 Tip: Run /setup …" — first-run hint shown above the prompt
     /// when the project has no setup state yet.
@@ -455,6 +457,28 @@ pub enum Msg<'a> {
     PluginUninstalled { plugin: &'a str, marketplace: &'a str },
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },
+    PluginReloadDone { skills: usize, warnings: usize },
+    /// Marketplace `add` completion toast. Emitted by `handle_plugin_job_event`
+    /// for both manual `/plugin marketplace add` and the detached
+    /// startup-bootstrap auto-install. `count` is the number of plugins the
+    /// marketplace exposes after cloning.
+    PluginMarketplaceAdded { name: &'a str, commit: &'a str, count: usize },
+    /// Marketplace `update` completion toast — HEAD actually moved. No-op
+    /// pulls (HEAD unchanged) emit no toast at all so a quiet `git pull`
+    /// doesn't spam the body region.
+    PluginMarketplaceUpdated { name: &'a str, commit: &'a str },
+    /// Plugin `install` completion toast. `skipped` counts skills that the
+    /// loader rejected (bad SKILL.md frontmatter, namespace collision, etc.);
+    /// `show_details_hint` flips on the trailing "(Ctrl+O for details)"
+    /// nudge when warnings exist and verbose mode is off.
+    PluginInstallDone {
+        plugin: &'a str,
+        marketplace: &'a str,
+        loaded: usize,
+        skipped: usize,
+        show_details_hint: bool,
+    },
+    SetupAutoReloaded { skills: usize, warnings: usize },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
     CmdDescSetup,

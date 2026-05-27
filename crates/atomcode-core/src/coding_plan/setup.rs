@@ -34,6 +34,8 @@ use std::sync::Arc;
 
 use super::client::{is_auth_expired, Client};
 use super::types::{ModelEntry, PlanType, StatusResponse};
+#[cfg(test)]
+use super::types::RateLimitWindow;
 use crate::auth;
 use crate::config::provider::ProviderConfig;
 use crate::config::Config;
@@ -252,8 +254,8 @@ impl SetupReport {
                     info.display_names.iter().map(|s| s.as_str()).collect();
                 // Locked models render FIRST so the upgrade prompt is the
                 // first thing the eye lands on under "Added N providers:".
-                // Visual cue is an `✗` prefix matching the existing
-                // failure rows (`✗ CodingPlan Max claim failed — …`)
+                // Visual cue is an `×` prefix matching the existing
+                // failure rows (`× CodingPlan Max claim failed — …`)
                 // plus the explicit `(requires Pro plan or higher)` suffix —
                 // both plain text, so every renderer (alt-screen /
                 // retained / plain) and every terminal font carries
@@ -334,18 +336,41 @@ impl SetupReport {
                         }));
                     }
                 }
-                if let Some(u) = &s.current_usage {
-                    out.push_str(&t(Msg::CpUsageLine {
-                        usage: &u.display_desc(),
-                        reset_at: &u.reset_at_display,
-                        duration: &format_duration_secs(u.seconds_until_reset),
-                    }));
-                }
-                if s.window_quota_exhausted {
-                    if let Some(hint) = &s.window_quota_hint {
-                        out.push_str(&t(Msg::CpWindowQuotaHint { hint }));
-                    } else {
-                        out.push_str(&t(Msg::CpWindowQuotaExhausted));
+                if !s.rate_limit_windows.is_empty() {
+                    for w in s.rate_limit_windows.iter().filter(|w| w.show_enable == 1) {
+                        let hours = w.window_size_seconds / 3600;
+                        if hours > 5 {
+                            // Long window (monthly / etc.) becoming visible signals
+                            // the user has hit the longer-period quota — surface the
+                            // monthly-exhausted message and the reset time.
+                            out.push_str(&t(Msg::CpMonthlyQuotaExhausted {
+                                reset_at: &w.reset_at_display,
+                                duration: &format_duration_secs(w.seconds_until_reset),
+                            }));
+                        } else {
+                            // Short rolling window (e.g. 5h) — show standard usage line.
+                            out.push_str(&t(Msg::CpUsageLine {
+                                usage: &w.usage_status_desc,
+                                reset_at: &w.reset_at_display,
+                                duration: &format_duration_secs(w.seconds_until_reset),
+                            }));
+                        }
+                    }
+                } else {
+                    // Backward-compat path for old server responses.
+                    if let Some(u) = &s.current_usage {
+                        out.push_str(&t(Msg::CpUsageLine {
+                            usage: &u.display_desc(),
+                            reset_at: &u.reset_at_display,
+                            duration: &format_duration_secs(u.seconds_until_reset),
+                        }));
+                    }
+                    if s.window_quota_exhausted {
+                        if let Some(hint) = &s.window_quota_hint {
+                            out.push_str(&t(Msg::CpWindowQuotaHint { hint }));
+                        } else {
+                            out.push_str(&t(Msg::CpWindowQuotaExhausted));
+                        }
                     }
                 }
             }
@@ -1378,6 +1403,7 @@ mod tests {
                 expires_at: Some("2026-05-22".into()),
                 window_quota_exhausted: false,
                 window_quota_hint: None,
+                rate_limit_windows: vec![],
             }),
             auth_expired: false,
         };
@@ -1414,10 +1440,10 @@ mod tests {
         let out = report.render();
         assert!(out.contains("✓ already logged in"));
         assert!(out.contains("already claimed"));
-        assert!(!out.contains("✗ CodingPlan claim"), "duplicate ≠ failure");
+        assert!(!out.contains("× CodingPlan claim"), "duplicate ≠ failure");
         // Status failed but it's warn-only: ⚠ prefix, NOT ✗.
         assert!(out.contains("⚠ Status fetch failed"));
-        assert!(!out.contains("✗ Status"));
+        assert!(!out.contains("× Status"));
         // Login skipped + models ok ⇒ config should still be persisted.
         assert!(report.should_persist_config());
     }
@@ -1461,6 +1487,7 @@ mod tests {
                 expires_at: None,
                 window_quota_exhausted: false,
                 window_quota_hint: None,
+                rate_limit_windows: vec![],
             }),
             auth_expired: false,
         };
@@ -1497,7 +1524,7 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        assert!(out.contains("✗ Login failed"));
+        assert!(out.contains("× Login failed"));
         // Cascade rows must NOT appear.
         assert!(!out.contains("CodingPlan claim"), "no cascade claim row on login fail");
         assert!(!out.contains("Models step"), "no cascade models row on login fail");
@@ -1842,7 +1869,7 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        assert!(out.contains("✗ CodingPlan claim failed"));
+        assert!(out.contains("× CodingPlan claim failed"));
         assert!(out.contains("今日codingplan申请额度已满"));
         // The cascade rows must NOT appear.
         assert!(!out.contains("Models step skipped"), "no cascade row for models");
@@ -2216,8 +2243,163 @@ mod tests {
         assert!(!out.contains("Vision preprocessor"));
     }
 
+    // ── rate_limit_windows rendering tests ─────────────────────────────
+
+    fn blank_status_response() -> crate::coding_plan::types::StatusResponse {
+        crate::coding_plan::types::StatusResponse {
+            codingplan_free: None,
+            current_usage: None,
+            audit_status: 0,
+            expires_at: None,
+            window_quota_exhausted: false,
+            window_quota_hint: None,
+            rate_limit_windows: vec![],
+        }
+    }
+
+    fn status_only_report(
+        s: crate::coding_plan::types::StatusResponse,
+    ) -> SetupReport {
+        SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Skipped("already claimed".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Skipped("models not exercised".into()),
+            status: StepResult::Ok(s),
+            auth_expired: false,
+        }
+    }
+
+    #[test]
+    fn render_uses_rate_limit_windows_when_present() {
+        // rate_limit_windows populated → prefers new field over current_usage.
+        let s = crate::coding_plan::types::StatusResponse {
+            rate_limit_windows: vec![
+                RateLimitWindow {
+                    rule_index: 0,
+                    show_enable: 1,
+                    window_size_seconds: 18000,
+                    window_hours: 5,
+                    call_limit: 1000,
+                    calls_used: 20,
+                    usage_percent: 2.0,
+                    quota_exhausted: false,
+                    reset_at: "2026-05-26T18:09:30".into(),
+                    reset_at_display: "18:09".into(),
+                    seconds_until_reset: 16080,
+                    reset_label: String::new(),
+                    usage_status_desc: "当前时间窗口用量约 2%".into(),
+                },
+            ],
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        assert!(out.contains("当前时间窗口用量约 2%"), "usage_status_desc missing: {}", out);
+        assert!(out.contains("18:09"), "reset_at_display missing: {}", out);
+    }
+
+    #[test]
+    fn render_long_window_shows_monthly_exhausted() {
+        // window_size_seconds > 5h * 3600 = 18000 → monthly-exhausted message.
+        let s = crate::coding_plan::types::StatusResponse {
+            rate_limit_windows: vec![
+                RateLimitWindow {
+                    rule_index: 1,
+                    show_enable: 1,
+                    window_size_seconds: 2592000, // 30 days
+                    window_hours: 720,
+                    call_limit: 16000,
+                    calls_used: 16000,
+                    usage_percent: 100.0,
+                    quota_exhausted: true,
+                    reset_at: "2026-06-20T23:09:30".into(),
+                    reset_at_display: "23:09".into(),
+                    seconds_until_reset: 2194080,
+                    reset_label: String::new(),
+                    usage_status_desc: "当前时间窗口用量约 100%".into(),
+                },
+            ],
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        assert!(
+            out.contains("本月用量已耗尽") || out.contains("Monthly quota exhausted"),
+            "long-window message missing: {}",
+            out
+        );
+        assert!(out.contains("23:09"), "reset_at_display missing: {}", out);
+    }
+
+    #[test]
+    fn render_falls_back_to_current_usage_when_windows_empty() {
+        // rate_limit_windows empty → backward-compat path using current_usage.
+        let s = crate::coding_plan::types::StatusResponse {
+            current_usage: Some(crate::coding_plan::types::UsageInfo {
+                placeholder: false,
+                window_token_limit: 0,
+                window_tokens_used: 0,
+                usage_percent: 5.0,
+                window_hours: 5,
+                reset_at: "2026-05-26T18:09:30".into(),
+                reset_at_display: "18:09".into(),
+                seconds_until_reset: 16080,
+                reset_label: String::new(),
+                usage_status_desc: "当前时间窗口用量约 5%".into(),
+            }),
+            rate_limit_windows: vec![], // empty → backward-compat path
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        assert!(out.contains("当前时间窗口用量约 5%"), "fallback usage missing: {}", out);
+        assert!(out.contains("18:09"), "reset_at_display missing: {}", out);
+    }
+
+    #[test]
+    fn render_rate_limit_window_hidden_when_show_enable_zero() {
+        // show_enable=0 windows must be skipped; only show_enable=1 rendered.
+        let s = crate::coding_plan::types::StatusResponse {
+            rate_limit_windows: vec![
+                RateLimitWindow {
+                    rule_index: 0,
+                    show_enable: 1,
+                    window_size_seconds: 18000,
+                    window_hours: 5,
+                    call_limit: 1000,
+                    calls_used: 50,
+                    usage_percent: 5.0,
+                    quota_exhausted: false,
+                    reset_at: "2026-05-26T18:09:30".into(),
+                    reset_at_display: "18:09".into(),
+                    seconds_until_reset: 16080,
+                    reset_label: String::new(),
+                    usage_status_desc: "visible window".into(),
+                },
+                RateLimitWindow {
+                    rule_index: 1,
+                    show_enable: 0, // must NOT render
+                    window_size_seconds: 2592000,
+                    window_hours: 720,
+                    call_limit: 16000,
+                    calls_used: 5000,
+                    usage_percent: 31.0,
+                    quota_exhausted: false,
+                    reset_at: "2026-06-20T23:09:30".into(),
+                    reset_at_display: "23:09".into(),
+                    seconds_until_reset: 2194080,
+                    reset_label: String::new(),
+                    usage_status_desc: "hidden window".into(),
+                },
+            ],
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        assert!(out.contains("visible window"), "show_enable=1 window missing: {}", out);
+        assert!(!out.contains("hidden window"), "show_enable=0 window must not render: {}", out);
+        assert!(!out.contains("23:09"), "hidden window reset_at must not appear: {}", out);
+    }
+
     /// Locked models (plan_available=false on a higher tier) must
-    /// surface in the rendered report with a distinctive `✗` prefix
+    /// surface in the rendered report with a distinctive `×` prefix
     /// + the explicit "(requires Pro plan or higher)" suffix, the whole row
     /// wrapped in SGR 31 (terminal-theme red), and appended to the
     /// same `Added N provider(s)` bullet list as the available models
@@ -2227,11 +2409,11 @@ mod tests {
     /// Three layered signals — colour, prefix glyph, suffix text —
     /// because each can fail independently:
     ///   * SGR 31 only fires when the renderer's sanitizer keeps SGR
-    ///     (alt_screen, plain) — retained's strict strip pathway
-    ///     drops the colour but the glyph + text still carry the
-    ///     meaning.
-    ///   * The `✗` glyph relies on font support (every common
-    ///     terminal font has it; this is the strongest of the three).
+    ///     (plain) — retained's strict strip pathway drops the colour
+    ///     but the glyph + text still carry the meaning.
+    ///   * The `×` glyph (U+00D7 MULTIPLICATION SIGN) is Latin-1 and
+    ///     present in every terminal font (unlike U+2717 ✗ which is
+    ///     missing from macOS Terminal.app's default font).
     ///   * The "(requires Pro plan or higher)" suffix is plain ASCII / CJK
     ///     and survives even font-fallback-tofu rendering.
     ///
@@ -2277,13 +2459,13 @@ mod tests {
         assert!(out.contains("(CodingPlan Lite)"), "claim row must show tier:\n{out}");
         // Available model: standard provider line.
         assert!(out.contains("AtomGit") && out.contains("lite/foo"));
-        // Locked model: `✗` prefix immediately before the name, plus
+        // Locked model: `×` prefix immediately before the name, plus
         // the explicit `(requires Pro plan or higher)` suffix, all wrapped
         // in SGR 31 (red fg) → SGR 39 (default fg) so the terminal
         // renders the whole row in the theme's red.
         assert!(
-            out.contains("\x1b[31m✗ max/super-secret"),
-            "locked model must open with SGR 31 + ✗ prefix:\n{out}"
+            out.contains("\x1b[31m× max/super-secret"),
+            "locked model must open with SGR 31 + × prefix:\n{out}"
         );
         assert!(out.contains("(requires Pro plan or higher)\x1b[39m"));
         // Strikethrough is intentionally NOT used (SGR 9 was eaten by

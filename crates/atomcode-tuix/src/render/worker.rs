@@ -56,23 +56,19 @@ enum RenderCmd {
     /// Remove the tail ApprovalPrompt body row (fire-and-forget).
     PopApprovalPrompt,
     /// Scroll the body viewport by `delta` rows. Negative = up,
-    /// positive = down. AltScreenRenderer mutates viewport_top;
-    /// other renderers default to no-op.
+    /// positive = down. RetainedRenderer's append-only path leaves
+    /// scrollback to the host terminal, so this is effectively a
+    /// trait no-op everywhere today.
     ScrollBody(i32),
     /// Jump body viewport to absolute top / bottom of scrollback.
     ScrollBodyToTop,
     ScrollBodyToBottom,
-    /// Mouse-drag selection lifecycle. Forwarded to the inner renderer;
-    /// only AltScreenRenderer acts on these. `(col, row)` are 0-indexed
-    /// terminal cells.
-    BeginSelection(u16, u16),
-    UpdateSelection(u16, u16),
-    EndSelection,
-    /// Copy the current selection to the system clipboard (arboard).
-    /// Returns `true` via the ACK channel if a non-empty selection was
-    /// copied. Used by Ctrl+C to copy selected text on Windows where
-    /// OSC 52 is not supported.
-    CopySelection(mpsc::Sender<bool>),
+    /// Jump body viewport to the prev/next message boundary.
+    /// Fire-and-forget — no ACK needed.
+    ScrollToPrevMessage,
+    ScrollToNextMessage,
+    ScrollToPrevUserMessage,
+    ScrollToNextUserMessage,
     /// Lifecycle operation requiring an ACK — the worker performs the
     /// op then sends `()` back so the caller can proceed.
     Ack {
@@ -196,24 +192,20 @@ impl Renderer for TaskRenderer {
         let _ = self.cmd_tx.send(RenderCmd::ScrollBodyToBottom);
     }
 
-    fn begin_selection(&mut self, col: u16, row: u16) {
-        let _ = self.cmd_tx.send(RenderCmd::BeginSelection(col, row));
+    fn scroll_to_prev_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToPrevMessage);
     }
 
-    fn update_selection(&mut self, col: u16, row: u16) {
-        let _ = self.cmd_tx.send(RenderCmd::UpdateSelection(col, row));
+    fn scroll_to_next_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToNextMessage);
     }
 
-    fn end_selection(&mut self) {
-        let _ = self.cmd_tx.send(RenderCmd::EndSelection);
+    fn scroll_to_prev_user_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToPrevUserMessage);
     }
 
-    fn copy_selection(&mut self) -> bool {
-        let (ack_tx, ack_rx) = mpsc::channel();
-        if self.cmd_tx.send(RenderCmd::CopySelection(ack_tx)).is_err() {
-            return false;
-        }
-        ack_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+    fn scroll_to_next_user_message(&mut self) {
+        let _ = self.cmd_tx.send(RenderCmd::ScrollToNextUserMessage);
     }
 }
 
@@ -283,18 +275,17 @@ fn run_worker(mut inner: Box<dyn Renderer>, cmd_rx: mpsc::Receiver<RenderCmd>) {
             RenderCmd::ScrollBodyToBottom => {
                 inner.scroll_body_to_bottom();
             }
-            RenderCmd::BeginSelection(col, row) => {
-                inner.begin_selection(col, row);
+            RenderCmd::ScrollToPrevMessage => {
+                inner.scroll_to_prev_message();
             }
-            RenderCmd::UpdateSelection(col, row) => {
-                inner.update_selection(col, row);
+            RenderCmd::ScrollToNextMessage => {
+                inner.scroll_to_next_message();
             }
-            RenderCmd::EndSelection => {
-                inner.end_selection();
+            RenderCmd::ScrollToPrevUserMessage => {
+                inner.scroll_to_prev_user_message();
             }
-            RenderCmd::CopySelection(ack) => {
-                let result = inner.copy_selection();
-                let _ = ack.send(result);
+            RenderCmd::ScrollToNextUserMessage => {
+                inner.scroll_to_next_user_message();
             }
             RenderCmd::Ack { op, ack } => {
                 let t0 = Instant::now();
