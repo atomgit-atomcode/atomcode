@@ -1104,6 +1104,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_prompt_nonzero_exit_with_json_block_still_blocks() {
+        let config = HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: r#"echo '{"decision":"block","reason":"intentional"}'; exit 1"#.to_string(),
+            timeout_ms: 10_000,
+            plugin_root: None,
+        };
+        let hook = Arc::new(ShellCommandHook::from_hook_config(config));
+        let payload = UserPromptSubmitPayload {
+            session_id: "s1".into(),
+            hook_event_name: "UserPromptSubmit".into(),
+            prompt: "hello".into(),
+            cwd: "/tmp".into(),
+        };
+        let result = hook.on_user_prompt_submit(&payload).await;
+        assert!(matches!(result, UserPromptSubmitResult::Block(ref s) if s == "intentional"));
+    }
+
+    #[tokio::test]
     async fn user_prompt_timeout_degrades_to_continue() {
         let config = HookConfig {
             event: HookEvent::UserPromptSubmit,

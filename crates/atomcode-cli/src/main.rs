@@ -1813,6 +1813,9 @@ async fn run_headless(
                 // we expect the turn to keep running.
                 eprintln!("[warning] {}", w);
             }
+            AgentEvent::HookWarningHint(msg) => {
+                eprintln!("[hook-warning] {}", msg);
+            }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 if verbose {
                     eprintln!("[cwd] {}", new_dir.display());
