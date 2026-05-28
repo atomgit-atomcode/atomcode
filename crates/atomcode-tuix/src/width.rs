@@ -3,48 +3,47 @@ use std::sync::OnceLock;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
-/// One-shot CJK-locale probe. On CJK locales, terminal hosts render East
-/// Asian Ambiguous characters (◆ ○ ⓘ ✓ × → • etc.) at 2 cols instead of
-/// `unicode-width`'s default 1 col. If our cell model uses 1 col but the
-/// terminal renders at 2 cols, every char after the first non-ASCII shifts
-/// one column left in the terminal vs the model, and the `emit_body_line`
-/// direct-write leaves orphaned cells the cell-diff doesn't repaint —
-/// visible as the `加加\`\``再按按nter` style char-duplication seen on
-/// Windows + pwsh7 + native conhost with a zh_CN-cp936 system locale.
+/// One-shot probe for "use width_cjk for ambiguous codepoints?" The choice
+/// has to match what the user's *terminal emulator* paints, not what their
+/// locale env var claims:
 ///
-/// Detection: `ATOMCODE_CJK_WIDTH=1` forces on, `=0` forces off, otherwise
-/// LC_ALL/LANG starting with `zh`/`ja`/`ko`/`yue` votes yes (POSIX hosts),
-/// and on Windows we additionally accept the system ACP being a CJK code
-/// page (936/950/932/949) since pwsh on Win10 conhost typically leaves
-/// LC_ALL/LANG unset.
+///   * Win10/11 native conhost in a CJK code page (936/950/932/949) is the
+///     one host known to render East Asian Ambiguous chars (◆ ○ ⓘ ✓ × → •)
+///     at 2 cols by default. pwsh7 routing through ConPTY inherits this.
+///     Auto-detect via `GetACP`.
+///   * macOS Terminal.app, iTerm2, alacritty, kitty, wezterm, modern xterm,
+///     Windows Terminal, VSCode integrated terminal — all paint ambiguous
+///     chars at 1 col regardless of the user's locale. A user with `LANG=
+///     zh_CN.UTF-8` on macOS still gets width-1 ◆ from Terminal.app, and
+///     forcing our cell model to width-2 just creates the same orphan-cell
+///     mismatch we set out to fix, this time backwards (model wider than
+///     reality, direct-write puts content one column LEFT of where cell-diff
+///     expects it, the right-edge column of each ambiguous char leaks).
+///     Surfaced as the macOS `●ddeepwiki__ask_question` char-duplication
+///     report — `LANG=zh_*` was triggering width_cjk without consent.
+///
+/// Final rule:
+///   * `ATOMCODE_CJK_WIDTH=1` / `=true` → force on (manual opt-in for any
+///     CJK-mode terminal that needs it; e.g. a Linux user running their
+///     terminal with `terminal.integrated.unicodeVersion: 6` or similar).
+///   * `ATOMCODE_CJK_WIDTH=0` → force off (escape hatch).
+///   * Otherwise on Windows: `GetACP() ∈ {936, 950, 932, 949}` votes yes.
+///   * Otherwise: off. **No LC_ALL/LANG fallback.** POSIX locales describe
+///     text encoding, not terminal rendering geometry; the assumption that
+///     `LANG=zh_*` implies "ambiguous=wide" doesn't hold on the macOS/Linux
+///     emulators users actually run today.
 fn is_cjk_locale() -> bool {
     static CJK: OnceLock<bool> = OnceLock::new();
     *CJK.get_or_init(|| {
         if let Ok(v) = std::env::var("ATOMCODE_CJK_WIDTH") {
             return v == "1" || v.eq_ignore_ascii_case("true");
         }
-        let locale = std::env::var("LC_ALL")
-            .ok()
-            .or_else(|| std::env::var("LANG").ok())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if locale.starts_with("zh")
-            || locale.starts_with("ja")
-            || locale.starts_with("ko")
-            || locale.starts_with("yue")
-        {
-            return true;
-        }
-        // Windows: pwsh / cmd inherit no LANG, but the console ACP is set by
-        // the system locale. CJK ACPs: 936 zh-CN, 950 zh-TW, 932 ja-JP, 949
-        // ko-KR. Check via GetACP — no need for GetConsoleOutputCP, ACP is
-        // what the system reports as its "native" code page.
         #[cfg(target_os = "windows")]
         unsafe {
             extern "system" {
                 fn GetACP() -> u32;
             }
-            matches!(GetACP(), 936 | 950 | 932 | 949)
+            return matches!(GetACP(), 936 | 950 | 932 | 949);
         }
         #[cfg(not(target_os = "windows"))]
         false
