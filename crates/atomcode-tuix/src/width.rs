@@ -3,50 +3,46 @@ use std::sync::OnceLock;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
-/// One-shot probe for "use width_cjk for ambiguous codepoints?" The choice
-/// has to match what the user's *terminal emulator* paints, not what their
-/// locale env var claims:
+/// One-shot probe for "use `width_cjk` for ambiguous codepoints?"
 ///
-///   * Win10/11 native conhost in a CJK code page (936/950/932/949) is the
-///     one host known to render East Asian Ambiguous chars (◆ ○ ⓘ ✓ × → •)
-///     at 2 cols by default. pwsh7 routing through ConPTY inherits this.
-///     Auto-detect via `GetACP`.
-///   * macOS Terminal.app, iTerm2, alacritty, kitty, wezterm, modern xterm,
-///     Windows Terminal, VSCode integrated terminal — all paint ambiguous
-///     chars at 1 col regardless of the user's locale. A user with `LANG=
-///     zh_CN.UTF-8` on macOS still gets width-1 ◆ from Terminal.app, and
-///     forcing our cell model to width-2 just creates the same orphan-cell
-///     mismatch we set out to fix, this time backwards (model wider than
-///     reality, direct-write puts content one column LEFT of where cell-diff
-///     expects it, the right-edge column of each ambiguous char leaks).
-///     Surfaced as the macOS `●ddeepwiki__ask_question` char-duplication
-///     report — `LANG=zh_*` was triggering width_cjk without consent.
+/// `width_cjk` widens East Asian Ambiguous codepoints (◆ ○ ⓘ ✓ × → •, the
+/// box-drawing block, …) from 1 col to 2 cols. The choice has to match
+/// what the user's terminal *actually paints*; getting it wrong leaves
+/// our cell model and the host's rendering off by 1 col per ambiguous
+/// char and downstream cell-diff patches land in the wrong column.
 ///
-/// Final rule:
-///   * `ATOMCODE_CJK_WIDTH=1` / `=true` → force on (manual opt-in for any
-///     CJK-mode terminal that needs it; e.g. a Linux user running their
-///     terminal with `terminal.integrated.unicodeVersion: 6` or similar).
-///   * `ATOMCODE_CJK_WIDTH=0` → force off (escape hatch).
-///   * Otherwise on Windows: `GetACP() ∈ {936, 950, 932, 949}` votes yes.
-///   * Otherwise: off. **No LC_ALL/LANG fallback.** POSIX locales describe
-///     text encoding, not terminal rendering geometry; the assumption that
-///     `LANG=zh_*` implies "ambiguous=wide" doesn't hold on the macOS/Linux
-///     emulators users actually run today.
+/// Detection history:
+///
+///   * `LC_ALL`/`LANG` starting with `zh`/`ja`/`ko`/`yue` voted yes —
+///     dropped in 6a1d42e8 after a macOS Terminal.app + `LANG=zh_CN.UTF-8`
+///     user reported `●ddeepwiki__ask_question` char-duplication.
+///     POSIX locale describes text encoding, not rendering geometry.
+///
+///   * Windows `GetACP() ∈ {936, 950, 932, 949}` voted yes on the
+///     assumption (from 6d950270) that conhost in a CJK code page paints
+///     ambiguous at 2 cols. Empirically wrong for the conhost / ConPTY
+///     combo shipping in current Win10/Win11: they paint ambiguous at 1
+///     col regardless of ACP. Forcing `width_cjk` on creates the
+///     symmetric mismatch (model wider than reality) and shows up as
+///     2x-stretched markdown table borders on every Windows host
+///     (cmd / pwsh / VSCode pwsh) and Pondering-spinner left/right
+///     shake on pwsh + ConPTY paths where the cell-diff patches land
+///     1 col off ConPTY's screen buffer. Dropped here.
+///
+/// Final rule: pure opt-in.
+///   * `ATOMCODE_CJK_WIDTH=1` / `=true` → width_cjk on. For users whose
+///     terminal really does paint ambiguous at 2 cols (vintage conhost
+///     configs, specific font/rendering setups, terminal vt mode flags).
+///   * Anything else (default) → off. Matches every modern terminal we
+///     know of: macOS Terminal.app, iTerm2, alacritty, kitty, wezterm,
+///     Windows Terminal, current Win10/Win11 conhost & ConPTY, VSCode
+///     integrated terminal.
 fn is_cjk_locale() -> bool {
     static CJK: OnceLock<bool> = OnceLock::new();
     *CJK.get_or_init(|| {
-        if let Ok(v) = std::env::var("ATOMCODE_CJK_WIDTH") {
-            return v == "1" || v.eq_ignore_ascii_case("true");
-        }
-        #[cfg(target_os = "windows")]
-        unsafe {
-            extern "system" {
-                fn GetACP() -> u32;
-            }
-            return matches!(GetACP(), 936 | 950 | 932 | 949);
-        }
-        #[cfg(not(target_os = "windows"))]
-        false
+        std::env::var("ATOMCODE_CJK_WIDTH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     })
 }
 
