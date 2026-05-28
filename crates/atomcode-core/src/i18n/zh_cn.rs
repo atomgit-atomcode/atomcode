@@ -721,6 +721,59 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
         Msg::CmdDescGuide => "向 atomcode-guide 提问使用方法".into(),
+        Msg::GuideMenuHeader => "📖 AtomCode 使用指南 — 输入 /guide <问题> 提问".into(),
+        Msg::GuideMenuTopics => "常用话题：".into(),
+        Msg::GuideMenuGettingStarted => "怎么开始使用          首次安装、登录、配置".into(),
+        Msg::GuideMenuSwitchModel => "怎么切换模型          /model /provider 操作".into(),
+        Msg::GuideMenuMcp => "怎么用 MCP            MCP 服务器配置与管理".into(),
+        Msg::GuideMenuSkills => "怎么用技能和插件       /skills /plugin 使用".into(),
+        Msg::GuideMenuMemory => "怎么用记忆功能         /remember /forget /memory".into(),
+        Msg::GuideMenuBackground => "怎么用后台任务         /bg 后台执行".into(),
+        Msg::GuideMenuContext => "怎么管理上下文         /compact /context /cost".into(),
+        Msg::GuideMenuKeybindings => "快捷键有哪些           键盘快捷键参考".into(),
+        Msg::GuideMenuConfig => "怎么配置               config.toml 配置说明".into(),
+        Msg::GuideKbNoResults { query } =>
+            format!("本地知识库中未找到与「{}」直接相关的条目。\n\n\
+                     你可以试试这些常见问题：\n\
+                     - /guide 怎么切换模型\n\
+                     - /guide MCP 怎么配置\n\
+                     - /guide 怎么用记忆功能\n\
+                     - /guide 快捷键有哪些\n\
+                     - /guide 怎么用后台任务\n\n\
+                     也可以访问文档站：https://atomcode.atomgit.com/docs/zh/", query).into(),
+        Msg::GuideKbRelatedHeader => "## 相关知识\n\n".into(),
+        Msg::GuideKbTruncated => "\n... (知识库内容已截断)\n".into(),
+        Msg::GuideAlreadyRunning => "已有子代理正在运行，请等待完成后再试".into(),
+        Msg::GuideSystemError => "系统错误，请重试".into(),
+        Msg::GuideNotFound => "未找到该子代理".into(),
+        Msg::GuideGenericError => "子代理异常，请重试".into(),
+        Msg::GuideCancelled => "已取消".into(),
+        Msg::GuideLlmError => "模型响应异常，请重试".into(),
+        Msg::GuideNoProvider => "未配置 Provider，请先运行 /setup".into(),
+        Msg::GuideQuerying => "指南查询中...".into(),
+        Msg::GuideDescription => "解答 AtomCode 使用问题 (功能、命令、配置、MCP、Skill 等)".into(),
+        Msg::GuideEmptyFallback => "\
+抱歉，暂时无法回答此问题。
+
+你可以试试：
+  /guide 怎么切换模型
+  /guide MCP 怎么配置
+  /guide 怎么用记忆功能
+  /guide 快捷键有哪些
+  /guide 怎么用后台任务
+
+也可以访问文档站：https://atomcode.atomgit.com/docs/zh/".into(),
+        Msg::ToolLabelReadFile => "读取文件中...".into(),
+        Msg::ToolLabelGrep => "搜索代码中...".into(),
+        Msg::ToolLabelGlob => "搜索文件中...".into(),
+        Msg::ToolLabelListDir => "浏览目录中...".into(),
+        Msg::ToolLabelWebSearch => "搜索网页中...".into(),
+        Msg::ToolLabelWebFetch => "获取网页中...".into(),
+        Msg::ToolLabelProcessing => "处理中...".into(),
+        Msg::GuideResultWrapper { text } =>
+            format!("[子代理回答]\n{}\n[以上信息由 atomcode-guide 子代理提供]", text).into(),
+        Msg::GuideDisplayName => "指南".into(),
+        Msg::GuideTruncatedIndicator => "\n*(已截断)*".into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
 
         // ── 配置保存失败 ──

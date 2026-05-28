@@ -1,7 +1,7 @@
 ---
 title: AtomCode 概览
 category: 概览
-keywords: [overview, 概览, 介绍, 指南, 入门, 使用, 功能, atomcode, 是什么, 怎么, 如何, 怎么用, 快速开始, 帮助, help, 安装, 更新, 支持, 系统, 平台, 版本, 终端, vscode, 插件, 快捷键, 键盘, hotkey, keybindings, 键位, 日志, log, debug, 调试, 报错, 错误, error, bug, 搜索, search, grep, 咋用, 咋办, 啥是]
+keywords: [概览, 介绍, 指南, 入门, 使用, 功能, 是什么, 怎么, 如何, 怎么用, 快速开始, 帮助, 安装, 更新, 支持, 系统, 平台, 版本, 终端, 插件, 快捷键, 键盘, 键位, 日志, 调试, 报错, 错误, 搜索, 咋用, 咋办, 啥是]
 ---
 
 # AtomCode 使用指南

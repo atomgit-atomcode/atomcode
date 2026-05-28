@@ -1,7 +1,7 @@
 ---
 title: 会话管理
 category: 会话
-keywords: [session, resume, rename, 会话, 恢复, 重命名, 新建, 切换, 持久化, 历史, 记录, 丢失]
+keywords: [会话, 恢复, 重命名, 新建, 切换, 持久化, 历史, 记录, 丢失]
 ---
 
 # 会话管理

@@ -733,6 +733,59 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescPlugin => "Plugin marketplace (subcommands: marketplace, install, uninstall, reload, list)".into(),
         Msg::CmdDescPaste => "Attach an image from the clipboard (Windows fallback for Ctrl+V)".into(),
         Msg::CmdDescGuide => "Ask atomcode-guide how to use".into(),
+        Msg::GuideMenuHeader => "📖 AtomCode Guide — type /guide <question>".into(),
+        Msg::GuideMenuTopics => "Common topics:".into(),
+        Msg::GuideMenuGettingStarted => "Getting started          First install, login, config".into(),
+        Msg::GuideMenuSwitchModel => "Switch models            /model /provider usage".into(),
+        Msg::GuideMenuMcp => "Using MCP                MCP server config & management".into(),
+        Msg::GuideMenuSkills => "Skills and plugins       /skills /plugin usage".into(),
+        Msg::GuideMenuMemory => "Memory feature           /remember /forget /memory".into(),
+        Msg::GuideMenuBackground => "Background tasks         /bg background execution".into(),
+        Msg::GuideMenuContext => "Context management       /compact /context /cost".into(),
+        Msg::GuideMenuKeybindings => "Keyboard shortcuts       Keyboard shortcut reference".into(),
+        Msg::GuideMenuConfig => "Configuration            config.toml reference".into(),
+        Msg::GuideKbNoResults { query } =>
+            format!("No entries found matching \"{}\" in the local knowledge base.\n\n\
+                     Try these common questions:\n\
+                     - /guide How to switch models\n\
+                     - /guide How to configure MCP\n\
+                     - /guide How to use memory\n\
+                     - /guide Keyboard shortcuts\n\
+                     - /guide Background tasks\n\n\
+                     Or visit the documentation: https://atomcode.atomgit.com/docs/en/", query).into(),
+        Msg::GuideKbRelatedHeader => "## Related Knowledge\n\n".into(),
+        Msg::GuideKbTruncated => "\n... (knowledge content truncated)\n".into(),
+        Msg::GuideAlreadyRunning => "A sub-agent is already running, please wait for it to complete".into(),
+        Msg::GuideSystemError => "System error, please try again".into(),
+        Msg::GuideNotFound => "Sub-agent not found".into(),
+        Msg::GuideGenericError => "Sub-agent error, please try again".into(),
+        Msg::GuideCancelled => "Cancelled".into(),
+        Msg::GuideLlmError => "Model response error, please try again".into(),
+        Msg::GuideNoProvider => "No provider configured, please run /setup first".into(),
+        Msg::GuideQuerying => "Querying guide...".into(),
+        Msg::GuideDescription => "Answer AtomCode usage questions (features, commands, config, MCP, Skills, etc.)".into(),
+        Msg::GuideEmptyFallback => "\
+Sorry, unable to answer this question right now.
+
+You can try:
+  /guide how to switch models
+  /guide how to configure MCP
+  /guide how to use memory
+  /guide what are the keybindings
+  /guide how to use background tasks
+
+Or visit the docs: https://atomcode.atomgit.com/docs/en/".into(),
+        Msg::ToolLabelReadFile => "Reading file...".into(),
+        Msg::ToolLabelGrep => "Searching code...".into(),
+        Msg::ToolLabelGlob => "Searching files...".into(),
+        Msg::ToolLabelListDir => "Browsing directory...".into(),
+        Msg::ToolLabelWebSearch => "Searching web...".into(),
+        Msg::ToolLabelWebFetch => "Fetching web page...".into(),
+        Msg::ToolLabelProcessing => "Processing...".into(),
+        Msg::GuideResultWrapper { text } =>
+            format!("[Sub-agent Answer]\n{}\n[Provided by atomcode-guide sub-agent]", text).into(),
+        Msg::GuideDisplayName => "Guide".into(),
+        Msg::GuideTruncatedIndicator => "\n*(truncated)*".into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
 
         // ── config save failed ──

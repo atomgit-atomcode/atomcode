@@ -1,7 +1,7 @@
 ---
 title: Slash 命令参考
 category: 命令
-keywords: [slash, 命令, command, /bg, /help, /model, /config, /mcp, /skills, /guide, 怎么, 如何, 快捷键, 切换, 模型, 会话, 记忆, 插件, compact, context, cost, plan, build, think, worktree, bg, background, codingplan, hotkey, 键盘, 模式, 费用, token, 压缩, 隔离, 后台, 计划, 思考, 构建, 咋用, 咋办, 搜索, search, grep, debug, 调试]
+keywords: [命令, /bg, /help, /model, /config, /mcp, /skills, /guide, 怎么, 如何, 快捷键, 切换, 模型, 会话, 记忆, 插件, codingplan, 键盘, 模式, 费用, 压缩, 隔离, 后台, 计划, 思考, 构建, 咋用, 咋办, 搜索, 调试]
 ---
 
 # Slash 命令 (共 41 个)

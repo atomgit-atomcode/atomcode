@@ -1459,10 +1459,9 @@ impl AgentLoop {
                     self.handle_invoke_subagent(name, task).await;
                 }
                 AgentCommand::InjectGuideResult { text } => {
-                    let guarded = format!(
-                        "[子代理回答]\n{}\n[以上信息由 atomcode-guide 子代理提供]",
-                        text,
-                    );
+                    let guarded = crate::i18n::t(
+                        crate::i18n::Msg::GuideResultWrapper { text: &text }
+                    ).into_owned();
                     self.conversation.messages.push(
                         crate::conversation::message::Message::new(
                             crate::conversation::message::Role::Assistant,
@@ -1520,9 +1519,12 @@ impl AgentLoop {
     }
 
     async fn handle_invoke_subagent(&mut self, name: String, task: String) {
+        use crate::i18n::t;
+        use crate::i18n::Msg;
+
         if self.subagent_running.swap(true, std::sync::atomic::Ordering::Acquire) {
             let _ = self.event_tx.send(AgentEvent::Warning(
-                "已有子代理正在运行，请等待完成后再试".to_string()
+                t(Msg::GuideAlreadyRunning).into_owned()
             ));
             return;
         }
@@ -1546,7 +1548,7 @@ impl AgentLoop {
                 if !completed_guard.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = guard_tx.send(AgentEvent::GuideComplete {
                         subagent: guard_name.clone(),
-                        text: "子代理异常，请重试".to_string(),
+                        text: t(Msg::GuideGenericError).into_owned(),
                         truncated: false,
                         cancelled: true,
                     });
@@ -1560,7 +1562,7 @@ impl AgentLoop {
                         completed.store(true, std::sync::atomic::Ordering::Relaxed);
                         let _ = event_tx.send(AgentEvent::GuideComplete {
                             subagent: name,
-                            text: "系统错误，请重试".to_string(),
+                            text: t(Msg::GuideSystemError).into_owned(),
                             truncated: false,
                             cancelled: true,
                         });
@@ -1570,19 +1572,24 @@ impl AgentLoop {
                 reg.find(&name)
             };
 
-            let def = match def {
+            let mut def = match def {
                 Some(d) => d,
                 None => {
                     completed.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = event_tx.send(AgentEvent::GuideComplete {
                         subagent: name,
-                        text: "未找到该子代理".to_string(),
+                        text: t(Msg::GuideNotFound).into_owned(),
                         truncated: false,
                         cancelled: true,
                     });
                     return;
                 }
             };
+
+            // Update system prompt based on current locale for guide subagent
+            if def.name == "atomcode-guide" {
+                def.system_prompt = crate::agent::guide::get_guide_system_prompt();
+            }
 
             let runner = crate::agent::sub_agent::runner::SubAgentRunner::new(
                 provider, config, parent_tools, parent_ctx,
@@ -1602,13 +1609,13 @@ impl AgentLoop {
                 }
                 Err(e) => {
                     let friendly = if e.cancelled {
-                        "已取消".to_string()
+                        t(Msg::GuideCancelled).into_owned()
                     } else if e.message.contains("LLM turn failed") {
-                        "模型响应异常，请重试".to_string()
+                        t(Msg::GuideLlmError).into_owned()
                     } else if e.message.contains("No default provider") {
-                        "未配置 Provider，请先运行 /setup".to_string()
+                        t(Msg::GuideNoProvider).into_owned()
                     } else {
-                        "子代理异常，请重试".to_string()
+                        t(Msg::GuideGenericError).into_owned()
                     };
                     let _ = event_tx.send(AgentEvent::GuideComplete {
                         subagent: name,

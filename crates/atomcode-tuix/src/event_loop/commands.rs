@@ -298,20 +298,29 @@ pub(super) fn execute_slash_command(
         }
         "guide" => {
             if arg.is_empty() {
-                let menu = "\
-📖 AtomCode 使用指南 — 输入 /guide <问题> 提问
-
-  常用话题：
-    /guide 怎么开始使用          首次安装、登录、配置
-    /guide 怎么切换模型          /model /provider 操作
-    /guide 怎么用 MCP            MCP 服务器配置与管理
-    /guide 怎么用技能和插件       /skills /plugin 使用
-    /guide 怎么用记忆功能         /remember /forget /memory
-    /guide 怎么用后台任务         /bg 后台执行
-    /guide 怎么管理上下文         /compact /context /cost
-    /guide 快捷键有哪些           键盘快捷键参考
-    /guide 怎么配置               config.toml 配置说明";
-                renderer.render(UiLine::CommandOutput(menu.to_string()));
+                let mut menu = String::new();
+                menu.push_str(&t(Msg::GuideMenuHeader));
+                menu.push_str("\n\n  ");
+                menu.push_str(&t(Msg::GuideMenuTopics));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuGettingStarted));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuSwitchModel));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuMcp));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuSkills));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuMemory));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuBackground));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuContext));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuKeybindings));
+                menu.push_str("\n    /guide ");
+                menu.push_str(&t(Msg::GuideMenuConfig));
+                renderer.render(UiLine::CommandOutput(menu));
                 renderer.flush();
             } else {
                 ctx.agent.cmd_tx.send(AgentCommand::InvokeSubAgent {

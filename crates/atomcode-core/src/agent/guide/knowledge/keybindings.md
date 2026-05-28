@@ -1,7 +1,7 @@
 ---
 title: 键盘快捷键
 category: 参考
-keywords: [快捷键, 键盘, hotkey, keybinding, 键位, 按键, 快捷, shortcut, 按啥, 怎么按]
+keywords: [快捷键, 键盘, 键位, 按键, 快捷, 按啥, 怎么按]
 ---
 
 # 键盘快捷键

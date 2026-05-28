@@ -1,7 +1,7 @@
 ---
 title: 记忆系统
 category: 功能
-keywords: [memory, remember, forget, 记忆, 记住, 忘记, 保存, 删除, 全局, global, 咋用, 查看]
+keywords: [记忆, 记住, 忘记, 保存, 删除, 全局, 咋用, 查看]
 ---
 
 # 记忆系统

@@ -1,7 +1,7 @@
 ---
 title: 配置参考
 category: 配置
-keywords: [config, 配置, settings, 设置, 怎么, 如何, model, provider, 切换, 模型, 修改, auto_commit, lsp, subagent, language, 文件, 报错, 错误, error, log, 日志, 调试, debug]
+keywords: [配置, 设置, 怎么, 如何, 模型, 切换, 修改, auto_commit, lsp, subagent, 文件, 报错, 错误, 日志, 调试]
 ---
 
 # 配置参考

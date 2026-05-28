@@ -1,7 +1,7 @@
 ---
 title: MCP 集成
 category: 扩展
-keywords: [mcp, server, tool, 扩展, 配置, 怎么, 如何, 连接, 安装, 服务器, 外部, 报错, 错误, error, 失败, 超时, timeout, debug, 调试]
+keywords: [mcp, 扩展, 配置, 怎么, 如何, 连接, 安装, 服务器, 外部, 报错, 错误, 失败, 超时, 调试]
 ---
 
 # MCP 集成

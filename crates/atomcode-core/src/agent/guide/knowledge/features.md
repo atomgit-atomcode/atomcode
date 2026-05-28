@@ -1,7 +1,7 @@
 ---
 title: 核心功能
 category: 功能
-keywords: [features, 功能, 介绍, atomcode, 特性, 支持, 平台, 系统, 怎么, 如何, 使用, AI, 编程, 代码, 工具, 日志, log, debug, 调试, 搜索, search, grep, 报错, 错误]
+keywords: [功能, 介绍, 特性, 支持, 平台, 系统, 怎么, 如何, 使用, 编程, 代码, 工具, 日志, 调试, 搜索, 报错, 错误]
 ---
 
 # AtomCode 核心功能

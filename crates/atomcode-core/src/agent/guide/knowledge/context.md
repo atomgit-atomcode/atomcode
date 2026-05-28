@@ -1,7 +1,7 @@
 ---
 title: 上下文与费用管理
 category: 会话
-keywords: [compact, context, cost, 上下文, 压缩, token, 费用, cache, 缓存, 预算, 太长, 满了, 超出, 爆了]
+keywords: [上下文, 压缩, 费用, 缓存, 预算, 太长, 满了, 超出, 爆了]
 ---
 
 # 上下文与费用管理

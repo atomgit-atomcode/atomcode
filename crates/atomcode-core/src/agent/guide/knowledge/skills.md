@@ -1,7 +1,7 @@
 ---
-title: Skill 与 Plugin
+title: 技能与插件
 category: 扩展
-keywords: [skill, plugin, 技能, 插件, 打包, use_skill, 扩展, marketplace, 安装, 怎么, 如何, 创建, 自定义, 模板, 咋用, 咋办]
+keywords: [技能, 插件, 打包, use_skill, 扩展, marketplace, 安装, 怎么, 如何, 创建, 自定义, 模板, 咋用, 咋办]
 ---
 
 # Skill 与 Plugin

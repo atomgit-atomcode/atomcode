@@ -528,6 +528,74 @@ pub enum Msg<'a> {
     CmdDescPaste,
     /// Description for the `/guide` slash command — asks atomcode-guide a question.
     CmdDescGuide,
+    /// `/guide` menu header: "📖 AtomCode Guide — type /guide <question>"
+    GuideMenuHeader,
+    /// `/guide` menu: "Common topics:" section label
+    GuideMenuTopics,
+    /// `/guide` menu topic: getting started
+    GuideMenuGettingStarted,
+    /// `/guide` menu topic: switching models
+    GuideMenuSwitchModel,
+    /// `/guide` menu topic: using MCP
+    GuideMenuMcp,
+    /// `/guide` menu topic: skills and plugins
+    GuideMenuSkills,
+    /// `/guide` menu topic: memory feature
+    GuideMenuMemory,
+    /// `/guide` menu topic: background tasks
+    GuideMenuBackground,
+    /// `/guide` menu topic: context management
+    GuideMenuContext,
+    /// `/guide` menu topic: keyboard shortcuts
+    GuideMenuKeybindings,
+    /// `/guide` menu topic: configuration
+    GuideMenuConfig,
+    /// Knowledge base: "no results found" message
+    GuideKbNoResults { query: &'a str },
+    /// Knowledge base: "Related knowledge" section header
+    GuideKbRelatedHeader,
+    /// Knowledge base: content truncated marker
+    GuideKbTruncated,
+    /// Guide subagent: already running warning
+    GuideAlreadyRunning,
+    /// Guide subagent: system error
+    GuideSystemError,
+    /// Guide subagent: subagent not found
+    GuideNotFound,
+    /// Guide subagent: generic error
+    GuideGenericError,
+    /// Guide subagent: cancelled
+    GuideCancelled,
+    /// Guide subagent: LLM error
+    GuideLlmError,
+    /// Guide subagent: no provider configured
+    GuideNoProvider,
+    /// Guide subagent: querying message
+    GuideQuerying,
+    /// Guide subagent: description for SubAgentDefinition
+    GuideDescription,
+    /// Guide subagent: fallback message when LLM returns empty answer
+    GuideEmptyFallback,
+    /// Guide subagent: tool label — reading file
+    ToolLabelReadFile,
+    /// Guide subagent: tool label — searching code
+    ToolLabelGrep,
+    /// Guide subagent: tool label — searching files
+    ToolLabelGlob,
+    /// Guide subagent: tool label — listing directory
+    ToolLabelListDir,
+    /// Guide subagent: tool label — web search
+    ToolLabelWebSearch,
+    /// Guide subagent: tool label — fetching web page
+    ToolLabelWebFetch,
+    /// Guide subagent: tool label — generic processing
+    ToolLabelProcessing,
+    /// Guide subagent: wrapper for injecting guide result into conversation
+    GuideResultWrapper { text: &'a str },
+    /// Guide subagent: display name for the guide subagent
+    GuideDisplayName,
+    /// Guide subagent: truncated indicator shown after guide answer
+    GuideTruncatedIndicator,
     /// `/paste` failed because the clipboard holds no image. Shown
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.

@@ -1,7 +1,7 @@
 ---
 title: 模式切换
 category: 工作流
-keywords: [plan, build, think, 计划, 构建, 思考, 模式, 只读, 推理, reasoning, budget, 读写, 权限]
+keywords: [计划, 构建, 思考, 模式, 只读, 推理, 读写, 权限]
 ---
 
 # 模式切换

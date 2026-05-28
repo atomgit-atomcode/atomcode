@@ -1,7 +1,7 @@
 ---
 title: 故障排除
 category: 帮助
-keywords: [troubleshooting, 故障, 排除, 问题, 报错, 错误, error, bug, 不工作, 失败, 无法, 异常, 卡住, 超时, timeout, 连接失败, 无响应, crash, panic, 崩溃, 咋办, 怎么办, 日志, log, debug, 调试]
+keywords: [故障, 排除, 问题, 报错, 错误, 不工作, 失败, 无法, 异常, 卡住, 超时, 连接失败, 无响应, 崩溃, 咋办, 怎么办, 日志, 调试]
 ---
 
 # 故障排除指南

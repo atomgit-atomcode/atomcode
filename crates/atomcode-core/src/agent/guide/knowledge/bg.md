@@ -1,7 +1,7 @@
 ---
 title: 后台任务
 category: 工作流
-keywords: [bg, background, 后台, 并行, 任务, slot, 槽位, 同时, 咋用]
+keywords: [后台, 并行, 任务, slot, 槽位, 同时, 咋用]
 ---
 
 # 后台任务 (/bg)

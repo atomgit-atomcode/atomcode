@@ -1,7 +1,7 @@
 ---
 title: 快速入门
 category: 入门
-keywords: [setup, install, 安装, 登录, 开始, 首次, 初始化, 配置, 入门, 快速, codingplan, 咋用, 咋办, 啥是, 第一次]
+keywords: [安装, 登录, 开始, 首次, 初始化, 配置, 入门, 快速, codingplan, 咋用, 咋办, 啥是, 第一次]
 ---
 
 # 快速入门
