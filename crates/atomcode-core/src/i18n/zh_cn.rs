@@ -28,20 +28,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpStepSkipped { reason } =>
             format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✗ 登录失败 — {}\n", error).into(),
+            format!("  × 登录失败 — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
             format!("  ✓ CodingPlan 已领取 — {}（CodingPlan {}）\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "成功".into(),
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan 已领取 — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✗ CodingPlan 领取失败 — {}\n", error).into(),
+            format!("  × CodingPlan 领取失败 — {}\n", error).into(),
         Msg::CpClaimTierSucceeded { tier } =>
             format!("  ✓ CodingPlan {} 领取成功\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
             format!("  ✓ CodingPlan {} 已领取\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  ✗ CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
             format!("  ✓ 已添加 {} 个 Provider：\n", count).into(),
         Msg::CpLocked { name } =>
@@ -49,8 +49,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             // 是亮色）让终端按当前主题映射 —— Solarized / Dracula /
             // 浅色模式都会落到各自的「红」上，不会被一个写死的 RGB
             // 锁住。retained 渲染器走严格 sanitizer 会把 SGR 剥光，
-            // 但 `✗ … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
-            format!("      \x1b[31m✗ {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
+            // 但 `× … （需要升级成 Pro 以上套餐）` 文本本身仍能传达含义。
+            format!("      \x1b[31m× {}  （需要升级成 Pro 以上套餐）\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  （默认）".into(),
@@ -63,7 +63,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpModelsSkipped { reason } =>
             format!("  ✓ 模型步骤已跳过 — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✗ 模型步骤失败 — {}\n", error).into(),
+            format!("  × 模型步骤失败 — {}\n", error).into(),
         Msg::CpStatusHeader =>
             "  ✓ CodingPlan 状态：\n".into(),
         Msg::CpPlanPending { plan } =>
@@ -75,6 +75,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::CpUsageLine { usage, reset_at, duration } =>
             format!("      用量：{}  ·  重置于 {}（{} 后）\n", usage, reset_at, duration).into(),
+        Msg::CpMonthlyQuotaExhausted { reset_at, duration } =>
+            format!("      ⚠ 本月用量已耗尽  ·  重置于 {}（{} 后）\n", reset_at, duration).into(),
         Msg::CpWindowQuotaExhausted =>
             "      ⚠ 当前窗口配额已耗尽\n".into(),
         Msg::CpWindowQuotaHint { hint } =>
@@ -109,6 +111,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 状态栏 ──
         Msg::StatusNoProvider =>
             "未配置 Provider · 使用 /provider 配置".into(),
+        Msg::StatusOfficialBuildRequired =>
+            "CodingPlan 需要官方构建".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} 可用 · 使用 /upgrade 升级").into(),
         Msg::StatusModelNotConfigured =>
@@ -146,7 +150,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusInstructionPresent { path, label } =>
             format!("    ✓ {} ({})\n", path, label).into(),
         Msg::StatusInstructionMissing { label } =>
-            format!("    ✗ {} — 未找到\n", label).into(),
+            format!("    × {} — 未找到\n", label).into(),
 
         // ── /login 完成提示 ──
         Msg::LoginSignedInWithCpHint { name, username } =>
@@ -180,6 +184,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
   ── 历史 ──
     Up                               上一条输入
     Down                             下一条输入
+
+  ── 翻看输出 ──
+    用终端原生 scrollback（cmd+↑/↓、鼠标滚轮、tmux copy-mode 等都生效）
+    鼠标拖选 + Ctrl+C                复制（atomcode 不接管鼠标）
 
   ── 会话 ──
     Ctrl+C                           取消当前轮 / 关闭弹层
@@ -312,7 +320,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueCreated { number, title, url } =>
             format!("  [issue] ✓ 已创建 #{number}：{title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
-            format!("  [issue] ✗ 创建失败：{error}\n").into(),
+            format!("  [issue] × 创建失败：{error}\n").into(),
         Msg::IssueRequiredField { field } =>
             format!("（必填 — 请输入 {field}，或按 Esc 取消）").into(),
 
@@ -415,23 +423,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ 终端不支持增强键盘协议。\n    请使用 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
         Msg::KbdHintOther =>
             "  ⚠ 终端不支持增强键盘协议。\n    请使用 Alt+Enter 或 Ctrl+Enter 插入换行（Shift+Enter 不可用）。\n\n".into(),
-
-        // ── JediTerm / conhost 回退 ──
-        Msg::JediTermFallback =>
-            "  ⓘ 检测到 JetBrains IDE 终端 — 运行在备用屏幕模式下。\n    \
-            使用鼠标滚轮、PageUp/PageDown 或 Shift+Up/Down 滚动历史。\n    \
-            AtomCode 运行期间无法使用宿主终端的原生回滚；\n    \
-            退出后宿主终端将恢复到 AtomCode 之前的状态。\n    \
-            设置 ATOMCODE_PLAIN=1 使用基础 CI 风格输出，或\n    \
-            设置 ATOMCODE_RETAIN=1 绕过此回退（可能导致对齐问题）。\n\n".into(),
-        Msg::LegacyConhostFallback =>
-            "  ⓘ 检测到旧版 Windows 控制台 — 运行在备用屏幕模式下。\n    \
-            使用鼠标滚轮、PageUp/PageDown 或 Shift+Up/Down 滚动历史。\n    \
-            AtomCode 运行期间无法使用宿主终端的原生回滚。\n    \
-            要获得完整的宿主终端回滚支持，请安装 Windows Terminal\n    \
-            （免费，Microsoft Store）、ConEmu、Alacritty 或 WezTerm。\n    \
-            设置 ATOMCODE_PLAIN=1 使用基础输出，或设置 ATOMCODE_RETAIN=1\n    \
-            绕过此回退（滚动时可能出现重复内容）。\n\n".into(),
 
         // ── 后台任务 ──
         Msg::BackgroundComplete { turns } =>
@@ -557,11 +548,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServerConnected { name } =>
             format!("✓ MCP 服务 '{name}' 已连接").into(),
         Msg::McpServerFailed { name, error } =>
-            format!("✗ MCP 服务 '{name}' 失败：{error}").into(),
+            format!("× MCP 服务 '{name}' 失败：{error}").into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP 服务 '{name}' 已为 .{ext} 启动").into(),
         Msg::LspServerFailed { name, ext, error } =>
-            format!("✗ LSP 服务 '{name}'（.{ext}）失败：{error}").into(),
+            format!("× LSP 服务 '{name}'（.{ext}）失败：{error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>
@@ -622,7 +613,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SetupSkippedRow { kind, slug, reason } =>
             format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
         Msg::SetupFailedRow { kind, slug, error } =>
-            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+            format!("  × {}:{} — {}\n", kind, slug, error).into(),
         Msg::CmdSetupTip =>
             "\u{1f4a1} 提示：运行 \x1b[1;96m/setup\x1b[0m 可自动为该项目配置 hooks、skills 和 MCP。".into(),
         Msg::CmdSetupRunning =>
@@ -638,7 +629,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── /plugin ──
         Msg::PluginUsage =>
-            "用法：/plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | list]".into(),
+            "用法：/plugin [marketplace add|remove|update|list | install <p>@<m> | uninstall <p>@<m> | reload | list]".into(),
         Msg::PluginMarketplaceUsage =>
             "用法：/plugin marketplace [add|remove|update|list] <参数>".into(),
         Msg::PluginInstallUsage =>
@@ -671,6 +662,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("卸载失败：{error}").into(),
         Msg::PluginListFailed { error } =>
             format!("列出插件失败：{error}").into(),
+        Msg::PluginReloadDone { skills, warnings } =>
+            format!("插件已重新加载：{skills} 个 skill，{warnings} 个警告").into(),
+        Msg::PluginMarketplaceAdded { name, commit, count } =>
+            format!("✓ 已添加 marketplace `{name}`（commit {commit}，共 {count} 个插件）").into(),
+        Msg::PluginMarketplaceUpdated { name, commit } =>
+            format!("✓ marketplace `{name}` 已更新至 {commit}").into(),
+        Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
+            let hint = if show_details_hint { "  （按 Ctrl+O 查看详情）" } else { "" };
+            format!("✓ 已安装 `{plugin}@{marketplace}` —— 加载 {loaded} 个 skill，跳过 {skipped} 个{hint}").into()
+        }
+        Msg::SetupAutoReloaded { skills, warnings } =>
+            format!("✓ Setup 完成，已自动刷新：{skills} 个 skill，{warnings} 个警告").into(),
 
         // ── 命令描述 ──
 Msg::CmdDescSetup =>
@@ -709,15 +712,15 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
         Msg::CmdDescEffort => "DeepSeek 推理强度控制（high / max / off）".into(),
-        Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 / reasoner 有效）".into(),
         Msg::CmdDescHelp => "显示帮助".into(),
         Msg::CmdDescKeys => "显示键盘快捷键".into(),
         Msg::CmdDescLanguage => "切换显示语言".into(),
         Msg::CmdDescQuit => "退出 AtomCode".into(),
         Msg::CmdDescSkills => "浏览已加载的技能".into(),
-        Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, list）".into(),
+        Msg::CmdDescPlugin => "插件市场（子命令：marketplace, install, uninstall, reload, list）".into(),
         Msg::CmdDescPaste => "从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口）".into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
+        Msg::ReasoningEffortNoEffect => "当前模型不支持 reasoning_effort（仅对 DeepSeek V4 / reasoner 有效）".into(),
 
         // ── 配置保存失败 ──
         Msg::ConfigSaveFailed { error } =>

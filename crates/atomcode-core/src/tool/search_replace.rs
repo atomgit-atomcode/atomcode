@@ -67,26 +67,59 @@ impl Tool for SearchReplaceTool {
             ))
     }
 
-    fn approval(&self, _args: &str) -> ApprovalRequirement {
-        // Bulk replacement across files is potentially destructive
-        // Auto-approve: search_replace is safe (literal/regex matching, respects .gitignore).
-        // Requiring approval caused the model to avoid it and use 30+ edit_file calls instead.
+    fn approval(&self, args: &str) -> ApprovalRequirement {
+        // search_replace is generally cheap to AutoApprove — the model
+        // benchmarks confirmed that requiring approval pushed it to
+        // emit 30+ edit_file calls instead of one bulk replace. But the
+        // "auto-approve everywhere" carve-out is exactly the gap that
+        // session-grant bypass exploited on edit_file: a sensitive
+        // target (.env / id_rsa / *.pem / /etc/*) should ALWAYS prompt,
+        // never silently inherit a prior [A] press on a safe scope.
+        let parsed = match serde_json::from_str::<SearchReplaceArgs>(args) {
+            Ok(p) => p,
+            Err(_) => return ApprovalRequirement::AutoApprove,
+        };
+        let scope = parsed.path.as_deref().unwrap_or(".");
+        if super::is_sensitive_input_path(scope) {
+            return ApprovalRequirement::RequireApproval(format!(
+                "Bulk replace targeting sensitive path: {}",
+                scope
+            ));
+        }
         ApprovalRequirement::AutoApprove
     }
 
     fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        // Same merge contract as edit.rs::approval_with_context: when
+        // the per-path workspace check defers (in-workspace AutoApprove)
+        // but the sensitivity check fired in `approval()`, upgrade to
+        // RequireApprovalAlways so a prior [A] on search_replace cannot
+        // bypass the sensitive-scope guard. Out-of-workspace writes are
+        // already RequireApprovalAlways from `approval_for_path` itself.
+        let base = self.approval(args);
         let parsed = match serde_json::from_str::<SearchReplaceArgs>(args) {
             Ok(parsed) => parsed,
-            Err(_) => return self.approval(args),
+            Err(_) => return base,
         };
         let working_dir = match ctx.working_dir.try_read() {
             Ok(wd) => wd.clone(),
-            Err(_) => return self.approval(args),
+            Err(_) => return base,
         };
         let raw_path = parsed.path.as_deref().unwrap_or(".");
         match super::approval_for_path(raw_path, &working_dir, super::ExternalPathAction::Write) {
-            Ok(approval) => approval,
-            Err(_) => self.approval(args),
+            Ok(ApprovalRequirement::RequireApprovalAlways(reason)) => {
+                ApprovalRequirement::RequireApprovalAlways(reason)
+            }
+            Ok(ApprovalRequirement::RequireApproval(reason)) => {
+                ApprovalRequirement::RequireApproval(reason)
+            }
+            Ok(ApprovalRequirement::AutoApprove) => match base {
+                ApprovalRequirement::RequireApproval(reason) => {
+                    ApprovalRequirement::RequireApprovalAlways(reason)
+                }
+                other => other,
+            },
+            Err(_) => base,
         }
     }
 
@@ -312,6 +345,76 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("tests/app.ts")).unwrap(),
             "const v = 'needle';\n"
+        );
+    }
+
+    /// Regression: sensitive in-workspace path must return
+    /// RequireApprovalAlways so a prior session [A] on search_replace
+    /// cannot disarm the guard for `.env` / `id_rsa` / `*.pem` etc.
+    /// Mirrors the edit.rs P1 fix.
+    #[test]
+    fn search_replace_sensitive_in_workspace_path_returns_always() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        // is_sensitive_input_path matches SECRET_FILE_NAMES by file_name
+        // anywhere on disk. `.env` is the canonical example.
+        let secret = workspace.path().join(".env");
+        let args = serde_json::json!({
+            "search": "foo",
+            "replace": "bar",
+            "path": secret.to_string_lossy(),
+        })
+        .to_string();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let approval = SearchReplaceTool.approval_with_context(&args, &ctx);
+        assert!(
+            matches!(approval, ApprovalRequirement::RequireApprovalAlways(_)),
+            "sensitive in-workspace path (.env) must require Always",
+        );
+    }
+
+    /// Cross-layer: session grant on search_replace must NOT bypass the
+    /// sensitive-path Always. Pins the end-to-end contract.
+    #[test]
+    fn search_replace_sensitive_path_through_store_with_session_grant_asks() {
+        use crate::tool::{PermissionDecision, PermissionStore};
+        let workspace = tempfile::TempDir::new().unwrap();
+        let secret = workspace.path().join(".env");
+        let args = serde_json::json!({
+            "search": "foo",
+            "replace": "bar",
+            "path": secret.to_string_lossy(),
+        })
+        .to_string();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let mut store = PermissionStore::new();
+        store.grant_session("search_replace");
+        let approval = SearchReplaceTool.approval_with_context(&args, &ctx);
+        let decision = store.check("search_replace", &approval);
+        assert!(
+            matches!(decision, PermissionDecision::Ask(_)),
+            "session grant must NOT bypass sensitive-path guard, got {decision:?}",
+        );
+    }
+
+    /// Negative control: ordinary in-workspace path remains AutoApprove
+    /// so the "model uses 30+ edit_file instead of one search_replace"
+    /// regression the original AutoApprove was guarding against stays
+    /// fixed.
+    #[test]
+    fn search_replace_ordinary_in_workspace_path_is_auto_approve() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let args = serde_json::json!({
+            "search": "foo",
+            "replace": "bar",
+            "path": workspace.path().join("src").to_string_lossy(),
+        })
+        .to_string();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let approval = SearchReplaceTool.approval_with_context(&args, &ctx);
+        assert!(
+            matches!(approval, ApprovalRequirement::AutoApprove),
+            "non-sensitive in-workspace path must stay AutoApprove",
         );
     }
 

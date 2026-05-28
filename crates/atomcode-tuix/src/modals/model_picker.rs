@@ -70,22 +70,6 @@ impl Modal for ModelPicker {
                     .unwrap_or_else(|| chosen.clone());
                 ctx.config.default_provider = chosen.clone();
                 ctx.model_name = display.clone();
-                // Sync reasoning_effort from the new provider; clear
-                // for non-DeepSeek models so stale values don't persist.
-                state.reasoning_effort = {
-                    let provider = ctx.config.providers.get(&chosen);
-                    let applicable = provider.map_or(false, |p| {
-                        atomcode_core::provider::openai::OpenAiProvider::reason_effort_applicable(
-                            &p.model,
-                            p.base_url.as_deref().unwrap_or(""),
-                        )
-                    });
-                    if applicable {
-                        provider.and_then(|p| p.reasoning_effort.clone())
-                    } else {
-                        None
-                    }
-                };
                 // Persist to config.toml + notify agent. Without this,
                 // the switch lives only in memory and the next startup
                 // reverts to whatever was last saved.

@@ -205,14 +205,13 @@ const FOOTER_ROWS: usize = 5;
 /// for SGR width because draw_panel-shaped output already commits
 /// to a known width.
 ///
-/// Both renderers (retained's DECSTBM region + alt_screen with
-/// sticky_bottom) anchor body content to the body region's BOTTOM:
-/// when total pushed rows < body_height, the auto-empty rows
-/// appear ABOVE the content, not below. So top-padding alone just
-/// stacks redundant blanks against the existing auto-empty strip
-/// while the panel stays glued to the footer. Filling the region
-/// to exactly body_height with top_blanks + content + bottom_blanks
-/// pushes the panel into the actual middle row in both renderers.
+/// RetainedRenderer anchors body content to the body region's BOTTOM:
+/// when total pushed rows < body_height, the auto-empty rows appear
+/// ABOVE the content, not below. So top-padding alone just stacks
+/// redundant blanks against the existing auto-empty strip while the
+/// panel stays glued to the footer. Filling the region to exactly
+/// body_height with top_blanks + content + bottom_blanks pushes the
+/// panel into the actual middle row.
 ///
 /// Each rendered line keeps its own SGR; we prepend bare spaces,
 /// which contribute no styling, so colour spans on the original
@@ -829,7 +828,7 @@ impl OnboardingWizard {
             // start_login failed at construction. Surface the cause
             // so the user knows whether to check network, broker, or
             // their own clock; offer Enter-to-retry below.
-            content.push(center("✗ 无法生成登录链接"));
+            content.push(center("× 无法生成登录链接"));
             content.push(String::new());
             // Error reason may be long; just left-align with indent
             // rather than centre — easier to scan.
@@ -875,7 +874,7 @@ impl OnboardingWizard {
         // Panel title carries the running atomcode version so users
         // reporting a screenshot tell us the build their bug landed
         // in without having to /status first. CARGO_PKG_VERSION is
-        // workspace-bound (e.g. "4.23.1") — matches the convention
+        // workspace-bound (e.g. "4.23.2") — matches the convention
         // used by the Step::Intro version line above.
         let panel_title = format!("AtomCode · v{}", env!("CARGO_PKG_VERSION"));
         out.extend(draw_panel(

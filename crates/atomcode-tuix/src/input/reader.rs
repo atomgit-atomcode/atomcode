@@ -9,6 +9,34 @@ use tokio::sync::mpsc;
 
 use super::InputEvent;
 
+/// Burst-aggregation poll timeout — how long the burst detector waits
+/// for the next event before deciding the burst is over. Picked per-OS
+/// because terminal stdin delivery cadence differs:
+///
+/// - **Windows** (PowerShell / Windows Terminal / conhost): bracketed
+///   paste payloads and char-by-char fallback delivery arrive in
+///   chunked stdin batches with 5-12 ms gaps between chunks; the old
+///   2 ms window split one logical Ctrl+V into 5-10 `[Pasted #N]`
+///   placeholders. 15 ms swallows those gaps without meaningfully
+///   extending per-keystroke typing latency — still well below the
+///   ~20 ms human perception floor.
+/// - **macOS / Linux**: bracketed paste arrives as one event in
+///   practice; the timeout only matters for the rare no-bracketed-paste
+///   fallback. 4 ms covers occasional 2-3 ms gaps seen on slow SSH
+///   sessions without adding perceptible typing lag.
+///
+/// Prior art: DeepSeek-TUI's `paste_burst.rs` ships Windows 60 ms /
+/// Unix 8 ms, but those depend on a two-stage state machine
+/// (short pending window → long active window) that gates the long
+/// timeout behind "burst confirmed". atomcode currently runs the
+/// timeout on *every* keystroke, so we keep both values comfortably
+/// below human perception. A follow-up will add the state machine,
+/// after which 60 ms can be safely adopted on Windows.
+#[cfg(target_os = "windows")]
+const BURST_POLL_TIMEOUT_MS: u64 = 15;
+#[cfg(not(target_os = "windows"))]
+const BURST_POLL_TIMEOUT_MS: u64 = 4;
+
 /// If a Key event could plausibly be part of a paste burst, return the
 /// character it contributes. Enter maps to `\n`, Tab to `\t`, Char(c) to
 /// itself. Modifier-carrying keys (Ctrl/Alt) and non-Press kinds are
@@ -362,15 +390,12 @@ fn run(
             let mut trailing: Option<Event> = None;
             const BATCH_CAP: usize = 8192;
             while chars.len() < BATCH_CAP {
-                // 2ms timeout is way under any human typing cadence
-                // (fastest typists are ~60ms/char) but bridges the
-                // transient gap Windows crossterm takes to translate
-                // each console record into an Event — without it, a
-                // paste arriving as 8 records in the console buffer
-                // can emit events with 100µs-1ms inter-event gaps that
-                // a strict `poll(0)` misses, and every line gets
-                // treated as an independent keystroke sequence.
-                match event::poll(Duration::from_millis(2)) {
+                // Bridge the transient gap a terminal takes to translate
+                // each console record into an Event. A paste arriving as
+                // chunked stdin batches gets split into per-record events
+                // and a strict `poll(0)` would miss the burst signature.
+                // See `BURST_POLL_TIMEOUT_MS` for per-OS rationale.
+                match event::poll(Duration::from_millis(BURST_POLL_TIMEOUT_MS)) {
                     Ok(true) => {}
                     _ => break,
                 }
@@ -512,21 +537,6 @@ fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
             crate::tuix_trace!("RD", "mouse scroll down");
             Some(InputEvent::MouseScroll(3))
         }
-        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            Some(InputEvent::MouseDown {
-                col: m.column,
-                row: m.row,
-            })
-        }
-        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-            Some(InputEvent::MouseDrag {
-                col: m.column,
-                row: m.row,
-            })
-        }
-        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-            Some(InputEvent::MouseUp)
-        }
         _ => None,
     }
 }
@@ -594,6 +604,55 @@ mod tests {
             "dedup window {}ms must stay below fastest realistic human \
              chord repeat (~100ms) so intentional Shift+Enter×2 still works",
             win
+        );
+    }
+
+    /// `BURST_POLL_TIMEOUT_MS` must sit above terminal stdin chunking
+    /// cadence (so paste chunks merge into one burst) but stay well
+    /// below the ~20 ms human input-perception floor (so single
+    /// keystrokes don't accrue per-key lag). The old 2 ms value was
+    /// too tight on Windows — PowerShell stdin delivery has 5-12 ms
+    /// gaps that fragmented one logical Ctrl+V into 5-10 [Pasted #N]
+    /// placeholders.
+    #[test]
+    fn burst_poll_timeout_within_safe_envelope() {
+        let t = BURST_POLL_TIMEOUT_MS;
+        assert!(
+            t >= 4,
+            "{}ms must be >= 4ms — at least the Unix baseline so 2-3ms \
+             SSH delivery gaps don't fragment pastes",
+            t
+        );
+        assert!(
+            t < 20,
+            "{}ms must stay under the ~20ms human input-perception \
+             floor so per-keystroke typing latency stays invisible",
+            t
+        );
+    }
+
+    /// Lock the Windows-specific tuned value. PowerShell / Windows
+    /// Terminal stdin chunks have 5-12 ms gaps; if a future edit
+    /// collapses Windows to the Unix baseline (4 ms), the original
+    /// Ctrl+V fragmentation bug returns.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn burst_poll_timeout_windows_is_tuned_value() {
+        assert_eq!(
+            BURST_POLL_TIMEOUT_MS, 15,
+            "Windows requires the tuned 15ms value, not the Unix baseline"
+        );
+    }
+
+    /// Lock the Unix baseline. 15 ms is the Windows-tuned value and
+    /// would add unnecessary per-keystroke lag for the macOS/Linux
+    /// majority where bracketed paste delivers as a single event.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn burst_poll_timeout_unix_is_baseline() {
+        assert_eq!(
+            BURST_POLL_TIMEOUT_MS, 4,
+            "non-Windows targets use the 4ms baseline, not the Windows 15ms"
         );
     }
 

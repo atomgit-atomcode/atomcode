@@ -694,8 +694,10 @@ impl PermissionStore {
 
         // 1. Session grant (user pressed [A] during this session).
         //    This overrides RequireApproval — the user explicitly chose "Always"
-        //    for this tool, so don't prompt again. Bash still has its own
-        //    destructive-command detection as a separate safety layer.
+        //    for this tool, so don't prompt again. Destructive operations opt
+        //    into `RequireApprovalAlways` (handled above) so they're NOT covered
+        //    by this bypass: e.g. bash returns RequireApprovalAlways for
+        //    rm -rf / rmdir /s /q / git push --force / dd / etc. (bash.rs:115).
         if self.session_grants.contains(tool_name) {
             return PermissionDecision::Allow;
         }
@@ -1562,15 +1564,17 @@ mod tests {
     }
 
     #[test]
-    fn test_permission_store_session_grant_bypasses_destructive() {
-        // Session grant (user pressed [A]) DOES bypass RequireApproval.
-        // The user explicitly chose "Always" — respect that. Bash still has
-        // its own destructive-command detection as a separate safety layer.
+    fn test_permission_store_session_grant_bypasses_require_approval() {
+        // Session grant (user pressed [A]) bypasses plain RequireApproval —
+        // the user explicitly chose "Always" for this tool. Destructive
+        // commands (rm -rf / rmdir / git push -f / …) must opt into
+        // RequireApprovalAlways so this bypass does NOT cover them; see
+        // the bash tool (bash.rs:115) and `..._does_not_bypass_require_approval_always`.
         let mut store = PermissionStore::new();
         store.grant_session("bash");
         let decision = store.check(
             "bash",
-            &ApprovalRequirement::RequireApproval("Destructive".into()),
+            &ApprovalRequirement::RequireApproval("non-destructive".into()),
         );
         assert!(matches!(decision, PermissionDecision::Allow));
     }

@@ -117,6 +117,10 @@ pub enum Msg<'a> {
         reset_at: &'a str,
         duration: &'a str,
     },
+    CpMonthlyQuotaExhausted {
+        reset_at: &'a str,
+        duration: &'a str,
+    },
     CpWindowQuotaExhausted,
     CpWindowQuotaHint {
         hint: &'a str,
@@ -163,6 +167,11 @@ pub enum Msg<'a> {
 
     // ── Status bar (build_status) ──
     StatusNoProvider,
+    /// Open-source build with an AtomGit-gateway provider configured.
+    /// Sending any chat will fail with `CpOfficialBuildRequired`; this
+    /// hint surfaces the same diagnosis up-front so the user doesn't
+    /// have to type a message to discover the dead-end.
+    StatusOfficialBuildRequired,
     StatusUpgradeHint {
         version: &'a str,
     },
@@ -476,10 +485,6 @@ pub enum Msg<'a> {
     KbdHintMacos,
     KbdHintOther,
 
-    // ── JediTerm / conhost fallback ──
-    JediTermFallback,
-    LegacyConhostFallback,
-
     // ── Background task ──
     BackgroundComplete {
         turns: usize,
@@ -708,7 +713,7 @@ pub enum Msg<'a> {
         slug: &'a str,
         reason: &'a str,
     },
-    /// Per-item failed row: "  ✗ mcp:xyz — error message"
+    /// Per-item failed row: "  × mcp:xyz — error message"
     SetupFailedRow {
         kind: &'a str,
         slug: &'a str,
@@ -770,6 +775,41 @@ pub enum Msg<'a> {
     PluginListFailed {
         error: &'a str,
     },
+    PluginReloadDone {
+        skills: usize,
+        warnings: usize,
+    },
+    /// Marketplace `add` completion toast. Emitted by `handle_plugin_job_event`
+    /// for both manual `/plugin marketplace add` and the detached
+    /// startup-bootstrap auto-install. `count` is the number of plugins the
+    /// marketplace exposes after cloning.
+    PluginMarketplaceAdded {
+        name: &'a str,
+        commit: &'a str,
+        count: usize,
+    },
+    /// Marketplace `update` completion toast — HEAD actually moved. No-op
+    /// pulls (HEAD unchanged) emit no toast at all so a quiet `git pull`
+    /// doesn't spam the body region.
+    PluginMarketplaceUpdated {
+        name: &'a str,
+        commit: &'a str,
+    },
+    /// Plugin `install` completion toast. `skipped` counts skills that the
+    /// loader rejected (bad SKILL.md frontmatter, namespace collision, etc.);
+    /// `show_details_hint` flips on the trailing "(Ctrl+O for details)"
+    /// nudge when warnings exist and verbose mode is off.
+    PluginInstallDone {
+        plugin: &'a str,
+        marketplace: &'a str,
+        loaded: usize,
+        skipped: usize,
+        show_details_hint: bool,
+    },
+    SetupAutoReloaded {
+        skills: usize,
+        warnings: usize,
+    },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
     CmdDescSetup,
@@ -806,9 +846,6 @@ pub enum Msg<'a> {
     CmdDescBuild,
     CmdDescThink,
     CmdDescEffort,
-    /// Rendered when the user tries to set reasoning_effort on a
-    /// provider that doesn't support it (non-DeepSeek V4 / reasoner).
-    ReasoningEffortNoEffect,
     CmdDescHelp,
     CmdDescKeys,
     CmdDescLanguage,
@@ -824,6 +861,9 @@ pub enum Msg<'a> {
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.
     CmdPasteNoImage,
+    /// Rendered when the user tries to set reasoning_effort on a
+    /// provider that doesn't support it (non-DeepSeek V4 / reasoner).
+    ReasoningEffortNoEffect,
 
     // ── config save failed ──
     ConfigSaveFailed {

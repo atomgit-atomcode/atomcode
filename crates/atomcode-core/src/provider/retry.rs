@@ -142,6 +142,64 @@ pub async fn send_with_retry(
     Err(last_err.expect("send_with_retry: loop terminated without error or response"))
 }
 
+/// Like `send_with_retry`, but rebuilds the request from scratch on
+/// every attempt. Use for callers whose request headers depend on a
+/// per-attempt fresh value (per-request nonce, per-request timestamp,
+/// per-request signature derived from both).
+///
+/// The factory is called BEFORE each attempt — never reuse a stale
+/// `RequestBuilder` across retries. If the factory itself produces a
+/// builder with a bad header / bad URL, that error surfaces as a
+/// `reqwest::Error` (via `build_split`) and propagates immediately
+/// without further retries.
+///
+/// Other behaviour matches `send_with_retry`: same `RetryPolicy`,
+/// same `is_retryable_status` / `is_retryable_error` decisions,
+/// same exponential backoff with jitter, same `Retry-After` honouring.
+pub async fn send_with_retry_resign<F>(
+    mut builder_factory: F,
+    policy: &RetryPolicy,
+) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let mut last_err: Option<reqwest::Error> = None;
+    for attempt in 1..=policy.max_attempts {
+        let builder = builder_factory();
+        let (client, built) = builder.build_split();
+        let req = match built {
+            Ok(r) => r,
+            Err(e) => {
+                // Builder-chain error (bad header, bad URL, etc.). The factory
+                // will keep producing the same bad builder — don't retry.
+                return Err(e);
+            }
+        };
+        // TODO: trace marker when atomcode-core gets a trace macro
+        match client.execute(req).await {
+            Ok(resp) => {
+                if is_retryable_status(resp.status()) && attempt < policy.max_attempts {
+                    let wait = parse_retry_after(resp.headers())
+                        .unwrap_or_else(|| compute_backoff(attempt, policy));
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                return Ok(resp);
+            }
+            Err(e) => {
+                if is_retryable_error(&e) && attempt < policy.max_attempts {
+                    let wait = compute_backoff(attempt, policy);
+                    last_err = Some(e);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err(last_err.expect("send_with_retry_resign: loop terminated without error or response"))
+}
+
 /// Blocking variant for sync code paths (e.g. OAuth token refresh in `create_provider`).
 /// Same contract as `send_with_retry`: builder-chain errors are surfaced
 /// as `reqwest::Error` rather than panics.
@@ -374,6 +432,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_connect() || err.is_request(), "got {:?}", err);
+    }
+
+    #[tokio::test]
+    async fn resign_factory_called_once_per_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let policy = RetryPolicy::testing();
+        let result = send_with_retry_resign(
+            move || {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                // Port 1 is never bound on localhost — guaranteed connection error.
+                reqwest::Client::new().post("http://127.0.0.1:1/unreachable")
+            },
+            &policy,
+        )
+        .await;
+        assert!(result.is_err(), "unreachable URL must error");
+        let expected = policy.max_attempts as usize;
+        let actual = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            actual, expected,
+            "factory should be called exactly once per attempt (got {actual}, expected {expected})",
+        );
     }
 
     /// Regression for user-reported crash: `send_with_retry: request

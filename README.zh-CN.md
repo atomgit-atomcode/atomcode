@@ -84,7 +84,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 |----------|:---:|---|
 | Claude（Anthropic） | 支持 | Claude Sonnet 4.5/4.6、Opus 4.6 |
 | OpenAI | 支持 | GPT-4o、GPT-4.1 |
-| DeepSeek | 支持 | DeepSeek V3、DeepSeek R1 |
+| DeepSeek | 支持 | DeepSeek V3、DeepSeek R1、DeepSeek V4 |
 | 智谱（GLM） | 支持 | GLM-4、GLM-5 |
 | 通义千问（阿里） | 支持 | Qwen-Plus、Qwen-Max |
 | SiliconFlow | 支持 | 多种开源模型 |
@@ -106,7 +106,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **多行输入** —— Shift+Enter 或 `\` + Enter 换行、高度自适应、历史记录
 - **任务完成通知** —— 长任务结束后优先走终端原生通知协议，必要时回退到系统通知
 - **文本选择** —— 鼠标拖选、自动滚动、复制到剪贴板
-- **斜杠命令** —— `/model`、`/provider`、`/resume`、`/bg`、`/diff`、`/undo`、`/cost`、`/clear`、`/compact` 等（完整列表见下）
+- **斜杠命令** —— `/model`、`/provider`、`/think`、`/effort`、`/resume`、`/bg`、`/diff`、`/undo`、`/cost`、`/clear`、`/compact` 等（完整列表见下）
 - **文件附加** —— 粘贴文件路径即可把内容作为上下文带入
 - **Bracketed paste** —— 长文本粘贴自动折叠为紧凑的指示器
 - **Skills** —— 从 skill 目录加载的用户自定义命令，像普通斜杠命令一样调用
@@ -316,6 +316,8 @@ atomcode --prompt-file task.md
 | `/config` | 编辑配置文件 |
 | `/status` | 查看登录状态和模型信息 |
 | `/logout` | 退出 AtomGit 登录 |
+| `/think` | 深度思考控制（on/off/budget N） |
+| `/effort` | DeepSeek 推理强度控制（high / max / off） |
 | `/help` | 查看命令与快捷键 |
 | `/quit` | 退出程序（或连按 Ctrl+C） |
 

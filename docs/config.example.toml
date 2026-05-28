@@ -13,6 +13,12 @@ context_window = 64000
 # "reasoning_content is missing in assistant tool call message".
 # reasoning_history = "include"  # or "exclude"
 
+# DeepSeek V4 reasoning effort. Controls the model's reasoning intensity.
+# Valid values: "high" or "max". None = don't send (API uses default).
+# Only takes effect when the provider targets api.deepseek.com or the
+# model name contains "deepseek-v4" / "deepseek-reasoner".
+# reasoning_effort = "high"
+
 # Per-turn datalog. Each turn writes a markdown summary; each LLM
 # round writes a JSON request/response pair under `<dir>/<project>/llm/`.
 # A per-project subdirectory is always appended under `dir` so multiple

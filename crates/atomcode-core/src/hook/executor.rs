@@ -204,7 +204,11 @@ impl HookExecutor {
             .arg(&hook.command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Hook timeout drops the inner future; without kill_on_drop
+            // the sh subprocess (and anything it spawned) keeps running
+            // detached. Set the flag BEFORE spawn so it propagates.
+            .kill_on_drop(true);
         if let Some(ref root) = hook.plugin_root {
             let s = root.as_os_str();
             cmd.env("CLAUDE_PLUGIN_ROOT", s);
@@ -262,7 +266,10 @@ impl HookExecutor {
         cmd.arg("-c")
             .arg(&hook.command)
             .env("ATOMCODE_HOOK_EVENT", &ctx.event)
-            .env("ATOMCODE_HOOK_CONTEXT", &ctx_json);
+            .env("ATOMCODE_HOOK_CONTEXT", &ctx_json)
+            // Hook timeout drops the cmd.output() future; without
+            // kill_on_drop the sh subprocess keeps running detached.
+            .kill_on_drop(true);
 
         if let Some(ref name) = ctx.tool_name {
             cmd.env("ATOMCODE_TOOL_NAME", name);

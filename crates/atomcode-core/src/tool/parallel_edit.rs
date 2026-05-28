@@ -114,8 +114,57 @@ impl Tool for ParallelEditTool {
         }
     }
 
-    fn approval(&self, _args: &str) -> ApprovalRequirement {
+    fn approval(&self, args: &str) -> ApprovalRequirement {
+        // parallel_edit_files dispatches sub-agents that each call
+        // edit_file, which has its own sensitive-path guard. BUT the
+        // outer call itself must also flag sensitive targets so a
+        // session [A] on parallel_edit_files can't disarm the guard
+        // — same class of bypass that hit edit_file before its fix.
+        // If ANY listed file is sensitive, prompt; approval_with_context
+        // upgrades that to Always when the file is in-workspace.
+        let parsed = match serde_json::from_str::<ParallelEditArgs>(args) {
+            Ok(p) => p,
+            Err(_) => return ApprovalRequirement::AutoApprove,
+        };
+        for file in &parsed.files {
+            if super::is_sensitive_input_path(&file.path) {
+                return ApprovalRequirement::RequireApproval(format!(
+                    "Editing sensitive system path in parallel batch: {}",
+                    file.path
+                ));
+            }
+        }
         ApprovalRequirement::AutoApprove
+    }
+
+    fn approval_with_context(&self, args: &str, ctx: &ToolContext) -> ApprovalRequirement {
+        // For each listed file, run the same Write boundary check
+        // edit.rs uses, then merge — strongest approval wins:
+        //   - out-of-workspace any file        → RequireApprovalAlways
+        //   - in-workspace + sensitive base    → RequireApprovalAlways
+        //   - all in-workspace + non-sensitive → AutoApprove
+        let base = self.approval(args);
+        let parsed = match serde_json::from_str::<ParallelEditArgs>(args) {
+            Ok(parsed) => parsed,
+            Err(_) => return base,
+        };
+        let working_dir = match ctx.working_dir.try_read() {
+            Ok(wd) => wd.clone(),
+            Err(_) => return base,
+        };
+        let mut strongest = base;
+        for file in &parsed.files {
+            let per_file = match super::approval_for_path(
+                &file.path,
+                &working_dir,
+                super::ExternalPathAction::Write,
+            ) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            strongest = merge_approval_strongest(strongest, per_file);
+        }
+        strongest
     }
 
     fn validate_args(&self, args: &str) -> std::result::Result<(), String> {
@@ -399,6 +448,25 @@ fn find_build_command(wd: &std::path::Path) -> Option<(String, std::path::PathBu
     None
 }
 
+/// Merge two `ApprovalRequirement`s into the strongest. Used by
+/// `parallel_edit_files`'s `approval_with_context` to fold a multi-file
+/// batch into a single approval decision — any file demanding Always
+/// promotes the whole batch; a base RequireApproval (sensitive) plus
+/// AutoApprove (in-workspace) upgrades to Always, mirroring edit.rs.
+fn merge_approval_strongest(a: ApprovalRequirement, b: ApprovalRequirement) -> ApprovalRequirement {
+    use ApprovalRequirement::*;
+    match (a, b) {
+        (RequireApprovalAlways(r), _) | (_, RequireApprovalAlways(r)) => RequireApprovalAlways(r),
+        // Sensitive base + workspace-internal write → upgrade to Always so
+        // a session grant on parallel_edit_files cannot bypass.
+        (RequireApproval(r), AutoApprove) | (AutoApprove, RequireApproval(r)) => {
+            RequireApprovalAlways(r)
+        }
+        (RequireApproval(r), RequireApproval(_)) => RequireApproval(r),
+        (a, _) => a,
+    }
+}
+
 #[cfg(test)]
 mod validate_args_tests {
     use super::*;
@@ -562,6 +630,79 @@ mod validate_args_tests {
         assert_eq!(infos[1].dedup_suffix, "");
         assert_eq!(infos[2].dedup_suffix, " (#2)");
         assert_eq!(infos[3].dedup_suffix, " (#3)");
+    }
+
+    /// Regression: any sensitive in-workspace file in the batch must
+    /// promote the whole call to RequireApprovalAlways so a prior [A]
+    /// on parallel_edit_files can't bypass the guard. Same class of
+    /// bypass that hit edit_file before its fix.
+    #[test]
+    fn parallel_edit_sensitive_file_in_batch_returns_always() {
+        use crate::tool::ToolContext;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let dotenv = workspace.path().join(".env");
+        let normal = workspace.path().join("src.rs");
+        let args = serde_json::json!({
+            "files": [
+                {"path": normal.to_string_lossy(), "instruction": "no-op"},
+                {"path": dotenv.to_string_lossy(),  "instruction": "no-op"},
+            ],
+            "contract": ""
+        })
+        .to_string();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let approval = tool().approval_with_context(&args, &ctx);
+        assert!(
+            matches!(approval, ApprovalRequirement::RequireApprovalAlways(_)),
+            "any sensitive in-workspace file in batch must require Always",
+        );
+    }
+
+    /// Cross-layer: session grant on parallel_edit_files must NOT
+    /// bypass the sensitive-batch guard. Pins the contract end-to-end.
+    #[test]
+    fn parallel_edit_sensitive_batch_through_store_with_session_grant_asks() {
+        use crate::tool::{PermissionDecision, PermissionStore, ToolContext};
+        let workspace = tempfile::TempDir::new().unwrap();
+        let dotenv = workspace.path().join(".env");
+        let normal = workspace.path().join("src.rs");
+        let args = serde_json::json!({
+            "files": [
+                {"path": normal.to_string_lossy(), "instruction": "no-op"},
+                {"path": dotenv.to_string_lossy(),  "instruction": "no-op"},
+            ],
+        })
+        .to_string();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let mut store = PermissionStore::new();
+        store.grant_session("parallel_edit_files");
+        let approval = tool().approval_with_context(&args, &ctx);
+        let decision = store.check("parallel_edit_files", &approval);
+        assert!(
+            matches!(decision, PermissionDecision::Ask(_)),
+            "session grant must NOT bypass sensitive-batch guard, got {decision:?}",
+        );
+    }
+
+    /// Negative control: batch of ordinary in-workspace files stays
+    /// AutoApprove so the parallel-edit ergonomics aren't ruined.
+    #[test]
+    fn parallel_edit_batch_of_ordinary_files_is_auto_approve() {
+        use crate::tool::ToolContext;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let args = serde_json::json!({
+            "files": [
+                {"path": workspace.path().join("a.rs").to_string_lossy(), "instruction": "x"},
+                {"path": workspace.path().join("b.rs").to_string_lossy(), "instruction": "y"},
+            ],
+        })
+        .to_string();
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let approval = tool().approval_with_context(&args, &ctx);
+        assert!(
+            matches!(approval, ApprovalRequirement::AutoApprove),
+            "ordinary batch must stay AutoApprove",
+        );
     }
 
     #[test]

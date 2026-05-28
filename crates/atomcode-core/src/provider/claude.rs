@@ -800,6 +800,7 @@ mod tests {
                     },
                 ],
             },
+            synthetic: false,
         }];
 
         let (_system, msgs) = ClaudeProvider::format_messages(&messages);
@@ -840,6 +841,7 @@ mod tests {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
+            synthetic: false,
         }];
 
         let (_system, msgs) = ClaudeProvider::format_messages(&messages);
@@ -864,6 +866,7 @@ mod tests {
                     data: "aWdub3JlLXRoaXM=".to_string(),
                 }],
             },
+            synthetic: false,
         }];
 
         let (_system, msgs) = ClaudeProvider::format_messages(&messages);
@@ -899,6 +902,7 @@ mod tests {
                     data: "c29tZS1kYXRh".to_string(),
                 }],
             },
+            synthetic: false,
         }];
 
         let (_system, msgs) = ClaudeProvider::format_messages(&messages);
@@ -930,6 +934,7 @@ mod tests {
                     },
                 ],
             },
+            synthetic: false,
         }];
 
         let (_system, msgs) = ClaudeProvider::format_messages(&messages);

@@ -99,6 +99,7 @@ pub async fn maybe_preprocess(
             text: Some(prompt),
             images: images.to_vec(),
         },
+        synthetic: false,
     }];
 
     // Idle (no-progress) timeout, NOT wall-clock. A VL call can take any

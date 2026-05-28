@@ -157,7 +157,9 @@ impl AgentLoop {
             if !skills.is_empty() {
                 prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
                 prompt.push_str(
-                    "Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
+                    "This is the COMPLETE list of available skills. Skills NOT listed here do NOT exist — do NOT fabricate or assume skills that are not in this list.\n\
+To MODIFY a skill, edit its SKILL.md file directly (e.g. .atomcode/skills/<name>/SKILL.md or ~/.atomcode/skills/<name>/SKILL.md), NOT the project instructions file.\n\
+Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
                 );
                 prompt.push_str(&skills.join("\n"));
                 prompt.push('\n');

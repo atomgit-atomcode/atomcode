@@ -25,7 +25,15 @@ pub struct OpenFileTool;
 
 #[derive(Deserialize)]
 struct OpenFileArgs {
-    path: String,
+    // `alias = "path"`: ce1c344f renamed the parameter from `path` to
+    // `file_path` to align with read/write/edit. Without an alias,
+    // serde rejects calls that still use `path` — which breaks
+    // resumed sessions that snapshotted the old tool schema and
+    // models whose cached schema isn't refreshed yet. Keep both
+    // accepted for one release cycle; remove the alias once the
+    // upgrade has settled.
+    #[serde(alias = "path")]
+    file_path: String,
 }
 
 /// What command pattern (if any) is appropriate for opening a local
@@ -191,12 +199,12 @@ impl Tool for OpenFileTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "file_path": {
                         "type": "string",
                         "description": "File path to open. Absolute, or relative to the current working directory. Must exist."
                     }
                 },
-                "required": ["path"]
+                "required": ["file_path"]
             }),
         }
     }
@@ -234,7 +242,8 @@ impl Tool for OpenFileTool {
             Ok(g) => g.clone(),
             Err(_) => return self.approval(args),
         };
-        match super::approval_for_path(&parsed.path, &wd, super::ExternalPathAction::Enumerate) {
+        match super::approval_for_path(&parsed.file_path, &wd, super::ExternalPathAction::Enumerate)
+        {
             Ok(approval) => approval,
             Err(_) => self.approval(args),
         }
@@ -242,7 +251,7 @@ impl Tool for OpenFileTool {
 
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: OpenFileArgs = serde_json::from_str(args)?;
-        let path = parsed.path.as_str();
+        let path = parsed.file_path.as_str();
 
         // Resolve relative to working_dir, mirroring every other file tool.
         let wd = ctx.working_dir.read().await.clone();
@@ -350,6 +359,20 @@ mod tests {
             return;
         }
         assert!(ssh_signal().is_none());
+    }
+
+    /// Both `path` (legacy) and `file_path` (canonical) must deserialize.
+    /// ce1c344f renamed without an alias — that left resumed sessions
+    /// snapshotting the old schema getting "missing field `file_path`"
+    /// errors. The alias keeps the old name working for one release.
+    #[test]
+    fn open_file_args_accepts_legacy_path_alias() {
+        let legacy: OpenFileArgs =
+            serde_json::from_str(r#"{"path":"/tmp/x.html"}"#).expect("legacy `path` must parse");
+        assert_eq!(legacy.file_path, "/tmp/x.html");
+        let canonical: OpenFileArgs =
+            serde_json::from_str(r#"{"file_path":"/tmp/x.html"}"#).expect("canonical must parse");
+        assert_eq!(canonical.file_path, "/tmp/x.html");
     }
 
     #[test]
