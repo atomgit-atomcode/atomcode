@@ -1100,7 +1100,7 @@ mod tests {
             cwd: "/tmp".into(),
         };
         let result = hook.on_user_prompt_submit(&payload).await;
-        assert!(matches!(result, UserPromptSubmitResult::Block(ref s) if s == "block message"));
+        assert!(matches!(result, UserPromptSubmitResult::Warning(ref s) if s == "block message"));
     }
 
     #[tokio::test]

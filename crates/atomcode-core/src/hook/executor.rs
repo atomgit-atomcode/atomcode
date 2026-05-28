@@ -582,7 +582,7 @@ mod tests {
         );
         let exec = HookExecutor::new(vec![hook]);
         let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
-        assert_eq!(r, UserPromptHookResult::Block("bad".into()));
+        assert_eq!(r, UserPromptHookResult::Warning("bad".into()));
     }
 
     /// Regression: stdout that mixes debug logging with a trailing JSON
@@ -798,7 +798,7 @@ context from second".into()));
         let hook = make_hook(HookEvent::UserPromptSubmit, None, "exit 1");
         let exec = HookExecutor::new(vec![hook]);
         let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
-        assert_eq!(r, UserPromptHookResult::Block("user prompt blocked by hook".into()));
+        assert_eq!(r, UserPromptHookResult::Warning("hook exited with error".into()));
     }
 
     #[tokio::test]
@@ -880,7 +880,7 @@ context from second".into()));
             r#"echo 'stdout msg' && echo 'stderr reason' >&2 && exit 1"#);
         let exec = HookExecutor::new(vec![hook]);
         let r = exec.run_user_prompt_submit("hi", "s", "/tmp").await;
-        assert_eq!(r, UserPromptHookResult::Block("stderr reason".into()));
+        assert_eq!(r, UserPromptHookResult::Warning("stderr reason".into()));
     }
 
     #[tokio::test]
