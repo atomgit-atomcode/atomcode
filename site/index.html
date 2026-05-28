@@ -225,7 +225,8 @@
   /* ---------- plugins ---------- */
   .plugins{padding:60px 30px 100px;background:linear-gradient(180deg,rgba(255,255,255,.015),transparent)}
   .plugin-wrap{width:min(1180px,100%);margin:0 auto}
-  .plugin-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:start}
+  .plugin-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+  .plugin-grid>.plugin-install{height:100%}
   .plugin-features{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   .plugin-feat{padding:22px 18px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,0));transition:border-color .25s,transform .3s cubic-bezier(.22,1,.36,1)}
   .plugin-feat:hover{border-color:rgba(232,160,80,.45);transform:translateY(-1px)}
@@ -240,18 +241,23 @@
   .plugin-install .pi-item .pi-url{display:block;padding:10px 12px;font-size:12px;color:var(--accent);text-decoration:none;line-height:1.5;word-break:break-all}
   .plugin-install .pi-item .pi-url:hover{text-decoration:underline}
   .plugin-install .pi-item .pi-cmd{margin:0;padding:10px 12px;font-size:12px;color:#e8e8e8;white-space:pre-wrap;line-height:1.5}
-  .plugin-cmds{background:#000;border:1px solid var(--line);border-radius:10px;overflow:hidden;font-family:var(--mono)}
-  .plugin-cmds .pc-head{padding:10px 16px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--line);font-size:11px;letter-spacing:1.5px;color:var(--accent)}
-  .plugin-cmds .pc-body{padding:14px 16px;display:flex;flex-wrap:wrap;gap:6px}
-  .plugin-cmds .pc-tag{padding:3px 10px;font-size:11px;color:rgba(255,255,255,.65);border:1px solid rgba(255,255,255,.12);border-radius:3px;background:rgba(255,255,255,.02)}
+  .pi-steps{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;padding:8px 12px;font-size:11px;color:rgba(255,255,255,.65)}
+  .pi-steps+.pi-steps{padding-top:0}
+  .pi-step-num{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;background:rgba(232,160,80,.18);color:var(--accent);font-size:7px;font-weight:600;flex-shrink:0}
+  .pi-steps .pi-url{display:block;width:100%;margin-top:4px;padding:0 0 0 24px;font-size:12px;color:var(--accent);text-decoration:none;word-break:break-all}
+  .pi-steps .pi-url:hover{text-decoration:underline}
+  .pi-steps .pi-cmd{width:100%;margin:4px 0 0 24px;font-size:12px;color:#e8e8e8;white-space:pre-wrap;line-height:1.5;font-family:var(--mono)}
+  .pi-item .cp-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 6px 4px 12px;background:rgba(255,255,255,.025);border-bottom:1px solid rgba(255,255,255,.05)}
+  .pi-item .cp-bar .label{font-family:var(--mono);font-size:10.5px;letter-spacing:.5px;color:rgba(255,255,255,.5);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pi-item .cp-btn{opacity:.85}
+  .pi-item:hover .cp-btn{opacity:1}
+  .pi-steps .cp-btn{flex-shrink:0;margin-left:auto}
   .plugin-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:32px}
   .plugin-stat{padding:24px 20px;border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,0));text-align:center;transition:border-color .25s,transform .3s}
   .plugin-stat:hover{border-color:rgba(232,160,80,.45);transform:translateY(-3px)}
   .plugin-stat .v{font-family:Inter,sans-serif;font-size:40px;font-weight:600;color:#fff}
   .plugin-stat .v .suf{font-size:18px;color:var(--accent);margin-left:2px}
   .plugin-stat .l{margin-top:6px;font-family:var(--mono);font-size:11px;color:rgba(255,255,255,.5);letter-spacing:1.5px;text-transform:uppercase}
-  .plugin-sidebar{display:flex;flex-direction:column;gap:12px;height:100%}
-
   /* ---------- comparison ---------- */
   .compare{padding:60px 30px 100px;background:linear-gradient(180deg,rgba(255,255,255,.015),transparent)}
   .cmp-wrap{width:min(1180px,100%);margin:0 auto}
@@ -421,9 +427,11 @@
   html.light .plugin-install .pi-item .pi-label{background:rgba(0,0,0,.025);border-bottom-color:rgba(0,0,0,.05);color:rgba(0,0,0,.5)}
   html.light .plugin-install .pi-item .pi-url{color:#c87618}
   html.light .plugin-install .pi-item .pi-cmd{color:#0d0d0d}
-  html.light .plugin-cmds{background:#fff;border-color:rgba(0,0,0,.10)}
-  html.light .plugin-cmds .pc-head{color:#c87618;background:rgba(0,0,0,.02);border-bottom-color:rgba(0,0,0,.08)}
-  html.light .plugin-cmds .pc-tag{color:rgba(0,0,0,.6);border-color:rgba(0,0,0,.12);background:rgba(0,0,0,.02)}
+  html.light .pi-step-num{background:rgba(200,118,24,.12);color:#c87618}
+  html.light .pi-steps{color:rgba(0,0,0,.55)}
+  html.light .pi-steps .pi-url{color:#c87618}
+  html.light .pi-item .cp-bar{background:rgba(0,0,0,.025);border-bottom-color:rgba(0,0,0,.05)}
+  html.light .pi-item .cp-bar .label{color:rgba(0,0,0,.5)}
   html.light .plugin-stat{border-color:rgba(0,0,0,.10);background:#fff}
   html.light .plugin-stat:hover{border-color:rgba(200,118,24,.45)}
   html.light .plugin-stat .v{color:#0d0d0d}
@@ -880,10 +888,8 @@
 
       </div>
 
-      <!-- right: install + slash commands -->
-      <div class="plugin-sidebar">
-
-        <div class="plugin-install">
+      <!-- right: install -->
+      <div class="plugin-install">
           <div class="pi-head">●●● <span data-i18n="plug.install.head">安装 AtomCode for VS Code</span></div>
           <div class="pi-body">
             <div class="pi-item">
@@ -891,27 +897,30 @@
               <a class="pi-url" href="https://marketplace.visualstudio.com/items?itemName=atomcode-tools.atomcode-tools" target="_blank" rel="noopener">marketplace.visualstudio.com/items?itemName=atomcode-tools.atomcode-tools</a>
             </div>
             <div class="pi-item">
-              <div class="pi-label" data-i18n="plug.install.vsix"># 或下载 .vsix 手动安装</div>
-              <pre class="pi-cmd">code --install-extension atomcode-tools-0.0.8.vsix</pre>
+              <div class="cp-bar">
+                <span class="label" data-i18n="plug.install.cmd"># 或通过命令行安装</span>
+                <button class="cp-btn pi-cp" type="button" data-i18n="install.copy.short">📋 复制</button>
+              </div>
+              <pre class="pi-cmd">code --install-extension atomcode-tools.atomcode-tools</pre>
+            </div>
+            <div class="pi-item">
+              <div class="cp-bar">
+                <span class="label" data-i18n="plug.install.vsix"># 或下载 .vsix 手动安装</span>
+              </div>
+              <div class="pi-steps">
+                <span class="pi-step-num">1</span>
+                <span data-i18n="plug.install.download">下载 .vsix 文件</span>
+                <a class="pi-url" href="https://marketplace.visualstudio.com/_apis/public/gallery/publishers/atomcode-tools/vsextensions/atomcode-tools/0.0.8/vspackage" target="_blank" rel="noopener" data-i18n="plug.install.dl-link">点击下载 atomcode-tools-0.0.8.vsix</a>
+              </div>
+              <div class="pi-steps">
+                <span class="pi-step-num">2</span>
+                <span data-i18n="plug.install.run">运行安装命令</span>
+                <button class="cp-btn pi-cp" type="button" data-i18n="install.copy.short">📋 复制</button>
+                <pre class="pi-cmd">code --install-extension atomcode-tools-0.0.8.vsix</pre>
+              </div>
             </div>
           </div>
         </div>
-
-        <div class="plugin-cmds">
-          <div class="pc-head" data-i18n="plug.slash.head">/ 斜杠命令</div>
-          <div class="pc-body">
-            <span class="pc-tag">/explain</span>
-            <span class="pc-tag">/fix</span>
-            <span class="pc-tag">/test</span>
-            <span class="pc-tag">/refactor</span>
-            <span class="pc-tag">/docs</span>
-            <span class="pc-tag">/review</span>
-            <span class="pc-tag">/login</span>
-            <span class="pc-tag">/codingplan</span>
-          </div>
-        </div>
-
-      </div>
 
     </div>
 
@@ -1193,8 +1202,12 @@ const T={
   'plug.atomgit.d':{zh:'OAuth 一键登录，CodingPlan 免费额度，/login /codingplan 命令',en:'OAuth one-click login, CodingPlan free tier, /login /codingplan commands'},
   'plug.install.head':{zh:'安装 AtomCode for VS Code',en:'Install AtomCode for VS Code'},
   'plug.install.mkt':{zh:'# 从 Marketplace 安装（推荐）',en:'# Install from Marketplace (recommended)'},
+  'plug.install.cmd':{zh:'# 或通过命令行安装',en:'# Or install via command line'},
   'plug.install.vsix':{zh:'# 或下载 .vsix 手动安装',en:'# Or download .vsix to install manually'},
-  'plug.slash.head':{zh:'/ 斜杠命令',en:'/ Slash Commands'},
+  'plug.install.download':{zh:'下载 .vsix 文件',en:'Download .vsix file'},
+  'plug.install.dl-link':{zh:'点击下载 atomcode-tools-0.0.8.vsix',en:'Download atomcode-tools-0.0.8.vsix'},
+  'plug.install.run':{zh:'运行安装命令',en:'Run install command'},
+
   'plug.stat.cmds':{zh:'内置命令',en:'Built-in Commands'},
   'plug.stat.slash':{zh:'斜杠命令',en:'Slash Commands'},
   'plug.stat.vscode':{zh:'VS Code 版本',en:'VS Code Version'},
@@ -1651,6 +1664,24 @@ window.applyWizardNav=null;
     setTimeout(()=>{toast.classList.remove('show')},1600);
     setTimeout(()=>{btn.classList.remove('copied');btn.textContent=t('install.copy.short')},1600);
   });
+
+  // Plugin install copy buttons — delegated click on .pi-cp
+  (function(){
+    const toast=document.getElementById('toast');
+    document.addEventListener('click',e=>{
+      const btn=e.target.closest('.pi-cp');
+      if(!btn)return;
+      const pre=btn.closest('.pi-item, .pi-steps')?.querySelector('pre');
+      if(!pre)return;
+      const text=pre.textContent||'';
+      if(navigator.clipboard)navigator.clipboard.writeText(text).catch(()=>{});
+      btn.classList.add('copied');
+      btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
+      toast.textContent=t('toast.copied');toast.classList.add('show');
+      setTimeout(()=>{toast.classList.remove('show')},1600);
+      setTimeout(()=>{btn.classList.remove('copied');btn.textContent=t('install.copy.short')},1600);
+    });
+  })();
 
   // downloads — actual release URLs
   document.getElementById('downloadRow').innerHTML=DOWNLOADS.map(d=>`
