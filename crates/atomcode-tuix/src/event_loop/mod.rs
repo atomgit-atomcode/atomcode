@@ -4625,6 +4625,17 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
+
+    // When a guide subagent is running, Ctrl+C should always cancel it
+    // regardless of whether the input buffer is empty or not.
+    if app.state.guide_running && matches!(action, Action::Cancel) {
+        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        app.buf.text.clear();
+        app.buf.cursor = 0;
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
@@ -5627,11 +5638,11 @@ pub(super) fn handle_upgrade_event(
     renderer.flush();
 }
 
-/// Map internal subagent names to user-facing Chinese display names.
-fn subagent_display_name(name: &str) -> &str {
+/// Map internal subagent names to user-facing display names.
+fn subagent_display_name(name: &str) -> std::borrow::Cow<'static, str> {
     match name {
-        "atomcode-guide" => "指南",
-        _ => name,
+        "atomcode-guide" => crate::i18n::t(crate::i18n::Msg::GuideDisplayName),
+        _ => std::borrow::Cow::Owned(name.to_string()),
     }
 }
 
@@ -6551,7 +6562,7 @@ fn handle_agent_event(
             renderer.flush();
             let mut output = text.clone();
             if truncated {
-                output.push_str("\n*(已截断)*");
+                output.push_str(&crate::i18n::t(crate::i18n::Msg::GuideTruncatedIndicator));
             }
             renderer.render(UiLine::GuideResult(output));
             renderer.flush();
