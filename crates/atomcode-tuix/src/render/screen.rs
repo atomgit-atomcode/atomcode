@@ -253,9 +253,16 @@ impl Screen {
     /// unknown. Safe to call even when prev is already blank
     /// (just produces no additional emit).
     pub fn invalidate(&mut self) {
-        let blank_row = vec![Cell::blank(); self.width as usize];
+        // Sentinel (not Cell::blank) so the next diff sees EVERY cell as
+        // changed — including positions where both the stale frame and
+        // the upcoming next frame happen to hold default-style spaces.
+        // The blank-match-blank suppression was the leak source for the
+        // win10 + pwsh7 + zh_CN char-doubling bug: direct-write left
+        // stale glyphs at columns the diff then declined to repaint.
+        // See `Cell::sentinel` for the full write-up.
+        let sentinel_row = vec![Cell::sentinel(); self.width as usize];
         for row in &mut self.prev_cells {
-            *row = blank_row.clone();
+            *row = sentinel_row.clone();
         }
         // Mark physical state unknown so the next render_diff begins
         // with a cold-start per-row CUP+EL — see `Screen::physical_dirty`
@@ -281,10 +288,18 @@ impl Screen {
     /// the diff cache to match what the caller already told the
     /// terminal to do.
     pub fn invalidate_rows_from(&mut self, start_row: usize) {
-        let blank_row = vec![Cell::blank(); self.width as usize];
+        // Sentinel — see `invalidate` and `Cell::sentinel` for why this
+        // is NOT `Cell::blank`. This is the main hot path for the bug:
+        // every push_body_row → emit_body_line_inner direct-write hits
+        // this. With Cell::blank prev, the follow-up cell-diff treated
+        // a row of `   X   Y   ` as "only patch X and Y, the spaces
+        // already match" — letting stale wide-char right-halves from a
+        // 1-col-off direct-write linger. Sentinel forces every column
+        // through the diff, including the spaces.
+        let sentinel_row = vec![Cell::sentinel(); self.width as usize];
         let h = self.prev_cells.len();
         for r in start_row.min(h)..h {
-            self.prev_cells[r] = blank_row.clone();
+            self.prev_cells[r] = sentinel_row.clone();
         }
     }
 
@@ -307,10 +322,16 @@ impl Screen {
             return;
         }
         let n = n.min(h);
-        let blank_row = vec![Cell::blank(); self.width as usize];
+        // Sentinel for the freed-by-scroll rows — same reasoning as the
+        // other invalidate paths. The caller just told the terminal "LF
+        // at the bottom row" which promoted the top into native
+        // scrollback and left the bottom slot blank; we sentinel-fill
+        // that slot so the next render_diff repaints every cell of it,
+        // not just the non-space ones.
+        let sentinel_row = vec![Cell::sentinel(); self.width as usize];
         self.prev_cells.rotate_left(n);
         for row_idx in (h - n)..h {
-            self.prev_cells[row_idx] = blank_row.clone();
+            self.prev_cells[row_idx] = sentinel_row.clone();
         }
     }
 

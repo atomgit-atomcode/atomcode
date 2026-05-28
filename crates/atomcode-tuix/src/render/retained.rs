@@ -4210,9 +4210,17 @@ mod tests {
     /// Streaming delta byte cost: scenario mirrors agent_events
     /// emitting `AssistantText` + `StreamingBox` repeatedly. Each
     /// iteration appends a short line to the body + re-paints the
-    /// footer spinner. Budget: < 200 B/iteration (AnsiRenderer was
-    /// 41 B for streaming-only, but retained pays an extra
-    /// full-frame cost for the trailing StreamingBox re-paint).
+    /// footer spinner. Budget: < 300 B/iteration.
+    ///
+    /// History: 200 → 250 when the retained renderer added an extra
+    /// full-frame cost for the trailing StreamingBox re-paint.
+    /// 250 → 300 when `invalidate_rows_from` switched from
+    /// `Cell::blank` to `Cell::sentinel` so every cell in the
+    /// invalidated region — including the trailing spaces inside the
+    /// footer's input box and status row — re-patches every frame.
+    /// That sentinel change kills the win10+pwsh7+zh_CN char-doubling
+    /// class of bugs (see `Cell::sentinel` doc); ~14 B/iter is the
+    /// shipping cost.
     #[test]
     fn retained_streaming_delta_byte_cost() {
         let (mut r, counter) = new_counting(80, 24);
@@ -4248,8 +4256,8 @@ mod tests {
             avg_per_delta
         );
         assert!(
-            avg_per_delta < 250,
-            "retained streaming regressed: {} B/iter (budget < 250)",
+            avg_per_delta < 300,
+            "retained streaming regressed: {} B/iter (budget < 300)",
             avg_per_delta
         );
     }
