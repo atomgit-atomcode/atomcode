@@ -21,43 +21,12 @@ use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
 /// Maximum recent project dirs we keep in memory + persist to disk.
 const MAX_RECENT_DIRS: usize = 5;
-
-fn build_oauth_provider() -> ProviderConfig {
-    // Post-P3 cutover: default OAuth fallback now points at the new
-    // signed gateway (`llm-api.atomgit.com`). The legacy
-    // `api-ai.gitcode.com` host previously served plaintext as a
-    // fallback for open-source builds — that escape hatch closes here
-    // because the legacy host is now also signing-enforced (see
-    // `crypto::is_atomgit_gateway`). Open-source-build users hitting
-    // `/login` will see `CpOfficialBuildRequired` on their first chat;
-    // they must either install the official build or configure a
-    // third-party provider via `/provider`.
-    ProviderConfig {
-        provider_type: "openai".to_string(),
-        api_key: None,
-        model: "MiniMax-M2.7".to_string(),
-        base_url: Some("https://llm-api.atomgit.com/v1".to_string()),
-        system_prompt: None,
-        user_agent: None,
-        context_window: 64_000,
-        max_tokens: None,
-        thinking_type: None,
-        thinking_keep: None,
-        reasoning_history: None,
-        thinking_enabled: None,
-        thinking_budget: None,
-        skip_tls_verify: false,
-        ephemeral: false,
-
-}
-}
 
 fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
     if matches!(
@@ -160,8 +129,9 @@ fn sync_bg_foreground(ctx: &mut LoopCtx) {
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
 // and a `build_oauth_provider` helper here. Both are owned by
-// `coding_plan::setup` now — `/login` is identity-only, provider
-// registration is the job of `/codingplan`.
+// `coding_plan::setup` now — `/login` runs the full CodingPlan
+// orchestrator (claim + model list + provider registration), so there
+// is no need for a separately maintained hardcoded fallback provider.
 
 /// Maximum length for a session name.
 pub const MAX_SESSION_NAME_LEN: usize = 100;
@@ -693,9 +663,6 @@ pub(super) fn execute_slash_command(
         }
         "login" => {
             run_login_flow(renderer, ctx)?;
-        }
-        "codingplan" => {
-            run_codingplan_flow(renderer, ctx)?;
         }
         "logout" => {
             // /logout only invalidates the OAuth token on disk.
@@ -2775,75 +2742,21 @@ fn run_oauth_with_renderer(
     session.finish(Some(&ctx.telemetry))
 }
 
-/// Run the OAuth login flow with the URL rendered into scrollback and
-/// the input box preserved. ESC cancels via `ctx.input_rx`. See
-/// `run_oauth_with_renderer` for the rationale.
-pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
-    let result = run_oauth_with_renderer(renderer, ctx)
-        .and_then(|auth| atomcode_core::auth::save_auth(&auth).map(|()| auth));
-
-    match result {
-        Ok(auth) => {
-            // /login is identity-only. Provider / model setup lives in
-            // /codingplan — that flow pulls the authoritative model list
-            // from the CodingPlan API and writes matching providers.
-            // Conflating the two paths was the source of a stale
-            // MiniMax-M2.7 entry being hardcoded here.
-            let name = auth
-                .user
-                .name
-                .as_deref()
-                .unwrap_or(&auth.user.username)
-                .to_string();
-            let had_provider = !ctx.config.providers.is_empty()
-                && ctx
-                    .config
-                    .providers
-                    .contains_key(&ctx.config.default_provider);
-            if !had_provider {
-                let provider_name = "AtomGit".to_string();
-                let provider = build_oauth_provider();
-                ctx.model_name = provider.model.clone();
-                ctx.config.providers.insert(provider_name.clone(), provider);
-                ctx.config.default_provider = provider_name;
-                save_and_reload(ctx, renderer);
-            } else {
-                if let Some(provider) = ctx.config.providers.get(&ctx.config.default_provider) {
-                    ctx.model_name = provider.model.clone();
-                }
-                let _ = ctx
-                    .agent
-                    .cmd_tx
-                    .send(AgentCommand::ReloadConfig(ctx.config.clone()));
-            }
-            renderer.render(UiLine::CommandOutput(
-                t(Msg::LoginSignedInWithCpHint {
-                    name: &name,
-                    username: &auth.user.username,
-                }).into_owned(),
-            ));
-            renderer.flush();
-        }
-        Err(e) => {
-            renderer.render(UiLine::Error(
-                t(Msg::CmdLoginFailed { error: &e.to_string() }).into_owned(),
-            ));
-            renderer.flush();
-        }
-    }
-    Ok(())
-}
-
-/// Run the full CodingPlan setup flow: login (if needed) → claim →
-/// fetch models + register providers → fetch status. Shares the
-/// orchestrator with `atomcode codingplan` (CLI).
+/// Run the full login + CodingPlan setup flow: OAuth (if needed) →
+/// claim → fetch models + register providers → fetch status. Shares
+/// the orchestrator with `atomcode login` / `atomcode codingplan` (CLI).
+///
+/// `/codingplan` used to be a separate slash command; it has been
+/// folded into `/login` so users have one canonical entry point.
+/// The CLI keeps `atomcode codingplan` as a hidden alias for
+/// `atomcode login` to avoid breaking scripts / muscle memory.
 ///
 /// When the user isn't already logged in we pre-flight the OAuth via
 /// `run_oauth_with_renderer` so the URL/ESC UI integrates with the TUI
 /// (input box stays visible). The subsequent `coding_plan::run` call
 /// then sees `is_logged_in() == true` and skips its own `auth::login`
 /// path — that path prints to stdout and is reserved for CLI callers.
-pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
+pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Phase 1: pre-flight login if needed.
     if !atomcode_core::auth::is_logged_in() {
         if let Err(e) = run_oauth_with_renderer(renderer, ctx)
@@ -2930,7 +2843,7 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
                     *g = None;
                 }
                 ctx.monitor_last_check_at = None;
-                // Same for usage slot — a fresh /codingplan run may have
+                // Same for usage slot — a fresh /login run may have
                 // rotated the quota window or switched plan tiers.
                 if let Ok(mut g) = ctx.usage_slot.lock() {
                     *g = None;

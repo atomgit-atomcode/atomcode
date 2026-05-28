@@ -727,7 +727,7 @@ pub struct LoopCtx {
     /// poll thread (see `event_loop::oauth_poll`). One event arrives
     /// per spawned poll task (Authorized or Failed). The `tokio::select!`
     /// arm that reads this channel closes the wizard modal + flips
-    /// `pending_run_codingplan` on Authorized, or surfaces the failure
+    /// `pending_run_login_setup` on Authorized, or surfaces the failure
     /// reason in scrollback on Failed.
     pub oauth_event_rx: mpsc::UnboundedReceiver<oauth_poll::OauthEvent>,
     /// Sender cloned into each spawned poll task.
@@ -761,11 +761,11 @@ pub struct LoopCtx {
     pub pending_new_issue: Option<NewIssueDraft>,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 0 (Set up CodingPlan). The event loop drains this on
-    /// modal close and runs the full CodingPlan setup flow (login if
-    /// needed → claim → fetch models → register providers). Needs
-    /// raw-mode suspend/resume, something modals can't drive
-    /// themselves. Same pattern as `pending_new_issue`.
-    pub pending_run_codingplan: bool,
+    /// modal close and runs the full `/login` flow (OAuth if needed →
+    /// claim → fetch models → register providers). Needs raw-mode
+    /// suspend/resume, something modals can't drive themselves. Same
+    /// pattern as `pending_new_issue`.
+    pub pending_run_login_setup: bool,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 1 (Configure manually). The event loop drains this on
     /// modal close and swaps in `ProviderWizard::MainMenu` — a
@@ -1274,7 +1274,7 @@ fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
         if acc >= target_col {
             return i;
         }
-        acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        acc += crate::width::cell_char_width(ch).unwrap_or(0);
     }
     line.len()
 }
@@ -2665,7 +2665,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         // poll thread (PR 1b) watches `/auth/check` and auto-closes
         // the modal the moment AtomGit reports authorisation, then
         // the `OauthEvent::Authorized` branch in the main `select!`
-        // flips `pending_run_codingplan` so `/codingplan` claims
+        // flips `pending_run_login_setup` so `/codingplan` claims
         // immediately — zero keystrokes after the user finishes the
         // browser flow. The legacy 3-step Intro / Language / Setup
         // wizard stays intact for `/welcome` — `new_qr_fast_path` is
@@ -2872,7 +2872,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── OAuth poll thread results ──
             // Emitted by `event_loop::oauth_poll::spawn_oauth_poll`
             // once per QR-fast-path session. Authorized → close the
-            // wizard + flip `pending_run_codingplan` so the existing
+            // wizard + flip `pending_run_login_setup` so the existing
             // /codingplan driver picks up the just-written auth.toml
             // and claims the plan. Failed → close the wizard too and
             // surface the reason in scrollback with a retry hint;
@@ -2896,21 +2896,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // refreshed below once the claim writes
                         // ctx.model_name.
                         crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
-                        // `pending_run_codingplan` is only drained by the
+                        // `pending_run_login_setup` is only drained by the
                         // keystroke-handler path (handle_input → modal
                         // close → drain flag). The OAuth poll path doesn't
                         // route through there, so just call the codingplan
                         // driver directly — same effect, runs in this
                         // select! arm's scope where renderer + ctx are
                         // already mutable.
-                        if let Err(e) = crate::event_loop::commands::run_codingplan_flow(renderer, &mut ctx) {
+                        if let Err(e) = crate::event_loop::commands::run_login_flow(renderer, &mut ctx) {
                             renderer.render(crate::render::UiLine::Error(
-                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /codingplan 手动重试。"),
+                                format!("CodingPlan 自动配置失败: {e:#}。可运行 /login 手动重试。"),
                             ));
                             renderer.flush();
                         }
                         // Splice the resolved model name into the
-                        // banner painted above. `run_codingplan_flow`
+                        // banner painted above. `run_login_flow`
                         // updates `ctx.model_name` from the picked
                         // default provider (see commands.rs:2906) — at
                         // this point the banner's cached model="" is
@@ -2938,7 +2938,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
                             format!(
-                                "登录失败: {reason}。运行 /codingplan 可重试。",
+                                "登录失败: {reason}。运行 /login 可重试。",
                             ),
                         ));
                         renderer.flush();
@@ -3241,7 +3241,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── OAuth poll thread results ──
             // Emitted by `event_loop::oauth_poll::spawn_oauth_poll`
             // once per QR-fast-path session. Authorized → close the
-            // wizard + flip `pending_run_codingplan` so the existing
+            // wizard + flip `pending_run_login_setup` so the existing
             // /codingplan driver picks up the just-written auth.toml
             // and claims the plan. Failed → close the wizard too and
             // surface the reason in scrollback with a retry hint;
@@ -3265,21 +3265,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // refreshed below once the claim writes
                         // ctx.model_name.
                         crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
-                        // `pending_run_codingplan` is only drained by the
+                        // `pending_run_login_setup` is only drained by the
                         // keystroke-handler path (handle_input → modal
                         // close → drain flag). The OAuth poll path doesn't
                         // route through there, so just call the codingplan
                         // driver directly — same effect, runs in this
                         // select! arm's scope where renderer + ctx are
                         // already mutable.
-                        if let Err(e) = crate::event_loop::commands::run_codingplan_flow(renderer, &mut ctx) {
+                        if let Err(e) = crate::event_loop::commands::run_login_flow(renderer, &mut ctx) {
                             renderer.render(crate::render::UiLine::Error(
-                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /codingplan 手动重试。"),
+                                format!("CodingPlan 自动配置失败: {e:#}。可运行 /login 手动重试。"),
                             ));
                             renderer.flush();
                         }
                         // Splice the resolved model name into the
-                        // banner painted above. `run_codingplan_flow`
+                        // banner painted above. `run_login_flow`
                         // updates `ctx.model_name` from the picked
                         // default provider (see commands.rs:2906) — at
                         // this point the banner's cached model="" is
@@ -3307,7 +3307,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
                             format!(
-                                "登录失败: {reason}。运行 /codingplan 可重试。",
+                                "登录失败: {reason}。运行 /login 可重试。",
                             ),
                         ));
                         renderer.flush();
@@ -3928,8 +3928,8 @@ fn handle_input(
                         // Modal-to-Modal swap that needs mutable
                         // `active_modal` access the modals themselves
                         // don't have.
-                        if std::mem::take(&mut ctx.pending_run_codingplan) {
-                            crate::event_loop::commands::run_codingplan_flow(renderer, ctx)?;
+                        if std::mem::take(&mut ctx.pending_run_login_setup) {
+                            crate::event_loop::commands::run_login_flow(renderer, ctx)?;
                         }
                         if std::mem::take(&mut ctx.pending_open_provider_wizard) {
                             let pw = crate::modals::ProviderWizard::MainMenu { selected: 0 };
@@ -5102,7 +5102,13 @@ fn handle_streaming_key(
     // the type-ahead queue: a user yanking the escape cord doesn't
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        crate::tuix_trace!(
+            "KEY",
+            "streaming Ctrl+C -> Cancel send_ok={} spinner={:?}",
+            send_res.is_ok(),
+            app.state.spinner_label
+        );
         restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }
@@ -5112,7 +5118,13 @@ fn handle_streaming_key(
     // stream — mid-stream the higher-value action is "stop the agent",
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
-        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        crate::tuix_trace!(
+            "KEY",
+            "streaming Esc -> Cancel send_ok={} spinner={:?}",
+            send_res.is_ok(),
+            app.state.spinner_label
+        );
         restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }

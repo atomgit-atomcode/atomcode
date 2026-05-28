@@ -785,7 +785,7 @@ impl OnboardingWizard {
     /// │                                              │
     /// │   扫码完成后按 Enter 继续                    │
     /// │                                              │
-    /// │   Esc 跳过 · /codingplan 重试 · /provider … │
+    /// │   Esc 跳过 · /login 重试 · /provider … │
     /// └─ Step 1/1 ─────────────────────────────────┘
     /// ```
     ///
@@ -862,7 +862,7 @@ impl OnboardingWizard {
             content.push(center("(状态未初始化)"));
         }
         content.push(String::new());
-        content.push(center("Esc 跳过 · /codingplan 重试 · /provider 手动配置"));
+        content.push(center("Esc 跳过 · /login 重试 · /provider 手动配置"));
         content.push(String::new());
 
         let mut out = Vec::new();
@@ -994,7 +994,7 @@ impl crate::modals::Modal for OnboardingWizard {
             }
             PureOutcome::ApplySetupThenClose => {
                 match self.setup_idx {
-                    0 => ctx.pending_run_codingplan = true,
+                    0 => ctx.pending_run_login_setup = true,
                     1 => ctx.pending_open_provider_wizard = true,
                     _ => { /* Skip — no flag */ }
                 }

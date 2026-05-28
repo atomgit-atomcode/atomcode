@@ -40,26 +40,46 @@ const PAD_COL: usize = 2;
 /// Bounded so memory doesn't grow without limit on long sessions.
 pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 
-/// Render context usage as `12.3k / 131k tok` when both used and window
+/// Render context usage as `12.3k/131k tok` when both used and window
 /// are known, or `12.3k tok` when only the used count is known (provider
 /// hasn't reported its window yet, e.g. pre-config or fallback).
+///
+/// Unit ladder is k below 1M and m at/above 1M, so a 1_000_000-token
+/// window reads as `1m` instead of the visually-confusing `1000k`. Round
+/// values stay clean (`1m`, `131k`); non-round values get one decimal
+/// (`1.5m`, `10.4k`).
 fn format_ctx_usage(used: usize, window: usize) -> String {
-    let used_label = if used < 1000 {
-        format!("{}", used)
-    } else {
-        format!("{:.1}k", (used as f64) / 1000.0)
-    };
+    let used_label = format_tok_count(used, /*round_clean=*/ false);
     if window == 0 {
         format!("{} tok", used_label)
     } else {
-        let window_label = if window < 1000 {
-            format!("{}", window)
-        } else if window % 1000 == 0 {
-            format!("{}k", window / 1000)
-        } else {
-            format!("{:.0}k", (window as f64) / 1000.0)
-        };
+        let window_label = format_tok_count(window, /*round_clean=*/ true);
         format!("{}/{} tok", used_label, window_label)
+    }
+}
+
+/// Format a token count using k/m units. `round_clean=true` drops the
+/// decimal when the value is an exact multiple of the unit (used for
+/// the model's advertised window — `128_000` → `128k`, `1_000_000` →
+/// `1m`). `round_clean=false` always emits one decimal at unit scale
+/// (used for the live counter — `10_400` → `10.4k`, `1_500_000` → `1.5m`).
+fn format_tok_count(n: usize, round_clean: bool) -> String {
+    if n >= 1_000_000 {
+        if round_clean && n % 1_000_000 == 0 {
+            format!("{}m", n / 1_000_000)
+        } else {
+            format!("{:.1}m", (n as f64) / 1_000_000.0)
+        }
+    } else if n >= 1000 {
+        if round_clean && n % 1000 == 0 {
+            format!("{}k", n / 1000)
+        } else if round_clean {
+            format!("{:.0}k", (n as f64) / 1000.0)
+        } else {
+            format!("{:.1}k", (n as f64) / 1000.0)
+        }
+    } else {
+        format!("{}", n)
     }
 }
 
@@ -121,7 +141,7 @@ fn parse_markdown_to_cells(s: &str) -> Vec<Vec<Cell>> {
             lines.push(Vec::new());
             continue;
         }
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        let w = crate::width::cell_char_width(c).unwrap_or(1);
         if w == 0 {
             continue;
         }
@@ -1670,16 +1690,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// off-screen.
     fn push_or_update_live_spinner(&mut self, row_cells: Vec<Cell>) {
         if self.live_spinner_active {
+            // Update body_lines in place; the next `flush_deferred`
+            // (≤5ms) lets the cell-diff path compute and emit only
+            // the cells that actually changed between this tick and
+            // the last (typically just the elapsed-seconds digits).
+            //
+            // Earlier this branch did its own direct write:
+            //   `\x1b[{bottom};1H\x1b[K` + `serialize_row(&row_cells)`
+            // The `\x1b[K` cleared the row visible before the serialize
+            // re-painted it. Inside `render_diff`'s DECSET 2026
+            // synchronized-output envelope that would be fine, but the
+            // direct write bypassed the envelope entirely — so on hosts
+            // that ignore BSU/ESU (pwsh7 on native Win10 conhost) the
+            // user saw a per-tick "row blanks then refills left→right"
+            // shake, with the leading icon stable (first byte after EL)
+            // and the trailing chars wobbling as they trickled into the
+            // terminal's cell buffer. Reported as 「字在左右抖动，图标
+            // 还好」on the Pondering spinner. Letting the cell-diff
+            // path do the work keeps the update inside the BSU envelope
+            // (where supported) and produces minimal patches (where not),
+            // which is the smallest visible change a host can render.
             if let Some(last) = self.body_lines.last_mut() {
-                *last = row_cells.clone();
+                *last = row_cells;
             }
-            let bottom = self.body_bottom_row();
-            if bottom > 0 {
-                let seq = format!("\x1b[{};1H\x1b[K", bottom);
-                let _ = self.out.write_all(seq.as_bytes());
-                let bytes = serialize_row(&row_cells);
-                let _ = self.out.write_all(&bytes);
-            }
+            self.dirty = true;
         } else {
             // `push_body_row` clears `live_spinner_active`; set it back
             // afterwards so the next tick takes the update-in-place
@@ -2213,7 +2247,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (DarkGrey would vanish on some iTerm2 light presets, default
         // fg unmuted competes with the user's input on dark presets).
         // Slash shortcuts stay accent_bold (cyan) for visual emphasis.
-        // Hint row(s): input prompt + /provider + /codingplan.
+        // Hint row(s): input prompt + /provider + /login.
         //
         // Wide enough to fit on one visual row → emit a single combined
         // line (user's preferred shape on standard 100+ col terminals).
@@ -3814,6 +3848,24 @@ mod tests {
         assert_eq!(format_ctx_usage(50_000, 131_072), "50.0k/131k tok");
     }
 
+    #[test]
+    fn ctx_usage_million_window_renders_as_m_not_thousand_k() {
+        // 1m-context models would previously show `1000k`, mixing k/m in
+        // the user's head and burning width on a leading zero parade.
+        // Round million → bare `1m`; non-round million → one-decimal `1.5m`.
+        assert_eq!(format_ctx_usage(1_400, 1_000_000), "1.4k/1m tok");
+        assert_eq!(format_ctx_usage(50_000, 2_000_000), "50.0k/2m tok");
+        assert_eq!(format_ctx_usage(50_000, 1_500_000), "50.0k/1.5m tok");
+    }
+
+    #[test]
+    fn ctx_usage_used_above_one_million_uses_m_unit() {
+        // Long-running sessions on a 1m window can park `used` above 1M;
+        // keep one decimal so the counter still moves visibly turn-to-turn.
+        assert_eq!(format_ctx_usage(1_200_000, 1_000_000), "1.2m/1m tok");
+        assert_eq!(format_ctx_usage(2_500_000, 0), "2.5m tok");
+    }
+
     fn caps_with_color() -> TerminalCaps {
         TerminalCaps::from_env(EnvView {
             is_stdout_tty: true,
@@ -4172,9 +4224,17 @@ mod tests {
     /// Streaming delta byte cost: scenario mirrors agent_events
     /// emitting `AssistantText` + `StreamingBox` repeatedly. Each
     /// iteration appends a short line to the body + re-paints the
-    /// footer spinner. Budget: < 200 B/iteration (AnsiRenderer was
-    /// 41 B for streaming-only, but retained pays an extra
-    /// full-frame cost for the trailing StreamingBox re-paint).
+    /// footer spinner. Budget: < 300 B/iteration.
+    ///
+    /// History: 200 → 250 when the retained renderer added an extra
+    /// full-frame cost for the trailing StreamingBox re-paint.
+    /// 250 → 300 when `invalidate_rows_from` switched from
+    /// `Cell::blank` to `Cell::sentinel` so every cell in the
+    /// invalidated region — including the trailing spaces inside the
+    /// footer's input box and status row — re-patches every frame.
+    /// That sentinel change kills the win10+pwsh7+zh_CN char-doubling
+    /// class of bugs (see `Cell::sentinel` doc); ~14 B/iter is the
+    /// shipping cost.
     #[test]
     fn retained_streaming_delta_byte_cost() {
         let (mut r, counter) = new_counting(80, 24);
@@ -4210,8 +4270,8 @@ mod tests {
             avg_per_delta
         );
         assert!(
-            avg_per_delta < 250,
-            "retained streaming regressed: {} B/iter (budget < 250)",
+            avg_per_delta < 300,
+            "retained streaming regressed: {} B/iter (budget < 300)",
             avg_per_delta
         );
     }
@@ -7394,12 +7454,12 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Welcome fingerprint: `/codingplan` is unique to the welcome
+        // Welcome fingerprint: `/login` is unique to the welcome
         // hint row and is a single non-wrapping token, so it gives a
         // stable single-row marker even when the combined hint line
         // soft-wraps at narrower widths. Must appear exactly once in
         // the *visible* viewport and zero times in scrollback.
-        let hint = "/codingplan";
+        let hint = "/login";
         let visible_count = (0..24)
             .filter(|r| vterm.row_text(*r).contains(hint))
             .count();

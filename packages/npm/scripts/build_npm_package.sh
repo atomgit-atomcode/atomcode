@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────
 # AtomCode npm package build script
-# Usage:  ./scripts/build_npm_package.sh <version> [npm-publish-flags...]
-# Example: ./scripts/build_npm_package.sh 4.23.2 --dry-run
-#          ./scripts/build_npm_package.sh 4.23.2
-#          ./scripts/build_npm_package.sh           # auto-detect from Cargo.toml
+# Usage:  ./scripts/build_npm_package.sh <version>
+# Example: ./scripts/build_npm_package.sh 4.23.3 --dry-run
+#          ./scripts/build_npm_package.sh 4.23.3
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 

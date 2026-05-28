@@ -14,7 +14,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeOptionSkip => "暂时跳过".into(),
         Msg::WelcomeOptionSkipHint => "稍后再说".into(),
 
-        // ── /codingplan ──
+        // ── /login（完整配置流程） ──
         Msg::CodingPlanSetupFailed { error } =>
             format!("CodingPlan 设置失败：{error}").into(),
         Msg::CpReauthAfter401 =>
@@ -35,13 +35,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan 已领取 — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  × CodingPlan 领取失败 — {}\n", error).into(),
+            format!("  × CodingPlan 套餐配置失败 — {}\n", error).into(),
+        Msg::CpClaimFailedBare =>
+            "  × CodingPlan 套餐配置失败\n".into(),
         Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} 领取成功\n", tier).into(),
+            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} 已领取\n", tier).into(),
+            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  × CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} 套餐配置失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
             format!("  ✓ 已添加 {} 个 Provider：\n", count).into(),
         Msg::CpLocked { name } =>
@@ -90,7 +92,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
              https://atomgit.com/atomgit_atomcode/atomcode/releases 下载安装。",
         ),
         Msg::CpAuthRequired => Cow::Borrowed(
-            "未登录 AtomCode CodingPlan。请运行 /codingplan 完成登录后再发送请求。",
+            "未登录 AtomCode CodingPlan。请运行 /login 完成登录后再发送请求。",
         ),
         Msg::CpSignStaleClockSkew => Cow::Borrowed(
             "请求被服务端拒绝：签名时间戳已过期。请校准本地系统时间（NTP 同步）后重试。",
@@ -129,11 +131,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
                 model, dir, config, tokens,
             ).into(),
         Msg::StatusCpNotSignedIn =>
-            "  CodingPlan：（未登录 — 运行 /codingplan 进行配置）\n".into(),
+            "  CodingPlan：（未登录 — 运行 /login 进行配置）\n".into(),
         Msg::StatusCpFetchFailed { error } =>
             format!("  CodingPlan：（状态获取失败 — {}）\n", error).into(),
         Msg::StatusCpNoActive =>
-            "  CodingPlan：（无激活套餐 — 运行 /codingplan）\n".into(),
+            "  CodingPlan：（无激活套餐 — 运行 /login）\n".into(),
         Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>
             format!(
                 "  CodingPlan：{}  ·  到期 {}（{}d / 共 {}d）\n",
@@ -151,13 +153,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("    ✓ {} ({})\n", path, label).into(),
         Msg::StatusInstructionMissing { label } =>
             format!("    × {} — 未找到\n", label).into(),
-
-        // ── /login 完成提示 ──
-        Msg::LoginSignedInWithCpHint { name, username } =>
-            format!(
-                "  已登录：{}（{}）。现在可以开始对话；运行 /codingplan 同步最新的模型权限。\n",
-                name, username,
-            ).into(),
 
         // ── 帮助 ──
         Msg::HelpAvailableCommands =>
@@ -341,11 +336,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "添加自定义模型".into(),
         Msg::IdleHintProviderFull =>
             "使用 /provider 添加自定义模型".into(),
-        Msg::IdleHintCodingplan => "/codingplan".into(),
+        Msg::IdleHintCodingplan => "/login".into(),
         Msg::IdleHintCodingplanSuffix =>
             "领取免费 Token 额度".into(),
         Msg::IdleHintCodingplanFull =>
-            "使用 /codingplan 领取免费 Token 额度".into(),
+            "使用 /login 领取免费 Token 额度".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>
@@ -678,11 +673,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 命令描述 ──
 Msg::CmdDescSetup =>
 "扫描项目、安装种子文件并运行 setup skill [hooks|mcp|skills|all]".into(),
-        Msg::CmdDescCodingplan =>
-            "领取 CodingPlan 并从计划的模型列表中配置模型".into(),
         Msg::CmdDescResume => "恢复上次会话".into(),
         Msg::CmdDescRename => "重命名当前会话".into(),
-        Msg::CmdDescLogin => "使用 AtomGit OAuth 登录".into(),
+        Msg::CmdDescLogin => "使用 AtomGit OAuth 登录并领取 CodingPlan 模型".into(),
         Msg::CmdDescLogout => "退出 AtomGit 登录".into(),
         Msg::CmdDescWhoami => "显示当前登录用户".into(),
         Msg::CmdDescModel => "切换 Provider / 模型".into(),

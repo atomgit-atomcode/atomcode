@@ -34,7 +34,7 @@ Exactly 7 event types, each with a common "envelope" of identifiers/metadata.
 | `llm_chat` | — | 每个 LLM turn 完成时 | `duration_ms, tool_calls_count, input_tokens, output_tokens, cached_tokens, had_error` |
 | `use_command` | 具体指令字符串 | 每次执行 slash 命令 | — |
 | `login_success` | / | OAuth 登录成功 | 无 |
-| `take_codingplan` | `success` / `fail` | `atomcode codingplan` / `/codingplan` 结束 | — |
+| `take_codingplan` | `success` / `fail` | `atomcode login` / `/login`（含隐藏的 `atomcode codingplan` 别名）结束 | — |
 | `panic` | / | 程序崩溃 | `location, message_head, thread, backtrace_top_5`（已 scrub） |
 | `telemetry_disabled` | / | 用户执行 `atomcode telemetry disable` 时（仅当原本是启用） | 无 |
 

@@ -405,12 +405,28 @@ pub fn flush_aligned_table_with_width(
     let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
 
     // Draw a horizontal rule row with given connector characters.
+    //
+    // Each inner column reserves `(w + 2)` *visual cells* of border —
+    // matching the content row's ` <body><pad> ` budget (1 leading space
+    // + w cells of content/padding + 1 trailing space) so border, content
+    // and separators align column-by-column.
+    //
+    // The dash glyph `─` (U+2500) is East Asian Ambiguous. With
+    // `cell_char_width('─') == 2` (i.e. `ATOMCODE_CJK_WIDTH=1`), each char
+    // we push occupies 2 cells, so naively pushing `(w + 2)` chars would
+    // paint `2 * (w + 2)` cells per column — borders drawn way past the
+    // content's right edge. Push `ceil((w + 2) / dash_w)` chars instead;
+    // for `dash_w == 1` (default) this is unchanged, for `dash_w == 2`
+    // odd widths overshoot by 1 cell — minor cosmetic, far better than
+    // a 2x stretch.
+    let dash_w = crate::width::cell_char_width('─').unwrap_or(1).max(1);
     let rule = |left: char, mid: char, right: char| -> String {
         let mut s = String::new();
         s.push_str(border_on);
         s.push(left);
         for (j, w) in col_widths.iter().enumerate() {
-            for _ in 0..(w + 2) {
+            let n_dashes = (w + 2).div_ceil(dash_w);
+            for _ in 0..n_dashes {
                 s.push('─');
             }
             if j + 1 < col_widths.len() {
@@ -518,9 +534,97 @@ fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
     out
 }
 
+/// Strip markdown formatting markers (`**bold**`, `*italic*`, `` `code` ``)
+/// to recover the *visible* string `render_inline` would produce, for
+/// column-width measurement in table layout.
+///
+/// MUST mirror `render_inline`'s parsing exactly. Earlier this was a naive
+/// `s.replace("**", "").replace('`', "")`, which broke alignment for cells
+/// containing markdown-marker characters as **literal content inside an
+/// inline-code span**: e.g. `` `src/**/*.ts` `` is rendered by
+/// `render_inline` as styled "src/**/*.ts" (`**` is glob-pattern literal,
+/// preserved inside the code span), but the old strip removed those `**`
+/// too — `plain_w` came back 2 cells short and the right border of that
+/// row was painted 2 cells past where the column was supposed to end.
+/// Same misalignment in reverse for `*italic*`: render strips the single
+/// `*` and emits "italic"; the old strip kept the `*` and overshot
+/// `plain_w` by 2. Reported on the markdown tools-listing table where
+/// the glob row was visibly nudged 2 cells right vs every other row.
+///
+/// Walk the same parser `render_inline` uses, emit only the inner text,
+/// preserve unclosed markers verbatim (matching render's fallback).
 fn strip_md_for_width(s: &str) -> String {
-    // Remove markdown markers that add bytes but no display width.
-    s.replace("**", "").replace('`', "")
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    let mut inner = String::new();
+                    let mut closed = false;
+                    while let Some(&p) = chars.peek() {
+                        if p == '*' {
+                            chars.next();
+                            if chars.peek() == Some(&'*') {
+                                chars.next();
+                                closed = true;
+                                break;
+                            } else {
+                                inner.push('*');
+                            }
+                        } else {
+                            chars.next();
+                            inner.push(p);
+                        }
+                    }
+                    if closed && !inner.is_empty() {
+                        out.push_str(&inner);
+                    } else {
+                        out.push_str("**");
+                        out.push_str(&inner);
+                    }
+                } else {
+                    let mut inner = String::new();
+                    let mut closed = false;
+                    while let Some(&p) = chars.peek() {
+                        chars.next();
+                        if p == '*' {
+                            closed = true;
+                            break;
+                        }
+                        inner.push(p);
+                    }
+                    if closed && !inner.is_empty() {
+                        out.push_str(&inner);
+                    } else {
+                        out.push('*');
+                        out.push_str(&inner);
+                    }
+                }
+            }
+            '`' => {
+                let mut inner = String::new();
+                let mut closed = false;
+                while let Some(&p) = chars.peek() {
+                    chars.next();
+                    if p == '`' {
+                        closed = true;
+                        break;
+                    }
+                    inner.push(p);
+                }
+                if closed && !inner.is_empty() {
+                    out.push_str(&inner);
+                } else {
+                    out.push('`');
+                    out.push_str(&inner);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Legacy single-line inline renderer — kept for direct callers (tests,
@@ -1375,5 +1479,91 @@ mod tests {
         // Existing behavior: no buffered table / code → returns None.
         let mut st = MdState::new();
         assert!(finalize(&mut st, caps()).is_none());
+    }
+
+    // ─── strip_md_for_width vs render_inline alignment ───
+    //
+    // For table column-width measurement to be correct, the visible string
+    // strip_md_for_width returns has to be exactly what render_inline
+    // ultimately paints (after the SGR escapes are removed). Any divergence
+    // pads the row by the wrong number of cells and bends the right border
+    // out of alignment with neighbouring rows.
+
+    /// Reported bug: glob row in the tools table painted ~2 cells past the
+    /// other rows' right border because `` `src/**/*.ts` `` had its inner
+    /// `**` stripped as bold markers. Pin: `**` inside a code span is
+    /// literal, never stripped.
+    #[test]
+    fn strip_md_for_width_keeps_double_star_inside_inline_code() {
+        assert_eq!(
+            strip_md_for_width("`src/**/*.ts`"),
+            "src/**/*.ts"
+        );
+    }
+
+    /// Companion to the bug above: `*italic*` is rendered as the inner text
+    /// only (single `*` stripped by render_inline). Strip must do the same,
+    /// otherwise plain_w over-counts by 2 cells per italic span.
+    #[test]
+    fn strip_md_for_width_strips_single_star_italic_markers() {
+        assert_eq!(strip_md_for_width("*italic*"), "italic");
+    }
+
+    #[test]
+    fn strip_md_for_width_strips_double_star_bold_markers() {
+        assert_eq!(strip_md_for_width("**bold**"), "bold");
+    }
+
+    #[test]
+    fn strip_md_for_width_strips_backtick_code_markers() {
+        assert_eq!(strip_md_for_width("`code`"), "code");
+    }
+
+    /// Unclosed markers stay verbatim — matches render_inline's "no closer
+    /// found, dump the marker as literal" fallback, so column-width math
+    /// keeps treating them as content.
+    #[test]
+    fn strip_md_for_width_keeps_unclosed_markers_verbatim() {
+        assert_eq!(strip_md_for_width("**unclosed"), "**unclosed");
+        assert_eq!(strip_md_for_width("*unclosed"), "*unclosed");
+        assert_eq!(strip_md_for_width("`unclosed"), "`unclosed");
+    }
+
+    /// The literal reported regression input: a CJK cell containing an
+    /// inline-code span whose inner text has `**` in it. Pre-fix
+    /// `strip_md_for_width` returned a string two cells short of what
+    /// `render_inline` paints; post-fix they match exactly.
+    #[test]
+    fn strip_md_for_width_matches_render_visible_width_on_glob_cell() {
+        use crate::width::display_width;
+        let md = "文件名通配符匹配（如 `src/**/*.ts`）";
+        let stripped = strip_md_for_width(md);
+        let rendered = render_inline(md, caps());
+        // Visible width of render = bytes of render minus SGR escape bytes.
+        // Easier: re-strip the rendered output by walking past `\x1b[...m`
+        // chunks; then assert it equals stripped.
+        let mut visible = String::new();
+        let bytes = rendered.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b {
+                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // consume the alpha terminator (m / K / etc.)
+                }
+                continue;
+            }
+            let next = rendered[i..]
+                .char_indices()
+                .nth(1)
+                .map(|(idx, _)| idx + i)
+                .unwrap_or(rendered.len());
+            visible.push_str(&rendered[i..next]);
+            i = next;
+        }
+        assert_eq!(stripped, visible, "strip must equal render-visible");
+        assert_eq!(display_width(&stripped), display_width(&visible));
     }
 }
