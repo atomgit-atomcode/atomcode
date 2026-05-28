@@ -18,10 +18,8 @@ mod services;
 mod tool_dispatch;
 mod verify;
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -99,6 +97,12 @@ pub enum AgentCommand {
     InvokeSubAgent {
         name: String,
         task: String,
+    },
+    /// Inject a guide subagent result into the conversation as an assistant
+    /// message. Sent by the TUI after rendering GuideComplete so the LLM
+    /// can reference previous /guide answers in follow-up turns.
+    InjectGuideResult {
+        text: String,
     },
     /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
     /// this before rendering so the user never sees a stale cache — the
@@ -392,11 +396,14 @@ pub enum AgentEvent {
         subagent: String,
         message: String,
     },
-    /// Subagent completed with answer
+    /// Subagent completed with answer (or was cancelled/errored).
     GuideComplete {
         subagent: String,
         text: String,
         truncated: bool,
+        /// True when the user cancelled (Ctrl+C) — the TUI shows
+        /// "已取消" instead of "已完成".
+        cancelled: bool,
     },
 }
 
@@ -526,8 +533,6 @@ pub struct AgentLoop {
     subagent_cancel_token: CancellationToken,
     /// Concurrency guard: prevents overlapping subagent invocations
     subagent_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Queue of (name, task) pairs waiting to run after the current subagent
-    pending_subagents: std::sync::Arc<Mutex<VecDeque<(String, String)>>>,
 
     /// Discipline tracking — all counters for loop detection, stagnation,
     /// error streaks, and tool usage patterns. Extracted from AgentLoop to
@@ -1001,7 +1006,6 @@ impl AgentLoop {
             subagent_handles: Vec::new(),
             subagent_cancel_token: CancellationToken::new(),
             subagent_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_subagents: Arc::new(Mutex::new(VecDeque::new())),
             discipline_state: DisciplineState::default(),
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
@@ -1074,6 +1078,7 @@ impl AgentLoop {
                     self.config.clone(),
                     self.event_tx.clone(),
                     self.subagent_registry.clone(),
+                    self.subagent_cancel_token.clone(),
                 )))
                 .await;
         }
@@ -1131,7 +1136,9 @@ impl AgentLoop {
                 }
                 AgentCommand::Cancel => {
                     self.cancel_token.cancel();
+                    self.subagent_cancel_token.cancel();
                     self.cancel_token = CancellationToken::new();
+                    self.subagent_cancel_token = CancellationToken::new();
                     self.phase = AgentPhase::Idle;
                     // Cancel the current turn — preserve completed content, backfill
                     // (cancelled) for unpaired tool calls, and mark turn as Completed.
@@ -1442,6 +1449,18 @@ impl AgentLoop {
                 AgentCommand::InvokeSubAgent { name, task } => {
                     self.handle_invoke_subagent(name, task).await;
                 }
+                AgentCommand::InjectGuideResult { text } => {
+                    let guarded = format!(
+                        "[子代理回答]\n{}\n[以上信息由 atomcode-guide 子代理提供]",
+                        text,
+                    );
+                    self.conversation.messages.push(
+                        crate::conversation::message::Message::new(
+                            crate::conversation::message::Role::Assistant,
+                            guarded,
+                        ),
+                    );
+                }
                 AgentCommand::RefreshContextStats => {
                     let system_prompt = self.build_system_prompt();
                     let (msgs, _) = self
@@ -1493,15 +1512,8 @@ impl AgentLoop {
 
     async fn handle_invoke_subagent(&mut self, name: String, task: String) {
         if self.subagent_running.swap(true, std::sync::atomic::Ordering::Acquire) {
-            self.pending_subagents
-                .lock()
-                .unwrap()
-                .push_back((name, task.clone()));
             let _ = self.event_tx.send(AgentEvent::Warning(
-                format!(
-                    "子代理正在运行中，你的请求已排队（当前队列长度: {}）",
-                    self.pending_subagents.lock().unwrap().len()
-                )
+                "已有子代理正在运行，请等待完成后再试".to_string()
             ));
             return;
         }
@@ -1514,72 +1526,76 @@ impl AgentLoop {
         let event_tx = self.event_tx.clone();
         let cancel_token = self.subagent_cancel_token.child_token();
         let running = self.subagent_running.clone();
-        let pending = self.pending_subagents.clone();
 
         let handle = tokio::spawn(async move {
-            // Run subagents in a loop, draining the queue after each completion
-            let mut current_name = name;
-            let mut current_task = task;
-            loop {
-                let finished = scopeguard::guard((), |_| {
-                    running.store(false, std::sync::atomic::Ordering::Release);
-                });
+            let _guard = scopeguard::guard((), |_| {
+                running.store(false, std::sync::atomic::Ordering::Release);
+            });
 
-                let def = {
-                    let reg = registry.read().unwrap();
-                    reg.find(&current_name)
-                };
-
-                let def = match def {
-                    Some(d) => d,
-                    None => {
-                        let _ = event_tx.send(AgentEvent::Warning(
-                            format!("未找到子代理: {}", current_name)
-                        ));
-                        break;
-                    }
-                };
-
-                let runner = crate::agent::sub_agent::runner::SubAgentRunner::new(
-                    provider.clone(),
-                    config.clone(),
-                    parent_tools.clone(),
-                    parent_ctx.clone(),
-                    event_tx.clone(),
-                    cancel_token.clone(),
-                );
-
-                let result = runner.run(def, current_task).await;
-                match result {
-                    Ok(output) => {
+            let def = {
+                let reg = match registry.read() {
+                    Ok(r) => r,
+                    Err(_) => {
                         let _ = event_tx.send(AgentEvent::GuideComplete {
-                            subagent: current_name,
-                            text: output.text,
-                            truncated: output.truncated,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = event_tx.send(AgentEvent::GuideComplete {
-                            subagent: current_name,
-                            text: format!("抱歉，无法回答此问题。{}", e.message),
+                            subagent: name,
+                            text: "系统错误，请重试".to_string(),
                             truncated: false,
+                            cancelled: true,
                         });
+                        return;
                     }
-                }
+                };
+                reg.find(&name)
+            };
 
-                // Check queue for the next pending request
-                let next = pending.lock().unwrap().pop_front();
-                match next {
-                    Some((next_name, next_task)) => {
-                        current_name = next_name;
-                        current_task = next_task;
-                        // Defuse the guard: keep running=true for next iteration
-                        scopeguard::ScopeGuard::into_inner(finished);
-                    }
-                    None => {
-                        // Guard will clear running and loop exits
-                        break;
-                    }
+            let def = match def {
+                Some(d) => d,
+                None => {
+                    let _ = event_tx.send(AgentEvent::GuideComplete {
+                        subagent: name,
+                        text: "未找到该子代理".to_string(),
+                        truncated: false,
+                        cancelled: true,
+                    });
+                    return;
+                }
+            };
+
+            let runner = crate::agent::sub_agent::runner::SubAgentRunner::new(
+                provider,
+                config,
+                parent_tools,
+                parent_ctx,
+                event_tx.clone(),
+                cancel_token,
+            );
+
+            let result = runner.run(def, task).await;
+            match result {
+                Ok(output) => {
+                    let _ = event_tx.send(AgentEvent::GuideComplete {
+                        subagent: name,
+                        text: output.text,
+                        truncated: output.truncated,
+                        cancelled: false,
+                    });
+                }
+                Err(e) => {
+                    let friendly = if e.cancelled {
+                        "已取消".to_string()
+                    } else if e.message.contains("LLM turn failed") {
+                        "模型响应异常，请重试".to_string()
+                    } else if e.message.contains("No default provider") {
+                        "未配置 Provider，请先运行 /setup".to_string()
+                    } else {
+                        "子代理异常，请重试".to_string()
+                    };
+                    let _ = event_tx.send(AgentEvent::GuideComplete {
+                        subagent: name,
+                        text: friendly,
+                        truncated: false,
+                        cancelled: e.cancelled,
+                    });
                 }
             }
         });

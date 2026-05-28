@@ -118,11 +118,15 @@ impl SubAgentRunner {
         //   if conversation.estimate_tokens() > ... { ... }
         let _compression_threshold = def.compression_threshold;
 
-        // ── 4. Inject knowledge base content as a user message ──────────
+        // ── 4. Inject knowledge into system prompt ─────────────────────
+        // Knowledge is appended to the system prompt (not a user message)
+        // so it doesn't accumulate across turns in the conversation loop.
+        let mut system_prompt = def.system_prompt.clone();
         if let Some(ref kb) = def.knowledge {
             let kb_text = kb.render_for_query(&user_task, def.max_knowledge_tokens);
             if !kb_text.is_empty() {
-                conversation.add_user_message(&kb_text);
+                system_prompt.push_str("\n\n## 知识库参考\n\n");
+                system_prompt.push_str(&kb_text);
             }
         }
 
@@ -141,6 +145,7 @@ impl SubAgentRunner {
                 return Err(SubAgentError {
                     turns_used: 0,
                     message: "No default provider configured".to_string(),
+                    cancelled: false,
                 });
             }
         };
@@ -170,12 +175,19 @@ impl SubAgentRunner {
             message: "思考中...".to_string(),
         });
 
+        // Wall-clock timeout (default 120s). The per-turn LLM calls are
+        // already gated by provider-level timeouts, but the aggregate loop
+        // (multiple tool-call rounds) needs its own ceiling.
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(120));
+        tokio::pin!(deadline);
+
         for turn_idx in 0..max_turns {
             // Fast-path cancellation check (non-blocking)
             if self.cancel_token.is_cancelled() {
                 return Err(SubAgentError {
                     turns_used,
                     message: "Sub-agent cancelled by user".to_string(),
+                    cancelled: true,
                 });
             }
 
@@ -184,7 +196,7 @@ impl SubAgentRunner {
             // user interrupts.
             let turn_fut = runner.run(
                 &mut conversation,
-                &def.system_prompt,
+                &system_prompt,
                 &turn_event_tx,
                 self.cancel_token.clone(),
             );
@@ -198,6 +210,14 @@ impl SubAgentRunner {
                     return Err(SubAgentError {
                         turns_used,
                         message: "Sub-agent cancelled during turn".to_string(),
+                        cancelled: true,
+                    });
+                }
+                _ = &mut deadline => {
+                    return Err(SubAgentError {
+                        turns_used,
+                        message: "Wall-clock timeout".to_string(),
+                        cancelled: false,
                     });
                 }
                 result = turn_fut => result,
@@ -224,19 +244,22 @@ impl SubAgentRunner {
                     return Err(SubAgentError {
                         turns_used,
                         message: format!("LLM turn failed: {}", err),
+                        cancelled: false,
                     });
                 }
                 TurnResult::Cancelled => {
                     return Err(SubAgentError {
                         turns_used,
                         message: "Sub-agent turn cancelled".to_string(),
+                        cancelled: true,
                     });
                 }
             }
         }
 
         // ── 10. Truncate answer to fit max_answer_tokens ──────────────
-        let max_chars = def.max_answer_tokens.saturating_mul(4);
+        // ~2 chars/token for mixed CJK+Latin content (vs ~4 for English-only).
+        let max_chars = def.max_answer_tokens.saturating_mul(2);
         let truncated = last_text.chars().count() > max_chars;
         let text = if last_text.is_empty() {
             "抱歉，暂时无法回答此问题。请尝试更具体的提问，或查阅 AtomCode 官方文档。".to_string()

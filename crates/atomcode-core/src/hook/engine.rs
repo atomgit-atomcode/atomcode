@@ -496,44 +496,10 @@ impl HookEngine {
         }
     }
 
-    /// 注册所有内置 hook
-    fn register_builtins(&mut self) {
-        use super::built_in::{
-            ToolAuditLogHook, TurnStatsHook, AutoCommitHook,
-            SessionSummaryHook, ErrorReportHook, ResponseValidationHook,
-        };
-
-        // ToolAuditLogHook: OnToolCallStartHook
-        let audit = Arc::new(ToolAuditLogHook { enabled: true, log_file: None });
-        self.register_on_tool_call_start_hook(audit);
-
-        // TurnStatsHook: OnTurnStart + OnTurnComplete
-        let stats = Arc::new(TurnStatsHook { enabled: true });
-        // TurnStatsHook implements both OnTurnStartHook + OnTurnCompleteHook;
-        // register via public API rather than direct field access.
-        self.register_on_turn_start_hook(stats.clone());
-        self.register_on_turn_complete_hook(stats.clone());
-
-        // AutoCommitHook: OnTurnCompleteHook
-        let auto_commit = Arc::new(AutoCommitHook {
-            enabled: true,
-            interval: 1,
-        });
-        self.register_on_turn_complete_hook(auto_commit);
-
-        // SessionSummaryHook: OnSessionStart + OnSessionEnd
-        let summary = Arc::new(SessionSummaryHook::new());
-        self.register_on_session_start_hook(summary.clone());
-        self.register_on_session_end_hook(summary);
-
-        // ErrorReportHook: OnErrorHook
-        let error_report = Arc::new(ErrorReportHook { enabled: true });
-        self.register_on_error_hook(error_report);
-
-        // ResponseValidationHook: OnModelResponseHook
-        let validation = Arc::new(ResponseValidationHook::new(vec![]));
-        self.register_on_model_response_hook(validation);
-    }
+    /// 注册所有内置 hook。
+    ///
+    /// 当前所有内置 hook 暂停使用，待后续通过配置文件驱动启用。
+    fn register_builtins(&mut self) {}
 }
 
 // ============================================================================

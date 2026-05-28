@@ -55,7 +55,7 @@ impl Default for SubAgentDefinition {
             tools: SubAgentToolPolicy::ReadOnlyWithWeb,
             knowledge: None,
             max_turns: 8,
-            max_answer_tokens: 4096,
+            max_answer_tokens: 800, // ~1600 chars at 2 chars/token (CJK-friendly)
             max_knowledge_tokens: 16_000,
             compression_threshold: 0.9,
         }
@@ -74,6 +74,7 @@ pub struct SubAgentOutput {
 pub struct SubAgentError {
     pub turns_used: usize,
     pub message: String,
+    pub cancelled: bool,
 }
 
 impl std::fmt::Display for SubAgentError {

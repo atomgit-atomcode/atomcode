@@ -160,7 +160,8 @@ pub enum UiLine {
     CommandOutput(String),
     /// Live sub-agent status line. Each emission replaces the previous
     /// `GuideStatus` row in-place — no scrollback accumulation.
-    /// Format: "⏺ subagent message" with animated spinner prefix.
+    /// Running state: spinner-animated via the spinner tick loop.
+    /// Text starting with "  ⎿" marks completion (static frozen line).
     GuideStatus(String),
     /// Sub-agent result text (markdown-formatted). Rendered through the
     /// markdown pipeline so headers, code blocks, and inline styles are

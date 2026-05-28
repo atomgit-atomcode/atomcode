@@ -42,7 +42,28 @@ pub async fn build_subagent_tools(
                 "web_search".to_string(),
             ]
         }
-        SubAgentToolPolicy::Custom(names) => names.clone(),
+        SubAgentToolPolicy::Custom(names) => {
+            const DESTRUCTIVE: &[&str] = &[
+                "bash", "write_file", "edit_file", "search_replace",
+                "parallel_edit_files", "delete_file", "rename_file",
+                "create_file", "move_file", "copy_file",
+                "git_auto_commit", "git_checkpoint",
+            ];
+            names.iter()
+                .filter(|n| {
+                    if DESTRUCTIVE.contains(&n.as_str()) {
+                        tracing::warn!(
+                            "SubAgentToolPolicy::Custom: rejected destructive tool '{}'",
+                            n,
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
+                .collect()
+        }
     };
 
     let registry = ToolRegistry::new();

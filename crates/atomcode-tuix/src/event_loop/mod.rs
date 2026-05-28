@@ -3197,8 +3197,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
-                    if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running
-                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    if matches!(app.state.phase, UiPhase::Streaming) || (app.state.guide_running
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100))
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         last_spinner_draw = std::time::Instant::now();
@@ -3577,8 +3577,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
-                    if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running
-                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    if matches!(app.state.phase, UiPhase::Streaming) || (app.state.guide_running
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100))
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         last_spinner_draw = std::time::Instant::now();
@@ -5691,6 +5691,14 @@ pub(super) fn handle_upgrade_event(
     renderer.flush();
 }
 
+/// Map internal subagent names to user-facing Chinese display names.
+fn subagent_display_name(name: &str) -> &str {
+    match name {
+        "atomcode-guide" => "指南",
+        _ => name,
+    }
+}
+
 fn handle_agent_event(
     ev: AgentEvent,
     state: &mut UiState,
@@ -6590,24 +6598,33 @@ fn handle_agent_event(
         }
         AgentEvent::GuideTurnActivity { subagent, message } => {
             state.guide_running = true;
+            let display = subagent_display_name(&subagent);
             renderer.render(UiLine::GuideStatus(
-                format!("⏺ {} {}", subagent, message),
+                format!("{} {}", display, message),
             ));
             renderer.flush();
         }
-        AgentEvent::GuideComplete { text, truncated, .. } => {
+        AgentEvent::GuideComplete { subagent, text, truncated, cancelled, .. } => {
             state.guide_running = false;
-            // Freeze the activity indicator with a completion line
-            renderer.render(UiLine::GuideStatus(
-                "  ⎿  已完成".to_string(),
-            ));
+            let display = subagent_display_name(&subagent);
+            let status = if cancelled {
+                format!("  ⎿  {} 已取消", display)
+            } else {
+                format!("  ⎿  {} 已完成", display)
+            };
+            renderer.render(UiLine::GuideStatus(status));
             renderer.flush();
-            let mut output = text;
+            let mut output = text.clone();
             if truncated {
-                output.push_str("\n*(truncated)*");
+                output.push_str("\n*(已截断)*");
             }
             renderer.render(UiLine::GuideResult(output));
             renderer.flush();
+            // Write non-cancelled results into the conversation for
+            // follow-up reference and /resume persistence.
+            if !cancelled && !text.is_empty() {
+                let _ = ctx.agent.cmd_tx.send(AgentCommand::InjectGuideResult { text });
+            }
         }
         AgentEvent::MessagesSync { messages } => {
             // Response to AgentCommand::SyncMessages. Persist the

@@ -24,6 +24,7 @@ pub struct AgentTool {
     pub config: Config,
     pub event_tx: mpsc::UnboundedSender<AgentEvent>,
     pub subagent_registry: Arc<std::sync::RwLock<SubAgentRegistry>>,
+    pub cancel_token: CancellationToken,
 }
 
 impl AgentTool {
@@ -32,12 +33,14 @@ impl AgentTool {
         config: Config,
         event_tx: mpsc::UnboundedSender<AgentEvent>,
         subagent_registry: Arc<std::sync::RwLock<SubAgentRegistry>>,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self {
             provider,
             config,
             event_tx,
             subagent_registry,
+            cancel_token,
         }
     }
 }
@@ -86,7 +89,7 @@ impl Tool for AgentTool {
         };
 
         // 2. Construct runner with a fresh cancellation token
-        let cancel_token = CancellationToken::new();
+        let cancel_token = self.cancel_token.child_token();
         let runner = SubAgentRunner::new(
             self.provider.clone(),
             Arc::new(self.config.clone()),

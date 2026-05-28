@@ -2141,12 +2141,18 @@ impl<W: Write + Send> Renderer for AltScreenRenderer<W> {
                 self.push_command_output(&text);
             }
             UiLine::GuideStatus(text) => {
-                self.push_command_output(&text);
+                // Dedup: skip if the last body line is identical (spinner
+                // ticks re-emit the same status text with different frame
+                // chars — alt_screen can't do CUP-based in-place replace).
+                if self.body_lines.last().map_or(true, |last| last != &text) {
+                    self.push_command_output(&text);
+                }
             }
             UiLine::GuideResult(text) => {
+                let safe = crate::sanitize::scrub_controls(&text);
                 let md_width = self.width as usize;
                 let mut md_state = crate::markdown::MdState::new();
-                for line in text.lines() {
+                for line in safe.lines() {
                     if let Some(rendered) = crate::markdown::render_line_with_width(
                         line,
                         &mut md_state,

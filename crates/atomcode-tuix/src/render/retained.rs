@@ -355,8 +355,9 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// Each GuideStatus emission removes the previous one before pushing,
     /// so the status line updates in-place without scrollback accumulation.
     guide_status_rows: usize,
-    /// Current guide subagent status label (None = no guide running).
-    /// The spinner tick loop uses this to prefix an animated frame glyph.
+    /// Current guide subagent status text (None = no guide running).
+    /// The spinner tick loop reads this to animate the running indicator.
+    /// Cleared when GuideStatus carries a completion marker ("  ⎿").
     guide_status_text: Option<String>,
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
@@ -2165,13 +2166,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // that suffix off and forward it to render_inflight_tool
                 // so the user gets a time anchor on long bashes.
                 if let Some(status) = self.guide_status_text.clone() {
-                    let is_done = status.starts_with("  ⎿");
-                    let frame = if is_done { " " } else { "⏺" };
-                    let cells = self.build_spinner_body_row(frame, &status);
+                    let meta = spinner_meta_suffix(&label);
+                    let label_with_time = if meta.is_empty() { status } else { format!("{}{}", status, meta) };
+                    let cells = self.build_spinner_body_row(frame, &label_with_time);
                     self.render_guide_spinner(cells);
-                    if is_done {
-                        self.guide_status_text = None;
-                    }
                 } else if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     let meta = spinner_meta_suffix(&label);
                     self.render_inflight_tool(frame, &name, &detail, meta);
@@ -2182,13 +2180,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::Spinner { frame, label } => {
                 if let Some(status) = self.guide_status_text.clone() {
-                    let is_done = status.starts_with("  ⎿");
-                    let frame = if is_done { " " } else { "⏺" };
-                    let cells = self.build_spinner_body_row(frame, &status);
+                    let meta = spinner_meta_suffix(&label);
+                    let label_with_time = if meta.is_empty() { status } else { format!("{}{}", status, meta) };
+                    let cells = self.build_spinner_body_row(frame, &label_with_time);
                     self.render_guide_spinner(cells);
-                    if is_done {
-                        self.guide_status_text = None;
-                    }
                 } else if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     let meta = spinner_meta_suffix(&label);
                     self.render_inflight_tool(frame, &name, &detail, meta);
@@ -2746,12 +2741,48 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text_sgr(&safe);
             }
             UiLine::GuideStatus(text) => {
-                // Store the label for spinner-based animation (the spinner
-                // tick loop reads this and prefixes an animated frame glyph).
+                // Completion marker: static frozen line, no further animation.
+                if text.starts_with("  ⎿") {
+                    self.guide_status_text = None;
+                    let body = text.strip_prefix("  ⎿ ").unwrap_or(&text);
+                    let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
+                    let mut new_rows: Vec<Vec<Cell>> = Vec::new();
+                    let prefix_style = self.style_for(Role::Brand);
+                    if w > 0 {
+                        for phys in body.split('\n') {
+                            for chunk in crate::width::wrap_line_to_width(phys, w.saturating_sub(4)) {
+                                let mut row = Vec::new();
+                                push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
+                                push_str_cells(&mut row, "  ⎿ ", &prefix_style);
+                                push_str_cells(&mut row, &chunk, &CellStyle::default());
+                                new_rows.push(row);
+                            }
+                        }
+                    }
+                    if new_rows.is_empty() {
+                        let mut row = Vec::new();
+                        push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
+                        push_str_cells(&mut row, "  ⎿ ", &prefix_style);
+                        new_rows.push(row);
+                    }
+                    let n = new_rows.len();
+                    let prev = self.guide_status_rows;
+                    if prev > 0 {
+                        let remove = prev.min(self.body_lines.len());
+                        self.body_lines.truncate(self.body_lines.len() - remove);
+                    }
+                    for row in new_rows {
+                        self.push_body_row(row);
+                    }
+                    self.guide_status_rows = n;
+                    return;
+                }
+
+                // Running state: store text for spinner animation, push
+                // initial row immediately (spinner tick will replace it
+                // in-place with the animated frame glyph on each tick).
                 self.guide_status_text = Some(text.clone());
 
-                // Live status line — each emission replaces the previous
-                // one in-place using CUP (same pattern as inflight_tool).
                 let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
                 let mut new_rows: Vec<Vec<Cell>> = Vec::new();
                 if w > 0 {
@@ -2774,7 +2805,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     self.ensure_scroll_region();
                     let bottom = self.body_bottom_row();
                     if bottom >= n as u16 {
-                        // Remove prev rows from model, swap in new rows.
                         let keep = self.body_lines.len().saturating_sub(prev);
                         self.body_lines.truncate(keep);
                         let first = bottom - n as u16 + 1;
@@ -2802,9 +2832,14 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.guide_status_rows = n;
             }
             UiLine::GuideResult(text) => {
+                // Scrub ANSI control sequences — the guide subagent may
+                // return LLM output influenced by web content. Non-SGR
+                // escapes (clear screen, cursor home, etc.) are stripped
+                // to prevent terminal injection.
+                let safe = crate::sanitize::scrub_controls(&text);
                 let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
                 let mut md_state = crate::markdown::MdState::new();
-                for line in text.lines() {
+                for line in safe.lines() {
                     if let Some(rendered) = crate::markdown::render_line_with_width(
                         line,
                         &mut md_state,
