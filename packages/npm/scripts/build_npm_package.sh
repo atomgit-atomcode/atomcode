@@ -7,14 +7,54 @@
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-VERSION="${1:?Usage: $0 <version> [npm-publish-flags...]}"
-shift || true
+B="https://api.atomgit.com/api/v5"
+ATOMGIT_TOKEN="${ATOMGIT_TOKEN:-}"
+
+# ── version auto-detection (same helpers as packages/homebrew/scripts/package-tar-gz.sh) ──
+et(){
+    command -v curl &>/dev/null || return 1
+    command -v jq &>/dev/null && return 0
+    j=jq-macos-amd64; [[ $(uname -m) == arm64 ]] && j=jq-macos-arm64
+    g="https://github.com/jqlang/jq/releases/download/jq-1.7.1/$j"
+    d=$(mktemp -d) || return 1; p=$d/jq
+    for u in "${ATOMGIT_JQ_URL:-}" "$g" "https://ghfast.top/$g"; do
+        [[ $u ]] || continue
+        curl -fsSL --connect-timeout 40 --retry 3 "$u" -o "$p" || continue
+        s=$(stat -f%z "$p" 2>/dev/null || echo 0)
+        [[ $s -ge 80000 ]] || { rm -f "$p"; continue; }
+        chmod +x "$p" || { rm -f "$p"; continue; }
+        "$p" -n . &>/dev/null || { rm -f "$p"; continue; }
+        export PATH="$d:$PATH"
+        command -v jq &>/dev/null && return 0
+    done
+    rm -rf "$d"; return 1
+}
+
+fct(){ curl -sS -H "PRIVATE-TOKEN: $ATOMGIT_TOKEN" -H "Accept: application/json" \
+    "$B/repos/atomgit_atomcode/atomcode/contents/Cargo.toml?ref=main"; }
+
+pvs(){
+    local t v
+    t=$(jq -er 'select(.type=="file")|.content|gsub("[[:space:]]";"")|@base64d' <<<"$1")
+    v=$(awk 'BEGIN{f=0} index($0,"[workspace.package]")==1{w=1;next} substr($0,1,1)=="["{w=0}
+        w&&/^version *=/{if(match($0,/"[^"]+"/)){print substr($0,RSTART+1,RLENGTH-2);f=1;exit}}
+        END{exit !f}' <<<"$t")
+    [[ $v ]] || exit 1; echo "$v"
+}
+
+# ── resolve version ──
+if [ $# -ge 1 ] && [[ "$1" != -* ]]; then
+    VERSION="$1"
+    shift
+else
+    et || { echo "Error: jq not available"; exit 1; }
+    j=$(fct) || { echo "Error: failed to fetch Cargo.toml"; exit 1; }
+    jq -e .error_code <<<"$j" &>/dev/null && { echo "Error fetching Cargo.toml: $(echo "$j" | jq -r .message)"; exit 1; }
+    VERSION=$(pvs "$j") || { echo "Error: failed to parse version from Cargo.toml"; exit 1; }
+fi
 
 # Capture remaining args for npm publish (e.g. --dry-run, --otp=...)
 NPM_EXTRA="${*:-}"
-
-# AtomGit release assets require authentication (set ATOMGIT_TOKEN env var)
-ATOMGIT_TOKEN="${ATOMGIT_TOKEN:-}"
 
 NPM_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WORK_DIR=$(mktemp -d)
