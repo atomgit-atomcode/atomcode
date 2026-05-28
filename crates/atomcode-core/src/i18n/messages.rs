@@ -411,6 +411,13 @@ pub enum Msg<'a> {
     CmdLoginFailed {
         error: &'a str,
     },
+    /// Shown inline by `/login` when OAuth completes successfully and
+    /// no CodingPlan provider was auto-configured. Tells the user to
+    /// run `/codingplan` to claim their free token quota.
+    LoginSignedInWithCpHint {
+        name: &'a str,
+        username: &'a str,
+    },
     CmdLogoutDone,
     CmdLogoutFailed {
         error: &'a str,

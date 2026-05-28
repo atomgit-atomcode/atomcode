@@ -24,6 +24,7 @@ use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
 use atomcode_core::config::Config;
+use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
 
@@ -1730,6 +1731,9 @@ pub(super) fn execute_slash_command(
                 renderer.flush();
             }
         }
+        "codingplan" => {
+            run_codingplan_setup_flow(renderer, ctx)?;
+        }
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,
@@ -3094,7 +3098,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 /// (input box stays visible). The subsequent `coding_plan::run` call
 /// then sees `is_logged_in() == true` and skips its own `auth::login`
 /// path — that path prints to stdout and is reserved for CLI callers.
-pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
+pub(crate) fn run_codingplan_setup_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Phase 1: pre-flight login if needed.
     if !atomcode_core::auth::is_logged_in() {
         if let Err(e) = run_oauth_with_renderer(renderer, ctx)

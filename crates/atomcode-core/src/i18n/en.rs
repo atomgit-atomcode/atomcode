@@ -367,6 +367,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("Unknown command: /{name}").into(),
         Msg::CmdLoginFailed { error } =>
             format!("login failed: {error}").into(),
+        Msg::LoginSignedInWithCpHint { name, username } =>
+            format!("  Signed in as {name} (@{username}). Use /codingplan to claim a free token quota.\n").into(),
         Msg::CmdLogoutDone =>
             "  Signed out of AtomGit. Permissions refreshed.\n".into(),
         Msg::CmdLogoutFailed { error } =>

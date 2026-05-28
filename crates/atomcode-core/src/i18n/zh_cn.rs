@@ -357,6 +357,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("未知命令：/{name}").into(),
         Msg::CmdLoginFailed { error } =>
             format!("登录失败：{error}").into(),
+        Msg::LoginSignedInWithCpHint { name, username } =>
+            format!("  已登录为 {name}（@{username}）。使用 /codingplan 领取免费额度。\n").into(),
         Msg::CmdLogoutDone =>
             "  已退出 AtomGit 登录。权限已刷新。\n".into(),
         Msg::CmdLogoutFailed { error } =>

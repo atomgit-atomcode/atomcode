@@ -2972,7 +2972,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // driver directly — same effect, runs in this
                         // select! arm's scope where renderer + ctx are
                         // already mutable.
-                        if let Err(e) = crate::event_loop::commands::run_login_flow(renderer, &mut ctx) {
+                        if let Err(e) = crate::event_loop::commands::run_codingplan_setup_flow(renderer, &mut ctx) {
                             renderer.render(crate::render::UiLine::Error(
                                 format!("CodingPlan 自动配置失败: {e:#}。可运行 /login 手动重试。"),
                             ));
@@ -3341,7 +3341,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // driver directly — same effect, runs in this
                         // select! arm's scope where renderer + ctx are
                         // already mutable.
-                        if let Err(e) = crate::event_loop::commands::run_login_flow(renderer, &mut ctx) {
+                        if let Err(e) = crate::event_loop::commands::run_codingplan_setup_flow(renderer, &mut ctx) {
                             renderer.render(crate::render::UiLine::Error(
                                 format!("CodingPlan 自动配置失败: {e:#}。可运行 /login 手动重试。"),
                             ));
@@ -4000,7 +4000,7 @@ fn handle_input(
                         // `active_modal` access the modals themselves
                         // don't have.
                         if std::mem::take(&mut ctx.pending_run_login_setup) {
-                            crate::event_loop::commands::run_login_flow(renderer, ctx)?;
+                            crate::event_loop::commands::run_codingplan_setup_flow(renderer, ctx)?;
                         }
                         if std::mem::take(&mut ctx.pending_open_provider_wizard) {
                             let pw = crate::modals::ProviderWizard::MainMenu { selected: 0 };
