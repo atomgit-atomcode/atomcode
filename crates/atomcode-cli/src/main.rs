@@ -222,6 +222,7 @@ fn should_try_sync_upgrade() -> bool {
                 | "status"
                 | "upgrade"
                 | "rollback"
+                | "uninstall"
                 | "mcp"
                 | "telemetry"
                 | "--version"
