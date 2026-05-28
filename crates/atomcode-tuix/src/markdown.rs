@@ -405,12 +405,28 @@ pub fn flush_aligned_table_with_width(
     let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
 
     // Draw a horizontal rule row with given connector characters.
+    //
+    // Each inner column reserves `(w + 2)` *visual cells* of border —
+    // matching the content row's ` <body><pad> ` budget (1 leading space
+    // + w cells of content/padding + 1 trailing space) so border, content
+    // and separators align column-by-column.
+    //
+    // The dash glyph `─` (U+2500) is East Asian Ambiguous. With
+    // `cell_char_width('─') == 2` (i.e. `ATOMCODE_CJK_WIDTH=1`), each char
+    // we push occupies 2 cells, so naively pushing `(w + 2)` chars would
+    // paint `2 * (w + 2)` cells per column — borders drawn way past the
+    // content's right edge. Push `ceil((w + 2) / dash_w)` chars instead;
+    // for `dash_w == 1` (default) this is unchanged, for `dash_w == 2`
+    // odd widths overshoot by 1 cell — minor cosmetic, far better than
+    // a 2x stretch.
+    let dash_w = crate::width::cell_char_width('─').unwrap_or(1).max(1);
     let rule = |left: char, mid: char, right: char| -> String {
         let mut s = String::new();
         s.push_str(border_on);
         s.push(left);
         for (j, w) in col_widths.iter().enumerate() {
-            for _ in 0..(w + 2) {
+            let n_dashes = (w + 2).div_ceil(dash_w);
+            for _ in 0..n_dashes {
                 s.push('─');
             }
             if j + 1 < col_widths.len() {
