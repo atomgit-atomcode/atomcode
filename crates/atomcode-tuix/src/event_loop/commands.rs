@@ -2356,7 +2356,9 @@ fn render_codingplan_status_for_status_cmd() -> String {
         out.push_str(&t(Msg::StatusCpUsage {
             usage: &u.display_desc(),
             reset_at: &u.reset_at_display,
-            seconds: u.seconds_until_reset,
+            duration: &atomcode_core::coding_plan::setup::format_duration_secs(
+                u.seconds_until_reset,
+            ),
         }));
     }
     if status.window_quota_exhausted {
