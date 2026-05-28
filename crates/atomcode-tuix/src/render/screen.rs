@@ -28,9 +28,11 @@
 //     resume-from-external, resize, and any "terminal state is
 //     unknown" situation uniformly.
 //
-//   * **Cursor and visibility** are frame-level state, emitted once
-//     per diff at the tail of the patch stream, so they don't
-//     bounce around between cell writes.
+//   * **Cursor and visibility** are frame-level state. Visibility is
+//     hidden at the head of the diff and restored at the tail; cursor
+//     position parks at the tail. Never interleaved with cell writes,
+//     so the caret can't be seen jumping across the screen between
+//     patches. Frames that emit no work skip the wrap entirely.
 
 use std::io::Write as _;
 
@@ -181,7 +183,8 @@ impl Screen {
     /// the next draw cycle starts clean — callers must re-draw
     /// every widget every frame (retained-mode invariant).
     pub fn render_diff(&mut self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut body = Vec::new();
+        let cold_start = self.physical_dirty;
         if self.physical_dirty {
             // Cold-start the physical terminal: per-row CUP+EL across
             // every screen row, then `\x1b[H` to home. The subsequent
@@ -196,16 +199,34 @@ impl Screen {
             // for the trailing columns and emits no patch, so the
             // stale glyphs survive.
             let h = self.cells.len();
-            out.reserve(h * 8 + 4);
+            body.reserve(h * 8 + 4);
             for row in 1..=h {
-                let _ = write!(&mut out, "\x1b[{};1H\x1b[K", row);
+                let _ = write!(&mut body, "\x1b[{};1H\x1b[K", row);
             }
-            out.extend_from_slice(b"\x1b[H");
+            body.extend_from_slice(b"\x1b[H");
             self.physical_dirty = false;
         }
         let patches = diff_cell_frames(&self.prev_cells, &self.cells);
         let patch_bytes = serialize_patches(&patches);
-        out.extend_from_slice(&patch_bytes);
+        body.extend_from_slice(&patch_bytes);
+        // Anti-flicker wrap around any frame that moves the caret.
+        // `serialize_patches` walks the cursor across every changed
+        // cell via CUP+glyph; the next frame parks it back at the
+        // input prompt. With DECTCEM on throughout, on streaming
+        // bodies the user perceives the caret zooming across the
+        // screen at 50fps and snapping back — looks like the input
+        // box is "blinking". `?25l` at frame start keeps the caret
+        // invisible during the patch walk; DECSET 2026 (synchronized
+        // output) lets capable hosts — Windows Terminal, iTerm2,
+        // kitty, wezterm, alacritty — defer paint until the whole
+        // patch lands, hiding intermediate state entirely. Older
+        // terminals ignore unknown DEC private modes per spec.
+        let has_visible_work = cold_start || !patch_bytes.is_empty();
+        let mut out = Vec::with_capacity(body.len() + 32);
+        if has_visible_work {
+            out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+        }
+        out.extend_from_slice(&body);
         if let Some((r, c)) = self.cursor {
             let _ = write!(&mut out, "\x1b[{};{}H", r, c);
         }
@@ -213,6 +234,9 @@ impl Screen {
             out.extend_from_slice(b"\x1b[?25h");
         } else {
             out.extend_from_slice(b"\x1b[?25l");
+        }
+        if has_visible_work {
+            out.extend_from_slice(b"\x1b[?2026l");
         }
         std::mem::swap(&mut self.prev_cells, &mut self.cells);
         // Clear the new scratch. Without this, stale cells from
@@ -548,5 +572,61 @@ mod tests {
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
         assert!(out.contains("\x1b[2;5H"), "cursor park missing: {:?}", out);
+    }
+
+    /// Frames with cell work get wrapped in DECSET 2026 + DECTCEM
+    /// hide/show so the caret doesn't visibly bounce across the screen
+    /// during the patch walk. Empty frames skip the wrap to avoid
+    /// wasting bytes on terminals that don't need it.
+    #[test]
+    fn nonempty_frame_wraps_in_sync_output_and_hides_cursor() {
+        let mut s = Screen::new(10, 3);
+        let mut cells = Vec::new();
+        push_str_cells(&mut cells, "x", &CellStyle::default());
+        s.draw_row(0, 0, &cells);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        // BSU/ESU wrap exists and order is correct.
+        let bsu = out.find("\x1b[?2026h").expect("BSU present");
+        let esu = out.find("\x1b[?2026l").expect("ESU present");
+        assert!(bsu < esu, "BSU must precede ESU: {:?}", out);
+        // Hide-cursor sits immediately after BSU, before any cell write.
+        assert!(
+            out.starts_with("\x1b[?2026h\x1b[?25l"),
+            "frame must open with BSU+hide: {:?}",
+            out
+        );
+        // Visibility restored before ESU.
+        assert!(
+            out.ends_with("\x1b[?25h\x1b[?2026l"),
+            "frame must close with show+ESU: {:?}",
+            out
+        );
+        // Cell content lands inside the wrap.
+        let x_pos = out.find('x').expect("x rendered");
+        assert!(bsu < x_pos && x_pos < esu, "cell write must sit inside wrap: {:?}", out);
+    }
+
+    #[test]
+    fn empty_frame_skips_sync_output_wrap() {
+        let mut s = Screen::new(10, 3);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(!out.contains("\x1b[?2026h"), "no BSU on empty frame: {:?}", out);
+        assert!(!out.contains("\x1b[?2026l"), "no ESU on empty frame: {:?}", out);
+        assert!(!out.contains("\x1b[?25l"), "no hide on empty frame: {:?}", out);
+    }
+
+    /// Invalidate triggers a cold-start CUP+EL walk across every row —
+    /// the cursor moves a lot. That work must also be wrapped in the
+    /// sync/hide envelope.
+    #[test]
+    fn invalidate_cold_start_is_wrapped() {
+        let mut s = Screen::new(10, 3);
+        s.invalidate();
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(out.starts_with("\x1b[?2026h\x1b[?25l"), "cold-start frame must open with BSU+hide: {:?}", out);
+        assert!(out.ends_with("\x1b[?25h\x1b[?2026l"), "cold-start frame must close with show+ESU: {:?}", out);
     }
 }
