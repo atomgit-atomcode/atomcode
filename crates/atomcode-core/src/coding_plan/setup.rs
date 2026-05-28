@@ -365,18 +365,31 @@ impl SetupReport {
                     }
                 }
                 if !s.rate_limit_windows.is_empty() {
-                    for w in s.rate_limit_windows.iter().filter(|w| w.show_enable == 1) {
-                        let hours = w.window_size_seconds / 3600;
-                        if hours > 5 {
-                            // Long window (monthly / etc.) becoming visible signals
-                            // the user has hit the longer-period quota — surface the
-                            // monthly-exhausted message and the reset time.
-                            out.push_str(&t(Msg::CpMonthlyQuotaExhausted {
-                                reset_at: &w.reset_at_display,
-                                duration: &format_duration_secs(w.seconds_until_reset),
-                            }));
-                        } else {
-                            // Short rolling window (e.g. 5h) — show standard usage line.
+                    // A visible long window (>5h, typically the 30d monthly
+                    // quota) means the user has hit the longer-period limit.
+                    // In that state the short 5h rolling window is moot —
+                    // even if it reads `0% · 重置于 2h 后`, the request
+                    // path is still gated by the monthly cap, so the user
+                    // can't actually issue calls until the long window
+                    // resets. Showing both produces the misleading "你还
+                    // 有 2h 短窗，但 12d 后才能用" pair the user reported
+                    // (the 0%-short-window line gave false hope). Resolve
+                    // by picking the longest exhausted window and rendering
+                    // only its line; otherwise iterate visible short
+                    // windows normally.
+                    let longest_exhausted = s
+                        .rate_limit_windows
+                        .iter()
+                        .filter(|w| w.show_enable == 1 && w.window_size_seconds / 3600 > 5)
+                        .max_by_key(|w| w.window_size_seconds);
+                    if let Some(w) = longest_exhausted {
+                        out.push_str(&t(Msg::CpMonthlyQuotaExhausted {
+                            duration: &format_duration_secs(w.seconds_until_reset),
+                        }));
+                    } else {
+                        for w in s.rate_limit_windows.iter().filter(|w| w.show_enable == 1) {
+                            // All visible windows are short rolling (≤5h) —
+                            // standard usage line.
                             out.push_str(&t(Msg::CpUsageLine {
                                 usage: &w.usage_status_desc,
                                 reset_at: &w.reset_at_display,
@@ -1020,7 +1033,13 @@ fn truncate_inline(msg: &str, max: usize) -> String {
 /// `90s`, `5m`, `2h 30m`, `3d 4h`. Replaces the previous "{N}s" which
 /// was unreadable for anything past a minute (e.g. "in 86340s" instead
 /// of "in 23h 59m").
-fn format_duration_secs(secs: i64) -> String {
+///
+/// `pub` so the `/status` rendering in atomcode-tuix can share the same
+/// formatter — keeps the `用量 重置于 ...（2h 后）` line consistent
+/// between `/login`'s CodingPlan setup output and `/status`'s
+/// CodingPlan section. (Pre-fix they diverged: setup said `2h`, status
+/// said `5984s`.)
+pub fn format_duration_secs(secs: i64) -> String {
     if secs < 0 {
         return "—".into();
     }
@@ -2479,31 +2498,116 @@ mod tests {
     #[test]
     fn render_long_window_shows_monthly_exhausted() {
         // window_size_seconds > 5h * 3600 = 18000 → monthly-exhausted message.
+        // Output: `用量：本月用量已耗尽，等 {duration} 后再使用` —
+        // the reset clock-time is intentionally dropped (it's typically a
+        // far-off "06-20 23:09" the user can't act on; the duration anchor
+        // `25d` reads more usefully).
         let s = crate::coding_plan::types::StatusResponse {
-            rate_limit_windows: vec![RateLimitWindow {
-                rule_index: 1,
-                show_enable: 1,
-                window_size_seconds: 2592000, // 30 days
-                window_hours: 720,
-                call_limit: 16000,
-                calls_used: 16000,
-                usage_percent: 100.0,
-                quota_exhausted: true,
-                reset_at: "2026-06-20T23:09:30".into(),
-                reset_at_display: "23:09".into(),
-                seconds_until_reset: 2194080,
-                reset_label: String::new(),
-                usage_status_desc: "当前时间窗口用量约 100%".into(),
-            }],
+            rate_limit_windows: vec![
+                RateLimitWindow {
+                    rule_index: 1,
+                    show_enable: 1,
+                    window_size_seconds: 2592000, // 30 days
+                    window_hours: 720,
+                    call_limit: 16000,
+                    calls_used: 16000,
+                    usage_percent: 100.0,
+                    quota_exhausted: true,
+                    reset_at: "2026-06-20T23:09:30".into(),
+                    reset_at_display: "23:09".into(),
+                    seconds_until_reset: 2194080, // ~25.4d
+                    reset_label: String::new(),
+                    usage_status_desc: "当前时间窗口用量约 100%".into(),
+                },
+            ],
             ..blank_status_response()
         };
         let out = status_only_report(s).render();
         assert!(
-            out.contains("本月用量已耗尽") || out.contains("Monthly quota exhausted"),
+            out.contains("本月用量已耗尽") || out.contains("monthly quota exhausted"),
             "long-window message missing: {}",
             out
         );
-        assert!(out.contains("23:09"), "reset_at_display missing: {}", out);
+        // Duration anchor present, clock time absent.
+        assert!(
+            out.contains("25d") || out.contains("in 25d"),
+            "duration anchor missing: {}",
+            out
+        );
+        assert!(!out.contains("23:09"), "clock-time should be dropped: {}", out);
+    }
+
+    /// User-reported scenario: monthly quota at 100% AND server also
+    /// reports a fresh 5h rolling window at 0%. Showing both produces
+    /// the misleading `用量 0% 重置于 2h / ⚠ 本月用量已耗尽 12d` pair
+    /// (the 0%-line gave false hope — even with 5h capacity the user
+    /// can't issue calls because the monthly cap gates everything).
+    /// Expected: collapse to the single monthly-exhausted line.
+    #[test]
+    fn render_monthly_exhausted_suppresses_short_window_line() {
+        let s = crate::coding_plan::types::StatusResponse {
+            rate_limit_windows: vec![
+                // 5h rolling, fresh — show_enable=1 from server.
+                RateLimitWindow {
+                    rule_index: 0,
+                    show_enable: 1,
+                    window_size_seconds: 18000,
+                    window_hours: 5,
+                    call_limit: 500,
+                    calls_used: 0,
+                    usage_percent: 0.0,
+                    quota_exhausted: false,
+                    reset_at: "2026-05-28T22:49:00".into(),
+                    reset_at_display: "22:49".into(),
+                    seconds_until_reset: 7200, // 2h
+                    reset_label: String::new(),
+                    usage_status_desc: "当前时间窗口用量约 0%".into(),
+                },
+                // 30d monthly, exhausted.
+                RateLimitWindow {
+                    rule_index: 1,
+                    show_enable: 1,
+                    window_size_seconds: 2592000,
+                    window_hours: 720,
+                    call_limit: 16000,
+                    calls_used: 16000,
+                    usage_percent: 100.0,
+                    quota_exhausted: true,
+                    reset_at: "2026-06-09T22:49:00".into(),
+                    reset_at_display: "06-09 22:49".into(),
+                    seconds_until_reset: 1036800, // 12d
+                    reset_label: String::new(),
+                    usage_status_desc: "本月用量约 100%".into(),
+                },
+            ],
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        // Monthly exhausted line present.
+        assert!(
+            out.contains("本月用量已耗尽") || out.contains("monthly quota exhausted"),
+            "monthly-exhausted line missing: {}",
+            out
+        );
+        // Short-window 0% line SUPPRESSED — the whole point of this fix.
+        assert!(
+            !out.contains("用量约 0%") && !out.contains("Usage: 当前时间窗口用量约 0%"),
+            "short-window 0% line must be suppressed when monthly exhausted: {}",
+            out
+        );
+        // Short window's `2h` reset duration should not leak either —
+        // would tell the user a stale "你还有 2 小时" anchor.
+        assert!(
+            !out.contains("（2h 后）") && !out.contains("(in 2h)"),
+            "short-window 2h duration must not leak: {}",
+            out
+        );
+        // Monthly window's 12d duration is what shows.
+        assert!(
+            out.contains("12d"),
+            "monthly 12d duration missing: {}",
+            out
+        );
     }
 
     #[test]

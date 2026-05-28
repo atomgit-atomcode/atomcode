@@ -104,6 +104,64 @@ struct ReadFileArgs {
     limit: Option<usize>,
 }
 
+/// Strip a single trailing `{…}` group from a filename if it's a *clean*
+/// trailing placeholder. Returns `Some(rest)` for `foo.md{}` /
+/// `foo.md{path}` / `foo.md{0}`, `None` for filenames without trailing
+/// braces, for placement other than the end (`{}foo.md`, `foo{}bar.md`),
+/// and for nested / interleaved braces (`foo{a}b}`) which we can't safely
+/// classify as a single template token.
+///
+/// Motivates the `{…}` strip-retry in `read_file`: the model occasionally
+/// copies SLF4J / log4j format-string fragments (`log.info("Read {}",
+/// path)` style) from the project's Java source into its `file_path`
+/// argument verbatim, so `ISSUES-INDEX.md{}` arrives as the requested
+/// path and every read errors NotFound. Detect that pattern, try the
+/// stripped path, and prepend an inline note so the model corrects
+/// future calls.
+fn strip_trailing_braces(s: &str) -> Option<&str> {
+    let without_close = s.strip_suffix('}')?;
+    let open = without_close.rfind('{')?;
+    // Body between `{` and the suffix-`}` must not contain another brace:
+    // an interleaved `{` or `}` makes this not a single clean trailing
+    // group (e.g. `foo{a}b}` — trailing `}` exists but the prefix doesn't
+    // end at a placeholder boundary).
+    if without_close[open + 1..].contains(['{', '}']) {
+        return None;
+    }
+    let stripped = &s[..open];
+    // Refuse stripping to an empty filename — a raw `{}` filename is
+    // pathological enough that we don't want to silently re-target the
+    // operation to the parent directory.
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped)
+    }
+}
+
+/// Path-aware wrapper around `strip_trailing_braces`: rebuilds the parent
+/// + stripped basename. Returns `None` if there's no trailing placeholder,
+/// no parent, or the basename isn't UTF-8 (rare on Windows but
+/// non-stripping is the safe behaviour).
+fn strip_trailing_placeholder(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let parent = path.parent()?;
+    let name = path.file_name()?.to_str()?;
+    let stripped = strip_trailing_braces(name)?;
+    Some(parent.join(stripped))
+}
+
+/// Prepend the auto-strip note (if present) to a body string. Kept as a
+/// free function so each ToolResult return site is one line: every Ok
+/// path in `execute` calls this before constructing the result so the
+/// model sees the correction notice on success and on failure paths
+/// (too-large / binary / invalid-offset) alike.
+fn prepend_note(note: &Option<String>, body: String) -> String {
+    match note {
+        Some(n) => format!("{}\n{}", n, body),
+        None => body,
+    }
+}
+
 #[async_trait]
 impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDef {
@@ -150,7 +208,7 @@ impl Tool for ReadFileTool {
     async fn execute(&self, args: &str, ctx: &ToolContext) -> Result<ToolResult> {
         let parsed: ReadFileArgs = serde_json::from_str(args)?;
         let working_dir = ctx.working_dir.read().await.clone();
-        let path = match super::inspect_path_access(&parsed.file_path, &working_dir) {
+        let path0 = match super::inspect_path_access(&parsed.file_path, &working_dir) {
             Ok(access) => access.path,
             Err(err) => {
                 return Ok(ToolResult {
@@ -158,6 +216,39 @@ impl Tool for ReadFileTool {
                     output: err.to_string(),
                     success: false,
                 });
+            }
+        };
+
+        // A: `{…}` placeholder strip-retry. If the resolved path doesn't
+        // exist but its filename ends in a `{…}` template fragment, try
+        // the path with that fragment stripped. The model occasionally
+        // copies SLF4J / log4j placeholder syntax (`log.info("Read {}",
+        // p)`) from project source into its `file_path` arg verbatim,
+        // sending paths like `…\\ISSUES-INDEX.md{}`. If the stripped
+        // path exists, swap to it and record an inline note that gets
+        // prepended to whatever result we eventually return — that way
+        // the model both gets the file it actually wanted AND a
+        // self-correcting hint for its next call.
+        //
+        // Guarded by the original path not existing, so files that
+        // genuinely have a `{…}` suffix in their basename (vanishingly
+        // rare on Windows; possible on POSIX with editor temp files)
+        // continue to take the happy path unchanged.
+        let (path, auto_strip_note): (std::path::PathBuf, Option<String>) = if path0.exists() {
+            (path0, None)
+        } else {
+            match strip_trailing_placeholder(&path0) {
+                Some(stripped) if stripped.exists() => {
+                    let note = format!(
+                        "[note: requested file_path ended with a `{{…}}` template fragment \
+                         (likely an SLF4J / log4j placeholder copied from project source) — \
+                         atomcode stripped it and read {} instead. Future read_file calls on \
+                         this file should omit the `{{…}}` suffix.]",
+                        stripped.display()
+                    );
+                    (stripped, Some(note))
+                }
+                _ => (path0, None),
             }
         };
         let path_ref = path.as_path();
@@ -180,7 +271,7 @@ impl Tool for ReadFileTool {
                 if cached_mtime == mtime {
                     return Ok(ToolResult {
                         call_id: String::new(),
-                        output: cached_output,
+                        output: prepend_note(&auto_strip_note, cached_output),
                         success: true,
                     });
                 }
@@ -200,10 +291,13 @@ impl Tool for ReadFileTool {
             entries.sort();
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!(
-                    "[NOTE: {} is a directory, not a file. Here are its contents:]\n{}",
-                    parsed.file_path,
-                    entries.join("\n")
+                output: prepend_note(
+                    &auto_strip_note,
+                    format!(
+                        "[NOTE: {} is a directory, not a file. Here are its contents:]\n{}",
+                        parsed.file_path,
+                        entries.join("\n")
+                    ),
                 ),
                 success: true,
             });
@@ -264,6 +358,25 @@ impl Tool for ReadFileTool {
                     }
                 }
                 find_file(&working_dir, &filename, 0, 7, &mut matches);
+                // C: if the basename has a trailing `{…}` placeholder,
+                // also search for the basename without it. A's
+                // strip-retry only checks the *exact* parent directory;
+                // C widens the search to the entire workspace so a
+                // model that copied both the wrong parent path AND the
+                // SLF4J-style `{}` suffix (e.g. relative path against a
+                // working_dir that no longer matches) still gets the
+                // real file surfaced in "Did you mean".
+                if let Some(stripped_name) = strip_trailing_braces(&filename) {
+                    if !stripped_name.is_empty() && stripped_name != filename {
+                        find_file(&working_dir, stripped_name, 0, 7, &mut matches);
+                    }
+                }
+                // Dedup (the same path could surface from both filename
+                // variants when the workspace contains both naming
+                // conventions, or when A's retry already pre-checked
+                // the exact-parent stripped path).
+                matches.sort();
+                matches.dedup();
                 // Rank by shared-path-prefix length with the requested
                 // path. The correct match almost always shares the most
                 // segments with what the agent asked for.
@@ -358,7 +471,7 @@ impl Tool for ReadFileTool {
                 }
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output,
+                    output: prepend_note(&auto_strip_note, output),
                     success: true,
                 });
             }
@@ -407,7 +520,7 @@ impl Tool for ReadFileTool {
                 );
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output,
+                    output: prepend_note(&auto_strip_note, output),
                     success: false,
                 });
             }
@@ -432,7 +545,7 @@ impl Tool for ReadFileTool {
                     );
                     return Ok(ToolResult {
                         call_id: String::new(),
-                        output,
+                        output: prepend_note(&auto_strip_note, output),
                         success: false,
                     });
                 }
@@ -448,7 +561,7 @@ impl Tool for ReadFileTool {
                 }
                 return Ok(ToolResult {
                     call_id: String::new(),
-                    output,
+                    output: prepend_note(&auto_strip_note, output),
                     success: true,
                 });
             }
@@ -484,7 +597,7 @@ impl Tool for ReadFileTool {
                             }
                             return Ok(ToolResult {
                                 call_id: String::new(),
-                                output,
+                                output: prepend_note(&auto_strip_note, output),
                                 success: true,
                             });
                         }
@@ -632,7 +745,7 @@ impl Tool for ReadFileTool {
             }
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: skeleton,
+                output: prepend_note(&auto_strip_note, skeleton),
                 success: true,
             });
         }
@@ -733,7 +846,7 @@ impl Tool for ReadFileTool {
         }
         Ok(ToolResult {
             call_id: String::new(),
-            output,
+            output: prepend_note(&auto_strip_note, output),
             success: true,
         })
     }
@@ -2137,6 +2250,146 @@ mod tests {
         assert!(
             !r.output.contains("Binary file"),
             "normal Rust file must not be flagged binary, got: {}",
+            r.output
+        );
+    }
+
+    // ─── A: `{…}` placeholder strip-retry ───
+    //
+    // The model sometimes copies SLF4J / log4j format-string placeholders
+    // (`log.info("Read {}", path)`) from project source into its
+    // `file_path` argument verbatim. Verify the read_file tool detects
+    // the trailing `{…}` group, swaps to the stripped path when that
+    // file actually exists, and prepends an inline note so the model
+    // self-corrects on the next call.
+
+    #[test]
+    fn strip_trailing_braces_empty_braces() {
+        assert_eq!(strip_trailing_braces("ISSUES-INDEX.md{}"), Some("ISSUES-INDEX.md"));
+    }
+
+    #[test]
+    fn strip_trailing_braces_filled_braces() {
+        assert_eq!(strip_trailing_braces("foo.md{path}"), Some("foo.md"));
+        assert_eq!(strip_trailing_braces("foo.md{0}"), Some("foo.md"));
+    }
+
+    #[test]
+    fn strip_trailing_braces_returns_none_without_trailing_close() {
+        assert_eq!(strip_trailing_braces("foo.md"), None);
+        assert_eq!(strip_trailing_braces("{}foo.md"), None);
+        assert_eq!(strip_trailing_braces("foo{}bar.md"), None);
+    }
+
+    #[test]
+    fn strip_trailing_braces_rejects_interleaved_braces() {
+        // `foo{a}b}` ends with `}` but the body has another `}` — not a
+        // single clean trailing placeholder, refuse to mangle.
+        assert_eq!(strip_trailing_braces("foo{a}b}"), None);
+    }
+
+    #[test]
+    fn strip_trailing_braces_refuses_empty_stripped_result() {
+        // Bare `{}` filename: stripping yields "" which would re-target
+        // the read to the parent directory. Conservative refuse.
+        assert_eq!(strip_trailing_braces("{}"), None);
+    }
+
+    #[test]
+    fn strip_trailing_placeholder_path_aware() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(
+            strip_trailing_placeholder(Path::new("/tmp/foo.md{}")),
+            Some(PathBuf::from("/tmp/foo.md"))
+        );
+        assert!(strip_trailing_placeholder(Path::new("/tmp/foo.md")).is_none());
+    }
+
+    /// End-to-end A: model sends `file.md{}`, real `file.md` exists →
+    /// read_file silently corrects, returns the real content AND a note
+    /// the model can use to fix its next call.
+    #[tokio::test]
+    async fn read_file_strips_trailing_placeholder_and_serves_real_content() {
+        let dir = TempDir::new().unwrap();
+        let real_path = dir.path().join("ISSUES-INDEX.md");
+        std::fs::write(&real_path, "# Index\n\n- entry one\n- entry two\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        // Mimic the model's bug: append `{}` to the real path.
+        let args = format!(
+            r#"{{"file_path":"{}{{}}"}}"#,
+            real_path.display().to_string().replace('\\', "\\\\")
+        );
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success, "should serve the stripped real file, got: {}", r.output);
+        assert!(
+            r.output.contains("entry one"),
+            "stripped read should return real content, got: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("template fragment"),
+            "model-facing correction note must mention the strip, got: {}",
+            r.output
+        );
+    }
+
+    /// Strip-retry must NOT fire when the original path exists — files
+    /// that legitimately have a `{…}` suffix in their basename (rare on
+    /// Windows, possible on POSIX) read normally with no note.
+    #[tokio::test]
+    async fn read_file_preserves_legitimate_brace_suffix_when_path_exists() {
+        let dir = TempDir::new().unwrap();
+        let real_path = dir.path().join("template.md{}");
+        std::fs::write(&real_path, "real content\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        let args = format!(
+            r#"{{"file_path":"{}"}}"#,
+            real_path.display().to_string().replace('\\', "\\\\")
+        );
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(r.success);
+        assert!(r.output.contains("real content"));
+        assert!(
+            !r.output.contains("template fragment"),
+            "no auto-strip note should fire when the brace-suffixed file exists",
+        );
+    }
+
+    /// C: when the stripped path doesn't help (wrong base directory),
+    /// the workspace-wide "Did you mean" search uses the stripped
+    /// filename so the real file gets surfaced as a candidate even when
+    /// it lives in a different directory.
+    #[tokio::test]
+    async fn read_file_did_you_mean_search_uses_stripped_basename() {
+        let dir = TempDir::new().unwrap();
+        // Real file lives in a subdirectory the model didn't guess.
+        let subdir = dir.path().join("docs").join("ISSUES");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let real_path = subdir.join("ISSUES-INDEX.md");
+        std::fs::write(&real_path, "indexed\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let tool = ReadFileTool;
+        // Model guessed the wrong parent dir AND appended `{}`.
+        let bad_path = dir.path().join("ISSUES-INDEX.md{}");
+        let args = format!(
+            r#"{{"file_path":"{}"}}"#,
+            bad_path.display().to_string().replace('\\', "\\\\")
+        );
+        let r = tool.execute(&args, &ctx).await.unwrap();
+        assert!(!r.success, "should fail — neither path exists");
+        assert!(
+            r.output.contains("Did you mean"),
+            "should surface 'Did you mean' candidates, got: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("ISSUES-INDEX.md"),
+            "candidate list should include the real file (found via stripped basename), got: {}",
             r.output
         );
     }
