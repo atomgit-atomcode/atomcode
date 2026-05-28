@@ -6,7 +6,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::RwLock;
+
+use crate::i18n::{t, Msg};
+use crate::locale::Locale;
 
 /// A single entry in the knowledge base.
 #[derive(Debug, Clone)]
@@ -29,40 +32,37 @@ struct KnowledgeInner {
     entries: Vec<KnowledgeEntry>,
     /// Maps lowercase keyword -> list of entry indices that contain it.
     keyword_index: HashMap<String, Vec<usize>>,
+    /// The locale used when loading this data.
+    locale: Locale,
 }
 
 /// Thread-safe knowledge base that loads Markdown files from `knowledge/`.
 ///
-/// The actual loading is deferred until the first search or render call,
-/// making it cheap to construct even when the knowledge base may not be used.
-///
-/// # Thread safety
-///
-/// `KnowledgeBase` uses `OnceLock` internally so it is safe to share
-/// across threads. The `Clone` implementation creates a new `OnceLock`;
-/// the underlying data is only loaded once in any clone, which is
-/// acceptable given the expected memory footprint of the knowledge files.
+/// The knowledge base automatically reloads when the UI language changes,
+/// ensuring content matches the user's locale.
 #[derive(Debug)]
 pub struct KnowledgeBase {
-    inner: OnceLock<KnowledgeInner>,
+    inner: RwLock<Option<KnowledgeInner>>,
     base_dir: PathBuf,
+    /// If set, this KB is pinned to a specific locale and will not
+    /// reload when the global locale changes. Used by `embedded_en()`
+    /// to create a stable English KB for cross-language fallback.
+    target_locale: Option<Locale>,
 }
 
 impl Clone for KnowledgeBase {
     fn clone(&self) -> Self {
-        // We intentionally create a fresh OnceLock so that each clone
-        // can independently detect its first access. The underlying data
-        // may be loaded more than once across clones, but the expected
-        // number of entries is tiny (< 100 files, < 1 MiB total).
-        let inner = OnceLock::new();
-        // If the original is already loaded, seed the clone's OnceLock
-        // so it doesn't re-read from disk.
-        if let Some(data) = self.inner.get() {
-            let _ = inner.set(data.clone());
-        }
+        let inner = match self.inner.read() {
+            Ok(guard) => {
+                let data = guard.clone();
+                RwLock::new(data)
+            }
+            Err(_) => RwLock::new(None),
+        };
         Self {
             inner,
             base_dir: self.base_dir.clone(),
+            target_locale: self.target_locale,
         }
     }
 }
@@ -177,19 +177,20 @@ impl KnowledgeBase {
     /// Files are embedded at compile time via `include_str!` so the
     /// knowledge base works regardless of the runtime working directory.
     pub fn embedded() -> Self {
-        let inner = OnceLock::new();
-        let _ = inner.set(Self::load_embedded());
+        let inner = RwLock::new(Some(Self::load_embedded()));
         Self {
             inner,
             base_dir: PathBuf::new(),
+            target_locale: None,
         }
     }
 
     /// Create a `KnowledgeBase` with a custom base directory (used in tests).
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self {
-            inner: OnceLock::new(),
+            inner: RwLock::new(None),
             base_dir,
+            target_locale: None,
         }
     }
 
@@ -198,7 +199,34 @@ impl KnowledgeBase {
     // -----------------------------------------------------------------
 
     fn load_embedded() -> KnowledgeInner {
-        let files: &[(&str, &str)] = &[
+        Self::load_embedded_for_locale(crate::i18n::current_locale())
+    }
+
+    /// Create an embedded KnowledgeBase loaded with English files.
+    fn embedded_en() -> Self {
+        let inner = RwLock::new(Some(Self::load_embedded_for_locale(crate::locale::Locale::En)));
+        Self {
+            inner,
+            base_dir: PathBuf::new(),
+            target_locale: Some(crate::locale::Locale::En),
+        }
+    }
+
+    /// Create an embedded KnowledgeBase loaded with Chinese files.
+    fn embedded_zh() -> Self {
+        let inner = RwLock::new(Some(Self::load_embedded_for_locale(crate::locale::Locale::ZhCn)));
+        Self {
+            inner,
+            base_dir: PathBuf::new(),
+            target_locale: Some(crate::locale::Locale::ZhCn),
+        }
+    }
+
+    fn load_embedded_for_locale(locale: crate::locale::Locale) -> KnowledgeInner {
+        let is_english = matches!(locale, crate::locale::Locale::En);
+
+        // Chinese knowledge files (default)
+        let zh_files: &[(&str, &str)] = &[
             ("overview.md", include_str!("knowledge/overview.md")),
             ("features.md", include_str!("knowledge/features.md")),
             ("slash-commands.md", include_str!("knowledge/slash-commands.md")),
@@ -217,10 +245,37 @@ impl KnowledgeBase {
             ("keybindings.md", include_str!("knowledge/keybindings.md")),
         ];
 
+        // English knowledge files
+        let en_files: &[(&str, &str)] = &[
+            ("overview.en.md", include_str!("knowledge/overview.en.md")),
+            ("features.en.md", include_str!("knowledge/features.en.md")),
+            ("slash-commands.en.md", include_str!("knowledge/slash-commands.en.md")),
+            ("mcp.en.md", include_str!("knowledge/mcp.en.md")),
+            ("skills.en.md", include_str!("knowledge/skills.en.md")),
+            ("config.en.md", include_str!("knowledge/config.en.md")),
+            ("bg.en.md", include_str!("knowledge/bg.en.md")),
+            ("context.en.md", include_str!("knowledge/context.en.md")),
+            ("getting-started.en.md", include_str!("knowledge/getting-started.en.md")),
+            ("memory.en.md", include_str!("knowledge/memory.en.md")),
+            ("modes.en.md", include_str!("knowledge/modes.en.md")),
+            ("sessions.en.md", include_str!("knowledge/sessions.en.md")),
+            ("worktree.en.md", include_str!("knowledge/worktree.en.md")),
+            ("troubleshooting.en.md", include_str!("knowledge/troubleshooting.en.md")),
+            ("keybindings.en.md", include_str!("knowledge/keybindings.en.md")),
+            ("doc-urls.en.md", include_str!("knowledge/doc-urls.en.md")),
+        ];
+
+        // Select files based on locale
+        let files = if is_english {
+            en_files.to_vec()
+        } else {
+            zh_files.to_vec()
+        };
+
         let mut entries = Vec::new();
         let mut keyword_index: HashMap<String, Vec<usize>> = HashMap::new();
 
-        for (name, raw) in files {
+        for (name, raw) in &files {
             match Self::parse_raw(name, raw) {
                 Ok(ke) => {
                     let idx = entries.len();
@@ -238,8 +293,8 @@ impl KnowledgeBase {
             }
         }
 
-        tracing::debug!("KnowledgeBase: loaded {} entries (embedded)", entries.len());
-        KnowledgeInner { entries, keyword_index }
+        tracing::debug!("KnowledgeBase: loaded {} entries (embedded, locale={:?})", entries.len(), locale);
+        KnowledgeInner { entries, keyword_index, locale }
     }
 
     // -----------------------------------------------------------------
@@ -247,18 +302,14 @@ impl KnowledgeBase {
     // -----------------------------------------------------------------
 
     /// Load (or reload) all knowledge entries from disk.
-    ///
-    /// This is called at most once per `KnowledgeBase` instance because
-    /// `get_or_load` uses `OnceLock`. In the common case the data stays
-    /// resident for the lifetime of the agent.
     fn load(&self) -> KnowledgeInner {
+        let locale = crate::i18n::current_locale();
         let mut entries = Vec::new();
         let mut keyword_index: HashMap<String, Vec<usize>> = HashMap::new();
 
         let dir = match std::fs::read_dir(&self.base_dir) {
             Ok(d) => d,
             Err(e) => {
-                // Directory may not exist yet if no knowledge files have been shipped.
                 tracing::warn!(
                     "KnowledgeBase: cannot read directory {}: {}",
                     self.base_dir.display(),
@@ -267,6 +318,7 @@ impl KnowledgeBase {
                 return KnowledgeInner {
                     entries,
                     keyword_index,
+                    locale,
                 };
             }
         };
@@ -301,14 +353,12 @@ impl KnowledgeBase {
         }
 
         tracing::debug!(
-            "KnowledgeBase: loaded {} entries from {}",
+            "KnowledgeBase: loaded {} entries from {} (locale={:?})",
             entries.len(),
-            self.base_dir.display()
+            self.base_dir.display(),
+            locale
         );
-        KnowledgeInner {
-            entries,
-            keyword_index,
-        }
+        KnowledgeInner { entries, keyword_index, locale }
     }
 
     /// Parse a single Markdown file from disk (used in tests).
@@ -388,9 +438,53 @@ impl KnowledgeBase {
     // Retrieval
     // -----------------------------------------------------------------
 
-    /// Get-or-load the inner data structure.
-    fn get_or_load(&self) -> &KnowledgeInner {
-        self.inner.get_or_init(|| self.load())
+    /// Get-or-load the inner data structure, reloading if locale changed.
+    ///
+    /// If `target_locale` is set, this KB is pinned to that locale and
+    /// will never reload due to global locale changes.
+    fn get_or_load(&self) -> KnowledgeInner {
+        // If pinned to a specific locale, never reload
+        if let Some(pinned) = self.target_locale {
+            let guard = self.inner.read().unwrap();
+            if let Some(ref inner) = *guard {
+                if inner.locale == pinned {
+                    return inner.clone();
+                }
+            }
+            // Pinned but not loaded yet — load with pinned locale (shouldn't
+            // happen for embedded KBs, but handle it gracefully)
+            drop(guard);
+            let new_inner = Self::load_embedded_for_locale(pinned);
+            let mut guard = self.inner.write().unwrap();
+            *guard = Some(new_inner.clone());
+            return new_inner;
+        }
+
+        let current_locale = crate::i18n::current_locale();
+
+        // Check if we need to reload due to locale change
+        let needs_reload = {
+            match self.inner.read() {
+                Ok(guard) => match &*guard {
+                    Some(inner) => inner.locale != current_locale,
+                    None => true,
+                },
+                Err(_) => true,
+            }
+        };
+
+        if needs_reload {
+            let new_inner = if self.base_dir.as_os_str().is_empty() {
+                Self::load_embedded()
+            } else {
+                self.load()
+            };
+            let mut guard = self.inner.write().unwrap();
+            *guard = Some(new_inner.clone());
+            new_inner
+        } else {
+            self.inner.read().unwrap().clone().unwrap()
+        }
     }
 
     /// Perform a keyword-based search against the loaded knowledge entries.
@@ -485,35 +579,55 @@ impl KnowledgeBase {
     }
 
     pub fn render_for_query(&self, query: &str, max_tokens: usize) -> String {
-        let inner = self.get_or_load();
-        let hits = self.search(query);
-        // AND may be too strict for CJK queries — fall back to OR.
-        let hits = if hits.is_empty() { self.search_or(query) } else { hits };
+        // Priority: detect query language first, fall back to current locale
+        let query_is_ascii = !query.is_empty()
+            && query.chars().all(|c| c.is_ascii() || c.is_whitespace());
+        let query_has_cjk = contains_cjk(query);
+
+        // For embedded KBs: select by query language directly
+        // For disk-based KBs: always use self (custom content)
+        let use_embedded = self.base_dir.as_os_str().is_empty();
+
+        let (hits, entries) = if use_embedded && query_is_ascii {
+            // ASCII query → English KB
+            let kb = Self::embedded_en();
+            let inner = kb.get_or_load();
+            let hits = kb.search(query);
+            let hits = if hits.is_empty() { kb.search_or(query) } else { hits };
+            tracing::debug!(query, hits = hits.len(), "ASCII query → English KB");
+            (hits, inner.entries)
+        } else if use_embedded && query_has_cjk {
+            // CJK query → Chinese KB
+            let kb = Self::embedded_zh();
+            let inner = kb.get_or_load();
+            let hits = kb.search(query);
+            let hits = if hits.is_empty() { kb.search_or(query) } else { hits };
+            tracing::debug!(query, hits = hits.len(), "CJK query → Chinese KB");
+            (hits, inner.entries)
+        } else {
+            // Undetectable language or disk-based KB → use self (current locale)
+            let inner = self.get_or_load();
+            let hits = self.search(query);
+            let hits = if hits.is_empty() { self.search_or(query) } else { hits };
+            (hits, inner.entries)
+        };
+
+        Self::render_hits(query, &hits, &entries, max_tokens)
+    }
+
+    fn render_hits(query: &str, hits: &[usize], entries: &[KnowledgeEntry], max_tokens: usize) -> String {
         tracing::debug!(query, hits = hits.len(), "knowledge search");
-        if hits.is_empty() && !query.is_empty() {
-            tracing::debug!(query, "AND search empty, falling back to OR");
-        }
 
         if hits.is_empty() {
-            return format!(
-                "本地知识库中未找到与「{}」直接相关的条目。\n\n\
-                 你可以试试这些常见问题：\n\
-                 - /guide 怎么切换模型\n\
-                 - /guide MCP 怎么配置\n\
-                 - /guide 怎么用记忆功能\n\
-                 - /guide 快捷键有哪些\n\
-                 - /guide 怎么用后台任务\n\n\
-                 也可以访问文档站：https://atomcode.atomgit.com/docs/zh/",
-                query,
-            );
+            return t(Msg::GuideKbNoResults { query }).into_owned();
         }
 
-        let mut out = String::from("## 相关知识\n\n");
-        for idx in &hits {
-            if *idx >= inner.entries.len() {
+        let mut out = t(Msg::GuideKbRelatedHeader).into_owned();
+        for idx in hits {
+            if *idx >= entries.len() {
                 continue;
             }
-            let entry = &inner.entries[*idx];
+            let entry = &entries[*idx];
             let chunk = format!(
                 "### {} ({})\n\n{}\n\n",
                 entry.title, entry.category, entry.content
@@ -526,10 +640,10 @@ impl KnowledgeBase {
                     let partial = truncate_at_boundary(&chunk, remaining);
                     if !partial.is_empty() {
                         out.push_str(&partial);
-                        out.push_str("\n... (知识库内容已截断)\n");
+                        out.push_str(&t(Msg::GuideKbTruncated));
                     }
                 } else {
-                    out.push_str("... (知识库内容已截断)\n");
+                    out.push_str(&t(Msg::GuideKbTruncated));
                 }
                 break;
             }
@@ -573,9 +687,10 @@ mod tests {
         assert!(hits.is_empty(), "no hits from empty directory");
 
         let rendered = kb.render_for_query("anything", 100);
+        // Should contain documentation URL (language-independent)
         assert!(
-            rendered.contains("本地知识库中未找到"),
-            "should render entry overview on miss"
+            rendered.contains("atomcode.atomgit.com/docs/"),
+            "should render entry overview on miss with doc URL"
         );
     }
 
@@ -693,8 +808,8 @@ Full content.
         let _tmp = tmp;
 
         let rendered = kb.render_for_query("nonexistent", 100);
-        assert!(rendered.contains("本地知识库中未找到"));
-        assert!(rendered.contains("atomcode.atomgit.com"));
+        // Should contain documentation URL (language-independent)
+        assert!(rendered.contains("atomcode.atomgit.com/docs/"));
     }
 
     #[test]
@@ -730,8 +845,9 @@ B content.
         // At least one entry should be shown
         assert!(has_a || has_b, "at least one entry should render");
         // Truncation marker should appear if only one entry fits
+        // Use language-independent check: truncation marker contains "..." in both locales
         assert!(
-            !(has_a && has_b) || rendered.contains("截断"),
+            !(has_a && has_b) || rendered.contains("..."),
             "with tight budget both entries should not fit without truncation"
         );
     }
@@ -883,6 +999,213 @@ Content.
         // Should be between pure-Chinese and pure-English estimates
         assert!(est > 5, "Mixed estimation should be > 5, got {}", est);
         assert!(est < 50, "Mixed estimation should be < 50, got {}", est);
+    }
+
+    #[test]
+    fn test_embedded_ascii_query_selects_english_kb() {
+        // ASCII query "Getting started" should select English KB,
+        // returning English content regardless of global locale.
+        let kb = KnowledgeBase::embedded();
+        let rendered = kb.render_for_query("Getting started", 2000);
+
+        // Should contain English knowledge content
+        assert!(
+            rendered.contains("Getting Started") || rendered.contains("Installation"),
+            "ASCII query should return English KB content, got: {}",
+            &rendered[..rendered.len().min(200)]
+        );
+        // Should NOT contain Chinese-only knowledge content
+        assert!(
+            !rendered.contains("安装完成后"),
+            "ASCII query should NOT return Chinese KB content"
+        );
+    }
+
+    #[test]
+    fn test_embedded_ascii_query_with_zh_locale_still_returns_english() {
+        // Simulate --lang en scenario: even if locale is ZhCn,
+        // ASCII query should still select English KB.
+        let _guard = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::locale::Locale::ZhCn);
+        assert_eq!(crate::i18n::current_locale(), crate::locale::Locale::ZhCn);
+
+        let kb = KnowledgeBase::embedded();
+        let rendered = kb.render_for_query("Getting started", 2000);
+
+        println!("=== With ZhCn locale, ASCII query (len={}) ===", rendered.len());
+        println!("{}", rendered);
+        println!("=== END ===");
+
+        // Knowledge content should still be English (from English KB)
+        assert!(
+            rendered.contains("Getting Started") || rendered.contains("Installation"),
+            "ASCII query should return English KB even with ZhCn locale, got: {}",
+            &rendered[..rendered.len().min(300)]
+        );
+        // Should NOT contain Chinese knowledge body
+        assert!(
+            !rendered.contains("安装完成后"),
+            "ASCII query should NOT return Chinese KB content even with ZhCn locale"
+        );
+    }
+
+    #[test]
+    fn test_embedded_cjk_query_selects_chinese_kb() {
+        // CJK query should select Chinese KB
+        let kb = KnowledgeBase::embedded();
+        let rendered = kb.render_for_query("入门指南", 2000);
+
+        // Should contain Chinese knowledge content
+        assert!(
+            rendered.contains("安装") || rendered.contains("启动") || rendered.contains("配置"),
+            "CJK query should return Chinese KB content, got: {}",
+            &rendered[..rendered.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn test_embedded_en_direct() {
+        // Directly test embedded_en returns English content
+        let kb = KnowledgeBase::embedded_en();
+        let inner = kb.get_or_load();
+
+        // Should have English entries
+        let titles: Vec<&str> = inner.entries.iter().map(|e| e.title.as_str()).collect();
+        assert!(
+            titles.iter().any(|t| t.contains("Getting Started")),
+            "embedded_en should contain 'Getting Started' entry, got: {:?}",
+            titles
+        );
+
+        // English content should NOT have Chinese body text
+        for entry in &inner.entries {
+            assert!(
+                !entry.content.contains("安装完成后"),
+                "English KB entry '{}' should not contain Chinese body",
+                entry.title
+            );
+        }
+    }
+
+    #[test]
+    fn test_embedded_zh_direct() {
+        // Directly test embedded_zh returns Chinese content
+        let kb = KnowledgeBase::embedded_zh();
+        let inner = kb.get_or_load();
+
+        // Should have Chinese entries
+        let titles: Vec<&str> = inner.entries.iter().map(|e| e.title.as_str()).collect();
+        assert!(
+            titles.iter().any(|t| t.contains("入门")),
+            "embedded_zh should contain Chinese '入门' entry, got: {:?}",
+            titles
+        );
+    }
+
+    /// End-to-end test: simulate the full /guide Getting started flow
+    /// with locale=En. Verifies that:
+    /// 1. System prompt is the English version
+    /// 2. Knowledge content is English (not Chinese)
+    /// 3. The i18n header matches the locale
+    #[test]
+    fn test_e2e_guide_getting_started_with_en_locale() {
+        use crate::agent::sub_agent::registry::SubAgentRegistry;
+
+        let _guard = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::locale::Locale::En);
+        assert_eq!(crate::i18n::current_locale(), crate::locale::Locale::En);
+
+        // Step 1: Register the guide subagent (same as mod.rs::register)
+        let registry = SubAgentRegistry::new();
+        crate::agent::guide::register(&registry).unwrap();
+
+        // Step 2: Find the guide definition (same as mod.rs:1558-1573)
+        let def = registry.find("atomcode-guide").expect("guide should be registered");
+
+        // Step 3: Update system prompt based on current locale (same as mod.rs:1589-1592)
+        let mut def = def;
+        def.system_prompt = crate::agent::guide::get_guide_system_prompt();
+
+        // Verify system prompt is English
+        assert!(
+            def.system_prompt.contains("Answer in the same language as the user's question"),
+            "System prompt should be English with 'Answer in the same language', got: {}",
+            &def.system_prompt[..def.system_prompt.len().min(200)]
+        );
+        assert!(
+            !def.system_prompt.contains("使用中文回答"),
+            "System prompt should NOT contain old '使用中文回答'"
+        );
+
+        // Step 4: Render knowledge for ASCII query (same as runner.rs:126-128)
+        let kb = def.knowledge.as_ref().expect("guide should have knowledge");
+        let kb_text = kb.render_for_query("Getting started", def.max_knowledge_tokens);
+
+        // Verify knowledge content is English
+        assert!(
+            kb_text.contains("Getting Started") || kb_text.contains("Installation"),
+            "Knowledge should contain English content for ASCII query, got: {}",
+            &kb_text[..kb_text.len().min(300)]
+        );
+        assert!(
+            !kb_text.contains("安装完成后"),
+            "Knowledge should NOT contain Chinese body for ASCII query"
+        );
+
+        // Verify i18n header is English (locale=En)
+        assert!(
+            kb_text.starts_with("## Related Knowledge"),
+            "KB header should be English '## Related Knowledge' with En locale, got: {}",
+            &kb_text[..kb_text.len().min(50)]
+        );
+    }
+
+    /// Same end-to-end test but with locale=ZhCn.
+    /// Verifies that even with Chinese locale, ASCII query still returns English knowledge.
+    #[test]
+    fn test_e2e_guide_getting_started_with_zh_locale() {
+        use crate::agent::sub_agent::registry::SubAgentRegistry;
+
+        let _guard = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::locale::Locale::ZhCn);
+        assert_eq!(crate::i18n::current_locale(), crate::locale::Locale::ZhCn);
+
+        // Register and find guide
+        let registry = SubAgentRegistry::new();
+        crate::agent::guide::register(&registry).unwrap();
+        let mut def = registry.find("atomcode-guide").expect("guide should be registered");
+
+        // Update system prompt (simulates mod.rs:1589-1592)
+        def.system_prompt = crate::agent::guide::get_guide_system_prompt();
+
+        // System prompt should be Chinese version with "same language" instruction
+        assert!(
+            def.system_prompt.contains("使用与用户提问相同的语言回答"),
+            "ZhCn system prompt should say '使用与用户提问相同的语言回答', got: {}",
+            &def.system_prompt[..def.system_prompt.len().min(200)]
+        );
+
+        // Render knowledge for ASCII query
+        let kb = def.knowledge.as_ref().expect("guide should have knowledge");
+        let kb_text = kb.render_for_query("Getting started", def.max_knowledge_tokens);
+
+        // Knowledge content should still be English (ASCII query → English KB)
+        assert!(
+            kb_text.contains("Getting Started") || kb_text.contains("Installation"),
+            "ASCII query should return English KB even with ZhCn locale, got: {}",
+            &kb_text[..kb_text.len().min(300)]
+        );
+        assert!(
+            !kb_text.contains("安装完成后"),
+            "ASCII query should NOT return Chinese KB content with ZhCn locale"
+        );
+
+        // i18n header follows global locale → Chinese
+        assert!(
+            kb_text.starts_with("## 相关知识"),
+            "KB header should be Chinese '## 相关知识' with ZhCn locale, got: {}",
+            &kb_text[..kb_text.len().min(50)]
+        );
     }
 
     #[test]

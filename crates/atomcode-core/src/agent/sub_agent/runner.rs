@@ -123,6 +123,7 @@ impl SubAgentRunner {
         // ── 4. Inject knowledge as first user message ──────────────────
         // Placed BEFORE the user task so the model reads the reference
         // material first, then answers the question.
+        tracing::debug!(subagent = %def.name, system_prompt_len = def.system_prompt.len(), "sub-agent system prompt");
         if let Some(ref kb) = def.knowledge {
             let kb_text = kb.render_for_query(&user_task, def.max_knowledge_tokens);
             tracing::debug!(subagent = %def.name, kb_text_len = kb_text.len(), "knowledge injected");
@@ -132,7 +133,28 @@ impl SubAgentRunner {
         }
 
         // ── 5. Inject user task as a User message ──────────────────────
-        conversation.add_user_message(&user_task);
+        // Prepend a language hint based on query character analysis so the
+        // model has an explicit, hard-to-ignore signal about response language.
+        // This supplements the system prompt instruction, which weaker models
+        // (e.g. DeepSeek) may not follow reliably.
+        let query_has_cjk = user_task.chars().any(|c| {
+            matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
+        });
+        let query_is_ascii = !user_task.is_empty()
+            && user_task.chars().all(|c| c.is_ascii() || c.is_whitespace());
+        let lang_hint = if query_is_ascii {
+            "Please respond in English. "
+        } else if query_has_cjk {
+            "请用中文回答。"
+        } else {
+            ""
+        };
+        let task_with_hint = if lang_hint.is_empty() {
+            user_task
+        } else {
+            format!("{}{}", lang_hint, user_task)
+        };
+        conversation.add_user_message(&task_with_hint);
 
         // ── 6. Build permission decider ────────────────────────────────
         // Sub-agent tools are read-only (per SubAgentToolPolicy), so
@@ -173,7 +195,7 @@ impl SubAgentRunner {
 
         let _ = self.event_tx.send(AgentEvent::GuideTurnActivity {
             subagent: def.name.clone(),
-            message: "指南查询中...".to_string(),
+            message: crate::i18n::t(crate::i18n::Msg::GuideQuerying).into_owned(),
         });
 
         // Wall-clock timeout (default 120s). The per-turn LLM calls are
@@ -268,18 +290,7 @@ impl SubAgentRunner {
         let truncated = last_text.chars().count() > max_chars;
         tracing::debug!(chars = last_text.chars().count(), truncated, "sub-agent answer ready");
         let text = if last_text.is_empty() {
-            "\
-抱歉，暂时无法回答此问题。
-
-你可以试试：
-  /guide 怎么切换模型
-  /guide MCP 怎么配置
-  /guide 怎么用记忆功能
-  /guide 快捷键有哪些
-  /guide 怎么用后台任务
-
-也可以访问文档站：https://atomcode.atomgit.com/docs/zh/"
-                .to_string()
+            crate::i18n::t(crate::i18n::Msg::GuideEmptyFallback).into_owned()
         } else if truncated {
             // Find nearest sentence/paragraph boundary before max_chars
             // so we don't cut mid-sentence.
@@ -304,15 +315,16 @@ impl SubAgentRunner {
     }
 }
 
-/// Map tool names to human-readable Chinese labels for progress display.
-fn tool_label(name: &str) -> &str {
+/// Map tool names to human-readable labels for progress display.
+fn tool_label(name: &str) -> std::borrow::Cow<'static, str> {
+    use crate::i18n::{t, Msg};
     match name {
-        "read_file" => "读取文件中...",
-        "grep" => "搜索代码中...",
-        "glob" => "搜索文件中...",
-        "list_dir" => "浏览目录中...",
-        "web_search" => "搜索网页中...",
-        "web_fetch" => "获取网页中...",
-        _ => "处理中...",
+        "read_file" => t(Msg::ToolLabelReadFile),
+        "grep" => t(Msg::ToolLabelGrep),
+        "glob" => t(Msg::ToolLabelGlob),
+        "list_dir" => t(Msg::ToolLabelListDir),
+        "web_search" => t(Msg::ToolLabelWebSearch),
+        "web_fetch" => t(Msg::ToolLabelWebFetch),
+        _ => t(Msg::ToolLabelProcessing),
     }
 }
