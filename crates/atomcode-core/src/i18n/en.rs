@@ -81,8 +81,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::CpUsageLine { usage, reset_at, duration } =>
             format!("      Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
-        Msg::CpMonthlyQuotaExhausted { reset_at, duration } =>
-            format!("      ⚠ Monthly quota exhausted  ·  resets at {} (in {})\n", reset_at, duration).into(),
+        Msg::CpMonthlyQuotaExhausted { duration } =>
+            format!("      Usage: monthly quota exhausted, available again in {}\n", duration).into(),
         Msg::CpWindowQuotaExhausted =>
             "      ⚠ Current window quota exhausted\n".into(),
         Msg::CpWindowQuotaHint { hint } =>

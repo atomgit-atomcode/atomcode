@@ -76,7 +76,7 @@ pub enum Msg<'a> {
         total_days: i32,
     },
     CpUsageLine { usage: &'a str, reset_at: &'a str, duration: &'a str },
-    CpMonthlyQuotaExhausted { reset_at: &'a str, duration: &'a str },
+    CpMonthlyQuotaExhausted { duration: &'a str },
     CpWindowQuotaExhausted,
     CpWindowQuotaHint { hint: &'a str },
     CpStatusFetchSkipped { reason: &'a str },
