@@ -5102,7 +5102,13 @@ fn handle_streaming_key(
     // the type-ahead queue: a user yanking the escape cord doesn't
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        crate::tuix_trace!(
+            "KEY",
+            "streaming Ctrl+C -> Cancel send_ok={} spinner={:?}",
+            send_res.is_ok(),
+            app.state.spinner_label
+        );
         restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }
@@ -5112,7 +5118,13 @@ fn handle_streaming_key(
     // stream — mid-stream the higher-value action is "stop the agent",
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
-        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        crate::tuix_trace!(
+            "KEY",
+            "streaming Esc -> Cancel send_ok={} spinner={:?}",
+            send_res.is_ok(),
+            app.state.spinner_label
+        );
         restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }

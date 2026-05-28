@@ -1046,11 +1046,13 @@ impl AgentLoop {
         }
 
         while let Some(cmd) = self.cmd_rx.recv().await {
+            crate::ctrace!("AGT", "outer cmd_rx pop: {:?}", std::mem::discriminant(&cmd));
             match cmd {
                 AgentCommand::SendMessage { text, images, image_markers } => {
                     self.handle_send_message(text, images, image_markers).await;
                 }
                 AgentCommand::Cancel => {
+                    crate::ctrace!("AGT", "outer Cancel -> cancel_token.cancel() (was_cancelled={})", self.cancel_token.is_cancelled());
                     self.cancel_token.cancel();
                     self.cancel_token = CancellationToken::new();
                     self.phase = AgentPhase::Idle;
@@ -2145,8 +2147,10 @@ impl AgentLoop {
                         }
 
                         Some(cmd) = cmd_rx.recv() => {
+                            crate::ctrace!("AGT", "inner cmd_rx pop: {:?}", std::mem::discriminant(&cmd));
                             match cmd {
                                 AgentCommand::Cancel => {
+                                    crate::ctrace!("AGT", "inner Cancel -> cancel_token.cancel() (was_cancelled={})", cancel_token.is_cancelled());
                                     cancel_token.cancel();
                                     *cancel_token = CancellationToken::new();
                                 }
