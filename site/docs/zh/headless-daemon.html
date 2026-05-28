@@ -230,7 +230,7 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><td><code>POST /auth/login/:login_id/poll</code></td><td>轮询登录结果</td></tr>
           <tr><td><code>DELETE /auth/login/:login_id</code></td><td>取消正在进行的登录</td></tr>
           <tr><td><code>POST /auth/logout</code></td><td>登出</td></tr>
-          <tr><td><code>POST /codingplan/setup</code></td><td>领取 CodingPlan 并写入 provider 配置(等同 CLI <code>atomcode codingplan</code>)</td></tr>
+          <tr><td><code>POST /codingplan/setup</code></td><td>领取 CodingPlan 并写入 provider 配置(等同 CLI <code>atomcode login</code>;<code>atomcode codingplan</code> 仍作为隐藏别名保留)</td></tr>
         </tbody>
       </table>
 
