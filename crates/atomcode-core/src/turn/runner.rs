@@ -1199,10 +1199,11 @@ impl TurnRunner {
         // payloads recover first) but BEFORE approval — the unrecoverable
         // remainder is what gets bounced.
         if let Err(reason) = tool.validate_args(&call.arguments) {
-            let msg = format!(
-                "Error: {}. Re-issue {} with a complete JSON object containing all required fields.",
-                reason, call.name
-            );
+            // `reason` already comes from `diagnose_args` (or a sibling
+            // helper) carrying a "Re-issue: <example>" tail. Appending
+            // another "Re-issue {tool} with..." here produced the
+            // double-Re-issue the user saw on the failed WriteFile call.
+            let msg = format!("Error: {}", reason);
             let _ = event_tx.send(TurnEvent::ToolCallResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
