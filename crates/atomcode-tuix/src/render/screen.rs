@@ -223,8 +223,11 @@ impl Screen {
         // terminals ignore unknown DEC private modes per spec.
         let has_visible_work = cold_start || !patch_bytes.is_empty();
         let mut out = Vec::with_capacity(body.len() + 32);
+        // DIAG 2026-05-28: BSU/ESU envelope temporarily disabled to verify
+        // whether Windows pwsh7 char-doubling-before-space bug is caused by
+        // host's synchronized-output implementation. hide-cursor wrap kept.
         if has_visible_work {
-            out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+            out.extend_from_slice(b"\x1b[?25l");
         }
         out.extend_from_slice(&body);
         if let Some((r, c)) = self.cursor {
@@ -234,9 +237,6 @@ impl Screen {
             out.extend_from_slice(b"\x1b[?25h");
         } else {
             out.extend_from_slice(b"\x1b[?25l");
-        }
-        if has_visible_work {
-            out.extend_from_slice(b"\x1b[?2026l");
         }
         std::mem::swap(&mut self.prev_cells, &mut self.cells);
         // Clear the new scratch. Without this, stale cells from
