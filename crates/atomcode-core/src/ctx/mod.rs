@@ -76,8 +76,14 @@ pub trait CtxBuilder: Send + Sync {
     }
 
     /// Produce a compression plan `(content_to_summarize,
-    /// messages_to_remove)`. Default: `None` (no compression).
-    fn compression_plan(&self, _conv: &Conversation) -> Option<(String, usize)> {
+    /// messages_to_remove)`. `keep_ceiling` is the max tokens the kept tail
+    /// may occupy (window minus system/tools/cold-zone/output reserve), so
+    /// reasoning-heavy tails get drained to fit. Default: `None`.
+    fn compression_plan(
+        &self,
+        _conv: &Conversation,
+        _keep_ceiling: usize,
+    ) -> Option<(String, usize)> {
         None
     }
 

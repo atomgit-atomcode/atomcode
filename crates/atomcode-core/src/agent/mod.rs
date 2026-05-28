@@ -1561,8 +1561,11 @@ impl AgentLoop {
             // No LLM call — the compressed content is already
             // one-line-per-round summaries (DefaultCtx) compact enough
             // for cold zone.
-            if let Some((content, n_msgs)) = self.ctx.compression_plan(&self.conversation) {
-                let system_prompt = self.build_system_prompt();
+            let system_prompt = self.build_system_prompt();
+            let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
+            if let Some((content, n_msgs)) =
+                self.ctx.compression_plan(&self.conversation, keep_ceiling)
+            {
                 let _ = self.try_apply_compression(&system_prompt, n_msgs, content, false);
             }
         }
@@ -2543,6 +2546,42 @@ impl AgentLoop {
     /// catastrophically. With proactive Tier 1 firing 5K below the
     /// wall, expected pattern is 3-4 mild Tier 1 events dropping
     /// 5-10K each, model retains skeleton + recent turns.
+    /// Max tokens the kept conversation tail may occupy after compaction:
+    /// the window minus the per-request overhead that shares it (system
+    /// prompt, tool definitions, cold-zone summaries, output reservation).
+    /// This overhead is roughly CONSTANT w.r.t. window size, so subtracting
+    /// it scales correctly from 128K to 1M — a fixed fraction would not
+    /// (it would waste ~460K on a 1M model, the same class of bug as the
+    /// old 60K drop cap).
+    async fn compaction_keep_ceiling(&self, system_prompt: &str) -> usize {
+        let window = self.ctx.ctx_window();
+        let system_tokens = system_prompt.len() / 4 + 4;
+        let tool_def_tokens: usize = self
+            .turn_runner
+            .tools
+            .get_definitions()
+            .await
+            .iter()
+            .map(|d| {
+                let params = serde_json::to_string(&d.parameters).unwrap_or_default();
+                (d.name.len() + d.description.len() + params.len()) / 4 + 4
+            })
+            .sum();
+        let cold_zone_tokens: usize = self
+            .conversation
+            .cold_summaries
+            .iter()
+            .map(|s| s.len() / 4 + 4)
+            .sum();
+        let output_reserve = (window / 4).clamp(8_000, 16_384);
+        window
+            .saturating_sub(system_tokens)
+            .saturating_sub(tool_def_tokens)
+            .saturating_sub(cold_zone_tokens)
+            .saturating_sub(output_reserve)
+            .max(window / 4) // defensive floor: tail never below 25% of window
+    }
+
     async fn maybe_compress_history(&mut self, system_prompt: &str) {
         let sys_tokens = system_prompt.len() / 4 + 4;
         if !self.ctx.needs_compression(&self.conversation, sys_tokens) {
@@ -2568,7 +2607,8 @@ impl AgentLoop {
         }
 
         // ── Tier 2: LLM-summarize oldest turns into cold zone ──
-        let (content, n_turns) = match self.ctx.compression_plan(&self.conversation) {
+        let keep_ceiling = self.compaction_keep_ceiling(system_prompt).await;
+        let (content, n_turns) = match self.ctx.compression_plan(&self.conversation, keep_ceiling) {
             Some(plan) => plan,
             None => return,
         };
@@ -2775,7 +2815,9 @@ impl AgentLoop {
     /// made it unreliable.
     async fn run_compact(&mut self, prompt: Option<String>) {
         let system_prompt = self.build_system_prompt();
-        let Some((mechanical_content, n_msgs)) = self.ctx.compression_plan(&self.conversation)
+        let keep_ceiling = self.compaction_keep_ceiling(&system_prompt).await;
+        let Some((mechanical_content, n_msgs)) =
+            self.ctx.compression_plan(&self.conversation, keep_ceiling)
         else {
             let _ = self.event_tx.send(AgentEvent::TextDelta(
                 crate::i18n::t(crate::i18n::Msg::CompactNothingShort).into_owned(),
