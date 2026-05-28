@@ -36,6 +36,12 @@ pub enum Msg<'a> {
     CpClaimSuccessFallback,
     CpAlreadyClaimed { reason: &'a str },
     CpClaimFailed { error: &'a str },
+    /// Same as `CpClaimFailed` but with no trailing detail body.
+    /// Used in the rare edge case where every tier returned success=
+    /// false with an empty server message AND no transport error
+    /// text — there's nothing to put after `— `, so the line stops
+    /// at the prefix.
+    CpClaimFailedBare,
     /// Per-tier cascade row — winning tier, fresh claim.
     /// Example (zh-CN): `  ✓ CodingPlan Lite 领取成功`
     CpClaimTierSucceeded { tier: &'a str },

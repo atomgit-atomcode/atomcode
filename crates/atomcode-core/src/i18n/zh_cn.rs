@@ -35,13 +35,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan 已领取 — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  × CodingPlan 领取失败 — {}\n", error).into(),
+            format!("  × CodingPlan 套餐配置失败 — {}\n", error).into(),
+        Msg::CpClaimFailedBare =>
+            "  × CodingPlan 套餐配置失败\n".into(),
         Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} 领取成功\n", tier).into(),
+            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} 已领取\n", tier).into(),
+            format!("  ✓ CodingPlan {} 生效\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  × CodingPlan {} 领取失败 — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} 套餐配置失败 — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s: _ } =>
             format!("  ✓ 已添加 {} 个 Provider：\n", count).into(),
         Msg::CpLocked { name } =>

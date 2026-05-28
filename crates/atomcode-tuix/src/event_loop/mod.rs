@@ -2905,7 +2905,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // already mutable.
                         if let Err(e) = crate::event_loop::commands::run_login_flow(renderer, &mut ctx) {
                             renderer.render(crate::render::UiLine::Error(
-                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /login 手动重试。"),
+                                format!("CodingPlan 自动配置失败: {e:#}。可运行 /login 手动重试。"),
                             ));
                             renderer.flush();
                         }
@@ -3274,7 +3274,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // already mutable.
                         if let Err(e) = crate::event_loop::commands::run_login_flow(renderer, &mut ctx) {
                             renderer.render(crate::render::UiLine::Error(
-                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /login 手动重试。"),
+                                format!("CodingPlan 自动配置失败: {e:#}。可运行 /login 手动重试。"),
                             ));
                             renderer.flush();
                         }

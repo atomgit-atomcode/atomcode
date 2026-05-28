@@ -35,13 +35,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan already claimed — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  × CodingPlan claim failed — {}\n", error).into(),
+            format!("  × CodingPlan tier setup failed — {}\n", error).into(),
+        Msg::CpClaimFailedBare =>
+            "  × CodingPlan tier setup failed\n".into(),
         Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} claimed\n", tier).into(),
+            format!("  ✓ CodingPlan {} active\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} already claimed\n", tier).into(),
+            format!("  ✓ CodingPlan {} active\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  × CodingPlan {} claim failed — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} tier setup failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>
             format!("  ✓ Added {} provider{}:\n", count, plural_s).into(),
         Msg::CpLocked { name } =>
