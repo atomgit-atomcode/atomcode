@@ -25,6 +25,14 @@ pub struct OpenFileTool;
 
 #[derive(Deserialize)]
 struct OpenFileArgs {
+    // `alias = "path"`: ce1c344f renamed the parameter from `path` to
+    // `file_path` to align with read/write/edit. Without an alias,
+    // serde rejects calls that still use `path` — which breaks
+    // resumed sessions that snapshotted the old tool schema and
+    // models whose cached schema isn't refreshed yet. Keep both
+    // accepted for one release cycle; remove the alias once the
+    // upgrade has settled.
+    #[serde(alias = "path")]
     file_path: String,
 }
 
@@ -354,6 +362,20 @@ mod tests {
             return;
         }
         assert!(ssh_signal().is_none());
+    }
+
+    /// Both `path` (legacy) and `file_path` (canonical) must deserialize.
+    /// ce1c344f renamed without an alias — that left resumed sessions
+    /// snapshotting the old schema getting "missing field `file_path`"
+    /// errors. The alias keeps the old name working for one release.
+    #[test]
+    fn open_file_args_accepts_legacy_path_alias() {
+        let legacy: OpenFileArgs =
+            serde_json::from_str(r#"{"path":"/tmp/x.html"}"#).expect("legacy `path` must parse");
+        assert_eq!(legacy.file_path, "/tmp/x.html");
+        let canonical: OpenFileArgs =
+            serde_json::from_str(r#"{"file_path":"/tmp/x.html"}"#).expect("canonical must parse");
+        assert_eq!(canonical.file_path, "/tmp/x.html");
     }
 
     #[test]

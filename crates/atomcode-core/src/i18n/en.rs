@@ -28,20 +28,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpStepSkipped { reason } =>
             format!("  ✓ {}\n", reason).into(),
         Msg::CpLoginFailed { error } =>
-            format!("  ✗ Login failed — {}\n", error).into(),
+            format!("  × Login failed — {}\n", error).into(),
         Msg::CpClaimed { message, plan_type } =>
             format!("  ✓ CodingPlan claimed — {} (CodingPlan {})\n", message, plan_type).into(),
         Msg::CpClaimSuccessFallback => "success".into(),
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan already claimed — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  ✗ CodingPlan claim failed — {}\n", error).into(),
+            format!("  × CodingPlan claim failed — {}\n", error).into(),
         Msg::CpClaimTierSucceeded { tier } =>
             format!("  ✓ CodingPlan {} claimed\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
             format!("  ✓ CodingPlan {} already claimed\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  ✗ CodingPlan {} claim failed — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} claim failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>
             format!("  ✓ Added {} provider{}:\n", count, plural_s).into(),
         Msg::CpLocked { name } =>
@@ -50,11 +50,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             // theme palette decides the exact shade — Solarized,
             // Dracula, light-mode, etc. all map this onto their
             // own "red" rather than a hard-coded RGB the user can't
-            // tune. The `✗ … (requires Pro plan or higher)` text inside is
+            // tune. The `× … (requires Pro plan or higher)` text inside is
             // a redundant signal so retained-mode terminals (which
             // strip SGR via the strict sanitizer path) still get
             // the meaning, just without the colour.
-            format!("      \x1b[31m✗ {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
+            format!("      \x1b[31m× {}  (requires Pro plan or higher)\x1b[39m\n", name).into(),
         Msg::CpProviderRow { provider, model, default_suffix } =>
             format!("      • {}  →  {}{}\n", provider, model, default_suffix).into(),
         Msg::CpDefaultSuffix => "  (default)".into(),
@@ -67,7 +67,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpModelsSkipped { reason } =>
             format!("  ✓ Models step skipped — {}\n", reason).into(),
         Msg::CpModelsFailed { error } =>
-            format!("  ✗ Models step failed — {}\n", error).into(),
+            format!("  × Models step failed — {}\n", error).into(),
         Msg::CpStatusHeader =>
             "  ✓ CodingPlan status:\n".into(),
         Msg::CpPlanPending { plan } =>
@@ -79,6 +79,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             ).into(),
         Msg::CpUsageLine { usage, reset_at, duration } =>
             format!("      Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
+        Msg::CpMonthlyQuotaExhausted { reset_at, duration } =>
+            format!("      ⚠ Monthly quota exhausted  ·  resets at {} (in {})\n", reset_at, duration).into(),
         Msg::CpWindowQuotaExhausted =>
             "      ⚠ Current window quota exhausted\n".into(),
         Msg::CpWindowQuotaHint { hint } =>
@@ -117,6 +119,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── Status bar ──
         Msg::StatusNoProvider =>
             "no provider · /provider to configure".into(),
+        Msg::StatusOfficialBuildRequired =>
+            "CodingPlan needs the official build".into(),
         Msg::StatusUpgradeHint { version } =>
             format!("↑ {version} available · /upgrade").into(),
         Msg::StatusModelNotConfigured =>
@@ -154,7 +158,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusInstructionPresent { path, label } =>
             format!("    ✓ {} ({})\n", path, label).into(),
         Msg::StatusInstructionMissing { label } =>
-            format!("    ✗ {} — not found\n", label).into(),
+            format!("    × {} — not found\n", label).into(),
 
         // ── /login completion ──
         Msg::LoginSignedInWithCpHint { name, username } =>
@@ -188,6 +192,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
   ── History ──
     Up                               Previous input
     Down                             Next input
+
+  ── Scrollback ──
+    Use the host terminal's native scrollback (cmd+↑/↓, mouse wheel,
+    tmux copy-mode — whatever your terminal already provides).
+    Drag + Ctrl+C                    Copy text (atomcode does not capture the mouse)
 
   ── Session ──
     Ctrl+C                           Cancel current turn / dismiss modal
@@ -321,7 +330,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::IssueCreated { number, title, url } =>
             format!("  [issue] ✓ created #{number}: {title}\n  {url}\n").into(),
         Msg::IssueCreateFailed { error } =>
-            format!("  [issue] ✗ create failed: {error}\n").into(),
+            format!("  [issue] × create failed: {error}\n").into(),
         Msg::IssueRequiredField { field } =>
             format!("(required — type a {field} or Esc to cancel)").into(),
 
@@ -424,23 +433,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
         Msg::KbdHintOther =>
             "  ⚠ Terminal does not support enhanced keyboard protocol.\n    Use Alt+Enter or Ctrl+Enter for newline (Shift+Enter won't work).\n\n".into(),
-
-        // ── JediTerm / conhost fallback ──
-        Msg::JediTermFallback =>
-            "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs;\n    \
-            on exit your host terminal restores its pre-atomcode state.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
-            ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n".into(),
-        Msg::LegacyConhostFallback =>
-            "  ⓘ Legacy Windows console detected — running in alt-screen mode.\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs.\n    \
-            For full host-terminal scrollback support, install Windows Terminal\n    \
-            (free, Microsoft Store), ConEmu, Alacritty, or WezTerm.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare baseline, or ATOMCODE_RETAIN=1 to\n    \
-            bypass this fallback (may show duplicated content on scroll).\n\n".into(),
 
         // ── Background task ──
         Msg::BackgroundComplete { turns } =>
@@ -568,11 +560,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpServerConnected { name } =>
             format!("✓ MCP server '{name}' connected").into(),
         Msg::McpServerFailed { name, error } =>
-            format!("✗ MCP server '{name}' failed: {error}").into(),
+            format!("× MCP server '{name}' failed: {error}").into(),
         Msg::LspServerStarted { name, ext } =>
             format!("✓ LSP server '{name}' started for .{ext}").into(),
         Msg::LspServerFailed { name, ext, error } =>
-            format!("✗ LSP server '{name}' for .{ext} failed: {error}").into(),
+            format!("× LSP server '{name}' for .{ext} failed: {error}").into(),
 
         // ── /worktree ──
         Msg::WorktreeUsage =>
@@ -633,7 +625,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SetupSkippedRow { kind, slug, reason } =>
             format!("  - {}:{} ({:?})\n", kind, slug, reason).into(),
         Msg::SetupFailedRow { kind, slug, error } =>
-            format!("  ✗ {}:{} — {}\n", kind, slug, error).into(),
+            format!("  × {}:{} — {}\n", kind, slug, error).into(),
         Msg::CmdSetupTip =>
             "\u{1f4a1} Tip: Run \x1b[1;96m/setup\x1b[0m to auto-configure hooks, skills, and MCP for this project.".into(),
         Msg::CmdSetupRunning =>
@@ -686,6 +678,14 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("list plugins: {error}").into(),
         Msg::PluginReloadDone { skills, warnings } =>
             format!("Plugins reloaded: {skills} skill(s), {warnings} warning(s)").into(),
+        Msg::PluginMarketplaceAdded { name, commit, count } =>
+            format!("✓ marketplace `{name}` added at {commit} ({count} plugins)").into(),
+        Msg::PluginMarketplaceUpdated { name, commit } =>
+            format!("✓ marketplace `{name}` updated to {commit}").into(),
+        Msg::PluginInstallDone { plugin, marketplace, loaded, skipped, show_details_hint } => {
+            let hint = if show_details_hint { "  (Ctrl+O for details)" } else { "" };
+            format!("✓ installed `{plugin}@{marketplace}` — {loaded} skills loaded, {skipped} skipped{hint}").into()
+        }
         Msg::SetupAutoReloaded { skills, warnings } =>
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
 

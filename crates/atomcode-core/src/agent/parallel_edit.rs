@@ -879,6 +879,7 @@ mod tests {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
+                    synthetic: false,
         }
     }
 
@@ -890,6 +891,7 @@ mod tests {
                 output: output.into(),
                 success,
             }),
+                    synthetic: false,
         }
     }
 

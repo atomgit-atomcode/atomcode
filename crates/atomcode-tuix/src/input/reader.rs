@@ -531,21 +531,6 @@ fn mouse_input_event(m: crossterm::event::MouseEvent) -> Option<InputEvent> {
             crate::tuix_trace!("RD", "mouse scroll down");
             Some(InputEvent::MouseScroll(3))
         }
-        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            Some(InputEvent::MouseDown {
-                col: m.column,
-                row: m.row,
-            })
-        }
-        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-            Some(InputEvent::MouseDrag {
-                col: m.column,
-                row: m.row,
-            })
-        }
-        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-            Some(InputEvent::MouseUp)
-        }
         _ => None,
     }
 }

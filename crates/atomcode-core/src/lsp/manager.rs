@@ -305,7 +305,7 @@ pub fn build_lsp_manager(config: &LspConfig, project_root: &Path) -> Option<Arc<
 
 /// Build an LspManager paired with a receiver for connection-status
 /// events. TUI mode wires the receiver into the event loop so server
-/// start/failure surfaces as `✓ LSP server …` / `✗ LSP server …`
+/// start/failure surfaces as `✓ LSP server …` / `× LSP server …`
 /// scrollback lines, matching the MCP server flow. Returns `None` when
 /// LSP is disabled in config.
 pub fn build_lsp_manager_with_events(

@@ -41,13 +41,23 @@ fn build_codingplan_headers(
         return Ok(Vec::new());
     }
 
-    // `CpAuthRequired` (no stored auth, or empty user.id /
-    // access_token) is a separate failure mode from
-    // `CpOfficialBuildRequired` (open-source build / unavailable
-    // signer). Users on an official build with no `~/.atomcode/auth.toml`
-    // would otherwise see the misleading "need official build"
-    // message — the build IS official, they just haven't logged in
-    // yet. Steer them to `/codingplan` instead.
+    // Order matters: signer availability is checked FIRST.
+    //
+    // An open-source build (no `codingplan-crypto` feature) can never
+    // produce a valid signature — `/login` will not fix that. If we
+    // checked auth first, an open-source user with empty auth.toml
+    // would be told "run /codingplan", they'd log in successfully,
+    // and STILL hit `Unavailable` on the next chat. The signer-first
+    // order gives them the actionable hint (`CpOfficialBuildRequired`)
+    // immediately.
+    //
+    // Official builds (`signer_available() == true`) fall through to
+    // the auth check, so an official user with no `~/.atomcode/auth.toml`
+    // still sees `CpAuthRequired` (the originally-intended UX).
+    if !crypto::signer_available() {
+        return Err(anyhow::anyhow!("{}", t(Msg::CpOfficialBuildRequired)));
+    }
+
     let (user_id_string, token_string);
     let (user_id, oauth_token) = match override_auth {
         Some((uid, tok)) => (uid, tok),
@@ -574,6 +584,20 @@ impl LlmProvider for OpenAiProvider {
         let base_url_for_signing = self.base_url.clone();
 
         tokio::spawn(async move {
+            // Upfront signing precheck. Without this, the retry factory
+            // below silently `.unwrap_or_default()`s any signing error
+            // (open-source build → empty headers → 403 from gateway with
+            // an unhelpful raw body), so users on an open-source build
+            // pointed at the AtomGit gateway would never see the
+            // actionable `CpOfficialBuildRequired` hint. Run it here
+            // (signer availability + auth state don't depend on body
+            // content, so a zero-byte probe is sufficient) so the
+            // friendly error surfaces BEFORE the first network call.
+            if let Err(e) = build_codingplan_headers(&base_url_for_signing, &[], None) {
+                let _ = tx.send(Ok(StreamEvent::Error(e.to_string())));
+                return;
+            }
+
             // Mid-stream retry: when the provider opens the stream but the
             // chunked body errors out BEFORE any SSE `data:` line is parsed,
             // it's safe to redo the whole request — no text/tool-call has
@@ -596,6 +620,10 @@ impl LlmProvider for OpenAiProvider {
             let mut auth_retry_used = false;
             'retry: loop {
                 attempt += 1;
+                // Serialize once per outer-loop iteration. The body content
+                // does NOT change between inner retries — only the signing
+                // headers do (fresh nonce/ts/sig per attempt to avoid
+                // SIG_REPLAY / SIG_STALE from the atomgit-gateway).
                 let body_bytes = match serde_json::to_vec(&body) {
                     Ok(b) => b,
                     Err(e) => {
@@ -605,27 +633,49 @@ impl LlmProvider for OpenAiProvider {
                         return;
                     }
                 };
-                let extra_headers = match build_codingplan_headers(&base_url_for_signing, &body_bytes, None) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        let _ = tx.send(Ok(StreamEvent::Error(format!("{e:#}"))));
-                        return;
-                    }
-                };
                 // Snapshot the current token. After a successful auth
                 // refresh below, the shared `api_key` will hold the new
                 // value and the next iteration picks it up here.
                 let current_token = api_key.read().await.clone();
-                let mut request = client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {}", current_token))
-                    .header("Content-Type", "application/json")
-                    .body(body_bytes);
-                for (name, value) in extra_headers {
-                    request = request.header(name, value);
-                }
 
-                let response = match crate::provider::retry::send_with_retry(request, &policy).await
+                // Build a factory closure that re-signs on every inner
+                // retry attempt. Each call to the factory generates a
+                // fresh nonce + timestamp + HMAC signature via
+                // `build_codingplan_headers`, preventing SIG_REPLAY
+                // (server's nonce cache holds the first attempt's nonce)
+                // and SIG_STALE (cumulative backoff pushes ts past the
+                // 300 s freshness window).
+                //
+                // On signing failure during a retry we fall back to
+                // empty extra headers (no panic, worst case we get a
+                // fresh 403 which the caller already handles). The
+                // initial request has already been signed successfully
+                // at this point, so retries are the only code path that
+                // can reach the fallback.
+                let url_for_factory = url.clone();
+                let body_for_factory = body_bytes.clone();
+                let base_url_clone = base_url_for_signing.clone();
+                let client_for_factory = client.clone();
+                let token_for_factory = current_token.clone();
+                let resign = move || -> reqwest::RequestBuilder {
+                    let extra_headers = build_codingplan_headers(
+                        &base_url_clone,
+                        &body_for_factory,
+                        None,
+                    )
+                    .unwrap_or_default();
+                    let mut req = client_for_factory
+                        .post(&url_for_factory)
+                        .header("Authorization", format!("Bearer {}", token_for_factory))
+                        .header("Content-Type", "application/json")
+                        .body(body_for_factory.clone());
+                    for (name, value) in extra_headers {
+                        req = req.header(name, value);
+                    }
+                    req
+                };
+
+                let response = match crate::provider::retry::send_with_retry_resign(resign, &policy).await
                 {
                     Ok(resp) => resp,
                     Err(e) => {
@@ -732,7 +782,18 @@ impl LlmProvider for OpenAiProvider {
                         None
                     };
                 // ────────────────────────────────────────────────────────
+                // (id, name, accumulated_args) per tool-call index.
                 let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+                // Tracks whether StreamEvent::ToolCallStart has already
+                // been emitted for each index. Some providers (GPT-5
+                // family — confirmed via wire-dump 2026-05-27) repeat
+                // the SAME non-empty id on EVERY chunk but only send
+                // function.name on the first chunk. Without an "emitted
+                // once" guard we'd fire ToolCallStart on every chunk;
+                // without a "don't clobber name with empty" guard we'd
+                // overwrite the captured name with `""` from subsequent
+                // chunks where func.name is None.
+                let mut tool_start_emitted: Vec<bool> = Vec::new();
                 let mut last_usage: Option<crate::stream::TokenUsage> = None;
                 let mut saw_data_line = false;
                 let mut saw_valid_chunk = false;
@@ -920,30 +981,60 @@ impl LlmProvider for OpenAiProvider {
                                                 String::new(),
                                                 String::new(),
                                             ));
+                                            tool_start_emitted.push(false);
                                         }
                                         let entry = &mut tool_calls[idx];
+                                        // 1) Capture id only when present + non-empty.
+                                        //    ModelScope sends empty-string id on
+                                        //    increment chunks — skipping keeps the
+                                        //    earlier non-empty value.
                                         if let Some(id) = &tc.id {
-                                            // Some providers (e.g., ModelScope) send empty string id
-                                            // in incremental tool call chunks. Only emit ToolCallStart
-                                            // for non-empty ids.
                                             if !id.is_empty() {
                                                 entry.0 = id.clone();
-                                                if let Some(func) = &tc.function {
-                                                    entry.1 = func.name.clone().unwrap_or_default();
-                                                }
-                                                let _ = tx.send(Ok(StreamEvent::ToolCallStart {
-                                                    id: entry.0.clone(),
-                                                    name: entry.1.clone(),
-                                                }));
                                             }
                                         }
+                                        // 2) Accumulate name + args INDEPENDENTLY of
+                                        //    id presence.
+                                        //    * GPT-5 family (confirmed via wire-dump):
+                                        //      repeats same non-empty id on EVERY chunk
+                                        //      but only sends function.name on chunk 1.
+                                        //      Old code did `entry.1 = func.name.clone()
+                                        //      .unwrap_or_default()` which clobbered the
+                                        //      captured "use_skill" with "" on every
+                                        //      subsequent chunk — final ToolCallDone had
+                                        //      empty name → dropped as malformed.
+                                        //    * Guard `!name.is_empty()` also protects
+                                        //      against any provider that ever sends
+                                        //      `name: ""` placeholder.
                                         if let Some(func) = &tc.function {
+                                            if let Some(name) = &func.name {
+                                                if !name.is_empty() {
+                                                    entry.1 = name.clone();
+                                                }
+                                            }
                                             if let Some(args) = &func.arguments {
                                                 entry.2.push_str(args);
                                                 let _ = tx.send(Ok(StreamEvent::ToolCallDelta(
                                                     args.clone(),
                                                 )));
                                             }
+                                        }
+                                        // 3) Emit ToolCallStart EXACTLY ONCE per index
+                                        //    — as soon as both id AND name are known.
+                                        //    Old code emitted on every chunk where id
+                                        //    was non-empty (N events for an N-chunk
+                                        //    stream); downstream UI handles the
+                                        //    duplicates but it's wasted work + log
+                                        //    noise.
+                                        if !tool_start_emitted[idx]
+                                            && !entry.0.is_empty()
+                                            && !entry.1.is_empty()
+                                        {
+                                            tool_start_emitted[idx] = true;
+                                            let _ = tx.send(Ok(StreamEvent::ToolCallStart {
+                                                id: entry.0.clone(),
+                                                name: entry.1.clone(),
+                                            }));
                                         }
                                     }
                                 }
@@ -968,6 +1059,7 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
+                                            tool_start_emitted.clear();
                                             pending_finish =
                                                 Some(StreamEvent::Done { truncated: false });
                                         }
@@ -987,6 +1079,7 @@ impl LlmProvider for OpenAiProvider {
                                                 )));
                                             }
                                             tool_calls.clear();
+                                            tool_start_emitted.clear();
                                             pending_finish =
                                                 Some(StreamEvent::Done { truncated: true });
                                         }
@@ -1134,6 +1227,7 @@ impl LlmProvider for OpenAiProvider {
                     )));
                 }
                 tool_calls.clear();
+                tool_start_emitted.clear();
                 let _ = tx.send(Ok(StreamEvent::Delta(
                     "\n[stream ended without close marker — response above may be incomplete]\n"
                         .to_string(),
@@ -1399,6 +1493,7 @@ mod tests {
                     data: "AAAA".to_string(),
                 }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         assert_eq!(out.len(), 1, "one message in, one out");
@@ -1431,6 +1526,7 @@ mod tests {
                     ImagePart { media_type: "image/jpeg".into(), data: "SECOND".into() },
                 ],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         let content = out[0]["content"].as_array().unwrap();
@@ -1451,6 +1547,7 @@ mod tests {
                 text: None,
                 images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[msg], ReasoningPolicy::Exclude, true);
         let content = out[0]["content"].as_array().unwrap();
@@ -1477,6 +1574,7 @@ mod tests {
                 text: Some("[Image #1] 这是什么图啊".into()),
                 images: vec![ImagePart { media_type: "image/png".into(), data: "AAAA".into() }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
         assert_eq!(out.len(), 1);
@@ -1516,6 +1614,7 @@ mod tests {
                 text: None,
                 images: vec![ImagePart { media_type: "image/png".into(), data: "X".into() }],
             },
+                    synthetic: false,
         };
         let out = OpenAiProvider::format_messages(&[history], ReasoningPolicy::Exclude, false);
         let content = out[0]["content"].as_str().expect("string content");
@@ -1717,6 +1816,7 @@ mod tests {
                 reasoning_content: reasoning.map(|s| s.to_string()),
                 thinking_blocks: Vec::new(),
             },
+            synthetic: false,
         }
     }
 
@@ -1778,6 +1878,7 @@ mod tests {
         let msgs = vec![Message {
             role: Role::Assistant,
             content: MessageContent::Text("当前系统时间是 …".into()),
+                    synthetic: false,
         }];
         let out = OpenAiProvider::format_messages(&msgs, ReasoningPolicy::Include, true);
         assert_eq!(out.len(), 1);
@@ -2034,6 +2135,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: MessageContent::Text("hi".into()),
+                    synthetic: false,
         };
         let mut stream = p.chat_stream(&[msg], None).expect("stream");
         let mut out = Vec::new();
@@ -2251,5 +2353,26 @@ mod codingplan_signing_tests {
         )
         .expect_err("empty auth must error");
         assert!(!format!("{:#}", err).is_empty());
+    }
+
+    #[cfg(not(feature = "codingplan-crypto"))]
+    #[test]
+    fn open_source_build_errors_official_build_required_before_auth_check() {
+        // Regression guard: when reordering build_codingplan_headers,
+        // the signer-availability check MUST run before any auth lookup
+        // so an open-source user with empty auth gets the actionable
+        // "need official build" hint instead of a misleading "/login"
+        // prompt that would never succeed.
+        let err = build_codingplan_headers(
+            "https://llm-api.atomgit.com/v1",
+            b"{}",
+            Some(("", "")), // empty auth
+        )
+        .expect_err("must error");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("official") || msg.contains("官方"),
+            "open-source + empty-auth must surface the official-build hint, not the auth hint. got: {msg}",
+        );
     }
 }
