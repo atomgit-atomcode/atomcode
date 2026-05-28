@@ -1690,16 +1690,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// off-screen.
     fn push_or_update_live_spinner(&mut self, row_cells: Vec<Cell>) {
         if self.live_spinner_active {
+            // Update body_lines in place; the next `flush_deferred`
+            // (≤5ms) lets the cell-diff path compute and emit only
+            // the cells that actually changed between this tick and
+            // the last (typically just the elapsed-seconds digits).
+            //
+            // Earlier this branch did its own direct write:
+            //   `\x1b[{bottom};1H\x1b[K` + `serialize_row(&row_cells)`
+            // The `\x1b[K` cleared the row visible before the serialize
+            // re-painted it. Inside `render_diff`'s DECSET 2026
+            // synchronized-output envelope that would be fine, but the
+            // direct write bypassed the envelope entirely — so on hosts
+            // that ignore BSU/ESU (pwsh7 on native Win10 conhost) the
+            // user saw a per-tick "row blanks then refills left→right"
+            // shake, with the leading icon stable (first byte after EL)
+            // and the trailing chars wobbling as they trickled into the
+            // terminal's cell buffer. Reported as 「字在左右抖动，图标
+            // 还好」on the Pondering spinner. Letting the cell-diff
+            // path do the work keeps the update inside the BSU envelope
+            // (where supported) and produces minimal patches (where not),
+            // which is the smallest visible change a host can render.
             if let Some(last) = self.body_lines.last_mut() {
-                *last = row_cells.clone();
+                *last = row_cells;
             }
-            let bottom = self.body_bottom_row();
-            if bottom > 0 {
-                let seq = format!("\x1b[{};1H\x1b[K", bottom);
-                let _ = self.out.write_all(seq.as_bytes());
-                let bytes = serialize_row(&row_cells);
-                let _ = self.out.write_all(&bytes);
-            }
+            self.dirty = true;
         } else {
             // `push_body_row` clears `live_spinner_active`; set it back
             // afterwards so the next tick takes the update-in-place
