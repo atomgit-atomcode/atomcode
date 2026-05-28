@@ -246,6 +246,7 @@ impl HookEngine {
         };
 
         let mut injected = String::new();
+        let mut warnings = Vec::new();
         for hook in &self.on_user_prompt_submit_hooks {
             match hook.on_user_prompt_submit(&payload).await {
                 UserPromptSubmitResult::Continue => {}
@@ -258,9 +259,15 @@ impl HookEngine {
                 UserPromptSubmitResult::Block(reason) => {
                     return UserPromptHookResult::Block(reason);
                 }
+                UserPromptSubmitResult::Warning(msg) => {
+                    warnings.push(msg);
+                }
             }
         }
 
+        if !warnings.is_empty() {
+            return UserPromptHookResult::Warning(warnings.join("; "));
+        }
         if injected.is_empty() {
             UserPromptHookResult::Continue
         } else {
@@ -743,14 +750,34 @@ impl OnUserPromptSubmitHook for ShellCommandHook {
         match self.execute_hook_with_stdin(&payload_json).await {
             Ok((exit_ok, stdout, stderr)) => {
                 if !exit_ok {
+                    // Non-zero exit: check if the hook explicitly blocked
+                    // via structured JSON before treating it as an
+                    // environment failure. This lets intentional blocks
+                    // still work while degrading "command not found" etc.
+                    // to a non-blocking warning.
+                    let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
+                    let json_action = last_line.and_then(|l| {
+                        serde_json::from_str::<UserPromptSubmitOutput>(l.trim()).ok()
+                    });
+                    if let Some(parsed) = json_action {
+                        if matches!(parsed.decision.as_deref(), Some("block")) {
+                            let reason = parsed
+                                .reason
+                                .unwrap_or_else(|| "user prompt blocked by hook".into());
+                            return UserPromptSubmitResult::Block(reason);
+                        }
+                    }
+                    // No structured block decision — this is an
+                    // environment failure (missing dep, crash, etc.),
+                    // not an intentional rejection. Warn but continue.
                     let reason = if !stderr.trim().is_empty() {
                         stderr.trim().to_string()
                     } else if !stdout.trim().is_empty() {
                         stdout.trim().to_string()
                     } else {
-                        "user prompt blocked by hook".into()
+                        "hook exited with error".into()
                     };
-                    return UserPromptSubmitResult::Block(reason);
+                    return UserPromptSubmitResult::Warning(reason);
                 }
 
                 // last-line-first JSON 解析 (CC parity)

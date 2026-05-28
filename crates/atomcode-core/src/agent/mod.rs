@@ -290,6 +290,11 @@ pub enum AgentEvent {
     /// Currently sourced from the OpenAI provider's truncation detector
     /// when the proxy reports implausibly few prompt_tokens.
     Warning(String),
+    /// A UserPromptSubmit hook failed due to an environment issue (missing
+    /// dependency, crash, etc.) rather than an explicit block. The turn
+    /// continues but the status-bar hint should surface the error so the
+    /// user can fix their hook configuration.
+    HookWarningHint(String),
     /// VL preprocessing failed; the agent is returning the user's pending
     /// images so the TUI can re-attach them to the input state. Lets the
     /// user retry the same image without re-pasting from clipboard. Hashes
@@ -1669,6 +1674,15 @@ impl AgentLoop {
                 });
                 self.finish_turn(TurnStopReason::Error);
                 return;
+            }
+            crate::hook::UserPromptHookResult::Warning(msg) => {
+                // Non-fatal: show inline warning + status-bar hint, continue turn.
+                let _ = self.event_tx.send(AgentEvent::Warning(
+                    format!("Hook 执行异常，已跳过：{}", msg),
+                ));
+                let _ = self.event_tx.send(AgentEvent::HookWarningHint(
+                    format!("Hook 异常: {}", msg),
+                ));
             }
         }
         // Detect negative feedback — user is unhappy with previous turn's work.

@@ -92,6 +92,10 @@ pub enum UserPromptHookResult {
     Inject(String),
     /// A hook explicitly blocked the prompt; `reason` is shown in the UI.
     Block(String),
+    /// A hook failed due to an environment issue (e.g. missing dependency)
+    /// rather than an explicit block. The turn continues but the user is
+    /// warned via the status-bar hint.
+    Warning(String),
 }
 
 /// Internal: parsed shape of a single hook's stdout payload (CC spec).
@@ -462,6 +466,8 @@ pub enum UserPromptSubmitResult {
     Inject(String),
     /// 阻止此 prompt
     Block(String),
+    /// Hook 因环境问题（如缺少依赖）执行失败，非主动拒绝
+    Warning(String),
 }
 
 impl From<UserPromptSubmitResult> for HookResult {
@@ -470,6 +476,7 @@ impl From<UserPromptSubmitResult> for HookResult {
             UserPromptSubmitResult::Continue => HookResult::Ok,
             UserPromptSubmitResult::Inject(s) => HookResult::Modified(s),
             UserPromptSubmitResult::Block(s) => HookResult::Denied(s),
+            UserPromptSubmitResult::Warning(_) => HookResult::Warning(String::new()),
         }
     }
 }

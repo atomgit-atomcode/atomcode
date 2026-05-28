@@ -126,21 +126,36 @@ impl HookExecutor {
         let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
 
         let mut injected = String::new();
+        let mut warnings = Vec::new();
         for hook in matched {
             match self.execute_hook_with_stdin(hook, &payload_json).await {
                 Ok((exit_ok, stdout, stderr)) => {
                     if !exit_ok {
-                        // Non-zero exit → block. Prefer stderr for the user
-                        // message (CC convention: scripts use stderr for
-                        // human-readable rejection text).
+                        // Non-zero exit: check if the hook explicitly blocked
+                        // via structured JSON before treating it as an
+                        // environment failure.
+                        let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
+                        let json_action = last_line.and_then(|l| {
+                            serde_json::from_str::<UserPromptSubmitOutput>(l.trim()).ok()
+                        });
+                        if let Some(parsed) = json_action {
+                            if matches!(parsed.decision.as_deref(), Some("block")) {
+                                let reason = parsed
+                                    .reason
+                                    .unwrap_or_else(|| "user prompt blocked by hook".into());
+                                return UserPromptHookResult::Block(reason);
+                            }
+                        }
+                        // No structured block — environment failure, warn.
                         let reason = if !stderr.trim().is_empty() {
                             stderr.trim().to_string()
                         } else if !stdout.trim().is_empty() {
                             stdout.trim().to_string()
                         } else {
-                            "user prompt blocked by hook".into()
+                            "hook exited with error".into()
                         };
-                        return UserPromptHookResult::Block(reason);
+                        warnings.push(reason);
+                        continue;
                     }
                     // CC parity: hooks routinely log debug noise on
                     // earlier lines and emit the structured decision as
@@ -189,6 +204,9 @@ impl HookExecutor {
             }
         }
 
+        if !warnings.is_empty() {
+            return UserPromptHookResult::Warning(warnings.join("; "));
+        }
         if injected.is_empty() {
             UserPromptHookResult::Continue
         } else {

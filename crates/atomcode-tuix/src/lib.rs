@@ -529,6 +529,7 @@ pub async fn run(
         current_session,
         update_hint,
         monitor_warning: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        hook_warning_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
         monitor_last_check_at: None,
         usage_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
         usage_last_check_at: None,

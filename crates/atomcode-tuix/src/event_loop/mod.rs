@@ -687,6 +687,11 @@ pub struct LoopCtx {
     /// when `/codingplan` persists a fresh config (re-sync resets the
     /// hint state).
     pub monitor_warning: std::sync::Arc<std::sync::Mutex<Option<monitor::CodingPlanWarning>>>,
+    /// Hook execution failure hint for the status bar. Written by the
+    /// `AgentEvent::HookWarningHint` handler; read by `build_status` on
+    /// each redraw. Takes precedence over `usage_hint` so a broken hook
+    /// is immediately visible. Cleared at the start of each new turn.
+    pub hook_warning_hint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Last time a monitor check was fired this session. Pre-turn
     /// triggers respect `monitor::CHECK_COOLDOWN` (15 min) against this
     /// timestamp; startup + `/model` switch bypass the cooldown.
@@ -4800,6 +4805,10 @@ fn handle_idle_key(
                     text: line.clone(),
                     images: kept_refs,
                 });
+                // Clear stale hook warning at the start of each turn.
+                if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
+                    *slot = None;
+                }
                 ctx.agent
                     .cmd_tx
                     .send(AgentCommand::SendMessage {
@@ -6171,6 +6180,11 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
+        AgentEvent::HookWarningHint(msg) => {
+            if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
+                *slot = Some(msg);
+            }
+        }
         AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
             // Format here (not in agent) so we can localize / restyle
             // without bumping the AgentEvent contract. Char count helps
@@ -6769,6 +6783,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         ))
     } else if let Some(warning) = ctx.monitor_warning.lock().ok().and_then(|g| g.clone()) {
         Some((warning.display_text(), crate::render::HintSeverity::Warning))
+    } else if let Some(hook_msg) = ctx.hook_warning_hint.lock().ok().and_then(|g| g.clone()) {
+        Some((hook_msg, crate::render::HintSeverity::Warning))
     } else if let Some(usage) =
         usage_monitor::build_usage_hint(&ctx.usage_slot, &ctx.config.default_provider)
     {
