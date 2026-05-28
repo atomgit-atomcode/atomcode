@@ -1,34 +1,38 @@
 ---
 title: 核心功能
 category: 功能
-keywords: [features, 功能, 特性, 能力, atomcode, 介绍]
+keywords: [features, 功能, 介绍, atomcode, 特性, 支持, 平台, 系统, 怎么, 如何, 使用, AI, 编程, 代码, 工具, 日志, log, debug, 调试, 搜索, search, grep, 报错, 错误]
 ---
 
 # AtomCode 核心功能
 
-AtomCode 是一个开源终端 AI 编程助手，基于 Rust 编写。主要功能包括：
+开源终端 AI 编程助手，Rust 编写，支持 macOS/Linux/Windows/HarmonyOS。
 
-## AI 对话编程
-- 在终端中与 AI 对话，获得代码生成、解释、重构帮助
-- 支持多模型切换 (/model)
-- 支持多 Provider (/provider)
+## AI 对话
+- 终端内自然语言编程，多模型/多 Provider 切换
+- 流式输出 + 思考链 (DeepSeek-R1 等推理模型)
+- 上下文压缩、会话持久化
+- 记忆系统 (/remember, /forget, /memory)
 
-## 文件编辑
-- 自动读写和编辑项目文件
-- 支持并行多文件编辑
-- 代码图辅助理解代码结构
+## 代码操作
+- 读写编辑文件、并行多文件编辑 (SubAgentPool)
+- 代码图索引辅助理解项目结构
+- LSP 集成获取诊断信息
 
 ## 工具系统
 - Bash 命令执行
-- 文件搜索 (grep, glob)
-- Web 搜索和抓取
-- LSP 集成
+- 文件搜索 (grep/glob/list_dir)
+- Web 搜索和内容抓取
+- 权限控制: 自动/交互/审批三种模式
 
-## 会话管理
-- 会话恢复 (/resume)
-- 对话历史压缩 (/compact)
-- 上下文窗口管理 (/context)
+## 扩展
+- MCP 协议连接外部工具
+- Skill 模板自定义 AI 行为
+- Plugin 插件市场 + 自动更新
+- Hooks 钩子系统 (事件触发自定义脚本)
 
-## 权限控制
-- 工具权限管理
-- 自动/交互/审批三种模式
+## 工作流
+- Git worktree 隔离并行任务
+- /bg 后台任务
+- /plan 计划模式 (只读探索)
+- /codingplan 编码计划

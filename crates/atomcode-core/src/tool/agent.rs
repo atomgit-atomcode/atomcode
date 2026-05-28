@@ -76,6 +76,12 @@ impl Tool for AgentTool {
         let input: InvokeSubAgentInput = serde_json::from_str(args)
             .map_err(|e| anyhow::anyhow!("invalid args: {}", e))?;
 
+        tracing::info!(
+            subagent = %input.subagent_name,
+            task_len = input.task.len(),
+            "invoke_subagent tool called by LLM",
+        );
+
         // 1. Lookup definition + clone + drop lock
         let def = {
             let registry = self.subagent_registry.read()

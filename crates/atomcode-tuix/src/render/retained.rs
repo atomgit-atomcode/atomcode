@@ -773,6 +773,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let bytes = serialize_row(&row);
                 let _ = self.out.write_all(&bytes);
                 self.body_lines.push(row);
+                // Restore cursor to input box so the caret doesn't
+                // blink at end-of-spinner-row between the direct write
+                // and the next flush_deferred tick.
+                if let Some((r, c)) = self.screen.peek_cursor() {
+                    let seq = format!("\x1b[{};{}H", r, c);
+                    let _ = self.out.write_all(seq.as_bytes());
+                }
                 return;
             }
         }
@@ -3117,6 +3124,26 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                         self.guide_status_rows = n;
                         return;
                     }
+                }
+
+                // Empty text: clear the spinner row from terminal.
+                if n == 0 {
+                    self.guide_status_text = None;
+                    if prev > 0 {
+                        self.ensure_scroll_region();
+                        let bottom = self.body_bottom_row();
+                        let remove = prev.min(self.body_lines.len());
+                        self.body_lines.truncate(self.body_lines.len() - remove);
+                        // Erase terminal rows (bottom-up, one per prev row).
+                        let first = bottom.saturating_sub(prev as u16) + 1;
+                        for i in 0..prev {
+                            let r = first + i as u16;
+                            let seq = format!("\x1b[{};1H\x1b[2K", r);
+                            let _ = self.out.write_all(seq.as_bytes());
+                        }
+                    }
+                    self.guide_status_rows = 0;
+                    return;
                 }
 
                 // First render, row count mismatch, or resize — fallback.

@@ -975,7 +975,9 @@ impl AgentLoop {
         // Register atomcode-guide subagent
         {
             let reg = subagent_registry.write().unwrap();
-            let _ = crate::agent::guide::register(&reg);
+            if let Err(e) = crate::agent::guide::register(&reg) {
+                tracing::warn!("Failed to register atomcode-guide subagent: {}", e);
+            }
         }
 
         let agent = Self {
@@ -1139,6 +1141,8 @@ impl AgentLoop {
                     self.subagent_cancel_token.cancel();
                     self.cancel_token = CancellationToken::new();
                     self.subagent_cancel_token = CancellationToken::new();
+                    // Drop completed handles to prevent unbounded growth.
+                    self.subagent_handles.retain(|h| !h.is_finished());
                     self.phase = AgentPhase::Idle;
                     // Cancel the current turn — preserve completed content, backfill
                     // (cancelled) for unpaired tool calls, and mark turn as Completed.
@@ -1527,15 +1531,28 @@ impl AgentLoop {
         let cancel_token = self.subagent_cancel_token.child_token();
         let running = self.subagent_running.clone();
 
+        let guard_name = name.clone();
+        let guard_tx = event_tx.clone();
         let handle = tokio::spawn(async move {
-            let _guard = scopeguard::guard((), |_| {
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_guard = completed.clone();
+            let _guard = scopeguard::guard((), move |_| {
                 running.store(false, std::sync::atomic::Ordering::Release);
+                if !completed_guard.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = guard_tx.send(AgentEvent::GuideComplete {
+                        subagent: guard_name.clone(),
+                        text: "子代理异常，请重试".to_string(),
+                        truncated: false,
+                        cancelled: true,
+                    });
+                }
             });
 
             let def = {
                 let reg = match registry.read() {
                     Ok(r) => r,
                     Err(_) => {
+                        completed.store(true, std::sync::atomic::Ordering::Relaxed);
                         let _ = event_tx.send(AgentEvent::GuideComplete {
                             subagent: name,
                             text: "系统错误，请重试".to_string(),
@@ -1551,6 +1568,7 @@ impl AgentLoop {
             let def = match def {
                 Some(d) => d,
                 None => {
+                    completed.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = event_tx.send(AgentEvent::GuideComplete {
                         subagent: name,
                         text: "未找到该子代理".to_string(),
@@ -1562,15 +1580,12 @@ impl AgentLoop {
             };
 
             let runner = crate::agent::sub_agent::runner::SubAgentRunner::new(
-                provider,
-                config,
-                parent_tools,
-                parent_ctx,
-                event_tx.clone(),
-                cancel_token,
+                provider, config, parent_tools, parent_ctx,
+                event_tx.clone(), cancel_token,
             );
 
             let result = runner.run(def, task).await;
+            completed.store(true, std::sync::atomic::Ordering::Relaxed);
             match result {
                 Ok(output) => {
                     let _ = event_tx.send(AgentEvent::GuideComplete {

@@ -67,6 +67,110 @@ impl Clone for KnowledgeBase {
     }
 }
 
+/// Estimate the number of LLM tokens for a string.
+///
+/// - CJK characters: ~1.5 tokens each
+/// - ASCII alphanumeric: ~0.25 tokens each (4 chars ≈ 1 token)
+/// - Whitespace/punctuation: ~0.25 tokens each
+fn estimate_tokens(text: &str) -> usize {
+    let mut tokens: f64 = 0.0;
+    let mut ascii_word_len = 0usize;
+
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            ascii_word_len += 1;
+        } else {
+            if ascii_word_len > 0 {
+                tokens += (ascii_word_len as f64) / 4.0;
+                ascii_word_len = 0;
+            }
+            if contains_cjk(&ch.to_string()) {
+                tokens += 1.5;
+            } else {
+                tokens += 0.25;
+            }
+        }
+    }
+    if ascii_word_len > 0 {
+        tokens += (ascii_word_len as f64) / 4.0;
+    }
+    tokens.ceil() as usize
+}
+
+/// Check if a string contains CJK (Chinese/Japanese/Korean) characters.
+fn contains_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            c,
+            '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs
+            | '\u{3400}'..='\u{4DBF}' // CJK Extension A
+            | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        )
+    })
+}
+
+/// Truncate text at a paragraph boundary, preserving code block integrity.
+/// Returns empty string if no clean boundary is found within budget.
+fn truncate_at_boundary(text: &str, estimated_token_budget: usize) -> String {
+    // Rough conversion: mixed content ~2 chars per token
+    let char_budget = estimated_token_budget * 2;
+    if text.len() <= char_budget {
+        return text.to_string();
+    }
+
+    let mut result = String::new();
+    let mut in_code_block = false;
+    let mut code_block_start = 0usize;
+
+    for line in text.split('\n') {
+        if line.trim_start().starts_with("```") {
+            if in_code_block {
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+                code_block_start = result.len();
+            }
+            result.push_str(line);
+            result.push('\n');
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+
+        // Check budget at paragraph boundaries (blank lines)
+        if !in_code_block && line.trim().is_empty() && result.len() >= char_budget {
+            break;
+        }
+    }
+
+    // If we ended inside a code block, roll back to before the block
+    if in_code_block {
+        result.truncate(code_block_start);
+    }
+
+    result
+}
+
+/// Check if a query word matches a keyword, supporting CJK substring matching.
+///
+/// For ASCII queries, exact word match is required.
+/// For CJK-containing queries, substring matching is used since Chinese text
+/// has no whitespace delimiters.
+fn keyword_matches(keyword: &str, query_word: &str) -> bool {
+    // Exact match (works for both ASCII and CJK)
+    if keyword == query_word {
+        return true;
+    }
+    // CJK substring matching: only when the query contains CJK characters
+    if contains_cjk(query_word) && query_word.contains(keyword) {
+        return true;
+    }
+    if contains_cjk(keyword) && keyword.contains(query_word) {
+        return true;
+    }
+    false
+}
+
 impl KnowledgeBase {
     /// Create a new `KnowledgeBase` with embedded knowledge files.
     ///
@@ -95,11 +199,22 @@ impl KnowledgeBase {
 
     fn load_embedded() -> KnowledgeInner {
         let files: &[(&str, &str)] = &[
+            ("overview.md", include_str!("knowledge/overview.md")),
             ("features.md", include_str!("knowledge/features.md")),
             ("slash-commands.md", include_str!("knowledge/slash-commands.md")),
             ("mcp.md", include_str!("knowledge/mcp.md")),
             ("skills.md", include_str!("knowledge/skills.md")),
             ("config.md", include_str!("knowledge/config.md")),
+            ("bg.md", include_str!("knowledge/bg.md")),
+            ("context.md", include_str!("knowledge/context.md")),
+            ("getting-started.md", include_str!("knowledge/getting-started.md")),
+            ("memory.md", include_str!("knowledge/memory.md")),
+            ("modes.md", include_str!("knowledge/modes.md")),
+            ("sessions.md", include_str!("knowledge/sessions.md")),
+            ("worktree.md", include_str!("knowledge/worktree.md")),
+            ("troubleshooting.md", include_str!("knowledge/troubleshooting.md")),
+            ("doc-urls.md", include_str!("knowledge/doc-urls.md")),
+            ("keybindings.md", include_str!("knowledge/keybindings.md")),
         ];
 
         let mut entries = Vec::new();
@@ -304,7 +419,10 @@ impl KnowledgeBase {
             let matched: Vec<usize> = inner
                 .keyword_index
                 .iter()
-                .filter(|(k, _)| k.split_whitespace().any(|kw| kw == word.as_str()))
+                .filter(|(k, _)| {
+                    k.split_whitespace()
+                        .any(|kw| keyword_matches(kw, word.as_str()))
+                })
                 .flat_map(|(_, indices)| indices.iter().copied())
                 .collect();
 
@@ -337,22 +455,57 @@ impl KnowledgeBase {
     ///
     /// The `max_tokens` parameter is an approximate limit: we multiply by 4 to
     /// get a character budget, then stop adding entries once we would exceed it.
+    /// OR fallback: when AND search returns nothing, try matching entries
+    /// by any single query word. Returns entries sorted by match count.
+    fn search_or(&self, query: &str) -> Vec<usize> {
+        let inner = self.get_or_load();
+        let words: Vec<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        if words.is_empty() {
+            return (0..inner.entries.len()).collect();
+        }
+        let mut scores: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for word in &words {
+            for (kw, indices) in &inner.keyword_index {
+                if kw.split_whitespace()
+                    .any(|w| keyword_matches(w, word.as_str()))
+                {
+                    for &idx in indices {
+                        *scores.entry(idx).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let mut pairs: Vec<(usize, usize)> = scores.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        pairs.into_iter().map(|(i, _)| i).collect()
+    }
+
     pub fn render_for_query(&self, query: &str, max_tokens: usize) -> String {
         let inner = self.get_or_load();
         let hits = self.search(query);
-        let max_chars = max_tokens * 4;
+        // AND may be too strict for CJK queries — fall back to OR.
+        let hits = if hits.is_empty() { self.search_or(query) } else { hits };
+        tracing::debug!(query, hits = hits.len(), "knowledge search");
+        if hits.is_empty() && !query.is_empty() {
+            tracing::debug!(query, "AND search empty, falling back to OR");
+        }
 
         if hits.is_empty() {
-            let mut out = String::from("## 可用知识条目\n\n");
-            for entry in &inner.entries {
-                let line = format!("- **{}** ({})\n", entry.title, entry.category);
-                if out.len() + line.len() > max_chars {
-                    break;
-                }
-                out.push_str(&line);
-            }
-            out.push_str("\n请指定你想了解哪个功能的更多信息。");
-            return out;
+            return format!(
+                "本地知识库中未找到与「{}」直接相关的条目。\n\n\
+                 你可以试试这些常见问题：\n\
+                 - /guide 怎么切换模型\n\
+                 - /guide MCP 怎么配置\n\
+                 - /guide 怎么用记忆功能\n\
+                 - /guide 快捷键有哪些\n\
+                 - /guide 怎么用后台任务\n\n\
+                 也可以访问文档站：https://atomcode.atomgit.com/docs/zh/",
+                query,
+            );
         }
 
         let mut out = String::from("## 相关知识\n\n");
@@ -365,11 +518,22 @@ impl KnowledgeBase {
                 "### {} ({})\n\n{}\n\n",
                 entry.title, entry.category, entry.content
             );
-            if out.len() + chunk.len() > max_chars {
-                out.push_str("... (知识库内容已截断)\n");
+            let combined = format!("{}{}", out, chunk);
+            if estimate_tokens(&combined) > max_tokens {
+                // Try to fit a partial entry at paragraph boundary
+                let remaining = max_tokens.saturating_sub(estimate_tokens(&out));
+                if remaining > 50 {
+                    let partial = truncate_at_boundary(&chunk, remaining);
+                    if !partial.is_empty() {
+                        out.push_str(&partial);
+                        out.push_str("\n... (知识库内容已截断)\n");
+                    }
+                } else {
+                    out.push_str("... (知识库内容已截断)\n");
+                }
                 break;
             }
-            out.push_str(&chunk);
+            out = combined;
         }
         out
     }
@@ -410,7 +574,7 @@ mod tests {
 
         let rendered = kb.render_for_query("anything", 100);
         assert!(
-            rendered.contains("可用知识条目"),
+            rendered.contains("本地知识库中未找到"),
             "should render entry overview on miss"
         );
     }
@@ -529,8 +693,8 @@ Full content.
         let _tmp = tmp;
 
         let rendered = kb.render_for_query("nonexistent", 100);
-        assert!(rendered.contains("可用知识条目"));
-        assert!(rendered.contains("Commands"));
+        assert!(rendered.contains("本地知识库中未找到"));
+        assert!(rendered.contains("atomcode.atomgit.com"));
     }
 
     #[test]
@@ -643,5 +807,114 @@ Content.
         // "testing" should NOT match "test" (exact word match)
         let hits = kb.search("testing");
         assert_eq!(hits.len(), 0, "'testing' should not match keyword 'test' (exact word required)");
+    }
+
+    #[test]
+    fn test_chinese_concatenated_query() {
+        // Chinese input without spaces should still match individual keywords
+        let (tmp, kb) = create_test_kb(&[(
+            "mcp.md",
+            r#"---
+title: "MCP 集成"
+category: "扩展"
+keywords: [mcp, 配置, 怎么, server]
+---
+MCP 配置说明。
+"#,
+        )]);
+        let _tmp = tmp;
+
+        // "怎么配置MCP" is a concatenated Chinese query — should match keywords "怎么", "配置", "mcp"
+        let hits = kb.search("怎么配置mcp");
+        assert_eq!(hits.len(), 1, "concatenated Chinese query should match via substring");
+
+        // Partial match: "怎么用mcp" contains "怎么" and "mcp"
+        let hits = kb.search("怎么用mcp");
+        assert_eq!(hits.len(), 1, "partial Chinese query should match");
+    }
+
+    #[test]
+    fn test_chinese_substring_match_not_for_english() {
+        // Ensure ASCII queries still use exact word matching
+        let (tmp, kb) = create_test_kb(&[(
+            "test.md",
+            r#"---
+title: "Test"
+category: "test"
+keywords: [command, config]
+---
+Content.
+"#,
+        )]);
+        let _tmp = tmp;
+
+        // "com" should NOT match "command" (ASCII exact-match preserved)
+        let hits = kb.search("com");
+        assert!(hits.is_empty(), "'com' should not match keyword 'command'");
+
+        // "command" should match
+        let hits = kb.search("command");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_estimate_tokens_chinese() {
+        // Pure Chinese: each char ~1.5 tokens
+        let cn = "这是一段中文文本用于测试估算函数的准确性";
+        let est = estimate_tokens(cn);
+        // 17 Chinese chars * 1.5 ≈ 26 tokens
+        assert!(est >= 20, "Chinese estimation should be >= 20, got {}", est);
+        assert!(est <= 40, "Chinese estimation should be <= 40, got {}", est);
+    }
+
+    #[test]
+    fn test_estimate_tokens_english() {
+        // Pure ASCII: "hello world" = 11 chars, ~3 tokens
+        let en = "hello world";
+        let est = estimate_tokens(en);
+        assert!(est >= 2 && est <= 5, "English estimation should be 2-5, got {}", est);
+    }
+
+    #[test]
+    fn test_estimate_tokens_mixed() {
+        // Mixed Chinese + English
+        let mixed = "配置MCP服务器需要修改config文件";
+        let est = estimate_tokens(mixed);
+        // Should be between pure-Chinese and pure-English estimates
+        assert!(est > 5, "Mixed estimation should be > 5, got {}", est);
+        assert!(est < 50, "Mixed estimation should be < 50, got {}", est);
+    }
+
+    #[test]
+    fn test_truncation_preserves_code_blocks() {
+        let (tmp, kb) = create_test_kb(&[(
+            "code.md",
+            r#"---
+title: "Code Example"
+category: "test"
+keywords: [code, example]
+---
+Some text before.
+
+```rust
+fn main() {
+    println!("hello");
+}
+```
+
+Some text after.
+"#,
+        )]);
+        let _tmp = tmp;
+
+        // Very tight budget should either show the full code block or skip it entirely
+        let rendered = kb.render_for_query("code", 15);
+        // If code block is included, it should be complete (have both ``` markers)
+        let backtick_count = rendered.matches("```").count();
+        assert!(
+            backtick_count % 2 == 0,
+            "Code blocks should be complete (even number of ``` markers), got {}",
+            backtick_count
+        );
     }
 }

@@ -7,6 +7,12 @@
 use crate::agent::sub_agent::types::SubAgentToolPolicy;
 use crate::tool::ToolRegistry;
 
+/// Read-only tools allowed by default for sub-agents.
+const READONLY_TOOLS: &[&str] = &["read_file", "grep", "glob", "list_dir"];
+
+/// Web-capable extensions for the read-only set.
+const WEB_TOOLS: &[&str] = &["web_fetch", "web_search"];
+
 /// Build a filtered [`ToolRegistry`] for a sub-agent.
 ///
 /// * `invoke_subagent` is **always** removed (recursive protection).
@@ -25,22 +31,10 @@ pub async fn build_subagent_tools(
     let allowed = match policy {
         SubAgentToolPolicy::None => Vec::new(),
         SubAgentToolPolicy::ReadOnly => {
-            vec![
-                "read_file".to_string(),
-                "grep".to_string(),
-                "glob".to_string(),
-                "list_dir".to_string(),
-            ]
+            READONLY_TOOLS.iter().map(|s| s.to_string()).collect()
         }
         SubAgentToolPolicy::ReadOnlyWithWeb => {
-            vec![
-                "read_file".to_string(),
-                "grep".to_string(),
-                "glob".to_string(),
-                "list_dir".to_string(),
-                "web_fetch".to_string(),
-                "web_search".to_string(),
-            ]
+            READONLY_TOOLS.iter().chain(WEB_TOOLS.iter()).map(|s| s.to_string()).collect()
         }
         SubAgentToolPolicy::Custom(names) => {
             const DESTRUCTIVE: &[&str] = &[
@@ -144,22 +138,10 @@ mod tests {
         let whitelist = match policy {
             SubAgentToolPolicy::None => Vec::new(),
             SubAgentToolPolicy::ReadOnly => {
-                vec![
-                    "read_file".to_string(),
-                    "grep".to_string(),
-                    "glob".to_string(),
-                    "list_dir".to_string(),
-                ]
+                READONLY_TOOLS.iter().map(|s| s.to_string()).collect()
             }
             SubAgentToolPolicy::ReadOnlyWithWeb => {
-                vec![
-                    "read_file".to_string(),
-                    "grep".to_string(),
-                    "glob".to_string(),
-                    "list_dir".to_string(),
-                    "web_fetch".to_string(),
-                    "web_search".to_string(),
-                ]
+                READONLY_TOOLS.iter().chain(WEB_TOOLS.iter()).map(|s| s.to_string()).collect()
             }
             SubAgentToolPolicy::Custom(names) => names.clone(),
         };

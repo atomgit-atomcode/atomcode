@@ -297,15 +297,28 @@ pub(super) fn execute_slash_command(
             renderer.flush();
         }
         "guide" => {
-            let task = if arg.is_empty() {
-                "请介绍 AtomCode 的主要功能和使用方法".to_string()
+            if arg.is_empty() {
+                let menu = "\
+📖 AtomCode 使用指南 — 输入 /guide <问题> 提问
+
+  常用话题：
+    /guide 怎么开始使用          首次安装、登录、配置
+    /guide 怎么切换模型          /model /provider 操作
+    /guide 怎么用 MCP            MCP 服务器配置与管理
+    /guide 怎么用技能和插件       /skills /plugin 使用
+    /guide 怎么用记忆功能         /remember /forget /memory
+    /guide 怎么用后台任务         /bg 后台执行
+    /guide 怎么管理上下文         /compact /context /cost
+    /guide 快捷键有哪些           键盘快捷键参考
+    /guide 怎么配置               config.toml 配置说明";
+                renderer.render(UiLine::CommandOutput(menu.to_string()));
+                renderer.flush();
             } else {
-                arg.to_string()
-            };
-            ctx.agent.cmd_tx.send(AgentCommand::InvokeSubAgent {
-                name: "atomcode-guide".to_string(),
-                task,
-            }).ok();
+                ctx.agent.cmd_tx.send(AgentCommand::InvokeSubAgent {
+                    name: "atomcode-guide".to_string(),
+                    task: arg.to_string(),
+                }).ok();
+            }
         }
         "keys" => {
             // Dump the full keyboard-shortcut reference into scrollback.

@@ -55,7 +55,7 @@ impl Default for SubAgentDefinition {
             tools: SubAgentToolPolicy::ReadOnlyWithWeb,
             knowledge: None,
             max_turns: 8,
-            max_answer_tokens: 800, // ~1600 chars at 2 chars/token (CJK-friendly)
+            max_answer_tokens: 1200, // ~2400 chars at 2 chars/token
             max_knowledge_tokens: 16_000,
             compression_threshold: 0.9,
         }

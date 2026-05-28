@@ -75,6 +75,8 @@ impl SubAgentRunner {
         def: SubAgentDefinition,
         user_task: String,
     ) -> SubAgentOutcome {
+        tracing::info!(subagent = %def.name, task = %user_task, "sub-agent run starting");
+
         // ── 1. Filter tools via the sub-agent's tool policy ────────────
         let filtered_tools = Arc::new(
             build_subagent_tools(&self.parent_tools, &def.tools).await,
@@ -118,15 +120,14 @@ impl SubAgentRunner {
         //   if conversation.estimate_tokens() > ... { ... }
         let _compression_threshold = def.compression_threshold;
 
-        // ── 4. Inject knowledge into system prompt ─────────────────────
-        // Knowledge is appended to the system prompt (not a user message)
-        // so it doesn't accumulate across turns in the conversation loop.
-        let mut system_prompt = def.system_prompt.clone();
+        // ── 4. Inject knowledge as first user message ──────────────────
+        // Placed BEFORE the user task so the model reads the reference
+        // material first, then answers the question.
         if let Some(ref kb) = def.knowledge {
             let kb_text = kb.render_for_query(&user_task, def.max_knowledge_tokens);
+            tracing::debug!(subagent = %def.name, kb_text_len = kb_text.len(), "knowledge injected");
             if !kb_text.is_empty() {
-                system_prompt.push_str("\n\n## 知识库参考\n\n");
-                system_prompt.push_str(&kb_text);
+                conversation.add_user_message(&kb_text);
             }
         }
 
@@ -172,7 +173,7 @@ impl SubAgentRunner {
 
         let _ = self.event_tx.send(AgentEvent::GuideTurnActivity {
             subagent: def.name.clone(),
-            message: "思考中...".to_string(),
+            message: "指南查询中...".to_string(),
         });
 
         // Wall-clock timeout (default 120s). The per-turn LLM calls are
@@ -182,8 +183,11 @@ impl SubAgentRunner {
         tokio::pin!(deadline);
 
         for turn_idx in 0..max_turns {
+            tracing::debug!(turn_idx, max_turns, "sub-agent turn");
+
             // Fast-path cancellation check (non-blocking)
             if self.cancel_token.is_cancelled() {
+                tracing::info!(turns_used, "sub-agent cancelled");
                 return Err(SubAgentError {
                     turns_used,
                     message: "Sub-agent cancelled by user".to_string(),
@@ -196,7 +200,7 @@ impl SubAgentRunner {
             // user interrupts.
             let turn_fut = runner.run(
                 &mut conversation,
-                &system_prompt,
+                &def.system_prompt,
                 &turn_event_tx,
                 self.cancel_token.clone(),
             );
@@ -214,6 +218,7 @@ impl SubAgentRunner {
                     });
                 }
                 _ = &mut deadline => {
+                    tracing::warn!(turns_used, "sub-agent wall-clock timeout");
                     return Err(SubAgentError {
                         turns_used,
                         message: "Wall-clock timeout".to_string(),
@@ -261,10 +266,36 @@ impl SubAgentRunner {
         // ~2 chars/token for mixed CJK+Latin content (vs ~4 for English-only).
         let max_chars = def.max_answer_tokens.saturating_mul(2);
         let truncated = last_text.chars().count() > max_chars;
+        tracing::debug!(chars = last_text.chars().count(), truncated, "sub-agent answer ready");
         let text = if last_text.is_empty() {
-            "抱歉，暂时无法回答此问题。请尝试更具体的提问，或查阅 AtomCode 官方文档。".to_string()
+            "\
+抱歉，暂时无法回答此问题。
+
+你可以试试：
+  /guide 怎么切换模型
+  /guide MCP 怎么配置
+  /guide 怎么用记忆功能
+  /guide 快捷键有哪些
+  /guide 怎么用后台任务
+
+也可以访问文档站：https://atomcode.atomgit.com/docs/zh/"
+                .to_string()
         } else if truncated {
-            last_text.chars().take(max_chars).collect()
+            // Find nearest sentence/paragraph boundary before max_chars
+            // so we don't cut mid-sentence.
+            let end = max_chars.min(last_text.chars().count());
+            let prefix: String = last_text.chars().take(end).collect();
+            let boundary = prefix
+                .rfind(|c: char| c == '。' || c == '\n' || c == '.' || c == '!' || c == '?')
+                .map(|p| p + 1)
+                .unwrap_or(end);
+            let trimmed: String = last_text.chars().take(boundary).collect();
+            let trimmed = trimmed.trim_end().to_string();
+            if trimmed.is_empty() {
+                last_text.chars().take(end).collect()
+            } else {
+                trimmed
+            }
         } else {
             last_text
         };

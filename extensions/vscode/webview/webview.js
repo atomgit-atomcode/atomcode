@@ -73840,13 +73840,16 @@
         };
       // ─── Context files ──────────────────────────────
       case "ADD_CONTEXT_FILE": {
-        if (state.contextFiles.some((f) => f.path === action.file.path)) return state;
+        const isDup = action.file.type === "selection" ? state.contextFiles.some((f) => f.path === action.file.path && f.startLine === action.file.startLine) : state.contextFiles.some((f) => f.path === action.file.path && f.type === "file");
+        if (isDup) return state;
         return { ...state, contextFiles: [...state.contextFiles, action.file] };
       }
       case "REMOVE_CONTEXT_FILE":
         return {
           ...state,
-          contextFiles: state.contextFiles.filter((f) => f.path !== action.path)
+          contextFiles: state.contextFiles.filter(
+            (f) => action.startLine ? !(f.path === action.path && f.startLine === action.startLine) : f.path !== action.path
+          )
         };
       case "CLEAR_CONTEXT":
         return { ...state, contextFiles: [] };
@@ -74122,6 +74125,8 @@
                 fileName: msg.fileName,
                 language: msg.language,
                 selection: msg.selection,
+                startLine: msg.startLine,
+                endLine: msg.endLine,
                 type: msg.selection ? "selection" : "file"
               }
             });
@@ -74146,7 +74151,15 @@
     const send = (0, import_react.useCallback)(
       (text2) => {
         const state2 = stateRef.current;
-        const ctx = stateRef.current.contextFiles.length > 0 ? stateRef.current.contextFiles.map((f) => ({ path: f.path, type: f.type })) : void 0;
+        const ctx = stateRef.current.contextFiles.length > 0 ? stateRef.current.contextFiles.map((f) => ({
+          path: f.path,
+          type: f.type,
+          fileName: f.fileName,
+          language: f.language,
+          selection: f.selection,
+          startLine: f.startLine,
+          endLine: f.endLine
+        })) : void 0;
         const contextFiles = state2.contextFiles;
         const isQueued = state2.isGenerating;
         const clientMessageId = `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -78272,12 +78285,23 @@ ${content}</tr>
           f.path
         )) })
       ] }),
-      state.contextFiles.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "attached-files", children: state.contextFiles.map((f) => /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)("span", { className: "attached-file-pill", title: f.path, children: [
-        f.type === "selection" ? "\u{1F4CB}" : "\u{1F4C4}",
-        " ",
-        f.fileName,
-        /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "pill-close", onClick: () => dispatch({ type: "REMOVE_CONTEXT_FILE", path: f.path }), children: "\xD7" })
-      ] }, f.path)) }),
+      state.contextFiles.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("div", { className: "attached-files", children: state.contextFiles.map((f) => /* @__PURE__ */ (0, import_jsx_runtime14.jsxs)(
+        "span",
+        {
+          className: `attached-file-pill ${f.type === "selection" ? "clickable" : ""}`,
+          title: f.type === "selection" && f.startLine ? `${f.path}:${f.startLine}-${f.endLine}` : f.path,
+          onClick: f.type === "selection" ? () => postMessage({ type: "openFile", path: f.path, startLine: f.startLine, endLine: f.endLine }) : void 0,
+          children: [
+            /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "pill-icon", children: f.type === "selection" ? "\u{1F4CB}" : "\u{1F4C4}" }),
+            /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("span", { className: "pill-name", children: f.type === "selection" && f.startLine ? `${f.fileName}:${f.startLine}-${f.endLine}` : f.fileName }),
+            /* @__PURE__ */ (0, import_jsx_runtime14.jsx)("button", { className: "pill-close", onClick: (e) => {
+              e.stopPropagation();
+              dispatch({ type: "REMOVE_CONTEXT_FILE", path: f.path, startLine: f.startLine });
+            }, children: "\xD7" })
+          ]
+        },
+        f.path + (f.startLine || "")
+      )) }),
       /* @__PURE__ */ (0, import_jsx_runtime14.jsx)(
         "textarea",
         {

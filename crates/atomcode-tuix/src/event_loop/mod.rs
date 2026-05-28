@@ -4831,22 +4831,26 @@ fn handle_idle_key(
             }
         }
         BufferResult::Exit => {
-            // Two-press confirmation: first Ctrl+C on an empty buffer arms
-            // the exit; a second Ctrl+C within the window actually exits.
-            // Any other keystroke (handled above) resets the arming.
-            let now = std::time::Instant::now();
-            let armed = app
-                .exit_pending
-                .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
-            if armed {
-                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
-            } else {
-                app.exit_pending = Some(now);
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
-                ));
-                renderer.flush();
+            // When a guide subagent is running, Ctrl+C on an empty
+            // buffer cancels the guide instead of triggering exit.
+            if app.state.guide_running {
+                ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            } else {
+                let now = std::time::Instant::now();
+                let armed = app
+                    .exit_pending
+                    .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
+                if armed {
+                    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                } else {
+                    app.exit_pending = Some(now);
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
+                    ));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
             }
         }
     }
@@ -6526,15 +6530,10 @@ fn handle_agent_event(
             ));
             renderer.flush();
         }
-        AgentEvent::GuideComplete { subagent, text, truncated, cancelled, .. } => {
+        AgentEvent::GuideComplete { text, truncated, cancelled, .. } => {
             state.guide_running = false;
-            let display = subagent_display_name(&subagent);
-            let status = if cancelled {
-                format!("  ⎿  {} 已取消", display)
-            } else {
-                format!("  ⎿  {} 已完成", display)
-            };
-            renderer.render(UiLine::GuideStatus(status));
+            // Clear the spinner row before showing the answer.
+            renderer.render(UiLine::GuideStatus(String::new()));
             renderer.flush();
             let mut output = text.clone();
             if truncated {
@@ -6542,8 +6541,6 @@ fn handle_agent_event(
             }
             renderer.render(UiLine::GuideResult(output));
             renderer.flush();
-            // Write non-cancelled results into the conversation for
-            // follow-up reference and /resume persistence.
             if !cancelled && !text.is_empty() {
                 let _ = ctx.agent.cmd_tx.send(AgentCommand::InjectGuideResult { text });
             }
