@@ -477,12 +477,44 @@ pub fn needs_compression(
 /// This operates at MESSAGE level, not turn level, because `turn_tracker`
 /// counts user messages (1 user msg = 1 turn) but a single user message
 /// can produce 15+ LLM calls with 35+ messages.
-pub fn build_compression_content(conv: &Conversation) -> (String, usize) {
-    if conv.messages.len() <= KEEP_MESSAGES {
-        return (String::new(), 0);
-    }
+pub fn build_compression_content(conv: &Conversation, keep_ceiling: usize) -> (String, usize) {
+    // Count-based starting cut: compress everything older than the last
+    // KEEP_MESSAGES. `saturating_sub` (not an early `len <= KEEP_MESSAGES`
+    // bail) because that old guard was a pure *message-count* gate — it let
+    // reasoning-heavy thinking sessions sit at <20 messages yet >>window
+    // tokens (the deepseek-v4 overflow). The token-aware loop below now
+    // drives the decision; we bail at the very end only if nothing needs
+    // dropping (compress_end_idx still 0 after the loop).
+    let mut compress_end_idx = conv.messages.len().saturating_sub(KEEP_MESSAGES);
 
-    let mut compress_end_idx = conv.messages.len() - KEEP_MESSAGES;
+    // ── Token-aware keep-floor ──
+    // KEEP_MESSAGES is a *message-count* floor; on reasoning-heavy thinking
+    // models (deepseek-v4 etc.) the kept tail's `reasoning_content` — which
+    // the API requires echoed back in full and which NO reducer condenses —
+    // can alone exceed the window. So advance the cut FORWARD (drop more old
+    // rounds) until the kept tail fits under `keep_ceiling` tokens. We drop
+    // whole rounds (the only API-legal way to shed echoed reasoning), never
+    // strip reasoning from a kept message. Floor: always keep the final round
+    // so the model still sees its latest action.
+    let last_round_start = conv
+        .messages
+        .iter()
+        .rposition(|m| matches!(m.role, Role::User | Role::Assistant))
+        .unwrap_or(0);
+    while compress_end_idx < last_round_start {
+        let tail_tokens: usize = conv.messages[compress_end_idx..]
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum();
+        if tail_tokens <= keep_ceiling {
+            break;
+        }
+        // Advance to the next round boundary (next User/Assistant), bounded
+        // so the final round always survives.
+        compress_end_idx = (compress_end_idx + 1..=last_round_start)
+            .find(|&i| matches!(conv.messages[i].role, Role::User | Role::Assistant))
+            .unwrap_or(last_round_start);
+    }
 
     // ── Pair-preserving snap ──
     // Anthropic API requires every `tool_result` to have its paired
@@ -1428,6 +1460,87 @@ mod tests {
         assert!(matches!(msgs[0].role, Role::System));
     }
 
+    /// FAITHFUL REPRO + regression guard: same single-turn deepseek-v4 scenario,
+    /// but now with
+    /// the real auto-compression cycle (`maybe_compress_history` in
+    /// agent/mod.rs) simulated after every round — Tier1
+    /// (`compact_old_tool_results_in_place`, keep 3) then Tier2
+    /// (`build_compression_content` + `apply_compression`). This answers the
+    /// question the pure-render repro above cannot: does auto-compaction
+    /// keep the payload under the window?
+    ///
+    /// Hypothesis under test: NO. Compaction drains OLD rounds (reasoning and
+    /// all) into the cold zone, but the keep-floor (last KEEP_MESSAGES=20
+    /// messages ≈ 10 rounds) is preserved at full fidelity — and 10 rounds of
+    /// heavy reasoning_content alone exceed the 128K window. If this asserts
+    /// green, the bug is render-only and compaction already protects prod; if
+    /// red, compaction genuinely cannot bound reasoning-heavy single turns.
+    #[test]
+    fn repro_reasoning_overflow_with_auto_compaction() {
+        use crate::tool::{ToolCall, ToolResult};
+
+        // Mirror maybe_compress_history: single pass, Tier1 then Tier2.
+        fn simulate_compress(conv: &mut Conversation, sys_tokens: usize, budget: usize) {
+            if !needs_compression(conv, sys_tokens, budget) {
+                return;
+            }
+            compact_old_tool_results_in_place(conv, 3);
+            if !needs_compression(conv, sys_tokens, budget) {
+                return;
+            }
+            // Mirror Agent::compaction_keep_ceiling (no tool defs in this test):
+            // window − system − cold-zone − output reserve.
+            let cold_zone: usize = conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
+            let output_reserve = (budget / 4).clamp(8_000, 16_384);
+            let keep_ceiling = budget
+                .saturating_sub(sys_tokens)
+                .saturating_sub(cold_zone)
+                .saturating_sub(output_reserve)
+                .max(budget / 4);
+            let (content, n) = build_compression_content(conv, keep_ceiling);
+            if !content.is_empty() && n > 0 {
+                conv.apply_compression(n, content);
+            }
+        }
+
+        let window = 128_000usize;
+        let sys = "sys";
+        let sys_tokens = sys.len() / 4 + 4;
+
+        let mut conv = Conversation::new();
+        conv.add_user_message("read the whole repo and explain the architecture");
+
+        for round in 0..15 {
+            let call = ToolCall {
+                id: format!("call_{}", round),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"file_path":"/src/f_{}.rs"}}"#, round),
+            };
+            conv.add_assistant_tool_calls(
+                Some("looking..."),
+                vec![call],
+                Some(&"思考过程".repeat(10_000)),
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", round),
+                output: "x".repeat(8_000),
+                success: true,
+            });
+            // Auto-compression runs at the TOP of each turn in the real loop.
+            simulate_compress(&mut conv, sys_tokens, window);
+        }
+
+        let (msgs, _stats) = build_messages(&conv, sys, window, "");
+        let total: usize = msgs.iter().map(|m| m.estimate_tokens()).sum();
+
+        assert!(
+            total <= window,
+            "even WITH auto-compaction the payload is {total} tok > {window} \
+             window — the KEEP_MESSAGES=20 keep-floor of reasoning-heavy rounds \
+             can't be compressed (faithful repro of the prod overflow)."
+        );
+    }
+
     /// Regression for the 1M-ctx drop-too-early bug: with `token_budget`
     /// = 1_000_000, a ~200K-token conversation should NOT trigger the
     /// drop-oldest-turns path (200K is comfortably under 80% = 800K).
@@ -2123,8 +2236,11 @@ mod tests {
 
         // Cold zone should have 1 entry
         assert_eq!(conv.cold_summaries.len(), 1);
-        // Messages should be reduced (first 3 turns removed)
-        assert_eq!(conv.turn_tracker.turns.len(), 5); // 8 - 3
+        // Messages reduced, but the first real User message (task 0) is
+        // carved out and preserved by apply_compression's sacred-set logic
+        // (af3d1ac7), so it survives as its own turn alongside tasks 3-7:
+        // task0 + task3,4,5,6,7 = 6 turns (not a clean 8 - 3 = 5).
+        assert_eq!(conv.turn_tracker.turns.len(), 6);
 
         // Budget check: cold zone should appear in output
         let (msgs, _stats) = build_messages(&conv, "sys", 100000, "");
@@ -2863,7 +2979,7 @@ mod tests {
         // Now query the real fn. Fix guarantees the cut index points at
         // a position that is NOT a ToolResult (advanced past trailing
         // ToolResults so no orphan survives).
-        let (_summary, actual_cut) = build_compression_content(&conv);
+        let (_summary, actual_cut) = build_compression_content(&conv, usize::MAX);
 
         if actual_cut < conv.messages.len() {
             let first_survivor = &conv.messages[actual_cut];
@@ -2923,7 +3039,7 @@ mod tests {
             .iter()
             .map(|m| m.estimate_tokens())
             .sum();
-        let (_mechanical_summary, remove_count) = build_compression_content(&conv);
+        let (_mechanical_summary, remove_count) = build_compression_content(&conv, usize::MAX);
         assert!(remove_count > 0, "test conversation should be compressible");
 
         conv.apply_compression(remove_count, "expanded summary ".repeat(2_000));

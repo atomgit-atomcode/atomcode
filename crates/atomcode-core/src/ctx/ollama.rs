@@ -85,10 +85,14 @@ impl CtxBuilder for OllamaCtx {
         crate::ctx::render::needs_compression(conv, system_tokens, self.ctx_window)
     }
 
-    fn compression_plan(&self, conv: &Conversation) -> Option<(String, usize)> {
+    fn compression_plan(
+        &self,
+        conv: &Conversation,
+        keep_ceiling: usize,
+    ) -> Option<(String, usize)> {
         // 决策用的是 self.needs_compression(35% 早触发),
         // plan 内容生成沿用 ctx::render 的 one-line-per-round 机械摘要。
-        let (content, n) = crate::ctx::render::build_compression_content(conv);
+        let (content, n) = crate::ctx::render::build_compression_content(conv, keep_ceiling);
         if content.is_empty() || n == 0 {
             None
         } else {
@@ -270,7 +274,7 @@ mod tests {
     fn compression_plan_none_below_threshold() {
         let o = OllamaCtx::new(&ollama_provider(8_000));
         let conv = Conversation::new();
-        assert!(o.compression_plan(&conv).is_none());
+        assert!(o.compression_plan(&conv, usize::MAX).is_none());
     }
 
     #[test]
