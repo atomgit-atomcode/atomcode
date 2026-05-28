@@ -1010,7 +1010,13 @@ fn truncate_inline(msg: &str, max: usize) -> String {
 /// `90s`, `5m`, `2h 30m`, `3d 4h`. Replaces the previous "{N}s" which
 /// was unreadable for anything past a minute (e.g. "in 86340s" instead
 /// of "in 23h 59m").
-fn format_duration_secs(secs: i64) -> String {
+///
+/// `pub` so the `/status` rendering in atomcode-tuix can share the same
+/// formatter — keeps the `用量 重置于 ...（2h 后）` line consistent
+/// between `/login`'s CodingPlan setup output and `/status`'s
+/// CodingPlan section. (Pre-fix they diverged: setup said `2h`, status
+/// said `5984s`.)
+pub fn format_duration_secs(secs: i64) -> String {
     if secs < 0 {
         return "—".into();
     }

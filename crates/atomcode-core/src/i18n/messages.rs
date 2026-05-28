@@ -143,7 +143,7 @@ pub enum Msg<'a> {
         remaining_days: i32,
         total_days: i32,
     },
-    StatusCpUsage { usage: &'a str, reset_at: &'a str, seconds: i64 },
+    StatusCpUsage { usage: &'a str, reset_at: &'a str, duration: &'a str },
     StatusCpWindowExhausted,
     StatusCpWindowHint { hint: &'a str },
     StatusInstructionFilesHeader,

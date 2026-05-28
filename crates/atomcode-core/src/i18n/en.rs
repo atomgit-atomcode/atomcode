@@ -149,8 +149,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 "  CodingPlan: {}  ·  expires {} ({}d/{}d)\n",
                 plan, expires_at, remaining_days, total_days,
             ).into(),
-        Msg::StatusCpUsage { usage, reset_at, seconds } =>
-            format!("  Usage: {}  ·  resets {} (in {}s)\n", usage, reset_at, seconds).into(),
+        Msg::StatusCpUsage { usage, reset_at, duration } =>
+            format!("  Usage: {}  ·  resets {} (in {})\n", usage, reset_at, duration).into(),
         Msg::StatusCpWindowExhausted =>
             "  ⚠ Current window quota exhausted\n".into(),
         Msg::StatusCpWindowHint { hint } =>
