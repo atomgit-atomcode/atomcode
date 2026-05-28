@@ -382,19 +382,33 @@ impl SetupReport {
                     }
                 } else {
                     // Backward-compat path for old server responses.
-                    if let Some(u) = &s.current_usage {
-                        out.push_str(&t(Msg::CpUsageLine {
-                            usage: &u.display_desc(),
-                            reset_at: &u.reset_at_display,
-                            duration: &format_duration_secs(u.seconds_until_reset),
-                        }));
-                    }
+                    //
+                    // `window_quota_exhausted=true` and `current_usage` are
+                    // independent fields on the legacy response, and the
+                    // server can — and visibly does — set BOTH simultaneously
+                    // (typically `current_usage.usage_status_desc=0%` for a
+                    // freshly-reset short window plus the exhaustion flag for
+                    // a separately-tracked longer window). Rendering both
+                    // produces the contradictory `用量 0% / ⚠额度已满` pair
+                    // the user reported as "v4.23.2 怎么还是这么展示". When
+                    // both fire, the user-actionable message is the
+                    // exhaustion warning; the usage line at 0% reads as
+                    // "you're fine" and just confuses things. Surface the
+                    // warning alone — same precedence the new
+                    // `rate_limit_windows` path already encodes (it picks
+                    // exactly one row per visible window).
                     if s.window_quota_exhausted {
                         if let Some(hint) = &s.window_quota_hint {
                             out.push_str(&t(Msg::CpWindowQuotaHint { hint }));
                         } else {
                             out.push_str(&t(Msg::CpWindowQuotaExhausted));
                         }
+                    } else if let Some(u) = &s.current_usage {
+                        out.push_str(&t(Msg::CpUsageLine {
+                            usage: &u.display_desc(),
+                            reset_at: &u.reset_at_display,
+                            duration: &format_duration_secs(u.seconds_until_reset),
+                        }));
                     }
                 }
             }
