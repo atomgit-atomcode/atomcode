@@ -546,7 +546,7 @@ pub async fn run(
         plugin_job_tx,
         plugin_job_rx,
         pending_new_issue: None,
-        pending_run_codingplan: false,
+        pending_run_login_setup: false,
         pending_open_provider_wizard: false,
         mcp_registry,
         mcp_connect_rx,

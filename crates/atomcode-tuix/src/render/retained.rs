@@ -2213,7 +2213,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // (DarkGrey would vanish on some iTerm2 light presets, default
         // fg unmuted competes with the user's input on dark presets).
         // Slash shortcuts stay accent_bold (cyan) for visual emphasis.
-        // Hint row(s): input prompt + /provider + /codingplan.
+        // Hint row(s): input prompt + /provider + /login.
         //
         // Wide enough to fit on one visual row → emit a single combined
         // line (user's preferred shape on standard 100+ col terminals).
@@ -7394,12 +7394,12 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
 
-        // Welcome fingerprint: `/codingplan` is unique to the welcome
+        // Welcome fingerprint: `/login` is unique to the welcome
         // hint row and is a single non-wrapping token, so it gives a
         // stable single-row marker even when the combined hint line
         // soft-wraps at narrower widths. Must appear exactly once in
         // the *visible* viewport and zero times in scrollback.
-        let hint = "/codingplan";
+        let hint = "/login";
         let visible_count = (0..24)
             .filter(|r| vterm.row_text(*r).contains(hint))
             .count();

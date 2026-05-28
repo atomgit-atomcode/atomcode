@@ -1134,7 +1134,7 @@ impl AgentLoop {
                                 if is_auth_gap {
                                     self.turn_runner.provider = std::sync::Arc::from(
                                         crate::provider::unavailable_provider(format!(
-                                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                                            "Provider 凭证不可用：{}。请使用 /login 完成配置后再试。",
                                             msg
                                         )),
                                     );

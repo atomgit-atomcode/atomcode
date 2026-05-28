@@ -40,8 +40,8 @@ impl CodingPlanWarning {
     /// (e.g. `接口暂不可用`, `当前时间窗口用量约 0%`).
     pub fn display_text(&self) -> String {
         match self {
-            Self::ModelMissing(name) => format!("⚠ '{}' 已下线 — /codingplan", name),
-            Self::StaleList => "ⓘ CodingPlan 模型列表更新 — 可执行/codingplan".into(),
+            Self::ModelMissing(name) => format!("⚠ '{}' 已下线 — /login", name),
+            Self::StaleList => "ⓘ CodingPlan 模型列表更新 — 可执行/login".into(),
         }
     }
 }
@@ -50,7 +50,7 @@ impl CodingPlanWarning {
 /// hit `/coding-plan/models` more than once per this interval within a
 /// single TUI session. Doesn't gate warnings: once a check has run and
 /// drift is detected, the user is told immediately regardless of when
-/// they last ran `/codingplan`. Startup always does one check (the
+/// they last ran `/login`. Startup always does one check (the
 /// in-session `Instant` resets on restart).
 ///
 /// 1 hour is a balance between:
@@ -272,11 +272,11 @@ mod tests {
     fn display_text_format() {
         assert_eq!(
             CodingPlanWarning::ModelMissing("Kimi-K2".into()).display_text(),
-            "⚠ 'Kimi-K2' 已下线 — /codingplan"
+            "⚠ 'Kimi-K2' 已下线 — /login"
         );
         assert_eq!(
             CodingPlanWarning::StaleList.display_text(),
-            "ⓘ CodingPlan 模型列表更新 — 可执行/codingplan"
+            "ⓘ CodingPlan 模型列表更新 — 可执行/login"
         );
     }
 }

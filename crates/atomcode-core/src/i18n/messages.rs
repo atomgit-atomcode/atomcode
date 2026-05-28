@@ -9,14 +9,14 @@ pub enum Msg<'a> {
     WelcomeOptionSkip,
     WelcomeOptionSkipHint,
 
-    // ── /codingplan ──
+    // ── /login (full setup flow) ──
     CodingPlanSetupFailed { error: &'a str },
-    /// Emitted inline by /codingplan and `atomcode codingplan` when the
-    /// stored OAuth token comes back 401 from the CodingPlan API
-    /// mid-flow. We re-run the same OAuth dance `/login` uses, save the
-    /// fresh token, and retry the whole setup once — this line tells
-    /// the user that's what's about to happen so the second
-    /// "Open this URL in any browser…" block isn't a surprise.
+    /// Emitted inline by `/login` and `atomcode login` when the stored
+    /// OAuth token comes back 401 from the CodingPlan API mid-flow.
+    /// We re-run the OAuth dance, save the fresh token, and retry the
+    /// whole setup once — this line tells the user that's what's about
+    /// to happen so the second "Open this URL in any browser…" block
+    /// isn't a surprise.
     CpReauthAfter401,
     /// Emitted by the OpenAI provider when an AtomGit-gateway chat
     /// request returns 401 and our one automatic refresh_token attempt
@@ -143,9 +143,6 @@ pub enum Msg<'a> {
     StatusInstructionFilesHeader,
     StatusInstructionPresent { path: &'a str, label: &'a str },
     StatusInstructionMissing { label: &'a str },
-
-    // ── /login completion ──
-    LoginSignedInWithCpHint { name: &'a str, username: &'a str },
 
     // ── Help / commands ──
     HelpAvailableCommands,
@@ -482,7 +479,6 @@ pub enum Msg<'a> {
 
     // ── Command descriptions (for help_text dynamic lookup) ──
     CmdDescSetup,
-    CmdDescCodingplan,
     CmdDescResume,
     CmdDescRename,
     CmdDescLogin,

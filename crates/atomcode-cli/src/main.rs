@@ -498,7 +498,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Login to AtomCode using AtomGit OAuth
+    /// Sign in with AtomGit OAuth and claim CodingPlan models in one
+    /// flow: OAuth (if needed) → claim → fetch models → register
+    /// providers → fetch status. Reports each step and exits.
     Login,
     /// Logout from AtomCode
     Logout,
@@ -518,9 +520,10 @@ enum Commands {
         /// Full issue URL, e.g. https://atomgit.com/owner/repo/issues/42
         url: String,
     },
-    /// Claim CodingPlan and set up provider/model config from its model list.
-    /// Runs: login (if not already) → claim → fetch models → write providers
-    /// → fetch status. Reports each step and exits.
+    /// Hidden alias for `atomcode login` — kept so existing scripts /
+    /// muscle memory don't break after `/codingplan` and `atomcode
+    /// codingplan` were folded into the unified `/login` flow.
+    #[command(hide = true)]
     Codingplan,
     /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
     #[command(subcommand)]
@@ -844,10 +847,11 @@ async fn run() -> Result<i32> {
     // ── End telemetry init ────────────────────────────────────────────────────
 
     // Handle subcommands. Most are self-contained (`handle_command` runs
-    // and exits); `Login` falls through to the TUI, and `Fixissue` is
-    // like headless `-p` but with the prompt synthesised from a remote
-    // issue payload — so we resolve it here and hand it to the agent
-    // loop via `fixissue_prompt` below.
+    // and exits); `Login` (and its hidden alias `Codingplan`) run the
+    // full OAuth + CodingPlan setup flow and then fall through to the
+    // TUI. `Fixissue` is like headless `-p` but with the prompt
+    // synthesised from a remote issue payload — so we resolve it here
+    // and hand it to the agent loop via `fixissue_prompt` below.
     let mut fixissue_prompt: Option<String> = None;
     // Saved when fixissue is parsed, so after the agent finishes we can
     // POST the summary back to AtomGit as a comment + add the `fixed`
@@ -859,21 +863,14 @@ async fn run() -> Result<i32> {
     let mut force_verbose = false;
     if let Some(cmd) = cli.command {
         match cmd {
-            Commands::Login => {
-                HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let auth = auth::login(Some(&telemetry))?;
-                auth::save_auth(&auth)?;
-                println!("  Login successful! Starting AtomCode...\n");
-                HEADLESS_MODE.store(false, Ordering::Relaxed);
-                // Fall through to TUI startup below
-            }
-            Commands::Codingplan => {
-                // Run the codingplan setup flow, then fall through to TUI
-                // startup regardless of outcome — mirrors `Commands::Login`.
-                // On success the freshly saved config.toml is picked up by
-                // `Config::load` further down. On failure the TUI opens in
-                // onboarding mode (no providers) so the user can retry via
-                // `/codingplan` or `/login` without re-launching the binary.
+            Commands::Login | Commands::Codingplan => {
+                // Unified login flow: OAuth (if needed) → claim → fetch
+                // models → register providers → fetch status. Falls
+                // through to TUI startup regardless of outcome. On
+                // success the freshly saved config.toml is picked up by
+                // `Config::load` further down. On failure the TUI opens
+                // in onboarding mode (no providers) so the user can
+                // retry via `/login` without re-launching the binary.
                 // Emits open_atomcode (mode=headless) then take_codingplan
                 // (emitted internally by run_codingplan_core via coding_plan::run).
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -896,7 +893,7 @@ async fn run() -> Result<i32> {
                         print!("{}", report);
                     }
                     Err(e) => {
-                        eprintln!("codingplan failed: {:#}", e);
+                        eprintln!("login setup failed: {:#}", e);
                     }
                 }
                 println!("\n  Starting AtomCode...\n");
@@ -1077,7 +1074,7 @@ async fn run() -> Result<i32> {
 
     /// Build the placeholder `ProviderConfig` used when no real provider is
     /// available.  The TUI still boots — the Welcome wizard / status-row
-    /// hints nudge the user to `/login` or `/codingplan`, and a successful
+    /// hints nudge the user to `/login`, and a successful
     /// auth flow rebuilds the real provider via `rebuild_provider`.
     fn dummy_provider_config() -> (ProviderConfig, String) {
         (
@@ -1127,7 +1124,7 @@ async fn run() -> Result<i32> {
             Err(e) => {
                 eprintln!(
                     "Warning: could not resolve active provider ({}). \
-                     Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                     Launching TUI in onboarding mode — use /login to set up.",
                     e
                 );
                 dummy_provider_config()
@@ -1146,7 +1143,7 @@ async fn run() -> Result<i32> {
     // Graceful fallback: if provider construction fails because the
     // token is unavailable, swap in the same dummy used on first-run
     // so the TUI boots. The Welcome-wizard / status-row hints will
-    // nudge the user to `/login` or `/codingplan`, and a successful
+    // nudge the user to `/login`, and a successful
     // auth flow rebuilds the real provider via `rebuild_provider`.
     let (provider, model_name) = if let Some(reason) = unavailable_reason {
         (unavailable_provider(reason), model_name)
@@ -1158,12 +1155,12 @@ async fn run() -> Result<i32> {
                 if is_auth_gap_error(&msg) {
                     eprintln!(
                         "Note: provider credentials not available ({}). \
-                         Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                         Launching TUI in onboarding mode — use /login to set up.",
                         msg
                     );
                     (
                         unavailable_provider(format!(
-                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                            "Provider 凭证不可用：{}。请使用 /login 完成配置后再试。",
                             msg
                         )),
                         String::new(),
@@ -1947,13 +1944,11 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
 
     match cmd {
         Commands::Login => {
-            // Pass the telemetry handle through so login() can both stamp the
-            // handle's account_id AND emit login_success. The caller flushes
-            // telemetry on return so the event actually leaves the process.
-            let auth = auth::login(Some(telemetry))?;
-            auth::save_auth(&auth)?;
-            println!("  Login successful! You can now use AtomCode.");
-            Ok(())
+            // `run()` intercepts Login (and its Codingplan alias) before
+            // handle_command is called, running the full OAuth + setup
+            // flow and falling through to the TUI. This arm is
+            // unreachable in normal execution but kept defensive.
+            unreachable!("Login is handled inline in run() before handle_command")
         }
         Commands::Logout => {
             auth::logout()?;
@@ -1997,8 +1992,8 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("Fixissue is handled inline in run() before handle_command")
         }
         Commands::Codingplan => {
-            // `run()` intercepts Codingplan before handle_command is called,
-            // so this arm is effectively unreachable in normal execution.
+            // Hidden alias for Login — `run()` intercepts both before
+            // handle_command is called, so this arm is unreachable.
             unreachable!("Codingplan is handled inline in run() before handle_command")
         }
         Commands::Telemetry { .. } => {
