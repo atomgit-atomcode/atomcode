@@ -40,26 +40,46 @@ const PAD_COL: usize = 2;
 /// Bounded so memory doesn't grow without limit on long sessions.
 pub const MAX_SCROLLBACK_ROWS: usize = 5000;
 
-/// Render context usage as `12.3k / 131k tok` when both used and window
+/// Render context usage as `12.3k/131k tok` when both used and window
 /// are known, or `12.3k tok` when only the used count is known (provider
 /// hasn't reported its window yet, e.g. pre-config or fallback).
+///
+/// Unit ladder is k below 1M and m at/above 1M, so a 1_000_000-token
+/// window reads as `1m` instead of the visually-confusing `1000k`. Round
+/// values stay clean (`1m`, `131k`); non-round values get one decimal
+/// (`1.5m`, `10.4k`).
 fn format_ctx_usage(used: usize, window: usize) -> String {
-    let used_label = if used < 1000 {
-        format!("{}", used)
-    } else {
-        format!("{:.1}k", (used as f64) / 1000.0)
-    };
+    let used_label = format_tok_count(used, /*round_clean=*/ false);
     if window == 0 {
         format!("{} tok", used_label)
     } else {
-        let window_label = if window < 1000 {
-            format!("{}", window)
-        } else if window % 1000 == 0 {
-            format!("{}k", window / 1000)
-        } else {
-            format!("{:.0}k", (window as f64) / 1000.0)
-        };
+        let window_label = format_tok_count(window, /*round_clean=*/ true);
         format!("{}/{} tok", used_label, window_label)
+    }
+}
+
+/// Format a token count using k/m units. `round_clean=true` drops the
+/// decimal when the value is an exact multiple of the unit (used for
+/// the model's advertised window — `128_000` → `128k`, `1_000_000` →
+/// `1m`). `round_clean=false` always emits one decimal at unit scale
+/// (used for the live counter — `10_400` → `10.4k`, `1_500_000` → `1.5m`).
+fn format_tok_count(n: usize, round_clean: bool) -> String {
+    if n >= 1_000_000 {
+        if round_clean && n % 1_000_000 == 0 {
+            format!("{}m", n / 1_000_000)
+        } else {
+            format!("{:.1}m", (n as f64) / 1_000_000.0)
+        }
+    } else if n >= 1000 {
+        if round_clean && n % 1000 == 0 {
+            format!("{}k", n / 1000)
+        } else if round_clean {
+            format!("{:.0}k", (n as f64) / 1000.0)
+        } else {
+            format!("{:.1}k", (n as f64) / 1000.0)
+        }
+    } else {
+        format!("{}", n)
     }
 }
 
@@ -3812,6 +3832,24 @@ mod tests {
     fn ctx_usage_non_round_window_rounds_to_nearest_k() {
         // GLM-5.1 endpoint ships a 131_072 window; we display 131k, not 131.072k.
         assert_eq!(format_ctx_usage(50_000, 131_072), "50.0k/131k tok");
+    }
+
+    #[test]
+    fn ctx_usage_million_window_renders_as_m_not_thousand_k() {
+        // 1m-context models would previously show `1000k`, mixing k/m in
+        // the user's head and burning width on a leading zero parade.
+        // Round million → bare `1m`; non-round million → one-decimal `1.5m`.
+        assert_eq!(format_ctx_usage(1_400, 1_000_000), "1.4k/1m tok");
+        assert_eq!(format_ctx_usage(50_000, 2_000_000), "50.0k/2m tok");
+        assert_eq!(format_ctx_usage(50_000, 1_500_000), "50.0k/1.5m tok");
+    }
+
+    #[test]
+    fn ctx_usage_used_above_one_million_uses_m_unit() {
+        // Long-running sessions on a 1m window can park `used` above 1M;
+        // keep one decimal so the counter still moves visibly turn-to-turn.
+        assert_eq!(format_ctx_usage(1_200_000, 1_000_000), "1.2m/1m tok");
+        assert_eq!(format_ctx_usage(2_500_000, 0), "2.5m tok");
     }
 
     fn caps_with_color() -> TerminalCaps {
