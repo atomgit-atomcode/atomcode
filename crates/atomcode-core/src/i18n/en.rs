@@ -14,9 +14,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeOptionSkip => "Skip for now".into(),
         Msg::WelcomeOptionSkipHint => "explore first".into(),
 
-        // ── /codingplan ──
+        // ── /login (full setup flow) ──
         Msg::CodingPlanSetupFailed { error } =>
-            format!("codingplan setup failed: {error}").into(),
+            format!("/login setup failed: {error}").into(),
         Msg::CpReauthAfter401 =>
             "  ⚠ Stored login expired — re-authenticating...\n".into(),
         Msg::ChatAuthExpired =>
@@ -35,13 +35,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CpAlreadyClaimed { reason } =>
             format!("  ✓ CodingPlan already claimed — {}\n", reason).into(),
         Msg::CpClaimFailed { error } =>
-            format!("  × CodingPlan claim failed — {}\n", error).into(),
+            format!("  × CodingPlan tier setup failed — {}\n", error).into(),
+        Msg::CpClaimFailedBare =>
+            "  × CodingPlan tier setup failed\n".into(),
         Msg::CpClaimTierSucceeded { tier } =>
-            format!("  ✓ CodingPlan {} claimed\n", tier).into(),
+            format!("  ✓ CodingPlan {} active\n", tier).into(),
         Msg::CpClaimTierAlreadyHeld { tier } =>
-            format!("  ✓ CodingPlan {} already claimed\n", tier).into(),
+            format!("  ✓ CodingPlan {} active\n", tier).into(),
         Msg::CpClaimTierFailed { tier, reason } =>
-            format!("  × CodingPlan {} claim failed — {}\n", tier, reason).into(),
+            format!("  × CodingPlan {} tier setup failed — {}\n", tier, reason).into(),
         Msg::CpAddedProviders { count, plural_s } =>
             format!("  ✓ Added {} provider{}:\n", count, plural_s).into(),
         Msg::CpLocked { name } =>
@@ -94,7 +96,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
              https://atomgit.com/atomgit_atomcode/atomcode/releases.",
         ),
         Msg::CpAuthRequired => Cow::Borrowed(
-            "Not signed in to AtomCode CodingPlan. Run /codingplan to log in \
+            "Not signed in to AtomCode CodingPlan. Run /login to sign in \
              before sending a request.",
         ),
         Msg::CpSignStaleClockSkew => Cow::Borrowed(
@@ -137,11 +139,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
                 model, dir, config, tokens,
             ).into(),
         Msg::StatusCpNotSignedIn =>
-            "  CodingPlan: (not signed in — run /codingplan to set up)\n".into(),
+            "  CodingPlan: (not signed in — run /login to set up)\n".into(),
         Msg::StatusCpFetchFailed { error } =>
             format!("  CodingPlan: (status fetch failed — {})\n", error).into(),
         Msg::StatusCpNoActive =>
-            "  CodingPlan: (no active plan — run /codingplan)\n".into(),
+            "  CodingPlan: (no active plan — run /login)\n".into(),
         Msg::StatusCpLine { plan, expires_at, remaining_days, total_days } =>
             format!(
                 "  CodingPlan: {}  ·  expires {} ({}d/{}d)\n",
@@ -159,13 +161,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("    ✓ {} ({})\n", path, label).into(),
         Msg::StatusInstructionMissing { label } =>
             format!("    × {} — not found\n", label).into(),
-
-        // ── /login completion ──
-        Msg::LoginSignedInWithCpHint { name, username } =>
-            format!(
-                "  Signed in as {} ({}). You can chat now; run /codingplan to sync the latest model access.\n",
-                name, username,
-            ).into(),
 
         // ── Help ──
         Msg::HelpAvailableCommands =>
@@ -351,11 +346,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "to add a custom model".into(),
         Msg::IdleHintProviderFull =>
             "/provider  to add a custom model".into(),
-        Msg::IdleHintCodingplan => "/codingplan".into(),
+        Msg::IdleHintCodingplan => "/login".into(),
         Msg::IdleHintCodingplanSuffix =>
             "to claim a free token quota".into(),
         Msg::IdleHintCodingplanFull =>
-            "/codingplan  to claim a free token quota".into(),
+            "/login  to claim a free token quota".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
@@ -690,11 +685,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── Command descriptions ──
 Msg::CmdDescSetup =>
 "Scan project, install seeds, and run setup skill [hooks|mcp|skills|all]".into(),
-        Msg::CmdDescCodingplan =>
-            "Claim CodingPlan + set up models from the plan's model list".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),
         Msg::CmdDescRename => "Rename current session".into(),
-        Msg::CmdDescLogin => "Sign in with AtomGit OAuth".into(),
+        Msg::CmdDescLogin => "Sign in with AtomGit OAuth and claim CodingPlan models".into(),
         Msg::CmdDescLogout => "Sign out of AtomGit".into(),
         Msg::CmdDescWhoami => "Show current logged-in user".into(),
         Msg::CmdDescModel => "Switch provider / model".into(),

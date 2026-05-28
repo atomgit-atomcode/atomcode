@@ -23,7 +23,6 @@ use crate::render::{Renderer, UiLine};
 use crate::state::{AgentMode, UiState};
 use anyhow::Result;
 use atomcode_core::agent::AgentCommand;
-use atomcode_core::config::provider::ProviderConfig;
 use atomcode_core::config::Config;
 use atomcode_core::conversation::Conversation;
 use atomcode_core::session::{Session, SessionId, SessionManager};
@@ -160,8 +159,9 @@ fn sync_bg_foreground(ctx: &mut LoopCtx) {
 
 // Historical note: there was a `const OAUTH_PROVIDER_NAME = "AtomGit"`
 // and a `build_oauth_provider` helper here. Both are owned by
-// `coding_plan::setup` now — `/login` is identity-only, provider
-// registration is the job of `/codingplan`.
+// `coding_plan::setup` now — `/login` runs the full CodingPlan
+// orchestrator (claim + model list + provider registration), so there
+// is no need for a separately maintained hardcoded fallback provider.
 
 /// Maximum length for a session name.
 pub const MAX_SESSION_NAME_LEN: usize = 100;
@@ -721,9 +721,6 @@ pub(super) fn execute_slash_command(
         }
         "login" => {
             run_login_flow(renderer, ctx)?;
-        }
-        "codingplan" => {
-            run_codingplan_flow(renderer, ctx)?;
         }
         "logout" => {
             // /logout only invalidates the OAuth token on disk.
@@ -2364,6 +2361,12 @@ fn render_codingplan_status_for_status_cmd() -> String {
         } else {
             out.push_str(&t(Msg::StatusCpWindowExhausted));
         }
+    } else if let Some(u) = &status.current_usage {
+        out.push_str(&t(Msg::StatusCpUsage {
+            usage: &u.display_desc(),
+            reset_at: &u.reset_at_display,
+            seconds: u.seconds_until_reset,
+        }));
     }
     out
 }
@@ -3091,7 +3094,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
 /// (input box stays visible). The subsequent `coding_plan::run` call
 /// then sees `is_logged_in() == true` and skips its own `auth::login`
 /// path — that path prints to stdout and is reserved for CLI callers.
-pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
+pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Phase 1: pre-flight login if needed.
     if !atomcode_core::auth::is_logged_in() {
         if let Err(e) = run_oauth_with_renderer(renderer, ctx)
@@ -3182,7 +3185,7 @@ pub(crate) fn run_codingplan_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx
                     *g = None;
                 }
                 ctx.monitor_last_check_at = None;
-                // Same for usage slot — a fresh /codingplan run may have
+                // Same for usage slot — a fresh /login run may have
                 // rotated the quota window or switched plan tiers.
                 if let Ok(mut g) = ctx.usage_slot.lock() {
                     *g = None;

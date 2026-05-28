@@ -93,11 +93,44 @@ impl Tool for WebSearchTool {
             "--max-time", "15",
             "-L", // follow redirects
         ]);
+        // SIGKILL the curl child when this tool future is dropped (e.g.
+        // because the outer select! picked its `cancel.cancelled()`
+        // branch on Ctrl+C). Without this, tokio's default leaves the
+        // child running and `output().await` can leave the runtime
+        // task structurally Pending until curl finishes on its own.
+        cmd.kill_on_drop(true);
 
         // On Windows, prevent the spawned curl.exe from creating a visible console window.
         crate::process_utils::suppress_console_window(&mut cmd);
 
-        let output = cmd.output().await;
+        crate::ctrace!("TOOL", "web_search before cmd.output().await query={:?}", parsed.query);
+        // tokio-level hard timeout (20s) on top of curl's own `--max-time 15`.
+        // Belt-and-suspenders: if curl somehow doesn't honour its flag (DNS
+        // wedge, broken pipe edge cases, child-reap stuck), the tokio future
+        // still returns within 20s instead of hanging the agent indefinitely
+        // — matches web_fetch's reqwest::timeout(20s) backstop.
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            cmd.output(),
+        )
+        .await
+        {
+            Ok(r) => {
+                crate::ctrace!("TOOL", "web_search after cmd.output().await is_ok={}", r.is_ok());
+                r
+            }
+            Err(_) => {
+                crate::ctrace!("TOOL", "web_search tokio timeout (20s) fired");
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!(
+                        "Search timed out after 20s for '{}'. Network may be unreachable or DuckDuckGo is slow — try a different query or use web_fetch on a known URL.",
+                        parsed.query
+                    ),
+                    success: false,
+                });
+            }
+        };
 
         let html = match output {
             Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),

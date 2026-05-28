@@ -170,43 +170,67 @@ impl SetupReport {
         }
 
         // Step 2: claim. When `claim_attempts` is populated (production
-        // path), emit one row per tier so refused / errored
-        // intermediates are visible alongside the winner. When empty
+        // path), emit one row per *successful* tier — refused / errored
+        // intermediates (e.g. "Max 套餐尚未开放") are suppressed so the
+        // happy-path output collapses to a single "Pro 生效" line. If
+        // no tier succeeded, fall through to a single failure row using
+        // `self.claim` so the user still gets a signal. When empty
         // (login-cascade suppression OR legacy test fixtures), fall
-        // back to a single summary row from `self.claim` — preserves
-        // pre-refactor test semantics without churning every fixture.
+        // back to the legacy single-row path.
         if !self.claim_attempts.is_empty() {
+            let mut any_success = false;
             for attempt in &self.claim_attempts {
                 let tier = attempt.tier.as_str();
                 match &attempt.outcome {
                     TierOutcome::Claimed { .. } => {
                         out.push_str(&t(Msg::CpClaimTierSucceeded { tier }));
+                        any_success = true;
                     }
                     TierOutcome::AlreadyHeld { .. } => {
                         out.push_str(&t(Msg::CpClaimTierAlreadyHeld { tier }));
+                        any_success = true;
                     }
-                    TierOutcome::Refused { message } => {
-                        let reason = if message.is_empty() {
-                            // Server returned success=false +
-                            // duplicate=false with no message — surface
-                            // a placeholder so the row isn't a
-                            // confusing "claim failed — " with nothing
-                            // after the em-dash.
-                            "(no reason given)"
-                        } else {
-                            message.as_str()
-                        };
-                        out.push_str(&t(Msg::CpClaimTierFailed { tier, reason }));
+                    TierOutcome::Refused { .. } | TierOutcome::Errored { .. } => {
+                        // Silently skipped — failures in the
+                        // tier cascade are noise once any other tier
+                        // succeeds, and even an all-fail run gets one
+                        // consolidated row below instead of three.
                     }
-                    TierOutcome::Errored { error } => {
-                        // 5xx / transport / parse — same "claim
-                        // failed" glyph as Refused; the message is
-                        // the error text (truncated so a stack
-                        // trace doesn't blow up the row).
-                        let reason = truncate_inline(error, 150);
-                        out.push_str(&t(Msg::CpClaimTierFailed {
-                            tier,
-                            reason: &reason,
+                }
+            }
+            if !any_success {
+                if let StepResult::Err(msg) = &self.claim {
+                    // Pick the freshest non-empty source for the body:
+                    // overall Err first, then walk attempts in reverse
+                    // so the last tier's server message wins. Avoids a
+                    // dangling `— ` when the overall Err was scrubbed
+                    // empty by the cascade builder.
+                    let body = if !msg.is_empty() {
+                        msg.clone()
+                    } else {
+                        self.claim_attempts
+                            .iter()
+                            .rev()
+                            .find_map(|a| match &a.outcome {
+                                TierOutcome::Refused { message } if !message.is_empty() => {
+                                    Some(format!("{}: {}", a.tier.as_str(), message))
+                                }
+                                TierOutcome::Errored { error } if !error.is_empty() => {
+                                    Some(format!("{}: {}", a.tier.as_str(), error))
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                    };
+                    if body.is_empty() {
+                        // Truly nothing to say — render the prefix
+                        // without a trailing em-dash body. Edge case:
+                        // every tier responded success=false with no
+                        // message AND no error text.
+                        out.push_str(&t(Msg::CpClaimFailedBare));
+                    } else {
+                        out.push_str(&t(Msg::CpClaimFailed {
+                            error: &truncate_inline(&body, 150),
                         }));
                     }
                 }
@@ -362,19 +386,33 @@ impl SetupReport {
                     }
                 } else {
                     // Backward-compat path for old server responses.
-                    if let Some(u) = &s.current_usage {
-                        out.push_str(&t(Msg::CpUsageLine {
-                            usage: &u.display_desc(),
-                            reset_at: &u.reset_at_display,
-                            duration: &format_duration_secs(u.seconds_until_reset),
-                        }));
-                    }
+                    //
+                    // `window_quota_exhausted=true` and `current_usage` are
+                    // independent fields on the legacy response, and the
+                    // server can — and visibly does — set BOTH simultaneously
+                    // (typically `current_usage.usage_status_desc=0%` for a
+                    // freshly-reset short window plus the exhaustion flag for
+                    // a separately-tracked longer window). Rendering both
+                    // produces the contradictory `用量 0% / ⚠额度已满` pair
+                    // the user reported as "v4.23.2 怎么还是这么展示". When
+                    // both fire, the user-actionable message is the
+                    // exhaustion warning; the usage line at 0% reads as
+                    // "you're fine" and just confuses things. Surface the
+                    // warning alone — same precedence the new
+                    // `rate_limit_windows` path already encodes (it picks
+                    // exactly one row per visible window).
                     if s.window_quota_exhausted {
                         if let Some(hint) = &s.window_quota_hint {
                             out.push_str(&t(Msg::CpWindowQuotaHint { hint }));
                         } else {
                             out.push_str(&t(Msg::CpWindowQuotaExhausted));
                         }
+                    } else if let Some(u) = &s.current_usage {
+                        out.push_str(&t(Msg::CpUsageLine {
+                            usage: &u.display_desc(),
+                            reset_at: &u.reset_at_display,
+                            duration: &format_duration_secs(u.seconds_until_reset),
+                        }));
                     }
                 }
             }
@@ -808,11 +846,13 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>, bool) {
             }
         }
     }
-    let overall = StepResult::Err(if last_msg.is_empty() {
-        "claim failed at every tier (Max/Pro/Lite)".into()
-    } else {
-        format!("claim failed at every tier — {}", last_msg)
-    });
+    // Surface the server's last response message verbatim — already in
+    // the user's language. The render layer wraps it in a localized
+    // prefix (`× CodingPlan 套餐配置失败 — …`), so a hardcoded English
+    // diagnostic wrapper here ("claim failed at every tier — …") would
+    // bleed into zh-CN output. Empty → empty; render guards the dangling
+    // em-dash.
+    let overall = StepResult::Err(last_msg.clone());
     (overall, attempts, false)
 }
 
@@ -1679,11 +1719,12 @@ mod tests {
     }
 
     /// Per-tier cascade rendering: Max refused (额度已满) → Pro
-    /// refused (额度已满) → Lite claimed. Users should see ALL three
-    /// rows so they understand the cascade walked Max → Pro → Lite,
-    /// not just the winner.
+    /// refused (额度已满) → Lite claimed. Only the winning tier
+    /// surfaces — intermediate refusals like "Max 套餐尚未开放" are
+    /// noise once a higher tier succeeds, and users will pay for
+    /// upgrades on the web rather than via the CLI cascade.
     #[test]
-    fn render_per_tier_cascade_shows_every_attempt() {
+    fn render_per_tier_cascade_shows_only_winning_tier() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in as Code_dh".into()),
             claim: StepResult::Ok(ClaimInfo {
@@ -1716,30 +1757,35 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        // Max + Pro must surface as 领取失败 with the actual server
-        // message so users can tell the cascade walked past them
-        // (and why) instead of a single "claim failed: Lite: 额度已满".
+        // Lite must surface as 生效 / active (the winner).
         assert!(
-            out.contains("CodingPlan Max 领取失败 — 额度已满")
-                || out.contains("CodingPlan Max claim failed — 额度已满"),
-            "Max refusal row missing: {}",
-            out
-        );
-        assert!(
-            out.contains("CodingPlan Pro 领取失败 — 额度已满")
-                || out.contains("CodingPlan Pro claim failed — 额度已满"),
-            "Pro refusal row missing: {}",
-            out
-        );
-        // Lite must surface as 领取成功 (the winner).
-        assert!(
-            out.contains("CodingPlan Lite 领取成功") || out.contains("CodingPlan Lite claimed"),
+            out.contains("CodingPlan Lite 生效")
+                || out.contains("CodingPlan Lite active"),
             "Lite success row missing: {}",
             out
         );
+        // Max + Pro refusal rows must NOT appear — the cascade
+        // intermediates are suppressed by design ("Max 套餐尚未开放"
+        // was spamming every successful run before this change).
+        assert!(
+            !out.contains("CodingPlan Max"),
+            "Max refusal row must be suppressed: {}",
+            out
+        );
+        assert!(
+            !out.contains("CodingPlan Pro"),
+            "Pro refusal row must be suppressed: {}",
+            out
+        );
+        // 「领取」字样应彻底消失 — neither successes nor failures
+        // should still carry the old claim wording.
+        assert!(
+            !out.contains("领取"),
+            "no '领取' wording should remain in rendered output: {}",
+            out
+        );
         // The legacy single-line summary must NOT appear when
-        // claim_attempts is populated — would be a duplicate "claimed
-        // Lite" row.
+        // claim_attempts is populated — would be a duplicate row.
         assert!(
             !out.contains("CodingPlan claimed"),
             "legacy claim-summary row must be suppressed when per-tier rows present: {}",
@@ -1748,13 +1794,16 @@ mod tests {
     }
 
     /// Per-tier cascade where every tier refused — winning tier is
-    /// `None`, overall claim is `Err`. Each refused tier still gets
-    /// its own row.
+    /// `None`, overall claim is `Err`. Per-tier failure rows are
+    /// suppressed; a single consolidated failure line surfaces so the
+    /// user still gets a signal that no plan was activated.
     #[test]
     fn render_per_tier_cascade_all_refused() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Err("claim failed at every tier — Lite: 暂无开放".into()),
+            // Bare server message — no English wrapper. Mirrors the
+            // new try_claim_with_cascade() output shape.
+            claim: StepResult::Err("Lite: 暂无开放".into()),
             claim_attempts: vec![
                 TierAttempt {
                     tier: PlanType::Max,
@@ -1780,23 +1829,29 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        // All three tier rows present with the 暂无开放 message.
+        // No per-tier failure rows — `Max/Pro/Lite` strings must not
+        // appear anywhere in the output.
         for tier in &["Max", "Pro", "Lite"] {
-            let zh = format!("CodingPlan {} 领取失败 — 暂无开放", tier);
-            let en = format!("CodingPlan {} claim failed — 暂无开放", tier);
+            let needle = format!("CodingPlan {}", tier);
             assert!(
-                out.contains(&zh) || out.contains(&en),
-                "{} refusal row missing: {}",
+                !out.contains(&needle),
+                "{} tier row must be suppressed in all-refused case: {}",
                 tier,
                 out
             );
         }
-        // Overall claim is Err but with claim_attempts populated, the
-        // legacy "✗ CodingPlan claim failed — ..." summary line is
-        // suppressed (per-tier rows already explain the failure).
+        // 「领取」字样应彻底消失.
         assert!(
-            !out.contains("claim failed at every tier"),
-            "legacy err-summary row must not appear: {}",
+            !out.contains("领取"),
+            "no '领取' wording should remain in rendered output: {}",
+            out
+        );
+        // BUT we must still emit a single consolidated failure line so
+        // the user knows the step didn't succeed — driven by the
+        // overall `claim` Err falling through to CpClaimFailed.
+        assert!(
+            out.contains("CodingPlan 套餐配置失败") || out.contains("CodingPlan tier setup failed"),
+            "consolidated failure row must appear when no tier succeeds: {}",
             out
         );
         // Models row also suppressed (cascade sentinel).
@@ -1807,13 +1862,13 @@ mod tests {
         );
     }
 
-    /// Per-tier cascade where Max errored (5xx). `Errored` and
-    /// `Refused` both render as `领取失败` with the message — same
-    /// visual to the user, same cause from their POV. Make sure the
-    /// error text gets truncated so a long stack trace doesn't blow
+    /// Per-tier cascade where Max errored (5xx). Per-tier failure
+    /// rows are suppressed, but the overall `claim` Err falls through
+    /// to a single consolidated failure line — and that line must
+    /// truncate a long error so a 500-char stack trace doesn't blow
     /// up the row.
     #[test]
-    fn render_per_tier_cascade_with_errored_tier_truncates_long_message() {
+    fn render_all_errored_consolidated_row_truncates_long_message() {
         let long_err = "x".repeat(500);
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
@@ -1829,17 +1884,69 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        // The Max row is present with 领取失败.
+        // No per-tier "Max" row.
         assert!(
-            out.contains("CodingPlan Max 领取失败 —")
-                || out.contains("CodingPlan Max claim failed —"),
-            "Max errored row missing: {}",
+            !out.contains("CodingPlan Max"),
+            "per-tier Max row must be suppressed: {}",
+            out
+        );
+        // Consolidated failure row is present (driven by claim Err).
+        assert!(
+            out.contains("CodingPlan 套餐配置失败") || out.contains("CodingPlan tier setup failed"),
+            "consolidated failure row must appear: {}",
             out
         );
         // The full 500-char error must NOT appear verbatim — truncated.
         assert!(
             !out.contains(&long_err),
             "long error must be truncated, not pasted whole: {}",
+            out
+        );
+    }
+
+    /// All-fail with no server detail anywhere — overall Err is empty
+    /// AND every TierAttempt has empty message/error. Render must
+    /// emit the bare-prefix variant (no dangling `— `).
+    #[test]
+    fn render_all_failed_with_no_detail_uses_bare_prefix() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Err(String::new()),
+            claim_attempts: vec![
+                TierAttempt {
+                    tier: PlanType::Max,
+                    outcome: TierOutcome::Refused {
+                        message: String::new(),
+                    },
+                },
+                TierAttempt {
+                    tier: PlanType::Pro,
+                    outcome: TierOutcome::Refused {
+                        message: String::new(),
+                    },
+                },
+                TierAttempt {
+                    tier: PlanType::Lite,
+                    outcome: TierOutcome::Refused {
+                        message: String::new(),
+                    },
+                },
+            ],
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: false,
+        };
+        let out = report.render();
+        // Prefix renders.
+        assert!(
+            out.contains("CodingPlan 套餐配置失败") || out.contains("CodingPlan tier setup failed"),
+            "bare failure prefix must appear: {}",
+            out
+        );
+        // No dangling em-dash — body is empty so the suffix is skipped.
+        assert!(
+            !out.contains("套餐配置失败 — ") && !out.contains("tier setup failed — "),
+            "must not render `— ` with empty body: {:?}",
             out
         );
     }
@@ -1902,7 +2009,7 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        assert!(out.contains("× CodingPlan claim failed"));
+        assert!(out.contains("× CodingPlan tier setup failed"));
         assert!(out.contains("今日codingplan申请额度已满"));
         // The cascade rows must NOT appear.
         assert!(

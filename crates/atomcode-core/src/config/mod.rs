@@ -600,7 +600,7 @@ impl Config {
                 .min()
                 .map(String::as_str)
                 .ok_or_else(|| {
-                    anyhow::anyhow!("No providers configured — run /codingplan or /provider")
+                    anyhow::anyhow!("No providers configured — run /login or /provider")
                 })
         };
         let name: &str = if name.is_empty() { fallback()? } else { name };

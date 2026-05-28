@@ -302,7 +302,6 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
     use crate::i18n::{t, Msg};
     let msg = match name {
         "setup" => Msg::CmdDescSetup,
-        "codingplan" => Msg::CmdDescCodingplan,
         "resume" => Msg::CmdDescResume,
         "rename" => Msg::CmdDescRename,
         "login" => Msg::CmdDescLogin,

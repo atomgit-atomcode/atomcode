@@ -28,9 +28,11 @@
 //     resume-from-external, resize, and any "terminal state is
 //     unknown" situation uniformly.
 //
-//   * **Cursor and visibility** are frame-level state, emitted once
-//     per diff at the tail of the patch stream, so they don't
-//     bounce around between cell writes.
+//   * **Cursor and visibility** are frame-level state. Visibility is
+//     hidden at the head of the diff and restored at the tail; cursor
+//     position parks at the tail. Never interleaved with cell writes,
+//     so the caret can't be seen jumping across the screen between
+//     patches. Frames that emit no work skip the wrap entirely.
 
 use std::io::Write as _;
 
@@ -181,7 +183,8 @@ impl Screen {
     /// the next draw cycle starts clean — callers must re-draw
     /// every widget every frame (retained-mode invariant).
     pub fn render_diff(&mut self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut body = Vec::new();
+        let cold_start = self.physical_dirty;
         if self.physical_dirty {
             // Cold-start the physical terminal: per-row CUP+EL across
             // every screen row, then `\x1b[H` to home. The subsequent
@@ -196,16 +199,34 @@ impl Screen {
             // for the trailing columns and emits no patch, so the
             // stale glyphs survive.
             let h = self.cells.len();
-            out.reserve(h * 8 + 4);
+            body.reserve(h * 8 + 4);
             for row in 1..=h {
-                let _ = write!(&mut out, "\x1b[{};1H\x1b[K", row);
+                let _ = write!(&mut body, "\x1b[{};1H\x1b[K", row);
             }
-            out.extend_from_slice(b"\x1b[H");
+            body.extend_from_slice(b"\x1b[H");
             self.physical_dirty = false;
         }
         let patches = diff_cell_frames(&self.prev_cells, &self.cells);
         let patch_bytes = serialize_patches(&patches);
-        out.extend_from_slice(&patch_bytes);
+        body.extend_from_slice(&patch_bytes);
+        // Anti-flicker wrap around any frame that moves the caret.
+        // `serialize_patches` walks the cursor across every changed
+        // cell via CUP+glyph; the next frame parks it back at the
+        // input prompt. With DECTCEM on throughout, on streaming
+        // bodies the user perceives the caret zooming across the
+        // screen at 50fps and snapping back — looks like the input
+        // box is "blinking". `?25l` at frame start keeps the caret
+        // invisible during the patch walk; DECSET 2026 (synchronized
+        // output) lets capable hosts — Windows Terminal, iTerm2,
+        // kitty, wezterm, alacritty — defer paint until the whole
+        // patch lands, hiding intermediate state entirely. Older
+        // terminals ignore unknown DEC private modes per spec.
+        let has_visible_work = cold_start || !patch_bytes.is_empty();
+        let mut out = Vec::with_capacity(body.len() + 32);
+        if has_visible_work {
+            out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+        }
+        out.extend_from_slice(&body);
         if let Some((r, c)) = self.cursor {
             let _ = write!(&mut out, "\x1b[{};{}H", r, c);
         }
@@ -213,6 +234,9 @@ impl Screen {
             out.extend_from_slice(b"\x1b[?25h");
         } else {
             out.extend_from_slice(b"\x1b[?25l");
+        }
+        if has_visible_work {
+            out.extend_from_slice(b"\x1b[?2026l");
         }
         std::mem::swap(&mut self.prev_cells, &mut self.cells);
         // Clear the new scratch. Without this, stale cells from
@@ -229,9 +253,16 @@ impl Screen {
     /// unknown. Safe to call even when prev is already blank
     /// (just produces no additional emit).
     pub fn invalidate(&mut self) {
-        let blank_row = vec![Cell::blank(); self.width as usize];
+        // Sentinel (not Cell::blank) so the next diff sees EVERY cell as
+        // changed — including positions where both the stale frame and
+        // the upcoming next frame happen to hold default-style spaces.
+        // The blank-match-blank suppression was the leak source for the
+        // win10 + pwsh7 + zh_CN char-doubling bug: direct-write left
+        // stale glyphs at columns the diff then declined to repaint.
+        // See `Cell::sentinel` for the full write-up.
+        let sentinel_row = vec![Cell::sentinel(); self.width as usize];
         for row in &mut self.prev_cells {
-            *row = blank_row.clone();
+            *row = sentinel_row.clone();
         }
         // Mark physical state unknown so the next render_diff begins
         // with a cold-start per-row CUP+EL — see `Screen::physical_dirty`
@@ -257,10 +288,18 @@ impl Screen {
     /// the diff cache to match what the caller already told the
     /// terminal to do.
     pub fn invalidate_rows_from(&mut self, start_row: usize) {
-        let blank_row = vec![Cell::blank(); self.width as usize];
+        // Sentinel — see `invalidate` and `Cell::sentinel` for why this
+        // is NOT `Cell::blank`. This is the main hot path for the bug:
+        // every push_body_row → emit_body_line_inner direct-write hits
+        // this. With Cell::blank prev, the follow-up cell-diff treated
+        // a row of `   X   Y   ` as "only patch X and Y, the spaces
+        // already match" — letting stale wide-char right-halves from a
+        // 1-col-off direct-write linger. Sentinel forces every column
+        // through the diff, including the spaces.
+        let sentinel_row = vec![Cell::sentinel(); self.width as usize];
         let h = self.prev_cells.len();
         for r in start_row.min(h)..h {
-            self.prev_cells[r] = blank_row.clone();
+            self.prev_cells[r] = sentinel_row.clone();
         }
     }
 
@@ -283,10 +322,16 @@ impl Screen {
             return;
         }
         let n = n.min(h);
-        let blank_row = vec![Cell::blank(); self.width as usize];
+        // Sentinel for the freed-by-scroll rows — same reasoning as the
+        // other invalidate paths. The caller just told the terminal "LF
+        // at the bottom row" which promoted the top into native
+        // scrollback and left the bottom slot blank; we sentinel-fill
+        // that slot so the next render_diff repaints every cell of it,
+        // not just the non-space ones.
+        let sentinel_row = vec![Cell::sentinel(); self.width as usize];
         self.prev_cells.rotate_left(n);
         for row_idx in (h - n)..h {
-            self.prev_cells[row_idx] = blank_row.clone();
+            self.prev_cells[row_idx] = sentinel_row.clone();
         }
     }
 
@@ -548,5 +593,61 @@ mod tests {
         let bytes = s.render_diff();
         let out = String::from_utf8_lossy(&bytes);
         assert!(out.contains("\x1b[2;5H"), "cursor park missing: {:?}", out);
+    }
+
+    /// Frames with cell work get wrapped in DECSET 2026 + DECTCEM
+    /// hide/show so the caret doesn't visibly bounce across the screen
+    /// during the patch walk. Empty frames skip the wrap to avoid
+    /// wasting bytes on terminals that don't need it.
+    #[test]
+    fn nonempty_frame_wraps_in_sync_output_and_hides_cursor() {
+        let mut s = Screen::new(10, 3);
+        let mut cells = Vec::new();
+        push_str_cells(&mut cells, "x", &CellStyle::default());
+        s.draw_row(0, 0, &cells);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        // BSU/ESU wrap exists and order is correct.
+        let bsu = out.find("\x1b[?2026h").expect("BSU present");
+        let esu = out.find("\x1b[?2026l").expect("ESU present");
+        assert!(bsu < esu, "BSU must precede ESU: {:?}", out);
+        // Hide-cursor sits immediately after BSU, before any cell write.
+        assert!(
+            out.starts_with("\x1b[?2026h\x1b[?25l"),
+            "frame must open with BSU+hide: {:?}",
+            out
+        );
+        // Visibility restored before ESU.
+        assert!(
+            out.ends_with("\x1b[?25h\x1b[?2026l"),
+            "frame must close with show+ESU: {:?}",
+            out
+        );
+        // Cell content lands inside the wrap.
+        let x_pos = out.find('x').expect("x rendered");
+        assert!(bsu < x_pos && x_pos < esu, "cell write must sit inside wrap: {:?}", out);
+    }
+
+    #[test]
+    fn empty_frame_skips_sync_output_wrap() {
+        let mut s = Screen::new(10, 3);
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(!out.contains("\x1b[?2026h"), "no BSU on empty frame: {:?}", out);
+        assert!(!out.contains("\x1b[?2026l"), "no ESU on empty frame: {:?}", out);
+        assert!(!out.contains("\x1b[?25l"), "no hide on empty frame: {:?}", out);
+    }
+
+    /// Invalidate triggers a cold-start CUP+EL walk across every row —
+    /// the cursor moves a lot. That work must also be wrapped in the
+    /// sync/hide envelope.
+    #[test]
+    fn invalidate_cold_start_is_wrapped() {
+        let mut s = Screen::new(10, 3);
+        s.invalidate();
+        let bytes = s.render_diff();
+        let out = String::from_utf8_lossy(&bytes);
+        assert!(out.starts_with("\x1b[?2026h\x1b[?25l"), "cold-start frame must open with BSU+hide: {:?}", out);
+        assert!(out.ends_with("\x1b[?25h\x1b[?2026l"), "cold-start frame must close with show+ESU: {:?}", out);
     }
 }
