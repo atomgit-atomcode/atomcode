@@ -56,6 +56,8 @@ export interface ContextFile {
   fileName: string;
   language?: string;
   selection?: string;
+  startLine?: number;
+  endLine?: number;
   type: 'file' | 'selection';
 }
 
@@ -147,7 +149,7 @@ export type ChatAction =
   | { type: 'SET_SESSIONS'; sessions: SessionMeta[] }
   | { type: 'SET_ACTIVE_SESSION'; sessionId?: string; projectHash?: string }
   | { type: 'ADD_CONTEXT_FILE'; file: ContextFile }
-  | { type: 'REMOVE_CONTEXT_FILE'; path: string }
+  | { type: 'REMOVE_CONTEXT_FILE'; path: string; startLine?: number }
   | { type: 'CLEAR_CONTEXT' }
   | { type: 'TOGGLE_HISTORY' }
   | { type: 'TOGGLE_SETTINGS' }
@@ -190,7 +192,7 @@ export type ExtensionMessage =
   | { type: 'setupWorking'; message: string }
   | { type: 'codingPlanResult'; result: { success: boolean; report_text: string } }
   | { type: 'setupError'; message: string }
-  | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string }
+  | { type: 'context'; filePath: string; fileName: string; selection?: string; language?: string; startLine?: number; endLine?: number }
   | { type: 'permissionRequest'; id: string; toolName: string; args: string; isDestructive: boolean }
   | { type: 'resumeStreaming' }
   | { type: 'setDraft'; text: string };

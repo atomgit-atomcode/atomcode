@@ -215,9 +215,23 @@ export function InputArea() {
         {state.contextFiles.length > 0 && (
           <div className="attached-files">
             {state.contextFiles.map((f) => (
-              <span key={f.path} className="attached-file-pill" title={f.path}>
-                {f.type === 'selection' ? '📋' : '📄'} {f.fileName}
-                <button className="pill-close" onClick={() => dispatch({ type: 'REMOVE_CONTEXT_FILE', path: f.path })}>×</button>
+              <span
+                key={f.path + (f.startLine || '')}
+                className={`attached-file-pill ${f.type === 'selection' ? 'clickable' : ''}`}
+                title={f.type === 'selection' && f.startLine
+                  ? `${f.path}:${f.startLine}-${f.endLine}`
+                  : f.path
+                }
+                onClick={f.type === 'selection' ? () => postMessage({ type: 'openFile', path: f.path, startLine: f.startLine, endLine: f.endLine }) : undefined}
+              >
+                <span className="pill-icon">{f.type === 'selection' ? '📋' : '📄'}</span>
+                <span className="pill-name">
+                  {f.type === 'selection' && f.startLine
+                    ? `${f.fileName}:${f.startLine}-${f.endLine}`
+                    : f.fileName
+                  }
+                </span>
+                <button className="pill-close" onClick={(e) => { e.stopPropagation(); dispatch({ type: 'REMOVE_CONTEXT_FILE', path: f.path, startLine: f.startLine }); }}>×</button>
               </span>
             ))}
           </div>

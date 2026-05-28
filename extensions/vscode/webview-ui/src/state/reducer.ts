@@ -388,14 +388,22 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     // ─── Context files ──────────────────────────────
     case 'ADD_CONTEXT_FILE': {
-      if (state.contextFiles.some((f) => f.path === action.file.path)) return state;
+      // For selections, use path+startLine as unique key; for files, use path only
+      const isDup = action.file.type === 'selection'
+        ? state.contextFiles.some((f) => f.path === action.file.path && f.startLine === action.file.startLine)
+        : state.contextFiles.some((f) => f.path === action.file.path && f.type === 'file');
+      if (isDup) return state;
       return { ...state, contextFiles: [...state.contextFiles, action.file] };
     }
 
     case 'REMOVE_CONTEXT_FILE':
       return {
         ...state,
-        contextFiles: state.contextFiles.filter((f) => f.path !== action.path),
+        contextFiles: state.contextFiles.filter((f) =>
+          action.startLine
+            ? !(f.path === action.path && f.startLine === action.startLine)
+            : f.path !== action.path
+        ),
       };
 
     case 'CLEAR_CONTEXT':
