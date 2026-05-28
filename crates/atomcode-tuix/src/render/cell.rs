@@ -137,7 +137,7 @@ pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
             }
             continue;
         }
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        let w = crate::width::cell_char_width(ch).unwrap_or(1);
         if w == 0 {
             // Zero-width (combining marks, control chars). Caller has
             // already scrubbed real controls; skip here rather than
@@ -213,7 +213,7 @@ pub fn push_str_cells_sgr(
             }
             continue;
         }
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        let w = crate::width::cell_char_width(ch).unwrap_or(1);
         if w == 0 {
             continue;
         }

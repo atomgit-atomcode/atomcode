@@ -1,6 +1,69 @@
 // crates/atomcode-tuix/src/width.rs
+use std::sync::OnceLock;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
+
+/// One-shot CJK-locale probe. On CJK locales, terminal hosts render East
+/// Asian Ambiguous characters (◆ ○ ⓘ ✓ × → • etc.) at 2 cols instead of
+/// `unicode-width`'s default 1 col. If our cell model uses 1 col but the
+/// terminal renders at 2 cols, every char after the first non-ASCII shifts
+/// one column left in the terminal vs the model, and the `emit_body_line`
+/// direct-write leaves orphaned cells the cell-diff doesn't repaint —
+/// visible as the `加加\`\``再按按nter` style char-duplication seen on
+/// Windows + pwsh7 + native conhost with a zh_CN-cp936 system locale.
+///
+/// Detection: `ATOMCODE_CJK_WIDTH=1` forces on, `=0` forces off, otherwise
+/// LC_ALL/LANG starting with `zh`/`ja`/`ko`/`yue` votes yes (POSIX hosts),
+/// and on Windows we additionally accept the system ACP being a CJK code
+/// page (936/950/932/949) since pwsh on Win10 conhost typically leaves
+/// LC_ALL/LANG unset.
+fn is_cjk_locale() -> bool {
+    static CJK: OnceLock<bool> = OnceLock::new();
+    *CJK.get_or_init(|| {
+        if let Ok(v) = std::env::var("ATOMCODE_CJK_WIDTH") {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        let locale = std::env::var("LC_ALL")
+            .ok()
+            .or_else(|| std::env::var("LANG").ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if locale.starts_with("zh")
+            || locale.starts_with("ja")
+            || locale.starts_with("ko")
+            || locale.starts_with("yue")
+        {
+            return true;
+        }
+        // Windows: pwsh / cmd inherit no LANG, but the console ACP is set by
+        // the system locale. CJK ACPs: 936 zh-CN, 950 zh-TW, 932 ja-JP, 949
+        // ko-KR. Check via GetACP — no need for GetConsoleOutputCP, ACP is
+        // what the system reports as its "native" code page.
+        #[cfg(target_os = "windows")]
+        unsafe {
+            extern "system" {
+                fn GetACP() -> u32;
+            }
+            matches!(GetACP(), 936 | 950 | 932 | 949)
+        }
+        #[cfg(not(target_os = "windows"))]
+        false
+    })
+}
+
+/// Display width of a single code point as our cells should model it. Wraps
+/// `UnicodeWidthChar::width`/`width_cjk` and picks the CJK variant when
+/// [`is_cjk_locale`] votes yes so East Asian Ambiguous codepoints (`◆`,
+/// `○`, `ⓘ`, `✓`, `×`, …) report 2 cols — matching what the user's
+/// terminal actually paints. Keeping model and host on the same width
+/// rule is what stops the direct-write / cell-diff drift described above.
+pub(crate) fn cell_char_width(ch: char) -> Option<usize> {
+    if is_cjk_locale() {
+        UnicodeWidthChar::width_cjk(ch)
+    } else {
+        UnicodeWidthChar::width(ch)
+    }
+}
 
 /// Display width of a single user-perceived character (grapheme cluster).
 ///
@@ -31,10 +94,10 @@ pub(crate) fn cluster_width(g: &str) -> usize {
         return 0;
     };
     if iter.clone().next().is_none() {
-        return UnicodeWidthChar::width(first).unwrap_or(0);
+        return cell_char_width(first).unwrap_or(0);
     }
     let mut has_emoji_marker = false;
-    let mut max_w = UnicodeWidthChar::width(first).unwrap_or(0);
+    let mut max_w = cell_char_width(first).unwrap_or(0);
     for c in std::iter::once(first).chain(iter) {
         match c {
             '\u{200D}' | '\u{FE0F}' => has_emoji_marker = true,
@@ -42,7 +105,7 @@ pub(crate) fn cluster_width(g: &str) -> usize {
             '\u{1F1E6}'..='\u{1F1FF}' => has_emoji_marker = true,
             _ => {}
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = cell_char_width(c).unwrap_or(0);
         if w > max_w {
             max_w = w;
         }

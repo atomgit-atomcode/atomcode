@@ -1274,7 +1274,7 @@ fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
         if acc >= target_col {
             return i;
         }
-        acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        acc += crate::width::cell_char_width(ch).unwrap_or(0);
     }
     line.len()
 }

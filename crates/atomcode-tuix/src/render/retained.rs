@@ -141,7 +141,7 @@ fn parse_markdown_to_cells(s: &str) -> Vec<Vec<Cell>> {
             lines.push(Vec::new());
             continue;
         }
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        let w = crate::width::cell_char_width(c).unwrap_or(1);
         if w == 0 {
             continue;
         }
