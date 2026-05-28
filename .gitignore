@@ -2,6 +2,9 @@
 /target
 /runs
 
+# npm package: build artifacts
+packages/npm/*.tgz
+
 .env/
 
 # Git worktrees (used by superpowers:using-git-worktrees)
@@ -83,3 +86,6 @@ crates/atomcode-codingplan-crypto/
 scripts/build-official.sh
 build-official.sh
 build-official-vscode.sh
+
+# git worktrees
+.worktrees/
