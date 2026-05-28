@@ -4468,6 +4468,15 @@ fn handle_idle_key(
                 renderer.render(UiLine::User(committed.clone()));
                 app.buf.text.clear();
                 app.buf.cursor = 0;
+                // Mirror the regular-message and queued-message paths
+                // below: pushing the just-submitted line into `ctx.history`
+                // is what Up-arrow recall reads from. Without this, a
+                // slash command executed from the menu vanishes from
+                // history the moment it runs.
+                ctx.history.push(crate::input::history::HistoryEntry {
+                    text: committed.clone(),
+                    images: Vec::new(),
+                });
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
                     if cmd.eq_ignore_ascii_case("paste") {
                         // `/paste` needs `&mut app.buf` to insert the
@@ -4673,6 +4682,14 @@ fn handle_idle_key(
                 // Slash commands carry no image markers — echo the
                 // user line as-typed, before dispatch.
                 renderer.render(UiLine::User(line.clone()));
+                // Push into the Up-arrow recall buffer so the just-typed
+                // command isn't lost the moment it executes. Mirrors the
+                // regular-message branch below; History::push dedups
+                // against the previous entry and ignores empty text.
+                ctx.history.push(crate::input::history::HistoryEntry {
+                    text: line.clone(),
+                    images: Vec::new(),
+                });
                 if cmd.eq_ignore_ascii_case("paste") {
                     // See `handle_paste_command` — short-circuited
                     // here because the dispatcher signature can't
