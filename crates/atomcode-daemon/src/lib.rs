@@ -12,6 +12,7 @@ mod api_config;
 mod api_provider;
 mod telemetry_scope;
 pub mod auth_token;
+pub mod permission_bridge;
 pub mod webui;
 
 pub(crate) use telemetry_scope::daemon_scope;
@@ -253,6 +254,8 @@ pub struct AppState {
     pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
     /// 本地 webui 一次性 token 存储（Phase 1）
     pub webui_tokens: auth_token::WebuiTokenStore,
+    /// webui 交互式权限：session_id -> decider response 发送端
+    pub pending_permissions: permission_bridge::PermissionResponders,
 }
 
 /// Cached MCP registry for a specific project directory.
@@ -2810,6 +2813,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         last_activity: last_activity.clone(),
         active_connections: active_connections.clone(),
         webui_tokens: webui_tokens.unwrap_or_default(),
+        pending_permissions: permission_bridge::PermissionResponders::new(),
     };
 
     let app = Router::new()
