@@ -2698,7 +2698,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // - children: muted (high-frequency rows, not anchors)
                 // - summary: same fix as header (see Summary arm below)
                 let header_style = self.style_bold(Role::Secondary);
-                let muted = self.style_for(Role::Muted);
+                // Children sit under the bold header. On dark themes
+                // `Role::Muted` is SGR 37 (near-white) — the same tier as the
+                // bold header — so the batch reads flat with no hierarchy.
+                // Render children FAINT on dark to dim them to gray, matching
+                // light theme (DarkGrey children under a black bold header) and
+                // the single tool-call `●` fix.
+                let muted = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
                 let screen_w = self.screen.width();
                 let header_row = build_one_row(&header, &header_style, screen_w);
                 self.push_body_row(header_row);
@@ -2757,7 +2767,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     None => return,
                 };
 
-                let muted = self.style_for(Role::Muted);
+                // Match the initial render: faint on dark for hierarchy.
+                let muted = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
                 let new_row = build_one_row(&new_text, &muted, self.screen.width());
 
                 // Update in-memory.
