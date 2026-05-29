@@ -2809,7 +2809,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.mark_message(crate::render::MarkKind::ToolCall);
                 self.last_mark_was_assistant = false;
                 self.flush_assistant_remainder();
-                let muted = self.style_for(Role::Muted);
+                // Same dark-theme color hierarchy as the `└` result line:
+                // on dark themes `Role::Muted` is SGR 37 (near-white), so the
+                // `●` anchor reads as the same tier as the bold command name
+                // beside it. Render it FAINT on dark to dim it to a gray,
+                // matching light theme (where `●` is DarkGrey against the
+                // black bold name). Light theme keeps the plain muted color.
+                let bullet_style = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
                 let tool_name_style = self.style_bold(Role::ToolName);
                 let safe_name = scrub_controls(&name);
                 let safe_detail = scrub_controls(&detail);
@@ -2821,10 +2831,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // Safety cap: prevent degenerate bodies (e.g. multi-KB bash
                 // commands) from producing hundreds of terminal lines.
                 let body_str = truncate_body_str(&body_str, 500);
-                // only NAME is bolded; retained uses a uniform style
-                // for the tool-call line (acceptable in Phase 4,
-                // tightens in Phase 5/6).
-                let _ = muted;
                 // ● (U+25CF, Geometric Shapes block) replaces the
                 // earlier ▸ (U+25B8). ▸ ships in Cascadia Code / SF
                 // Mono but is missing from Consolas / NSimSun /
@@ -2838,7 +2844,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // model for tool-call entries.
                 self.push_body_prefixed(
                     "● ",
-                    &self.style_for(Role::Muted),
+                    &bullet_style,
                     &body_str,
                     &tool_name_style,
                 );
@@ -2885,7 +2891,21 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 //     failure body) stay readable.
                 //   * error_header / warn_header — line 0 of a failure
                 //     body, see B-discriminated logic below.
-                let summary_style = self.style_for(Role::Muted);
+                // Dark-theme color hierarchy: on dark themes `Role::Muted`
+                // resolves to SGR 37 (near-white), visually indistinct from
+                // the header's default-fg — so the `● ToolName` header and
+                // its `└` result line read as the same tier. Render the
+                // muted hint FAINT on dark so it dims to a gray, restoring
+                // the two-tier look light theme gets for free from
+                // `MUTED_LIGHT` (DarkGrey). Light theme keeps the plain
+                // muted color: DarkGrey is already a readable gray, and
+                // faint-on-DarkGrey would over-dim it.
+                let muted_hint = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
+                let summary_style = muted_hint.clone();
                 let continuation_style = self.style_for(Role::Secondary);
                 let error_header = self.style_bold(Role::Error);
                 let warn_header = self.style_bold(Role::Warning);
@@ -2913,8 +2933,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // Drawing block) ships in every monospace font.
                 let row_w = (self.screen.width() as usize).saturating_sub(PAD_COL + 4);
                 // Muted (dim gray) for the result prefix — visually subordinate
-                // to the tool-call header above (● ToolName).
-                let prefix_style = self.style_for(Role::Muted);
+                // to the tool-call header above (● ToolName). Reuses the
+                // theme-aware `muted_hint` (faint on dark) computed above so
+                // the `└` glyph dims in lockstep with the summary text.
+                let prefix_style = muted_hint;
                 // `└` is a leaf marker for the whole result block, not
                 // a per-line bullet — emit it on the FIRST visual row
                 // only. Continuation rows (both wrap chunks of one
@@ -5859,6 +5881,81 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
         let found = vterm.any_row(|row| row.contains("└") && row.contains("3 files changed"));
         assert!(found, "tool result missing\ndump:\n{}", vterm.dump());
+    }
+
+    /// Dark-theme color hierarchy: the `└` result line (leaf glyph +
+    /// summary metadata) renders FAINT so it reads as subordinate to
+    /// the bold tool-call header above it. On dark themes `Role::Muted`
+    /// resolves to SGR 37 (near-white) which is visually indistinct
+    /// from the header's default-fg; faint dims it to a gray, restoring
+    /// the same two-tier hierarchy light theme gets for free from
+    /// `MUTED_LIGHT` (DarkGrey). The header itself must stay bold and
+    /// NOT faint — it's the prominent tier.
+    #[test]
+    fn retained_tool_result_summary_is_faint_in_dark_theme() {
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let status = status_basic();
+        r.render(UiLine::ToolCall {
+            name: "ListDirectory".into(),
+            detail: ".".into(),
+        });
+        r.render(UiLine::ToolResult {
+            success: true,
+            summary: "3 files changed".into(),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status: status.clone(),
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+
+        // Result line: the `└` glyph and the summary text must be faint.
+        let res_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("└") && vterm.row_text(i).contains("3 files"))
+            .unwrap_or_else(|| panic!("result row missing\ndump:\n{}", vterm.dump()));
+        let arrow_cell = vterm.cell_at(res_idx, 2);
+        assert_eq!(arrow_cell.ch, '└');
+        assert!(
+            arrow_cell.faint,
+            "`└` glyph must be faint in dark theme, got {:?}",
+            arrow_cell,
+        );
+        let summary_col = vterm.row_text(res_idx).find("3 files").unwrap();
+        let summary_cell = vterm.cell_at(res_idx, summary_col);
+        assert!(
+            summary_cell.faint,
+            "summary metadata must be faint in dark theme, got {:?}",
+            summary_cell,
+        );
+
+        // Header line: the `●` anchor must be faint (subordinate tier,
+        // in lockstep with the `└` line), while the tool name must be
+        // bold and NOT faint — the prominent tier.
+        let hdr_idx = (0..vterm.height() as usize)
+            .find(|&i| vterm.row_text(i).contains("ListDirectory"))
+            .unwrap_or_else(|| panic!("header row missing\ndump:\n{}", vterm.dump()));
+        let bullet_col = vterm.row_text(hdr_idx).find('●').unwrap();
+        let bullet_cell = vterm.cell_at(hdr_idx, bullet_col);
+        assert!(
+            bullet_cell.faint,
+            "`●` bullet must be faint in dark theme, got {:?}",
+            bullet_cell,
+        );
+        let name_col = vterm.row_text(hdr_idx).find("ListDirectory").unwrap();
+        let name_cell = vterm.cell_at(hdr_idx, name_col);
+        assert!(name_cell.bold, "tool name must be bold, got {:?}", name_cell);
+        assert!(
+            !name_cell.faint,
+            "tool name must NOT be faint, got {:?}",
+            name_cell,
+        );
     }
 
     /// ToolResult `⎿` glyph sits at col 2 — directly under the tool
