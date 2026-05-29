@@ -44,7 +44,7 @@ use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
-use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
+use atomcode_core::turn::permission::{ApprovalRequest, InteractivePermissionDecider};
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
@@ -1533,6 +1533,17 @@ pub enum ChatEvent {
         tool_calls: usize,
         session_id: String,
     },
+    /// A tool requires user approval. The browser must POST the decision
+    /// back to `/chat/permission` keyed by `session_id`. The decider blocks
+    /// until the decision arrives (or the turn is cancelled).
+    #[serde(rename = "permission_request")]
+    PermissionRequest {
+        session_id: String,
+        tool_name: String,
+        reason: String,
+        call_id: String,
+        arguments: String,
+    },
     /// Chat was stopped by user
     #[serde(rename = "stopped")]
     Stopped,
@@ -1809,6 +1820,7 @@ async fn chat_stream(
     let stopped_sessions = state.stopped_sessions.clone();
     let mcp_cache = state.mcp_cache.clone();
     let telemetry = state.telemetry.clone();
+    let pending_permissions = state.pending_permissions.clone();
 
     // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
     // Use the request's working_dir to detect repo_origin dynamically (not the
@@ -1833,6 +1845,7 @@ async fn chat_stream(
                 stopped_sessions.clone(),
                 mcp_cache,
                 telemetry,
+                pending_permissions,
             )
             .await
             {
@@ -1883,6 +1896,7 @@ async fn process_chat_request(
     stopped_sessions: StoppedSessionsStore,
     mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
+    pending_permissions: permission_bridge::PermissionResponders,
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
@@ -1929,6 +1943,13 @@ async fn process_chat_request(
         // Create new session
         Session::new(working_dir.clone())
     };
+
+    // Key used to route interactive permission decisions back to this turn's
+    // decider. We use the *actual* session id (not req.session_id, which may be
+    // empty for brand-new chats and would collide across concurrent new
+    // sessions). Both the responder registration AND the emitted
+    // `permission_request` SSE event use this same key.
+    let perm_session_key = session.id.to_string();
 
     // Create conversation from session messages
     let conversation = Arc::new(tokio::sync::Mutex::new({
@@ -2050,10 +2071,23 @@ async fn process_chat_request(
 
     let shared_tools = Arc::new(tool_registry);
 
-    // API/daemon mode: no interactive approval channel. All tools (including MCP)
-    // are auto-approved. Users implicitly authorize MCP tools by configuring them
-    // in .mcp.json. This matches the CLI sub-agent behavior (BypassAll).
-    let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
+    // webui/daemon mode: interactive approval bridged over HTTP. The decider
+    // sends an `ApprovalRequest` on `perm_req_tx` (we keep the receiver alive so
+    // `send` succeeds — if it were dropped, EVERY tool would auto-deny) and
+    // blocks on `perm_resp_rx` until the browser POSTs a decision to
+    // `/chat/permission`, which is routed back here via `pending_permissions`.
+    // The user-facing notification is the `TurnEvent::ApprovalRequested` event
+    // forwarded as a `permission_request` SSE event below.
+    let (perm_req_tx, perm_req_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+    let (perm_resp_tx, perm_resp_rx) =
+        tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+    let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
+        atomcode_core::tool::PermissionStore::new(),
+    ));
+    pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
+    let permission =
+        Box::new(InteractivePermissionDecider::new(perm_req_tx, perm_resp_rx, perm_store));
     // Same ctx selection as interactive AgentLoop: walk config.providers
     // for the active provider, fallback to synthetic 128K config if absent.
     let daemon_ctx = match config.providers.get(&config.default_provider) {
@@ -2125,6 +2159,10 @@ async fn process_chat_request(
             tool_calls: 0,
             session_id: session.id.to_string(),
         });
+        // Turn never ran — drop the permission registration and the request
+        // receiver (the decider/perm_req_tx are owned by `turn_runner`, which is
+        // dropped here too).
+        pending_permissions.unregister(&perm_session_key);
         return Ok(());
     }
 
@@ -2136,6 +2174,12 @@ async fn process_chat_request(
 
     // Run turn(s) in background task - may need multiple turns if tools are used
     tokio::spawn(async move {
+        // Keep the ApprovalRequest receiver alive for the entire turn. The
+        // InteractivePermissionDecider (inside turn_runner) sends on the paired
+        // sender; if this receiver were dropped, every `send` would fail and the
+        // decider would auto-deny EVERY tool. We never read from it — the browser
+        // notification comes from the forwarded `TurnEvent::ApprovalRequested`.
+        let _keep_perm_req_rx = perm_req_rx;
         CurrentContext::scope(tel_ctx, || async move {
         let mut conv = conversation_clone.lock().await;
 
@@ -2301,10 +2345,23 @@ async fn process_chat_request(
                 // `ctx.working_dir` was already updated in the tool. Clients
                 // that need the cwd can read it from subsequent tool output.
             }
-            TurnEvent::ApprovalRequested { .. } => {
-                // ApprovalRequested is TUI-only (carries conversation.messages
-                // for /bg session persistence). Daemon mode handles approval
-                // via the PermissionDecider channel directly.
+            TurnEvent::ApprovalRequested {
+                tool_name,
+                reason,
+                call,
+                ..
+            } => {
+                // Notify the browser that a tool needs approval. The decision
+                // round-trips via POST /chat/permission -> pending_permissions
+                // -> the decider's response channel. We drop the big `messages`
+                // field (TUI-only, for /bg session persistence).
+                let _ = event_tx.send(ChatEvent::PermissionRequest {
+                    session_id: perm_session_key.clone(),
+                    tool_name,
+                    reason,
+                    call_id: call.id,
+                    arguments: call.arguments,
+                });
             }
         }
     }
@@ -2345,6 +2402,10 @@ async fn process_chat_request(
         tool_calls: tool_call_count,
         session_id: session.id.to_string(),
     });
+    // Turn finished (the forwarding loop above exits when turn_rx closes, i.e.
+    // when the turn task and its turn_tx are dropped). Drop the permission
+    // registration so it doesn't leak.
+    pending_permissions.unregister(&perm_session_key);
     Ok(())
 }
 
