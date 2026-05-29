@@ -778,7 +778,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
     fn ensure_scroll_region(&mut self) {}
 
     /// Render the guide subagent status line with a spinner frame.
-    /// Replaces the previous GuideStatus row in-place via CUP.
+    /// Replaces the previous GuideStatus row in-place. Updates
+    /// `body_lines` so the next `flush_deferred` tick (≤5ms) paints
+    /// the row through the cell-diff path inside `render_diff`'s
+    /// DECSET 2026 + hide-cursor envelope.
+    ///
+    /// Earlier this function did its own direct stdout write
+    /// (`\x1b[{bottom};1H\x1b[2K` + `serialize_row`) followed by a
+    /// `peek_cursor` CUP to re-anchor the caret. That bypassed the
+    /// BSU envelope entirely, so on hosts that ignore BSU/ESU the
+    /// user saw a per-tick cursor hop from input box to spinner row
+    /// and back, perceived as input-box flicker while the guide
+    /// subagent ran.
     fn render_guide_spinner(&mut self, row: Vec<Cell>) {
         let prev = self.guide_status_rows;
         let inplace_ok = prev > 0 && prev == 1;
@@ -788,18 +799,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
             if bottom >= 1 {
                 let keep = self.body_lines.len().saturating_sub(prev);
                 self.body_lines.truncate(keep);
-                let seq = format!("\x1b[{};1H\x1b[2K", bottom);
-                let _ = self.out.write_all(seq.as_bytes());
-                let bytes = serialize_row(&row);
-                let _ = self.out.write_all(&bytes);
                 self.body_lines.push(row);
-                // Restore cursor to input box so the caret doesn't
-                // blink at end-of-spinner-row between the direct write
-                // and the next flush_deferred tick.
-                if let Some((r, c)) = self.screen.peek_cursor() {
-                    let seq = format!("\x1b[{};{}H", r, c);
-                    let _ = self.out.write_all(seq.as_bytes());
-                }
+                // `render()` sets `self.dirty = true` at end of call;
+                // the next `flush_deferred` tick emits only the
+                // changed cells through the cell-diff path, keeping
+                // the update inside the BSU envelope.
                 return;
             }
         }
@@ -2130,7 +2134,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
     }
 
     fn flush_frame(&mut self) {
-        let bytes = self.screen.render_diff();
+        let mut bytes = self.screen.render_diff();
+        if let Some((r, c)) = self.screen.peek_cursor() {
+            let cup = format!("\x1b[{};{}H", r, c);
+            bytes.extend_from_slice(cup.as_bytes());
+        }
         let _ = self.out.write_all(&bytes);
     }
 
@@ -3117,6 +3125,24 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     return;
                 }
 
+                // Empty text from GuideComplete: clear spinner state so
+                // subsequent non-guide turns route through the normal
+                // spinner / tool-call rendering paths. Without this,
+                // `text.is_empty()` would fall through to the running-
+                // state branch and set `guide_status_text = Some("")`,
+                // causing every future tick to take the guide animation
+                // path and skip tool-call rendering.
+                if text.is_empty() {
+                    self.guide_status_text = None;
+                    let prev = self.guide_status_rows;
+                    if prev > 0 {
+                        let remove = prev.min(self.body_lines.len());
+                        self.body_lines.truncate(self.body_lines.len() - remove);
+                    }
+                    self.guide_status_rows = 0;
+                    return;
+                }
+
                 // Running state: store text for spinner animation, push
                 // initial row immediately (spinner tick will replace it
                 // in-place with the animated frame glyph on each tick).
@@ -3724,7 +3750,16 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 .unwrap_or(0);
             let buf_display_w = crate::width::display_width(&self.input_buf);
             self.paint_frame();
-            let bytes = self.screen.render_diff();
+            let mut bytes = self.screen.render_diff();
+            // Re-anchor cursor: `render_diff`'s trailing DECTCEM
+            // (\x1b[?25h) may obscure the preceding CUP on terminals
+            // like iTerm2 that treat the visibility toggle as a
+            // cursor-position side-effect. Append one extra CUP so it
+            // rides the same chunked write as the rest of the frame.
+            if let Some((r, c)) = self.screen.peek_cursor() {
+                let cup = format!("\x1b[{};{}H", r, c);
+                bytes.extend_from_slice(cup.as_bytes());
+            }
             let emit_len = bytes.len();
             // Chunked emit: Mac Terminal.app has been observed to drop
             // bytes mid-sequence when a single write carries ~1KB+ of
