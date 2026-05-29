@@ -19,6 +19,9 @@ When the knowledge base doesn't cover the user's question, fetch the correspondi
 | sessions, undo | https://atomcode.atomgit.com/docs/en/sessions.html |
 | project instructions, CLAUDE.md | https://atomcode.atomgit.com/docs/en/project-instructions.html |
 | install, login, getting started | https://atomcode.atomgit.com/docs/en/getting-started.html |
+| pricing, cost, price | https://atomcode.atomgit.com/docs/en/getting-started.html |
+| enterprise, deployment, compliance, self-hosted | https://atomcode.atomgit.com/docs/en/configuration.html |
+| audit, logging, code graph, architecture | https://atomcode.atomgit.com/docs/en/basic-usage.html |
 | FAQ | https://atomcode.atomgit.com/docs/en/faq.html |
 | other | https://atomcode.atomgit.com/docs/en/basic-usage.html |
 

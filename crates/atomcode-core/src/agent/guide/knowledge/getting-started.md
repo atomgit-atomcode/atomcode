@@ -1,10 +1,16 @@
 ---
 title: 快速入门
 category: 入门
-keywords: [安装, 登录, 开始, 首次, 初始化, 配置, 入门, 快速, codingplan, 咋用, 咋办, 啥是, 第一次]
+keywords: [安装, 登录, 开始, 首次, 初始化, 配置, 入门, 快速, codingplan, 中文, 零基础, 新手, api key, 咋用, 咋办, 啥是, 第一次]
 ---
 
 # 快速入门
+
+> **AtomCode 完全支持中文**，你可以用中文和 AI 对话，界面也可以切换为中文（`/language` 设置为 `zh_CN`）。
+
+## 什么是 API Key？
+
+API Key 就像一把"钥匙"，让你能使用 AI 模型服务。在 AtomCode 中配置 API Key（在 `~/.atomcode/config.toml` 文件中填写 `api_key` 字段）后，AI 才能响应你的请求。如果你还没有 API Key，可以在你使用的模型服务商（如 AtomGit）网站上申请。
 
 ## 安装
 

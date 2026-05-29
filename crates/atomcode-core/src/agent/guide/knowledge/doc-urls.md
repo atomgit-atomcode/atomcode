@@ -19,6 +19,9 @@ keywords: [文档, 链接, 页面, 网址, 文档站, 帮助页面]
 | 会话、session、撤销 | https://atomcode.atomgit.com/docs/zh/sessions.html |
 | 项目指令、CLAUDE.md | https://atomcode.atomgit.com/docs/zh/project-instructions.html |
 | 安装、登录、开始 | https://atomcode.atomgit.com/docs/zh/getting-started.html |
+| 定价、费用、价格、多少钱 | https://atomcode.atomgit.com/docs/zh/getting-started.html |
+| 企业、部署、合规、私有化 | https://atomcode.atomgit.com/docs/zh/configuration.html |
+| 审计、日志、代码图、架构 | https://atomcode.atomgit.com/docs/zh/basic-usage.html |
 | 常见问题、FAQ | https://atomcode.atomgit.com/docs/zh/faq.html |
 | 其他 | https://atomcode.atomgit.com/docs/zh/basic-usage.html |
 

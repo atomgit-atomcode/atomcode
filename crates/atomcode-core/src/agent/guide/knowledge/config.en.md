@@ -1,7 +1,7 @@
 ---
 title: Configuration Reference
 category: Configuration
-keywords: [config, configuration, settings, model, provider, switch, modify, how, customize, setup, language, error, log, debug, configure, api, key]
+keywords: [config, configuration, settings, model, provider, switch, modify, how, customize, setup, language, error, log, debug, configure, api, key, offline, self-hosted, proxy, enterprise]
 ---
 
 # Configuration Reference

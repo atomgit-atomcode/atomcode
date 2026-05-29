@@ -1,7 +1,7 @@
 ---
 title: AtomCode 概览
 category: 概览
-keywords: [概览, 介绍, 指南, 入门, 使用, 功能, 是什么, 快速开始, 帮助, 安装, 更新, 支持, 系统, 平台, 版本, 终端, 插件, vscode, 快捷键, 键盘, 键位, 日志, 调试, 报错, 错误, 搜索, 钩子, hooks, 思考链, 语言, copilot, 迁移, 术语, token, lsp, mcp, provider, 啥是]
+keywords: [概览, 介绍, 指南, 入门, 使用, 功能, 是什么, 快速开始, 帮助, 安装, 更新, 支持, 系统, 平台, 版本, 终端, 插件, vscode, 快捷键, 键盘, 键位, 日志, 调试, 报错, 错误, 搜索, 钩子, hooks, 思考链, 语言, copilot, 迁移, 术语, token, lsp, mcp, provider, 开源, 社区, 许可证, 免费, 中文, python, windows, 学生, 学习, 啥是]
 ---
 
 # AtomCode 使用指南
@@ -70,6 +70,16 @@ LSP 代码补全支持取决于对应语言服务器是否已安装。
 - 有完整的工作流系统（后台任务、计划模式、worktree 隔离）
 - 可通过 MCP 连接外部工具，通过 Skill/Plugin 扩展能力
 - 费用透明：`/cost` 可查看实时 token 用量和费用
+
+## 定价与版本
+
+AtomCode 是开源免费的工具，无订阅费用。使用云端 AI 模型时，费用由各模型 Provider 按 token 用量收取（通过 `/cost` 可实时查看）。也可通过 Ollama 配置本地模型，完全免费且无需联网。AtomCode 目前没有企业版，所有功能对所有用户开放。
+
+## 社区与支持
+
+- 代码仓库（含 Issue 跟踪）: https://atomgit.com/atomgit_atomcode/atomcode
+- 文档站: https://atomcode.atomgit.com/docs/zh/
+- 在仓库中提交 Issue 获取帮助或报告 bug，也可直接在对话中键入 `/issue`
 
 ## 术语表
 

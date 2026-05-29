@@ -1,10 +1,16 @@
 ---
 title: Getting Started
 category: Getting Started
-keywords: [setup, install, getting, started, first, login, sign, begin, new, how, start, quick, codingplan, initialize, configure]
+keywords: [setup, install, getting, started, first, login, sign, begin, new, how, start, quick, codingplan, initialize, configure, beginner, chinese, api key, free]
 ---
 
 # Getting Started
+
+> **AtomCode fully supports multiple languages.** You can chat with the AI in your preferred language, and switch the UI language with `/language`.
+
+## What is an API Key?
+
+An API Key is like a "key" that lets you access AI model services. After configuring it in `~/.atomcode/config.toml` (the `api_key` field), the AI will be able to respond to your requests. If you don't have one yet, sign up on your model provider's website (e.g., AtomGit) to get an API Key.
 
 ## Installation
 

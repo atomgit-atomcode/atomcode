@@ -1,7 +1,7 @@
 ---
 title: AtomCode Overview
 category: Overview
-keywords: [overview, introduction, guide, getting started, about, atomcode, what, is, help, features, terminal, vscode, plugin, extension, hotkey, keybinding, keyboard, shortcut, log, debug, error, bug, search, grep, hooks, thinking, chain, language, languages, copilot, migrate, migration, glossary, term, token, lsp, mcp, provider]
+keywords: [overview, introduction, guide, getting started, about, atomcode, what, is, help, features, terminal, vscode, plugin, extension, hotkey, keybinding, keyboard, shortcut, log, debug, error, bug, search, grep, hooks, thinking, chain, language, languages, copilot, migrate, migration, glossary, term, token, lsp, mcp, provider, open, source, community, license, free, pricing, chinese, python, windows, student, beginner, learn]
 ---
 
 # AtomCode User Guide
@@ -70,6 +70,16 @@ If you're coming from GitHub Copilot, key differences:
 - Full workflow system (background tasks, planning mode, worktree isolation)
 - Extensible via MCP for external tools, Skill/Plugin for custom behaviors
 - Transparent pricing: `/cost` shows real-time token usage and costs
+
+## Pricing & Versions
+
+AtomCode is open source and free — no subscription fees. Cloud AI model usage is billed by each model Provider based on token consumption (check with `/cost` in real time). You can also configure local models via Ollama for completely free, offline-capable use. There is currently no enterprise edition; all features are available to all users.
+
+## Community & Support
+
+- Repository (with issue tracking): https://atomgit.com/atomgit_atomcode/atomcode
+- Documentation: https://atomcode.atomgit.com/docs/en/
+- Submit issues in the repository for help or bug reports, or type `/issue` directly in a conversation
 
 ## Glossary
 
