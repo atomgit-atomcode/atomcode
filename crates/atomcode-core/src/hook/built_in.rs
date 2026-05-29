@@ -7,8 +7,6 @@
 //! - 错误上报
 //! - 模型响应验证
 
-use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Local;
@@ -100,7 +98,7 @@ impl Hook for TurnStatsHook {
 
 #[async_trait]
 impl OnTurnStartHook for TurnStatsHook {
-    async fn on_turn_start(&self, ctx: &TurnStartContext) -> HookResult {
+    async fn on_turn_start(&self, _ctx: &TurnStartContext) -> HookResult {
         // Turn 开始时记录
         HookResult::Ok
     }
@@ -230,16 +228,11 @@ impl AutoCommitHook {
 /// 在会话结束时生成总结报告
 pub struct SessionSummaryHook {
     pub enabled: bool,
-    /// 会话开始时间
-    start_time: Option<Instant>,
 }
 
 impl SessionSummaryHook {
     pub fn new() -> Self {
-        Self {
-            enabled: true,
-            start_time: None,
-        }
+        Self { enabled: true }
     }
 }
 

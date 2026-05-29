@@ -9,7 +9,6 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::conversation::Conversation;
 use crate::ctx::CtxBuilder;
-use crate::hook::HookEngine;
 use crate::i18n::{t, Msg};
 use crate::provider::LlmProvider;
 use crate::tool::{ToolContext, ToolRegistry};

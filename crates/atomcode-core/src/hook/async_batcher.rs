@@ -105,7 +105,6 @@ pub struct BatchRequest {
 /// 批量发送器
 pub struct AsyncWebhookBatcher {
     config: AsyncWebhookConfig,
-    client: Client,
     /// 事件队列
     event_queue: Arc<Mutex<Vec<WebhookEvent>>>,
     /// 发送通道
@@ -137,7 +136,6 @@ impl AsyncWebhookBatcher {
 
         Self {
             config,
-            client,
             event_queue,
             sender,
             handle: Mutex::new(Some(handle)),

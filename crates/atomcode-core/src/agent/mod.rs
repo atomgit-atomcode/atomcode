@@ -3263,13 +3263,6 @@ impl AgentLoop {
         // --- 统一 TurnComplete Hook (fire-and-forget) ---
         {
             let stop_str = format!("{:?}", stop_reason).to_lowercase();
-            let wd_str = self
-                .turn_runner
-                .context
-                .working_dir
-                .try_read()
-                .map(|g| g.display().to_string())
-                .unwrap_or_default();
             let turn_complete_ctx = crate::hook::TurnCompleteContext {
                 turn_number: self.turn_count as u32,
                 result_type: stop_str,
