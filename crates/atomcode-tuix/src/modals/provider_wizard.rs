@@ -393,18 +393,25 @@ fn handle_key(
                 buf.text.clear();
                 buf.cursor = 0;
 
+                // ── Pre-plan step: Template paste ──
                 if matches!(step, WizardStep::Template) {
-                    // Decide the path and build the question plan.
-                    let new_plan = match resolve_template(
-                        &mut draft,
-                        &answer,
-                        &ctx.config.providers,
-                        renderer,
-                    ) {
-                        TemplateOutcome::Manual => manual_plan(),
-                        TemplateOutcome::Import => import_plan(&draft),
+                    match resolve_template(&mut draft, &answer, &ctx.config.providers, renderer) {
+                        TemplateOutcome::Manual => {
+                            // Manual entry leads with a required Base URL — its
+                            // own pre-plan step, no (x/y) counter.
+                            let new = ProviderWizard::Add {
+                                step: WizardStep::BaseUrl,
+                                draft,
+                                plan: Vec::new(),
+                                idx: 0,
+                            };
+                            if let ProviderWizard::Add { step, draft, .. } = &new {
+                                show_add_step_prompt(*step, draft, 0, 0, buf, state, ctx, &new, renderer);
+                            }
+                            *wizard = new;
+                            return Ok(ModalAction::Continue);
+                        }
                         TemplateOutcome::Retry => {
-                            // Not a recognized template — re-prompt Template.
                             let new = ProviderWizard::Add {
                                 step: WizardStep::Template,
                                 draft,
@@ -418,13 +425,47 @@ fn handle_key(
                             *wizard = new;
                             return Ok(ModalAction::Continue);
                         }
-                    };
-                    let first = new_plan[0];
-                    if matches!(first, WizardStep::Name) {
-                        ensure_name_default(&mut draft, &ctx.config.providers);
+                        // Import: draft pre-filled → fall through to enter the plan.
+                        TemplateOutcome::Import => {}
                     }
-                    let total = new_plan.len();
-                    let new = ProviderWizard::Add { step: first, draft, plan: new_plan, idx: 0 };
+                    ensure_name_default(&mut draft, &ctx.config.providers);
+                    let plan = import_plan(&draft);
+                    let total = plan.len();
+                    let first = plan[0];
+                    let new = ProviderWizard::Add { step: first, draft, plan, idx: 0 };
+                    if let ProviderWizard::Add { step, draft, .. } = &new {
+                        show_add_step_prompt(*step, draft, 0, total, buf, state, ctx, &new, renderer);
+                    }
+                    *wizard = new;
+                    return Ok(ModalAction::Continue);
+                }
+
+                // ── Pre-plan step: manual Base URL (required) ──
+                if matches!(step, WizardStep::BaseUrl) {
+                    let url = answer.trim();
+                    if url.is_empty() {
+                        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderBaseUrlEmpty));
+                        let new = ProviderWizard::Add {
+                            step: WizardStep::BaseUrl,
+                            draft,
+                            plan: Vec::new(),
+                            idx: 0,
+                        };
+                        if let ProviderWizard::Add { step, draft, .. } = &new {
+                            show_add_step_prompt(*step, draft, 0, 0, buf, state, ctx, &new, renderer);
+                        }
+                        *wizard = new;
+                        return Ok(ModalAction::Continue);
+                    }
+                    let ptype = apply_manual_base_url(&mut draft, url, &ctx.config.providers);
+                    push(
+                        renderer,
+                        &crate::i18n::t(crate::i18n::Msg::ProviderTypeInferred { type_name: ptype }),
+                    );
+                    let plan = import_plan(&draft);
+                    let total = plan.len();
+                    let first = plan[0];
+                    let new = ProviderWizard::Add { step: first, draft, plan, idx: 0 };
                     if let ProviderWizard::Add { step, draft, .. } = &new {
                         show_add_step_prompt(*step, draft, 0, total, buf, state, ctx, &new, renderer);
                     }
@@ -667,10 +708,6 @@ fn show_add_step_prompt(
     let body = match step {
         WizardStep::Template => t(Msg::ProviderImportPrompt).into_owned(),
         WizardStep::Name => t(Msg::ProviderStepNameDefault { default: &draft.name }).into_owned(),
-        // Type pre-filled from the Base URL → show it as a default to accept.
-        WizardStep::ProviderType if !draft.provider_type.is_empty() => {
-            t(Msg::ProviderStepTypeWithHint { current: &draft.provider_type }).into_owned()
-        }
         other => step_prompt_text(other, None),
     };
     if matches!(step, WizardStep::Template) || total == 0 {
@@ -749,7 +786,7 @@ fn resolve_template(
     push(
         renderer,
         &t(Msg::ProviderImportParsed {
-            name: &draft.name,
+            base_url: &draft.base_url,
             type_name: ptype,
             model: model_disp,
         }),
@@ -757,18 +794,19 @@ fn resolve_template(
     TemplateOutcome::Import
 }
 
-/// Manual-entry questions, in order. Base URL comes first so the type can be
-/// inferred from it and pre-filled on the Type step (blank Enter accepts it);
-/// a blank Base URL means the type's default and the Type step is answered
-/// from scratch.
-fn manual_plan() -> Vec<WizardStep> {
-    vec![
-        WizardStep::BaseUrl,
-        WizardStep::ProviderType,
-        WizardStep::ApiKey,
-        WizardStep::Model,
-        WizardStep::Name,
-    ]
+/// Apply a manually-entered (required) Base URL: store it, infer + set the
+/// provider type, and seed the name default. Returns the inferred type so the
+/// caller can echo it. After this the manual flow joins `import_plan`.
+fn apply_manual_base_url(
+    draft: &mut DraftProvider,
+    url: &str,
+    existing: &std::collections::HashMap<String, ProviderConfig>,
+) -> &'static str {
+    let ptype = infer_type(url);
+    draft.base_url = url.to_string();
+    draft.provider_type = ptype.to_string();
+    ensure_name_default(draft, existing);
+    ptype
 }
 
 /// Post-import questions: only the gaps the template didn't fill, then the
@@ -817,29 +855,6 @@ fn store_step(
 ) -> StepOutcome {
     let ans = answer.trim();
     match step {
-        WizardStep::ProviderType => {
-            if ans.is_empty() {
-                // Accept the inferred default (set at the Base URL step); only
-                // re-prompt if there's nothing to fall back on.
-                if draft.provider_type.is_empty() {
-                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType));
-                    return StepOutcome::Retry;
-                }
-            } else if !["openai", "claude", "ollama"].contains(&ans) {
-                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType));
-                return StepOutcome::Retry;
-            } else {
-                draft.provider_type = ans.to_string();
-            }
-        }
-        // Blank Base URL is valid — it means "use this type's default". A
-        // non-blank URL pre-fills the type for the next (Type) step.
-        WizardStep::BaseUrl => {
-            draft.base_url = ans.to_string();
-            if !ans.is_empty() {
-                draft.provider_type = infer_type(ans).to_string();
-            }
-        }
         WizardStep::ApiKey => draft.api_key = ans.to_string(),
         WizardStep::Model => {
             if ans.is_empty() {
@@ -856,8 +871,8 @@ fn store_step(
             };
             draft.name = dedupe_name(&chosen, |n| existing.contains_key(n));
         }
-        // Template is handled by resolve_template, never reaches here.
-        WizardStep::Template => {}
+        // Template / Base URL / Type are pre-plan steps, never planned.
+        WizardStep::Template | WizardStep::BaseUrl | WizardStep::ProviderType => {}
     }
     StepOutcome::Ok
 }
@@ -1401,46 +1416,19 @@ chunks = query({
     }
 
     #[test]
-    fn manual_plan_starts_with_base_url() {
-        assert_eq!(
-            manual_plan(),
-            vec![
-                WizardStep::BaseUrl,
-                WizardStep::ProviderType,
-                WizardStep::ApiKey,
-                WizardStep::Model,
-                WizardStep::Name
-            ]
-        );
-    }
-
-    #[test]
-    fn store_step_base_url_infers_type() {
+    fn apply_manual_base_url_infers_type_and_plans_gaps() {
         let mut d = DraftProvider::default();
         let existing = std::collections::HashMap::new();
-        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
-        let out = store_step(&mut d, WizardStep::BaseUrl, "https://api.anthropic.com", &existing, &mut sink);
-        assert_eq!(out, StepOutcome::Ok);
+        let ptype = apply_manual_base_url(&mut d, "https://api.anthropic.com", &existing);
+        assert_eq!(ptype, "claude");
         assert_eq!(d.base_url, "https://api.anthropic.com");
-        assert_eq!(d.provider_type, "claude", "type pre-filled from base_url");
-    }
-
-    #[test]
-    fn store_step_blank_type_keeps_inferred() {
-        let mut d = DraftProvider { provider_type: "openai".into(), ..Default::default() };
-        let existing = std::collections::HashMap::new();
-        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
-        // Empty Enter on the Type step accepts the inferred default.
-        assert_eq!(store_step(&mut d, WizardStep::ProviderType, "", &existing, &mut sink), StepOutcome::Ok);
-        assert_eq!(d.provider_type, "openai");
-    }
-
-    #[test]
-    fn store_step_blank_type_without_inference_retries() {
-        let mut d = DraftProvider::default(); // no inferred type (blank base_url)
-        let existing = std::collections::HashMap::new();
-        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
-        assert_eq!(store_step(&mut d, WizardStep::ProviderType, "", &existing, &mut sink), StepOutcome::Retry);
+        assert_eq!(d.provider_type, "claude");
+        assert_eq!(d.name, "anthropic"); // derived from host
+        // Manual entry never supplies key/model, so both are asked, then Name.
+        assert_eq!(
+            import_plan(&d),
+            vec![WizardStep::ApiKey, WizardStep::Model, WizardStep::Name]
+        );
     }
 
     #[test]
