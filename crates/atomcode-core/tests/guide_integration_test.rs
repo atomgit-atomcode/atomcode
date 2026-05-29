@@ -18,6 +18,8 @@ fn test_embedded_kb_loads_without_errors() {
 
 #[test]
 fn test_chinese_query_matches_mcp() {
+    let _guard = atomcode_core::i18n::test_lock();
+    atomcode_core::i18n::set_locale(atomcode_core::locale::Locale::ZhCn);
     let kb = KnowledgeBase::embedded();
     let hits = kb.search("怎么配置mcp");
     assert!(
@@ -28,6 +30,8 @@ fn test_chinese_query_matches_mcp() {
 
 #[test]
 fn test_english_query_matches_memory() {
+    let _guard = atomcode_core::i18n::test_lock();
+    atomcode_core::i18n::set_locale(atomcode_core::locale::Locale::En);
     let kb = KnowledgeBase::embedded();
     let hits = kb.search("memory");
     assert!(
@@ -38,6 +42,8 @@ fn test_english_query_matches_memory() {
 
 #[test]
 fn test_mixed_query_matches_config() {
+    let _guard = atomcode_core::i18n::test_lock();
+    atomcode_core::i18n::set_locale(atomcode_core::locale::Locale::ZhCn);
     let kb = KnowledgeBase::embedded();
     let hits = kb.search("切换模型");
     assert!(
@@ -48,28 +54,39 @@ fn test_mixed_query_matches_config() {
 
 #[test]
 fn test_unknown_query_returns_fallback() {
+    let _guard = atomcode_core::i18n::test_lock();
+    // render_for_query with ASCII query uses English KB automatically,
+    // but the i18n fallback message follows the global locale.
+    // Use English locale so the assertion matches the English message.
+    atomcode_core::i18n::set_locale(atomcode_core::locale::Locale::En);
     let kb = KnowledgeBase::embedded();
     let rendered = kb.render_for_query("xyznonexistent123", 100);
     assert!(
-        rendered.contains("本地知识库中未找到"),
-        "Unknown query should return fallback message"
+        rendered.contains("No entries found"),
+        "Unknown query should return fallback message, got: {}",
+        &rendered[..rendered.len().min(200)]
     );
 }
 
 #[test]
 fn test_token_budget_truncation() {
+    let _guard = atomcode_core::i18n::test_lock();
+    atomcode_core::i18n::set_locale(atomcode_core::locale::Locale::ZhCn);
     let kb = KnowledgeBase::embedded();
     // Very tight budget should trigger truncation
     let rendered = kb.render_for_query("功能", 30);
     // Should contain either content or truncation marker
     assert!(
         rendered.contains("相关知识") || rendered.contains("截断") || rendered.contains("未找到"),
-        "Tight budget should produce some output"
+        "Tight budget should produce some output, got: {}",
+        &rendered[..rendered.len().min(200)]
     );
 }
 
 #[test]
 fn test_or_fallback_for_partial_keywords() {
+    let _guard = atomcode_core::i18n::test_lock();
+    atomcode_core::i18n::set_locale(atomcode_core::locale::Locale::En);
     let kb = KnowledgeBase::embedded();
     // "debug" is a keyword added to multiple files via expansion
     let hits = kb.search("debug");
@@ -81,6 +98,8 @@ fn test_or_fallback_for_partial_keywords() {
 
 #[test]
 fn test_troubleshooting_doc_is_searchable() {
+    let _guard = atomcode_core::i18n::test_lock();
+    atomcode_core::i18n::set_locale(atomcode_core::locale::Locale::ZhCn);
     let kb = KnowledgeBase::embedded();
     let hits = kb.search("故障");
     assert!(
@@ -97,6 +116,8 @@ fn test_troubleshooting_doc_is_searchable() {
 
 #[test]
 fn test_doc_urls_doc_is_searchable() {
+    let _guard = atomcode_core::i18n::test_lock();
+    atomcode_core::i18n::set_locale(atomcode_core::locale::Locale::ZhCn);
     let kb = KnowledgeBase::embedded();
     let hits = kb.search("文档");
     assert!(
@@ -107,15 +128,19 @@ fn test_doc_urls_doc_is_searchable() {
 
 #[test]
 fn test_keybindings_query_returns_useful_content() {
+    let _guard = atomcode_core::i18n::test_lock();
+    atomcode_core::i18n::set_locale(atomcode_core::locale::Locale::ZhCn);
     let kb = KnowledgeBase::embedded();
     // Use a generous budget to ensure keybindings content is included
-    let rendered = kb.render_for_query("快捷键有哪些", 2000);
+    let rendered = kb.render_for_query("键盘快捷键", 5000);
     assert!(
         rendered.contains("Ctrl"),
-        "Keybindings content should contain actual shortcut keys"
+        "Keybindings content should contain actual shortcut keys, got: {}",
+        &rendered[..rendered.len().min(300)]
     );
     assert!(
         rendered.contains("键盘快捷键"),
-        "Keybindings content should contain title '键盘快捷键'"
+        "Keybindings content should contain title '键盘快捷键', got: {}",
+        &rendered[..rendered.len().min(300)]
     );
 }

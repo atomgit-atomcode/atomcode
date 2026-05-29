@@ -37,7 +37,7 @@ use super::types::*;
 /// 3. Create a fresh [`Conversation`] and inject the user task
 /// 4. Run a turn loop with `CancellationToken` support
 /// 5. Exit early when the model responds with text and no tool calls
-/// 6. Truncate the answer to `max_answer_tokens * 4` chars and return
+/// 6. Truncate the answer to `max_answer_tokens * 2` chars and return
 pub struct SubAgentRunner {
     pub provider: Arc<dyn LlmProvider>,
     pub config: Arc<Config>,

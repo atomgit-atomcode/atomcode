@@ -605,6 +605,12 @@ pub enum Msg<'a> {
     GuideDisplayName,
     /// Guide subagent: truncated indicator shown after guide answer
     GuideTruncatedIndicator,
+    /// invoke_subagent tool: description shown to LLM
+    InvokeSubAgentToolDesc,
+    /// invoke_subagent tool: subagent_name parameter description
+    InvokeSubAgentParamName,
+    /// invoke_subagent tool: task parameter description
+    InvokeSubAgentParamTask,
     /// `/paste` failed because the clipboard holds no image. Shown
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.

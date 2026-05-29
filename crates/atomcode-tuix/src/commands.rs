@@ -103,7 +103,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
-    Command { name: "guide",   desc: "向 atomcode-guide 提问使用方法", needs_args: true },
+    Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
     Command { name: "language", desc: "Switch display language", needs_args: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },

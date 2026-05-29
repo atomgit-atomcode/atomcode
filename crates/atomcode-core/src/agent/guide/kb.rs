@@ -203,23 +203,33 @@ impl KnowledgeBase {
     }
 
     /// Create an embedded KnowledgeBase loaded with English files.
-    fn embedded_en() -> Self {
-        let inner = RwLock::new(Some(Self::load_embedded_for_locale(crate::locale::Locale::En)));
-        Self {
-            inner,
-            base_dir: PathBuf::new(),
-            target_locale: Some(crate::locale::Locale::En),
-        }
+    /// Cached via OnceLock so the knowledge files are parsed only once.
+    fn embedded_en() -> &'static Self {
+        use std::sync::OnceLock;
+        static KB: OnceLock<KnowledgeBase> = OnceLock::new();
+        KB.get_or_init(|| {
+            let inner = RwLock::new(Some(Self::load_embedded_for_locale(crate::locale::Locale::En)));
+            KnowledgeBase {
+                inner,
+                base_dir: PathBuf::new(),
+                target_locale: Some(crate::locale::Locale::En),
+            }
+        })
     }
 
     /// Create an embedded KnowledgeBase loaded with Chinese files.
-    fn embedded_zh() -> Self {
-        let inner = RwLock::new(Some(Self::load_embedded_for_locale(crate::locale::Locale::ZhCn)));
-        Self {
-            inner,
-            base_dir: PathBuf::new(),
-            target_locale: Some(crate::locale::Locale::ZhCn),
-        }
+    /// Cached via OnceLock so the knowledge files are parsed only once.
+    fn embedded_zh() -> &'static Self {
+        use std::sync::OnceLock;
+        static KB: OnceLock<KnowledgeBase> = OnceLock::new();
+        KB.get_or_init(|| {
+            let inner = RwLock::new(Some(Self::load_embedded_for_locale(crate::locale::Locale::ZhCn)));
+            KnowledgeBase {
+                inner,
+                base_dir: PathBuf::new(),
+                target_locale: Some(crate::locale::Locale::ZhCn),
+            }
+        })
     }
 
     fn load_embedded_for_locale(locale: crate::locale::Locale) -> KnowledgeInner {

@@ -792,6 +792,9 @@ Or visit the docs: https://atomcode.atomgit.com/docs/en/".into(),
             format!("[Sub-agent Answer]\n{}\n[Provided by atomcode-guide sub-agent]", text).into(),
         Msg::GuideDisplayName => "Guide".into(),
         Msg::GuideTruncatedIndicator => "\n*(truncated)*".into(),
+        Msg::InvokeSubAgentToolDesc => "Invoke a sub-agent for a specific task. Available: atomcode-guide (answers AtomCode usage questions)".into(),
+        Msg::InvokeSubAgentParamName => "Sub-agent name".into(),
+        Msg::InvokeSubAgentParamTask => "Task description to execute".into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
 
         // ── config save failed ──

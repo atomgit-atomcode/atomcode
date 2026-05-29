@@ -780,6 +780,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("[子代理回答]\n{}\n[以上信息由 atomcode-guide 子代理提供]", text).into(),
         Msg::GuideDisplayName => "指南".into(),
         Msg::GuideTruncatedIndicator => "\n*(已截断)*".into(),
+        Msg::InvokeSubAgentToolDesc => "调用子代理执行特定任务。可用的子代理: atomcode-guide (解答 AtomCode 使用问题)".into(),
+        Msg::InvokeSubAgentParamName => "子代理名称".into(),
+        Msg::InvokeSubAgentParamTask => "要执行的任务描述".into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
 
         // ── 配置保存失败 ──

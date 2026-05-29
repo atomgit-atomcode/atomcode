@@ -48,19 +48,20 @@ impl AgentTool {
 #[async_trait]
 impl Tool for AgentTool {
     fn definition(&self) -> ToolDef {
+        use crate::i18n::{t, Msg};
         ToolDef {
             name: "invoke_subagent",
-            description: "调用子代理执行特定任务。可用的子代理: atomcode-guide (解答 AtomCode 使用问题)".to_string(),
+            description: t(Msg::InvokeSubAgentToolDesc).into_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "subagent_name": {
                         "type": "string",
-                        "description": "子代理名称"
+                        "description": t(Msg::InvokeSubAgentParamName).as_ref()
                     },
                     "task": {
                         "type": "string",
-                        "description": "要执行的任务描述"
+                        "description": t(Msg::InvokeSubAgentParamTask).as_ref()
                     }
                 },
                 "required": ["subagent_name", "task"]
