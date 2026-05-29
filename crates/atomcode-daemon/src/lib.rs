@@ -254,6 +254,9 @@ pub struct AppState {
     pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
     /// 本地 webui 一次性 token 存储（Phase 1）
     pub webui_tokens: auth_token::WebuiTokenStore,
+    /// 仅 webui 模式（启动时提供了 token store）强制 token 鉴权；
+    /// 独立 daemon / VSCode 实例不强制，保持原行为。
+    pub enforce_token: bool,
     /// webui 交互式权限：session_id -> decider response 发送端
     pub pending_permissions: permission_bridge::PermissionResponders,
 }
@@ -2904,6 +2907,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         shutdown_tx: shutdown_tx.clone(),
         last_activity: last_activity.clone(),
         active_connections: active_connections.clone(),
+        enforce_token: webui_tokens.is_some(),
         webui_tokens: webui_tokens.unwrap_or_default(),
         pending_permissions: permission_bridge::PermissionResponders::new(),
     };
@@ -2929,11 +2933,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         // Model API
         .route("/models", get(get_models))
-        // Chat API
-        .route("/chat", post(chat_stream))
+        // Chat API（/chat 与 /chat/permission 为敏感路由，单独套 token 鉴权，见下方 protected）
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
-        .route("/chat/permission", post(chat_permission))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
@@ -2971,6 +2973,17 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         // WebUI static assets + SPA fallback (Task 3/4)
         .route("/", axum::routing::get(webui::serve_webui))
         .fallback(webui::serve_webui)
+        // 敏感 webui 路由：仅 webui 模式（enforce_token=true）强制 token 鉴权；
+        // 独立 daemon/VSCode（enforce_token=false）中间件直接放行（见 auth_token.rs）。
+        .merge(
+            Router::new()
+                .route("/chat", post(chat_stream))
+                .route("/chat/permission", post(chat_permission))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_token::require_webui_token,
+                )),
+        )
         .with_state(state)
         .layer(axum::middleware::from_fn(activity_tracker_middleware))
         .layer(axum::Extension(last_activity.clone()))

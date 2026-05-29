@@ -59,6 +59,10 @@ pub async fn require_webui_token(
     req: axum::extract::Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    if !state.enforce_token {
+        // 独立 daemon / VSCode 实例：不强制 token，保持原行为。
+        return Ok(next.run(req).await);
+    }
     let header = req
         .headers()
         .get(AUTHORIZATION)
