@@ -812,6 +812,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let remove = prev.min(self.body_lines.len());
             self.body_lines.truncate(self.body_lines.len() - remove);
         }
+        // Old spinner rows are gone (truncated above); clear the count so
+        // push_body_row's pop_guide_spinner doesn't also strip content.
+        self.guide_status_rows = 0;
         self.push_body_row(row);
         self.guide_status_rows = 1;
     }
@@ -1644,6 +1647,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
         true
     }
 
+    /// Remove the trailing guide-status (spinner) rows from `body_lines` and
+    /// erase them on screen, so a content push lands where the spinner was
+    /// instead of stranding the spinner in scrollback. Only fires for an
+    /// ACTIVE spinner (`guide_status_text` set) — the frozen `⎿` completion
+    /// marker has `guide_status_text == None` and must persist. The text is
+    /// kept, so the next spinner tick re-renders the row below the new
+    /// content. Returns true if rows were removed.
+    fn pop_guide_spinner(&mut self) -> bool {
+        if self.guide_status_text.is_none() || self.guide_status_rows == 0 {
+            return false;
+        }
+        let remove = self.guide_status_rows.min(self.body_lines.len());
+        if remove > 0 {
+            self.ensure_scroll_region();
+            let bottom = self.body_bottom_row();
+            self.body_lines.truncate(self.body_lines.len() - remove);
+            let first = bottom.saturating_sub(remove as u16) + 1;
+            for i in 0..remove {
+                let r = first + i as u16;
+                let seq = format!("\x1b[{};1H\x1b[2K", r);
+                let _ = self.out.write_all(seq.as_bytes());
+            }
+        }
+        self.guide_status_rows = 0;
+        true
+    }
+
     /// Append a fully-cell-formatted body row to history AND emit it
     /// immediately so it enters terminal scrollback. Trims oldest
     /// `body_lines` when over the retention cap (memory-only — rows
@@ -1691,6 +1721,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // remains armed for source-compat with callers that consult
             // it; its decrement path is now a no-op (kept to avoid a
             // bigger refactor in this combined commit).
+            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
+        }
+        // Same for an active guide spinner: a content push (streamed answer,
+        // markdown, etc.) must take the spinner's slot, not push it down into
+        // scrollback. The spinner re-renders below on its next tick.
+        if self.pop_guide_spinner() {
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
         }
         // Append-only: `next_body_emit_row` checks the cap; emit is
@@ -3248,6 +3284,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     let remove = prev.min(self.body_lines.len());
                     self.body_lines.truncate(self.body_lines.len() - remove);
                 }
+                // Old spinner rows are gone (truncated above); clear the count
+                // so push_body_row's pop_guide_spinner doesn't strip content.
+                self.guide_status_rows = 0;
                 for row in new_rows {
                     self.push_body_row(row);
                 }
@@ -4222,6 +4261,34 @@ mod tests {
 
     fn sample(c: &Arc<AtomicU64>) -> u64 {
         c.load(Ordering::Relaxed)
+    }
+
+    /// Regression: a guide answer streamed while the "Querying guide…"
+    /// spinner is active must NOT strand the spinner row in scrollback.
+    /// The content push pops the spinner (keeping its text so the next tick
+    /// re-renders below) rather than pushing content beneath it.
+    #[test]
+    fn guide_spinner_not_stranded_by_streamed_content() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::GuideStatus("Guide Querying guide… · 1.8s".to_string()));
+        assert!(r.guide_status_rows >= 1, "spinner should occupy a row");
+        assert!(r.guide_status_text.is_some());
+
+        // Streamed answer content arrives while the spinner is still active.
+        r.render(UiLine::GuideResult("hello world".to_string()));
+
+        assert_eq!(
+            r.guide_status_rows, 0,
+            "spinner rows popped before content, not left above it"
+        );
+        assert!(
+            r.guide_status_text.is_some(),
+            "text kept so the next spinner tick re-renders below the content"
+        );
+        let stranded = r.body_lines.iter().any(|row| {
+            row.iter().map(|c| c.ch).collect::<String>().contains("Querying")
+        });
+        assert!(!stranded, "spinner line must not remain in scrollback");
     }
 
     fn status_basic() -> StatusLine {
