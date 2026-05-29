@@ -3086,9 +3086,18 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         pending_permissions: permission_bridge::PermissionResponders::new(),
     };
 
-    let app = Router::new()
+    // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。
+    // 页面必须可加载，SPA 才能读取 ?token= 并在后续 API 调用中携带。
+    let public = Router::new()
         // Health check
         .route("/health", get(health))
+        // WebUI static assets + SPA fallback (Task 3/4)
+        .route("/", axum::routing::get(webui::serve_webui))
+        .fallback(webui::serve_webui);
+
+    // 受保护路由：所有数据/API 端点。仅 webui 模式（enforce_token=true）强制 token 鉴权；
+    // 独立 daemon/VSCode（enforce_token=false）中间件直接放行（见 auth_token.rs）。
+    let protected = Router::new()
         // Shutdown endpoint (R7.1)
         .route("/shutdown", post(shutdown_handler))
         // Session APIs
@@ -3107,9 +3116,13 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         // Model API
         .route("/models", get(get_models))
-        // Chat API（/chat 与 /chat/permission 为敏感路由，单独套 token 鉴权，见下方 protected）
+        // Chat API
+        .route("/chat", post(chat_stream))
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
+        .route("/chat/permission", post(chat_permission))
+        // Filesystem API
+        .route("/fs/list", get(fs_list))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
@@ -3144,21 +3157,13 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/auth/logout", post(api_auth::auth_logout))
         // CodingPlan API (P0)
         .route("/codingplan/setup", post(api_codingplan::codingplan_setup))
-        // WebUI static assets + SPA fallback (Task 3/4)
-        .route("/", axum::routing::get(webui::serve_webui))
-        .fallback(webui::serve_webui)
-        // 敏感 webui 路由：仅 webui 模式（enforce_token=true）强制 token 鉴权；
-        // 独立 daemon/VSCode（enforce_token=false）中间件直接放行（见 auth_token.rs）。
-        .merge(
-            Router::new()
-                .route("/chat", post(chat_stream))
-                .route("/chat/permission", post(chat_permission))
-                .route("/fs/list", get(fs_list))
-                .route_layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    auth_token::require_webui_token,
-                )),
-        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_token::require_webui_token,
+        ));
+
+    let app = public
+        .merge(protected)
         .with_state(state)
         .layer(axum::middleware::from_fn(activity_tracker_middleware))
         .layer(axum::Extension(last_activity.clone()))
