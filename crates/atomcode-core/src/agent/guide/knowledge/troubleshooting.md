@@ -1,7 +1,7 @@
 ---
 title: 故障排除
 category: 帮助
-keywords: [故障, 排除, 问题, 报错, 错误, 不工作, 失败, 无法, 异常, 卡住, 超时, 连接失败, 无响应, 崩溃, 咋办, 怎么办, 日志, 调试]
+keywords: [故障, 排除, 问题, 报错, 错误, 不工作, 失败, 无法, 异常, 卡住, 超时, 连接失败, 无响应, 崩溃, 怎么办, 日志, 调试, 慢, 性能, 用不了, 坏了, 打不开, api]
 ---
 
 # 故障排除指南
@@ -87,4 +87,4 @@ keywords: [故障, 排除, 问题, 报错, 错误, 不工作, 失败, 无法, �
 如果以上方案都无法解决问题:
 1. 使用 `/guide <具体问题描述>` 获取针对性帮助
 2. 访问文档站: https://atomcode.atomgit.com/docs/zh/
-3. 提交 Issue: https://github.com/anthropics/claude-code/issues
+3. 提交 Issue: 使用 `/issue` 命令提交 bug 或功能请求

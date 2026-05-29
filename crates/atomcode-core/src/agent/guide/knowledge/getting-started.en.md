@@ -12,6 +12,12 @@ AtomCode supports macOS, Linux, Windows, and HarmonyOS.
 
 After installation, start by typing `atomcode` in your terminal.
 
+**Installation methods**:
+- **macOS**: `brew install atomcode`
+- **Linux**: Download binary or use `curl -fsSL https://atomcode.atomgit.com/install.sh | bash`
+- **Windows**: Download `.msi` installer
+- **Docker**: `docker run -it --rm -v $(pwd):/workspace atomcode/atomcode:latest`
+
 ## First Use
 
 ### /setup — Setup Wizard
@@ -21,7 +27,7 @@ For first-time users, run `/setup` to automatically install default skill packag
 If you have a CodingPlan account, `/codingplan` can configure your model list with one click.
 
 ### /login — Sign In
-Use AtomGit OAuth to sign in and unlock cloud features.
+Use AtomGit OAuth to sign in and unlock cloud features. Login credentials (OAuth Token) are stored encrypted locally, never in plain text. Use `/logout` to revoke the login at any time.
 
 ### /welcome — Re-run Onboarding
 You can re-run the onboarding wizard at any time.

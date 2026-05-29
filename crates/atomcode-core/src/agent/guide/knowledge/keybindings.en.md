@@ -1,7 +1,7 @@
 ---
 title: Keyboard Shortcuts
 category: Reference
-keywords: [keyboard, shortcut, hotkey, keybinding, key, binding, keys, hotkeys, keybindings, how, press]
+keywords: [keyboard, shortcut, shortcuts, hotkey, hotkeys, keybinding, key, binding, keys, keybindings, how, press]
 ---
 
 # Keyboard Shortcuts

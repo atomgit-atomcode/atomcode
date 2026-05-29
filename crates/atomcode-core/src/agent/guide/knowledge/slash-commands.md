@@ -1,10 +1,12 @@
 ---
 title: Slash 命令参考
 category: 命令
-keywords: [命令, /bg, /help, /model, /config, /mcp, /skills, /guide, 怎么, 如何, 快捷键, 切换, 模型, 会话, 记忆, 插件, codingplan, 键盘, 模式, 费用, 压缩, 隔离, 后台, 计划, 思考, 构建, 咋用, 咋办, 搜索, 调试]
+keywords: [命令, /bg, /help, /model, /config, /mcp, /skills, /guide, 快捷键, 切换, 模型, 会话, 记忆, 插件, codingplan, 键盘, 模式, 费用, 压缩, 隔离, 后台, 计划, 思考, 构建, 搜索, 调试]
 ---
 
 # Slash 命令 (共 41 个)
+
+> **新手推荐**：刚接触 AtomCode 先记住这几个：`/help`（查看所有命令）、`/model`（切换模型）、`/clear`（清屏）、`/session`（新建会话）、`/guide <问题>`（提问使用方法）、`/keys`（查看快捷键）。其他命令慢慢熟悉即可。
 
 ## 账户
 - `/login` — AtomGit OAuth 登录

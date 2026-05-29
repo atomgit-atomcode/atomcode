@@ -1,7 +1,7 @@
 ---
 title: AtomCode Overview
 category: Overview
-keywords: [overview, introduction, guide, getting started, about, atomcode, what, is, help, features, terminal, vscode, plugin, extension, hotkey, keybinding, keyboard, shortcut, log, debug, error, bug, search, grep]
+keywords: [overview, introduction, guide, getting started, about, atomcode, what, is, help, features, terminal, vscode, plugin, extension, hotkey, keybinding, keyboard, shortcut, log, debug, error, bug, search, grep, hooks, thinking, chain, language, languages, copilot, migrate, migration, glossary, term, token, lsp, mcp, provider]
 ---
 
 # AtomCode User Guide
@@ -11,7 +11,16 @@ AtomCode is an open-source terminal AI programming assistant written in Rust, su
 ## Usage
 
 AtomCode provides both terminal (CLI) and VS Code plugin interfaces, sharing the same Provider configuration and session data.
-- VS Code plugin: https://atomcode.atomgit.com/index.html#editor-plugins
+
+### Terminal (CLI)
+Launch by typing `atomcode` in your terminal. All features are accessible via slash commands.
+
+### VS Code Plugin
+Search "AtomCode" in the VS Code extension marketplace to install. Open the AtomCode panel in the sidebar after installation.
+- Download: https://atomcode.atomgit.com/index.html#editor-plugins
+- Shares Provider config, session data, and memories with the terminal
+- Most slash commands work in the plugin (e.g., `/model`, `/guide`, `/clear`)
+- Shortcuts integrate with VS Code native keybindings (e.g., `Cmd+Shift+P` for command palette)
 
 ## Getting Started
 - Describe programming tasks in natural language, AI automatically reads/writes files and executes commands
@@ -41,6 +50,41 @@ AtomCode provides both terminal (CLI) and VS Code plugin interfaces, sharing the
 | Workflow | `/bg` `/diff` `/undo` `/cd` `/init` `/plan` `/build` |
 | Extension | `/skills` `/plugin` `/mcp` |
 | Help | `/help` `/guide` `/keys` `/status` |
+
+## Supported Languages
+
+AtomCode supports all mainstream programming languages, including but not limited to:
+- **Backend**: Rust, Go, Java, Python, C/C++, C#
+- **Frontend**: TypeScript, JavaScript, React, Vue, HTML/CSS
+- **Mobile**: Swift (iOS), Kotlin (Android), Dart (Flutter)
+- **Data Science**: Python (pandas/numpy), R, SQL
+- **Scripting**: Bash, PowerShell, Python
+
+LSP code completion depends on whether the corresponding language server is installed.
+
+## Migrating from GitHub Copilot
+
+If you're coming from GitHub Copilot, key differences:
+- AtomCode is terminal-first, supporting full project-level operations (read/write files, execute commands)
+- Multi-provider / multi-model switching (`/model` command)
+- Full workflow system (background tasks, planning mode, worktree isolation)
+- Extensible via MCP for external tools, Skill/Plugin for custom behaviors
+- Transparent pricing: `/cost` shows real-time token usage and costs
+
+## Glossary
+
+| Term | Explanation |
+|------|-------------|
+| Provider | AI model service provider (e.g., AtomGit, OpenAI, Ollama) |
+| MCP | Model Context Protocol, for connecting external tools |
+| LSP | Language Server Protocol, for code completion/diagnostics |
+| Skill | Reusable AI prompt template |
+| Plugin | Packaged distribution containing one or more Skills |
+| Worktree | Isolated git working directory for parallel development |
+| SubAgent | Sub-agent that executes tasks like parallel file editing |
+| Thinking Chain | Intermediate reasoning process of reasoning models |
+| Context | Total conversation content the AI can currently "remember" |
+| Token | LLM text unit, roughly 4 English characters or 1 CJK character |
 
 ## More Resources
 - Documentation: https://atomcode.atomgit.com/docs/en/

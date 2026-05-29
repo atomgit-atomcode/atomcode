@@ -1,7 +1,7 @@
 ---
 title: Git Worktree Isolation
 category: Workflows
-keywords: [worktree, isolation, parallel, development, git, checkout, branch, isolated, create, list, done, cleanup]
+keywords: [worktree, isolation, parallel, development, git, checkout, branch, isolated, create, list, done, cleanup, difference, vs]
 ---
 
 # Git Worktree Isolation (/worktree)

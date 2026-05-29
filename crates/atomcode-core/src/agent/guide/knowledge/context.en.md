@@ -1,7 +1,7 @@
 ---
 title: Context & Cost Management
 category: Session
-keywords: [compact, context, cost, budget, compress, usage, manage, limit, long, overflow, token, cache]
+keywords: [compact, context, cost, budget, compress, usage, manage, limit, long, overflow, token, cache, conversation, slow, performance]
 ---
 
 # Context & Cost Management

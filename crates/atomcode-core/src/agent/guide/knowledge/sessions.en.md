@@ -1,7 +1,7 @@
 ---
 title: Session Management
 category: Session
-keywords: [session, resume, rename, sessions, save, load, history, switch, manage, restore, new, create]
+keywords: [session, resume, rename, sessions, save, load, history, switch, manage, restore, new, create, undo, revert]
 ---
 
 # Session Management
@@ -26,6 +26,8 @@ Rename the current session. Names are used to identify sessions in the session l
 ## Session Storage
 
 Session files are saved in AtomCode's data directory, grouped by working directory. Each session contains complete conversation history, timestamps, and message counts.
+
+> **Note**: Session content is stored in plain text on local disk. Do not share passwords, API keys, or other sensitive information in conversations. To clean up, manually delete the corresponding files under `.atomcode/sessions/`.
 
 ## Typical Workflow
 

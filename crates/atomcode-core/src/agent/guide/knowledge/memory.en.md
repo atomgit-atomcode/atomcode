@@ -15,7 +15,7 @@ Save a memory. Memories are automatically injected into system prompts in subseq
 
 ```
 /remember This project uses Rust, tests with cargo test
---global I prefer functional coding style
+/remember --global I prefer functional coding style
 ```
 
 - Default saves as **project-level memory**, only effective in sessions under the current working directory
@@ -37,6 +37,8 @@ View all saved memories (project-level + global).
 - Global memory: `~/.atomcode/memory.md`
 
 Memories are stored in Markdown format and can also be edited manually.
+
+> **Note**: Memories are stored in plain text on disk. Do not store passwords, API keys, tokens, or other sensitive information in memories. Memory content is stored locally and is not automatically uploaded to the cloud.
 
 ## Use Cases
 

@@ -1,7 +1,7 @@
 ---
 title: Core Features
 category: Features
-keywords: [features, feature, introduction, overview, platform, tool, coding, code, programming, AI, debug, log, search, grep, error]
+keywords: [features, feature, introduction, overview, platform, platforms, tool, coding, code, programming, AI, debug, log, search, grep, error, permission, control, thinking, chain, reasoning]
 ---
 
 # AtomCode Core Features
@@ -23,7 +23,10 @@ Open-source terminal AI programming assistant written in Rust, supporting macOS/
 - Bash command execution
 - File search (grep/glob/list_dir)
 - Web search and content fetching
-- Permission control: auto/interactive/approval modes
+- Permission control: three modes available
+  - **Auto mode**: AI executes commands directly without confirmation (for fully trusted scenarios)
+  - **Interactive mode** (recommended): Requests user confirmation before each execution
+  - **Approval mode**: Requires explicit user approval, suitable for security-sensitive environments
 
 ## Extensions
 - MCP protocol for external tools

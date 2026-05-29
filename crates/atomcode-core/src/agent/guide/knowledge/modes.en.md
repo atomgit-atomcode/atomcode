@@ -6,7 +6,7 @@ keywords: [plan, build, think, mode, switch, readonly, read, write, permission, 
 
 # Mode Switching
 
-AtomCode has three working modes that control AI behavior boundaries.
+AtomCode has three working modes that control AI behavior boundaries. There is also a configuration wizard `/codingplan`.
 
 ## /plan — Planning Mode
 

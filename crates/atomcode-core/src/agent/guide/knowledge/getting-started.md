@@ -12,6 +12,12 @@ AtomCode 支持 macOS、Linux、Windows、HarmonyOS。
 
 安装后在终端输入 `atomcode` 启动。
 
+**安装方式**：
+- **macOS**: `brew install atomcode`
+- **Linux**: 下载二进制包或使用 `curl -fsSL https://atomcode.atomgit.com/install.sh | bash`
+- **Windows**: 下载 `.msi` 安装包
+- **Docker**: `docker run -it --rm -v $(pwd):/workspace atomcode/atomcode:latest`
+
 ## 首次使用
 
 ### /setup — 安装向导
@@ -21,7 +27,7 @@ AtomCode 支持 macOS、Linux、Windows、HarmonyOS。
 如果已有 CodingPlan 账号，`/codingplan` 可一键配置模型列表。
 
 ### /login — 登录
-使用 AtomGit OAuth 登录，解锁云端功能。
+使用 AtomGit OAuth 登录，解锁云端功能。登录凭证（OAuth Token）加密存储在本地，不会明文保存。可通过 `/logout` 随时撤销登录状态。
 
 ### /welcome — 重新引导
 随时可重新运行首次引导流程。

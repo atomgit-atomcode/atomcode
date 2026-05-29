@@ -1,7 +1,7 @@
 ---
 title: Git Worktree 隔离
 category: 工作流
-keywords: [worktree, 隔离, 分支, 并行开发, 并行]
+keywords: [worktree, 隔离, 分支, 并行开发, 并行, 区别]
 ---
 
 # Git Worktree 隔离 (/worktree)

@@ -1,10 +1,12 @@
 ---
 title: Skills & Plugins
 category: Extensions
-keywords: [skill, plugin, skills, plugins, extension, install, create, custom, template, how, use, marketplace]
+keywords: [skill, plugin, skills, plugins, extension, install, create, custom, template, how, use, marketplace, write]
 ---
 
 # Skills & Plugins
+
+**Relationship**: A Skill is a single AI prompt template. A Plugin is a packaged distribution of one or more Skills. After installing a Plugin from the marketplace, its Skills appear in the `/skills` list.
 
 ## Skills
 

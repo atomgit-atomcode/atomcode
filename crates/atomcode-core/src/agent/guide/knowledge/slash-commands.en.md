@@ -6,6 +6,8 @@ keywords: [slash, command, commands, list, all, available, /bg, /help, /model, /
 
 # Slash Commands (41 total)
 
+> **New to AtomCode?** Start with these: `/help` (list all commands), `/model` (switch model), `/clear` (clear screen), `/session` (new session), `/guide <question>` (ask about usage), `/keys` (keyboard shortcuts). Explore the rest as you go.
+
 ## Account
 - `/login` — AtomGit OAuth login
 - `/logout` — Sign out

@@ -1,7 +1,7 @@
 ---
 title: Troubleshooting
 category: Help
-keywords: [troubleshooting, fix, issue, problem, help, not working, failed, stuck, hang, error, bug, timeout, crash, panic, debug, log]
+keywords: [troubleshooting, fix, issue, problem, help, not working, failed, stuck, hang, error, bug, timeout, crash, panic, debug, log, slow, performance, latency, api]
 ---
 
 # Troubleshooting Guide
@@ -87,4 +87,4 @@ keywords: [troubleshooting, fix, issue, problem, help, not working, failed, stuc
 If none of the above solutions work:
 1. Use `/guide <specific problem description>` for targeted help
 2. Visit documentation: https://atomcode.atomgit.com/docs/en/
-3. Submit Issue: https://github.com/anthropics/claude-code/issues
+3. Submit Issue: Use `/issue` command to submit bugs or feature requests
