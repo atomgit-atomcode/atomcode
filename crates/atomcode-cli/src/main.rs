@@ -537,6 +537,12 @@ enum Commands {
         #[arg(long)]
         client: Option<String>,
     },
+    /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
+    Webui {
+        /// 端口（默认 13456）
+        #[arg(long, default_value = "13456")]
+        port: u16,
+    },
     /// Telemetry controls
     Telemetry {
         #[command(subcommand)]
@@ -962,6 +968,14 @@ async fn run() -> Result<i32> {
                         return Ok(1);
                     }
                 }
+            }
+            Commands::Webui { port } => {
+                HEADLESS_MODE.store(true, Ordering::Relaxed);
+                let msg = atomcode_daemon::ensure_server_and_open(port).await;
+                eprintln!("{msg}");
+                // server 是后台 task；保持进程存活直到用户 Ctrl+C
+                let _ = tokio::signal::ctrl_c().await;
+                return Ok(0);
             }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -2001,6 +2015,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")
+        }
+        Commands::Webui { .. } => {
+            unreachable!("Webui is handled inline in run() before handle_command")
         }
         Commands::Setup { .. } => {
             unreachable!("Setup is handled inline in run() before handle_command")
