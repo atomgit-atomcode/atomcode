@@ -24,7 +24,8 @@ webui **不取代 TUI**，二者并存，webui 需功能基本完整（聊天、
 | 后端 | 复用现有 daemon 服务逻辑（方案 A），webui 是它的第二个前端 |
 | **服务形态** | **合进主程序进程内启动**：daemon crate 抽成库暴露 `run_server(...)`，`atomcode` 进程内 `tokio::spawn` 直接跑 server，**不依赖独立 `atomcode-daemon` 二进制**（普通用户 `curl \| sh` 只装主程序，没有 daemon） |
 | 权限 UX | 交互式审批（浏览器逐次批准/拒绝工具调用） |
-| 会话模型 | webui 会话与 TUI 会话各自独立运行，共享磁盘 session 历史，可互相 resume |
+| 会话模型 | Phase 1：webui 会话与 TUI 会话各自独立运行，共享磁盘 session 历史，可互相 resume |
+| **实时同步 (Phase 1.5)** | **方案 A 进程内「活动会话总线」**：webui 默认独立，提供「同步/接管当前 TUI 会话」开关；开启后 TUI 与浏览器是同一活动会话的两个视图，输入双向、渲染实时 |
 | 工作目录 | 每会话独立 cwd，随 `/chat` 请求带 `working_dir`；切换不影响其它客户端。全局 `/cd` 仅作可选「设默认目录」 |
 | 远期远程 | 官方中转隧道（出站连官方中转，子域名反代） |
 
@@ -154,6 +155,45 @@ webui server 与 TUI 跑在**同一个进程**：daemon 服务逻辑下沉为库
 - `/webui stop`：停掉进程内 server 任务（abort handle / shutdown watch）。
 - 端口被占 → 命令内明确报错并提示。
 - 复用 `open_browser`，开不了就打印 URL 供手动点击。
+
+## Phase 1.5：TUI ⇄ webui 实时同步（方案 A · 进程内活动会话总线）
+
+**目标**：浏览器里问的内容在 TUI 实时渲染，TUI 里输入的内容在打开的浏览器里实时渲染——
+双向、同一会话。
+
+**前提利好**：Phase 1 已把 server 改为进程内 `tokio::spawn`，TUI 与 server **同进程共享内存**，
+故同步是**进程内广播**，不需要跨进程 IPC / 网络同步协议 / 冲突合并。
+
+### 核心：`LiveSession` 总线（放 `atomcode-core`）
+
+core 同时被 tuix 与 daemon 库依赖，故总线放 core，避免依赖环。结构：
+
+- `conversation: Arc<Mutex<Conversation>>`——**单一数据源**。
+- `events: tokio::sync::broadcast::Sender<TurnEvent>`——**事件扇出**，TUI 渲染器与 webui SSE 都订阅。
+- `input_tx: mpsc::UnboundedSender<UserInput>`——**唯一输入入口**，任一端的用户消息都投这里。
+- `turn_state: Arc<Mutex<TurnState{Idle|Running}>>`——**单写者守卫**，保证同一会话同一时刻只跑一个 turn。
+- **单一 turn 协调器**任务：从 `input_tx` 取消息 → 若 Idle 则置 Running、追加到 conversation、用
+  `TurnRunner`（与 Phase 1 同一套）跑 turn、把 `TurnEvent` 发到 broadcast → 完成置 Idle。
+
+模型：**一个活动会话，多个视图**。TUI 与浏览器都退化为「订阅 broadcast 渲染 + 投 input_tx 输入」。
+
+### 同步模式（默认值，已确认）
+
+- **webui 默认独立会话**；提供「同步/接管当前 TUI 会话」开关。仅开启时才走 `LiveSession`。
+- **并发**：turn 进行中，另一端输入框**禁用 + 提示「对方正在对话」**（不排队，避免乱序）。
+- **晚加入**：webui 开启同步时，先收会话快照（replay 现有 messages）再接实时 broadcast 增量。
+- **权限审批**：审批请求经 broadcast 同时出现在 TUI 与浏览器，**任一端可批准，先到先得**，另一端关闭卡片。
+
+### TUI 侧改造
+
+- 同步开启时，TUI 输入不再走自己的 `AgentLoop`，而是投 `LiveSession.input_tx`；TUI 渲染改为订阅
+  broadcast。不同步时维持现状。
+- 这是 Phase 1.5 主要工作量（碰 TUI 事件循环），故独立于 Phase 1 基础功能、后做。
+
+### webui server 侧
+
+- 新增 `GET /live`（SSE：先 replay 快照、后推 broadcast）与 `POST /live/message`（投 input_tx）；
+  暴露「当前活动会话」标识。基础 webui 的 `/chat` 路径不变，仅在「同步开启」时切到 `/live`。
 
 ## Phase 2 蓝图（仅留接口，不实现）
 
