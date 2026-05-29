@@ -1105,13 +1105,25 @@ fn derive_name(base_url: &str, provider_type: &str, is_taken: impl Fn(&str) -> b
         .split(':')
         .next()
         .unwrap_or("");
-    let host = host.trim_start_matches("api.").trim_start_matches("www.");
-    let label = host.split('.').next().unwrap_or("");
-    // No usable host (blank / localhost / loopback) → name after the type.
-    let base = if label.is_empty() || label == "localhost" || host == "127.0.0.1" {
-        provider_type
+    let labels: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
+    // Prefer the registrable domain — the label just before the public
+    // suffix — so `api-ai.gitcode.com` → `gitcode`, not `api-ai`. Hop over a
+    // generic second-level like `com` in `example.com.cn`.
+    let label = if labels.len() >= 2 {
+        let mut i = labels.len() - 2;
+        const GENERIC_SLD: [&str; 7] = ["com", "net", "org", "co", "gov", "edu", "ac"];
+        if i >= 1 && GENERIC_SLD.contains(&labels[i]) {
+            i -= 1;
+        }
+        labels[i]
     } else {
+        ""
+    };
+    // No usable host (blank / localhost / IP literal) → name after the type.
+    let base = if label.chars().any(|c| c.is_ascii_alphabetic()) {
         label
+    } else {
+        provider_type
     };
 
     dedupe_name(base, is_taken)
@@ -1326,6 +1338,19 @@ chunks = query({
     #[test]
     fn derive_name_handles_no_api_prefix() {
         assert_eq!(derive_name("https://openrouter.ai/api/v1", "openai", |_| false), "openrouter");
+    }
+
+    #[test]
+    fn derive_name_prefers_registrable_domain_over_subdomain() {
+        // api-ai.gitcode.com → gitcode (not "api-ai")
+        assert_eq!(derive_name("https://api-ai.gitcode.com/v1", "openai", |_| false), "gitcode");
+        assert_eq!(derive_name("https://www.openrouter.ai/api/v1", "openai", |_| false), "openrouter");
+    }
+
+    #[test]
+    fn derive_name_handles_multi_part_tld() {
+        // example.com.cn → example (hop over the generic `com`)
+        assert_eq!(derive_name("https://api.example.com.cn/v1", "openai", |_| false), "example");
     }
 
     #[test]
