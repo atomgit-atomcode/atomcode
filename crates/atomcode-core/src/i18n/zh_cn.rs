@@ -223,11 +223,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderMenuSetDefault => "设为默认".into(),
         Msg::ProviderMenuSetDefaultDesc => "切换默认 Provider".into(),
         Msg::ProviderImportPrompt =>
-            "粘贴模板自动识别（curl / JSON / TOML 或 Base URL），或直接回车手动填写：".into(),
+            "粘贴模板自动识别（curl / JSON / TOML），或直接回车手动填写：".into(),
         Msg::ProviderImportParsed { name, type_name, model } =>
             format!("已识别：{name} · {type_name} · {model}").into(),
         Msg::ProviderImportFailed =>
-            "未能从模板识别出 Base URL，请重贴或按 Esc 取消。".into(),
+            "未能识别为模板，请重贴 curl / JSON / TOML，或留空回车手动填写。".into(),
         Msg::ProviderNoProviders =>
             "尚未配置任何 Provider。".into(),
         Msg::ProviderDeleteConfirm { name } =>
@@ -246,7 +246,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepTypeWithHint { current } =>
             format!("类型？[{current}]（openai / claude / ollama，留空保持不变）").into(),
         Msg::ProviderStepBaseUrl =>
-            "Base URL？（例如 https://api.deepseek.com/v1）".into(),
+            "Base URL？（留空用该类型默认值，例：https://api.deepseek.com/v1）".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL？[{current}]（留空保持不变）").into(),
         Msg::ProviderDefaultHint => "Provider 默认值".into(),
@@ -266,8 +266,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "未知类型。请选择 openai / claude / ollama 或留空。".into(),
         Msg::ProviderModelEmpty => "模型不能为空。".into(),
         Msg::ProviderEditKeep => "（保持不变）".into(),
-        Msg::ProviderTypeInferred { type_name } =>
-            format!("类型：{type_name}（根据 Base URL 推断）").into(),
         Msg::ProviderStepNameDefault { default } =>
             format!("Provider 名称？[{default}]（留空使用此名）").into(),
         Msg::ProviderStepProgress { current, total } =>

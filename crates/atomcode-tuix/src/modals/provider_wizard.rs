@@ -22,13 +22,15 @@ pub enum ProviderWizard {
     /// Initial picker: Add / Edit / Delete / Set Default.
     MainMenu { selected: usize },
     /// Sequential `Add` prompts. `draft` accumulates answered fields.
-    /// The flow leads with a `Template` paste step (auto-detect), then only
-    /// asks for the gaps. `total` is the number of gap questions, fixed once
-    /// the template step resolves, and drives the `(x/y)` counter.
+    /// The flow leads with a `Template` paste step (auto-detect). Once it
+    /// resolves, `plan` holds the exact remaining questions (manual → all
+    /// fields; import → only the gaps), and `idx` points at the current one.
+    /// Progress is simply `(idx + 1, plan.len())` — no per-step guessing.
     Add {
         step: WizardStep,
         draft: DraftProvider,
-        total: usize,
+        plan: Vec<WizardStep>,
+        idx: usize,
     },
     /// Pick which provider to edit.
     EditPick {
@@ -194,13 +196,20 @@ fn handle_key(
                             let new = ProviderWizard::Add {
                                 step: WizardStep::Template,
                                 draft: DraftProvider::default(),
-                                total: 0,
+                                plan: Vec::new(),
+                                idx: 0,
                             };
-                            if let ProviderWizard::Add { step, draft, total } = &new {
-                                show_add_step_prompt(
-                                    *step, draft, *total, buf, state, ctx, &new, renderer,
-                                );
-                            }
+                            show_add_step_prompt(
+                                WizardStep::Template,
+                                &DraftProvider::default(),
+                                0,
+                                0,
+                                buf,
+                                state,
+                                ctx,
+                                &new,
+                                renderer,
+                            );
                             *wizard = new;
                         }
                         "edit" | "delete" | "set-default" if providers.is_empty() => {
@@ -371,61 +380,105 @@ fn handle_key(
         }
 
         // ── Text-input states: Enter submits, chars edit buf, others pass through Buffer. ──
-        ProviderWizard::Add { step, mut draft, total } => {
+        ProviderWizard::Add { step, mut draft, plan, idx } => {
             if matches!(code, KeyCode::Enter) {
                 // Expand any folded `[Pasted #N …]` placeholder so the
                 // Template step parses the real pasted content.
                 let answer = buf.expanded_text();
                 // Don't echo the raw paste back for the (multi-line) template
-                // step — `advance_add` prints a "Detected:" summary instead.
+                // step — `resolve_template` prints a "Detected:" summary instead.
                 if !matches!(step, WizardStep::Template) {
                     push(renderer, &format!("  ↳ {}", answer));
                 }
                 buf.text.clear();
                 buf.cursor = 0;
-                let leaving_template = matches!(step, WizardStep::Template);
-                match advance_add(&mut draft, step, &answer, &ctx.config.providers, renderer) {
-                    Some(next) => {
-                        // The gap count is fixed once we leave the Template
-                        // step (and didn't bounce back to it on a parse error).
-                        let total = if leaving_template && next != WizardStep::Template {
-                            remaining_add_steps(&draft).len()
-                        } else {
-                            total
-                        };
-                        let new = ProviderWizard::Add { step: next, draft, total };
-                        if let ProviderWizard::Add { step, draft, total } = &new {
+
+                if matches!(step, WizardStep::Template) {
+                    // Decide the path and build the question plan.
+                    let new_plan = match resolve_template(
+                        &mut draft,
+                        &answer,
+                        &ctx.config.providers,
+                        renderer,
+                    ) {
+                        TemplateOutcome::Manual => manual_plan(),
+                        TemplateOutcome::Import => import_plan(&draft),
+                        TemplateOutcome::Retry => {
+                            // Not a recognized template — re-prompt Template.
+                            let new = ProviderWizard::Add {
+                                step: WizardStep::Template,
+                                draft,
+                                plan: Vec::new(),
+                                idx: 0,
+                            };
                             show_add_step_prompt(
-                                *step, draft, *total, buf, state, ctx, &new, renderer,
+                                WizardStep::Template, &DraftProvider::default(), 0, 0,
+                                buf, state, ctx, &new, renderer,
                             );
+                            *wizard = new;
+                            return Ok(ModalAction::Continue);
+                        }
+                    };
+                    let first = new_plan[0];
+                    if matches!(first, WizardStep::Name) {
+                        ensure_name_default(&mut draft, &ctx.config.providers);
+                    }
+                    let total = new_plan.len();
+                    let new = ProviderWizard::Add { step: first, draft, plan: new_plan, idx: 0 };
+                    if let ProviderWizard::Add { step, draft, .. } = &new {
+                        show_add_step_prompt(*step, draft, 0, total, buf, state, ctx, &new, renderer);
+                    }
+                    *wizard = new;
+                    return Ok(ModalAction::Continue);
+                }
+
+                // A planned question step.
+                match store_step(&mut draft, step, &answer, &ctx.config.providers, renderer) {
+                    StepOutcome::Retry => {
+                        let total = plan.len();
+                        let new = ProviderWizard::Add { step, draft, plan, idx };
+                        if let ProviderWizard::Add { step, draft, .. } = &new {
+                            show_add_step_prompt(*step, draft, idx, total, buf, state, ctx, &new, renderer);
                         }
                         *wizard = new;
                         return Ok(ModalAction::Continue);
                     }
-                    None => {
-                        // All fields gathered — commit and switch to it.
-                        // Users expect /provider add to behave like "create
-                        // and activate": after the wizard closes, the newly
-                        // added entry should be the current default so the
-                        // next message uses it without an extra /model step.
-                        let name = draft.name.clone();
-                        let model = draft.model.clone();
-                        let cfg = draft.into_config();
-                        ctx.config.providers.insert(name.clone(), cfg);
-                        ctx.config.default_provider = name.clone();
-                        ctx.model_name = model.clone();
-                        save_and_reload(ctx, renderer);
-                        push(
-                            renderer,
-                            &crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: &name, model: &model }),
-                        );
-                        return Ok(ModalAction::Close);
+                    StepOutcome::Ok => {
+                        let next_idx = idx + 1;
+                        if next_idx >= plan.len() {
+                            // All fields gathered — commit and switch to it, so
+                            // the newly added entry is the current default
+                            // without an extra /model step.
+                            let name = draft.name.clone();
+                            let model = draft.model.clone();
+                            let cfg = draft.into_config();
+                            ctx.config.providers.insert(name.clone(), cfg);
+                            ctx.config.default_provider = name.clone();
+                            ctx.model_name = model.clone();
+                            save_and_reload(ctx, renderer);
+                            push(
+                                renderer,
+                                &crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: &name, model: &model }),
+                            );
+                            return Ok(ModalAction::Close);
+                        }
+                        let next = plan[next_idx];
+                        if matches!(next, WizardStep::Name) {
+                            ensure_name_default(&mut draft, &ctx.config.providers);
+                        }
+                        let total = plan.len();
+                        let new = ProviderWizard::Add { step: next, draft, plan, idx: next_idx };
+                        if let ProviderWizard::Add { step, draft, .. } = &new {
+                            show_add_step_prompt(*step, draft, next_idx, total, buf, state, ctx, &new, renderer);
+                        }
+                        *wizard = new;
+                        return Ok(ModalAction::Continue);
                     }
                 }
             }
             // Forward other keys to the buffer so typing / editing works.
             forward_to_buffer(code, _mods, buf, state, ctx);
-            *wizard = ProviderWizard::Add { step, draft, total };
+            *wizard = ProviderWizard::Add { step, draft, plan, idx };
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
         }
@@ -602,6 +655,7 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
 fn show_add_step_prompt(
     step: WizardStep,
     draft: &DraftProvider,
+    idx: usize,
     total: usize,
     buf: &Buffer,
     state: &UiState,
@@ -618,9 +672,7 @@ fn show_add_step_prompt(
     if matches!(step, WizardStep::Template) || total == 0 {
         push(renderer, &body);
     } else {
-        // current = how many gap questions are done + this one.
-        let current = total - remaining_add_steps(draft).len() + 1;
-        let progress = t(Msg::ProviderStepProgress { current, total });
+        let progress = t(Msg::ProviderStepProgress { current: idx + 1, total });
         push(renderer, &format!("{progress} {body}"));
     }
     redraw(buf, state, ctx, wizard, renderer);
@@ -640,47 +692,141 @@ fn show_step_prompt(
     redraw(buf, state, ctx, wizard, renderer);
 }
 
-/// Validate and advance the "Add" sub-flow. Returns the next state, or
-/// None when the wizard has committed / cancelled (caller clears).
-///
-/// The flow leads with the Template paste step: a recognized template (or
-/// bare URL) fills the draft and infers the type, so only the missing fields
-/// are asked. Leaving it blank falls back to manual entry. `existing` is
-/// consulted so derived / entered names don't collide with a provider.
-fn advance_add(
+/// What the Template paste step decided.
+#[derive(Debug, PartialEq)]
+enum TemplateOutcome {
+    /// Blank input → fill everything by hand.
+    Manual,
+    /// A template was recognized and `draft` pre-filled from it.
+    Import,
+    /// Non-blank but not a recognizable template → re-prompt.
+    Retry,
+}
+
+/// Handle the Template paste step. Blank → manual. A recognized template
+/// (curl / JSON / TOML, anything yielding a URL) pre-fills the draft and
+/// echoes a summary. Anything else (incl. a bare URL or hostname) is *not*
+/// treated as a base_url here — that belongs in the manual Base URL step —
+/// so it re-prompts.
+fn resolve_template(
+    draft: &mut DraftProvider,
+    answer: &str,
+    existing: &std::collections::HashMap<String, ProviderConfig>,
+    renderer: &mut dyn Renderer,
+) -> TemplateOutcome {
+    use crate::i18n::{t, Msg};
+    if answer.trim().is_empty() {
+        return TemplateOutcome::Manual;
+    }
+    let parsed = parse_template(answer);
+    let Some(raw_url) = parsed.url.as_deref() else {
+        push(renderer, &t(Msg::ProviderImportFailed));
+        return TemplateOutcome::Retry;
+    };
+    let ptype = infer_type(raw_url);
+    draft.provider_type = ptype.to_string();
+    draft.base_url = normalize_base_url(raw_url, ptype);
+    if let Some(k) = parsed.api_key {
+        if !is_placeholder(&k) {
+            draft.api_key = k;
+        }
+    }
+    if let Some(m) = parsed.model {
+        if !m.trim().is_empty() {
+            draft.model = m;
+        }
+    }
+    let base = parsed
+        .name
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| derive_name(&draft.base_url, ptype, |n| existing.contains_key(n)));
+    draft.name = dedupe_name(&base, |n| existing.contains_key(n));
+    let model_disp = if draft.model.is_empty() { "?" } else { &draft.model };
+    push(
+        renderer,
+        &t(Msg::ProviderImportParsed {
+            name: &draft.name,
+            type_name: ptype,
+            model: model_disp,
+        }),
+    );
+    TemplateOutcome::Import
+}
+
+/// Manual-entry questions, in order. Type is asked explicitly (rather than
+/// inferred) and Base URL is its own step (blank = the type's default).
+fn manual_plan() -> Vec<WizardStep> {
+    vec![
+        WizardStep::ProviderType,
+        WizardStep::BaseUrl,
+        WizardStep::ApiKey,
+        WizardStep::Model,
+        WizardStep::Name,
+    ]
+}
+
+/// Post-import questions: only the gaps the template didn't fill, then the
+/// Name confirmation (always shown).
+fn import_plan(draft: &DraftProvider) -> Vec<WizardStep> {
+    let mut plan = Vec::new();
+    if draft.api_key.is_empty() {
+        plan.push(WizardStep::ApiKey);
+    }
+    if draft.model.is_empty() {
+        plan.push(WizardStep::Model);
+    }
+    plan.push(WizardStep::Name);
+    plan
+}
+
+/// Seed the Name step's default if it isn't set yet.
+fn ensure_name_default(
+    draft: &mut DraftProvider,
+    existing: &std::collections::HashMap<String, ProviderConfig>,
+) {
+    if draft.name.is_empty() {
+        draft.name = derive_name(&draft.base_url, &draft.provider_type, |n| {
+            existing.contains_key(n)
+        });
+    }
+}
+
+/// Outcome of validating + storing one planned question's answer.
+#[derive(Debug, PartialEq)]
+enum StepOutcome {
+    /// Stored; advance to the next planned step.
+    Ok,
+    /// Invalid input; re-prompt the same step.
+    Retry,
+}
+
+/// Validate and store a single planned Add question. Re-prompts (Retry) on a
+/// required-field violation; otherwise stores into `draft` and returns Ok.
+fn store_step(
     draft: &mut DraftProvider,
     step: WizardStep,
     answer: &str,
     existing: &std::collections::HashMap<String, ProviderConfig>,
     renderer: &mut dyn Renderer,
-) -> Option<WizardStep> {
+) -> StepOutcome {
     let ans = answer.trim();
     match step {
-        WizardStep::Template => advance_template(draft, answer, existing, renderer),
         WizardStep::ProviderType => {
             if !["openai", "claude", "ollama"].contains(&ans) {
                 push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType));
-                return Some(WizardStep::ProviderType);
+                return StepOutcome::Retry;
             }
             draft.provider_type = ans.to_string();
-            Some(WizardStep::ApiKey)
         }
-        WizardStep::ApiKey => {
-            draft.api_key = ans.to_string();
-            // Skip Model when the template already supplied one.
-            if draft.model.is_empty() {
-                Some(WizardStep::Model)
-            } else {
-                Some(to_name_step(draft, existing))
-            }
-        }
+        // Blank Base URL is valid — it means "use this type's default".
+        WizardStep::BaseUrl => draft.base_url = ans.to_string(),
+        WizardStep::ApiKey => draft.api_key = ans.to_string(),
         WizardStep::Model => {
             if ans.is_empty() {
                 push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderModelEmpty));
-                return Some(WizardStep::Model);
+                return StepOutcome::Retry;
             }
             draft.model = ans.to_string();
-            Some(to_name_step(draft, existing))
         }
         WizardStep::Name => {
             let chosen = if ans.is_empty() {
@@ -689,126 +835,11 @@ fn advance_add(
                 ans.to_string()
             };
             draft.name = dedupe_name(&chosen, |n| existing.contains_key(n));
-            None // signal: ready to commit
         }
-        // BaseUrl is an Edit-only step; in Add the URL comes via Template.
-        WizardStep::BaseUrl => Some(to_name_step(draft, existing)),
+        // Template is handled by resolve_template, never reaches here.
+        WizardStep::Template => {}
     }
-}
-
-/// Handle the Template paste step. Fills `draft` from a recognized template
-/// (or bare URL) and returns the first gap step, re-prompts on a failed
-/// parse, or falls through to manual entry when left blank.
-fn advance_template(
-    draft: &mut DraftProvider,
-    answer: &str,
-    existing: &std::collections::HashMap<String, ProviderConfig>,
-    renderer: &mut dyn Renderer,
-) -> Option<WizardStep> {
-    use crate::i18n::{t, Msg};
-    let trimmed = answer.trim();
-    if trimmed.is_empty() {
-        // Manual path: no URL, ask the type (base_url stays empty → default).
-        return Some(WizardStep::ProviderType);
-    }
-
-    let parsed = parse_template(answer);
-    if let Some(raw_url) = parsed.url.as_deref() {
-        let ptype = infer_type(raw_url);
-        draft.provider_type = ptype.to_string();
-        draft.base_url = normalize_base_url(raw_url, ptype);
-        if let Some(k) = parsed.api_key {
-            if !is_placeholder(&k) {
-                draft.api_key = k;
-            }
-        }
-        if let Some(m) = parsed.model {
-            if !m.trim().is_empty() {
-                draft.model = m;
-            }
-        }
-        let base = parsed
-            .name
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| derive_name(&draft.base_url, ptype, |n| existing.contains_key(n)));
-        draft.name = dedupe_name(&base, |n| existing.contains_key(n));
-        let model_disp = if draft.model.is_empty() { "?" } else { &draft.model };
-        push(
-            renderer,
-            &t(Msg::ProviderImportParsed {
-                name: &draft.name,
-                type_name: ptype,
-                model: model_disp,
-            }),
-        );
-        Some(first_gap_after_import(draft))
-    } else if looks_like_template(answer) {
-        // Looked like a template but no URL came out — let the user retry.
-        push(renderer, &t(Msg::ProviderImportFailed));
-        Some(WizardStep::Template)
-    } else {
-        // Plain text with no URL: treat it as the base_url itself.
-        let inferred = infer_type(trimmed);
-        draft.base_url = trimmed.to_string();
-        draft.provider_type = inferred.to_string();
-        push(renderer, &t(Msg::ProviderTypeInferred { type_name: inferred }));
-        Some(WizardStep::ApiKey)
-    }
-}
-
-/// First gap step after an import fills what it can: ask for the API key,
-/// then the model, else go straight to the Name confirmation.
-fn first_gap_after_import(draft: &DraftProvider) -> WizardStep {
-    if draft.api_key.is_empty() {
-        WizardStep::ApiKey
-    } else if draft.model.is_empty() {
-        WizardStep::Model
-    } else {
-        WizardStep::Name
-    }
-}
-
-/// Seed the Name step's default (if not already set) and return it.
-fn to_name_step(
-    draft: &mut DraftProvider,
-    existing: &std::collections::HashMap<String, ProviderConfig>,
-) -> WizardStep {
-    if draft.name.is_empty() {
-        draft.name = derive_name(&draft.base_url, &draft.provider_type, |n| {
-            existing.contains_key(n)
-        });
-    }
-    WizardStep::Name
-}
-
-/// Whether pasted text looks like a template we should parse (vs. a bare URL
-/// or hostname). Used to decide between re-prompting and treating input as a
-/// base_url when no URL was extracted.
-fn looks_like_template(input: &str) -> bool {
-    let lower = input.to_ascii_lowercase();
-    lower.contains("curl")
-        || lower.contains("authorization")
-        || lower.contains("x-api-key")
-        || input.contains('{')
-        || lower.contains("[providers")
-}
-
-/// The ordered gap questions still owed for `draft`: Type (if unset), API key
-/// (if unset), Model (if unset), then always the Name confirmation. Drives
-/// the `(x/y)` counter; `total` is this length frozen at the Template step.
-fn remaining_add_steps(draft: &DraftProvider) -> Vec<WizardStep> {
-    let mut steps = Vec::new();
-    if draft.provider_type.is_empty() {
-        steps.push(WizardStep::ProviderType);
-    }
-    if draft.api_key.is_empty() {
-        steps.push(WizardStep::ApiKey);
-    }
-    if draft.model.is_empty() {
-        steps.push(WizardStep::Model);
-    }
-    steps.push(WizardStep::Name);
-    steps
+    StepOutcome::Ok
 }
 
 /// Validate and advance the "Edit" sub-flow. Empty answers preserve
@@ -1240,19 +1271,21 @@ chunks = query({
     }
 
     #[test]
-    fn advance_template_drops_shell_var_key_and_asks() {
+    fn resolve_template_drops_shell_var_key_then_import_asks_key() {
         let input = r#"curl https://openrouter.ai/api/v1/chat/completions \
   -H "Authorization: Bearer $OPENROUTER_API_KEY" \
   -d '{"model":"stepfun/step-3.7-flash"}'"#;
         let mut d = DraftProvider::default();
         let existing = std::collections::HashMap::new();
         let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
-        let next = advance_template(&mut d, input, &existing, &mut sink);
+        let outcome = resolve_template(&mut d, input, &existing, &mut sink);
+        assert_eq!(outcome, TemplateOutcome::Import);
         assert_eq!(d.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(d.model, "stepfun/step-3.7-flash");
         assert!(d.api_key.is_empty(), "shell-var key must be dropped, got {:?}", d.api_key);
         assert_eq!(d.name, "openrouter");
-        assert_eq!(next, Some(WizardStep::ApiKey));
+        // Only gap is the key → plan asks ApiKey then Name.
+        assert_eq!(import_plan(&d), vec![WizardStep::ApiKey, WizardStep::Name]);
     }
 
     #[test]
@@ -1323,12 +1356,12 @@ chunks = query({
     }
 
     #[test]
-    fn remaining_steps_manual_is_four() {
-        // Nothing filled (blank template) → ask type, key, model, name.
+    fn manual_plan_is_five_fixed_steps() {
         assert_eq!(
-            remaining_add_steps(&DraftProvider::default()),
+            manual_plan(),
             vec![
                 WizardStep::ProviderType,
+                WizardStep::BaseUrl,
                 WizardStep::ApiKey,
                 WizardStep::Model,
                 WizardStep::Name
@@ -1337,67 +1370,68 @@ chunks = query({
     }
 
     #[test]
-    fn remaining_steps_bare_url_import_is_three() {
-        // Type inferred from URL; key + model still missing.
-        let d = draft_filled("openai", "", "");
+    fn import_plan_only_covers_gaps() {
+        // key + model missing → ask both, then Name.
         assert_eq!(
-            remaining_add_steps(&d),
+            import_plan(&draft_filled("openai", "", "")),
             vec![WizardStep::ApiKey, WizardStep::Model, WizardStep::Name]
         );
-    }
-
-    #[test]
-    fn remaining_steps_full_template_is_just_name() {
-        let d = draft_filled("openai", "sk-1", "gpt-4o");
-        assert_eq!(remaining_add_steps(&d), vec![WizardStep::Name]);
-    }
-
-    #[test]
-    fn remaining_steps_skips_filled_model() {
-        let d = draft_filled("openai", "", "gpt-4o");
+        // everything filled → just confirm Name.
         assert_eq!(
-            remaining_add_steps(&d),
+            import_plan(&draft_filled("openai", "sk-1", "gpt-4o")),
+            vec![WizardStep::Name]
+        );
+        // model already filled → skip it.
+        assert_eq!(
+            import_plan(&draft_filled("openai", "", "gpt-4o")),
             vec![WizardStep::ApiKey, WizardStep::Name]
         );
     }
 
     #[test]
-    fn advance_template_blank_goes_manual() {
+    fn resolve_template_blank_goes_manual() {
         let mut d = DraftProvider::default();
         let existing = std::collections::HashMap::new();
         let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
-        let next = advance_template(&mut d, "", &existing, &mut sink);
-        assert_eq!(next, Some(WizardStep::ProviderType));
+        assert_eq!(
+            resolve_template(&mut d, "", &existing, &mut sink),
+            TemplateOutcome::Manual
+        );
         assert!(d.base_url.is_empty());
     }
 
     #[test]
-    fn advance_template_curl_fills_draft_and_asks_for_key() {
+    fn resolve_template_curl_fills_draft() {
         let input = r#"curl https://taotoken.net/api/v1/chat/completions \
   -H "Authorization: Bearer <API_KEY>" \
   -d '{"model":"qwen3.7-max"}'"#;
         let mut d = DraftProvider::default();
         let existing = std::collections::HashMap::new();
         let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
-        let next = advance_template(&mut d, input, &existing, &mut sink);
+        assert_eq!(
+            resolve_template(&mut d, input, &existing, &mut sink),
+            TemplateOutcome::Import
+        );
         assert_eq!(d.provider_type, "openai");
         assert_eq!(d.base_url, "https://taotoken.net/api/v1");
         assert_eq!(d.model, "qwen3.7-max");
         assert!(d.api_key.is_empty(), "placeholder key must be dropped");
         assert_eq!(d.name, "taotoken");
-        // Key is the only gap → ask for it first.
-        assert_eq!(next, Some(WizardStep::ApiKey));
+        assert_eq!(import_plan(&d), vec![WizardStep::ApiKey, WizardStep::Name]);
     }
 
     #[test]
-    fn advance_template_bare_url_is_treated_as_base_url() {
+    fn resolve_template_bare_url_reprompts_not_base_url() {
+        // A bare URL is NOT a template — it belongs in the manual Base URL
+        // step, so the Template step re-prompts instead of consuming it.
         let mut d = DraftProvider::default();
         let existing = std::collections::HashMap::new();
         let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
-        let next = advance_template(&mut d, "https://api.deepseek.com/v1", &existing, &mut sink);
-        assert_eq!(d.base_url, "https://api.deepseek.com/v1");
-        assert_eq!(d.provider_type, "openai");
-        assert_eq!(next, Some(WizardStep::ApiKey));
+        assert_eq!(
+            resolve_template(&mut d, "https://api.deepseek.com/v1", &existing, &mut sink),
+            TemplateOutcome::Retry
+        );
+        assert!(d.base_url.is_empty());
     }
 
     #[test]
