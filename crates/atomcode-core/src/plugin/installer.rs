@@ -83,6 +83,13 @@ fn install_external(
             git_clone_with_pin(&url, &target_abs, pin)
                 .with_context(|| format!("clone {}", url))?;
         }
+        ExternalSource::GitSubdir { url, path, pin } => {
+            // The recorded plugin_dir points INTO the subtree, so return early
+            // with the subdir-qualified path rather than the clone root.
+            return git_subdir_clone(url, path, pin, &target_abs)
+                .map(|_| format!("{}/{}", target_rel, normalize_rel_subdir(path)))
+                .with_context(|| format!("git-subdir clone {} ({})", url, path));
+        }
         ExternalSource::Local { path } => {
             let src = expand_local_path(path)?;
             copy_dir_recursive(&src, &target_abs)
@@ -90,6 +97,107 @@ fn install_external(
         }
     }
     Ok(target_rel)
+}
+
+/// Normalise a subdir path for joining into `plugin_dir`: strip a leading
+/// `./` and any trailing slash. (Traversal safety is enforced separately by
+/// `validate_plugin_source` before this is called.)
+fn normalize_rel_subdir(path: &str) -> String {
+    path.trim_start_matches("./").trim_end_matches('/').to_string()
+}
+
+/// Realise a `git-subdir` source: sparse + partial clone of just `path` from
+/// `url` into `target`. `url` may be an `owner/repo` shorthand (expanded as a
+/// GitHub repo) or a full git URL.
+fn git_subdir_clone(url: &str, path: &str, pin: &GitPin, target: &Path) -> Result<()> {
+    validate_plugin_source(path)?;
+    let sub = normalize_rel_subdir(path);
+    if sub.is_empty() {
+        bail!("git-subdir source has empty path");
+    }
+    let clone_url = resolve_subdir_url(url)?;
+
+    // Partial clone (no blobs) + no checkout, so we can scope the working tree
+    // to just `sub` before materialising any files.
+    let mut clone = Command::new("git");
+    clone.args(["clone", "--filter=blob:none", "--no-checkout", "--depth", "1"]);
+    // git-subdir pins are branch names in practice (the schema's `ref`); a
+    // commit `sha` would need full history, but the catalog carries none.
+    let branch = pin.git_ref.as_deref().or(pin.branch.as_deref());
+    if let Some(b) = branch {
+        clone.args(["--branch", b]);
+    }
+    clone.arg(clone_url.as_str()).arg(target);
+    let out = clone.output().context("spawn git clone (git-subdir)")?;
+    if !out.status.success() {
+        // Fall back to a plain shallow clone for git versions without
+        // partial-clone support; we still scope via sparse-checkout below.
+        let mut plain = Command::new("git");
+        plain.args(["clone", "--no-checkout", "--depth", "1"]);
+        if let Some(b) = branch {
+            plain.args(["--branch", b]);
+        }
+        plain.arg(clone_url.as_str()).arg(target);
+        let out2 = plain.output().context("spawn git clone (git-subdir fallback)")?;
+        if !out2.status.success() {
+            bail!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&out2.stderr)
+            );
+        }
+    }
+
+    // Scope the working tree to the subdir, then check it out. `--no-cone` +
+    // `--` keep an exotic path from being read as a cone pattern or a flag.
+    let sparse = Command::new("git")
+        .args(["sparse-checkout", "set", "--no-cone", "--", &sub])
+        .current_dir(target)
+        .output()
+        .context("spawn git sparse-checkout")?;
+    if !sparse.status.success() {
+        bail!(
+            "git sparse-checkout failed: {}",
+            String::from_utf8_lossy(&sparse.stderr)
+        );
+    }
+    let checkout = Command::new("git")
+        .args(["checkout"])
+        .current_dir(target)
+        .output()
+        .context("spawn git checkout (git-subdir)")?;
+    if !checkout.status.success() {
+        bail!(
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
+
+    // The subdir must actually exist in the repo, or this plugin is empty.
+    let materialised = target.join(&sub);
+    if !materialised.is_dir() {
+        bail!(
+            "git-subdir path `{}` not found in repo {}",
+            sub,
+            clone_url
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a git-subdir `url` field. `owner/repo` shorthand → GitHub https URL
+/// (reusing the existing anti-injection guard); anything with a scheme or an
+/// ssh host → validated as a full git URL.
+fn resolve_subdir_url(url: &str) -> Result<String> {
+    let looks_shorthand = !url.contains("://")
+        && !url.contains('@')
+        && url.matches('/').count() == 1
+        && !url.starts_with('/');
+    if looks_shorthand {
+        expand_github_repo(url)
+    } else {
+        validate_git_url(url)?;
+        Ok(url.to_string())
+    }
 }
 
 /// Expand a `github` shorthand (`owner/name`) into the canonical clone URL.
@@ -226,6 +334,9 @@ fn external_matches_marketplace(ext: &ExternalSource, mp_url: &str) -> bool {
             Ok(u) => (u, pin),
             Err(_) => return false,
         },
+        // A git-subdir install pulls only a subtree into its own dir; it must
+        // never be deduped against the marketplace's full clone.
+        ExternalSource::GitSubdir { .. } => return false,
         ExternalSource::Local { .. } => return false,
     };
     if pin.branch.is_some()
@@ -311,6 +422,14 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
                 install_external(&plugin_key, marketplace, ext)?
             }
         }
+        PluginSource::Unknown(raw) => {
+            bail!(
+                "plugin `{}` uses an unsupported source type and cannot be \
+                 installed by this build: {}",
+                plugin,
+                raw
+            );
+        }
     };
 
     let id = plugin_id(&plugin_key, marketplace);
@@ -355,9 +474,15 @@ pub fn uninstall(plugin: &str, marketplace: &str) -> Result<()> {
 
     // Garbage-collect external clones. `marketplaces/*` belongs to the
     // marketplace itself and must be left intact for any sibling plugins.
+    // For most external sources `plugin_dir` IS the clone root
+    // (`installed/<mp>/<plugin>`), but a `git-subdir` install records the
+    // subdir-qualified path (`installed/<mp>/<plugin>/<sub>`) — so remove the
+    // canonical `installed/<mp>/<plugin>` root, not the recorded path, to take
+    // the whole clone with it.
     if entry.plugin_dir.starts_with("installed/") {
         if let Some(root) = paths::plugins_root() {
-            let abs = root.join(&entry.plugin_dir);
+            let install_root_rel = format!("installed/{}/{}", entry.marketplace, entry.plugin);
+            let abs = root.join(&install_root_rel);
             if abs.exists() {
                 std::fs::remove_dir_all(&abs).ok();
             }
@@ -620,5 +745,127 @@ mod tests {
         assert!(validate_plugin_source("plugins/../etc").is_err());
         assert!(validate_plugin_source("/etc/passwd").is_err());
         assert!(validate_plugin_source("plugins/foo/../bar").is_err());
+    }
+
+    // ---- git-subdir source ----
+
+    #[test]
+    fn resolve_subdir_url_shorthand_and_full() {
+        // owner/repo shorthand → GitHub https
+        assert_eq!(
+            resolve_subdir_url("openclaw/openclaw").unwrap(),
+            "https://github.com/openclaw/openclaw.git"
+        );
+        // full url passes through
+        assert_eq!(
+            resolve_subdir_url("https://example.com/r.git").unwrap(),
+            "https://example.com/r.git"
+        );
+        // ssh form is not shorthand (has '@'), validated as a url
+        assert!(resolve_subdir_url("git@github.com:o/r.git").is_ok());
+        // three segments is neither valid shorthand nor (here) a url scheme
+        assert!(resolve_subdir_url("a/b/c").is_err());
+    }
+
+    #[test]
+    fn normalize_rel_subdir_strips_dot_and_slash() {
+        assert_eq!(normalize_rel_subdir("./a/b/"), "a/b");
+        assert_eq!(normalize_rel_subdir("a/b"), "a/b");
+        assert_eq!(normalize_rel_subdir(".agents/skills/x"), ".agents/skills/x");
+    }
+
+    /// Build an "upstream" repo containing a plugin in a subdirectory.
+    /// Returns (repo_path, current_branch_name) so the test can pin `ref`
+    /// without depending on the machine's git `init.defaultBranch`.
+    fn make_subdir_upstream(subdir: &str) -> (PathBuf, String) {
+        let work = tempfile::tempdir().unwrap().keep();
+        let repo = work.join("upstream");
+        std::fs::create_dir_all(&repo).unwrap();
+        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["config", "user.name", "t"]).current_dir(&repo).status().unwrap();
+        let sub = repo.join(subdir);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("plugin.json"), r#"{"name":"sk"}"#).unwrap();
+        std::fs::create_dir_all(sub.join("skills/sk")).unwrap();
+        std::fs::write(
+            sub.join("skills/sk/SKILL.md"),
+            "---\nname: sk\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+        // A file OUTSIDE the subdir, to prove sparse-checkout scopes correctly.
+        std::fs::write(repo.join("OUTSIDE_MARKER"), "x").unwrap();
+        Command::new("git").args(["add", "-A"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo).status().unwrap();
+        let out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (repo, branch)
+    }
+
+    /// End-to-end: a marketplace whose manifest has a `git-subdir` entry
+    /// pointing at a separate upstream repo's subdirectory. Install must
+    /// sparse-clone only that subtree and record a plugin_dir INTO the subdir.
+    #[test]
+    #[serial_test::serial]
+    fn install_git_subdir_clones_only_subtree() {
+        let _home = isolated_home();
+        let (upstream, branch) = make_subdir_upstream("pkg/tool");
+        let upstream_url = format!("file://{}", upstream.display());
+
+        let manifest = format!(
+            r#"{{"name":"mp_gs","plugins":[{{"name":"tool","source":{{"source":"git-subdir","url":"{}","path":"pkg/tool","ref":"{}"}}}}]}}"#,
+            upstream_url, branch
+        );
+        let mp_repo = make_repo("mp_gs", Some(&manifest));
+        add_marketplace(&format!("file://{}", mp_repo.display())).unwrap();
+
+        let info = install("tool", "mp_gs").unwrap();
+        // plugin_dir points into the subdir.
+        assert_eq!(info.plugin_dir, "installed/mp_gs/tool/pkg/tool");
+
+        let abs = paths::plugins_root().unwrap().join(&info.plugin_dir);
+        assert!(abs.join("plugin.json").exists(), "subdir content missing");
+        assert!(abs.join("skills/sk/SKILL.md").exists(), "subdir skill missing");
+
+        // sparse-checkout must NOT have materialised files outside the subdir.
+        let clone_root = paths::plugins_root().unwrap().join("installed/mp_gs/tool");
+        assert!(
+            !clone_root.join("OUTSIDE_MARKER").exists(),
+            "sparse-checkout leaked files outside the requested subdir"
+        );
+
+        // uninstall removes the whole clone.
+        uninstall("tool", "mp_gs").unwrap();
+        assert!(!clone_root.exists(), "uninstall should remove the clone");
+    }
+
+    /// A git-subdir entry whose `path` escapes the repo must be rejected.
+    #[test]
+    #[serial_test::serial]
+    fn install_git_subdir_rejects_path_traversal() {
+        let _home = isolated_home();
+        let manifest = r#"{"name":"mp_bad","plugins":[{"name":"esc","source":{"source":"git-subdir","url":"o/r","path":"../etc","ref":"main"}}]}"#;
+        let mp_repo = make_repo("mp_bad", Some(manifest));
+        add_marketplace(&format!("file://{}", mp_repo.display())).unwrap();
+        let err = install("esc", "mp_bad").unwrap_err();
+        assert!(
+            err.to_string().contains("disallowed components")
+                || err.to_string().contains("git-subdir"),
+            "expected traversal rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dedup_skipped_for_git_subdir_source() {
+        let ext = ExternalSource::GitSubdir {
+            url: "o/r".into(),
+            path: "sub".into(),
+            pin: GitPin::default(),
+        };
+        assert!(!external_matches_marketplace(&ext, "https://github.com/o/r.git"));
     }
 }

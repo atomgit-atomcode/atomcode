@@ -344,8 +344,16 @@ impl Tool for ParallelEditTool {
 
         // Build verification — best-effort, structural detector (probes
         // for build-system markers, not model intent). On miss the table
-        // is the final answer.
-        if let Some((cmd, build_dir)) = find_build_command(&working_dir) {
+        // is the final answer. The marker probe does blocking `read_dir`,
+        // so run it on the blocking pool to keep cancellation responsive.
+        let build_detect = {
+            let working_dir = working_dir.clone();
+            tokio::task::spawn_blocking(move || find_build_command(&working_dir))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some((cmd, build_dir)) = build_detect {
             let mut build_cmd = tokio::process::Command::new("sh");
             build_cmd.args(["-c", &cmd])
                 .current_dir(&build_dir);

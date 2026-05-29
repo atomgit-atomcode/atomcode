@@ -177,87 +177,48 @@ impl Tool for SearchReplaceTool {
             None => None,
         };
 
-        // Walk files
-        let mut walker = WalkBuilder::new(&search_dir);
-        walker.hidden(true).git_ignore(true);
-        let walk = walker.build();
+        // Phase 1: walk + read + compute replacements on the BLOCKING pool.
+        // The `ignore` walk and per-file `std::fs::read_to_string` would
+        // otherwise stall the async worker on a hung filesystem and make the
+        // turn uncancellable. Writes + history/LSP bookkeeping need `ctx`'s
+        // async locks, so they run in phase 2 below — only for the few matched
+        // files; the heavy full-tree traversal is what must stay off-thread.
+        let scan_dir = search_dir.clone();
+        let replace = parsed.replace.clone();
+        let (modified, files_scanned) = tokio::task::spawn_blocking(move || {
+            sr_scan(&scan_dir, &re, glob_filter.as_ref(), &replace)
+        })
+        .await
+        .unwrap_or_else(|_| (Vec::new(), 0usize));
 
+        // Phase 2: backup → write → LSP/store bookkeeping per modified file.
+        // backup_before_write must precede the write (it snapshots the old
+        // on-disk content), so this stays sequential and async.
         let mut total_replacements = 0usize;
         let mut files_modified = Vec::new();
-        let mut files_scanned = 0usize;
-
-        for entry in walk {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-                continue;
+        for (file_path, new_content, count) in modified {
+            ctx.file_history
+                .lock()
+                .await
+                .backup_before_write(&file_path.to_string_lossy())
+                .await;
+            if let Err(e) = tokio::fs::write(&file_path, &new_content).await {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: format!("Failed to write {}: {}", file_path.display(), e),
+                    success: false,
+                });
             }
-
-            let file_path = entry.path();
-
-            if let Some(ref filter) = glob_filter {
-                if !filter.is_match(file_path, &search_dir) {
-                    continue;
-                }
-            }
-
-            // Read file
-            let content = match std::fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(_) => continue, // skip binary/unreadable files
-            };
-
-            files_scanned += 1;
-
-            // Quick check: does the file contain the search pattern?
-            if !re.is_match(&content) {
-                continue;
-            }
-
-            // Count and replace
-            let count = re.find_iter(&content).count();
-            let new_content = re
-                .replace_all(&content, parsed.replace.as_str())
-                .to_string();
-
-            if new_content != content {
-                // Backup before write
-                ctx.file_history
-                    .lock()
-                    .await
-                    .backup_before_write(&file_path.to_string_lossy())
-                    .await;
-                // Write back
-                if let Err(e) = std::fs::write(file_path, &new_content) {
-                    return Ok(ToolResult {
-                        call_id: String::new(),
-                        output: format!("Failed to write {}: {}", file_path.display(), e),
-                        success: false,
-                    });
-                }
-                // Canonicalize once so downstream by-path lookups
-                // (FileStore, LSP) match what read.rs originally
-                // stored — `entry.path()` from the directory walk
-                // can be the un-resolved symlink form (e.g. macOS
-                // `/var/...` vs `/private/var/...`), which would
-                // miss the FileStore key inserted by read_file.
-                let canon = std::fs::canonicalize(file_path)
-                    .unwrap_or_else(|_| file_path.to_path_buf());
-                // Notify LSP that file changed (if LSP is enabled).
-                ctx.notify_lsp_file_changed(&canon, &new_content).await;
-                // D3: drop any FileStore entry — peek_file against an
-                // old store_id reports stale, forcing fresh read_file.
-                ctx.file_store.write().await.invalidate(&canon);
-                total_replacements += count;
-                files_modified.push(format!(
-                    "  {} ({} replacements)",
-                    file_path.display(),
-                    count
-                ));
-            }
+            // Canonicalize so downstream by-path lookups (FileStore, LSP)
+            // match what read.rs stored — the walk can yield the un-resolved
+            // symlink form (macOS `/var/...` vs `/private/var/...`).
+            let canon = tokio::fs::canonicalize(&file_path)
+                .await
+                .unwrap_or_else(|_| file_path.clone());
+            ctx.notify_lsp_file_changed(&canon, &new_content).await;
+            ctx.file_store.write().await.invalidate(&canon);
+            total_replacements += count;
+            files_modified.push(format!("  {} ({} replacements)", file_path.display(), count));
         }
 
         if files_modified.is_empty() {
@@ -288,6 +249,57 @@ impl Tool for SearchReplaceTool {
             success: true,
         })
     }
+}
+
+/// Synchronous walk + read + replace computation, pulled out of
+/// `SearchReplaceTool::execute` so the (blocking) `ignore` walk and per-file
+/// reads run inside `tokio::task::spawn_blocking` and don't stall the async
+/// worker on a hung filesystem. Does NOT write — returns the list of
+/// (path, new_content, replacement_count) for changed files plus the count of
+/// files scanned. Writes + history/LSP bookkeeping happen in async phase 2
+/// because they need `ctx`'s async locks.
+fn sr_scan(
+    search_dir: &std::path::Path,
+    re: &regex::Regex,
+    glob_filter: Option<&FileGlob>,
+    replace: &str,
+) -> (Vec<(std::path::PathBuf, String, usize)>, usize) {
+    let mut walker = WalkBuilder::new(search_dir);
+    walker.hidden(true).git_ignore(true);
+    let walk = walker.build();
+
+    let mut modified: Vec<(std::path::PathBuf, String, usize)> = Vec::new();
+    let mut files_scanned = 0usize;
+
+    for entry in walk {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            continue;
+        }
+        let file_path = entry.path();
+        if let Some(filter) = glob_filter {
+            if !filter.is_match(file_path, search_dir) {
+                continue;
+            }
+        }
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(_) => continue, // skip binary/unreadable files
+        };
+        files_scanned += 1;
+        if !re.is_match(&content) {
+            continue;
+        }
+        let count = re.find_iter(&content).count();
+        let new_content = re.replace_all(&content, replace).to_string();
+        if new_content != content {
+            modified.push((file_path.to_path_buf(), new_content, count));
+        }
+    }
+    (modified, files_scanned)
 }
 
 struct FileGlob {

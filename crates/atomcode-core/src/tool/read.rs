@@ -118,6 +118,41 @@ struct ReadFileArgs {
 /// path and every read errors NotFound. Detect that pattern, try the
 /// stripped path, and prepend an inline note so the model corrects
 /// future calls.
+/// Recursive workspace search for a file by basename — the "did you mean"
+/// fallback when a read targets a non-existent path. Uses blocking `read_dir`,
+/// so callers run it inside `tokio::task::spawn_blocking` to keep cancellation
+/// responsive on a hung filesystem. Was a nested fn inside `ReadTool::execute`;
+/// hoisted to module scope so the blocking closure can reach it.
+fn find_file_recursive(
+    dir: &std::path::Path,
+    target: &str,
+    depth: usize,
+    max_depth: usize,
+    results: &mut Vec<String>,
+) {
+    if depth > max_depth || results.len() >= 20 {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.')
+                || name == "node_modules"
+                || name == "target"
+                || name == ".git"
+            {
+                continue;
+            }
+            let p = entry.path();
+            if p.is_dir() {
+                find_file_recursive(&p, target, depth + 1, max_depth, results);
+            } else if name == target {
+                results.push(p.to_string_lossy().to_string());
+            }
+        }
+    }
+}
+
 fn strip_trailing_braces(s: &str) -> Option<&str> {
     let without_close = s.strip_suffix('}')?;
     let open = without_close.rfind('{')?;
@@ -328,49 +363,26 @@ impl Tool for ReadFileTool {
                 .unwrap_or_default();
             let mut matches: Vec<String> = Vec::new();
             if !filename.is_empty() {
-                fn find_file(
-                    dir: &std::path::Path,
-                    target: &str,
-                    depth: usize,
-                    max_depth: usize,
-                    results: &mut Vec<String>,
-                ) {
-                    if depth > max_depth || results.len() >= 20 {
-                        return;
-                    }
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with('.')
-                                || name == "node_modules"
-                                || name == "target"
-                                || name == ".git"
-                            {
-                                continue;
-                            }
-                            let p = entry.path();
-                            if p.is_dir() {
-                                find_file(&p, target, depth + 1, max_depth, results);
-                            } else if name == target {
-                                results.push(p.to_string_lossy().to_string());
-                            }
+                // The recursive `read_dir` walk blocks; run it on the blocking
+                // pool so a hung filesystem can't stall cancellation. (Helper
+                // `find_file_recursive` lives at module scope.) The trailing
+                // `{…}`-placeholder variant is searched too, so a model that
+                // copied an SLF4J-style `{}` suffix still gets the real file
+                // surfaced in "Did you mean".
+                let scan_wd = working_dir.clone();
+                let scan_name = filename.clone();
+                matches = tokio::task::spawn_blocking(move || {
+                    let mut found: Vec<String> = Vec::new();
+                    find_file_recursive(&scan_wd, &scan_name, 0, 7, &mut found);
+                    if let Some(stripped) = strip_trailing_braces(&scan_name) {
+                        if !stripped.is_empty() && stripped != scan_name {
+                            find_file_recursive(&scan_wd, stripped, 0, 7, &mut found);
                         }
                     }
-                }
-                find_file(&working_dir, &filename, 0, 7, &mut matches);
-                // C: if the basename has a trailing `{…}` placeholder,
-                // also search for the basename without it. A's
-                // strip-retry only checks the *exact* parent directory;
-                // C widens the search to the entire workspace so a
-                // model that copied both the wrong parent path AND the
-                // SLF4J-style `{}` suffix (e.g. relative path against a
-                // working_dir that no longer matches) still gets the
-                // real file surfaced in "Did you mean".
-                if let Some(stripped_name) = strip_trailing_braces(&filename) {
-                    if !stripped_name.is_empty() && stripped_name != filename {
-                        find_file(&working_dir, stripped_name, 0, 7, &mut matches);
-                    }
-                }
+                    found
+                })
+                .await
+                .unwrap_or_default();
                 // Dedup (the same path could surface from both filename
                 // variants when the workspace contains both naming
                 // conventions, or when A's retry already pre-checked

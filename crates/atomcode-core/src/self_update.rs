@@ -104,8 +104,30 @@ pub struct RollbackSummary {
 /// `None` means the current platform has no published release — the
 /// caller must surface a clean "unsupported platform" message rather
 /// than fall through to a 404 download.
+// `target_env = "ohos"` is unknown to the check-cfg lint on toolchains
+// without the OpenHarmony target registered; the cfg is still correct when
+// building for `*-linux-ohos`, so silence the false-positive.
+#[allow(unexpected_cfgs)]
 pub fn detect_target() -> Option<&'static str> {
-    target_tag(std::env::consts::OS, std::env::consts::ARCH)
+    // HarmonyOS / OpenHarmony builds report `std::env::consts::OS == "linux"`
+    // at runtime, so the OS+ARCH table below would resolve to `linux-arm64`
+    // — a STATIC-musl build that doesn't run on HarmonyOS — and the auto-
+    // upgrade would clobber the working DYNAMIC-musl install (the one linked
+    // against `/lib/ld-musl-aarch64.so.1`), leaving `permission denied`.
+    // The OHOS artifact is compiled for a `*-linux-ohos` target, so pin it to
+    // its own `ohos-arm64` asset using the COMPILE-TIME target rather than the
+    // runtime OS string. Zero effect on every other platform.
+    #[cfg(any(target_os = "ohos", target_env = "ohos"))]
+    {
+        return match std::env::consts::ARCH {
+            "aarch64" | "arm64" => Some("ohos-arm64"),
+            _ => None,
+        };
+    }
+    #[cfg(not(any(target_os = "ohos", target_env = "ohos")))]
+    {
+        target_tag(std::env::consts::OS, std::env::consts::ARCH)
+    }
 }
 
 fn target_tag(os: &str, arch: &str) -> Option<&'static str> {
