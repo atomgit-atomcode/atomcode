@@ -151,3 +151,70 @@ fn derive_name(base_url: &str, provider_type: &str, existing: &HashMap<String, P
 - Edit 流程行为完全不变
 - 想添加官方 OpenAI/Claude/Ollama（用默认 URL）的用户：Base URL 留空 → 仍会被问
   Type，路径与今天一致，只是少了手敲 Name（改为派生默认 + 回车）
+
+---
+
+## 增补（最终实现）：模板导入并入 Add + 步骤进度（2026-05-29）
+
+最终没有单列「模板导入」菜单项，而是**把导入并进 add**：进来第一步就推荐粘贴模板，
+留空则手动填写。菜单保持 4 项（add / edit / delete / set-default）。
+
+### 统一的 Add 流程
+
+新增 `WizardStep::Template` 作为 Add 的第一步，提示：
+「粘贴模板自动识别（curl / JSON / TOML 或 Base URL），或直接回车手动填写：」
+
+- **粘贴内容**（`advance_template`）：
+  - `parse_template` 抽到 URL → 填 draft：`infer_type` 推断 type、`normalize_base_url`
+    归一化 base_url、占位符 key 丢弃、model 带入、name 用解析值或 `derive_name`；回显
+    `ProviderImportParsed`「已识别：name · type · model」；进入「补缺」（缺 key/model 才问）。
+  - 像模板但抠不出 URL（`looks_like_template`）→ `ProviderImportFailed`，重贴。
+  - 非空且不像模板、也无 URL → 当作裸 base_url 处理（推断 type → 问 API Key）。
+- **留空** → 手动：问 类型 → API Key → Model → Name（base_url 留空用 provider 默认）。
+
+### 解析（纯函数，逐个 TDD）
+
+- `parse_template(input) -> ParsedTemplate { url, api_key, model, name }`：
+  - 含 `curl`/`authorization`/`x-api-key`/`-h `/`-d ` → curl 模式：URL = 第一个
+    `http(s)://` token；api_key = `Authorization: Bearer X` 或 `x-api-key: X`；
+    model = body 里 `"model"` 值
+  - 否则 key-value 模式（JSON/TOML 通用）：`quoted_value_after` 抓
+    `base_url`/`api_key`/`model`；`toml_provider_name` 抓 `[providers.NAME]` → name
+- `normalize_base_url`：openai 剥结尾端点保留 `/v1`；claude/ollama 只留 authority
+- `is_placeholder`：`<...>`、`YOUR_API_KEY`、`sk-xxxx`、`****` → 占位符
+
+### 步骤进度
+
+- `remaining_add_steps(draft)`：按已填情况返回剩余问题序列（Type 若 type 空、ApiKey 若
+  key 空、Model 若 model 空、末尾恒含 Name）。
+- 离开 Template 步时把 `remaining_add_steps(draft).len()` 冻结为 `Add.total`；
+  各 gap 步显示 `(current/total)`，`current = total − 当前 remaining 长度 + 1`。
+- Template 步本身不计数（此时还不知道要几步）。
+- 新增 i18n `ProviderStepProgress { current, total }`。
+
+### 衔接细节
+
+- `advance_add` 跳转「已填则跳过」：ApiKey 之后若 model 已填则直接到 Name；普通手动
+  路径此刻 model 必空，行为不变。
+- 转入 Name 统一走 `to_name_step`（name 空则派生），Model→Name 与 ApiKey→Name 共用。
+- `Add` 增加 `total: usize` 字段；`BaseUrl` 步在 Add 中不再出现（URL 经 Template 进入），
+  仍保留给 Edit。
+
+### i18n
+
+新增 `ProviderImportPrompt`、`ProviderImportParsed { name, type_name, model }`、
+`ProviderImportFailed`、`ProviderTypeInferred { type_name }`、
+`ProviderStepNameDefault { default }`、`ProviderStepProgress { current, total }`。
+
+### 测试（均纯函数 / 轻量集成）
+
+- `parse_template`：taotoken curl（OpenAI 风）、Anthropic 风 curl、JSON 片段、TOML 块
+- `normalize_base_url`：openai 剥端点 / 保留、claude 去路径、ollama 留 host:port
+- `is_placeholder`：占位符 → true；真实 key → false
+- `remaining_add_steps`：手动 4 步、裸 URL 3 步、全填只剩 Name、跳过已填 model
+- `advance_template`：留空走手动、curl 填充并问 key、裸 URL 当 base_url
+
+### 兼容性
+
+并入 add 单一入口；`advance_add` 的 skip 对手动 add 行为零变化；Edit 完全不变；
+不引入网络、不改 schema 与配置格式。
