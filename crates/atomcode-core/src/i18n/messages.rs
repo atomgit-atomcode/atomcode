@@ -561,6 +561,8 @@ pub enum Msg<'a> {
     GuideMenuConfig,
     /// /guide menu tip: hint for users to type a question
     GuideMenuTip,
+    /// /guide menu: documentation URL
+    GuideMenuDocUrl,
     /// Knowledge base: "no results found" message
     GuideKbNoResults { query: &'a str },
     /// Knowledge base: "Related knowledge" section header

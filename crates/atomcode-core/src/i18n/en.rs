@@ -752,7 +752,9 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::GuideMenuConfig => "Configuration            config.toml reference".into(),
         Msg::GuideMenuTip => "
   Tip: type /guide <your question> for a specific answer.
-  Example: /guide How to switch models".into(),
+  Example: /guide How to switch models
+".into(),
+        Msg::GuideMenuDocUrl => "  Full docs: https://atomcode.atomgit.com/docs/en/".into(),
         Msg::GuideKbNoResults { query } =>
             format!("No entries found matching \"{}\" in the local knowledge base.\n\n\
                      Try these common questions:\n\

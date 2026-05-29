@@ -740,7 +740,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::GuideMenuConfig => "怎么配置               config.toml 配置说明".into(),
         Msg::GuideMenuTip => "
   提示：输入 /guide <你的问题> 获取具体回答。
-  例如：/guide 怎么切换模型".into(),
+  例如：/guide 怎么切换模型
+".into(),
+        Msg::GuideMenuDocUrl => "  完整文档：https://atomcode.atomgit.com/docs/zh/".into(),
         Msg::GuideKbNoResults { query } =>
             format!("本地知识库中未找到与「{}」直接相关的条目。\n\n\
                      你可以试试这些常见问题：\n\

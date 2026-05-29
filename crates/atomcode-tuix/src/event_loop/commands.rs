@@ -291,6 +291,8 @@ pub(super) fn execute_slash_command(
                 menu.push_str("\n    /guide ");
                 menu.push_str(&t(Msg::GuideMenuConfig));
                 menu.push_str(&t(Msg::GuideMenuTip));
+                menu.push('\n');
+                menu.push_str(&t(Msg::GuideMenuDocUrl));
                 renderer.render(UiLine::CommandOutput(menu));
                 renderer.flush();
             } else {

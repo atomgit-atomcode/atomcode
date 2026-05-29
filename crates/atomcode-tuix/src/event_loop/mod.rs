@@ -1084,7 +1084,15 @@ impl Buffer {
                     self.history_idx = None;
                     return BufferResult::Redraw;
                 }
-                let line = self.text.trim().to_string();
+                let mut line = self.text.trim();
+                // Strip leading shell prompt characters (❯, $, >, #, %, λ)
+                // that users accidentally paste from terminal output.
+                while let Some(rest) = line.strip_prefix(|c: char| {
+                    matches!(c, '❯' | '$' | '>' | '#' | '%' | 'λ')
+                }) {
+                    line = rest.trim_start();
+                }
+                let line = line.to_string();
                 if line.is_empty() {
                     return BufferResult::Redraw;
                 }
