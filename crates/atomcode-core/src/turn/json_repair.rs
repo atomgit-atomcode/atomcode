@@ -116,8 +116,19 @@ fn pre_escape_windows_paths_in_json(s: &str) -> String {
 }
 
 /// True iff `s` contains a Windows drive-letter path prefix
-/// (`[A-Za-z]:[\\/]`) where the drive letter stands alone (not the
-/// tail of a longer alphabetic run).
+/// (`[A-Za-z]:[\\/]`) appearing in a path-shaped context.
+///
+/// Required context: the drive letter is at the start of the body,
+/// or the byte before it is `\` (UNC long-path `\\?\D:\…`), `'`,
+/// or `"` (quoted path literal embedded in code). Without this
+/// guard, natural-language strings whose contents happen to match
+/// the alpha-colon-backslash shape — e.g. `class A:\n`, `case X:\n`,
+/// `Section B:\nContent` — would be misread as Windows paths and
+/// every `\n`/`\t` in the body would be doubled to a literal
+/// backslash+letter, corrupting the file. The earlier
+/// "preceded-by-alphabetic" guard only ruled out multi-letter
+/// words like `category:\n`; single-letter labels slipped through
+/// and broke `write_file` on common Python sources.
 fn looks_like_windows_path(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.len() < 3 {
@@ -133,10 +144,15 @@ fn looks_like_windows_path(s: &str) -> bool {
         if bytes[i + 2] != b'\\' && bytes[i + 2] != b'/' {
             continue;
         }
-        // Tail-of-word guard: drive letter is a single char, so the
-        // byte before must NOT be alphabetic (rules out `category:\…`).
-        if i > 0 && bytes[i - 1].is_ascii_alphabetic() {
-            continue;
+        // Path-context guard: only accept at start of body, or
+        // immediately after a path-shaped delimiter. Everything
+        // else (whitespace, alpha, punctuation, JSON escapes) is
+        // a false-positive surface for prose content.
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if !matches!(prev, b'\\' | b'"' | b'\'') {
+                continue;
+            }
         }
         return true;
     }
@@ -162,13 +178,27 @@ fn rewrite_windows_path_body(body: &str, out: &mut String) {
                 out.push_str("\\\\");
                 k += 2;
             }
-            Some(c @ ('"' | '/')) => {
-                // JSON-legal escape unrelated to paths — preserve.
+            Some(c @ ('"' | '/' | 'u')) => {
+                // JSON-legal escape unrelated to single-char ambiguity
+                // — preserve verbatim.
+                //
+                // `\u` is the JSON Unicode escape `\uXXXX` (always 6
+                // chars total, 4 hex digits follow). Unlike `\t`/`\n`/
+                // `\r`/`\b`/`\f` — single-letter shortcuts that a
+                // Windows path could naturally produce as
+                // backslash+letter — `\u` is unambiguous: a Windows
+                // path containing literal `\u` is impossible (drive
+                // letter + `:` + `\` then directory char; no shell or
+                // model would normalise a directory called "u…" to a
+                // `\u` glyph). Treating `\u` as ambiguous corrupted
+                // legitimate Unicode escapes inside drive-letter
+                // strings: `"D:A\foo"` → `"D:\\u0041\\foo"`
+                // decoded to literal `D:A\foo` instead of `D:A\foo`.
                 out.push('\\');
                 out.push(c);
                 k += 2;
             }
-            Some(c @ ('t' | 'n' | 'r' | 'b' | 'f' | 'u')) => {
+            Some(c @ ('t' | 'n' | 'r' | 'b' | 'f')) => {
                 // Ambiguous in Windows-path context: model meant a
                 // literal backslash, not a JSON escape. Double the
                 // backslash so the JSON parser decodes `\X` back to
@@ -965,6 +995,64 @@ mod tests {
         assert!(!s.contains('\\'), "no literal backslash should remain: got {:?}", s);
     }
 
+    /// Reverted-fix regression pin. A previous attempt added a
+    /// "skip if body contains `\n` or `\r` escape" guard to
+    /// `looks_like_windows_path` to defend content-with-embedded-
+    /// path bodies. It broke Windows paths whose own filenames
+    /// start with `n` or `r` — `D:\new`, `D:\node_modules`,
+    /// `D:\readme.txt`, `\nightly\foo`, etc. — because those
+    /// contain a `\` + `n` (or `\r`) byte pair that the guard
+    /// misread as a newline escape. Eval matrix went 14 → 27
+    /// before the revert.
+    ///
+    /// Pin the loose-path case so any future "body shape" guard
+    /// has to keep it working.
+    #[test]
+    fn repair_tool_args_loose_windows_path_with_n_dir_name_still_rewrites() {
+        // Raw JSON: `{"file_path": "D:\new\foo.py"}` — model emits
+        // single-backslash Windows path with a directory called
+        // `new`. The bytes between the inner quotes are `D` `:`
+        // `\` `n` `e` `w` `\` `f` `o` `o` `.` `p` `y`. The pre-
+        // escape pass MUST double the `\n` and `\f` so the path
+        // round-trips, otherwise serde decodes `\n` → newline and
+        // the path turns into `D:<newline>ew<formfeed>oo.py`.
+        let input = "{\"file_path\": \"D:\\new\\foo.py\"}";
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let p = v["file_path"].as_str().unwrap();
+        assert_eq!(p, "D:\\new\\foo.py", "loose Windows path with `\\n` substring must round-trip; got {:?}", p);
+        assert!(!p.contains('\n'), "no real newline must leak through: {:?}", p);
+        assert!(!p.contains('\u{000C}'), "no form feed must leak through: {:?}", p);
+    }
+
+    /// Python source like `class A:\n    pass\n` has a single
+    /// uppercase letter preceded by whitespace, then `:`, then
+    /// `\` from the JSON `\n` escape. The old tail-of-word guard
+    /// only rejected multi-letter words, so single-letter "names"
+    /// (class names, match arms, switch labels) slipped through
+    /// and every `\n`/`\t` in the file body got doubled, writing
+    /// the file as one line of literal `\n` characters. This is
+    /// the v4.23.2 tool-error regression — `notify.py` rewrites
+    /// turned into 1 line of garbage.
+    #[test]
+    fn repair_tool_args_single_letter_label_before_newline_is_not_path() {
+        let input = r#"{"file_path": "/tmp/notify.py", "content": "class A:\n    pass\n"}"#;
+        let out = repair_tool_args("write_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let content = v["content"].as_str().unwrap();
+        assert!(
+            content.contains('\n'),
+            "newline must survive — file becomes 1-line garbage otherwise: got {:?}",
+            content
+        );
+        assert!(
+            !content.contains("\\n"),
+            "literal backslash-n must not appear: got {:?}",
+            content
+        );
+        assert_eq!(content, "class A:\n    pass\n");
+    }
+
     #[test]
     fn repair_tool_args_lowercase_drive_letter_recognized() {
         // Lowercase `c:\` is also a valid Windows drive prefix.
@@ -1019,6 +1107,47 @@ mod tests {
         let once = pre_escape_windows_paths_in_json(r#"{"p": "D:\\a\\b"}"#);
         let twice = pre_escape_windows_paths_in_json(&once);
         assert_eq!(once, twice, "pre_escape should be idempotent");
+    }
+
+    /// `\u` Unicode escapes inside a drive-letter string must survive
+    /// the Windows pre-pass intact. `\u` is the 6-char `\uXXXX` JSON
+    /// escape — not a single-char ambiguity like `\t`/`\n` that could
+    /// arise from a literal Windows path. Treating it as ambiguous
+    /// would corrupt legitimate Unicode escapes (`张` for "张" in
+    /// `C:\Users\张三\…`) by doubling the backslash and turning the
+    /// Chinese name into the literal text `张`.
+    #[test]
+    fn pre_escape_preserves_unicode_escape_in_windows_path() {
+        // Raw bytes: `C` `:` `\` `\` `U` `s` `e` `r` `s` `\` `\` `\` `u` `5` `f` `2` `0` …
+        // After JSON decode that's `C:\Users\张三\file.txt`.
+        let input = r#"{"file_path": "C:\\Users\\张三\\file.txt"}"#;
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["file_path"], "C:\\Users\\张三\\file.txt");
+        // Negative: bytes after pre-pass MUST NOT contain `\\u` —
+        // that would mean we doubled the backslash and broke the
+        // Unicode escape. Check via the round-trip: if the decoded
+        // string contains a literal `\u` substring, the pre-pass
+        // corrupted it.
+        let s = v["file_path"].as_str().unwrap();
+        assert!(
+            !s.contains("\\u"),
+            "Unicode escape must not survive as literal `\\u`; got {s:?}",
+        );
+    }
+
+    /// Mixed: `\u` preserved (legit escape) AND `\t`/`\f` doubled
+    /// (Windows path chars). The path-context heuristic applies per
+    /// `\X` pair independently. JSON body `D:\testA\foo` should
+    /// decode to `D:\testA\foo` — the `A` from `A` snaps directly
+    /// onto `test` because no backslash separates them in the source.
+    #[test]
+    fn pre_escape_mixes_unicode_escape_with_ambiguous_letter() {
+        let input = "{\"file_path\": \"D:\\test\\u0041\\foo\"}";
+        let out = repair_tool_args("read_file", input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        // \t → literal `\t`; A → "A"; \f → literal `\f`.
+        assert_eq!(v["file_path"], "D:\\testA\\foo");
     }
 
     // --- repair_json in_string awareness regression tests ---

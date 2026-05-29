@@ -31,7 +31,7 @@ retries = 2
 [[webhooks]]
 name = "custom-api"
 description = "发送到自定义 API"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://api.example.com/atomcode/hooks"
 method = "POST"
 enabled = true
@@ -57,38 +57,42 @@ enabled = true
 # 钉钉通知
 [[webhooks]]
 name = "dingtalk"
-trigger = "on_turn_complete"
+trigger = "turn_complete"
 url = "https://oapi.dingtalk.com/robot/send?access_token=XXX"
 enabled = true
 
 # 企业微信
 [[webhooks]]
 name = "wechat"
-trigger = "on_session_end"
+trigger = "session_end"
 url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=XXX"
 enabled = true
 ```
 
 ## 支持的触发时机
 
-Webhook 支持所有 Hook 时机，trigger 字段可以包含以下值：
+Webhook 支持除 OnUserPromptSubmit 外的所有 Hook 时机（共 12 种），trigger 字段可以包含以下值（逗号分隔多个）：
 
-| trigger 值 | 触发时机 |
-|-----------|---------|
-| `on_message_received` | 用户消息接收时 |
-| `on_turn_start` | Turn 开始前 |
-| `on_tool_call_start` | 工具调用开始时 |
-| `pre_tool` / `before_tool` | 工具执行前 |
-| `post_tool` / `after_tool` | 工具执行后 |
-| `on_turn_complete` / `after_turn` | Turn 完成后 |
-| `post_turn` | Turn 完成后（旧版） |
-| `on_session_start` | 会话启动时 |
-| `on_session_end` | 会话结束时 |
-| `on_error` | 错误发生时 |
-| `on_model_response` | 模型响应完成后 |
-| `system_prompt` | 系统 Prompt 构建时 |
+| trigger 值（规范） | 别名 | 触发时机 |
+|-----------|------|---------|
+| `turn_start` | — | Turn 开始前 |
+| `tool_call_start` | — | 工具调用开始时 |
+| `pre_tool` | `before_tool` | 工具执行前 |
+| `post_tool` | `after_tool` | 工具执行后 |
+| `turn_complete` | `after_turn` | Turn 完成后（详细统计） |
+| `post_turn` | — | Turn 完成后（旧版兼容） |
+| `session_start` | — | 会话启动时 |
+| `session_end` | — | 会话结束时 |
+| `error` | — | 错误发生时 |
+| `model_response` | — | 模型响应完成后 |
+| `system_prompt` | — | 系统 Prompt 构建时 |
+| `message`² | `message_received` | 用户消息接收时 |
 
-**注意**：Webhook 会注册到所有触发时机，但只会在匹配 `trigger` 字段时实际发送 HTTP 请求。
+> ² `message`：WebhookHook 已实现对应 trait，但引擎尚未注册触发槽位，当前实际不可用。
+>
+> **匹配规则**：使用 **contains（子串包含）** 匹配，因此 `on_turn_start`、`turn_start_hook` 等变体也能工作。但推荐使用上表的规范值，避免歧义。例如 `trigger = "error"` 会匹配所有含 "error" 的 trigger 字符串，如果同时写了 `trigger = "pre_tool,error"`，则该 Webhook 也会在错误事件触发。
+>
+> **注意**：Webhook 会注册到所有触发时机，但只会在 `trigger` 字段匹配时实际发送 HTTP 请求。
 
 ## 请求格式
 
@@ -159,7 +163,7 @@ Webhook 服务端应该返回 JSON 响应：
 [[webhooks]]
 name = "slack-audit"
 description = "记录所有工具调用到 Slack"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
 enabled = true
 timeout_secs = 10
@@ -205,7 +209,7 @@ if __name__ == '__main__':
 ```toml
 [[webhooks]]
 name = "slack-via-adapter"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "http://localhost:5000/atomcode/hooks"
 enabled = true
 ```
@@ -218,7 +222,7 @@ enabled = true
 [[webhooks]]
 name = "dingtalk"
 description = "发送通知到钉钉"
-trigger = "on_turn_complete"
+trigger = "turn_complete"
 url = "https://oapi.dingtalk.com/robot/send?access_token=XXX"
 enabled = true
 ```
@@ -264,7 +268,7 @@ if __name__ == '__main__':
 [[webhooks]]
 name = "wechat"
 description = "发送通知到企业微信"
-trigger = "on_error"
+trigger = "error"
 url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=XXX"
 enabled = true
 ```
@@ -277,7 +281,7 @@ enabled = true
 [[webhooks]]
 name = "audit-log"
 description = "发送所有工具调用审计日志"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://log-service.example.com/atomcode/audit"
 method = "POST"
 enabled = true
@@ -297,7 +301,7 @@ Content-Type = "application/json"
 [[webhooks]]
 name = "response-validator"
 description = "远程验证模型响应"
-trigger = "on_model_response"
+trigger = "model_response"
 url = "https://validator.example.com/check"
 enabled = true
 timeout_secs = 10
@@ -373,7 +377,7 @@ Webhook 错误会显示为警告，不会中断流程：
    ```toml
    [[webhooks]]
    name = "debug"
-   trigger = "on_tool_call_start"
+   trigger = "tool_call_start"
    url = "https://webhook.site/your-unique-id"
    enabled = true
    ```
@@ -416,7 +420,7 @@ timeout_secs = 5
 [[webhooks]]
 name = "dingtalk-turns"
 description = "钉钉 Turn 完成通知"
-trigger = "on_turn_complete"
+trigger = "turn_complete"
 url = "https://oapi.dingtalk.com/robot/send?access_token=XXX"
 enabled = true
 timeout_secs = 5
@@ -425,7 +429,7 @@ timeout_secs = 5
 [[webhooks]]
 name = "wechat-session"
 description = "企业微信会话结束通知"
-trigger = "on_session_end"
+trigger = "session_end"
 url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=XXX"
 enabled = true
 timeout_secs = 5
@@ -434,7 +438,7 @@ timeout_secs = 5
 [[webhooks]]
 name = "audit-log"
 description = "云端审计日志"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://log-service.example.com/audit"
 enabled = true
 timeout_secs = 5

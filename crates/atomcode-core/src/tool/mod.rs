@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod auto_fix;
 pub mod bash;
 pub mod blast_radius;
@@ -855,6 +856,14 @@ impl ToolContext {
 
     /// Create an isolated copy: same working directory value, independent Arc.
     /// Shares the same graph (read-only for tools) but independent working_dir.
+    ///
+    /// Fields that are NOT copied from the original:
+    /// - `read_cache`: reset — subagent re-reads files (acceptable for isolation)
+    /// - `event_tx`: reset — subagent has its own event channel
+    /// - `tool_registry`: reset — subagent gets filtered tools
+    /// - `first_error_signatures`: reset — subagent has independent error state
+    /// - `ctx_budget_hint`: reset to MAX — subagent has its own budget
+    /// - `read_budget_tokens`: reset to MAX — subagent has own budget
     pub async fn isolate(&self) -> Self {
         let wd = self.working_dir.read().await.clone();
         let mut ctx = Self::new(wd);
@@ -873,7 +882,7 @@ impl ToolContext {
     pub async fn notify_lsp_file_changed(&self, path: &Path, content: &str) {
         if let Some(ref lsp) = self.lsp {
             if let Err(e) = lsp.notify_file_changed(path, content).await {
-                eprintln!(
+                tracing::warn!(
                     "[lsp] Failed to refresh diagnostics for {}: {}",
                     path.display(),
                     e

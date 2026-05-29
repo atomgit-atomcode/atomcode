@@ -1,5 +1,7 @@
 # 异步 Webhook 和批量发送实现总结
 
+> ⚠️ **当前状态警告**：异步 Webhook 的定时 flush 机制尚未完全激活（参见 issue #914）。目前 batcher 已创建但不会自动定期发送。在定时 flush 完成之前，请使用同步 Webhook 替代异步模式。关注后续更新以获取可用通知。
+
 ## 概述
 
 已成功实现异步 Webhook 和批量发送功能，使用后台任务处理 Webhook 请求，避免阻塞 AtomCode 主流程。
@@ -8,7 +10,7 @@
 
 ### 1. 核心模块
 
-**文件**: `crates/atomcode-core/src/hook/async_batcher.rs` (366 行)
+**文件**: `crates/atomcode-core/src/hook/async_batcher.rs` (~534 行)
 
 #### 主要结构
 
@@ -114,7 +116,7 @@ async fn send_webhook(&self, payload: &serde_json::Value) -> Result<WebhookRespo
 # 同步 Webhook
 [[webhooks]]
 name = "error-alert"
-trigger = "on_error"
+trigger = "error"
 url = "https://alert.example.com/error"
 enabled = true
 
@@ -138,7 +140,7 @@ flush_interval_ms = 1000
 
 | 文件 | 类型 | 行数 | 变更 |
 |------|------|------|------|
-| `src/hook/async_batcher.rs` | 新增 | 366 行 | 异步批处理器核心实现 |
+| `src/hook/async_batcher.rs` | 新增 | ~534 行 | 异步批处理器核心实现 |
 | `src/hook/webhook.rs` | 更新 | +30 行 | 集成异步模式 |
 | `src/hook/config_loader.rs` | 更新 | +50 行 | 支持异步配置加载 |
 | `src/hook/mod.rs` | 更新 | +1 行 | 导出异步模块 |
@@ -230,7 +232,7 @@ flush_interval_ms = 100
 # 关键通知（同步，确保不丢失）
 [[webhooks]]
 name = "error-alert"
-trigger = "on_error"
+trigger = "error"
 url = "https://alert.example.com/error"
 enabled = true
 
@@ -245,7 +247,7 @@ flush_interval_ms = 1000
 
 ### 8. 批量请求格式
 
-异步 Webhook 发送的批量请求格式：
+异步 Webhook 发送的批量请求格式（event 字段值与 WebhookHook 事件名一致）：
 
 ```json
 {
@@ -258,7 +260,7 @@ flush_interval_ms = 1000
     {
       "event": "on_tool_call_start",
       "hook_name": "audit-log",
-      "trigger": "on_tool_call_start",
+      "trigger": "tool_call_start",
       "context": {
         "tool_name": "edit_file",
         "tool_args": "{...}",
@@ -281,6 +283,8 @@ flush_interval_ms = 1000
   ]
 }
 ```
+
+> ⚠️ **注意**：`trigger` 字段存储用户配置值（如 `tool_call_start`），`event` 字段存储 WebhookHook 发出的事件名（如 `on_tool_call_start`）。服务端应以 `event` 字段为准做事件类型判断。
 
 ### 9. 测试验证
 
@@ -358,7 +362,7 @@ flush_interval_ms = 1000
 
 ### 完成的工作
 
-1. ✅ **实现异步批处理器核心模块** - 366 行 Rust 代码
+1. ✅ **实现异步批处理器核心模块** - ~534 行 Rust 代码
 2. ✅ **集成到 WebhookHook** - 支持同步/异步模式切换
 3. ✅ **实现事件队列和批量聚合** - mpsc 通道 + tokio 后台任务
 4. ✅ **添加配置选项** - batch_size, flush_interval_ms

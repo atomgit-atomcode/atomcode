@@ -113,6 +113,23 @@ pub fn signer() -> &'static dyn RequestSigner {
     &REAL_SIGNER
 }
 
+/// True iff this build can actually produce a signature. Lets callers
+/// fail-fast with `CpOfficialBuildRequired` BEFORE walking auth state
+/// or hitting the network, instead of either (a) discovering it only
+/// after `sign()` returns `Unavailable` (current `build_codingplan_headers`
+/// — but its error is then swallowed by `resign`'s `unwrap_or_default`)
+/// or (b) surfacing the misleading `CpAuthRequired` to an open-source
+/// user whose auth is empty.
+#[cfg(feature = "codingplan-crypto")]
+pub fn signer_available() -> bool {
+    true
+}
+
+#[cfg(not(feature = "codingplan-crypto"))]
+pub fn signer_available() -> bool {
+    false
+}
+
 /// True iff the given base URL points at an AtomGit-operated LLM
 /// gateway that REQUIRES per-request signing.
 ///
@@ -126,7 +143,7 @@ pub fn signer() -> &'static dyn RequestSigner {
 ///     after the P3 cutover; users with `api-ai.gitcode.com` in their
 ///     config get the same protection as `pre-llm-api-cce.atomgit.com` users
 ///     and don't need to edit their config to migrate.
-pub(crate) fn is_atomgit_gateway(base_url: &str) -> bool {
+pub fn is_atomgit_gateway(base_url: &str) -> bool {
     let url = match url::Url::parse(base_url) {
         Ok(u) => u,
         Err(_) => return false,
@@ -165,6 +182,18 @@ mod tests {
     fn unavailable_signer_reports_algorithm_version_zero() {
         let s = UnavailableSigner;
         assert_eq!(s.algorithm_version(), 0);
+    }
+
+    #[cfg(not(feature = "codingplan-crypto"))]
+    #[test]
+    fn signer_available_reports_false_in_open_source_build() {
+        assert!(!signer_available());
+    }
+
+    #[cfg(feature = "codingplan-crypto")]
+    #[test]
+    fn signer_available_reports_true_in_official_build() {
+        assert!(signer_available());
     }
 
     #[cfg(not(feature = "codingplan-crypto"))]

@@ -12,7 +12,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::conversation::Conversation;
-use crate::hook::HookEngine;
 use crate::provider::LlmProvider;
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::turn::event::{TurnEvent, TurnResult};
@@ -879,6 +878,7 @@ mod tests {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
+                    synthetic: false,
         }
     }
 
@@ -890,6 +890,7 @@ mod tests {
                 output: output.into(),
                 success,
             }),
+                    synthetic: false,
         }
     }
 

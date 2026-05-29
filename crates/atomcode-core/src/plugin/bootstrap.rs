@@ -5,8 +5,9 @@
 //!
 //! 1. **Fresh install** — atomcode runs for the first time on a host
 //!    that has never run it. The marker file
-//!    `$ATOMCODE_HOME/.plugin_bootstrap_v1` does not exist. We `git clone`
-//!    the default `atomcode-skills` marketplace and touch the marker.
+//!    `$ATOMCODE_HOME/.plugin_bootstrap_v2` does not exist. We `git clone`
+//!    the official `atomcode-plugins-official` marketplace and touch the
+//!    marker.
 //!    Failure (no network, no git on PATH, upstream down) is logged
 //!    and swallowed — startup proceeds without skills.
 //!
@@ -16,9 +17,9 @@
 //!    skills track the new binary. Same swallowed-failure semantics.
 //!
 //! The marker file makes (1) a one-time event. If the user later runs
-//! `/plugin uninstall atomcode-skills`, the marker stays and we
+//! `/plugin marketplace remove atomcode`, the marker stays and we
 //! respect their intent — no re-install on subsequent startups. To
-//! force a re-bootstrap, the user can `rm $ATOMCODE_HOME/.plugin_bootstrap_v1`.
+//! force a re-bootstrap, the user can `rm $ATOMCODE_HOME/.plugin_bootstrap_v2`.
 //!
 //! Both functions are best-effort and never propagate errors —
 //! atomcode must remain usable on offline machines, in air-gapped
@@ -27,17 +28,23 @@
 use crate::config::Config;
 
 use super::marketplace::{add_marketplace, list_marketplaces, update_marketplace};
+use super::PluginJobEvent;
 
-/// Public git URL for the default skills marketplace. The plugin
-/// installer dispatches on the SOURCE field (the URL we cloned from),
-/// so this string is the identity of the "default skills" entry.
+/// Public git URL for the default marketplace — the official AtomCode
+/// plugin registry. The plugin installer dispatches on the SOURCE field
+/// (the URL we cloned from), so this string is the identity of the
+/// bootstrapped "default" entry. The name stays `DEFAULT_SKILLS_URL` for
+/// API stability; it now points at the full plugin registry, not just a
+/// bag of skills.
 pub const DEFAULT_SKILLS_URL: &str =
-    "https://atomgit.com/atomgit_atomcode/atomcode-skills.git";
+    "https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git";
 
-/// Versioned bootstrap marker. Bump the `_v1` suffix when introducing
-/// a new bootstrap step (e.g. a second default marketplace, or a
-/// post-install migration) so existing users opt into the new run.
-const BOOTSTRAP_MARKER_FILENAME: &str = ".plugin_bootstrap_v1";
+/// Versioned bootstrap marker. Bumped v1 → v2 when the default
+/// marketplace was repointed from the legacy `atomcode-skills` bag to the
+/// official `atomcode-plugins-official` registry, so existing users
+/// re-bootstrap onto the new default exactly once. Bump again when
+/// introducing a future bootstrap step (e.g. a second default marketplace).
+const BOOTSTRAP_MARKER_FILENAME: &str = ".plugin_bootstrap_v2";
 
 /// Env var that the upgrade path (`self_update::apply_pending_upgrade`
 /// → `re_exec_self`) sets on the new binary so the new session knows
@@ -51,14 +58,25 @@ const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
 /// startup AFTER `Config::load` and AFTER any pending self-upgrade has
 /// re-exec'd. Synchronous — runs `git` subprocesses inline; budget
 /// roughly 1-3 s on a warm path, longer on first install.
-pub fn run_startup_hooks(config: &Config) {
+///
+/// Returns the list of `PluginJobEvent`s the caller should forward to
+/// the TUI event loop so the user sees a toast (e.g. "marketplace
+/// `atomcode` added at abc1234 (3 plugins)"). The same lines
+/// are still `eprintln!`'d for `stderr.log` posterity. No-op cases
+/// (marker already present, no marketplaces to refresh, nothing
+/// changed under HEAD) return an empty vec.
+pub fn run_startup_hooks(config: &Config) -> Vec<PluginJobEvent> {
+    let mut events = Vec::new();
     if config.plugin.auto_install_default_skills {
-        maybe_install_default_skills();
+        if let Some(ev) = maybe_install_default_skills() {
+            events.push(ev);
+        }
     }
     let upgraded = std::env::var(UPGRADED_FROM_ENV).is_ok();
     if upgraded && config.plugin.auto_update_marketplaces {
-        refresh_installed_marketplaces();
+        events.extend(refresh_installed_marketplaces());
     }
+    events
 }
 
 fn bootstrap_marker_path() -> std::path::PathBuf {
@@ -81,14 +99,18 @@ fn touch_marker() {
     let _ = std::fs::write(&path, b"");
 }
 
-/// Plan A: clone the default skills marketplace into
-/// `$ATOMCODE_HOME/plugins/marketplaces/atomcode-skills/` if (a) the
+/// Plan A: clone the official plugin marketplace into
+/// `$ATOMCODE_HOME/plugins/marketplaces/atomcode/` if (a) the
 /// bootstrap marker isn't there yet AND (b) the marketplace isn't
 /// already installed. After this attempt — successful or not — the
 /// marker is written so the next startup doesn't try again.
-fn maybe_install_default_skills() {
+///
+/// Returns `Some(PluginJobEvent)` when an `add_marketplace` actually
+/// fired (succeeded or failed). `None` for the no-op paths (marker
+/// exists, or the marketplace was already installed manually).
+fn maybe_install_default_skills() -> Option<PluginJobEvent> {
     if marker_exists() {
-        return;
+        return None;
     }
 
     // Marketplace already present from a prior manual `/plugin install`?
@@ -102,44 +124,62 @@ fn maybe_install_default_skills() {
         .unwrap_or(false);
     if already_installed {
         touch_marker();
-        return;
+        return None;
     }
 
-    match add_marketplace(DEFAULT_SKILLS_URL) {
+    let event = match add_marketplace(DEFAULT_SKILLS_URL) {
         Ok(info) => {
             eprintln!(
-                "✓ Auto-installed default skills marketplace `{}` (commit {}).",
+                "✓ Auto-installed official plugin marketplace `{}` (commit {}).",
                 info.name,
                 short_commit(&info.git_commit)
             );
+            Some(PluginJobEvent::MarketplaceAdded(info))
         }
         Err(e) => {
-            eprintln!(
-                "⚠ Auto-install of default skills marketplace failed (non-fatal): {e}\n  \
-                 Run `/plugin install {DEFAULT_SKILLS_URL}` manually when ready."
+            let msg = format!(
+                "auto-install of the official plugin marketplace failed: {e}. \
+                 Run `/plugin marketplace add {DEFAULT_SKILLS_URL}` manually when ready."
             );
+            eprintln!("⚠ {msg}");
+            Some(PluginJobEvent::Failed {
+                op: "auto-install".into(),
+                msg,
+            })
         }
-    }
+    };
 
     // Mark the bootstrap as attempted. Even on failure we don't want
     // to retry on every launch — that turns into a flapping network
     // probe. The user can delete the marker to force a retry.
     touch_marker();
+    event
 }
 
 /// Plan B: best-effort `git pull --ff-only` on every installed
 /// marketplace. Only runs when called from a session that was launched
 /// by `apply_pending_upgrade` (caller gates on `ATOMCODE_UPGRADED_FROM`).
-fn refresh_installed_marketplaces() {
+///
+/// Returns one `PluginJobEvent` per marketplace whose HEAD actually
+/// moved, plus one `Failed` event per pull error. No-op pulls (HEAD
+/// unchanged) produce no event — keeps the toast lane quiet when
+/// there's nothing the user needs to know about.
+fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
+    let mut events = Vec::new();
     let list = match list_marketplaces() {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("⚠ Could not enumerate marketplaces for auto-update: {e}");
-            return;
+            let msg = format!("could not enumerate marketplaces for auto-update: {e}");
+            eprintln!("⚠ {msg}");
+            events.push(PluginJobEvent::Failed {
+                op: "auto-update".into(),
+                msg,
+            });
+            return events;
         }
     };
     if list.is_empty() {
-        return;
+        return events;
     }
     for entry in list {
         match update_marketplace(&entry.name) {
@@ -151,16 +191,20 @@ fn refresh_installed_marketplaces() {
                         short_commit(&entry.git_commit),
                         short_commit(&info.git_commit)
                     );
+                    events.push(PluginJobEvent::MarketplaceUpdated(info));
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "⚠ Auto-update of marketplace `{}` failed (non-fatal): {e}",
-                    entry.name
-                );
+                let msg = format!("auto-update of marketplace `{}` failed: {e}", entry.name);
+                eprintln!("⚠ {msg}");
+                events.push(PluginJobEvent::Failed {
+                    op: "auto-update".into(),
+                    msg,
+                });
             }
         }
     }
+    events
 }
 
 fn short_commit(sha: &str) -> &str {

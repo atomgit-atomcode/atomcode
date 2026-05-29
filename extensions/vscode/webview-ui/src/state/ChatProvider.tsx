@@ -187,6 +187,8 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
               fileName: msg.fileName,
               language: msg.language,
               selection: msg.selection,
+              startLine: msg.startLine,
+              endLine: msg.endLine,
               type: msg.selection ? 'selection' : 'file',
             },
           });
@@ -218,7 +220,15 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     (text: string) => {
       const state = stateRef.current;
       const ctx = stateRef.current.contextFiles.length > 0
-        ? stateRef.current.contextFiles.map((f) => ({ path: f.path, type: f.type }))
+        ? stateRef.current.contextFiles.map((f) => ({
+            path: f.path,
+            type: f.type,
+            fileName: f.fileName,
+            language: f.language,
+            selection: f.selection,
+            startLine: f.startLine,
+            endLine: f.endLine,
+          }))
         : undefined;
       const contextFiles = state.contextFiles;
       const isQueued = state.isGenerating;

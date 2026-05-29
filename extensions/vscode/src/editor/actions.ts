@@ -23,6 +23,10 @@ export class AtomCodeActionProvider implements vscode.CodeActionProvider {
     optimizeAction.command = { command: 'atomcode.optimize', title: 'Optimize Selection' };
     actions.push(optimizeAction);
 
+    const addToChatAction = new vscode.CodeAction('AtomCode: Add to Chat', vscode.CodeActionKind.Empty);
+    addToChatAction.command = { command: 'atomcode.addToChat', title: 'Add to Chat' };
+    actions.push(addToChatAction);
+
     return actions;
   }
 }

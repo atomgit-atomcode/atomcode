@@ -51,19 +51,25 @@ use atomcode_telemetry::{
 };
 
 /// Set to `true` at the start of `run_headless` so the panic hook and the
-/// top-level error handler can skip TUI cleanup. In headless mode we never
-/// entered the alternate screen, so calling `LeaveAlternateScreen` would
-/// emit `\x1b[?1049l` to stdout and corrupt pipe-friendly output.
+/// top-level error handler can skip TUI cleanup. In headless mode raw mode
+/// was never enabled, so calling `disable_raw_mode` would be a wasted ioctl
+/// and on Windows can panic if the console handle isn't a real TTY.
 static HEADLESS_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Restore terminal state if (and only if) we ever entered TUI mode.
 /// No-op in headless mode — see [`HEADLESS_MODE`].
+///
+/// TUI mode (v4.23.2+) runs entirely in the primary screen via the
+/// append-only RetainedRenderer — we never emit `\x1b[?1049h`, so there
+/// is no `LeaveAlternateScreen` counterpart to issue here. Mouse mode,
+/// cursor visibility, autowrap and DECSTBM are restored by
+/// `RetainedRenderer::Drop` / `shutdown()`; this hook only owns the
+/// raw-mode toggle.
 fn restore_terminal_if_tui() {
     if HEADLESS_MODE.load(Ordering::Relaxed) {
         return;
     }
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen,);
 }
 
 /// Resolve the working directory at startup. **Always** uses the current
@@ -216,6 +222,7 @@ fn should_try_sync_upgrade() -> bool {
                 | "status"
                 | "upgrade"
                 | "rollback"
+                | "uninstall"
                 | "mcp"
                 | "telemetry"
                 | "--version"
@@ -491,7 +498,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Login to AtomCode using AtomGit OAuth
+    /// Sign in with AtomGit OAuth and claim CodingPlan models in one
+    /// flow: OAuth (if needed) → claim → fetch models → register
+    /// providers → fetch status. Reports each step and exits.
     Login,
     /// Logout from AtomCode
     Logout,
@@ -511,9 +520,10 @@ enum Commands {
         /// Full issue URL, e.g. https://atomgit.com/owner/repo/issues/42
         url: String,
     },
-    /// Claim CodingPlan and set up provider/model config from its model list.
-    /// Runs: login (if not already) → claim → fetch models → write providers
-    /// → fetch status. Reports each step and exits.
+    /// Hidden alias for `atomcode login` — kept so existing scripts /
+    /// muscle memory don't break after `/codingplan` and `atomcode
+    /// codingplan` were folded into the unified `/login` flow.
+    #[command(hide = true)]
     Codingplan,
     /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
     #[command(subcommand)]
@@ -854,10 +864,11 @@ async fn run() -> Result<i32> {
     // ── End telemetry init ────────────────────────────────────────────────────
 
     // Handle subcommands. Most are self-contained (`handle_command` runs
-    // and exits); `Login` falls through to the TUI, and `Fixissue` is
-    // like headless `-p` but with the prompt synthesised from a remote
-    // issue payload — so we resolve it here and hand it to the agent
-    // loop via `fixissue_prompt` below.
+    // and exits); `Login` (and its hidden alias `Codingplan`) run the
+    // full OAuth + CodingPlan setup flow and then fall through to the
+    // TUI. `Fixissue` is like headless `-p` but with the prompt
+    // synthesised from a remote issue payload — so we resolve it here
+    // and hand it to the agent loop via `fixissue_prompt` below.
     let mut fixissue_prompt: Option<String> = None;
     // Saved when fixissue is parsed, so after the agent finishes we can
     // POST the summary back to AtomGit as a comment + add the `fixed`
@@ -869,21 +880,14 @@ async fn run() -> Result<i32> {
     let mut force_verbose = false;
     if let Some(cmd) = cli.command {
         match cmd {
-            Commands::Login => {
-                HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let auth = auth::login(Some(&telemetry))?;
-                auth::save_auth(&auth)?;
-                println!("  Login successful! Starting AtomCode...\n");
-                HEADLESS_MODE.store(false, Ordering::Relaxed);
-                // Fall through to TUI startup below
-            }
-            Commands::Codingplan => {
-                // Run the codingplan setup flow, then fall through to TUI
-                // startup regardless of outcome — mirrors `Commands::Login`.
-                // On success the freshly saved config.toml is picked up by
-                // `Config::load` further down. On failure the TUI opens in
-                // onboarding mode (no providers) so the user can retry via
-                // `/codingplan` or `/login` without re-launching the binary.
+            Commands::Login | Commands::Codingplan => {
+                // Unified login flow: OAuth (if needed) → claim → fetch
+                // models → register providers → fetch status. Falls
+                // through to TUI startup regardless of outcome. On
+                // success the freshly saved config.toml is picked up by
+                // `Config::load` further down. On failure the TUI opens
+                // in onboarding mode (no providers) so the user can
+                // retry via `/login` without re-launching the binary.
                 // Emits open_atomcode (mode=headless) then take_codingplan
                 // (emitted internally by run_codingplan_core via coding_plan::run).
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
@@ -906,7 +910,7 @@ async fn run() -> Result<i32> {
                         print!("{}", report);
                     }
                     Err(e) => {
-                        eprintln!("codingplan failed: {:#}", e);
+                        eprintln!("login setup failed: {:#}", e);
                     }
                 }
                 println!("\n  Starting AtomCode...\n");
@@ -1068,23 +1072,16 @@ async fn run() -> Result<i32> {
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
     //
-    // Two best-effort hooks fire here (after config load, before any
-    // network-bound LLM activity):
-    //
-    //   1. First-startup auto-install of the default skills
-    //      marketplace. One-shot, marker-file gated; respects later
-    //      `/plugin uninstall`. Config: `plugin.auto_install_default_skills`.
-    //   2. Post-self-upgrade `git pull` of every installed
-    //      marketplace. Gated on `ATOMCODE_UPGRADED_FROM` being set
-    //      (which `self_update::re_exec_self` does on success), so a
-    //      plain `cargo build` invocation never triggers it. Config:
-    //      `plugin.auto_update_marketplaces`.
-    //
-    // Both are non-blocking from a UX standpoint (worst case ~1-3 s
-    // of `git` subprocess time on a warm path; longer for the first
-    // clone). Failures are logged to stderr and swallowed — the user
-    // gets a usable atomcode either way.
-    atomcode_core::plugin::bootstrap::run_startup_hooks(&config);
+    // Two best-effort hooks (auto-install default skills marketplace
+    // on first startup, `git pull` every installed marketplace after a
+    // self-upgrade) used to fire here synchronously, blocking the
+    // input box for 1–3s on a warm path (and 5–10s on first clone).
+    // Both now run as a detached `spawn_blocking` from inside
+    // `atomcode_tuix::run` after the skill registry is constructed —
+    // see lib.rs near `spawn_plugin_bootstrap`. Newly-installed skills
+    // are picked up by a `skill_registry.reload()` + wake pulse the
+    // background task fires on completion, so the slash menu refreshes
+    // without a restart.
 
     let unavailable_reason = if config.providers.is_empty() {
         Some(atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::CmdNoActiveProvider).into_owned())
@@ -1094,7 +1091,7 @@ async fn run() -> Result<i32> {
 
     /// Build the placeholder `ProviderConfig` used when no real provider is
     /// available.  The TUI still boots — the Welcome wizard / status-row
-    /// hints nudge the user to `/login` or `/codingplan`, and a successful
+    /// hints nudge the user to `/login`, and a successful
     /// auth flow rebuilds the real provider via `rebuild_provider`.
     fn dummy_provider_config() -> (ProviderConfig, String) {
         (
@@ -1144,7 +1141,7 @@ async fn run() -> Result<i32> {
             Err(e) => {
                 eprintln!(
                     "Warning: could not resolve active provider ({}). \
-                     Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                     Launching TUI in onboarding mode — use /login to set up.",
                     e
                 );
                 dummy_provider_config()
@@ -1163,7 +1160,7 @@ async fn run() -> Result<i32> {
     // Graceful fallback: if provider construction fails because the
     // token is unavailable, swap in the same dummy used on first-run
     // so the TUI boots. The Welcome-wizard / status-row hints will
-    // nudge the user to `/login` or `/codingplan`, and a successful
+    // nudge the user to `/login`, and a successful
     // auth flow rebuilds the real provider via `rebuild_provider`.
     let (provider, model_name) = if let Some(reason) = unavailable_reason {
         (unavailable_provider(reason), model_name)
@@ -1172,18 +1169,15 @@ async fn run() -> Result<i32> {
             Ok(p) => (p, model_name),
             Err(e) => {
                 let msg = format!("{:#}", e);
-                let is_auth_gap = msg.contains("Not logged in")
-                    || msg.contains("Invalid auth.toml")
-                    || msg.contains("Token expired");
-                if is_auth_gap {
+                if is_auth_gap_error(&msg) {
                     eprintln!(
                         "Note: provider credentials not available ({}). \
-                         Launching TUI in onboarding mode — use /login or /codingplan to set up.",
+                         Launching TUI in onboarding mode — use /login to set up.",
                         msg
                     );
                     (
                         unavailable_provider(format!(
-                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                            "Provider 凭证不可用：{}。请使用 /login 完成配置后再试。",
                             msg
                         )),
                         String::new(),
@@ -1485,6 +1479,17 @@ async fn run() -> Result<i32> {
                 spawn_detached_upgrade_prep();
             }
 
+            // Redirect fd 2 → $ATOMCODE_HOME/stderr.log before the TUI takes
+            // ownership of the terminal. NSPasteboard deprecation warnings
+            // (arboard clipboard polling, ~1.5 s interval) and any other
+            // rogue C-lib stderr writes would otherwise land at the raw-mode
+            // cursor position, painting into the input box.
+            //
+            // Only fires here — the TUI branch. Headless (-p/--prompt-file)
+            // leaves stderr pointing at the real terminal so the user sees
+            // actual errors in their shell/CI output.
+            redirect_stderr_to_log_file();
+
             let ctx = atomcode_telemetry::CurrentContext::current();
             tokio::spawn(async move {
                 atomcode_telemetry::CurrentContext::scope(ctx, || agent_loop.run()).await
@@ -1499,6 +1504,73 @@ async fn run() -> Result<i32> {
     .await;
 
     result
+}
+
+/// On macOS the NSPasteboard runtime prints deprecation warnings to
+/// stderr when arboard calls into AppKit (via clipboard polling for
+/// the "ctrl+v to paste image" hint). In raw mode, stderr shares the
+/// TTY with the TUI paint stream, so those warnings paint into the
+/// input box at whatever cursor row happens to be active. Other libs
+/// (LSP, MCP shells) can leak the same way.
+///
+/// Redirect fd 2 to `$ATOMCODE_HOME/stderr.log` once we know we're
+/// entering interactive TUI mode. plain / headless / piped paths
+/// don't call this — they want stderr to reach the terminal so the
+/// user sees real errors.
+///
+/// Best-effort: if the home dir can't be created or the file can't
+/// be opened, do nothing and let stderr leak (the original bug); we
+/// don't want to take down atomcode startup because logging failed.
+#[cfg(unix)]
+fn redirect_stderr_to_log_file() {
+    use std::os::unix::io::AsRawFd;
+    let Some(home) = std::env::var_os("ATOMCODE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".atomcode")))
+    else {
+        return;
+    };
+    if std::fs::create_dir_all(&home).is_err() {
+        return;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.join("stderr.log"))
+    else {
+        return;
+    };
+    // Write a session marker so users can see in stderr.log where
+    // each atomcode session starts — helps separate one run's noise
+    // from another's when grepping for actual problems.
+    // Use epoch seconds (std::time only — no chrono dep needed).
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let marker = format!("\n--- atomcode session start (unix={epoch_secs}) ---\n");
+    let _ = std::io::Write::write_all(
+        &mut std::io::BufWriter::new(&file),
+        marker.as_bytes(),
+    );
+    // SAFETY: dup2 swaps the file descriptor table entry for fd 2
+    // to point at `file`'s underlying fd. This is a standard, safe
+    // operation; the worst case (dup2 fails) is the redirect doesn't
+    // happen and we log nothing — same as the no-redirect baseline.
+    unsafe {
+        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+    }
+    // Intentionally keep `file` alive via the dup2 — the kernel
+    // holds a reference to the underlying inode, so even after
+    // `file` is dropped, fd 2 stays pointing at the same file.
+    // No need to std::mem::forget.
+}
+
+#[cfg(not(unix))]
+fn redirect_stderr_to_log_file() {
+    // Windows: NSPasteboard is mac-only; arboard on Windows uses
+    // OpenClipboard which doesn't NSLog. Not a known leak path.
+    // No-op for now; revisit if a similar Windows issue surfaces.
 }
 
 /// Run agent in headless mode (pipe-friendly: stdout = LLM text only,
@@ -1521,8 +1593,9 @@ async fn run_headless(
     capture: bool,
     working_dir: PathBuf,
 ) -> Result<(i32, Option<String>)> {
-    // Tell the panic hook / error path to skip TUI cleanup — we never enter
-    // the alternate screen here, so LeaveAlternateScreen would corrupt stdout.
+    // Tell the panic hook / error path to skip TUI cleanup — raw mode was
+    // never enabled here, so `disable_raw_mode` would be a wasted ioctl
+    // (and on Windows can panic when stdin isn't a real console handle).
     HEADLESS_MODE.store(true, Ordering::Relaxed);
 
     let notifications = agent_loop.config.notifications.clone();
@@ -1738,6 +1811,9 @@ async fn run_headless(
                 // we expect the turn to keep running.
                 eprintln!("[warning] {}", w);
             }
+            AgentEvent::HookWarningHint(msg) => {
+                eprintln!("[hook-warning] {}", msg);
+            }
             AgentEvent::WorkingDirChanged(new_dir) => {
                 if verbose {
                     eprintln!("[cwd] {}", new_dir.display());
@@ -1840,6 +1916,19 @@ async fn run_headless(
             AgentEvent::MessagesSync { .. } => {
                 // Only used by TUI for /bg session persistence; ignore in CLI.
             }
+            AgentEvent::GuideTurnActivity { .. } => {
+                // Subagent is thinking — no output needed in CLI mode.
+                // Final result arrives via GuideComplete.
+            }
+            AgentEvent::GuideComplete {
+                text,
+                truncated,
+                ..
+            } => {
+                close_thinking_line(&mut thinking_line_open);
+                let tag = if truncated { " [truncated]" } else { "" };
+                eprintln!("{}{}", text, tag);
+            }
         }
     }
 
@@ -1888,13 +1977,11 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
 
     match cmd {
         Commands::Login => {
-            // Pass the telemetry handle through so login() can both stamp the
-            // handle's account_id AND emit login_success. The caller flushes
-            // telemetry on return so the event actually leaves the process.
-            let auth = auth::login(Some(telemetry))?;
-            auth::save_auth(&auth)?;
-            println!("  Login successful! You can now use AtomCode.");
-            Ok(())
+            // `run()` intercepts Login (and its Codingplan alias) before
+            // handle_command is called, running the full OAuth + setup
+            // flow and falling through to the TUI. This arm is
+            // unreachable in normal execution but kept defensive.
+            unreachable!("Login is handled inline in run() before handle_command")
         }
         Commands::Logout => {
             auth::logout()?;
@@ -1938,8 +2025,8 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("Fixissue is handled inline in run() before handle_command")
         }
         Commands::Codingplan => {
-            // `run()` intercepts Codingplan before handle_command is called,
-            // so this arm is effectively unreachable in normal execution.
+            // Hidden alias for Login — `run()` intercepts both before
+            // handle_command is called, so this arm is unreachable.
             unreachable!("Codingplan is handled inline in run() before handle_command")
         }
         Commands::Telemetry { .. } => {
@@ -2483,10 +2570,47 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
     }));
 }
 
+/// Classify a `create_provider` error display string as an "auth gap" —
+/// i.e. the user has no usable OAuth token (file missing, malformed,
+/// access_token expired, refresh_token expired/missing, refresh network
+/// error, etc.). Auth-gap errors must NOT abort startup; they should
+/// fall back to the onboarding TUI so the user can run `/login` from
+/// within the app.
+///
+/// Implementation note — substring matching, not typed errors:
+///
+/// `create_provider` returns `anyhow::Error` and the auth-gap producers
+/// live in three modules (`provider::mod::load_auth_token`,
+/// `provider::mod::refresh_and_save`, `auth::oauth::get_valid_token`).
+/// Threading a typed sentinel through all of them is invasive; instead
+/// we match on a stable convention: **every auth-gap error message in
+/// the codebase ends with the substring `"/login"`** (either
+/// `"please /login"` or `"please use /login"`). That hint is part of
+/// the user-facing contract — any future auth-gap producer that wants
+/// graceful fallback simply has to follow the same convention.
+///
+/// The three legacy substrings (`Not logged in` / `Invalid auth.toml`
+/// / `Token expired`) are retained as belt-and-braces: they were the
+/// original matches before the `"/login"` rule was extracted, and
+/// keeping them ensures the test for the historical contract stays
+/// green even if some future refactor temporarily strips the `/login`
+/// suffix from a specific message.
+///
+/// Non-auth errors (config parse failure, network issues unrelated to
+/// the refresh endpoint, provider validation rejects model name, etc.)
+/// fall through to `return Err(e)` and abort startup as designed.
+fn is_auth_gap_error(msg: &str) -> bool {
+    msg.contains("/login")
+        || msg.contains("Not logged in")
+        || msg.contains("Invalid auth.toml")
+        || msg.contains("Token expired")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        close_thinking_chunk, format_thinking_chunk, resolve_working_dir, truncate_log_line,
+        close_thinking_chunk, format_thinking_chunk, is_auth_gap_error, resolve_working_dir,
+        truncate_log_line,
     };
     use std::path::PathBuf;
 
@@ -2672,5 +2796,88 @@ mod tests {
         close_thinking_chunk(&mut buf, &mut open);
         buf.push_str("[tool→ read_file]\n");
         assert_eq!(buf, "[thinking] I should check the file\n[tool→ read_file]\n");
+    }
+
+    // ── is_auth_gap_error ────────────────────────────────────────────
+    //
+    // Regression set for the "both access_token AND refresh_token
+    // expired → CLI bails before TUI loads" bug. Pre-fix catch list
+    // only matched `Not logged in` / `Invalid auth.toml` / `Token
+    // expired`, missing the 4 paths below — user landed in an
+    // unrecoverable startup error because they couldn't get into the
+    // TUI to run `/login`. Post-fix every auth-gap error's `/login`
+    // suffix triggers graceful fallback to onboarding mode.
+
+    #[test]
+    fn auth_gap_catches_historical_three() {
+        // Pre-existing matches — must stay green.
+        assert!(is_auth_gap_error("Not logged in — please use /login"));
+        assert!(is_auth_gap_error("Invalid auth.toml — please use /login"));
+        assert!(is_auth_gap_error("Token expired — please use /login"));
+    }
+
+    #[test]
+    fn auth_gap_catches_refresh_http_failure() {
+        // The actual user-reported scenario: access_token expired,
+        // `refresh_and_save` POSTs the (also-expired) refresh_token to
+        // the broker, broker returns 401, `provider::mod::refresh_and_save`
+        // bails with this message. Pre-fix catch list MISSED this —
+        // none of the 3 historical substrings appeared, so CLI fell
+        // through to `return Err(e)` and aborted startup.
+        assert!(is_auth_gap_error(
+            "Token refresh failed (401 Unauthorized) — please /login"
+        ));
+        assert!(is_auth_gap_error(
+            "Token refresh failed (400 Bad Request) — please /login"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_catches_refresh_network_failure() {
+        // `refresh_and_save` network-layer error path (broker host
+        // unreachable, DNS failure, TLS error, etc.). Same root cause
+        // as the HTTP path — token can't be refreshed → user needs
+        // `/login`. Onboarding TUI is the only way they can run it.
+        assert!(is_auth_gap_error(
+            "Token refresh failed: connection refused — please /login"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_catches_refresh_parse_failure() {
+        // Broker returned 200 but body wasn't valid refresh-token
+        // JSON. Treated as auth gap because there's no usable token
+        // either way.
+        assert!(is_auth_gap_error(
+            "Token refresh parse error: missing field `access_token` — please /login"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_catches_missing_refresh_token() {
+        // `auth/oauth.rs::refresh_access_token` when stored auth.toml
+        // has access_token but no refresh_token field. Suffix is
+        // "please /login again" — still ends in `/login`, so the new
+        // substring rule catches it.
+        assert!(is_auth_gap_error(
+            "No refresh_token available — please /login again"
+        ));
+    }
+
+    #[test]
+    fn auth_gap_does_not_swallow_non_auth_errors() {
+        // Non-auth errors must NOT trigger the onboarding fallback —
+        // the user should see the real failure, not a generic "please
+        // /login" prompt that doesn't apply.
+        assert!(!is_auth_gap_error(
+            "Config parse error: invalid TOML at line 12"
+        ));
+        assert!(!is_auth_gap_error(
+            "Provider rejected model name 'foo-bar-9000': unknown model"
+        ));
+        assert!(!is_auth_gap_error(
+            "HTTP request to https://api.example.com failed: timeout"
+        ));
+        assert!(!is_auth_gap_error(""));
     }
 }

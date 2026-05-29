@@ -2,227 +2,153 @@
 
 ## 概述
 
-为 AtomCode 实现了完整的 Hook（钩子）机制，允许开发者在关键执行点插入自定义逻辑，实现灵活的扩展能力。
+AtomCode Hook 系统基于 **HookEngine** 统一引擎架构，支持 13 个 trait 扩展点、3 种配置方式（JSON CC 兼容、TOML ScriptHook、TOML Webhook），以及 6 个内置工程化 Hook。
 
-## 实现的文件
+> 系统已从旧架构（`HookRegistry` + `HookExecutor`）完全迁移到 `HookEngine`。旧 `executor.rs` 仍存在但已不再使用，`HookRegistry` 已删除。
+
+## 源文件清单
 
 ### 核心模块
 
-1. **`crates/atomcode-core/src/hook/mod.rs`** (280 行)
-   - 定义了 Hook trait 和四种钩子类型
-   - HookContext 和 ToolResultContext 数据结构
-   - HookRegistry 注册表和触发器
-   - HookResult 枚举（Ok/Warning/Denied/Modified）
+| 文件 | 行数 | 说明 |
+|------|:----:|------|
+| `crates/atomcode-core/src/hook/mod.rs` | ~680 | 13 个 trait 定义、12 个 context 结构体、HookResult/HookEvent 枚举 |
+| `crates/atomcode-core/src/hook/engine.rs` | ~1284 | **HookEngine** — 统一注册/触发引擎、ShellCommandHook 实现、12 个注册槽位 + 12 个触发方法 |
+| `crates/atomcode-core/src/hook/script_runner.rs` | ~449 | **ScriptHook** — TOML 配置加载的外部脚本执行（stdin JSON 协议） |
+| `crates/atomcode-core/src/hook/webhook.rs` | ~748 | **WebhookHook** — HTTP 远程调用，实现 12 个 trait |
+| `crates/atomcode-core/src/hook/async_batcher.rs` | ~534 | **AsyncWebhookBatcher** — 异步批量发送（mpsc 通道 + tokio 后台任务） |
+| `crates/atomcode-core/src/hook/built_in.rs` | ~572 | **6 个内置 Hook** — ToolAuditLogHook、TurnStatsHook、AutoCommitHook 等 |
+| `crates/atomcode-core/src/hook/config_loader.rs` | ~501 | **HooksConfig** — TOML 配置文件加载、Webhook/AsyncWebhook 注册 |
+| `crates/atomcode-core/src/hook/json_config.rs` | ~561 | **JSON 配置加载** — CC 兼容 `.hooks.json` 加载 |
+| `crates/atomcode-core/src/hook/config.rs` | ~175 | 工具名匹配工具函数 |
+| `crates/atomcode-core/src/hook/executor.rs` | ~1115 | ⚠️ **旧 HookExecutor**（已废弃，不再使用，待清理） |
 
-2. **`crates/atomcode-core/src/hook/script_runner.rs`** (227 行)
-   - ScriptHook 实现 - 支持外部 shell/python 脚本
-   - 脚本执行和超时管理
-   - JSON 输出解析和格式转换
+### 调用侧集成
 
-3. **`crates/atomcode-core/src/hook/config_loader.rs`** (127 行)
-   - hooks.toml 配置文件加载
-   - 从全局和项目目录自动加载
-   - 脚本路径解析和注册
+- `crates/atomcode-core/src/agent/mod.rs` — AgentLoop 初始化时调用 `HookEngine::load_all()`
+- `crates/atomcode-core/src/turn/runner.rs` — TurnRunner 在各阶段触发 hook
 
-### 集成点
+## 架构概览
 
-4. **`crates/atomcode-core/src/turn/runner.rs`** (修改)
-   - 添加 hook_registry 字段到 TurnRunner
-   - 在 execute_single_tool 中注入 pre/post hooks
-   - 在 run_with_filter 中注入 post-turn hooks
-
-5. **`crates/atomcode-core/src/agent/mod.rs`** (修改)
-   - 在 AgentLoop 初始化时加载 hooks
-   - 导入 HookRegistry
-
-6. **`crates/atomcode-core/src/agent/sub_agent.rs`** (修改)
-   - 为 SubAgent 添加空 hook_registry
-
-7. **`crates/atomcode-daemon/src/main.rs`** (修改)
-   - 为 Daemon 模式添加空 hook_registry
-
-### 测试
-
-8. **`crates/atomcode-core/tests/hook_test.rs`** (248 行)
-   - 5 个单元测试覆盖核心功能
-   - 测试计数、拒绝、修改参数、优先级等
-
-### 示例和文档
-
-9. **`examples/hooks/`** 目录
-   - `log_tool_calls.sh` - 工具调用日志记录
-   - `auto_commit.sh` - 自动 Git 提交
-   - `code_review.sh` - 代码质量检查
-   - `hooks.toml` - 配置示例
-
-10. **`docs/hooks.md`** (172 行)
-    - 完整的使用文档
-    - 快速开始指南
-    - Hook 类型说明
-    - 安全注意事项
-
-## Hook 类型
-
-### 1. PreToolExecutionHook (工具执行前)
-- **触发时机**: 工具执行前，权限检查后
-- **用途**: 参数修改、审计日志、阻止执行
-- **返回值**: 
-  - `Ok` - 继续执行
-  - `Modified(new_args)` - 使用新参数
-  - `Denied(reason)` - 阻止执行
-  - `Warning(msg)` - 记录警告
-
-### 2. PostToolExecutionHook (工具执行后)
-- **触发时机**: 工具执行完成后
-- **用途**: 结果处理、触发后续操作、统计收集
-- **输入**: 工具名称、参数、结果、成功状态、执行时间
-
-### 3. PostTurnHook (Turn 完成后)
-- **触发时机**: 一轮对话完成后
-- **用途**: 自动提交、代码审查、生成报告
-- **输入**: Turn 结果（Responded/UsedTools/Failed）
-
-### 4. SystemPromptHook (系统 Prompt 扩展)
-- **触发时机**: 构建系统提示时
-- **用途**: 注入额外规则、自定义指令
-- **返回**: 要追加到系统 prompt 的文本
-
-## 配置方式
-
-### 全局 Hooks
 ```
-~/.atomcode/hooks/
-  ├── hooks.toml          # 配置文件
-  ├── log_tool_calls.sh   # 脚本
-  └── auto_commit.sh
+AgentLoop / TurnRunner
+        │
+        ▼
+   HookEngine (engine.rs)
+   统一注册/触发引擎
+        │
+        ├── ShellCommandHook  (JSON 配置 → shell 命令, 环境变量协议)
+        ├── ScriptHook        (TOML 配置 → 外部脚本, stdin JSON 协议)
+        ├── WebhookHook       (TOML 配置 → HTTP 远程调用)
+        └── 6 BuiltInHook     (Rust 原生, 自动注册)
 ```
 
-### 项目级 Hooks
-```
-<project>/.atomcode/hooks/
-  ├── hooks.toml
-  └── custom_hook.py
-```
+## 13 个 Trait 定义
 
-### hooks.toml 格式
-```toml
-[[hooks]]
-name = "my-hook"
-description = "描述"
-trigger = "post_tool"
-script = "script.sh"
-script_type = "shell"
-enabled = true
-timeout_secs = 2
-```
+| # | Trait | 关键方法签名 | 可影响流程 |
+|---|-------|------------|:--:|
+| 1 | `PreToolExecutionHook` | `on_pre_execute(ctx: &HookCtx) -> HookResult` | ✅ 修改/阻止 |
+| 2 | `PostToolExecutionHook` | `on_post_execute(ctx: &HookCtx, result: &ToolResultContext) -> HookResult` | ❌ |
+| 3 | `PostTurnHook` | `on_post_turn(ctx: &HookCtx, turn_result: &str) -> HookResult` | ❌ |
+| 4 | `SystemPromptHook` | `extend_system_prompt() -> Option<String>` | ✅ 追加 |
+| 5 | `OnUserPromptSubmitHook` | `on_user_prompt_submit(payload: &UserPromptSubmitPayload) -> UserPromptSubmitResult` | ✅ 注入/阻止 |
+| 6 | `OnMessageReceivedHook` | `on_message_received(ctx: &UserMessageContext) -> HookResult` | ❌ |
+| 7 | `OnTurnStartHook` | `on_turn_start(ctx: &TurnStartContext) -> HookResult` | ❌ |
+| 8 | `OnToolCallStartHook` | `on_tool_call_start(ctx: &ToolCallStartContext) -> HookResult` | ❌ |
+| 9 | `OnTurnCompleteHook` | `on_turn_complete(ctx: &TurnCompleteContext) -> HookResult` | ❌ |
+| 10 | `OnSessionStartHook` | `on_session_start(ctx: &SessionContext) -> HookResult` | ❌ |
+| 11 | `OnSessionEndHook` | `on_session_end(ctx: &SessionContext) -> HookResult` | ❌ |
+| 12 | `OnErrorHook` | `on_error(ctx: &ErrorContext) -> HookResult` | ❌ |
+| 13 | `OnModelResponseHook` | `on_model_response(response: &str, turn_ctx: &TurnStartContext) -> HookResult` | ❌ |
 
-## 加载优先级
+## 各实现覆盖的 Trait
 
-1. 全局 hooks (~/.atomcode/hooks/) 先加载
-2. 项目级 hooks (<cwd>/.atomcode/hooks/) 后加载
-3. 可通过 CLI `--hooks-dir` 参数额外加载
+| 实现 | Trait 数 | 具体覆盖 |
+|------|:---:|------|
+| **ShellCommandHook** | 6 | PreTool + PostTool + OnSessionStart + OnSessionEnd + OnUserPromptSubmit + OnToolCallStart（空操作占位） |
+| **ScriptHook** | 4 | PreTool + PostTool + PostTurn + SystemPrompt |
+| **WebhookHook** | 12 | 除 OnUserPromptSubmitHook 外的全部（含 trigger 字段过滤） |
+| **ToolAuditLogHook** | 1 | OnToolCallStartHook |
+| **TurnStatsHook** | 2 | OnTurnStartHook + OnTurnCompleteHook |
+| **AutoCommitHook** | 1 | OnTurnCompleteHook |
+| **SessionSummaryHook** | 2 | OnSessionStartHook + OnSessionEndHook |
+| **ErrorReportHook** | 1 | OnErrorHook |
+| **ResponseValidationHook** | 1 | OnModelResponseHook |
 
-## 安全机制
+## 配置体系
 
-1. **不能绕过权限系统** - pre-tool hook 的 deny 不会覆盖用户的 always_allow 设置
-2. **脚本执行超时** - 默认 2 秒，超时后终止进程
-3. **项目级 hooks 优先级低** - 不能覆盖全局设置
-4. **脚本在用户权限下运行** - 需要注意脚本安全性
+### JSON CC 兼容配置（`.hooks.json`）
 
-## 使用示例
+- 加载路径：`~/.atomcode/hooks.json`（全局）+ `<project>/.hooks.json`（项目）
+- 支持 event：`pre_tool_use`、`post_tool_use`、`session_start`、`session_end`、`user_prompt_submit`
+- 协议：环境变量（`ATOMCODE_HOOK_EVENT`、`ATOMCODE_HOOK_CONTEXT` 等），stdout 输出 CC JSON
+- 项目 hooks **覆盖**同名全局 hooks
 
-### Rust 原生 Hook
-```rust
-use atomcode_core::hook::*;
+### TOML 配置（`hooks.toml`）
 
-struct MyHook;
+- 加载路径：`~/.atomcode/hooks/hooks.toml` + `<project>/.atomcode/hooks/hooks.toml`
+- 三段式结构：
+  - `[[hooks]]` → ScriptHook（4 种 trigger: `pre_tool`/`post_tool`/`post_turn`/`system_prompt`）
+  - `[[webhooks]]` → WebhookHook（11 种 trigger, contains 匹配, 逗号分隔）
+  - `[[async_webhooks]]` → AsyncWebhookBatcher（批量异步, 同名关联 WebhookHook）
+- 默认超时：ScriptHook 2s, Webhook 10s, AsyncWebhook 10s
 
-#[async_trait]
-impl Hook for MyHook {
-    fn name(&self) -> &str { "my-hook" }
-}
+### 内置 Hook（无配置，自动注册）
 
-#[async_trait]
-impl PreToolExecutionHook for MyHook {
-    async fn on_pre_execute(&self, ctx: &HookContext) -> HookResult {
-        // 自定义逻辑
-        HookResult::Ok
-    }
-}
+6 个内置 Hook 在 `HookEngine::register_builtins()` 中自动注册。
 
-registry.register_pre_tool_hook(Arc::new(MyHook));
-```
+## 加载顺序与优先级
 
-### 外部脚本 Hook
-```bash
-#!/bin/bash
-INPUT=$(cat)
-TOOL_NAME=$(echo "$INPUT" | jq -r '.hook_context.tool_name')
-echo "Saw tool: $TOOL_NAME" >&2
-echo "ok"
-```
+`HookEngine::load_all()` 按以下顺序加载：
+1. **JSON hooks** (`load_json_hooks`) → ShellCommandHook（CC 兼容）
+2. **TOML hooks** (`load_toml_hooks`) → ScriptHook + WebhookHook
+3. **内置 Hook** (`register_builtins`) → 6 个内置 Hook
+4. **Webhook 异步关联** (`load_webhook_hooks`) → AsyncWebhookBatcher 关联
 
-配置：
-```toml
-[[hooks]]
-name = "logger"
-trigger = "post_tool"
-script = "logger.sh"
-script_type = "shell"
-enabled = true
-```
+**全局 hooks 先加载，项目 hooks 后加载**。后加载的同名 hook **覆盖**先前注册的同名 hook（后加载优先）。
+
+## 关键设计决策
+
+### 为什么使用 trait 而不是纯脚本？
+
+- **类型安全** — Rust 编译时检查
+- **性能** — 零开销抽象
+- **灵活性** — 可以访问完整的 AtomCode API
+- **可选性** — 脚本 hooks 仍支持快速原型
+
+### 为什么 Hook 失败不中断流程？
+
+- **容错性** — 非致命 hook 失败不应阻止用户工作
+- **渐进式采用** — 用户可以逐步启用 hooks
+- **Warning 机制** — 记录问题但不阻止
+
+### 并发安全模型
+
+- `HookEngine` 通过 `ArcSwap` 原子替换实现无锁热重载
+- 读路径（trigger_*）零锁开销
+- 写路径（reload）只建新引擎 + 原子替换一次
+- 旧 Arc 引用计数 > 0 时等待正在执行的 trigger 返回
+
+### 为什么项目 hooks 优先级高于全局？
+
+- 项目 hooks 后加载，同名覆盖全局
+- 允许项目定制覆盖用户全局设置
+- 安全性靠 hook 不能绕过权限系统保证（`pre_tool` deny 不覆盖 `always_allow`）
 
 ## 测试覆盖
 
-运行测试：
-```bash
-cargo test -p atomcode-core --test hook_test
-```
-
-测试结果：
-```
-running 5 tests
-test test_hook_registry_basic ... ok
-test test_hook_deny_execution ... ok
-test test_hook_modify_args ... ok
-test test_system_prompt_hook ... ok
-test test_hook_priority_order ... ok
-
-test result: ok. 5 passed; 0 failed
-```
+核心测试分布在：
+- `mod.rs` — HookEvent/HookConfig/PreHookResult/HookContext 序列化测试
+- `engine.rs` — ShellCommandHook 全场景测试（allow/block/modify/matcher/timeout/crash 等 20+ 测试）
+- `config_loader.rs` — TOML 解析/注册/trigger 测试（10+ 测试）
+- `json_config.rs` — JSON 加载/合并/覆盖/CC 转换测试（15+ 测试）
+- `script_runner.rs` — ScriptHook 输出解析/协议测试（10+ 测试）
+- `webhook.rs` — WebhookHook 配置/响应解析测试（7+ 测试）
+- `built_in.rs` — 内置 Hook 行为测试（11+ 测试）
 
 ## 未来扩展点
 
-1. **Hook 链式组合** - 允许 hooks 之间传递数据
-2. **异步脚本支持** - 支持 Node.js 等异步脚本
-3. **Hook 热重载** - 修改配置后自动重新加载
-4. **Hook 市场** - 社区共享和下载 hooks
-
-## 关键技术决策
-
-### 为什么使用 trait 而不是纯脚本？
-- **类型安全** - Rust 编译时检查
-- **性能** - 零开销抽象
-- **灵活性** - 可以访问完整的 AtomCode API
-- **可选性** - 脚本 hooks 仍支持快速原型
-
-### 为什么 Hook 失败不中断流程？
-- **容错性** - 非致命 hook 失败不应阻止用户工作
-- **渐进式采用** - 用户可以逐步启用 hooks
-- **Warning 机制** - 记录问题但不阻止
-
-### 为什么项目级 hooks 优先级低于全局？
-- **安全** - 防止恶意项目覆盖安全设置
-- **一致性** - 用户的全局设置始终生效
-
-## 总结
-
-Hook 系统为 AtomCode 提供了强大的扩展能力：
-- ✅ 4 种钩子类型覆盖关键执行点
-- ✅ 支持 Rust 原生和外部脚本两种扩展方式
-- ✅ 配置文件驱动，灵活启用/禁用
-- ✅ 完善的测试覆盖（5/5 通过）
-- ✅ 文档齐全，示例丰富
-- ✅ 安全可控，不能绕过权限系统
-
-这为实现 Issue #109 中描述的"灵活的扩展机制"奠定了坚实基础。
+1. **OnMessageReceivedHook 激活** — trait 已定义，需在 HookEngine 增加注册槽位和触发调用
+2. **内置 Hook 开关** — CLI 命令启用/禁用内置 Hook
+3. **Hook 热重载** — 修改配置后自动重新加载（架构已支持 ArcSwap）
+4. **AsyncWebhookBatcher flush 调度** — 当前 batcher 已创建但未定期 flush（TODO #914）

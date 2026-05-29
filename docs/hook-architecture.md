@@ -55,8 +55,8 @@
 │                                                                 │
 │  engine.rs · HookEngine                                         │
 │  ├─ load_all(working_dir)    ← 唯一的配置入口                    │
-│  ├─ 10 个 register_* 方法                                       │
-│  └─ 6 个 trigger_* 方法 (async, 顺序遍历 Vec<Arc<dyn Trait>>)    │
+│  ├─ 12 个 register_* 方法                                       │
+│  └─ 12 个 trigger_*/collect_* 方法 (11 trigger_* + 1 collect_*)  │
 │                                                                 │
 │  关于 Arc:                                                       │
 │  TurnRunner 持有 Arc<HookEngine>，AgentLoop 持有同引用。           │
@@ -80,12 +80,13 @@
 │  │ timeout_ms          │     │ script_type  │    │ headers   │  │
 │  │ plugin_root         │     └──────────────┘    └───────────┘  │
 │  │                     │                                         │
-│  │ 实现 5 个 trait:    │  实现 4 个 trait:      通过 engine 注册   │
-│  │ PreToolExecution    │  PreToolExecution     到对应槽位          │
-│  │ PostToolExecution   │  PostToolExecution                      │
+│  │ 实现 6 个 trait:    │  实现 4 个 trait:      实现 12 个 trait:   │
+│  │ PreToolExecution    │  PreToolExecution     (除 OnUserPrompt     │
+│  │ PostToolExecution   │  PostToolExecution     Submit 外全部)    │
 │  │ OnSessionStart      │  PostTurn                               │
 │  │ OnSessionEnd        │  SystemPrompt                           │
 │  │ OnUserPromptSubmit  │                                         │
+│  │ OnToolCallStart     │                                         │
 │  └─────────────────────┘                                         │
 │                                                                 │
 │  BuiltInHook (built_in.rs)                                      │
@@ -97,6 +98,9 @@
 │  │ ErrorReportHook      → OnError                             │ │
 │  │ ResponseValidation   → OnModelResponse                     │ │
 │  └────────────────────────────────────────────────────────────┘ │
+│                                                                 │
+│  注意：OnMessageReceivedHook trait 已定义但暂未在 HookEngine 中    │
+│  注册触发，仅 WebhookHook 实现了该 trait（待后续 PR 激活）          │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼

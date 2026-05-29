@@ -1234,10 +1234,11 @@ impl TurnRunner {
         // payloads recover first) but BEFORE approval — the unrecoverable
         // remainder is what gets bounced.
         if let Err(reason) = tool.validate_args(&call.arguments) {
-            let msg = format!(
-                "Error: {}. Re-issue {} with a complete JSON object containing all required fields.",
-                reason, call.name
-            );
+            // `reason` already comes from `diagnose_args` (or a sibling
+            // helper) carrying a "Re-issue: <example>" tail. Appending
+            // another "Re-issue {tool} with..." here produced the
+            // double-Re-issue the user saw on the failed WriteFile call.
+            let msg = format!("Error: {}", reason);
             let _ = event_tx.send(TurnEvent::ToolCallResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -1399,9 +1400,14 @@ impl TurnRunner {
         // bash) finish fast enough that interrupting them mid-execution
         // is acceptable — user pressed Ctrl+C knowing they want to stop.
         let start = Instant::now();
+        crate::ctrace!("RNR", "execute_single_tool start name={} cancel_already={}", call.name, cancel.is_cancelled());
         let result = tokio::select! {
-            r = tool.execute(&final_args, &self.context) => r,
+            r = tool.execute(&call.arguments, &self.context) => {
+                crate::ctrace!("RNR", "execute_single_tool tool returned name={} elapsed_ms={} cancel_now={}", call.name, start.elapsed().as_millis(), cancel.is_cancelled());
+                r
+            },
             _ = cancel.cancelled() => {
+                crate::ctrace!("RNR", "execute_single_tool cancel branch fired name={} elapsed_ms={}", call.name, start.elapsed().as_millis());
                 // Clean up event sender
                 self.context.event_tx = None;
                 self.context.current_call_id = None;
@@ -1635,11 +1641,13 @@ fn strip_model_tags(text: &str) -> String {
     result
 }
 
-/// Rescue tool calls embedded as text in the model's response. Three variants:
+/// Rescue tool calls embedded as text in the model's response. Four variants:
 ///   1. `<tool_call>name(json)</tool_call>` — paren+JSON
 ///   2. `<tool_call>name(k=v, k=v)</tool_call>` — paren+kv (legacy single-line)
 ///   3. `<tool_call><tool_name>name</tool_name><arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`
-///      — Qwen/GLM XML format (multi-line, args may span newlines)
+///      — Qwen2.5 / GLM XML format
+///   4. `<tool_call><function=name><parameter=k>v</parameter>...</function></tool_call>`
+///      — OpenHands / Qwen3+ "function-tag" format (attribute-style)
 /// Returns rescued ToolCalls, empty vec if nothing found.
 fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut calls = Vec::new();
@@ -1660,7 +1668,9 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
         };
         let body = body.trim();
 
-        if let Some((name, args_json)) = parse_xml_tool_call(body) {
+        if let Some((name, args_json)) = parse_xml_tool_call(body)
+            .or_else(|| parse_xml_attr_style_tool_call(body))
+        {
             let call_id = format!("rescued_{}", calls.len());
             calls.push(ToolCall {
                 id: call_id,
@@ -1713,7 +1723,7 @@ fn rescue_text_tool_calls(text: &str) -> Vec<ToolCall> {
     calls
 }
 
-/// Parse Qwen/GLM XML-style tool call body:
+/// Parse Qwen2.5 / GLM XML-style tool call body:
 ///   `<tool_name>NAME</tool_name><arg_key>K1</arg_key><arg_value>V1</arg_value>...`
 /// Returns `(name, args_as_json_object)` or None when the format doesn't match.
 fn parse_xml_tool_call(body: &str) -> Option<(String, String)> {
@@ -1740,6 +1750,61 @@ fn parse_xml_tool_call(body: &str) -> Option<(String, String)> {
         let raw_value = &v_after[..v_end];
         map.insert(key, coerce_xml_value(raw_value));
         rest = &v_after[v_end + "</arg_value>".len()..];
+    }
+
+    if map.is_empty() {
+        return None;
+    }
+    Some((name, serde_json::Value::Object(map).to_string()))
+}
+
+/// Parse OpenHands / Qwen3+ "function-tag" XML-style tool call body:
+///   `<function=NAME><parameter=K1>V1</parameter><parameter=K2>V2</parameter></function>`
+/// Returns `(name, args_as_json_object)` or None when the format doesn't match.
+///
+/// Differs from `parse_xml_tool_call` in two ways:
+///   * the function name rides on the opening tag's attribute slot
+///     (`<function=read_file>`), not inside a `<tool_name>` wrapper
+///   * each parameter is one `<parameter=KEY>VALUE</parameter>` element,
+///     not two separate `<arg_key>` / `<arg_value>` pairs
+///
+/// This format is what Qwen3 / Qwen3-Coder / Qwen3.6 / GLM-Z1-Agent emit
+/// when the inference gateway doesn't parse them out into the OpenAI
+/// `tool_calls` field — they were SFT-trained on OpenHands-style data.
+/// Without this rescue, the XML leaks into the visible assistant text
+/// and the tool never executes.
+fn parse_xml_attr_style_tool_call(body: &str) -> Option<(String, String)> {
+    let fn_marker = body.find("<function=")?;
+    let after_marker = &body[fn_marker + "<function=".len()..];
+    let close_bracket = after_marker.find('>')?;
+    let name = after_marker[..close_bracket].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let inner_start = close_bracket + 1;
+    let inner_end = after_marker[inner_start..].find("</function>")? + inner_start;
+    let inner = &after_marker[inner_start..inner_end];
+
+    let mut map = serde_json::Map::new();
+    let mut rest = inner;
+    while let Some(p_marker) = rest.find("<parameter=") {
+        let after_p = &rest[p_marker + "<parameter=".len()..];
+        let cb = after_p.find('>')?;
+        let key = after_p[..cb].trim().to_string();
+        if key.is_empty() {
+            return None;
+        }
+        let val_start = cb + 1;
+        let val_end = after_p[val_start..].find("</parameter>")? + val_start;
+        let raw = &after_p[val_start..val_end];
+        // Function-tag format puts every value on its own line(s); strip a
+        // single leading and trailing newline that's there purely for layout.
+        // Don't `.trim()` — `old_string` for edit_file may legitimately need
+        // its internal whitespace preserved for the file-match to land.
+        let value = raw.strip_prefix('\n').unwrap_or(raw);
+        let value = value.strip_suffix('\n').unwrap_or(value);
+        map.insert(key, coerce_xml_value(value));
+        rest = &after_p[val_end + "</parameter>".len()..];
     }
 
     if map.is_empty() {
@@ -2210,6 +2275,128 @@ mod tool_call_text_rescue_tests {
         assert_eq!(v["n"], 42);
         assert!((v["f"].as_f64().unwrap() - 3.14).abs() < 1e-9);
         assert_eq!(v["s"], "hello");
+    }
+
+    #[test]
+    fn rescues_qwen3_function_tag_format() {
+        // Qwen3 / Qwen3-Coder / Qwen3.6 (and other OpenHands-trained agents)
+        // emit tool calls as `<function=NAME><parameter=K>V</parameter>...
+        // </function>`. Mirrors the exact shape captured in the 21:17 Qwen3.6
+        // screenshot: two sequential read_file calls with int + path params.
+        let text = r#"Let me look at the exact code structure more carefully.
+
+<tool_call>
+<function=read_file>
+<parameter=limit>
+30
+</parameter>
+<parameter=offset>
+147
+</parameter>
+<parameter=file_path>
+/tmp/cc-switch-src/src-tauri/src/proxy/response_processor.rs
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=read_file>
+<parameter=limit>
+20
+</parameter>
+<parameter=offset>
+530
+</parameter>
+<parameter=file_path>
+/tmp/cc-switch-src/src-tauri/src/proxy/providers/streaming.rs
+</parameter>
+</function>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 2, "two sequential blocks must rescue two calls");
+
+        let v0: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(v0["limit"], 30);
+        assert_eq!(v0["offset"], 147);
+        // File path must NOT carry the layout newlines that wrapped the value
+        // inside the `<parameter>` element — file dispatch on a `"\n/tmp/...\n"`
+        // arg would 404.
+        assert_eq!(
+            v0["file_path"],
+            "/tmp/cc-switch-src/src-tauri/src/proxy/response_processor.rs"
+        );
+
+        let v1: serde_json::Value = serde_json::from_str(&calls[1].arguments).unwrap();
+        assert_eq!(calls[1].name, "read_file");
+        assert_eq!(v1["limit"], 20);
+        assert_eq!(v1["offset"], 530);
+        assert_eq!(
+            v1["file_path"],
+            "/tmp/cc-switch-src/src-tauri/src/proxy/providers/streaming.rs"
+        );
+    }
+
+    #[test]
+    fn function_tag_preserves_internal_whitespace_for_edit_file_old_string() {
+        // edit_file's `old_string` is matched against the file verbatim, so
+        // internal whitespace MUST round-trip. The layout-newline strip should
+        // only peel ONE leading and ONE trailing `\n`, leaving multi-line
+        // bodies intact.
+        let text = r#"<tool_call>
+<function=edit_file>
+<parameter=file_path>
+src/main.rs
+</parameter>
+<parameter=old_string>
+        attrs
+      }
+  }
+</parameter>
+<parameter=new_string>
+        attrs.push(x);
+        attrs
+      }
+  }
+</parameter>
+</function>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "edit_file");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(v["file_path"], "src/main.rs");
+        assert_eq!(v["old_string"], "        attrs\n      }\n  }");
+        assert_eq!(
+            v["new_string"],
+            "        attrs.push(x);\n        attrs\n      }\n  }"
+        );
+    }
+
+    #[test]
+    fn function_tag_without_close_function_tag_skips() {
+        // Missing `</function>` close — better to drop the rescue than guess
+        // where the call body ended. Matches the existing safety posture in
+        // `parse_xml_tool_call` (returns None on missing tags rather than
+        // making things up).
+        let text = r#"<tool_call>
+<function=read_file>
+<parameter=file_path>x.rs</parameter>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert!(calls.is_empty(), "missing </function> must yield zero calls");
+    }
+
+    #[test]
+    fn function_tag_without_any_parameter_skips() {
+        // A `<function=...>` with no `<parameter=...>` children means we'd
+        // dispatch with empty args — usually broken intent. Skip rather than
+        // guess (mirrors `xml_without_tool_name_is_skipped`).
+        let text = r#"<tool_call>
+<function=list_files>
+</function>
+</tool_call>"#;
+        let calls = rescue_text_tool_calls(text);
+        assert!(calls.is_empty(), "no <parameter> children → no rescue");
     }
 
     #[test]

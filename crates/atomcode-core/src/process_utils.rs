@@ -8,9 +8,14 @@
 
 /// Apply `CREATE_NO_WINDOW` to a `tokio::process::Command` on Windows.
 /// No-op on other platforms.
+///
+/// `tokio::process::Command::creation_flags` is an inherent method on
+/// Windows — unlike `std::process::Command` it does NOT require the
+/// `std::os::windows::process::CommandExt` trait to be in scope, which
+/// is why this body lacks the `use` statement that
+/// `suppress_console_window_sync` below needs.
 #[cfg(target_os = "windows")]
 pub fn suppress_console_window(cmd: &mut tokio::process::Command) {
-    use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
@@ -31,3 +36,94 @@ pub fn suppress_console_window_sync(cmd: &mut std::process::Command) {
 /// No-op on non-Windows platforms.
 #[cfg(not(target_os = "windows"))]
 pub fn suppress_console_window_sync(_cmd: &mut std::process::Command) {}
+
+/// Decode raw bytes captured from a subprocess's stdout / stderr.
+///
+/// Modern cross-platform tools (git, cargo, npm, …) emit UTF-8 even on
+/// Windows, so we try strict UTF-8 first. Legacy Win32 console tools and
+/// `cmd.exe` builtins (`dir`, `type`, `chcp`, …) emit *localized* strings
+/// from cmd.exe's resource segment in the system's **OEM code page** —
+/// CP936 (GBK) on Simplified Chinese, CP950 (Big5) on Traditional, CP932
+/// (Shift-JIS) on Japanese, CP949 (UHC) on Korean — regardless of `chcp`
+/// or `SetConsoleOutputCP` state, because resource strings are picked
+/// before the console code page applies.
+///
+/// Without this fallback a Chinese-locale user running `dir` through the
+/// Bash tool sees `������` mojibake: every CP936 multi-byte sequence
+/// fails UTF-8 validation and `from_utf8_lossy` rewrites it as U+FFFD.
+///
+/// Chunk-boundary handling: if UTF-8 validation fails purely because the
+/// last few bytes are an incomplete codepoint (the byte buffer landed
+/// mid-character on a streaming read), the prefix is genuinely UTF-8 and
+/// only the tail needs lossy replacement — don't punt the whole chunk to
+/// the OEM decoder. `error_len() == None` is exactly that case.
+///
+/// On non-Windows, fall back to `from_utf8_lossy`: POSIX subprocess
+/// stdout is UTF-8-by-convention and guessing another encoding from a
+/// `LANG` value is the kind of vote we already retired for cell widths
+/// (see `width::is_cjk_locale`).
+pub fn decode_subprocess_output(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => return s.to_string(),
+        // Error is "unexpected end" — chunk was sliced mid-codepoint, the
+        // valid prefix is real UTF-8. Lossy decode here just inserts one
+        // U+FFFD for the truncated tail; the next chunk replays the tail.
+        Err(e) if e.error_len().is_none() => {
+            return String::from_utf8_lossy(bytes).to_string();
+        }
+        Err(_) => {}
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let cp = unsafe {
+            extern "system" {
+                fn GetOEMCP() -> u32;
+            }
+            GetOEMCP()
+        };
+        let encoding = match cp {
+            936 => encoding_rs::GB18030,
+            950 => encoding_rs::BIG5,
+            932 => encoding_rs::SHIFT_JIS,
+            949 => encoding_rs::EUC_KR,
+            _ => return String::from_utf8_lossy(bytes).to_string(),
+        };
+        let (decoded, _, _) = encoding.decode(bytes);
+        return decoded.into_owned();
+    }
+    #[cfg(not(target_os = "windows"))]
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_passes_through_ascii() {
+        assert_eq!(decode_subprocess_output(b"hello world\n"), "hello world\n");
+    }
+
+    #[test]
+    fn decode_passes_through_valid_utf8() {
+        assert_eq!(decode_subprocess_output("你好世界".as_bytes()), "你好世界");
+    }
+
+    #[test]
+    fn decode_handles_truncated_utf8_tail_as_lossy_not_oem_decode() {
+        // "你好" = E4 BD A0  E5 A5 BD. Slice off the last byte: the prefix
+        // "你" is valid UTF-8, the trailing "E5 A5" is an incomplete codepoint.
+        // The fix path takes the lossy branch (error_len == None) so the
+        // valid prefix is preserved verbatim and only the tail becomes U+FFFD —
+        // we do NOT misclassify the whole chunk as CP936 and garble the prefix.
+        let full = "你好".as_bytes();
+        let truncated = &full[..full.len() - 1];
+        let decoded = decode_subprocess_output(truncated);
+        assert!(decoded.starts_with('你'), "prefix 你 must survive: got {:?}", decoded);
+    }
+
+    #[test]
+    fn decode_empty_input_is_empty_string() {
+        assert_eq!(decode_subprocess_output(b""), "");
+    }
+}

@@ -68,7 +68,7 @@ impl HookEngine {
         }
     }
 
-    // ── 注册方法 (10 个) ──────────────────────────────────────────
+    // ── 注册方法 (12 个) ──────────────────────────────────────────
 
     pub fn register_pre_tool_hook(&mut self, hook: Arc<dyn PreToolExecutionHook>) {
         if hook.is_enabled() {
@@ -158,13 +158,13 @@ impl HookEngine {
             match hook.on_pre_execute(ctx).await {
                 HookResult::Ok => {}
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg);
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg);
                 }
                 HookResult::Denied(reason) => {
                     return Err(format!("{}: {}", hook.name(), reason));
                 }
                 HookResult::Modified(new_args) => {
-                    eprintln!("[Hook Modified] {} modified arguments", hook.name());
+                    tracing::info!("[Hook Modified] {} modified arguments", hook.name());
                     modified_args = Some(new_args);
                 }
             }
@@ -182,10 +182,10 @@ impl HookEngine {
                 let result = hook.on_post_execute(ctx, result_ctx).await;
                 match result {
                     HookResult::Warning(msg) => {
-                        eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                        tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                     }
                     HookResult::Denied(reason) => {
-                        eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                        tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                     }
                     _ => {}
                 }
@@ -202,10 +202,10 @@ impl HookEngine {
             .map(|hook| async move {
                 match hook.on_post_turn(ctx, turn_result).await {
                     HookResult::Warning(msg) => {
-                        eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                        tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                     }
                     HookResult::Denied(reason) => {
-                        eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                        tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                     }
                     _ => {}
                 }
@@ -246,6 +246,7 @@ impl HookEngine {
         };
 
         let mut injected = String::new();
+        let mut warnings = Vec::new();
         for hook in &self.on_user_prompt_submit_hooks {
             match hook.on_user_prompt_submit(&payload).await {
                 UserPromptSubmitResult::Continue => {}
@@ -258,9 +259,15 @@ impl HookEngine {
                 UserPromptSubmitResult::Block(reason) => {
                     return UserPromptHookResult::Block(reason);
                 }
+                UserPromptSubmitResult::Warning(msg) => {
+                    warnings.push(msg);
+                }
             }
         }
 
+        if !warnings.is_empty() {
+            return UserPromptHookResult::Warning(warnings.join("; "));
+        }
         if injected.is_empty() {
             UserPromptHookResult::Continue
         } else {
@@ -284,10 +291,10 @@ impl HookEngine {
         for hook in &self.on_turn_start_hooks {
             match hook.on_turn_start(ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 _ => {}
             }
@@ -299,10 +306,10 @@ impl HookEngine {
         for hook in &self.on_tool_call_start_hooks {
             match hook.on_tool_call_start(ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 _ => {}
             }
@@ -314,13 +321,13 @@ impl HookEngine {
         for hook in &self.on_turn_complete_hooks {
             match hook.on_turn_complete(ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 HookResult::Modified(msg) => {
-                    eprintln!("[Hook Modified] {}: {}", hook.name(), msg)
+                    tracing::info!("[Hook Modified] {}: {}", hook.name(), msg)
                 }
                 _ => {}
             }
@@ -334,10 +341,10 @@ impl HookEngine {
         for hook in &self.on_model_response_hooks {
             match hook.on_model_response(response, turn_ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 _ => {}
             }
@@ -349,10 +356,10 @@ impl HookEngine {
         for hook in &self.on_error_hooks {
             match hook.on_error(ctx).await {
                 HookResult::Warning(msg) => {
-                    eprintln!("[Hook Warning] {}: {}", hook.name(), msg)
+                    tracing::warn!("[Hook Warning] {}: {}", hook.name(), msg)
                 }
                 HookResult::Denied(reason) => {
-                    eprintln!("[Hook Denied] {}: {}", hook.name(), reason)
+                    tracing::warn!("[Hook Denied] {}: {}", hook.name(), reason)
                 }
                 _ => {}
             }
@@ -420,7 +427,7 @@ impl HookEngine {
             match config.event {
                 HookEvent::Notification => {
                     // Notification 事件无对应 trait, CC 生态中也被静默跳过
-                    eprintln!(
+                    tracing::warn!(
                         "[Hook] Notification hooks not supported, skipping: {}",
                         config.command
                     );
@@ -496,44 +503,10 @@ impl HookEngine {
         }
     }
 
-    /// 注册所有内置 hook
-    fn register_builtins(&mut self) {
-        use super::built_in::{
-            ToolAuditLogHook, TurnStatsHook, AutoCommitHook,
-            SessionSummaryHook, ErrorReportHook, ResponseValidationHook,
-        };
-
-        // ToolAuditLogHook: OnToolCallStartHook
-        let audit = Arc::new(ToolAuditLogHook { enabled: true, log_file: None });
-        self.register_on_tool_call_start_hook(audit);
-
-        // TurnStatsHook: OnTurnStart + OnTurnComplete
-        let stats = Arc::new(TurnStatsHook { enabled: true });
-        // TurnStatsHook implements both OnTurnStartHook + OnTurnCompleteHook;
-        // register via public API rather than direct field access.
-        self.register_on_turn_start_hook(stats.clone());
-        self.register_on_turn_complete_hook(stats.clone());
-
-        // AutoCommitHook: OnTurnCompleteHook
-        let auto_commit = Arc::new(AutoCommitHook {
-            enabled: true,
-            interval: 1,
-        });
-        self.register_on_turn_complete_hook(auto_commit);
-
-        // SessionSummaryHook: OnSessionStart + OnSessionEnd
-        let summary = Arc::new(SessionSummaryHook::new());
-        self.register_on_session_start_hook(summary.clone());
-        self.register_on_session_end_hook(summary);
-
-        // ErrorReportHook: OnErrorHook
-        let error_report = Arc::new(ErrorReportHook { enabled: true });
-        self.register_on_error_hook(error_report);
-
-        // ResponseValidationHook: OnModelResponseHook
-        let validation = Arc::new(ResponseValidationHook::new(vec![]));
-        self.register_on_model_response_hook(validation);
-    }
+    /// 注册所有内置 hook。
+    ///
+    /// 当前所有内置 hook 暂停使用，待后续通过配置文件驱动启用。
+    fn register_builtins(&mut self) {}
 }
 
 // ============================================================================
@@ -576,7 +549,7 @@ impl ShellCommandHook {
     /// 执行 shell 命令，返回 stdout（环境变量协议）。
     async fn execute_hook(&self, ctx: &HookContext) -> anyhow::Result<String> {
         let ctx_json = serde_json::to_string(ctx).unwrap_or_else(|e| {
-            eprintln!("[Hook Warning] Failed to serialize HookContext to JSON: {}", e);
+            tracing::warn!("[Hook Warning] Failed to serialize HookContext to JSON: {}", e);
             "{}".to_string()
         });
 
@@ -777,14 +750,34 @@ impl OnUserPromptSubmitHook for ShellCommandHook {
         match self.execute_hook_with_stdin(&payload_json).await {
             Ok((exit_ok, stdout, stderr)) => {
                 if !exit_ok {
+                    // Non-zero exit: check if the hook explicitly blocked
+                    // via structured JSON before treating it as an
+                    // environment failure. This lets intentional blocks
+                    // still work while degrading "command not found" etc.
+                    // to a non-blocking warning.
+                    let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty());
+                    let json_action = last_line.and_then(|l| {
+                        serde_json::from_str::<UserPromptSubmitOutput>(l.trim()).ok()
+                    });
+                    if let Some(parsed) = json_action {
+                        if matches!(parsed.decision.as_deref(), Some("block")) {
+                            let reason = parsed
+                                .reason
+                                .unwrap_or_else(|| "user prompt blocked by hook".into());
+                            return UserPromptSubmitResult::Block(reason);
+                        }
+                    }
+                    // No structured block decision — this is an
+                    // environment failure (missing dep, crash, etc.),
+                    // not an intentional rejection. Warn but continue.
                     let reason = if !stderr.trim().is_empty() {
                         stderr.trim().to_string()
                     } else if !stdout.trim().is_empty() {
                         stdout.trim().to_string()
                     } else {
-                        "user prompt blocked by hook".into()
+                        "hook exited with error".into()
                     };
-                    return UserPromptSubmitResult::Block(reason);
+                    return UserPromptSubmitResult::Warning(reason);
                 }
 
                 // last-line-first JSON 解析 (CC parity)
@@ -1107,7 +1100,27 @@ mod tests {
             cwd: "/tmp".into(),
         };
         let result = hook.on_user_prompt_submit(&payload).await;
-        assert!(matches!(result, UserPromptSubmitResult::Block(ref s) if s == "block message"));
+        assert!(matches!(result, UserPromptSubmitResult::Warning(ref s) if s == "block message"));
+    }
+
+    #[tokio::test]
+    async fn user_prompt_nonzero_exit_with_json_block_still_blocks() {
+        let config = HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: r#"echo '{"decision":"block","reason":"intentional"}'; exit 1"#.to_string(),
+            timeout_ms: 10_000,
+            plugin_root: None,
+        };
+        let hook = Arc::new(ShellCommandHook::from_hook_config(config));
+        let payload = UserPromptSubmitPayload {
+            session_id: "s1".into(),
+            hook_event_name: "UserPromptSubmit".into(),
+            prompt: "hello".into(),
+            cwd: "/tmp".into(),
+        };
+        let result = hook.on_user_prompt_submit(&payload).await;
+        assert!(matches!(result, UserPromptSubmitResult::Block(ref s) if s == "intentional"));
     }
 
     #[tokio::test]

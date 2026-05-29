@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.1</span>
+    <span class="dhdr-ver">v4.23.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -102,9 +102,12 @@
           <tr><th>Key</th><th>Action</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>Ctrl+↑ / Ctrl+↓</code></td><td>Scroll the chat area (3 lines)</td></tr>
-          <tr><td><code>PageUp / PageDown</code></td><td>Scroll the chat area (one page)</td></tr>
+          <tr><td><code>Shift+↑ / Shift+↓</code></td><td>Scroll one line</td></tr>
+          <tr><td><code>PageUp / PageDown</code></td><td>Scroll one page (10 lines)</td></tr>
+          <tr><td><code>Alt+↑ / Alt+↓</code></td><td>Jump to previous / next message (macOS Apple Terminal: enable Settings → Profiles → Keyboard → "Use Option as Meta key" first)</td></tr>
+          <tr><td><code>Ctrl+↑ / Ctrl+↓</code></td><td>Jump to previous / next <strong>user</strong> message</td></tr>
           <tr><td><code>Home / End</code></td><td>Jump to top / bottom of the conversation</td></tr>
+          <tr><td>Mouse wheel</td><td>Scroll inside the chat area (atomcode captures the wheel)</td></tr>
           <tr><td><code>Ctrl+L</code></td><td>Clear the current session's messages</td></tr>
         </tbody>
       </table>
@@ -115,7 +118,8 @@
           <tr><th>Key / action</th><th>Effect</th></tr>
         </thead>
         <tbody>
-          <tr><td>Mouse drag</td><td>Select text in the chat area (auto-scrolls at selection edges)</td></tr>
+          <tr><td>Mouse drag</td><td>Select text in the chat area (atomcode-managed; auto-scrolls at selection edges)</td></tr>
+          <tr><td><code>Shift+</code> mouse drag</td><td>Use the host terminal's native selection (bypasses atomcode; better for cross-viewport copy)</td></tr>
           <tr><td><code>Ctrl+Shift+C</code></td><td>Copy selection to system clipboard</td></tr>
           <tr><td><code>/copy</code></td><td>Copy the AI's last complete reply</td></tr>
           <tr><td>Right-click menu</td><td>Some terminals offer direct copy/paste (depends on the terminal, not atomcode)</td></tr>

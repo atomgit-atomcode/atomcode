@@ -70,11 +70,10 @@ impl CommandRegistry {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
-    Command { name: "codingplan", desc: "Claim CodingPlan + set up models from the plan's model list", needs_args: false },
+    Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false },
     Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true },
-    Command { name: "login",   desc: "Sign in with AtomGit OAuth", needs_args: false },
     Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false },
     Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false },
     Command { name: "model",   desc: "Switch provider / model", needs_args: false },
@@ -104,6 +103,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false },
     Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false },
     Command { name: "help",    desc: "Show this help", needs_args: false },
+    Command { name: "guide",   desc: "向 atomcode-guide 提问使用方法", needs_args: true },
     Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false },
     Command { name: "language", desc: "Switch display language", needs_args: false },
     Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false },
@@ -132,7 +132,6 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
     use crate::i18n::{t, Msg};
     let msg = match name {
         "setup" => Msg::CmdDescSetup,
-        "codingplan" => Msg::CmdDescCodingplan,
         "resume" => Msg::CmdDescResume,
         "rename" => Msg::CmdDescRename,
         "login" => Msg::CmdDescLogin,
@@ -165,6 +164,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "build" => Msg::CmdDescBuild,
         "think" => Msg::CmdDescThink,
         "help" => Msg::CmdDescHelp,
+        "guide" => Msg::CmdDescGuide,
         "keys" => Msg::CmdDescKeys,
         "language" => Msg::CmdDescLanguage,
         "welcome" => Msg::CmdWelcomeDescription,

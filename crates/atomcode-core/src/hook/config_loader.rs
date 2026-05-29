@@ -64,7 +64,7 @@ impl HooksConfig {
             };
 
             if !script_path.exists() {
-                eprintln!("[Hook] Warning: Script not found: {}", script_path.display());
+                tracing::warn!("[Hook] Warning: Script not found: {}", script_path.display());
                 continue;
             }
 
@@ -94,7 +94,7 @@ impl HooksConfig {
                     engine.register_system_prompt_hook(hook);
                 }
                 _ => {
-                    eprintln!("[Hook] Warning: Unknown trigger type: {}", config.trigger);
+                    tracing::warn!("[Hook] Warning: Unknown trigger type: {}", config.trigger);
                 }
             }
         }
@@ -127,11 +127,11 @@ impl HooksConfig {
             // 按 trigger 只注册到匹配的 slot（避免 9 个不必要的 Arc clone）
             Self::register_webhook_by_trigger(engine, &webhook, &config.trigger);
 
-            eprintln!("[Webhook] Registered: {} -> {}", config.name, config.url);
+            tracing::info!("[Webhook] Registered: {} -> {}", config.name, config.url);
         }
 
         if !async_registry.batchers.is_empty() {
-            eprintln!("[AsyncWebhook] Registered {} async batchers", async_registry.batchers.len());
+            tracing::info!("[AsyncWebhook] Registered {} async batchers", async_registry.batchers.len());
         }
     }
 
@@ -494,7 +494,7 @@ enabled = true
         engine.load_all(&dir);
         // built-ins are always registered, so has_any() may be true
         // This test just verifies load_all doesn't panic on empty dir
-        eprintln!("engine has_any: {}", engine.has_any());
+        assert!(engine.has_any());
 
         let _ = fs::remove_dir_all(&dir);
     }

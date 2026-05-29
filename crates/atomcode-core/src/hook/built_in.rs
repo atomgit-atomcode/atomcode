@@ -7,8 +7,6 @@
 //! - 错误上报
 //! - 模型响应验证
 
-use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Local;
@@ -67,8 +65,8 @@ impl OnToolCallStartHook for ToolAuditLogHook {
                 let _ = file.write_all(log_entry.as_bytes());
             }
         } else {
-            // 输出到 stderr
-            eprint!("{}", log_entry);
+            // 输出到 tracing（stderr 在 TUI alternate screen 下会污染输入栏）
+            tracing::info!("{}", log_entry.trim_end());
         }
 
         HookResult::Ok
@@ -100,7 +98,7 @@ impl Hook for TurnStatsHook {
 
 #[async_trait]
 impl OnTurnStartHook for TurnStatsHook {
-    async fn on_turn_start(&self, ctx: &TurnStartContext) -> HookResult {
+    async fn on_turn_start(&self, _ctx: &TurnStartContext) -> HookResult {
         // Turn 开始时记录
         HookResult::Ok
     }
@@ -109,7 +107,7 @@ impl OnTurnStartHook for TurnStatsHook {
 #[async_trait]
 impl OnTurnCompleteHook for TurnStatsHook {
     async fn on_turn_complete(&self, ctx: &TurnCompleteContext) -> HookResult {
-        eprintln!(
+        tracing::info!(
             "[Turn #{}] Result: {} | Tokens: {} | Tools: {} | Duration: {}ms | Files: {:?}",
             ctx.turn_number,
             ctx.result_type,
@@ -211,7 +209,7 @@ impl AutoCommitHook {
             .output()
         {
             Ok(output) if output.status.success() => {
-                eprintln!("[AutoCommit] Committed at turn #{}", ctx.turn_number);
+                tracing::info!("[AutoCommit] Committed at turn #{}", ctx.turn_number);
                 HookResult::Ok
             }
             Ok(output) => HookResult::Warning(format!(
@@ -230,16 +228,11 @@ impl AutoCommitHook {
 /// 在会话结束时生成总结报告
 pub struct SessionSummaryHook {
     pub enabled: bool,
-    /// 会话开始时间
-    start_time: Option<Instant>,
 }
 
 impl SessionSummaryHook {
     pub fn new() -> Self {
-        Self {
-            enabled: true,
-            start_time: None,
-        }
+        Self { enabled: true }
     }
 }
 
@@ -268,12 +261,14 @@ impl OnSessionStartHook for SessionSummaryHook {
 #[async_trait]
 impl OnSessionEndHook for SessionSummaryHook {
     async fn on_session_end(&self, ctx: &SessionContext) -> HookResult {
-        eprintln!("\n{}", "=".repeat(60));
-        eprintln!("[Session Summary]");
-        eprintln!("Session ID: {}", ctx.session_id);
-        eprintln!("Working Dir: {}", ctx.working_dir);
-        eprintln!("Model: {} ({})", ctx.model_name, ctx.provider_name);
-        eprintln!("{}", "=".repeat(60));
+        let sep = "=".repeat(60);
+        tracing::info!(
+            "\n{sep}\n[Session Summary]\nSession ID: {}\nWorking Dir: {}\nModel: {} ({})\n{sep}",
+            ctx.session_id,
+            ctx.working_dir,
+            ctx.model_name,
+            ctx.provider_name,
+        );
 
         HookResult::Ok
     }
@@ -306,8 +301,8 @@ impl Hook for ErrorReportHook {
 impl OnErrorHook for ErrorReportHook {
     async fn on_error(&self, ctx: &ErrorContext) -> HookResult {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-        eprintln!(
-            "\n[ERROR REPORT] {}\nType: {}\nPhase: {}\nTurn: {:?}\nMessage: {}\n",
+        tracing::error!(
+            "[ERROR REPORT] {}\nType: {}\nPhase: {}\nTurn: {:?}\nMessage: {}",
             timestamp, ctx.error_type, ctx.phase, ctx.turn_number, ctx.error_message
         );
 

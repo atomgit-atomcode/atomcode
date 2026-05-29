@@ -8,7 +8,7 @@
 
 ### 1. 核心模块
 
-**文件**: `crates/atomcode-core/src/hook/webhook.rs` (454 行)
+**文件**: `crates/atomcode-core/src/hook/webhook.rs` (~748 行)
 
 #### 主要结构
 
@@ -58,8 +58,7 @@ pub struct WebhookHook {
    }
    ```
 
-4. **支持所有 Hook 时机**
-   - ✅ OnMessageReceived
+4. **支持所有 Hook 时机（12 个）**
    - ✅ OnTurnStart
    - ✅ OnToolCallStart
    - ✅ PreToolExecution
@@ -71,6 +70,7 @@ pub struct WebhookHook {
    - ✅ OnError
    - ✅ OnModelResponse
    - ✅ SystemPrompt
+   - ✅ OnMessageReceived
 
 ### 2. 配置加载
 
@@ -96,14 +96,14 @@ Authorization = "Bearer YOUR_TOKEN"
 #### 加载逻辑
 
 - 从 `hooks.toml` 的 `[[webhooks]]` 数组加载
-- 自动注册到所有 Hook 时机
+- 根据 trigger 字段匹配注册到对应 HookEngine 槽位
 - 根据 `trigger` 字段过滤实际触发的事件
 
 ### 3. 文件变更
 
 | 文件 | 变更 | 行数 |
 |------|------|------|
-| `src/hook/webhook.rs` | 新增 | 454 行 |
+| `src/hook/webhook.rs` | 新增 | ~748 行 |
 | `src/hook/config_loader.rs` | 更新 | +40 行 |
 | `src/hook/mod.rs` | 更新 | +1 行 |
 | `tests/webhook_test.rs` | 新增 | 78 行 |
@@ -128,7 +128,7 @@ test result: ok. 3 passed; 0 failed
 [[webhooks]]
 name = "slack-audit"
 description = "记录所有工具调用到 Slack"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
 enabled = true
 timeout_secs = 10
@@ -140,7 +140,7 @@ timeout_secs = 10
 [[webhooks]]
 name = "dingtalk"
 description = "发送通知到钉钉"
-trigger = "on_turn_complete"
+trigger = "turn_complete"
 url = "https://oapi.dingtalk.com/robot/send?access_token=XXX"
 enabled = true
 ```
@@ -151,7 +151,7 @@ enabled = true
 [[webhooks]]
 name = "wechat"
 description = "发送通知到企业微信"
-trigger = "on_error"
+trigger = "error"
 url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=XXX"
 enabled = true
 ```
@@ -162,7 +162,7 @@ enabled = true
 [[webhooks]]
 name = "audit-log"
 description = "发送所有工具调用审计日志"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://log-service.example.com/atomcode/audit"
 enabled = true
 timeout_secs = 5
@@ -214,7 +214,7 @@ Authorization = "Bearer AUDIT_TOKEN"
    ```toml
    [[webhooks]]
    name = "debug"
-   trigger = "on_tool_call_start"
+   trigger = "tool_call_start"
    url = "https://webhook.site/your-unique-id"
    enabled = true
    ```
@@ -249,7 +249,7 @@ enabled = true
 [[webhooks]]
 name = "slack-notify"
 description = "发送工具调用通知到 Slack"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://hooks.slack.com/services/XXX"
 enabled = true
 timeout_secs = 5
@@ -258,7 +258,7 @@ timeout_secs = 5
 [[webhooks]]
 name = "dingtalk"
 description = "Turn 完成通知"
-trigger = "on_turn_complete"
+trigger = "turn_complete"
 url = "https://oapi.dingtalk.com/robot/send?access_token=XXX"
 enabled = true
 
@@ -266,7 +266,7 @@ enabled = true
 [[webhooks]]
 name = "audit-log"
 description = "发送所有工具调用到云端"
-trigger = "on_tool_call_start"
+trigger = "tool_call_start"
 url = "https://log-service.example.com/audit"
 enabled = true
 retries = 3
@@ -286,7 +286,7 @@ Authorization = "Bearer AUDIT_TOKEN"
 
 ### 完成的工作
 
-1. ✅ **实现 Webhook Hook 核心模块** - 454 行 Rust 代码
+1. ✅ **实现 Webhook Hook 核心模块** - ~748 行 Rust 代码
 2. ✅ **支持所有 12 个 Hook 时机** - 完整的 HTTP 远程调用
 3. ✅ **实现超时和重试机制** - 指数退避策略
 4. ✅ **支持自定义 Header** - 认证和元数据传递

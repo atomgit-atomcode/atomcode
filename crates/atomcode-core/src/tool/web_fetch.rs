@@ -158,7 +158,6 @@ fn err_result(msg: impl Into<String>) -> ToolResult {
     }
 }
 
-#[cfg(test)]
 fn host_is_auto_approved(host: &str) -> bool {
     const ALLOWLIST: &[&str] = &[
         "github.com",
@@ -200,11 +199,25 @@ impl Tool for WebFetchTool {
     }
 
     fn approval(&self, args: &str) -> ApprovalRequirement {
-        // web_fetch is always auto-approved. URL validation and scheme checks
-        // are performed during execution - invalid URLs will return an error
-        // result rather than blocking for user approval.
-        let _ = args; // suppress unused variable warning
-        ApprovalRequirement::AutoApprove
+        // Check if the URL host is in the allowlist.
+        // Unknown domains require user approval.
+        let parsed: Result<WebFetchArgs, _> = serde_json::from_str(args);
+        match parsed {
+            Ok(p) => {
+                if let Ok(url) = url::Url::parse(&p.url) {
+                    if let Some(host) = url.host_str() {
+                        if host_is_auto_approved(host) {
+                            return ApprovalRequirement::AutoApprove;
+                        }
+                    }
+                }
+                ApprovalRequirement::RequireApproval(format!(
+                    "web_fetch 请求访问 {}",
+                    p.url
+                ))
+            }
+            Err(_) => ApprovalRequirement::AutoApprove, // malformed args: let execute() handle the error
+        }
     }
 
     async fn execute(&self, args: &str, _ctx: &ToolContext) -> Result<ToolResult> {
@@ -237,6 +250,7 @@ impl Tool for WebFetchTool {
             Ok(u) => u,
             Err(e) => return Ok(err_result(format!("Invalid URL: {}", e))),
         };
+        tracing::debug!(url = %parsed.url, "web_fetch starting");
 
         let mut hops = 0u8;
         let response = loop {
@@ -286,11 +300,13 @@ impl Tool for WebFetchTool {
                 }
             };
             hops += 1;
+            tracing::debug!(from = %parsed.url, to = %url, hops, "web_fetch redirect");
         };
 
         let final_url = url.to_string();
         let status = response.status();
         if !status.is_success() {
+            tracing::warn!(status = %status, url = %final_url, "web_fetch HTTP error");
             return Ok(err_result(format!(
                 "HTTP {} from {}",
                 status.as_u16(),
@@ -373,6 +389,8 @@ impl Tool for WebFetchTool {
         } else {
             String::new()
         };
+
+        tracing::info!(url = %final_url, body_len = output.len(), truncated = hit_cap, "web_fetch completed");
 
         Ok(ToolResult {
             call_id: String::new(),

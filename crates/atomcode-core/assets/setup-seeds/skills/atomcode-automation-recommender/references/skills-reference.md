@@ -48,7 +48,13 @@ Skills distributed as plugins — install with `/plugin marketplace add <url>` t
 
 | Skill | Plugin | Install | Best For |
 |-------|--------|---------|----------|
-| **ask** | atomcode | `/plugin marketplace add https://atomgit.com/atomgit_atomcode/atomcode-skills` then `/plugin install atomcode@atomcode-skills` | AtomCode usage & docs Q&A — installation, config, slash commands, troubleshooting |
+| **atomcode-workflows** | atomcode-workflows | `/plugin marketplace add https://atomgit.com/atomgit_atomcode/atomcode-plugins-official` then `/plugin install atomcode-workflows@atomcode` | Plan / review / debug / brainstorm workflow skills |
+| **commit-craft** | commit-craft | (same marketplace) `/plugin install commit-craft@atomcode` | Conventional commit messages, PR descriptions, changelogs |
+| **git-worktree** | git-worktree | (same marketplace) `/plugin install git-worktree@atomcode` | `/worktree` — isolated worktrees for parallel work |
+
+> **AtomCode usage & docs Q&A** (installation, config, slash commands,
+> troubleshooting) is now the **built-in `/guide`** subagent — run
+> `/guide <question>`, no plugin install needed.
 
 ---
 

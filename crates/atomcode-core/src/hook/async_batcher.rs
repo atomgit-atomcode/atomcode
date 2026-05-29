@@ -105,7 +105,6 @@ pub struct BatchRequest {
 /// 批量发送器
 pub struct AsyncWebhookBatcher {
     config: AsyncWebhookConfig,
-    client: Client,
     /// 事件队列
     event_queue: Arc<Mutex<Vec<WebhookEvent>>>,
     /// 发送通道
@@ -137,7 +136,6 @@ impl AsyncWebhookBatcher {
 
         Self {
             config,
-            client,
             event_queue,
             sender,
             handle: Mutex::new(Some(handle)),
@@ -153,7 +151,7 @@ impl AsyncWebhookBatcher {
         if queue.len() >= self.config.batch_size {
             let events = queue.drain(..).collect();
             if let Err(e) = self.sender.send(events).await {
-                eprintln!("[AsyncWebhook] Failed to send batch: {}", e);
+                tracing::warn!("[AsyncWebhook] Failed to send batch: {}", e);
                 return HookResult::Warning("Failed to queue webhook event".to_string());
             }
         }
@@ -170,7 +168,7 @@ impl AsyncWebhookBatcher {
 
         let events = queue.drain(..).collect();
         if let Err(e) = self.sender.send(events).await {
-            eprintln!("[AsyncWebhook] Failed to flush: {}", e);
+            tracing::warn!("[AsyncWebhook] Failed to flush: {}", e);
             return HookResult::Warning("Failed to flush webhook events".to_string());
         }
 
@@ -200,13 +198,13 @@ impl AsyncWebhookBatcher {
 
                     // 发送批量数据
                     if let Err(e) = Self::send_batch(&client, &config, &events).await {
-                        eprintln!("[AsyncWebhook] Failed to send batch: {}", e);
+                        tracing::warn!("[AsyncWebhook] Failed to send batch: {}", e);
                     }
                 }
 
                 // 通道关闭，退出
                 else => {
-                    eprintln!("[AsyncWebhook] Background task exiting");
+                    tracing::info!("[AsyncWebhook] Background task exiting");
                     break;
                 }
             }
@@ -259,7 +257,7 @@ impl AsyncWebhookBatcher {
                     let body = response.text().await.unwrap_or_default();
 
                     if status.is_success() {
-                        eprintln!(
+                        tracing::info!(
                             "[AsyncWebhook] Sent {} events to {}",
                             events.len(),
                             config.url
@@ -326,7 +324,7 @@ impl AsyncWebhookRegistry {
         }
 
         let batcher = Arc::new(AsyncWebhookBatcher::new(config.clone()));
-        eprintln!(
+        tracing::info!(
             "[AsyncWebhook] Registered: {} -> {} (batch={}, interval={}ms)",
             config.name, config.url, config.batch_size, config.flush_interval_ms
         );

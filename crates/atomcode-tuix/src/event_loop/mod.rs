@@ -687,6 +687,11 @@ pub struct LoopCtx {
     /// when `/codingplan` persists a fresh config (re-sync resets the
     /// hint state).
     pub monitor_warning: std::sync::Arc<std::sync::Mutex<Option<monitor::CodingPlanWarning>>>,
+    /// Hook execution failure hint for the status bar. Written by the
+    /// `AgentEvent::HookWarningHint` handler; read by `build_status` on
+    /// each redraw. Takes precedence over `usage_hint` so a broken hook
+    /// is immediately visible. Cleared at the start of each new turn.
+    pub hook_warning_hint: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Last time a monitor check was fired this session. Pre-turn
     /// triggers respect `monitor::CHECK_COOLDOWN` (15 min) against this
     /// timestamp; startup + `/model` switch bypass the cooldown.
@@ -727,7 +732,7 @@ pub struct LoopCtx {
     /// poll thread (see `event_loop::oauth_poll`). One event arrives
     /// per spawned poll task (Authorized or Failed). The `tokio::select!`
     /// arm that reads this channel closes the wizard modal + flips
-    /// `pending_run_codingplan` on Authorized, or surfaces the failure
+    /// `pending_run_login_setup` on Authorized, or surfaces the failure
     /// reason in scrollback on Failed.
     pub oauth_event_rx: mpsc::UnboundedReceiver<oauth_poll::OauthEvent>,
     /// Sender cloned into each spawned poll task.
@@ -761,11 +766,11 @@ pub struct LoopCtx {
     pub pending_new_issue: Option<NewIssueDraft>,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 0 (Set up CodingPlan). The event loop drains this on
-    /// modal close and runs the full CodingPlan setup flow (login if
-    /// needed → claim → fetch models → register providers). Needs
-    /// raw-mode suspend/resume, something modals can't drive
-    /// themselves. Same pattern as `pending_new_issue`.
-    pub pending_run_codingplan: bool,
+    /// modal close and runs the full `/login` flow (OAuth if needed →
+    /// claim → fetch models → register providers). Needs raw-mode
+    /// suspend/resume, something modals can't drive themselves. Same
+    /// pattern as `pending_new_issue`.
+    pub pending_run_login_setup: bool,
     /// Set by `OnboardingWizard` (step 3, Setup) when the user picks
     /// option 1 (Configure manually). The event loop drains this on
     /// modal close and swaps in `ProviderWizard::MainMenu` — a
@@ -1016,6 +1021,14 @@ impl Buffer {
 
     fn clear_pastes(&mut self) {
         self.pastes.clear();
+    }
+
+    /// Current buffer text with every `[Pasted #N …]` placeholder expanded
+    /// back to its original contents. Modals that consume `text` directly
+    /// (instead of going through the Submit/Commit path, which expands at
+    /// the event loop) use this so a folded paste is seen in full.
+    pub fn expanded_text(&self) -> String {
+        self.expand_pastes(&self.text)
     }
 
     pub(crate) fn apply(
@@ -1274,7 +1287,7 @@ fn byte_offset_at_col(line: &str, target_col: usize) -> usize {
         if acc >= target_col {
             return i;
         }
-        acc += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        acc += crate::width::cell_char_width(ch).unwrap_or(0);
     }
     line.len()
 }
@@ -1314,6 +1327,19 @@ mod buffer_tests {
     fn expand_pastes_is_noop_without_placeholders() {
         let b = Buffer::new();
         assert_eq!(b.expand_pastes("plain text"), "plain text");
+    }
+
+    #[test]
+    fn expanded_text_recovers_folded_paste() {
+        // Modals (e.g. the provider Template step) read `expanded_text()`
+        // instead of `text`, so a folded multi-line paste is seen in full
+        // rather than as the literal `[Pasted #N +M lines]` placeholder.
+        let mut b = Buffer::new();
+        let body = "line\n".repeat(30);
+        b.insert_paste(body.clone());
+        assert!(b.text.contains("[Pasted #"), "should fold to placeholder");
+        assert!(!b.expanded_text().contains("[Pasted #"));
+        assert_eq!(b.expanded_text(), body);
     }
 
     #[test]
@@ -2523,16 +2549,6 @@ pub struct App {
     /// session. Flipped to `true` after the first render; subsequent
     /// redraws skip the check entirely.
     pub setup_hint_shown: bool,
-    /// Timestamp of the last Ctrl+C that was consumed by `copy_selection()`
-    /// via the Windows OS-level signal handler. On Windows, the OS Ctrl+C
-    /// signal fires *before* the keyboard event arrives in the input
-    /// buffer (biased `tokio::select!` prioritises the signal arm), so
-    /// after the signal handler copies the selection, the keyboard event
-    /// still shows up in `handle_input` and would trigger Cancel/exit.
-    /// This timestamp lets the keyboard path detect and suppress that
-    /// stale echo within a short debounce window.
-    #[cfg(windows)]
-    pub last_ctrl_c_copy: Option<std::time::Instant>,
 }
 
 /// How long the "press Ctrl+C again to exit" confirmation stays armed.
@@ -2554,8 +2570,6 @@ impl App {
             setup_pending: false,
             reasoning_buffer: String::new(),
             setup_hint_shown: false,
-            #[cfg(windows)]
-            last_ctrl_c_copy: None,
         }
     }
 }
@@ -2628,20 +2642,12 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // "won't work" claim, and surface `\<Enter>` as the universal
     // fallback so legacy-conhost users (where modifier+Enter IS
     // genuinely swallowed at the OS layer) have a guaranteed path.
-    //
-    // Also suppressed when the legacy-conhost hint is firing — that
-    // hint already covers the only environment where the chord
-    // truly fails, so dual-firing produced wall-of-text noise (see
-    // user feedback 2026-05-09 "全部展示的是…可以更精细化下").
     let kbd_hint_set = std::env::var("ATOMCODE_KBD_NOT_ENHANCED").is_ok();
-    let jediterm_set = std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok();
     if kbd_hint_set {
         std::env::remove_var("ATOMCODE_KBD_NOT_ENHANCED");
     }
-    // Suppress the standalone keyboard hint when the JediTerm banner
-    // is firing — that banner already carries its own newline
-    // guidance, so dual-firing produced wall-of-text noise. Otherwise
-    // emit a single universal hint pointing at `\<Enter>`.
+    // Emit a single universal hint pointing at `\<Enter>` whenever the
+    // keyboard-enhanced negotiation failed.
     //
     // Why the universal-fallback message instead of per-terminal
     // chord recommendations: the previous helper detected MSYSTEM /
@@ -2658,41 +2664,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     // use them. The startup hint targets the user who doesn't know,
     // and for them a guaranteed-works recommendation beats a
     // sometimes-wrong terminal-specific one.
-    if kbd_hint_set && !jediterm_set {
+    if kbd_hint_set {
         renderer.render(UiLine::CommandOutput(
             crate::i18n::t(crate::i18n::Msg::HintMultiLineInput).into_owned(),
-        ));
-    }
-
-    // JediTerm auto-fallback hint: lib.rs detected
-    // `TERMINAL_EMULATOR=JetBrains-JediTerm` (Android Studio, IntelliJ,
-    // PyCharm, etc.) and routed to AltScreenRenderer because the
-    // retained renderer's DECSTBM-pinned footer misaligns there.
-    // Tell the user about the trade-off — alt-screen owns the
-    // viewport so the host terminal's native scrollback isn't
-    // available; the app provides its own (PageUp / Shift+Up /
-    // mouse wheel). Only set by lib.rs when the user did NOT
-    // explicitly opt in via ATOMCODE_PLAIN / ATOMCODE_ALT —
-    // informed choices don't get lectured.
-    if std::env::var("ATOMCODE_JEDITERM_FALLBACK").is_ok() {
-        std::env::remove_var("ATOMCODE_JEDITERM_FALLBACK");
-        // Includes newline-insertion guidance because the standalone
-        // keyboard hint is suppressed when this banner fires (see
-        // kbd_hint_set block above). Lead with `\<Enter>` — the
-        // buffer-layer fallback that works regardless of which
-        // chord the IDE's JediTerm fork happens to forward. Modifier
-        // chords still supported by `key_action.rs::classify`; users
-        // who know they have them just use them.
-        renderer.render(UiLine::CommandOutput(
-            "  ⓘ JetBrains IDE terminal detected — running in alt-screen mode.\n    \
-            Newlines: end the line with `\\` then press Enter (Shift / Alt /\n    \
-            Ctrl + Enter may also work depending on your IDE version).\n    \
-            Use mouse wheel, PageUp/PageDown, or Shift+Up/Down to scroll history.\n    \
-            Native terminal scrollback is unavailable while atomcode runs;\n    \
-            on exit your host terminal restores its pre-atomcode state.\n    \
-            Set ATOMCODE_PLAIN=1 for a bare CI-style baseline, or\n    \
-            ATOMCODE_RETAIN=1 to bypass this fallback (may misalign).\n\n"
-                .into(),
         ));
     }
 
@@ -2745,7 +2719,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         // poll thread (PR 1b) watches `/auth/check` and auto-closes
         // the modal the moment AtomGit reports authorisation, then
         // the `OauthEvent::Authorized` branch in the main `select!`
-        // flips `pending_run_codingplan` so `/codingplan` claims
+        // flips `pending_run_login_setup` so `/codingplan` claims
         // immediately — zero keystrokes after the user finishes the
         // browser flow. The legacy 3-step Intro / Language / Setup
         // wizard stays intact for `/welcome` — `new_qr_fast_path` is
@@ -2930,7 +2904,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                 last_spinner_draw = std::time::Instant::now();
             }
@@ -2952,7 +2926,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── OAuth poll thread results ──
             // Emitted by `event_loop::oauth_poll::spawn_oauth_poll`
             // once per QR-fast-path session. Authorized → close the
-            // wizard + flip `pending_run_codingplan` so the existing
+            // wizard + flip `pending_run_login_setup` so the existing
             // /codingplan driver picks up the just-written auth.toml
             // and claims the plan. Failed → close the wizard too and
             // surface the reason in scrollback with a retry hint;
@@ -2976,21 +2950,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // refreshed below once the claim writes
                         // ctx.model_name.
                         crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
-                        // `pending_run_codingplan` is only drained by the
+                        // `pending_run_login_setup` is only drained by the
                         // keystroke-handler path (handle_input → modal
                         // close → drain flag). The OAuth poll path doesn't
                         // route through there, so just call the codingplan
                         // driver directly — same effect, runs in this
                         // select! arm's scope where renderer + ctx are
                         // already mutable.
-                        if let Err(e) = crate::event_loop::commands::run_codingplan_flow(renderer, &mut ctx) {
+                        if let Err(e) = crate::event_loop::commands::run_login_flow(renderer, &mut ctx) {
                             renderer.render(crate::render::UiLine::Error(
-                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /codingplan 手动重试。"),
+                                format!("CodingPlan 自动配置失败: {e:#}。可运行 /login 手动重试。"),
                             ));
                             renderer.flush();
                         }
                         // Splice the resolved model name into the
-                        // banner painted above. `run_codingplan_flow`
+                        // banner painted above. `run_login_flow`
                         // updates `ctx.model_name` from the picked
                         // default provider (see commands.rs:2906) — at
                         // this point the banner's cached model="" is
@@ -3018,7 +2992,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
                             format!(
-                                "登录失败: {reason}。运行 /codingplan 可重试。",
+                                "登录失败: {reason}。运行 /login 可重试。",
                             ),
                         ));
                         renderer.flush();
@@ -3197,8 +3171,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
-                    if matches!(app.state.phase, UiPhase::Streaming)
-                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    if matches!(app.state.phase, UiPhase::Streaming) || (app.state.guide_running
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100))
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         last_spinner_draw = std::time::Instant::now();
@@ -3279,21 +3253,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // when that path is silent. Single-press exit: skips the
             // 2-press confirm because if we got here, the user has no
             // working keyboard route to confirm with anyway.
-            //
-            // However, on Windows the OS Ctrl+C signal fires *before*
-            // the keyboard event arrives in the input buffer (and the
-            // `biased` select gives this arm priority), so when the
-            // user has a mouse selection active they expect Ctrl+C to
-            // *copy* — not exit. Try copy_selection first; only fall
-            // through to Shutdown when there's nothing selected.
             Some(()) = win_ctrl_c.recv() => {
-                if renderer.copy_selection() {
-                    crate::tuix_trace!("KEY", "windows ctrl_c signal -> copy_selection (had selection)");
-                    // Stamp so the keyboard-event echo (which arrives
-                    // shortly after via input_rx) knows to suppress
-                    // itself instead of triggering Cancel/exit.
-                    app.last_ctrl_c_copy = Some(std::time::Instant::now());
-                } else if matches!(app.state.phase, UiPhase::Streaming) {
+                if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running {
                     // In Streaming phase, Ctrl+C should cancel the
                     // running turn (matching keyboard-path behaviour)
                     // rather than shut down the whole application.
@@ -3315,7 +3276,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                 last_spinner_draw = std::time::Instant::now();
             }
@@ -3334,7 +3295,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // ── OAuth poll thread results ──
             // Emitted by `event_loop::oauth_poll::spawn_oauth_poll`
             // once per QR-fast-path session. Authorized → close the
-            // wizard + flip `pending_run_codingplan` so the existing
+            // wizard + flip `pending_run_login_setup` so the existing
             // /codingplan driver picks up the just-written auth.toml
             // and claims the plan. Failed → close the wizard too and
             // surface the reason in scrollback with a retry hint;
@@ -3358,21 +3319,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // refreshed below once the claim writes
                         // ctx.model_name.
                         crate::modals::onboarding_wizard::paint_welcome(&ctx, renderer);
-                        // `pending_run_codingplan` is only drained by the
+                        // `pending_run_login_setup` is only drained by the
                         // keystroke-handler path (handle_input → modal
                         // close → drain flag). The OAuth poll path doesn't
                         // route through there, so just call the codingplan
                         // driver directly — same effect, runs in this
                         // select! arm's scope where renderer + ctx are
                         // already mutable.
-                        if let Err(e) = crate::event_loop::commands::run_codingplan_flow(renderer, &mut ctx) {
+                        if let Err(e) = crate::event_loop::commands::run_login_flow(renderer, &mut ctx) {
                             renderer.render(crate::render::UiLine::Error(
-                                format!("CodingPlan 自动领取失败: {e:#}。可运行 /codingplan 手动重试。"),
+                                format!("CodingPlan 自动配置失败: {e:#}。可运行 /login 手动重试。"),
                             ));
                             renderer.flush();
                         }
                         // Splice the resolved model name into the
-                        // banner painted above. `run_codingplan_flow`
+                        // banner painted above. `run_login_flow`
                         // updates `ctx.model_name` from the picked
                         // default provider (see commands.rs:2906) — at
                         // this point the banner's cached model="" is
@@ -3400,7 +3361,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     OauthEvent::Failed(reason) => {
                         renderer.render(crate::render::UiLine::Error(
                             format!(
-                                "登录失败: {reason}。运行 /codingplan 可重试。",
+                                "登录失败: {reason}。运行 /login 可重试。",
                             ),
                         ));
                         renderer.flush();
@@ -3577,8 +3538,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
-                    if matches!(app.state.phase, UiPhase::Streaming)
-                        && last_spinner_draw.elapsed() >= Duration::from_millis(100)
+                    if matches!(app.state.phase, UiPhase::Streaming) || (app.state.guide_running
+                        && last_spinner_draw.elapsed() >= Duration::from_millis(100))
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         last_spinner_draw = std::time::Instant::now();
@@ -3741,7 +3702,7 @@ fn attach_image_to_input(
     let marker = format!("[Image #{}]", n);
     app.buf.text.insert_str(app.buf.cursor, &marker);
     app.buf.cursor += marker.len();
-    if matches!(app.state.phase, UiPhase::Streaming) {
+    if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running {
         draw_spinner_now(
             &mut app.state,
             &app.buf,
@@ -3813,31 +3774,18 @@ fn handle_input(
             InputEvent::Key(k) => format!("key({:?},{:?})", k.kind, k.code),
             InputEvent::Resize(w, h) => format!("resize({}x{})", w, h),
             InputEvent::MouseScroll(d) => format!("mouse_scroll({})", d),
-            InputEvent::MouseDown { col, row } => format!("mouse_down({},{})", col, row),
-            InputEvent::MouseDrag { col, row } => format!("mouse_drag({},{})", col, row),
-            InputEvent::MouseUp => "mouse_up".into(),
         }
     );
 
     match ev {
         InputEvent::MouseScroll(delta) => {
-            // Mouse wheel — only the alt-screen renderer takes action;
-            // retained / plain default to no-op (host terminal handles
-            // their scrollback natively, mouse capture isn't enabled
-            // for them anyway).
+            // Mouse wheel is a no-op: SGR mouse capture (`?1002h` /
+            // `?1006h`) is intentionally NOT enabled, so wheel ticks
+            // resolve at the terminal level (native scrollback) before
+            // reaching us. This arm survives only as a defensive
+            // catch-all for terminals that forward wheel events
+            // outside the SGR mouse protocol.
             renderer.scroll_body(delta);
-        }
-        InputEvent::MouseDown { col, row } => {
-            // Anchor a new selection. Only AltScreenRenderer responds
-            // (it owns mouse capture); other backends no-op since the
-            // host terminal still does native drag-to-select for them.
-            renderer.begin_selection(col, row);
-        }
-        InputEvent::MouseDrag { col, row } => {
-            renderer.update_selection(col, row);
-        }
-        InputEvent::MouseUp => {
-            renderer.end_selection();
         }
         InputEvent::Resize(mut cols, mut rows) => {
             // Coalesce burst-fired SIGWINCH events. gnome-terminal /
@@ -3920,7 +3868,7 @@ fn handle_input(
                     return Ok(());
                 }
                 app.buf.insert_paste(text);
-                if matches!(app.state.phase, UiPhase::Streaming) {
+                if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running {
                     draw_spinner_now(
                         &mut app.state,
                         &app.buf,
@@ -4034,8 +3982,8 @@ fn handle_input(
                         // Modal-to-Modal swap that needs mutable
                         // `active_modal` access the modals themselves
                         // don't have.
-                        if std::mem::take(&mut ctx.pending_run_codingplan) {
-                            crate::event_loop::commands::run_codingplan_flow(renderer, ctx)?;
+                        if std::mem::take(&mut ctx.pending_run_login_setup) {
+                            crate::event_loop::commands::run_login_flow(renderer, ctx)?;
                         }
                         if std::mem::take(&mut ctx.pending_open_provider_wizard) {
                             let pw = crate::modals::ProviderWizard::MainMenu { selected: 0 };
@@ -4054,52 +4002,11 @@ fn handle_input(
             }
             // PageUp / PageDown / Home / End: scroll the body
             // viewport. Universal across phases — same as a terminal's
-            // own scrollback navigation. Only AltScreenRenderer
-            // implements these (it owns the alt-screen buffer and
-            // host-terminal scrollback is unavailable while we're
-            // in alt-screen); other renderers default to no-op so
-            // these keys do nothing in retained / plain modes (as
-            // before — those rely on the host terminal's native
-            // scrollback). We intercept BEFORE phase dispatch so
-            // scrolling works in Idle / Streaming alike.
-
-            // ── Ctrl+C: copy selection ──────────────────────────────
-            // On Windows, OSC 52 is not supported by Windows Terminal /
-            // conhost, so the user cannot copy text by mouse-selecting
-            // alone (end_selection's OSC 52 write is silently ignored).
-            // Ctrl+C is the user's natural instinct to copy selected
-            // text. We intercept it here: if a selection exists in the
-            // alt-screen renderer, copy its text to the system clipboard
-            // via arboard and clear the selection. If no selection exists,
-            // fall through to the normal Cancel behaviour.
-            //
-            // This also helps on macOS / Linux when the user prefers
-            // Ctrl+C / Cmd+C over the mouse-release OSC 52 auto-copy,
-            // or when the terminal ignores OSC 52 (macOS Terminal.app
-            // without the opt-in setting).
-            if code == crossterm::event::KeyCode::Char('c')
-                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
-                && !modifiers.contains(crossterm::event::KeyModifiers::ALT)
-            {
-                // Windows: the OS Ctrl+C signal handler may have already
-                // consumed this Ctrl+C as a copy (see the `win_ctrl_c`
-                // select arm above). The keyboard event arrives shortly
-                // after via input_rx. If the signal handler stamped
-                // `last_ctrl_c_copy` within the last 500 ms, suppress
-                // the keyboard echo so it doesn't trigger Cancel/exit.
-                #[cfg(windows)]
-                if let Some(ts) = app.last_ctrl_c_copy.take() {
-                    if ts.elapsed() < Duration::from_millis(500) {
-                        crate::tuix_trace!("KEY", "ctrl+c keyboard echo suppressed (OS signal already handled copy)");
-                        return Ok(());
-                    }
-                }
-                if renderer.copy_selection() {
-                    return Ok(());
-                }
-                // No selection — fall through to Cancel below.
-            }
+            // own scrollback navigation. RetainedRenderer and
+            // PlainRenderer rely on the host terminal's native
+            // scrollback, so these keys default to a no-op there.
+            // We intercept BEFORE phase dispatch so scrolling works in
+            // Idle / Streaming alike.
 
             // Ctrl+V: pull the system clipboard image and attach as
             // `[Image #N]` — independent of whether the host terminal
@@ -4187,10 +4094,10 @@ fn handle_input(
 ///     cursor instead)
 ///   - `None`        → not a scroll key at all
 ///
-/// AltScreenRenderer is the only renderer that does anything with
-/// these calls; the trait defaults are no-op so retained / plain
-/// silently fall through and let the existing phase dispatch handle
-/// the key (e.g. End-of-line cursor movement during input).
+/// RetainedRenderer implements the scroll-related trait methods;
+/// PlainRenderer uses the trait no-op defaults and silently falls
+/// through to the existing phase dispatch (e.g. End-of-line cursor
+/// movement during input).
 fn handle_scroll_key(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -4213,6 +4120,24 @@ fn handle_scroll_key(
         }
         KeyCode::PageDown => {
             renderer.scroll_body(10);
+            Some(true)
+        }
+        // Message-jump scrolls. Alt+Up/Down jumps to prev/next message.
+        // Ctrl+Up/Down jumps to prev/next user message.
+        KeyCode::Up if modifiers.contains(KeyModifiers::ALT) && !has_shift => {
+            renderer.scroll_to_prev_message();
+            Some(true)
+        }
+        KeyCode::Down if modifiers.contains(KeyModifiers::ALT) && !has_shift => {
+            renderer.scroll_to_next_message();
+            Some(true)
+        }
+        KeyCode::Up if modifiers.contains(KeyModifiers::CONTROL) && !has_shift => {
+            renderer.scroll_to_prev_user_message();
+            Some(true)
+        }
+        KeyCode::Down if modifiers.contains(KeyModifiers::CONTROL) && !has_shift => {
+            renderer.scroll_to_next_user_message();
             Some(true)
         }
         // Line-step. Shift+Up / Shift+Down is the cross-keyboard
@@ -4597,6 +4522,15 @@ fn handle_idle_key(
                 renderer.render(UiLine::User(committed.clone()));
                 app.buf.text.clear();
                 app.buf.cursor = 0;
+                // Mirror the regular-message and queued-message paths
+                // below: pushing the just-submitted line into `ctx.history`
+                // is what Up-arrow recall reads from. Without this, a
+                // slash command executed from the menu vanishes from
+                // history the moment it runs.
+                ctx.history.push(crate::input::history::HistoryEntry {
+                    text: committed.clone(),
+                    images: Vec::new(),
+                });
                 if let Some((cmd, arg)) = parse_slash_line(&committed) {
                     if cmd.eq_ignore_ascii_case("paste") {
                         // `/paste` needs `&mut app.buf` to insert the
@@ -4721,6 +4655,17 @@ fn handle_idle_key(
     }
 
     let action = classify(code, modifiers);
+
+    // When a guide subagent is running, Ctrl+C should always cancel it
+    // regardless of whether the input buffer is empty or not.
+    if app.state.guide_running && matches!(action, Action::Cancel) {
+        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        app.buf.text.clear();
+        app.buf.cursor = 0;
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+        return Ok(());
+    }
+
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
@@ -4802,6 +4747,14 @@ fn handle_idle_key(
                 // Slash commands carry no image markers — echo the
                 // user line as-typed, before dispatch.
                 renderer.render(UiLine::User(line.clone()));
+                // Push into the Up-arrow recall buffer so the just-typed
+                // command isn't lost the moment it executes. Mirrors the
+                // regular-message branch below; History::push dedups
+                // against the previous entry and ignores empty text.
+                ctx.history.push(crate::input::history::HistoryEntry {
+                    text: line.clone(),
+                    images: Vec::new(),
+                });
                 if cmd.eq_ignore_ascii_case("paste") {
                     // See `handle_paste_command` — short-circuited
                     // here because the dispatcher signature can't
@@ -4901,6 +4854,10 @@ fn handle_idle_key(
                     text: line.clone(),
                     images: kept_refs,
                 });
+                // Clear stale hook warning at the start of each turn.
+                if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
+                    *slot = None;
+                }
                 ctx.agent
                     .cmd_tx
                     .send(AgentCommand::SendMessage {
@@ -4932,22 +4889,26 @@ fn handle_idle_key(
             }
         }
         BufferResult::Exit => {
-            // Two-press confirmation: first Ctrl+C on an empty buffer arms
-            // the exit; a second Ctrl+C within the window actually exits.
-            // Any other keystroke (handled above) resets the arming.
-            let now = std::time::Instant::now();
-            let armed = app
-                .exit_pending
-                .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
-            if armed {
-                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
-            } else {
-                app.exit_pending = Some(now);
-                renderer.render(UiLine::CommandOutput(
-                    crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
-                ));
-                renderer.flush();
+            // When a guide subagent is running, Ctrl+C on an empty
+            // buffer cancels the guide instead of triggering exit.
+            if app.state.guide_running {
+                ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            } else {
+                let now = std::time::Instant::now();
+                let armed = app
+                    .exit_pending
+                    .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
+                if armed {
+                    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
+                } else {
+                    app.exit_pending = Some(now);
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
+                    ));
+                    renderer.flush();
+                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+                }
             }
         }
     }
@@ -4980,7 +4941,16 @@ fn redraw_with_menu(
         status: build_status(state, ctx),
         attachments,
     });
-    renderer.flush();
+    // Footer-only UiLines (InputPrompt / StreamingBox) update widget
+    // state and set `dirty = true` but emit NO bytes — the real paint
+    // happens on the next `flush_deferred` tick (~5ms cadence,
+    // configured in event_loop's select loop). Calling `renderer.flush()`
+    // here would queue a `RenderCmd::Flush` that hits an empty BufWriter,
+    // which on Linux/macOS terminals is a sub-µs no-op but on Windows
+    // OpenConsole / xterm.js costs 1–3ms per arrow keypress (each Flush
+    // forces a WriteFile syscall + VT-parser cycle in the host). The
+    // 5ms paint tick is well below human perception, so dropping the
+    // explicit flush has zero UX cost and removes the per-key syscall.
 }
 
 /// Synchronize `state.pending_recalled_attachments` with whatever
@@ -5023,7 +4993,10 @@ fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mu
         status: build_status(state, ctx),
         attachments,
     });
-    renderer.flush();
+    // No explicit flush — see `redraw_with_menu` for the rationale
+    // (InputPrompt is footer-only, the 5ms `flush_deferred` tick owns
+    // the actual paint, and `out.flush()` on every keystroke is a
+    // measurable per-keypress syscall on Windows OpenConsole / xterm.js).
 }
 
 /// True iff startup should auto-open the OnboardingWizard:
@@ -5219,7 +5192,13 @@ fn handle_streaming_key(
     // the type-ahead queue: a user yanking the escape cord doesn't
     // want queued messages to auto-fire after the current one dies.
     if code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        crate::tuix_trace!(
+            "KEY",
+            "streaming Ctrl+C -> Cancel send_ok={} spinner={:?}",
+            send_res.is_ok(),
+            app.state.spinner_label
+        );
         restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }
@@ -5229,7 +5208,13 @@ fn handle_streaming_key(
     // stream — mid-stream the higher-value action is "stop the agent",
     // not "clear an unsubmitted slash token" (users can Ctrl+U for that).
     if code == KeyCode::Esc {
-        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
+        let send_res = ctx.agent.cmd_tx.send(AgentCommand::Cancel);
+        crate::tuix_trace!(
+            "KEY",
+            "streaming Esc -> Cancel send_ok={} spinner={:?}",
+            send_res.is_ok(),
+            app.state.spinner_label
+        );
         restore_cancelled_message_to_buf(app, renderer, ctx);
         return Ok(());
     }
@@ -5539,45 +5524,57 @@ pub(super) fn handle_plugin_job_event(
         PluginJobEvent::MarketplaceAdded(info) => {
             // Marketplace add by itself doesn't load any skills (those come
             // from installed plugins) — show only the marketplace summary.
+            // `✓` prefix + col-0 alignment mirrors the MCP-connect toast
+            // (`McpServerConnected`) emitted from the same body region, so
+            // every "background install completed" line lands at the same
+            // left edge regardless of which subsystem owns it.
             let _ = reload_plugins(ctx);
-            renderer.render(UiLine::CommandOutput(format!(
-                "  marketplace `{}` added at {} ({} plugins)\n",
-                info.name,
-                &info.git_commit[..7.min(info.git_commit.len())],
-                info.plugins.len()
-            )));
+            let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginMarketplaceAdded {
+                    name: &info.name,
+                    commit: short_commit,
+                    count: info.plugins.len(),
+                })
+                .into_owned(),
+            ));
         }
         PluginJobEvent::MarketplaceUpdated(info) => {
             let _ = reload_plugins(ctx);
-            renderer.render(UiLine::CommandOutput(format!(
-                "  marketplace `{}` updated to {}\n",
-                info.name,
-                &info.git_commit[..7.min(info.git_commit.len())]
-            )));
+            let short_commit = &info.git_commit[..7.min(info.git_commit.len())];
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginMarketplaceUpdated {
+                    name: &info.name,
+                    commit: short_commit,
+                })
+                .into_owned(),
+            ));
         }
         PluginJobEvent::PluginInstalled(info) => {
             let (loaded, warnings) = reload_plugins(ctx);
             // Verbose mode (Ctrl+O) dumps the per-skill rejection reasons,
             // so users can debug a misnamed SKILL.md without restarting.
             // Default mode prints only the count summary — no cursor races.
+            //
+            // Sub-detail warning rows keep a 2-col indent: they are
+            // children of the install summary line, indenting communicates
+            // that subordination.
             if state.show_tool_output {
                 for w in &warnings {
-                    renderer.render(UiLine::CommandOutput(format!("  {}\n", w)));
+                    renderer.render(UiLine::CommandOutput(format!("  {}", w)));
                 }
             }
-            let hint = if warnings.is_empty() || state.show_tool_output {
-                String::new()
-            } else {
-                "  (Ctrl+O for details)".to_string()
-            };
-            renderer.render(UiLine::CommandOutput(format!(
-                "  installed `{}@{}` — {} skills loaded, {} skipped{}\n",
-                info.plugin,
-                info.marketplace,
-                loaded,
-                warnings.len(),
-                hint,
-            )));
+            let show_details_hint = !warnings.is_empty() && !state.show_tool_output;
+            renderer.render(UiLine::CommandOutput(
+                crate::i18n::t(crate::i18n::Msg::PluginInstallDone {
+                    plugin: &info.plugin,
+                    marketplace: &info.marketplace,
+                    loaded,
+                    skipped: warnings.len(),
+                    show_details_hint,
+                })
+                .into_owned(),
+            ));
         }
         PluginJobEvent::Failed { op, msg } => {
             renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
@@ -5689,6 +5686,14 @@ pub(super) fn handle_upgrade_event(
         }
     }
     renderer.flush();
+}
+
+/// Map internal subagent names to user-facing display names.
+fn subagent_display_name(name: &str) -> std::borrow::Cow<'static, str> {
+    match name {
+        "atomcode-guide" => crate::i18n::t(crate::i18n::Msg::GuideDisplayName),
+        _ => std::borrow::Cow::Owned(name.to_string()),
+    }
 }
 
 fn handle_agent_event(
@@ -5811,9 +5816,9 @@ fn handle_agent_event(
                 // Dingbats), ● (U+25CF Geometric Shapes): all in WGL4 so
                 // every Windows monospace font (Consolas, NSimSun,
                 // Cascadia, Microsoft YaHei) ships them. Hardcoded —
-                // no `unicode_symbols` ASCII fallback — matching
-                // `alt_screen::push_tool_call`'s ● treatment for visual
-                // parity between batched and single tool-call paths.
+                // no `unicode_symbols` ASCII fallback — matching the
+                // single-tool-call ● treatment for visual parity
+                // between batched and single tool-call paths.
                 let child_glyph = "\u{2514}";
                 let arrow = "\u{2192}";
                 let suffix = if success {
@@ -6236,6 +6241,11 @@ fn handle_agent_event(
             renderer.render(UiLine::Warning(w));
             renderer.flush();
         }
+        AgentEvent::HookWarningHint(msg) => {
+            if let Ok(mut slot) = ctx.hook_warning_hint.lock() {
+                *slot = Some(msg);
+            }
+        }
         AgentEvent::VisionPreprocessSuccess { vl_key, char_count } => {
             // Format here (not in agent) so we can localize / restyle
             // without bumping the AgentEvent contract. Char count helps
@@ -6385,9 +6395,8 @@ fn handle_agent_event(
             // with `└` for tool-result rows below the call. Both
             // glyphs are in WGL4 (Consolas, NSimSun, Cascadia, Microsoft
             // YaHei all ship them), so no `unicode_symbols` ASCII
-            // fallback — matches `alt_screen::push_tool_call`'s
-            // hardcoded ● for visual parity between batched and single
-            // tool-call paths.
+            // fallback — matches the single-tool-call hardcoded ● for
+            // visual parity between batched and single tool-call paths.
             let head_glyph = "\u{25cf}";
             let child_glyph = "\u{2514}";
             // Build header + child rows; renderer keeps the group
@@ -6588,6 +6597,29 @@ fn handle_agent_event(
             }
             renderer.flush();
         }
+        AgentEvent::GuideTurnActivity { subagent, message } => {
+            state.guide_running = true;
+            let display = subagent_display_name(&subagent);
+            renderer.render(UiLine::GuideStatus(
+                format!("{} {}", display, message),
+            ));
+            renderer.flush();
+        }
+        AgentEvent::GuideComplete { text, truncated, cancelled, .. } => {
+            state.guide_running = false;
+            // Clear the spinner row before showing the answer.
+            renderer.render(UiLine::GuideStatus(String::new()));
+            renderer.flush();
+            let mut output = text.clone();
+            if truncated {
+                output.push_str(&crate::i18n::t(crate::i18n::Msg::GuideTruncatedIndicator));
+            }
+            renderer.render(UiLine::GuideResult(output));
+            renderer.flush();
+            if !cancelled && !text.is_empty() {
+                let _ = ctx.agent.cmd_tx.send(AgentCommand::InjectGuideResult { text });
+            }
+        }
         AgentEvent::MessagesSync { messages } => {
             // Response to AgentCommand::SyncMessages. Persist the
             // snapshot to the current session so /bg can recover
@@ -6653,10 +6685,14 @@ pub(crate) fn apply_session_messages(
         || session.name.trim_start().starts_with('[');
     if should_rename {
         use atomcode_core::conversation::message::Role;
+        // Primary signal: `Message.synthetic` field (accurate for sessions
+        // saved after the field landed). Secondary signal: bracket-prefix
+        // legacy heuristic for sessions saved before the field existed
+        // and so default-loaded as `synthetic = false`.
         let first_real_user = session
             .messages
             .iter()
-            .filter(|m| matches!(m.role, Role::User))
+            .filter(|m| matches!(m.role, Role::User) && !m.synthetic)
             .find_map(|m| m.text().filter(|t| !is_synthetic_user_text(t)));
         if let Some(text) = first_real_user {
             let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
@@ -6777,19 +6813,39 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     //   3. None.
     let no_provider =
         ctx.config.providers.is_empty() && atomcode_core::auth::get_stored_auth().is_none();
-    // Priority: no-provider (Warning red) > CodingPlan drift monitor
-    // (Warning red) > CodingPlan token-usage hint (Info ≥80%, Warning
-    // ≥95%) > upgrade banner (Info dim). Usage outranks upgrade because
-    // ">80% in this rolling window" is more actionable than "new
-    // version available". Only one hint renders at a time (right-aligned
-    // on the status row).
-    let hint: Option<(String, crate::render::HintSeverity)> = if no_provider {
+    // Open-source build pointed at an AtomGit gateway: any chat will
+    // fail-fast with `CpOfficialBuildRequired`. Surface that diagnosis
+    // up front (red, beats every other hint) so the user doesn't have
+    // to type a message to discover the dead-end — `/login` won't help,
+    // only switching to the official build will.
+    let active_base_url = ctx
+        .config
+        .active_provider(None)
+        .ok()
+        .and_then(|p| p.base_url.clone())
+        .unwrap_or_default();
+    let needs_official_build = !atomcode_core::coding_plan::signer_available()
+        && atomcode_core::coding_plan::is_atomgit_gateway(&active_base_url);
+    // Priority: needs-official-build (Warning red) > no-provider (Warning
+    // red) > CodingPlan drift monitor (Warning red) > CodingPlan
+    // token-usage hint (Info ≥80%, Warning ≥95%) > upgrade banner
+    // (Info dim). Usage outranks upgrade because ">80% in this rolling
+    // window" is more actionable than "new version available". Only one
+    // hint renders at a time (right-aligned on the status row).
+    let hint: Option<(String, crate::render::HintSeverity)> = if needs_official_build {
+        Some((
+            crate::i18n::t(crate::i18n::Msg::StatusOfficialBuildRequired).into_owned(),
+            crate::render::HintSeverity::Warning,
+        ))
+    } else if no_provider {
         Some((
             crate::i18n::t(crate::i18n::Msg::StatusNoProvider).into_owned(),
             crate::render::HintSeverity::Warning,
         ))
     } else if let Some(warning) = ctx.monitor_warning.lock().ok().and_then(|g| g.clone()) {
         Some((warning.display_text(), crate::render::HintSeverity::Warning))
+    } else if let Some(hook_msg) = ctx.hook_warning_hint.lock().ok().and_then(|g| g.clone()) {
+        Some((hook_msg, crate::render::HintSeverity::Warning))
     } else if let Some(usage) =
         usage_monitor::build_usage_hint(&ctx.usage_slot, &ctx.config.default_provider)
     {

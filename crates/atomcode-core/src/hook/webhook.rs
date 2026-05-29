@@ -23,7 +23,7 @@ use crate::hook::{
     ToolCallStartContext, ToolResultContext, HookCtx,
     ErrorContext, SessionContext,
 };
-use super::async_batcher::{AsyncWebhookBatcher, AsyncWebhookConfig, WebhookEvent};
+use super::async_batcher::{AsyncWebhookBatcher, WebhookEvent};
 
 /// Webhook 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,7 +484,7 @@ impl SystemPromptHook for WebhookHook {
                 }
             }
             Err(e) => {
-                eprintln!("[Webhook] {} error: {}", self.config.name, e);
+                tracing::warn!("[Webhook] {} error: {}", self.config.name, e);
                 None
             }
         }

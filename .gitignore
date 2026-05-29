@@ -2,6 +2,9 @@
 /target
 /runs
 
+# npm package: build artifacts
+packages/npm/*.tgz
+
 .env/
 
 # Git worktrees (used by superpowers:using-git-worktrees)
@@ -62,6 +65,7 @@ backend.log
 # diverge between contributors, and shouldn't imply official project rules).
 /CLAUDE.md
 .claude/settings.local.json
+.claude/worktrees/
 
 # Local eval harness — kept off version control. Includes scripts,
 # baseline/config TOML (may hold API keys), case inputs, run outputs,
