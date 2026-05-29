@@ -112,12 +112,142 @@ export async function respondPermission(
   return resp.json();
 }
 
-export async function listSessions(): Promise<unknown> {
+// --- Session types ---
+
+export interface SessionMeta {
+  id: string;
+  name: string;
+  working_dir: string;
+  created_at: number;
+  updated_at: number;
+  message_count: number;
+  file_size?: number;
+}
+
+export interface SessionMetaWithProject extends SessionMeta {
+  project_hash: string;
+}
+
+export interface SessionMessage {
+  role: string;
+  content: string;
+  tool_calls?: unknown;
+  tool_result?: unknown;
+}
+
+export interface SessionDetail {
+  id: string;
+  name: string;
+  working_dir: string;
+  created_at: number;
+  updated_at: number;
+  message_count: number;
+  messages: SessionMessage[];
+}
+
+export async function listSessions(): Promise<SessionMetaWithProject[]> {
   const resp = await fetch('/sessions', { headers: authHeaders() });
   return resp.json();
 }
 
-export async function getConfig(): Promise<unknown> {
+// --- Config types ---
+
+export interface ProviderInfo {
+  name: string;
+  type: string;
+  model: string;
+  base_url?: string;
+  has_api_key: boolean;
+  is_default: boolean;
+  context_window?: number;
+}
+
+export interface ConfigInfo {
+  path: string;
+  default_provider: string;
+  default_workdir?: string;
+  providers: ProviderInfo[];
+}
+
+export async function getConfig(): Promise<ConfigInfo> {
   const resp = await fetch('/config', { headers: authHeaders() });
+  return resp.json();
+}
+
+// --- Projects types ---
+
+export interface ProjectInfo {
+  hash: string;
+  name: string;
+  working_dir: string;
+  description?: string;
+  session_count: number;
+  created_at: number;
+  last_updated: number;
+}
+
+export async function getProjects(): Promise<ProjectInfo[]> {
+  const resp = await fetch('/projects', { headers: authHeaders() });
+  return resp.json();
+}
+
+// --- Current project state ---
+
+export interface ProjectState {
+  working_dir: string;
+  previous_dir?: string;
+  recent_dirs?: string[];
+  name?: string;
+}
+
+export async function getProject(): Promise<ProjectState> {
+  const resp = await fetch('/project', { headers: authHeaders() });
+  return resp.json();
+}
+
+// --- Filesystem browsing ---
+
+export interface FsListResult {
+  path: string;
+  dirs: string[];
+}
+
+export async function listDir(path: string): Promise<FsListResult> {
+  const resp = await fetch('/fs/list?path=' + encodeURIComponent(path), {
+    headers: authHeaders(),
+  });
+  return resp.json();
+}
+
+// --- Change default directory ---
+
+export interface CdResponse {
+  success: boolean;
+  message: string;
+  current_dir: string;
+  project_hash: string;
+}
+
+export async function setDefaultDir(path: string): Promise<CdResponse> {
+  const resp = await fetch('/cd', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders(),
+    },
+    body: JSON.stringify({ path }),
+  });
+  return resp.json();
+}
+
+// --- Session detail (messages endpoint exists) ---
+
+export async function getSession(
+  projectHash: string,
+  sessionId: string,
+): Promise<SessionDetail> {
+  const resp = await fetch(`/projects/${projectHash}/sessions/${sessionId}`, {
+    headers: authHeaders(),
+  });
   return resp.json();
 }

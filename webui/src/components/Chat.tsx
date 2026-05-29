@@ -1,7 +1,8 @@
 // Task 13 — Chat view with streaming rendering
+// Task 15 — sessionId + cwd lifted to App
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent } from '../api';
+import { streamChat, SSEEvent, getSession, SessionMetaWithProject } from '../api';
 
 interface ToolRow {
   id: string;
@@ -33,8 +34,12 @@ interface PermissionRequestEvent {
 }
 
 interface ChatProps {
+  sessionId: string | null;
+  onSessionId: (id: string) => void;
+  cwd: string;
   onPermission: (req: PermissionRequestEvent) => void;
-  cwd?: string;
+  /** Metadata of the currently-active session (for loading history) */
+  activeSession?: SessionMetaWithProject | null;
 }
 
 function formatArgs(args: unknown): string {
@@ -51,15 +56,57 @@ function abbreviateArgs(args: string, maxLen = 60): string {
   return args.slice(0, maxLen) + '…';
 }
 
-export function Chat({ onPermission, cwd }: ChatProps) {
+export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession }: ChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
-  const [sessionId, setSessionId] = useState<string | null>(null);
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
+  const [historyHint, setHistoryHint] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // When sessionId changes from outside (sidebar switch or new session), reset transcript
+  // and try to load session history
+  useEffect(() => {
+    // Abort any in-flight chat
+    abortRef.current?.abort();
+    setBusy(false);
+    setMessages([]);
+    setTokens(null);
+    setHistoryHint(null);
+
+    if (!sessionId) {
+      // New session — blank slate
+      return;
+    }
+
+    // Try to load history via session-detail endpoint
+    if (activeSession?.project_hash) {
+      getSession(activeSession.project_hash, sessionId)
+        .then((detail) => {
+          // Convert loaded messages to display format (user/assistant only; skip system/tool)
+          const loaded: Message[] = [];
+          for (const msg of detail.messages) {
+            if (msg.role === 'user' || msg.role === 'assistant') {
+              loaded.push({ role: msg.role, text: msg.content, tools: [] });
+            }
+          }
+          if (loaded.length > 0) {
+            setMessages(loaded);
+          } else {
+            setHistoryHint(`继续会话 ${sessionId.slice(0, 8)}（历史在 TUI/磁盘中）`);
+          }
+        })
+        .catch(() => {
+          // Endpoint exists but failed — show hint
+          setHistoryHint(`继续会话 ${sessionId.slice(0, 8)}（历史在 TUI/磁盘中）`);
+        });
+    } else {
+      setHistoryHint(`继续会话 ${sessionId.slice(0, 8)}（历史在 TUI/磁盘中）`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -146,7 +193,7 @@ export function Chat({ onPermission, cwd }: ChatProps) {
         break;
 
       case 'done':
-        setSessionId(event.session_id);
+        onSessionId(event.session_id);
         setBusy(false);
         break;
 
@@ -170,6 +217,7 @@ export function Chat({ onPermission, cwd }: ChatProps) {
     if (!text || busy) return;
 
     setInput('');
+    setHistoryHint(null);
     setBusy(true);
 
     // Push user message + empty assistant placeholder
@@ -226,9 +274,18 @@ export function Chat({ onPermission, cwd }: ChatProps) {
     <div class="flex flex-col h-full">
       {/* Message area */}
       <div class="flex-1 overflow-y-auto p-6 space-y-5 min-h-0">
-        {messages.length === 0 && (
+        {messages.length === 0 && !historyHint && (
           <div class="flex items-center justify-center h-full text-slate-400 text-sm">
             发送消息开始对话…
+          </div>
+        )}
+
+        {messages.length === 0 && historyHint && (
+          <div class="flex items-center justify-center h-full">
+            <div class="text-center">
+              <div class="text-slate-400 text-sm">{historyHint}</div>
+              <div class="text-slate-300 text-xs mt-1">发送消息继续此会话</div>
+            </div>
           </div>
         )}
 
