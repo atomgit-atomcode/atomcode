@@ -2837,6 +2837,74 @@ fn spawn_idle_timeout_task(
     });
 }
 
+// ============================================================================
+// 进程内 webui 启动器（Task 9）
+// ============================================================================
+
+/// 进程内 webui server 的全局句柄。只在主进程第一次调用
+/// [`ensure_server_and_open`] 时被初始化一次。
+struct WebuiHandle {
+    /// 与 server 共享的同一 token store；用于 mint 一次性 token。
+    tokens: auth_token::WebuiTokenStore,
+    /// server 绑定的端口。
+    port: u16,
+}
+
+static WEBUI: std::sync::OnceLock<WebuiHandle> = std::sync::OnceLock::new();
+
+/// 确保进程内 webui server 已起（只起一次），mint 一次性 token，开浏览器。
+///
+/// 返回给用户展示的状态串。在 `atomcode` 主程序（已有 tokio runtime）内调用。
+/// `port` 由调用方决定（CLI 子命令可自定义；TUI 传 13456）。
+pub async fn ensure_server_and_open(port: u16) -> String {
+    // 在 get_or_init 之前判定是否首次启动：若闭包内修改外层变量会触发借用问题，
+    // 这里改为先检查 WEBUI 是否已初始化。竞态可忽略——单进程内本函数串行调用。
+    let just_started = WEBUI.get().is_none();
+
+    let handle = WEBUI.get_or_init(|| {
+        let tokens = auth_token::WebuiTokenStore::new();
+        let opts = ServerOpts {
+            host: "127.0.0.1".to_string(),
+            port,
+            // 与 parse_daemon_args 的“无 --no-telemetry”默认一致。
+            cli_override: CliOverride::default(),
+            // 0 = 关闭 idle 看门狗（见 spawn_idle_timeout_task：idle_timeout_secs==0 直接 return）。
+            // 进程内 webui 应随主程序常驻，不能自行 idle 关停。
+            idle_timeout_secs: 0,
+            // 与 parse_daemon_args 的默认 client mode 一致（无 --client 标志时为 Ide）。
+            startup_mode: SessionMode::Ide,
+            // 传入同一 store：server 进入 webui 模式（enforce_token=true）并用它校验 token。
+            webui_tokens: Some(tokens.clone()),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = run_server(opts).await {
+                eprintln!("webui server error: {e}");
+            }
+        });
+        WebuiHandle { tokens, port }
+    });
+
+    // 仅首次启动时等待 bind 就绪，避免浏览器先于 server 打开。
+    if just_started {
+        for _ in 0..40 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    let token = handle.tokens.mint();
+    let url = format!("http://127.0.0.1:{}/?token={}", handle.port, token);
+    match atomcode_core::auth::oauth::open_browser(&url) {
+        Ok(()) => format!("已在浏览器打开 webui：{url}"),
+        Err(_) => format!("请手动在浏览器打开：{url}"),
+    }
+}
+
 /// Options controlling how [`run_server`] builds and runs the API server.
 ///
 /// Field types intentionally mirror the tuple returned by the binary's
