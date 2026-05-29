@@ -481,7 +481,7 @@ pub async fn run(
     // resulting `PluginJobEvent` through `plugin_job_tx` so the event
     // loop's existing `handle_plugin_job_event` renders the same toast
     // the synchronous `/plugin install` path would emit (e.g.
-    // "marketplace `atomcode-skills` added at abc1234 (12 plugins)").
+    // "marketplace `atomcode` added at abc1234 (3 plugins)" ).
     // The user sees the install land as a regular body row instead of
     // a silent file-system mutation. Worst case the user types `/`
     // before the install settles — they see an empty / partial menu
