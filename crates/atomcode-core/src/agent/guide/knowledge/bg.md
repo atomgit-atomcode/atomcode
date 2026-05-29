@@ -27,6 +27,6 @@ keywords: [后台, 并行, 任务, slot, 槽位, 同时, bg]
 
 ## 限制
 
-- 最多同时运行 4 个后台任务（`MAX_BACKGROUND_SLOTS`）
+- 最多同时运行 16 个后台任务（`MAX_BACKGROUND_SLOTS`）
 - 后台任务共享同一个 Provider 配额
 - `/background <任务>` 是兼容别名，效果等同于 `/bg <任务>`

@@ -19,7 +19,7 @@ AtomCode 提供终端 (CLI) 和 VS Code 插件两种使用方式，共享相同�
 在 VS Code 扩展市场搜索 "AtomCode" 安装。安装后在侧边栏打开 AtomCode 面板即可使用。
 - 下载地址: https://atomcode.atomgit.com/index.html#editor-plugins
 - 插件与终端共享 Provider 配置、会话数据和记忆
-- 大部分斜杠命令在插件中同样可用（如 `/model`、`/guide`、`/clear`）
+- 插件支持代码编辑快捷命令（如 `/explain`、`/fix`、`/test`、`/refactor`）以及 `/login`、`/codingplan`，终端专属命令（如 `/model`、`/guide`、`/bg`）需在终端中执行
 - 插件中的快捷键与 VS Code 原生快捷键融合（如 `Cmd+Shift+P` 打开命令面板）
 
 ## 快速开始

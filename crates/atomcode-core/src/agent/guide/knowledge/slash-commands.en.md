@@ -41,7 +41,7 @@ keywords: [slash, command, commands, list, all, available, /bg, /help, /model, /
 - `/plan` — Planning mode (read-only exploration)
 - `/build` — Build mode (full execution)
 - `/think [on/off/N]` — Extended thinking control
-- `/codingplan` — Coding plan
+- `/codingplan` — Coding plan (merged into `/login` flow)
 
 ## Memory
 - `/remember <content>` — Save fact to memory (--global for global)
@@ -61,4 +61,4 @@ keywords: [slash, command, commands, list, all, available, /bg, /help, /model, /
 - `/issue` — Report bug / request feature
 - `/welcome` — First-time onboarding
 - `/status` — Session status
-- `/quit` — Exit
+- `/quit` (or `/exit`) — Exit

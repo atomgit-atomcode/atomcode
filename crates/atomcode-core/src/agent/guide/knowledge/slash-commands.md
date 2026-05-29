@@ -41,7 +41,7 @@ keywords: [命令, /bg, /help, /model, /config, /mcp, /skills, /guide, 快捷键
 - `/plan` — 计划模式 (只读探索)
 - `/build` — 构建模式 (完整执行)
 - `/think [on/off/N]` — 扩展思考控制
-- `/codingplan` — 编码计划
+- `/codingplan` — 编码计划 (已合并入 `/login` 流程)
 
 ## 记忆
 - `/remember <内容>` — 保存事实到记忆 (--global 全局)
@@ -61,4 +61,4 @@ keywords: [命令, /bg, /help, /model, /config, /mcp, /skills, /guide, 快捷键
 - `/issue` — 报告 bug / 请求功能
 - `/welcome` — 首次引导
 - `/status` — 会话状态
-- `/quit` — 退出
+- `/quit` (或 `/exit`) — 退出

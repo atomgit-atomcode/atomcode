@@ -31,18 +31,22 @@ description: My custom skill
 ```
 
 ### Usage
-- In conversation: `use_skill my-skill` or `/my-skill`
-- `/skills` — Browse installed skills
+- Use `/skills` to browse installed skills, select one to expand its template
+- `/skills <name>` to directly expand a specific skill, e.g., `/skills brainstorm`
+- In conversation, ask the AI to use a skill (AI invokes it via the `use_skill` tool), e.g., "review my code with code-reviewer"
+- Note: Direct `/my-skill` invocation only works if the skill is loaded and user-invocable; it won't appear in the top-level `/` command menu
 
 ## Plugins
 
 Plugin marketplace system for installing community skill packages.
 
 ### Commands
-- `/plugin marketplace` — Browse marketplace
-- `/plugin install <name>` — Install plugin
-- `/plugin uninstall <name>` — Uninstall
-- `/plugin list` — List installed
+- `/plugin marketplace list` — List registered marketplaces
+- `/plugin marketplace add <url>` — Add a marketplace
+- `/plugin marketplace remove <name>` — Remove a marketplace
+- `/plugin install <name>@<marketplace>` — Install plugin from a marketplace
+- `/plugin uninstall <name>@<marketplace>` — Uninstall plugin
+- `/plugin list` — List installed plugins
 
 ### Configuration
 - `auto_install_default_skills` — Auto-install default skill package on first launch

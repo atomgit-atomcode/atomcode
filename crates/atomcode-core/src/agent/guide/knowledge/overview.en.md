@@ -19,7 +19,7 @@ Launch by typing `atomcode` in your terminal. All features are accessible via sl
 Search "AtomCode" in the VS Code extension marketplace to install. Open the AtomCode panel in the sidebar after installation.
 - Download: https://atomcode.atomgit.com/index.html#editor-plugins
 - Shares Provider config, session data, and memories with the terminal
-- Most slash commands work in the plugin (e.g., `/model`, `/guide`, `/clear`)
+- Plugin supports code-editing shortcuts (e.g., `/explain`, `/fix`, `/test`, `/refactor`) and `/login`, `/codingplan`. Terminal-specific commands (e.g., `/model`, `/guide`, `/bg`) require the terminal
 - Shortcuts integrate with VS Code native keybindings (e.g., `Cmd+Shift+P` for command palette)
 
 ## Getting Started

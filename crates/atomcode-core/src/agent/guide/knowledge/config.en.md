@@ -47,8 +47,9 @@ timeout_secs = 300        # Per-task timeout (seconds)
 enabled = true
 auto_detect = false       # Auto-detect and start language servers
 
-[plugin]                  # Plugin auto-update
-auto_update_marketplaces = true
+[plugin]                  # Plugin
+auto_install_default_skills = true   # Auto-install default skills on first launch
+auto_update_marketplaces = true      # Auto-update marketplaces after upgrade
 ```
 
 ## Project Instruction Files
@@ -60,7 +61,7 @@ auto_update_marketplaces = true
 
 - **API Key Protection**: `api_key` is stored in plain text. Set file permissions to `600` (`chmod 600 ~/.atomcode/config.toml`) to prevent other users from reading it
 - **Don't commit to version control**: Ensure `config.toml` is in `.gitignore` to avoid committing API keys to git history
-- **Environment variable alternative**: You can use `ATOMCODE_API_KEY` environment variable instead of writing it in the config file. Recommended for CI environments
+- **Environment variable alternative**: In CI environments, use shell scripts or CI secrets to dynamically write the config file instead of hardcoding API keys
 - **Provider type**: The `type` field specifies the API protocol format (`openai` = OpenAI-compatible API), not the model vendor name. For example, DeepSeek uses an OpenAI-compatible interface, so `type = "openai"`
 
 ## Local Model Configuration (Ollama)
@@ -82,10 +83,10 @@ Prerequisites: Install [Ollama](https://ollama.com) and pull a model (`ollama pu
 
 When using AtomCode in CI/CD pipelines or Docker containers:
 
-- **Environment variables**: Use `ATOMCODE_API_KEY` env var instead of writing API keys in config files
+- **Environment variables**: Use CI secrets or env vars to dynamically generate config files without hardcoding
 - **Non-interactive mode**: Disable interactive features in CI (e.g., `auto_commit = false`, disable auto-update)
 - **Proxy**: Set `http_proxy` / `https_proxy` env vars for corporate network environments
-- **Exit codes**: In non-interactive mode, AtomCode returns standard exit codes (0 = success, non-zero = failure)
+- **Exit codes**: In non-interactive mode, exit codes are 0=success, 1=error, 2=user denied, 130=user cancelled
 - **Logging**: Set `RUST_LOG=info` to view runtime logs
 
 ## Low-Resource Device Tuning

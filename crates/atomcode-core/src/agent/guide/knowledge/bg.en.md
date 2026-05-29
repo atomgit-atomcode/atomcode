@@ -27,6 +27,6 @@ keywords: [bg, background, task, parallel, run, execute, jobs, queue, how, slot]
 
 ## Limitations
 
-- Maximum 4 concurrent background tasks (`MAX_BACKGROUND_SLOTS`)
+- Maximum 16 concurrent background tasks (`MAX_BACKGROUND_SLOTS`)
 - Background tasks share the same Provider quota
 - `/background <task>` is an alias, same effect as `/bg <task>`
