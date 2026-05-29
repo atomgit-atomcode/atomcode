@@ -20,11 +20,13 @@ webui **不取代 TUI**，二者并存，webui 需功能基本完整（聊天、
 | 决策点 | 结论 |
 |--------|------|
 | 定位 | TUI 之外的并行入口，功能基本完整，不取代 TUI |
-| 打包 | 前端构建产物用 `rust-embed` 嵌入 `atomcode-daemon` 二进制 |
-| 后端 | 复用现有 `atomcode-daemon`（方案 A），webui 是它的第二个前端 |
+| 打包 | 前端构建产物用 `rust-embed` 嵌入二进制 |
+| 后端 | 复用现有 daemon 服务逻辑（方案 A），webui 是它的第二个前端 |
+| **服务形态** | **合进主程序进程内启动**：daemon crate 抽成库暴露 `run_server(...)`，`atomcode` 进程内 `tokio::spawn` 直接跑 server，**不依赖独立 `atomcode-daemon` 二进制**（普通用户 `curl \| sh` 只装主程序，没有 daemon） |
 | 权限 UX | 交互式审批（浏览器逐次批准/拒绝工具调用） |
 | 会话模型 | webui 会话与 TUI 会话各自独立运行，共享磁盘 session 历史，可互相 resume |
-| 远期远程 | 官方中转隧道（daemon 出站连官方中转，子域名反代） |
+| 工作目录 | 每会话独立 cwd，随 `/chat` 请求带 `working_dir`；切换不影响其它客户端。全局 `/cd` 仅作可选「设默认目录」 |
+| 远期远程 | 官方中转隧道（出站连官方中转，子域名反代） |
 
 ## 现状事实（实现时依赖）
 
@@ -33,9 +35,15 @@ webui **不取代 TUI**，二者并存，webui 需功能基本完整（聊天、
 - daemon 当前用 `AutoPermissionMode::BypassAll`（`main.rs:2051`）——会自动批准所有工具调用，
   必须替换为交互式 decider。
 - TUI（tuix）进程内跑 agent（`TurnRunner`），与 daemon 是独立进程。
-- CLI 已有 `atomcode daemon` 子命令，re-exec 进 `atomcode-daemon` 二进制
-  （`atomcode-cli/src/main.rs:933+`）。
-- 已有 `session.open_browser_best_effort()`（`event_loop/commands.rs:2710`）。
+- **`atomcode` 主程序已是 `#[tokio::main]`（CLI `main.rs:698`），依赖含 `tokio (full)` + `reqwest`**——
+  进程内起 axum server 零额外成本，直接 `tokio::spawn`。
+- **`atomcode-daemon` 是完全独立的二进制，单独发布；`install.sh` 每平台只下载 `atomcode` 主程序，
+  不含 daemon；`atomcode-cli` 不依赖 daemon crate**——故必须把 server 逻辑下沉为库供主程序调用。
+- `atomcode daemon` 子命令（CLI `main.rs:933+`）目前 re-exec 独立二进制；改造后它与 webui、VSCode
+  都调同一个 `run_server`。
+- daemon 已有 `/cd`(POST)、`/project`(GET)、`/projects`(GET)；`ChatRequest` 已支持可选
+  `working_dir`（`main.rs:1782` 不带才回退全局）。**无文件系统目录列举端点**（需新增 `/fs/list`）。
+- 已有 `atomcode_core::auth::oauth::open_browser(url)`（按平台 cfg）。
 - 内置斜杠命令在 `event_loop/commands.rs` 的 `match cmd` 分发。
 - 现有 `site/` 前端栈为原生 HTML + Tailwind。
 
@@ -51,16 +59,19 @@ webui **不取代 TUI**，二者并存，webui 需功能基本完整（聊天、
                          └──────────────┬────────────────┘
                                         │
 ┌───────────────────────┐   HTTP/SSE   ▼
-│ 浏览器 (embedded SPA)  │ ◀──────▶ ┌────────────────────┐
-│  - 聊天/流式            │          │ atomcode-daemon     │
-│  - 工具批准卡片         │          │  - 复用 /chat /sessions│
-│  - 会话侧栏/配置        │          │  - 新增静态资源 + 权限流│
-└───────────────────────┘          │  - 进程内 TurnRunner  │
-                                    └────────────────────┘
+│ 浏览器 (embedded SPA)  │ ◀──────▶ ┌──────────────────────┐
+│  - 聊天/流式            │          │ run_server()（daemon 库）│
+│  - 工具批准卡片         │          │  - 复用 /chat /sessions  │
+│  - 会话侧栏/目录切换/配置 │          │  - 静态资源+权限流+/fs/list│
+└───────────────────────┘          │  - 进程内 TurnRunner     │
+                                    └──────────────────────┘
+       （以上整体在同一个 atomcode 进程内 · tokio::spawn）
 ```
 
-daemon 是 webui 的后端，独立于 TUI 进程。`/webui` 只是 daemon 的"自动启动 + 开浏览器"包装，
-复用 `atomcode daemon` 子命令已有的 re-exec spawn 逻辑。
+webui server 与 TUI 跑在**同一个进程**：daemon 服务逻辑下沉为库函数 `run_server(...)`，
+`/webui` 在已有 tokio runtime 上 `tokio::spawn` 起它——不 spawn 子进程、不依赖独立二进制
+（普通用户只装了 `atomcode` 主程序）。独立 `atomcode-daemon` 二进制与 VSCode 扩展仍在，
+改为同样调用 `run_server`。`/webui` 包装的三步：起 server（若未起）→ 生成 token → 开浏览器。
 
 ## 组件划分
 
@@ -71,58 +82,83 @@ daemon 是 webui 的后端，独立于 TUI 进程。`/webui` 只是 daemon 的"�
 - 模块：聊天流式视图、工具批准卡片、会话侧栏/切换、配置表单、登录入口。
 - 构建产物用 `rust-embed` 打进 daemon。
 
-### daemon 新增
+### daemon crate 改造（库化）
 
-- `mod webui`：`rust-embed` 静态资源 handler。`GET /` 与 `/assets/*` 命中嵌入资源，未命中路由
-  fallback 到 `index.html`（SPA 路由）。
-- dev 模式：环境变量（如 `ATOMCODE_WEBUI_DEV=http://localhost:5173`）时反代/重定向到本地
-  vite dev server，便于前端热更新。
-- `WebPermissionDecider`：实现现有 permission trait，替换 `BypassAll`。
+- 抽 `lib.rs` 暴露 `pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()>`（含 Router +
+  AppState 构建 + bind + serve）；原 `main.rs` 变薄壳调它。VSCode/独立二进制路径不变。
+- `mod webui`：`rust-embed` 静态资源 handler。`GET /` 命中嵌入资源，未命中路由 fallback 到
+  `index.html`（SPA 路由）。
+- dev 模式：环境变量 `ATOMCODE_WEBUI_DEV=http://localhost:5173` 时重定向到 vite dev server。
+- `/chat` 把 `BypassAll` 换成已有的 `InteractivePermissionDecider`，新增 `/chat/permission` 回送决定。
 - token 鉴权中间件：**可插拔**，本地 token 与远期账号 token 共用一条校验链（为 Phase 2 预留）。
+- 新增 `GET /fs/list?path=`：列子目录（`~` 展开 + loopback + 越权防护），供前端目录浏览器。
 
-### TUI 新增
+### 主程序（atomcode-cli）改造
 
-- `event_loop/commands.rs` 加 `"webui"` 分支 → 调用新 helper `ensure_daemon_and_open(token)`。
-- `/webui stop`：关掉由 `/webui` 启动的 daemon（若确为它启动）。
+- 依赖 daemon crate（lib）。`/webui` 与 `atomcode webui` 都在进程内 `tokio::spawn(run_server(...))`，
+  用进程内单例（`OnceLock`）保证只起一次。
+- 前端 `rust-embed` 嵌入在 **daemon crate**（`webui.rs` 内随 `run_server` 服务）；主程序依赖 daemon
+  库即自动包含，无需在 cli 重复嵌入。
+- `event_loop/commands.rs` 加 `"webui"` 分支 → `ensure_server_and_open()`：起 server（若未起）→
+  mint token → 开浏览器。
+- `atomcode webui` 子命令：命令行直接启动 + 开浏览器（headless，不进 TUI）。
+- `/webui stop`：停掉进程内 server 任务（abort spawn 的 handle / 触发 shutdown watch）。
 
-### CLI 新增
+### 体积控制
 
-- `atomcode webui` 子命令：等价于命令行直接启动 + 开浏览器，不进 TUI。
+- webui server + axum + 嵌入前端约 +1~3MB。用 cargo feature `webui`（默认开）门控，瘦身构建可关。
 
 ## 数据流：聊天 + 交互式权限
 
 聊天复用现有 `POST /chat` 的 SSE 流。交互式工具批准新增双向流：
 
-1. agent 要调危险工具 → `WebPermissionDecider` 在 SSE 里推一条 `permission_request`
-   （含 tool、参数、call_id）并**阻塞等待**。
+1. agent 要调危险工具 → 复用 core 的 `InteractivePermissionDecider` 发 `ApprovalRequest`，
+   server 的 SSE 循环把它转成 `permission_request` 事件（含 tool_name、reason、call_id、参数）
+   下发，decider **阻塞等待**其 `response_rx`。
 2. 前端弹审批卡片，用户点批准/拒绝/总是允许。
-3. 前端 `POST /chat/permission { call_id, decision }`。
-4. daemon 用 `tokio::sync::oneshot`（按 call_id 索引的 map）唤醒被阻塞的 decider，返回决定，
-   agent 继续。
+3. 前端 `POST /chat/permission { session_id, decision }`。
+4. server 经 `PermissionResponders`（`session_id -> mpsc::Sender<PermissionDecision>`）把决定
+   送回该 session 的 decider，唤醒它，agent 继续。
 5. 超时（如 5 分钟无响应）默认拒绝。
 
-决定粒度对齐 TUI：`Approve` / `Deny` / `AlwaysAllow`（本会话该工具）。
+决定粒度对齐 TUI：`Approve` / `Deny` / `AlwaysAllow`（本会话该工具，由 `PermissionStore` 承载）。
+
+## 工作目录切换
+
+- **语义：每会话独立 cwd**。前端为当前会话保存 `working_dir`，每次 `POST /chat` 带上它
+  （DTO 已支持）；切目录只改前端状态，**不影响同时连着的 VSCode 或另一个 webui 标签页**。
+  resume 历史会话时用该 session 存档里的 `working_dir`。
+- **选择方式**（三层，叠加）：
+  1. 最近项目下拉——复用现有 `GET /projects`（从 session 历史聚合的目录）。
+  2. 手动路径输入——支持 `~` 展开（复用 `/cd` 的展开逻辑）。
+  3. 目录浏览器——新增 `GET /fs/list?path=` 列子目录，前端做面包屑 + 文件夹点选。
+- **入口**：顶栏 cwd 面包屑（可点）+ 新建会话时的目录选择器。
+- **可选全局**：切换器底部 checkbox「同时设为 daemon 默认目录」勾选时才调 `POST /cd`（影响所有客户端），默认不勾。
+- **安全**：`/fs/list` 仅 loopback + token 鉴权；只返回目录名、不返回文件内容；对 `..` 与符号链接做规范化，避免越权探测。
 
 ## 安全模型（本地）
 
-- daemon 默认只绑 `127.0.0.1`（现状已是）。
-- **一次性 session token**：`/webui` 启动时生成随机 token 写入 daemon，浏览器 URL 带
-  `?token=`，前端存内存并在后续请求头 `Authorization: Bearer` 带上，daemon 校验。
-  防止本机其它用户/恶意网页 CSRF 到 daemon。
-- 加 `Origin` 校验，仅接受 loopback origin。
-- token 不落盘，随 daemon 退出失效。
+- server 默认只绑 `127.0.0.1`（现状已是）。
+- **一次性 session token**：`/webui` 起 server 时 mint 随机 token，浏览器 URL 带 `?token=`，
+  前端存内存并在后续请求头 `Authorization: Bearer` 带上，server 校验。
+  防止本机其它用户/恶意网页 CSRF 到 server。
+- 复用现有 `origin_is_allowed`，仅接受 loopback origin。
+- token 不落盘，随进程退出失效。
+- **兼容既有客户端**：VSCode 扩展当前无 token；token 中间件仅对 webui 敏感写路由强制，或采用
+  「有有效 token **或** 旧客户端标识」放行，避免 break VSCode。
 
 ## `/webui` 命令生命周期
 
-- `/webui`：健康检查 → 必要时 spawn daemon（等就绪）→ 生成 token → 开浏览器。已在跑则直接开。
-- `/webui stop`：关掉由 `/webui` 启动的 daemon。
-- 端口被占/spawn 失败 → TUI 内明确报错。
-- 复用 `open_browser_best_effort()`，开不了就打印 URL 供手动点击。
+- `/webui`：进程内 server 未起则 `tokio::spawn(run_server(...))`（端口占用则提示）→ mint token →
+  `open_browser("http://127.0.0.1:13456/?token=...")`。已起则直接 mint + 开浏览器。
+- `/webui stop`：停掉进程内 server 任务（abort handle / shutdown watch）。
+- 端口被占 → 命令内明确报错并提示。
+- 复用 `open_browser`，开不了就打印 URL 供手动点击。
 
 ## Phase 2 蓝图（仅留接口，不实现）
 
-- daemon 内预留 `mod tunnel`：daemon 主动向官方中转服务建立出站长连接（WebSocket/QUIC），
-  中转按子域名 `alice.atomcode.dev` 反代回来。
+- server 内预留 `mod tunnel`：进程主动向官方中转服务建立出站长连接（WebSocket/QUIC），
+  中转按子域名 `alice.atomcode.dev` 反代回来。`run_server` 库化后，隧道挂载点天然可复用。
 - 鉴权复用现有 OAuth/coding-plan 账号体系（统一身份）。
 - Phase 1 须预留：token 鉴权中间件做成可插拔（本地 token / 账号 token 共用校验链）；
   权限流走 SSE 已天然适配远程。
@@ -130,13 +166,17 @@ daemon 是 webui 的后端，独立于 TUI 进程。`/webui` 只是 daemon 的"�
 
 ## 测试策略
 
-- daemon：权限流单测（oneshot 唤醒、超时默认拒绝、token 校验拒绝无 token 请求）。
+- server：权限桥接单测（`PermissionResponders` 按 session 路由、未知 session 返回 false、
+  超时默认拒绝）、token 校验单测（无 token 401、Bearer 解析）。
 - 静态资源 handler：embed 资源能取到、SPA fallback 正确。
-- `/webui` 命令：daemon 探测/spawn 逻辑（mock 健康检查）。
-- 前端：先手动验证（聊天流式、审批卡片、会话切换），不上重型 e2e。
+- `/fs/list`：列目录、`~` 展开、`..` 越权被拒。
+- 进程内启动：`run_server` 库函数可在 tokio 任务内起、单例只起一次。
+- 前端：先手动验证（聊天流式、审批卡片、会话切换、目录切换），不上重型 e2e。
 
 ## 范围边界（YAGNI）
 
 - 本 spec 仅 Phase 1 本地。Phase 2 中转隧道、账号-子域名、TLS 另开 spec。
-- 不做重型前端 e2e；不引入额外后端服务（不新建独立 webui 二进制）。
+- 不做重型前端 e2e。
+- 独立 `atomcode-daemon` 二进制保留（VSCode/Docker 用），但 webui 不依赖它——server 逻辑库化后两者共用。
+- 配置编辑、`/fs/list` 的文件级浏览（只到目录）等留待后续增强。
 - webui 不接管 TUI 进程内正在运行的实时会话（如需，属另一设计方向）。
