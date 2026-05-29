@@ -204,6 +204,7 @@ impl KnowledgeBase {
 
     /// Create an embedded KnowledgeBase loaded with English files.
     /// Cached via OnceLock so the knowledge files are parsed only once.
+    #[allow(dead_code)]
     fn embedded_en() -> &'static Self {
         use std::sync::OnceLock;
         static KB: OnceLock<KnowledgeBase> = OnceLock::new();
@@ -219,6 +220,7 @@ impl KnowledgeBase {
 
     /// Create an embedded KnowledgeBase loaded with Chinese files.
     /// Cached via OnceLock so the knowledge files are parsed only once.
+    #[allow(dead_code)]
     fn embedded_zh() -> &'static Self {
         use std::sync::OnceLock;
         static KB: OnceLock<KnowledgeBase> = OnceLock::new();
@@ -253,6 +255,7 @@ impl KnowledgeBase {
             ("troubleshooting.md", include_str!("knowledge/troubleshooting.md")),
             ("doc-urls.md", include_str!("knowledge/doc-urls.md")),
             ("keybindings.md", include_str!("knowledge/keybindings.md")),
+            ("guide-usage.md", include_str!("knowledge/guide-usage.md")),
         ];
 
         // English knowledge files
@@ -273,6 +276,7 @@ impl KnowledgeBase {
             ("troubleshooting.en.md", include_str!("knowledge/troubleshooting.en.md")),
             ("keybindings.en.md", include_str!("knowledge/keybindings.en.md")),
             ("doc-urls.en.md", include_str!("knowledge/doc-urls.en.md")),
+            ("guide-usage.en.md", include_str!("knowledge/guide-usage.en.md")),
         ];
 
         // Select files based on locale
@@ -548,6 +552,18 @@ impl KnowledgeBase {
         let mut indices = result.unwrap_or_default();
         indices.sort();
         indices.dedup();
+
+        // Sort by relevance: entries with fewer total keywords (more
+        // specific) rank higher. This prevents the overview entry
+        // (50+ keywords) from always appearing before specialized
+        // entries that better match the query.
+        let _word_count = words.len();
+        indices.sort_by(|a, b| {
+            let a_kw = inner.entries.get(*a).map(|e| e.keywords.len()).unwrap_or(0);
+            let b_kw = inner.entries.get(*b).map(|e| e.keywords.len()).unwrap_or(0);
+            // Fewer keywords = more specific = higher rank
+            a_kw.cmp(&b_kw).then(a.cmp(b))
+        });
         indices
     }
 
@@ -589,38 +605,12 @@ impl KnowledgeBase {
     }
 
     pub fn render_for_query(&self, query: &str, max_tokens: usize) -> String {
-        // Priority: detect query language first, fall back to current locale
-        let query_is_ascii = !query.is_empty()
-            && query.chars().all(|c| c.is_ascii() || c.is_whitespace());
-        let query_has_cjk = contains_cjk(query);
+        // Always use self (locale-based KB), no character-based detection.
+        let inner = self.get_or_load();
+        let hits = self.search(query);
+        let hits = if hits.is_empty() { self.search_or(query) } else { hits };
 
-        // For embedded KBs: select by query language directly
-        // For disk-based KBs: always use self (custom content)
-        let use_embedded = self.base_dir.as_os_str().is_empty();
-
-        let (hits, entries) = if use_embedded && query_is_ascii {
-            // ASCII query → English KB
-            let kb = Self::embedded_en();
-            let inner = kb.get_or_load();
-            let hits = kb.search(query);
-            let hits = if hits.is_empty() { kb.search_or(query) } else { hits };
-            tracing::debug!(query, hits = hits.len(), "ASCII query → English KB");
-            (hits, inner.entries)
-        } else if use_embedded && query_has_cjk {
-            // CJK query → Chinese KB
-            let kb = Self::embedded_zh();
-            let inner = kb.get_or_load();
-            let hits = kb.search(query);
-            let hits = if hits.is_empty() { kb.search_or(query) } else { hits };
-            tracing::debug!(query, hits = hits.len(), "CJK query → Chinese KB");
-            (hits, inner.entries)
-        } else {
-            // Undetectable language or disk-based KB → use self (current locale)
-            let inner = self.get_or_load();
-            let hits = self.search(query);
-            let hits = if hits.is_empty() { self.search_or(query) } else { hits };
-            (hits, inner.entries)
-        };
+        let (hits, entries) = (hits, inner.entries);
 
         Self::render_hits(query, &hits, &entries, max_tokens)
     }
@@ -1013,28 +1003,28 @@ Content.
 
     #[test]
     fn test_embedded_ascii_query_selects_english_kb() {
-        // ASCII query "Getting started" should select English KB,
-        // returning English content regardless of global locale.
+        // No CJK in query → use self (locale). Default locale=En → English KB.
+        let _guard = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::locale::Locale::En);
         let kb = KnowledgeBase::embedded();
         let rendered = kb.render_for_query("Getting started", 2000);
 
         // Should contain English knowledge content
         assert!(
             rendered.contains("Getting Started") || rendered.contains("Installation"),
-            "ASCII query should return English KB content, got: {}",
+            "No-CJK query with En locale should return English KB content, got: {}",
             &rendered[..rendered.len().min(200)]
         );
         // Should NOT contain Chinese-only knowledge content
         assert!(
             !rendered.contains("安装完成后"),
-            "ASCII query should NOT return Chinese KB content"
+            "No-CJK query with En locale should NOT return Chinese KB content"
         );
     }
 
     #[test]
-    fn test_embedded_ascii_query_with_zh_locale_still_returns_english() {
-        // Simulate --lang en scenario: even if locale is ZhCn,
-        // ASCII query should still select English KB.
+    fn test_embedded_no_cjk_query_with_zh_locale_returns_chinese() {
+        // No CJK in query + ZhCn locale → Chinese KB (locale default).
         let _guard = crate::i18n::test_lock();
         crate::i18n::set_locale(crate::locale::Locale::ZhCn);
         assert_eq!(crate::i18n::current_locale(), crate::locale::Locale::ZhCn);
@@ -1042,33 +1032,30 @@ Content.
         let kb = KnowledgeBase::embedded();
         let rendered = kb.render_for_query("Getting started", 2000);
 
-        println!("=== With ZhCn locale, ASCII query (len={}) ===", rendered.len());
+        println!("=== With ZhCn locale, no-CJK query (len={}) ===", rendered.len());
         println!("{}", rendered);
         println!("=== END ===");
 
-        // Knowledge content should still be English (from English KB)
+        // Knowledge content should be Chinese (from Chinese KB, locale default)
         assert!(
-            rendered.contains("Getting Started") || rendered.contains("Installation"),
-            "ASCII query should return English KB even with ZhCn locale, got: {}",
+            rendered.contains("安装") || rendered.contains("启动") || rendered.contains("配置"),
+            "No-CJK query with ZhCn locale should return Chinese KB content, got: {}",
             &rendered[..rendered.len().min(300)]
-        );
-        // Should NOT contain Chinese knowledge body
-        assert!(
-            !rendered.contains("安装完成后"),
-            "ASCII query should NOT return Chinese KB content even with ZhCn locale"
         );
     }
 
     #[test]
-    fn test_embedded_cjk_query_selects_chinese_kb() {
-        // CJK query should select Chinese KB
+    fn test_zh_locale_returns_chinese_kb() {
+        // ZhCn locale → Chinese KB, regardless of query characters.
+        let _guard = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::locale::Locale::ZhCn);
         let kb = KnowledgeBase::embedded();
         let rendered = kb.render_for_query("入门指南", 2000);
 
         // Should contain Chinese knowledge content
         assert!(
             rendered.contains("安装") || rendered.contains("启动") || rendered.contains("配置"),
-            "CJK query should return Chinese KB content, got: {}",
+            "ZhCn locale should return Chinese KB content, got: {}",
             &rendered[..rendered.len().min(200)]
         );
     }
@@ -1171,7 +1158,7 @@ Content.
     }
 
     /// Same end-to-end test but with locale=ZhCn.
-    /// Verifies that even with Chinese locale, ASCII query still returns English knowledge.
+    /// Verifies that with Chinese locale, no-CJK query returns Chinese knowledge.
     #[test]
     fn test_e2e_guide_getting_started_with_zh_locale() {
         use crate::agent::sub_agent::registry::SubAgentRegistry;
@@ -1195,25 +1182,21 @@ Content.
             &def.system_prompt[..def.system_prompt.len().min(200)]
         );
 
-        // Render knowledge for ASCII query
+        // Render knowledge for no-CJK query — now uses locale (ZhCn → Chinese KB)
         let kb = def.knowledge.as_ref().expect("guide should have knowledge");
         let kb_text = kb.render_for_query("Getting started", def.max_knowledge_tokens);
 
-        // Knowledge content should still be English (ASCII query → English KB)
+        // Knowledge content should be Chinese (locale default when no CJK detected)
         assert!(
-            kb_text.contains("Getting Started") || kb_text.contains("Installation"),
-            "ASCII query should return English KB even with ZhCn locale, got: {}",
+            kb_text.contains("安装") || kb_text.contains("启动") || kb_text.contains("配置"),
+            "No-CJK query with ZhCn locale should return Chinese KB content, got: {}",
             &kb_text[..kb_text.len().min(300)]
         );
-        assert!(
-            !kb_text.contains("安装完成后"),
-            "ASCII query should NOT return Chinese KB content with ZhCn locale"
-        );
 
-        // i18n header follows global locale → Chinese
+        // i18n output follows global locale → Chinese (header or fallback message)
         assert!(
-            kb_text.starts_with("## 相关知识"),
-            "KB header should be Chinese '## 相关知识' with ZhCn locale, got: {}",
+            kb_text.starts_with("## 相关知识") || kb_text.contains("本地知识库中未找到"),
+            "KB output should be Chinese with ZhCn locale, got: {}",
             &kb_text[..kb_text.len().min(50)]
         );
     }

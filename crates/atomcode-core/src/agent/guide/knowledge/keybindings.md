@@ -48,5 +48,12 @@ AtomCode 的终端快捷键，基于 readline/emacs 风格。
 | `Ctrl+D` | 退出 atomcode |
 | `Ctrl+L` | 清屏 |
 
+## macOS 特别说明
+
+- AtomCode 的快捷键基于 readline/emacs 风格，与 macOS 常见的 `Cmd+C/V/Z` 不同
+- 终端内的复制粘贴使用终端原生快捷键（如 iTerm2 中 `Cmd+C/V`，Terminal.app 中也是）
+- `Ctrl+C` 在 AtomCode 中是取消当前操作，不是复制。复制请用 `Cmd+C`（macOS）或终端的复制快捷键
+- 如果快捷键被 macOS 或终端拦截（如 `Alt+Enter`），请改用 `Ctrl+J` 或 `\` + `Enter` 插入换行
+
 * `Alt+Enter`：部分终端（如 Windows Terminal）会拦截此快捷键用于全屏切换，此时请改用 `Ctrl+J` 或 `\` + `Enter`。
 ** `Shift+Enter`：部分终端（如原生 macOS Terminal）不支持，此时请改用 `Ctrl+J` 或 `\` + `Enter`。

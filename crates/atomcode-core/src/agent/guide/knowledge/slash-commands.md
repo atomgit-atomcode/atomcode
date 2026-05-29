@@ -52,7 +52,7 @@ keywords: [命令, /bg, /help, /model, /config, /mcp, /skills, /guide, 快捷键
 - `/skills` — 浏览已安装技能
 - `/plugin` — 插件市场 (install/uninstall/list)
 - `/mcp` — MCP 服务器状态
-- `/paste` — 粘贴剪贴板图片
+- `/paste` — 粘贴剪贴板中的图片到对话中（支持 PNG/JPEG/WebP，用于截图分析等场景）
 
 ## 帮助
 - `/help` — 显示所有命令

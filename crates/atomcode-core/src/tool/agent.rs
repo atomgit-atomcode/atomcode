@@ -49,19 +49,25 @@ impl AgentTool {
 impl Tool for AgentTool {
     fn definition(&self) -> ToolDef {
         use crate::i18n::{t, Msg};
+        // Bind Cow<str> values to let-bindings so they outlive the
+        // serde_json::json! macro expansion.  Cow::as_ref() borrows
+        // from the Cow, which must stay alive until json! finishes.
+        let desc = t(Msg::InvokeSubAgentToolDesc);
+        let param_name = t(Msg::InvokeSubAgentParamName);
+        let param_task = t(Msg::InvokeSubAgentParamTask);
         ToolDef {
             name: "invoke_subagent",
-            description: t(Msg::InvokeSubAgentToolDesc).into_owned(),
+            description: desc.into_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "subagent_name": {
                         "type": "string",
-                        "description": t(Msg::InvokeSubAgentParamName).as_ref()
+                        "description": param_name.as_ref()
                     },
                     "task": {
                         "type": "string",
-                        "description": t(Msg::InvokeSubAgentParamTask).as_ref()
+                        "description": param_task.as_ref()
                     }
                 },
                 "required": ["subagent_name", "task"]
