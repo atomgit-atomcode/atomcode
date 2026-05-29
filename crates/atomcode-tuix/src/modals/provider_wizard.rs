@@ -667,6 +667,10 @@ fn show_add_step_prompt(
     let body = match step {
         WizardStep::Template => t(Msg::ProviderImportPrompt).into_owned(),
         WizardStep::Name => t(Msg::ProviderStepNameDefault { default: &draft.name }).into_owned(),
+        // Type pre-filled from the Base URL → show it as a default to accept.
+        WizardStep::ProviderType if !draft.provider_type.is_empty() => {
+            t(Msg::ProviderStepTypeWithHint { current: &draft.provider_type }).into_owned()
+        }
         other => step_prompt_text(other, None),
     };
     if matches!(step, WizardStep::Template) || total == 0 {
@@ -753,12 +757,14 @@ fn resolve_template(
     TemplateOutcome::Import
 }
 
-/// Manual-entry questions, in order. Type is asked explicitly (rather than
-/// inferred) and Base URL is its own step (blank = the type's default).
+/// Manual-entry questions, in order. Base URL comes first so the type can be
+/// inferred from it and pre-filled on the Type step (blank Enter accepts it);
+/// a blank Base URL means the type's default and the Type step is answered
+/// from scratch.
 fn manual_plan() -> Vec<WizardStep> {
     vec![
-        WizardStep::ProviderType,
         WizardStep::BaseUrl,
+        WizardStep::ProviderType,
         WizardStep::ApiKey,
         WizardStep::Model,
         WizardStep::Name,
@@ -812,14 +818,28 @@ fn store_step(
     let ans = answer.trim();
     match step {
         WizardStep::ProviderType => {
-            if !["openai", "claude", "ollama"].contains(&ans) {
+            if ans.is_empty() {
+                // Accept the inferred default (set at the Base URL step); only
+                // re-prompt if there's nothing to fall back on.
+                if draft.provider_type.is_empty() {
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType));
+                    return StepOutcome::Retry;
+                }
+            } else if !["openai", "claude", "ollama"].contains(&ans) {
                 push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType));
                 return StepOutcome::Retry;
+            } else {
+                draft.provider_type = ans.to_string();
             }
-            draft.provider_type = ans.to_string();
         }
-        // Blank Base URL is valid — it means "use this type's default".
-        WizardStep::BaseUrl => draft.base_url = ans.to_string(),
+        // Blank Base URL is valid — it means "use this type's default". A
+        // non-blank URL pre-fills the type for the next (Type) step.
+        WizardStep::BaseUrl => {
+            draft.base_url = ans.to_string();
+            if !ans.is_empty() {
+                draft.provider_type = infer_type(ans).to_string();
+            }
+        }
         WizardStep::ApiKey => draft.api_key = ans.to_string(),
         WizardStep::Model => {
             if ans.is_empty() {
@@ -1381,17 +1401,46 @@ chunks = query({
     }
 
     #[test]
-    fn manual_plan_is_five_fixed_steps() {
+    fn manual_plan_starts_with_base_url() {
         assert_eq!(
             manual_plan(),
             vec![
-                WizardStep::ProviderType,
                 WizardStep::BaseUrl,
+                WizardStep::ProviderType,
                 WizardStep::ApiKey,
                 WizardStep::Model,
                 WizardStep::Name
             ]
         );
+    }
+
+    #[test]
+    fn store_step_base_url_infers_type() {
+        let mut d = DraftProvider::default();
+        let existing = std::collections::HashMap::new();
+        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
+        let out = store_step(&mut d, WizardStep::BaseUrl, "https://api.anthropic.com", &existing, &mut sink);
+        assert_eq!(out, StepOutcome::Ok);
+        assert_eq!(d.base_url, "https://api.anthropic.com");
+        assert_eq!(d.provider_type, "claude", "type pre-filled from base_url");
+    }
+
+    #[test]
+    fn store_step_blank_type_keeps_inferred() {
+        let mut d = DraftProvider { provider_type: "openai".into(), ..Default::default() };
+        let existing = std::collections::HashMap::new();
+        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
+        // Empty Enter on the Type step accepts the inferred default.
+        assert_eq!(store_step(&mut d, WizardStep::ProviderType, "", &existing, &mut sink), StepOutcome::Ok);
+        assert_eq!(d.provider_type, "openai");
+    }
+
+    #[test]
+    fn store_step_blank_type_without_inference_retries() {
+        let mut d = DraftProvider::default(); // no inferred type (blank base_url)
+        let existing = std::collections::HashMap::new();
+        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
+        assert_eq!(store_step(&mut d, WizardStep::ProviderType, "", &existing, &mut sink), StepOutcome::Retry);
     }
 
     #[test]
