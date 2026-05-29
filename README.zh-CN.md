@@ -111,6 +111,12 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **Bracketed paste** —— 长文本粘贴自动折叠为紧凑的指示器
 - **Skills** —— 从 skill 目录加载的用户自定义命令，像普通斜杠命令一样调用
 
+### Web UI
+
+- **`/webui`**（TUI 内）或 **`atomcode webui`**（命令行）会在浏览器里打开一个本地 Web 界面，作为终端界面之外的另一种选择——同一个 agent、同一份会话，渲染在浏览器中
+- **仅本地回环** —— server 绑定 `127.0.0.1` 并使用一次性 token，不对网络暴露
+- **`/webui stop`** 停止进程内 server（之后再次 `/webui` 会重新启动）
+
 ### 安全性
 
 - **破坏性命令检测** —— `rm -rf`、`git push --force`、`DROP TABLE` 等需要显式确认

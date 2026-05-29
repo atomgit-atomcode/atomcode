@@ -662,10 +662,15 @@ pub(super) fn execute_slash_command(
             ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
         }
         "webui" => {
-            let msg = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(atomcode_daemon::ensure_server_and_open(13456))
-            });
+            let msg = if arg.trim() == "stop" {
+                // 同步停止，无需 block_on。
+                atomcode_daemon::stop_server()
+            } else {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(atomcode_daemon::ensure_server_and_open(13456))
+                })
+            };
             renderer.render(UiLine::CommandOutput(msg));
             renderer.flush();
         }

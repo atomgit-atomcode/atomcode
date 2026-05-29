@@ -2841,53 +2841,69 @@ fn spawn_idle_timeout_task(
 // 进程内 webui 启动器（Task 9）
 // ============================================================================
 
-/// 进程内 webui server 的全局句柄。只在主进程第一次调用
-/// [`ensure_server_and_open`] 时被初始化一次。
+/// 进程内 webui server 的全局句柄。在主进程第一次调用
+/// [`ensure_server_and_open`] 时初始化；`stop_server` 可清除以支持重启。
 struct WebuiHandle {
     /// 与 server 共享的同一 token store；用于 mint 一次性 token。
     tokens: auth_token::WebuiTokenStore,
     /// server 绑定的端口。
     port: u16,
+    /// server task 的 abort handle；用于 `/webui stop` 停止。
+    abort: tokio::task::AbortHandle,
 }
 
-static WEBUI: std::sync::OnceLock<WebuiHandle> = std::sync::OnceLock::new();
+static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
 
-/// 确保进程内 webui server 已起（只起一次），mint 一次性 token，开浏览器。
+/// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token，开浏览器。
 ///
 /// 返回给用户展示的状态串。在 `atomcode` 主程序（已有 tokio runtime）内调用。
 /// `port` 由调用方决定（CLI 子命令可自定义；TUI 传 13456）。
 pub async fn ensure_server_and_open(port: u16) -> String {
-    // 在 get_or_init 之前判定是否首次启动：若闭包内修改外层变量会触发借用问题，
-    // 这里改为先检查 WEBUI 是否已初始化。竞态可忽略——单进程内本函数串行调用。
-    let just_started = WEBUI.get().is_none();
-
-    let handle = WEBUI.get_or_init(|| {
-        let tokens = auth_token::WebuiTokenStore::new();
-        let opts = ServerOpts {
-            host: "127.0.0.1".to_string(),
-            port,
-            // 与 parse_daemon_args 的“无 --no-telemetry”默认一致。
-            cli_override: CliOverride::default(),
-            // 0 = 关闭 idle 看门狗（见 spawn_idle_timeout_task：idle_timeout_secs==0 直接 return）。
-            // 进程内 webui 应随主程序常驻，不能自行 idle 关停。
-            idle_timeout_secs: 0,
-            // 与 parse_daemon_args 的默认 client mode 一致（无 --client 标志时为 Ide）。
-            startup_mode: SessionMode::Ide,
-            // 传入同一 store：server 进入 webui 模式（enforce_token=true）并用它校验 token。
-            webui_tokens: Some(tokens.clone()),
-        };
-        tokio::spawn(async move {
-            if let Err(e) = run_server(opts).await {
-                eprintln!("webui server error: {e}");
+    // 持锁判定是否需要新起 server。注意：std Mutex guard 不能跨 .await 持有，
+    // 故在此作用域内 clone 出所需数据（tokens / port）后立即 drop guard，再 await。
+    let (tokens, actual_port, just_started) = {
+        let mut guard = WEBUI.lock().unwrap();
+        match guard.as_ref() {
+            // 复用仍在运行的 server。
+            Some(handle) if !handle.abort.is_finished() => {
+                (handle.tokens.clone(), handle.port, false)
             }
-        });
-        WebuiHandle { tokens, port }
-    });
+            // 无句柄或上一个 task 已结束（被 stop 或异常退出）：新起一个。
+            _ => {
+                let tokens = auth_token::WebuiTokenStore::new();
+                let opts = ServerOpts {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    // 与 parse_daemon_args 的“无 --no-telemetry”默认一致。
+                    cli_override: CliOverride::default(),
+                    // 0 = 关闭 idle 看门狗（见 spawn_idle_timeout_task：idle_timeout_secs==0 直接 return）。
+                    // 进程内 webui 应随主程序常驻，不能自行 idle 关停。
+                    idle_timeout_secs: 0,
+                    // 与 parse_daemon_args 的默认 client mode 一致（无 --client 标志时为 Ide）。
+                    startup_mode: SessionMode::Ide,
+                    // 传入同一 store：server 进入 webui 模式（enforce_token=true）并用它校验 token。
+                    webui_tokens: Some(tokens.clone()),
+                };
+                let task = tokio::spawn(async move {
+                    if let Err(e) = run_server(opts).await {
+                        eprintln!("webui server error: {e}");
+                    }
+                });
+                *guard = Some(WebuiHandle {
+                    tokens: tokens.clone(),
+                    port,
+                    abort: task.abort_handle(),
+                });
+                (tokens, port, true)
+            }
+        }
+        // guard 在此 drop（作用域结束），后续 await 不持锁。
+    };
 
     // 仅首次启动时等待 bind 就绪，避免浏览器先于 server 打开。
     if just_started {
         for _ in 0..40 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            if tokio::net::TcpStream::connect(("127.0.0.1", actual_port))
                 .await
                 .is_ok()
             {
@@ -2897,11 +2913,22 @@ pub async fn ensure_server_and_open(port: u16) -> String {
         }
     }
 
-    let token = handle.tokens.mint();
-    let url = format!("http://127.0.0.1:{}/?token={}", handle.port, token);
+    let token = tokens.mint();
+    let url = format!("http://127.0.0.1:{}/?token={}", actual_port, token);
     match atomcode_core::auth::oauth::open_browser(&url) {
         Ok(()) => format!("已在浏览器打开 webui：{url}"),
         Err(_) => format!("请手动在浏览器打开：{url}"),
+    }
+}
+
+/// 停止进程内 webui server（若在运行）。返回状态串。
+pub fn stop_server() -> String {
+    let mut guard = WEBUI.lock().unwrap();
+    if let Some(handle) = guard.take() {
+        handle.abort.abort();
+        "已停止 webui server".to_string()
+    } else {
+        "webui server 未在运行".to_string()
     }
 }
 
