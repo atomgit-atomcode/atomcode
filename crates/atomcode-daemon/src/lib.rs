@@ -2905,6 +2905,59 @@ pub async fn ensure_server_and_open(port: u16) -> String {
     }
 }
 
+// ============================================================================
+// GET /fs/list — 目录列举端点（Task 15a）
+// ============================================================================
+
+/// 展开 `~`，返回路径（不校验存在性）。复用与 /cd 一致的展开规则。
+pub fn normalize_dir_arg(arg: &str) -> PathBuf {
+    if let Some(rest) = arg.strip_prefix('~') {
+        if let Some(home) = atomcode_core::tool::real_home_dir() {
+            return home.join(rest.trim_start_matches('/'));
+        }
+    }
+    PathBuf::from(arg)
+}
+
+/// 列出某目录下的直接子目录名（不含文件、不递归、跳过隐藏目录）。
+pub fn list_subdirs(dir: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if let Some(name) = entry.file_name().to_str() {
+                if !name.starts_with('.') {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[derive(serde::Deserialize)]
+pub struct FsListQuery {
+    pub path: String,
+}
+
+async fn fs_list(
+    State(_state): State<AppState>,
+    Query(q): Query<FsListQuery>,
+) -> impl IntoResponse {
+    // canonicalize 消解 `..`/符号链接；失败时退回展开后的路径
+    let expanded = normalize_dir_arg(&q.path);
+    let dir = expanded.canonicalize().unwrap_or(expanded);
+    match list_subdirs(&dir) {
+        Ok(dirs) => Json(serde_json::json!({
+            "path": dir.to_string_lossy(),
+            "dirs": dirs,
+        }))
+        .into_response(),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
 /// Options controlling how [`run_server`] builds and runs the API server.
 ///
 /// Field types intentionally mirror the tuple returned by the binary's
@@ -3073,6 +3126,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             Router::new()
                 .route("/chat", post(chat_stream))
                 .route("/chat/permission", post(chat_permission))
+                .route("/fs/list", get(fs_list))
                 .route_layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     auth_token::require_webui_token,
@@ -3202,6 +3256,37 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     telemetry.shutdown(Duration::from_millis(500)).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod fs_list_tests {
+    use super::*;
+
+    #[test]
+    fn expands_tilde() {
+        if let Some(home) = atomcode_core::tool::real_home_dir() {
+            assert_eq!(normalize_dir_arg("~"), home);
+            assert_eq!(normalize_dir_arg("~/x"), home.join("x"));
+        }
+    }
+
+    #[test]
+    fn lists_subdirs_of_temp() {
+        // create a temp dir with a child dir + a file; expect only the child dir name
+        let base = std::env::temp_dir()
+            .join(format!("atomcode_fslist_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(base.join("childdir"));
+        let _ = std::fs::write(base.join("afile.txt"), b"x");
+        let dirs = list_subdirs(&base).unwrap();
+        assert!(dirs.contains(&"childdir".to_string()));
+        assert!(!dirs.iter().any(|d| d == "afile.txt"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn errors_on_missing_dir() {
+        assert!(list_subdirs(std::path::Path::new("/no/such/dir/xyz123")).is_err());
+    }
 }
 
 #[cfg(test)]
