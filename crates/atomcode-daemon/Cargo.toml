@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "atomcode_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atomcode-daemon"
+path = "src/main.rs"
+
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
