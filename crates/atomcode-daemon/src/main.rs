@@ -131,6 +131,7 @@ async fn main() {
         cli_override,
         idle_timeout_secs,
         startup_mode,
+        webui_tokens: None,
     })
     .await
     {

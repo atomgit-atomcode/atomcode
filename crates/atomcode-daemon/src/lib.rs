@@ -250,6 +250,8 @@ pub struct AppState {
     pub last_activity: Arc<std::sync::atomic::AtomicI64>,
     /// Number of active SSE streaming connections (chat in progress)
     pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// 本地 webui 一次性 token 存储（Phase 1）
+    pub webui_tokens: auth_token::WebuiTokenStore,
 }
 
 /// Cached MCP registry for a specific project directory.
@@ -2725,6 +2727,8 @@ pub struct ServerOpts {
     pub idle_timeout_secs: u64,
     /// Session mode reported to telemetry on startup.
     pub startup_mode: SessionMode,
+    /// webui token 存储；进程内启动器传入以共享同一 store，独立二进制传 None。
+    pub webui_tokens: Option<auth_token::WebuiTokenStore>,
 }
 
 /// Build and run the axum server until a shutdown signal is received.
@@ -2746,6 +2750,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         cli_override,
         idle_timeout_secs,
         startup_mode,
+        webui_tokens,
     } = opts;
 
     // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default
@@ -2803,6 +2808,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         shutdown_tx: shutdown_tx.clone(),
         last_activity: last_activity.clone(),
         active_connections: active_connections.clone(),
+        webui_tokens: webui_tokens.unwrap_or_default(),
     };
 
     let app = Router::new()
