@@ -2602,6 +2602,37 @@ async fn active_chat_sessions(
     Json(sessions)
 }
 
+/// POST /chat/permission - Deliver a permission decision for a pending tool-approval request.
+///
+/// The browser receives a `permission_request` SSE event (emitted by `/chat`)
+/// that contains the `session_id`. It POSTs back here with the user's choice so
+/// the blocked turn can resume.
+#[derive(Debug, serde::Deserialize)]
+pub struct PermissionDecisionRequest {
+    pub session_id: String,
+    /// "allow" | "deny" | "always_allow"
+    pub decision: String,
+}
+
+async fn chat_permission(
+    State(state): State<AppState>,
+    Json(req): Json<PermissionDecisionRequest>,
+) -> impl IntoResponse {
+    use atomcode_core::tool::PermissionDecision;
+    let decision = match req.decision.as_str() {
+        "allow" => PermissionDecision::Allow,
+        // Phase 1: always_allow 暂按 Allow 处理；本会话"总是允许"语义（PermissionStore 持久化）
+        // 留待后续增强，此处保持决定路由职责单一。
+        "always_allow" => PermissionDecision::Allow,
+        _ => PermissionDecision::Deny,
+    };
+    if state.pending_permissions.deliver(&req.session_id, decision) {
+        Json(serde_json::json!({ "success": true }))
+    } else {
+        Json(serde_json::json!({ "success": false, "error": "no pending permission for session" }))
+    }
+}
+
 // --- MCP API handlers ---
 
 #[derive(Serialize)]
@@ -2902,6 +2933,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/chat", post(chat_stream))
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
+        .route("/chat/permission", post(chat_permission))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
