@@ -678,6 +678,21 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("installing `{plugin}@{marketplace}`…").into(),
         Msg::PluginAlreadyInstalled { id } =>
             format!("  plugin `{id}` is already installed.\n  PS: To reinstall, first run `/plugin uninstall {id}` then `/plugin install {id}`\n").into(),
+        Msg::PluginMgrBrowse => "Browse & install".into(),
+        Msg::PluginMgrAdd => "Add marketplace…".into(),
+        Msg::PluginMgrRemove => "Remove marketplace…".into(),
+        Msg::PluginMgrInstalled { count } => format!("Installed ({count})").into(),
+        Msg::PluginMgrInstalledMark => "✓ installed".into(),
+        Msg::PluginMgrHintNav => "↑/↓ select · ⏎ open · esc back".into(),
+        Msg::PluginMgrHintToggle => "⏎ install/uninstall · esc back".into(),
+        Msg::PluginMgrHintRemove => "⏎ remove · esc back".into(),
+        Msg::PluginMgrHintUninstall => "⏎ uninstall · esc back".into(),
+        Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
+        Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…”".into(),
+        Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace.".into(),
+        Msg::PluginMgrEmptyInstalled => "No plugins installed.".into(),
+        Msg::PluginMgrCloning => "Cloning marketplace…".into(),
+        Msg::PluginMgrInstalling { plugin } => format!("Installing {plugin}…").into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("uninstalled `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>

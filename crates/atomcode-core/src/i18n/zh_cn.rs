@@ -666,6 +666,21 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
         Msg::PluginAlreadyInstalled { id } =>
             format!("  插件 `{id}` 已安装。\n  PS: 如需重新安装，请先执行 `/plugin uninstall {id}`，然后再执行 `/plugin install {id}`\n").into(),
+        Msg::PluginMgrBrowse => "浏览并安装".into(),
+        Msg::PluginMgrAdd => "添加市场…".into(),
+        Msg::PluginMgrRemove => "移除市场…".into(),
+        Msg::PluginMgrInstalled { count } => format!("已安装 ({count})").into(),
+        Msg::PluginMgrInstalledMark => "✓ 已安装".into(),
+        Msg::PluginMgrHintNav => "↑/↓ 选择 · ⏎ 进入 · esc 返回".into(),
+        Msg::PluginMgrHintToggle => "⏎ 安装/卸载 · esc 返回".into(),
+        Msg::PluginMgrHintRemove => "⏎ 移除 · esc 返回".into(),
+        Msg::PluginMgrHintUninstall => "⏎ 卸载 · esc 返回".into(),
+        Msg::PluginMgrHintUrl => "输入/粘贴 git URL · ⏎ 添加 · esc 取消".into(),
+        Msg::PluginMgrEmptyMarketplaces => "暂无市场，请选「添加市场…」".into(),
+        Msg::PluginMgrEmptyPlugins => "该市场暂无插件。".into(),
+        Msg::PluginMgrEmptyInstalled => "暂无已安装插件。".into(),
+        Msg::PluginMgrCloning => "正在克隆市场…".into(),
+        Msg::PluginMgrInstalling { plugin } => format!("正在安装 {plugin}…").into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("已卸载 `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
