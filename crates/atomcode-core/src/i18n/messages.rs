@@ -196,7 +196,6 @@ pub enum Msg<'a> {
     ProviderUnknownTypeEdit,
     ProviderModelEmpty,
     ProviderEditKeep,
-    ProviderTypeInferred { type_name: &'a str },
     ProviderStepNameDefault { default: &'a str },
     ProviderStepProgress { current: usize, total: usize },
 
