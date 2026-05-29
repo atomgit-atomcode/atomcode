@@ -20,13 +20,9 @@ pub struct MdState {
     pub table_buf: Vec<String>,
     /// Lines accumulated between an opening and closing code fence.
     /// Flushed through `highlight::highlight_block` on close fence so
-    /// the syntax highlighter sees the whole block at once. Code thus
-    /// appears in one chunk at fence close rather than streaming
-    /// line-by-line.
+    /// the code block appears in one chunk at fence close rather than
+    /// streaming line-by-line.
     pub code_buf: Vec<String>,
-    /// Language tag captured from the opening fence (`"rust"` from
-    /// ```` ```rust ````). `None` for fences with no tag.
-    pub code_lang: Option<String>,
 }
 
 impl MdState {
@@ -37,7 +33,6 @@ impl MdState {
         self.in_code_block = false;
         self.table_buf.clear();
         self.code_buf.clear();
-        self.code_lang = None;
     }
 }
 
@@ -109,25 +104,20 @@ pub fn render_line_with_width(
     // block comments correctly.
     //
     // CLOSE fence: flush the buffered block through `highlight::highlight_block`,
-    // which handles caps gating (no-color path returns plain 2-space-indented
-    // text, matching the pre-existing CC-style behavior).
+    // which under plan-0 unconditionally emits 2-space-indented plain text
+    // (no per-token colour — see that function's doc for the rationale).
     if is_fence(trimmed) {
         if state.in_code_block {
             // CLOSE
             let source = state.code_buf.join("\n");
-            let highlighted = crate::highlight::highlight_block(
-                state.code_lang.as_deref(),
-                &source,
-                caps,
-            );
+            let highlighted = crate::highlight::highlight_block(&source);
             state.in_code_block = false;
             state.code_buf.clear();
-            state.code_lang = None;
             return Some(prepend(highlighted));
         } else {
-            // OPEN — extract optional language tag.
+            // OPEN — language tag on the fence is ignored under plan-0
+            // (the highlighter is colour-free regardless of language).
             state.in_code_block = true;
-            state.code_lang = parse_fence_lang(trimmed);
             state.code_buf.clear();
             return prefix_only();
         }
@@ -217,14 +207,9 @@ pub fn finalize_with_width(
 
     let code_part = if state.in_code_block && !state.code_buf.is_empty() {
         let source = state.code_buf.join("\n");
-        let highlighted = crate::highlight::highlight_block(
-            state.code_lang.as_deref(),
-            &source,
-            caps,
-        );
+        let highlighted = crate::highlight::highlight_block(&source);
         state.in_code_block = false;
         state.code_buf.clear();
-        state.code_lang = None;
         Some(highlighted)
     } else {
         None
@@ -292,6 +277,72 @@ pub fn flush_aligned_table(rows: &[String], caps: TerminalCaps) -> String {
     flush_aligned_table_with_width(rows, caps, 0)
 }
 
+/// Split a markdown table row on `|`, honouring:
+///   * `` ` ``…`` ` `` inline code spans (pipes inside are literal, not
+///     separators — so Rust closures `|a, b|`, pattern alternatives
+///     `Foo | Bar`, bash pipes `cat | grep`, Python type unions
+///     `int | str` etc. inside backticks stay in one cell)
+///   * `\|` escape (standard markdown escape for a literal pipe in
+///     a cell)
+///   * Leading/trailing `|` delimiters (stripped so the edges aren't
+///     turned into empty cells)
+///
+/// Returns trimmed cell strings with backticks preserved (downstream
+/// inline formatter handles them). `\|` outside a code span is
+/// rewritten to a literal `|` in the cell so the renderer shows the
+/// pipe glyph without the backslash.
+fn split_table_row(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut cells: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_code = false;
+    let mut i = 0;
+    if !bytes.is_empty() && bytes[0] == b'|' {
+        i = 1;
+    }
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'`' {
+            in_code = !in_code;
+            current.push('`');
+            i += 1;
+            continue;
+        }
+        if !in_code && b == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+            current.push('|');
+            i += 2;
+            continue;
+        }
+        if !in_code && b == b'|' {
+            let rest = &line[i + 1..];
+            if rest.trim().is_empty() {
+                cells.push(current.trim().to_string());
+                current = String::new();
+                break;
+            }
+            cells.push(current.trim().to_string());
+            current = String::new();
+            i += 1;
+            continue;
+        }
+        let ch_len = if b < 128 {
+            1
+        } else {
+            let mut len = 1;
+            while i + len < bytes.len() && (bytes[i + len] & 0xc0) == 0x80 {
+                len += 1;
+            }
+            len
+        };
+        current.push_str(&line[i..i + ch_len]);
+        i += ch_len;
+    }
+    if !current.is_empty() || cells.is_empty() {
+        cells.push(current.trim().to_string());
+    }
+    cells
+}
+
 /// Width-aware variant. When `max_width > 0` and the table can't fit at its
 /// natural column widths, fall back to a flat key/value record format
 /// (`header: cell` per line, blank line between rows) so no information is
@@ -302,14 +353,8 @@ pub fn flush_aligned_table_with_width(
     caps: TerminalCaps,
     max_width: usize,
 ) -> String {
-    // Parse each row: strip leading/trailing '|', split by '|', trim cells.
-    let parsed: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| {
-            let s = r.trim_start_matches('|').trim_end_matches('|');
-            s.split('|').map(|c| c.trim().to_string()).collect()
-        })
-        .collect();
+    // Parse each row honouring code-span pipes + `\|` escape.
+    let parsed: Vec<Vec<String>> = rows.iter().map(|r| split_table_row(r)).collect();
 
     // Identify separator row(s) — cells match `[-: ]+` only.
     let is_sep = |row: &[String]| -> bool {
@@ -360,12 +405,28 @@ pub fn flush_aligned_table_with_width(
     let border_off = if caps.colors { theme::MD_MUTED_CLOSE } else { "" };
 
     // Draw a horizontal rule row with given connector characters.
+    //
+    // Each inner column reserves `(w + 2)` *visual cells* of border —
+    // matching the content row's ` <body><pad> ` budget (1 leading space
+    // + w cells of content/padding + 1 trailing space) so border, content
+    // and separators align column-by-column.
+    //
+    // The dash glyph `─` (U+2500) is East Asian Ambiguous. With
+    // `cell_char_width('─') == 2` (i.e. `ATOMCODE_CJK_WIDTH=1`), each char
+    // we push occupies 2 cells, so naively pushing `(w + 2)` chars would
+    // paint `2 * (w + 2)` cells per column — borders drawn way past the
+    // content's right edge. Push `ceil((w + 2) / dash_w)` chars instead;
+    // for `dash_w == 1` (default) this is unchanged, for `dash_w == 2`
+    // odd widths overshoot by 1 cell — minor cosmetic, far better than
+    // a 2x stretch.
+    let dash_w = crate::width::cell_char_width('─').unwrap_or(1).max(1);
     let rule = |left: char, mid: char, right: char| -> String {
         let mut s = String::new();
         s.push_str(border_on);
         s.push(left);
         for (j, w) in col_widths.iter().enumerate() {
-            for _ in 0..(w + 2) {
+            let n_dashes = (w + 2).div_ceil(dash_w);
+            for _ in 0..n_dashes {
                 s.push('─');
             }
             if j + 1 < col_widths.len() {
@@ -473,9 +534,97 @@ fn render_flat_table(parsed: &[Vec<String>], caps: TerminalCaps) -> String {
     out
 }
 
+/// Strip markdown formatting markers (`**bold**`, `*italic*`, `` `code` ``)
+/// to recover the *visible* string `render_inline` would produce, for
+/// column-width measurement in table layout.
+///
+/// MUST mirror `render_inline`'s parsing exactly. Earlier this was a naive
+/// `s.replace("**", "").replace('`', "")`, which broke alignment for cells
+/// containing markdown-marker characters as **literal content inside an
+/// inline-code span**: e.g. `` `src/**/*.ts` `` is rendered by
+/// `render_inline` as styled "src/**/*.ts" (`**` is glob-pattern literal,
+/// preserved inside the code span), but the old strip removed those `**`
+/// too — `plain_w` came back 2 cells short and the right border of that
+/// row was painted 2 cells past where the column was supposed to end.
+/// Same misalignment in reverse for `*italic*`: render strips the single
+/// `*` and emits "italic"; the old strip kept the `*` and overshot
+/// `plain_w` by 2. Reported on the markdown tools-listing table where
+/// the glob row was visibly nudged 2 cells right vs every other row.
+///
+/// Walk the same parser `render_inline` uses, emit only the inner text,
+/// preserve unclosed markers verbatim (matching render's fallback).
 fn strip_md_for_width(s: &str) -> String {
-    // Remove markdown markers that add bytes but no display width.
-    s.replace("**", "").replace('`', "")
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    let mut inner = String::new();
+                    let mut closed = false;
+                    while let Some(&p) = chars.peek() {
+                        if p == '*' {
+                            chars.next();
+                            if chars.peek() == Some(&'*') {
+                                chars.next();
+                                closed = true;
+                                break;
+                            } else {
+                                inner.push('*');
+                            }
+                        } else {
+                            chars.next();
+                            inner.push(p);
+                        }
+                    }
+                    if closed && !inner.is_empty() {
+                        out.push_str(&inner);
+                    } else {
+                        out.push_str("**");
+                        out.push_str(&inner);
+                    }
+                } else {
+                    let mut inner = String::new();
+                    let mut closed = false;
+                    while let Some(&p) = chars.peek() {
+                        chars.next();
+                        if p == '*' {
+                            closed = true;
+                            break;
+                        }
+                        inner.push(p);
+                    }
+                    if closed && !inner.is_empty() {
+                        out.push_str(&inner);
+                    } else {
+                        out.push('*');
+                        out.push_str(&inner);
+                    }
+                }
+            }
+            '`' => {
+                let mut inner = String::new();
+                let mut closed = false;
+                while let Some(&p) = chars.peek() {
+                    chars.next();
+                    if p == '`' {
+                        closed = true;
+                        break;
+                    }
+                    inner.push(p);
+                }
+                if closed && !inner.is_empty() {
+                    out.push_str(&inner);
+                } else {
+                    out.push('`');
+                    out.push_str(&inner);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Legacy single-line inline renderer — kept for direct callers (tests,
@@ -597,28 +746,6 @@ fn is_fence(trimmed: &str) -> bool {
     }
 }
 
-/// Extract the language tag from an opening fence line. Handles both
-/// backtick and tilde fences; returns `None` if no tag is present or
-/// the line is just the fence character.
-///
-/// Examples:
-///   "```rust"        -> Some("rust")
-///   "```rust  "      -> Some("rust")
-///   "```Rust"        -> Some("rust")     ← lowercased
-///   "```"            -> None
-///   "~~~python"      -> Some("python")
-fn parse_fence_lang(trimmed: &str) -> Option<String> {
-    let after = trimmed
-        .trim_start_matches('`')
-        .trim_start_matches('~')
-        .trim();
-    if after.is_empty() {
-        None
-    } else {
-        Some(after.to_lowercase())
-    }
-}
-
 fn is_hrule(trimmed: &str) -> bool {
     if trimmed.len() < 3 {
         return false;
@@ -718,6 +845,106 @@ mod tests {
     }
 
     #[test]
+    fn split_table_row_handles_pipe_in_inline_code() {
+        let row = "| 闭包 | `|a, b| b.cmp(&a)` |";
+        assert_eq!(
+            split_table_row(row),
+            vec!["闭包".to_string(), "`|a, b| b.cmp(&a)`".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_handles_multiple_code_spans_with_pipes() {
+        let row = "| `cat | grep` | `int | str` | result |";
+        assert_eq!(
+            split_table_row(row),
+            vec![
+                "`cat | grep`".to_string(),
+                "`int | str`".to_string(),
+                "result".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn split_table_row_honours_backslash_escape() {
+        let row = "| literal \\| pipe | next |";
+        assert_eq!(
+            split_table_row(row),
+            vec!["literal | pipe".to_string(), "next".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_plain_no_codespan_unchanged() {
+        let row = "| a | b | c |";
+        assert_eq!(
+            split_table_row(row),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_no_leading_or_trailing_delim() {
+        let row = "a | b | c";
+        assert_eq!(
+            split_table_row(row),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_empty_cell_preserved() {
+        let row = "| a |  | c |";
+        assert_eq!(
+            split_table_row(row),
+            vec!["a".to_string(), "".to_string(), "c".to_string()],
+        );
+    }
+
+    #[test]
+    fn split_table_row_with_cjk_content() {
+        let row = "| 模式匹配 | `Foo | Bar` 多模式 |";
+        assert_eq!(
+            split_table_row(row),
+            vec![
+                "模式匹配".to_string(),
+                "`Foo | Bar` 多模式".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn flush_aligned_table_rust_closure_renders_two_columns() {
+        // End-to-end: a table cell containing a Rust closure should
+        // NOT explode into phantom columns. Before the split_table_row
+        // fix, `|a, b|` inside the cell got split as separators and
+        // the body row showed 4+ vertical bars (header + 3 phantom
+        // separators). After the fix, only the real cell separator
+        // remains: borders + 1 between cell — at most 3 bars total.
+        let rows = vec![
+            "| 元素 | 示例 |".to_string(),
+            "| --- | --- |".to_string(),
+            "| 闭包 | `|a, b| b.cmp(&a)` |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let body_line = out
+            .lines()
+            .find(|l| l.contains("闭包"))
+            .expect("body row missing");
+        // Count only the box-drawing vertical `│` (U+2502) — the
+        // literal ASCII `|` inside the cell content `|a, b|` is
+        // expected and shouldn't be conflated with column borders.
+        let box_bar_count = body_line.chars().filter(|c| *c == '│').count();
+        assert_eq!(
+            box_bar_count, 3,
+            "expected exactly 3 box-drawing bars (left border + 1 sep + right border); \
+             got {} in {:?}",
+            box_bar_count, body_line,
+        );
+    }
+
+    #[test]
     fn inline_bold() {
         assert_eq!(
             render_inline_line("**bold**", caps()),
@@ -780,29 +1007,31 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_block_colors_on_emits_truecolor_for_known_lang() {
-        // With colors enabled and a known language tag, the close-fence
-        // flush must include at least one truecolor SGR (theme color).
-        // We don't assert exact bytes — the palette is intentionally
-        // free to evolve in `highlight::theme`.
+    fn fenced_code_block_known_lang_emits_plain_indent_no_ansi() {
+        // Plan-0 contract (see `highlight_block`'s doc): even with colors
+        // enabled and a known language tag, the close-fence flush emits
+        // plain 2-space-indented source with zero ANSI. Per-token
+        // colouring was dropped because macOS Terminal.app's selection
+        // overlay made truecolor tokens unreadable inside selections.
         let mut state = MdState::new();
         let _ = render_line("```rust", &mut state, caps());
         assert!(render_line("fn main() {}", &mut state, caps()).is_none());
         let out = render_line("```", &mut state, caps()).unwrap();
-        assert!(out.contains("  "), "indent preserved: {:?}", out);
+        assert!(out.contains("  fn main() {}"), "indent + body preserved: {:?}", out);
         assert!(
-            out.contains("\x1b[38;2;"),
-            "expected at least one truecolor SGR, got: {:?}",
+            !out.contains('\x1b'),
+            "expected zero ANSI bytes under plan-0, got: {:?}",
             out
         );
     }
 
     #[test]
-    fn fenced_code_block_unknown_lang_falls_back_to_plain_indent() {
-        // Unknown lang tag → syntect's find_syntax_by_token returns None
-        // → dispatch falls through to plain indent. No ANSI emitted even
-        // though caps.colors is true. Matches the design's "no fallback
-        // module" decision (syntect's lookup is the gate).
+    fn fenced_code_block_unknown_lang_emits_plain_indent() {
+        // Plan-0: regardless of lang tag (known, unknown, or absent),
+        // the body is emitted verbatim with a 2-space indent and zero
+        // ANSI. This test pins the unknown-lang case specifically;
+        // the known-lang case is covered by
+        // `fenced_code_block_known_lang_emits_plain_indent_no_ansi`.
         let mut state = MdState::new();
         let _ = render_line("```frobnicate", &mut state, caps());
         assert!(render_line(r#"x = "hello""#, &mut state, caps()).is_none());
@@ -1141,33 +1370,32 @@ mod tests {
     }
 
     #[test]
-    fn mdstate_default_has_empty_code_buf_and_no_lang() {
+    fn mdstate_default_has_empty_code_buf() {
         let s = MdState::new();
         assert!(s.code_buf.is_empty(), "code_buf must start empty");
-        assert!(s.code_lang.is_none(), "code_lang must start None");
+        assert!(!s.in_code_block, "in_code_block must start false");
     }
 
     #[test]
-    fn mdstate_reset_clears_code_buf_and_lang() {
+    fn mdstate_reset_clears_code_buf() {
         let mut s = MdState::new();
         s.code_buf.push("dirty".into());
-        s.code_lang = Some("rust".into());
         s.in_code_block = true;
         s.reset();
         assert!(s.code_buf.is_empty(), "reset must clear code_buf");
-        assert!(s.code_lang.is_none(), "reset must clear code_lang");
         assert!(!s.in_code_block, "reset must clear in_code_block");
     }
 
     #[test]
-    fn fence_open_with_lang_captures_lang_and_buffers_lines() {
+    fn fence_open_with_lang_tag_buffers_lines_without_emit() {
+        // Under plan-0 the lang tag is ignored entirely (no language-
+        // dependent path remains). We only assert that the fence
+        // transitions state into `in_code_block` and accumulates body
+        // lines silently until the close fence flushes.
         let mut st = MdState::new();
-        // Open fence with `rust` tag — language captured, no body output yet.
         assert!(render_line("```rust", &mut st, caps()).is_none());
-        assert_eq!(st.code_lang.as_deref(), Some("rust"));
         assert!(st.in_code_block);
 
-        // Body lines accumulate to code_buf, no output emitted yet.
         assert!(render_line("let x = 1;", &mut st, caps()).is_none());
         assert!(render_line("let y = 2;", &mut st, caps()).is_none());
         assert_eq!(st.code_buf.len(), 2);
@@ -1175,12 +1403,6 @@ mod tests {
 
     #[test]
     fn fence_close_flushes_buffered_block_as_one_chunk() {
-        // Use plain_caps so the substring checks see the literal source text
-        // — with truecolor caps, syntect interleaves ANSI escapes between
-        // every token boundary (keywords/identifiers/operators each get
-        // their own SGR pair), so `out.contains("let x = 1;")` won't match.
-        // The colored path is covered separately by
-        // `fence_close_with_colors_produces_truecolor_ansi`.
         let mut st = MdState::new();
         assert!(render_line("```rust", &mut st, plain_caps()).is_none());
         assert!(render_line("let x = 1;", &mut st, plain_caps()).is_none());
@@ -1195,20 +1417,24 @@ mod tests {
         // State is reset for the next block.
         assert!(!st.in_code_block);
         assert!(st.code_buf.is_empty());
-        assert!(st.code_lang.is_none());
     }
 
     #[test]
-    fn fence_close_with_colors_produces_truecolor_ansi() {
+    fn fence_close_with_colors_emits_plain_indent_no_ansi() {
+        // Plan-0: even with `caps.colors == true`, code-block flush
+        // emits the body with a 2-space indent and zero ANSI. See
+        // `highlight::highlight_block`'s doc for why per-token colour
+        // was dropped (Terminal.app selection-overlay readability).
         let mut st = MdState::new();
         render_line("```rust", &mut st, caps());
         render_line("fn main() {}", &mut st, caps());
         let out = render_line("```", &mut st, caps()).unwrap();
         assert!(
-            out.contains("\x1b[38;2;"),
-            "tinted output must contain a truecolor SGR, got: {:?}",
+            !out.contains('\x1b'),
+            "code-block output must contain zero ANSI under plan-0, got: {:?}",
             out
         );
+        assert!(out.contains("  fn main() {}"), "indent + body preserved: {:?}", out);
     }
 
     #[test]
@@ -1222,18 +1448,10 @@ mod tests {
     }
 
     #[test]
-    fn fence_open_with_no_lang_tag_buffers_with_none_lang() {
+    fn fence_open_with_no_lang_tag_buffers() {
         let mut st = MdState::new();
         assert!(render_line("```", &mut st, caps()).is_none());
-        assert_eq!(st.code_lang, None);
         assert!(st.in_code_block);
-    }
-
-    #[test]
-    fn lang_tag_with_trailing_whitespace_is_trimmed() {
-        let mut st = MdState::new();
-        render_line("```rust  ", &mut st, caps());
-        assert_eq!(st.code_lang.as_deref(), Some("rust"));
     }
 
     #[test]
@@ -1247,20 +1465,11 @@ mod tests {
         // No close fence.
 
         let out = finalize(&mut st, caps()).expect("unclosed block must emit something");
-        // Use plain caps for substring check: syntect interleaves ANSI between
-        // tokens so "let x = 1;" never appears contiguously in tinted output.
-        // The colored-output path is already covered by Task 6's tests; here we
-        // just verify the body survives at all.
-        let mut st_plain = MdState::new();
-        render_line("```rust", &mut st_plain, plain_caps());
-        render_line("let x = 1;", &mut st_plain, plain_caps());
-        render_line("let y = 2;", &mut st_plain, plain_caps());
-        let out_plain = finalize(&mut st_plain, plain_caps()).expect("unclosed block must emit");
-        assert!(out_plain.contains("let x = 1;"), "got: {:?}", out_plain);
-        assert!(out_plain.contains("let y = 2;"), "got: {:?}", out_plain);
-
-        // Tinted path: at least some output (non-empty) and state cleared.
-        assert!(!out.is_empty());
+        // Under plan-0 the body is emitted verbatim (2-space indent, no
+        // ANSI), so the source lines are contiguous and substring-checkable
+        // directly without bouncing through `plain_caps()`.
+        assert!(out.contains("let x = 1;"), "got: {:?}", out);
+        assert!(out.contains("let y = 2;"), "got: {:?}", out);
         assert!(st.code_buf.is_empty());
         assert!(!st.in_code_block);
     }
@@ -1270,5 +1479,91 @@ mod tests {
         // Existing behavior: no buffered table / code → returns None.
         let mut st = MdState::new();
         assert!(finalize(&mut st, caps()).is_none());
+    }
+
+    // ─── strip_md_for_width vs render_inline alignment ───
+    //
+    // For table column-width measurement to be correct, the visible string
+    // strip_md_for_width returns has to be exactly what render_inline
+    // ultimately paints (after the SGR escapes are removed). Any divergence
+    // pads the row by the wrong number of cells and bends the right border
+    // out of alignment with neighbouring rows.
+
+    /// Reported bug: glob row in the tools table painted ~2 cells past the
+    /// other rows' right border because `` `src/**/*.ts` `` had its inner
+    /// `**` stripped as bold markers. Pin: `**` inside a code span is
+    /// literal, never stripped.
+    #[test]
+    fn strip_md_for_width_keeps_double_star_inside_inline_code() {
+        assert_eq!(
+            strip_md_for_width("`src/**/*.ts`"),
+            "src/**/*.ts"
+        );
+    }
+
+    /// Companion to the bug above: `*italic*` is rendered as the inner text
+    /// only (single `*` stripped by render_inline). Strip must do the same,
+    /// otherwise plain_w over-counts by 2 cells per italic span.
+    #[test]
+    fn strip_md_for_width_strips_single_star_italic_markers() {
+        assert_eq!(strip_md_for_width("*italic*"), "italic");
+    }
+
+    #[test]
+    fn strip_md_for_width_strips_double_star_bold_markers() {
+        assert_eq!(strip_md_for_width("**bold**"), "bold");
+    }
+
+    #[test]
+    fn strip_md_for_width_strips_backtick_code_markers() {
+        assert_eq!(strip_md_for_width("`code`"), "code");
+    }
+
+    /// Unclosed markers stay verbatim — matches render_inline's "no closer
+    /// found, dump the marker as literal" fallback, so column-width math
+    /// keeps treating them as content.
+    #[test]
+    fn strip_md_for_width_keeps_unclosed_markers_verbatim() {
+        assert_eq!(strip_md_for_width("**unclosed"), "**unclosed");
+        assert_eq!(strip_md_for_width("*unclosed"), "*unclosed");
+        assert_eq!(strip_md_for_width("`unclosed"), "`unclosed");
+    }
+
+    /// The literal reported regression input: a CJK cell containing an
+    /// inline-code span whose inner text has `**` in it. Pre-fix
+    /// `strip_md_for_width` returned a string two cells short of what
+    /// `render_inline` paints; post-fix they match exactly.
+    #[test]
+    fn strip_md_for_width_matches_render_visible_width_on_glob_cell() {
+        use crate::width::display_width;
+        let md = "文件名通配符匹配（如 `src/**/*.ts`）";
+        let stripped = strip_md_for_width(md);
+        let rendered = render_inline(md, caps());
+        // Visible width of render = bytes of render minus SGR escape bytes.
+        // Easier: re-strip the rendered output by walking past `\x1b[...m`
+        // chunks; then assert it equals stripped.
+        let mut visible = String::new();
+        let bytes = rendered.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b {
+                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // consume the alpha terminator (m / K / etc.)
+                }
+                continue;
+            }
+            let next = rendered[i..]
+                .char_indices()
+                .nth(1)
+                .map(|(idx, _)| idx + i)
+                .unwrap_or(rendered.len());
+            visible.push_str(&rendered[i..next]);
+            i = next;
+        }
+        assert_eq!(stripped, visible, "strip must equal render-visible");
+        assert_eq!(display_width(&stripped), display_width(&visible));
     }
 }

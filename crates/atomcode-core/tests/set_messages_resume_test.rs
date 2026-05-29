@@ -45,6 +45,7 @@ fn build_multi_turn_conversation(n: usize) -> Conversation {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
+                    synthetic: false,
         });
         conv.turn_tracker.on_message_added(msg_idx);
 
@@ -57,6 +58,7 @@ fn build_multi_turn_conversation(n: usize) -> Conversation {
                 output: format!("output {}", t),
                 success: true,
             }),
+                    synthetic: false,
         });
         conv.turn_tracker.on_message_added(msg_idx);
 
@@ -347,6 +349,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
+                    synthetic: false,
         },
         Message {
             role: Role::Tool,
@@ -355,6 +358,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 output: "found foo".into(),
                 success: true,
             }),
+                    synthetic: false,
         },
         Message {
             role: Role::Tool,
@@ -363,6 +367,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 output: "file contents".into(),
                 success: true,
             }),
+                    synthetic: false,
         },
         Message::new(Role::Assistant, "Here's what I found..."),
         Message::new(Role::User, "now edit it"),
@@ -378,6 +383,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 reasoning_content: None,
                 thinking_blocks: Vec::new(),
             },
+                    synthetic: false,
         },
         Message {
             role: Role::Tool,
@@ -386,6 +392,7 @@ fn rebuild_handles_tool_call_turns_correctly() {
                 output: "edit applied".into(),
                 success: true,
             }),
+                    synthetic: false,
         },
     ];
 

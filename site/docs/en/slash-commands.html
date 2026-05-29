@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.1</span>
+    <span class="dhdr-ver">v4.23.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -79,8 +79,7 @@
           <tr><th>Command</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/codingplan</code></td><td><strong>Recommended</strong> — one command logs you in, claims AtomGit CodingPlan free tokens, and auto-configures a provider from the granted model list. The lowest-friction entry point for first-time users</td></tr>
-          <tr><td><code>/login</code></td><td>Only performs AtomGit OAuth identity auth, <strong>does not change provider config</strong> (for users who already have an API key but want AtomGit integrations like <code>/issue</code>)</td></tr>
+          <tr><td><code>/login</code></td><td><strong>Recommended</strong> — one command runs AtomGit OAuth + claims CodingPlan free tokens + auto-configures a provider from the granted model list. The lowest-friction entry point for first-time users; re-running after you're already signed in idempotently re-syncs the model list. <em>As of v4.23.3 <code>/codingplan</code> has been folded into <code>/login</code>; the standalone entry has been removed</em></td></tr>
           <tr><td><code>/resume</code></td><td>Open the session picker to restore any previously persisted session (messages, directory, and model state)</td></tr>
           <tr><td><code>/session</code></td><td>Start a fresh, clean session</td></tr>
           <tr><td><code>/bg</code></td><td>Send the current session to the background and open a new foreground; subcommands: <code>/bg list</code>, <code>/bg &lt;N&gt;</code>, <code>/bg drop &lt;N&gt;</code>, <code>/bg help</code>. See <a href="./sessions.html#bg">Background sessions</a></td></tr>
@@ -176,7 +175,7 @@
           <tr><td><code>/status</code></td><td>Show login status, current provider, model, context budget, CodingPlan usage and reset time</td></tr>
           <tr><td><code>/whoami</code></td><td>Show the username / email of the current AtomGit-logged-in user</td></tr>
           <tr><td><code>/config</code></td><td>Show the path of <code>~/.atomcode/config.toml</code></td></tr>
-          <tr><td><code>/reload</code></td><td>Hot-reload <code>~/.atomcode/config.toml</code> from disk — external edits (or changes from another terminal's <code>/codingplan</code>) take effect without restarting atomcode</td></tr>
+          <tr><td><code>/reload</code></td><td>Hot-reload <code>~/.atomcode/config.toml</code> from disk — external edits (or changes from another terminal's <code>/login</code>) take effect without restarting atomcode</td></tr>
           <tr><td><code>/language</code></td><td>Switch UI language: auto-detect (<code>LC_ALL</code> / <code>LANG</code>), English, or Simplified Chinese. Takes effect immediately and is written back to <code>~/.atomcode/config.toml</code></td></tr>
           <tr><td><code>/welcome</code></td><td>Re-open the 3-step first-run wizard (welcome → language → setup). Non-empty sessions are confirmed with a <code>y/N</code> before clearing the screen. Both language and default onboarding path can be revisited here</td></tr>
           <tr><td><code>/logout</code></td><td>Clear the AtomGit OAuth token</td></tr>
@@ -198,7 +197,7 @@
       <h2>Typical workflows</h2>
 
       <h3>First launch — one-click onboarding</h3>
-      <pre><code>&gt; /codingplan
+      <pre><code>&gt; /login
   ✔ Logged in as alice (alice, alice@example.com)
   ✔ CodingPlan claimed — CodingPlan Free · expires 2026-05-22 (29d / 30d)
   ✔ 3 models registered as AtomGit-* providers

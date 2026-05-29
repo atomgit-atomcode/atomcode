@@ -34,6 +34,8 @@ use std::sync::Arc;
 
 use super::client::{is_auth_expired, Client};
 use super::types::{ModelEntry, PlanType, StatusResponse};
+#[cfg(test)]
+use super::types::RateLimitWindow;
 use crate::auth;
 use crate::config::provider::ProviderConfig;
 use crate::config::Config;
@@ -168,43 +170,67 @@ impl SetupReport {
         }
 
         // Step 2: claim. When `claim_attempts` is populated (production
-        // path), emit one row per tier so refused / errored
-        // intermediates are visible alongside the winner. When empty
+        // path), emit one row per *successful* tier — refused / errored
+        // intermediates (e.g. "Max 套餐尚未开放") are suppressed so the
+        // happy-path output collapses to a single "Pro 生效" line. If
+        // no tier succeeded, fall through to a single failure row using
+        // `self.claim` so the user still gets a signal. When empty
         // (login-cascade suppression OR legacy test fixtures), fall
-        // back to a single summary row from `self.claim` — preserves
-        // pre-refactor test semantics without churning every fixture.
+        // back to the legacy single-row path.
         if !self.claim_attempts.is_empty() {
+            let mut any_success = false;
             for attempt in &self.claim_attempts {
                 let tier = attempt.tier.as_str();
                 match &attempt.outcome {
                     TierOutcome::Claimed { .. } => {
                         out.push_str(&t(Msg::CpClaimTierSucceeded { tier }));
+                        any_success = true;
                     }
                     TierOutcome::AlreadyHeld { .. } => {
                         out.push_str(&t(Msg::CpClaimTierAlreadyHeld { tier }));
+                        any_success = true;
                     }
-                    TierOutcome::Refused { message } => {
-                        let reason = if message.is_empty() {
-                            // Server returned success=false +
-                            // duplicate=false with no message — surface
-                            // a placeholder so the row isn't a
-                            // confusing "claim failed — " with nothing
-                            // after the em-dash.
-                            "(no reason given)"
-                        } else {
-                            message.as_str()
-                        };
-                        out.push_str(&t(Msg::CpClaimTierFailed { tier, reason }));
+                    TierOutcome::Refused { .. } | TierOutcome::Errored { .. } => {
+                        // Silently skipped — failures in the
+                        // tier cascade are noise once any other tier
+                        // succeeds, and even an all-fail run gets one
+                        // consolidated row below instead of three.
                     }
-                    TierOutcome::Errored { error } => {
-                        // 5xx / transport / parse — same "claim
-                        // failed" glyph as Refused; the message is
-                        // the error text (truncated so a stack
-                        // trace doesn't blow up the row).
-                        let reason = truncate_inline(error, 150);
-                        out.push_str(&t(Msg::CpClaimTierFailed {
-                            tier,
-                            reason: &reason,
+                }
+            }
+            if !any_success {
+                if let StepResult::Err(msg) = &self.claim {
+                    // Pick the freshest non-empty source for the body:
+                    // overall Err first, then walk attempts in reverse
+                    // so the last tier's server message wins. Avoids a
+                    // dangling `— ` when the overall Err was scrubbed
+                    // empty by the cascade builder.
+                    let body = if !msg.is_empty() {
+                        msg.clone()
+                    } else {
+                        self.claim_attempts
+                            .iter()
+                            .rev()
+                            .find_map(|a| match &a.outcome {
+                                TierOutcome::Refused { message } if !message.is_empty() => {
+                                    Some(format!("{}: {}", a.tier.as_str(), message))
+                                }
+                                TierOutcome::Errored { error } if !error.is_empty() => {
+                                    Some(format!("{}: {}", a.tier.as_str(), error))
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                    };
+                    if body.is_empty() {
+                        // Truly nothing to say — render the prefix
+                        // without a trailing em-dash body. Edge case:
+                        // every tier responded success=false with no
+                        // message AND no error text.
+                        out.push_str(&t(Msg::CpClaimFailedBare));
+                    } else {
+                        out.push_str(&t(Msg::CpClaimFailed {
+                            error: &truncate_inline(&body, 150),
                         }));
                     }
                 }
@@ -252,8 +278,8 @@ impl SetupReport {
                     info.display_names.iter().map(|s| s.as_str()).collect();
                 // Locked models render FIRST so the upgrade prompt is the
                 // first thing the eye lands on under "Added N providers:".
-                // Visual cue is an `✗` prefix matching the existing
-                // failure rows (`✗ CodingPlan Max claim failed — …`)
+                // Visual cue is an `×` prefix matching the existing
+                // failure rows (`× CodingPlan Max claim failed — …`)
                 // plus the explicit `(requires Pro plan or higher)` suffix —
                 // both plain text, so every renderer (alt-screen /
                 // retained / plain) and every terminal font carries
@@ -334,18 +360,68 @@ impl SetupReport {
                         }));
                     }
                 }
-                if let Some(u) = &s.current_usage {
-                    out.push_str(&t(Msg::CpUsageLine {
-                        usage: &u.display_desc(),
-                        reset_at: &u.reset_at_display,
-                        duration: &format_duration_secs(u.seconds_until_reset),
-                    }));
-                }
-                if s.window_quota_exhausted {
-                    if let Some(hint) = &s.window_quota_hint {
-                        out.push_str(&t(Msg::CpWindowQuotaHint { hint }));
+                if !s.rate_limit_windows.is_empty() {
+                    // A visible long window (>5h, typically the 30d monthly
+                    // quota) means the user has hit the longer-period limit.
+                    // In that state the short 5h rolling window is moot —
+                    // even if it reads `0% · 重置于 2h 后`, the request
+                    // path is still gated by the monthly cap, so the user
+                    // can't actually issue calls until the long window
+                    // resets. Showing both produces the misleading "你还
+                    // 有 2h 短窗，但 12d 后才能用" pair the user reported
+                    // (the 0%-short-window line gave false hope). Resolve
+                    // by picking the longest exhausted window and rendering
+                    // only its line; otherwise iterate visible short
+                    // windows normally.
+                    let longest_exhausted = s
+                        .rate_limit_windows
+                        .iter()
+                        .filter(|w| w.show_enable == 1 && w.window_size_seconds / 3600 > 5)
+                        .max_by_key(|w| w.window_size_seconds);
+                    if let Some(w) = longest_exhausted {
+                        out.push_str(&t(Msg::CpMonthlyQuotaExhausted {
+                            duration: &format_duration_secs(w.seconds_until_reset),
+                        }));
                     } else {
-                        out.push_str(&t(Msg::CpWindowQuotaExhausted));
+                        for w in s.rate_limit_windows.iter().filter(|w| w.show_enable == 1) {
+                            // All visible windows are short rolling (≤5h) —
+                            // standard usage line.
+                            out.push_str(&t(Msg::CpUsageLine {
+                                usage: &w.usage_status_desc,
+                                reset_at: &w.reset_at_display,
+                                duration: &format_duration_secs(w.seconds_until_reset),
+                            }));
+                        }
+                    }
+                } else {
+                    // Backward-compat path for old server responses.
+                    //
+                    // `window_quota_exhausted=true` and `current_usage` are
+                    // independent fields on the legacy response, and the
+                    // server can — and visibly does — set BOTH simultaneously
+                    // (typically `current_usage.usage_status_desc=0%` for a
+                    // freshly-reset short window plus the exhaustion flag for
+                    // a separately-tracked longer window). Rendering both
+                    // produces the contradictory `用量 0% / ⚠额度已满` pair
+                    // the user reported as "v4.23.2 怎么还是这么展示". When
+                    // both fire, the user-actionable message is the
+                    // exhaustion warning; the usage line at 0% reads as
+                    // "you're fine" and just confuses things. Surface the
+                    // warning alone — same precedence the new
+                    // `rate_limit_windows` path already encodes (it picks
+                    // exactly one row per visible window).
+                    if s.window_quota_exhausted {
+                        if let Some(hint) = &s.window_quota_hint {
+                            out.push_str(&t(Msg::CpWindowQuotaHint { hint }));
+                        } else {
+                            out.push_str(&t(Msg::CpWindowQuotaExhausted));
+                        }
+                    } else if let Some(u) = &s.current_usage {
+                        out.push_str(&t(Msg::CpUsageLine {
+                            usage: &u.display_desc(),
+                            reset_at: &u.reset_at_display,
+                            duration: &format_duration_secs(u.seconds_until_reset),
+                        }));
                     }
                 }
             }
@@ -770,11 +846,13 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>, bool) {
             }
         }
     }
-    let overall = StepResult::Err(if last_msg.is_empty() {
-        "claim failed at every tier (Max/Pro/Lite)".into()
-    } else {
-        format!("claim failed at every tier — {}", last_msg)
-    });
+    // Surface the server's last response message verbatim — already in
+    // the user's language. The render layer wraps it in a localized
+    // prefix (`× CodingPlan 套餐配置失败 — …`), so a hardcoded English
+    // diagnostic wrapper here ("claim failed at every tier — …") would
+    // bleed into zh-CN output. Empty → empty; render guards the dangling
+    // em-dash.
+    let overall = StepResult::Err(last_msg.clone());
     (overall, attempts, false)
 }
 
@@ -945,7 +1023,13 @@ fn truncate_inline(msg: &str, max: usize) -> String {
 /// `90s`, `5m`, `2h 30m`, `3d 4h`. Replaces the previous "{N}s" which
 /// was unreadable for anything past a minute (e.g. "in 86340s" instead
 /// of "in 23h 59m").
-fn format_duration_secs(secs: i64) -> String {
+///
+/// `pub` so the `/status` rendering in atomcode-tuix can share the same
+/// formatter — keeps the `用量 重置于 ...（2h 后）` line consistent
+/// between `/login`'s CodingPlan setup output and `/status`'s
+/// CodingPlan section. (Pre-fix they diverged: setup said `2h`, status
+/// said `5984s`.)
+pub fn format_duration_secs(secs: i64) -> String {
     if secs < 0 {
         return "—".into();
     }
@@ -1378,6 +1462,7 @@ mod tests {
                 expires_at: Some("2026-05-22".into()),
                 window_quota_exhausted: false,
                 window_quota_hint: None,
+                rate_limit_windows: vec![],
             }),
             auth_expired: false,
         };
@@ -1414,10 +1499,10 @@ mod tests {
         let out = report.render();
         assert!(out.contains("✓ already logged in"));
         assert!(out.contains("already claimed"));
-        assert!(!out.contains("✗ CodingPlan claim"), "duplicate ≠ failure");
+        assert!(!out.contains("× CodingPlan claim"), "duplicate ≠ failure");
         // Status failed but it's warn-only: ⚠ prefix, NOT ✗.
         assert!(out.contains("⚠ Status fetch failed"));
-        assert!(!out.contains("✗ Status"));
+        assert!(!out.contains("× Status"));
         // Login skipped + models ok ⇒ config should still be persisted.
         assert!(report.should_persist_config());
     }
@@ -1461,6 +1546,7 @@ mod tests {
                 expires_at: None,
                 window_quota_exhausted: false,
                 window_quota_hint: None,
+                rate_limit_windows: vec![],
             }),
             auth_expired: false,
         };
@@ -1497,7 +1583,7 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        assert!(out.contains("✗ Login failed"));
+        assert!(out.contains("× Login failed"));
         // Cascade rows must NOT appear.
         assert!(!out.contains("CodingPlan claim"), "no cascade claim row on login fail");
         assert!(!out.contains("Models step"), "no cascade models row on login fail");
@@ -1616,11 +1702,12 @@ mod tests {
     }
 
     /// Per-tier cascade rendering: Max refused (额度已满) → Pro
-    /// refused (额度已满) → Lite claimed. Users should see ALL three
-    /// rows so they understand the cascade walked Max → Pro → Lite,
-    /// not just the winner.
+    /// refused (额度已满) → Lite claimed. Only the winning tier
+    /// surfaces — intermediate refusals like "Max 套餐尚未开放" are
+    /// noise once a higher tier succeeds, and users will pay for
+    /// upgrades on the web rather than via the CLI cascade.
     #[test]
-    fn render_per_tier_cascade_shows_every_attempt() {
+    fn render_per_tier_cascade_shows_only_winning_tier() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in as Code_dh".into()),
             claim: StepResult::Ok(ClaimInfo {
@@ -1653,31 +1740,35 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        // Max + Pro must surface as 领取失败 with the actual server
-        // message so users can tell the cascade walked past them
-        // (and why) instead of a single "claim failed: Lite: 额度已满".
+        // Lite must surface as 生效 / active (the winner).
         assert!(
-            out.contains("CodingPlan Max 领取失败 — 额度已满")
-                || out.contains("CodingPlan Max claim failed — 额度已满"),
-            "Max refusal row missing: {}",
-            out
-        );
-        assert!(
-            out.contains("CodingPlan Pro 领取失败 — 额度已满")
-                || out.contains("CodingPlan Pro claim failed — 额度已满"),
-            "Pro refusal row missing: {}",
-            out
-        );
-        // Lite must surface as 领取成功 (the winner).
-        assert!(
-            out.contains("CodingPlan Lite 领取成功")
-                || out.contains("CodingPlan Lite claimed"),
+            out.contains("CodingPlan Lite 生效")
+                || out.contains("CodingPlan Lite active"),
             "Lite success row missing: {}",
             out
         );
+        // Max + Pro refusal rows must NOT appear — the cascade
+        // intermediates are suppressed by design ("Max 套餐尚未开放"
+        // was spamming every successful run before this change).
+        assert!(
+            !out.contains("CodingPlan Max"),
+            "Max refusal row must be suppressed: {}",
+            out
+        );
+        assert!(
+            !out.contains("CodingPlan Pro"),
+            "Pro refusal row must be suppressed: {}",
+            out
+        );
+        // 「领取」字样应彻底消失 — neither successes nor failures
+        // should still carry the old claim wording.
+        assert!(
+            !out.contains("领取"),
+            "no '领取' wording should remain in rendered output: {}",
+            out
+        );
         // The legacy single-line summary must NOT appear when
-        // claim_attempts is populated — would be a duplicate "claimed
-        // Lite" row.
+        // claim_attempts is populated — would be a duplicate row.
         assert!(
             !out.contains("CodingPlan claimed"),
             "legacy claim-summary row must be suppressed when per-tier rows present: {}",
@@ -1686,15 +1777,16 @@ mod tests {
     }
 
     /// Per-tier cascade where every tier refused — winning tier is
-    /// `None`, overall claim is `Err`. Each refused tier still gets
-    /// its own row.
+    /// `None`, overall claim is `Err`. Per-tier failure rows are
+    /// suppressed; a single consolidated failure line surfaces so the
+    /// user still gets a signal that no plan was activated.
     #[test]
     fn render_per_tier_cascade_all_refused() {
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
-            claim: StepResult::Err(
-                "claim failed at every tier — Lite: 暂无开放".into(),
-            ),
+            // Bare server message — no English wrapper. Mirrors the
+            // new try_claim_with_cascade() output shape.
+            claim: StepResult::Err("Lite: 暂无开放".into()),
             claim_attempts: vec![
                 TierAttempt {
                     tier: PlanType::Max,
@@ -1720,23 +1812,29 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        // All three tier rows present with the 暂无开放 message.
+        // No per-tier failure rows — `Max/Pro/Lite` strings must not
+        // appear anywhere in the output.
         for tier in &["Max", "Pro", "Lite"] {
-            let zh = format!("CodingPlan {} 领取失败 — 暂无开放", tier);
-            let en = format!("CodingPlan {} claim failed — 暂无开放", tier);
+            let needle = format!("CodingPlan {}", tier);
             assert!(
-                out.contains(&zh) || out.contains(&en),
-                "{} refusal row missing: {}",
+                !out.contains(&needle),
+                "{} tier row must be suppressed in all-refused case: {}",
                 tier,
                 out
             );
         }
-        // Overall claim is Err but with claim_attempts populated, the
-        // legacy "✗ CodingPlan claim failed — ..." summary line is
-        // suppressed (per-tier rows already explain the failure).
+        // 「领取」字样应彻底消失.
         assert!(
-            !out.contains("claim failed at every tier"),
-            "legacy err-summary row must not appear: {}",
+            !out.contains("领取"),
+            "no '领取' wording should remain in rendered output: {}",
+            out
+        );
+        // BUT we must still emit a single consolidated failure line so
+        // the user knows the step didn't succeed — driven by the
+        // overall `claim` Err falling through to CpClaimFailed.
+        assert!(
+            out.contains("CodingPlan 套餐配置失败") || out.contains("CodingPlan tier setup failed"),
+            "consolidated failure row must appear when no tier succeeds: {}",
             out
         );
         // Models row also suppressed (cascade sentinel).
@@ -1747,13 +1845,13 @@ mod tests {
         );
     }
 
-    /// Per-tier cascade where Max errored (5xx). `Errored` and
-    /// `Refused` both render as `领取失败` with the message — same
-    /// visual to the user, same cause from their POV. Make sure the
-    /// error text gets truncated so a long stack trace doesn't blow
+    /// Per-tier cascade where Max errored (5xx). Per-tier failure
+    /// rows are suppressed, but the overall `claim` Err falls through
+    /// to a single consolidated failure line — and that line must
+    /// truncate a long error so a 500-char stack trace doesn't blow
     /// up the row.
     #[test]
-    fn render_per_tier_cascade_with_errored_tier_truncates_long_message() {
+    fn render_all_errored_consolidated_row_truncates_long_message() {
         let long_err = "x".repeat(500);
         let report = SetupReport {
             login: StepResult::Skipped("already logged in".into()),
@@ -1769,17 +1867,69 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        // The Max row is present with 领取失败.
+        // No per-tier "Max" row.
         assert!(
-            out.contains("CodingPlan Max 领取失败 —")
-                || out.contains("CodingPlan Max claim failed —"),
-            "Max errored row missing: {}",
+            !out.contains("CodingPlan Max"),
+            "per-tier Max row must be suppressed: {}",
+            out
+        );
+        // Consolidated failure row is present (driven by claim Err).
+        assert!(
+            out.contains("CodingPlan 套餐配置失败") || out.contains("CodingPlan tier setup failed"),
+            "consolidated failure row must appear: {}",
             out
         );
         // The full 500-char error must NOT appear verbatim — truncated.
         assert!(
             !out.contains(&long_err),
             "long error must be truncated, not pasted whole: {}",
+            out
+        );
+    }
+
+    /// All-fail with no server detail anywhere — overall Err is empty
+    /// AND every TierAttempt has empty message/error. Render must
+    /// emit the bare-prefix variant (no dangling `— `).
+    #[test]
+    fn render_all_failed_with_no_detail_uses_bare_prefix() {
+        let report = SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Err(String::new()),
+            claim_attempts: vec![
+                TierAttempt {
+                    tier: PlanType::Max,
+                    outcome: TierOutcome::Refused {
+                        message: String::new(),
+                    },
+                },
+                TierAttempt {
+                    tier: PlanType::Pro,
+                    outcome: TierOutcome::Refused {
+                        message: String::new(),
+                    },
+                },
+                TierAttempt {
+                    tier: PlanType::Lite,
+                    outcome: TierOutcome::Refused {
+                        message: String::new(),
+                    },
+                },
+            ],
+            models: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            status: StepResult::Skipped(CASCADE_FROM_UPSTREAM_FAIL.into()),
+            auth_expired: false,
+        };
+        let out = report.render();
+        // Prefix renders.
+        assert!(
+            out.contains("CodingPlan 套餐配置失败") || out.contains("CodingPlan tier setup failed"),
+            "bare failure prefix must appear: {}",
+            out
+        );
+        // No dangling em-dash — body is empty so the suffix is skipped.
+        assert!(
+            !out.contains("套餐配置失败 — ") && !out.contains("tier setup failed — "),
+            "must not render `— ` with empty body: {:?}",
             out
         );
     }
@@ -1842,7 +1992,7 @@ mod tests {
             auth_expired: false,
         };
         let out = report.render();
-        assert!(out.contains("✗ CodingPlan claim failed"));
+        assert!(out.contains("× CodingPlan tier setup failed"));
         assert!(out.contains("今日codingplan申请额度已满"));
         // The cascade rows must NOT appear.
         assert!(!out.contains("Models step skipped"), "no cascade row for models");
@@ -2216,8 +2366,246 @@ mod tests {
         assert!(!out.contains("Vision preprocessor"));
     }
 
+    // ── rate_limit_windows rendering tests ─────────────────────────────
+
+    fn blank_status_response() -> crate::coding_plan::types::StatusResponse {
+        crate::coding_plan::types::StatusResponse {
+            codingplan_free: None,
+            current_usage: None,
+            audit_status: 0,
+            expires_at: None,
+            window_quota_exhausted: false,
+            window_quota_hint: None,
+            rate_limit_windows: vec![],
+        }
+    }
+
+    fn status_only_report(
+        s: crate::coding_plan::types::StatusResponse,
+    ) -> SetupReport {
+        SetupReport {
+            login: StepResult::Skipped("already logged in".into()),
+            claim: StepResult::Skipped("already claimed".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Skipped("models not exercised".into()),
+            status: StepResult::Ok(s),
+            auth_expired: false,
+        }
+    }
+
+    #[test]
+    fn render_uses_rate_limit_windows_when_present() {
+        // rate_limit_windows populated → prefers new field over current_usage.
+        let s = crate::coding_plan::types::StatusResponse {
+            rate_limit_windows: vec![
+                RateLimitWindow {
+                    rule_index: 0,
+                    show_enable: 1,
+                    window_size_seconds: 18000,
+                    window_hours: 5,
+                    call_limit: 1000,
+                    calls_used: 20,
+                    usage_percent: 2.0,
+                    quota_exhausted: false,
+                    reset_at: "2026-05-26T18:09:30".into(),
+                    reset_at_display: "18:09".into(),
+                    seconds_until_reset: 16080,
+                    reset_label: String::new(),
+                    usage_status_desc: "当前时间窗口用量约 2%".into(),
+                },
+            ],
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        assert!(out.contains("当前时间窗口用量约 2%"), "usage_status_desc missing: {}", out);
+        assert!(out.contains("18:09"), "reset_at_display missing: {}", out);
+    }
+
+    #[test]
+    fn render_long_window_shows_monthly_exhausted() {
+        // window_size_seconds > 5h * 3600 = 18000 → monthly-exhausted message.
+        // Output: `用量：本月用量已耗尽，等 {duration} 后再使用` —
+        // the reset clock-time is intentionally dropped (it's typically a
+        // far-off "06-20 23:09" the user can't act on; the duration anchor
+        // `25d` reads more usefully).
+        let s = crate::coding_plan::types::StatusResponse {
+            rate_limit_windows: vec![
+                RateLimitWindow {
+                    rule_index: 1,
+                    show_enable: 1,
+                    window_size_seconds: 2592000, // 30 days
+                    window_hours: 720,
+                    call_limit: 16000,
+                    calls_used: 16000,
+                    usage_percent: 100.0,
+                    quota_exhausted: true,
+                    reset_at: "2026-06-20T23:09:30".into(),
+                    reset_at_display: "23:09".into(),
+                    seconds_until_reset: 2194080, // ~25.4d
+                    reset_label: String::new(),
+                    usage_status_desc: "当前时间窗口用量约 100%".into(),
+                },
+            ],
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        assert!(
+            out.contains("本月用量已耗尽") || out.contains("monthly quota exhausted"),
+            "long-window message missing: {}",
+            out
+        );
+        // Duration anchor present, clock time absent.
+        assert!(
+            out.contains("25d") || out.contains("in 25d"),
+            "duration anchor missing: {}",
+            out
+        );
+        assert!(!out.contains("23:09"), "clock-time should be dropped: {}", out);
+    }
+
+    /// User-reported scenario: monthly quota at 100% AND server also
+    /// reports a fresh 5h rolling window at 0%. Showing both produces
+    /// the misleading `用量 0% 重置于 2h / ⚠ 本月用量已耗尽 12d` pair
+    /// (the 0%-line gave false hope — even with 5h capacity the user
+    /// can't issue calls because the monthly cap gates everything).
+    /// Expected: collapse to the single monthly-exhausted line.
+    #[test]
+    fn render_monthly_exhausted_suppresses_short_window_line() {
+        let s = crate::coding_plan::types::StatusResponse {
+            rate_limit_windows: vec![
+                // 5h rolling, fresh — show_enable=1 from server.
+                RateLimitWindow {
+                    rule_index: 0,
+                    show_enable: 1,
+                    window_size_seconds: 18000,
+                    window_hours: 5,
+                    call_limit: 500,
+                    calls_used: 0,
+                    usage_percent: 0.0,
+                    quota_exhausted: false,
+                    reset_at: "2026-05-28T22:49:00".into(),
+                    reset_at_display: "22:49".into(),
+                    seconds_until_reset: 7200, // 2h
+                    reset_label: String::new(),
+                    usage_status_desc: "当前时间窗口用量约 0%".into(),
+                },
+                // 30d monthly, exhausted.
+                RateLimitWindow {
+                    rule_index: 1,
+                    show_enable: 1,
+                    window_size_seconds: 2592000,
+                    window_hours: 720,
+                    call_limit: 16000,
+                    calls_used: 16000,
+                    usage_percent: 100.0,
+                    quota_exhausted: true,
+                    reset_at: "2026-06-09T22:49:00".into(),
+                    reset_at_display: "06-09 22:49".into(),
+                    seconds_until_reset: 1036800, // 12d
+                    reset_label: String::new(),
+                    usage_status_desc: "本月用量约 100%".into(),
+                },
+            ],
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        // Monthly exhausted line present.
+        assert!(
+            out.contains("本月用量已耗尽") || out.contains("monthly quota exhausted"),
+            "monthly-exhausted line missing: {}",
+            out
+        );
+        // Short-window 0% line SUPPRESSED — the whole point of this fix.
+        assert!(
+            !out.contains("用量约 0%") && !out.contains("Usage: 当前时间窗口用量约 0%"),
+            "short-window 0% line must be suppressed when monthly exhausted: {}",
+            out
+        );
+        // Short window's `2h` reset duration should not leak either —
+        // would tell the user a stale "你还有 2 小时" anchor.
+        assert!(
+            !out.contains("（2h 后）") && !out.contains("(in 2h)"),
+            "short-window 2h duration must not leak: {}",
+            out
+        );
+        // Monthly window's 12d duration is what shows.
+        assert!(
+            out.contains("12d"),
+            "monthly 12d duration missing: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn render_falls_back_to_current_usage_when_windows_empty() {
+        // rate_limit_windows empty → backward-compat path using current_usage.
+        let s = crate::coding_plan::types::StatusResponse {
+            current_usage: Some(crate::coding_plan::types::UsageInfo {
+                placeholder: false,
+                window_token_limit: 0,
+                window_tokens_used: 0,
+                usage_percent: 5.0,
+                window_hours: 5,
+                reset_at: "2026-05-26T18:09:30".into(),
+                reset_at_display: "18:09".into(),
+                seconds_until_reset: 16080,
+                reset_label: String::new(),
+                usage_status_desc: "当前时间窗口用量约 5%".into(),
+            }),
+            rate_limit_windows: vec![], // empty → backward-compat path
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        assert!(out.contains("当前时间窗口用量约 5%"), "fallback usage missing: {}", out);
+        assert!(out.contains("18:09"), "reset_at_display missing: {}", out);
+    }
+
+    #[test]
+    fn render_rate_limit_window_hidden_when_show_enable_zero() {
+        // show_enable=0 windows must be skipped; only show_enable=1 rendered.
+        let s = crate::coding_plan::types::StatusResponse {
+            rate_limit_windows: vec![
+                RateLimitWindow {
+                    rule_index: 0,
+                    show_enable: 1,
+                    window_size_seconds: 18000,
+                    window_hours: 5,
+                    call_limit: 1000,
+                    calls_used: 50,
+                    usage_percent: 5.0,
+                    quota_exhausted: false,
+                    reset_at: "2026-05-26T18:09:30".into(),
+                    reset_at_display: "18:09".into(),
+                    seconds_until_reset: 16080,
+                    reset_label: String::new(),
+                    usage_status_desc: "visible window".into(),
+                },
+                RateLimitWindow {
+                    rule_index: 1,
+                    show_enable: 0, // must NOT render
+                    window_size_seconds: 2592000,
+                    window_hours: 720,
+                    call_limit: 16000,
+                    calls_used: 5000,
+                    usage_percent: 31.0,
+                    quota_exhausted: false,
+                    reset_at: "2026-06-20T23:09:30".into(),
+                    reset_at_display: "23:09".into(),
+                    seconds_until_reset: 2194080,
+                    reset_label: String::new(),
+                    usage_status_desc: "hidden window".into(),
+                },
+            ],
+            ..blank_status_response()
+        };
+        let out = status_only_report(s).render();
+        assert!(out.contains("visible window"), "show_enable=1 window missing: {}", out);
+        assert!(!out.contains("hidden window"), "show_enable=0 window must not render: {}", out);
+        assert!(!out.contains("23:09"), "hidden window reset_at must not appear: {}", out);
+    }
+
     /// Locked models (plan_available=false on a higher tier) must
-    /// surface in the rendered report with a distinctive `✗` prefix
+    /// surface in the rendered report with a distinctive `×` prefix
     /// + the explicit "(requires Pro plan or higher)" suffix, the whole row
     /// wrapped in SGR 31 (terminal-theme red), and appended to the
     /// same `Added N provider(s)` bullet list as the available models
@@ -2227,11 +2615,11 @@ mod tests {
     /// Three layered signals — colour, prefix glyph, suffix text —
     /// because each can fail independently:
     ///   * SGR 31 only fires when the renderer's sanitizer keeps SGR
-    ///     (alt_screen, plain) — retained's strict strip pathway
-    ///     drops the colour but the glyph + text still carry the
-    ///     meaning.
-    ///   * The `✗` glyph relies on font support (every common
-    ///     terminal font has it; this is the strongest of the three).
+    ///     (plain) — retained's strict strip pathway drops the colour
+    ///     but the glyph + text still carry the meaning.
+    ///   * The `×` glyph (U+00D7 MULTIPLICATION SIGN) is Latin-1 and
+    ///     present in every terminal font (unlike U+2717 ✗ which is
+    ///     missing from macOS Terminal.app's default font).
     ///   * The "(requires Pro plan or higher)" suffix is plain ASCII / CJK
     ///     and survives even font-fallback-tofu rendering.
     ///
@@ -2277,13 +2665,13 @@ mod tests {
         assert!(out.contains("(CodingPlan Lite)"), "claim row must show tier:\n{out}");
         // Available model: standard provider line.
         assert!(out.contains("AtomGit") && out.contains("lite/foo"));
-        // Locked model: `✗` prefix immediately before the name, plus
+        // Locked model: `×` prefix immediately before the name, plus
         // the explicit `(requires Pro plan or higher)` suffix, all wrapped
         // in SGR 31 (red fg) → SGR 39 (default fg) so the terminal
         // renders the whole row in the theme's red.
         assert!(
-            out.contains("\x1b[31m✗ max/super-secret"),
-            "locked model must open with SGR 31 + ✗ prefix:\n{out}"
+            out.contains("\x1b[31m× max/super-secret"),
+            "locked model must open with SGR 31 + × prefix:\n{out}"
         );
         assert!(out.contains("(requires Pro plan or higher)\x1b[39m"));
         // Strikethrough is intentionally NOT used (SGR 9 was eaten by

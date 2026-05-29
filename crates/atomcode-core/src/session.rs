@@ -114,11 +114,16 @@ impl Session {
             return;
         }
 
+        // Primary: filter by the `synthetic` flag — accurate for sessions
+        // written after the field landed. Secondary: bracket-prefix
+        // heuristic (`[Context was compressed]` / `[System meta...]`)
+        // for legacy session files whose messages were saved before the
+        // field existed and so default to `synthetic = false`.
         let first_real_user = self
             .messages
             .iter()
-            .filter(|m| matches!(m.role, Role::User))
-            .find_map(|m| m.text().filter(|t| !is_synthetic_user_text(t)));
+            .filter(|m| matches!(m.role, Role::User) && !m.synthetic)
+            .find_map(|m| m.text().filter(|t| !is_synthetic_user_text_legacy(t)));
 
         if let Some(text) = first_real_user {
             let name: String = text.lines().next().unwrap_or("").chars().take(40).collect();
@@ -140,10 +145,20 @@ impl Session {
 }
 
 fn should_auto_name_session(name: &str) -> bool {
+    // Names starting with `[` are legacy auto-names derived from a
+    // synthetic user message (pre-`Message.synthetic`-field heuristic).
+    // Treat them like default / session-<ts>: candidates for re-naming
+    // once a real user message is found.
     name == "default" || name.starts_with("session-") || name.trim_start().starts_with('[')
 }
 
-fn is_synthetic_user_text(text: &str) -> bool {
+/// Legacy synthetic-message detector kept as a defensive fallback for
+/// session JSONs saved before `Message.synthetic` existed. Such messages
+/// load with `synthetic = false` (serde default), so the bracket-prefix
+/// convention is the only signal we have for them. New code should rely
+/// on the `synthetic` field directly; only `auto_name_from_messages`
+/// retains this heuristic so legacy `/resume` picker titles stay sane.
+fn is_synthetic_user_text_legacy(text: &str) -> bool {
     text.trim_start().starts_with('[')
 }
 

@@ -20,15 +20,11 @@ pub enum InputEvent {
     /// pinned at `[H - footer_rows + 1, H]`).
     Resize(u16, u16),
     /// Mouse scroll wheel. `delta` lines: negative = up (older
-    /// content), positive = down (newer). Only emitted when the
-    /// active renderer has enabled mouse capture (currently
-    /// AltScreenRenderer only — RetainedRenderer relies on host-
-    /// terminal scrollback, PlainRenderer doesn't pin a UI).
+    /// content), positive = down (newer). SGR mouse capture
+    /// (`?1002h` / `?1006h`) is intentionally disabled, so the host
+    /// terminal handles wheel events natively before they reach us
+    /// in practice — this variant survives only as a defensive
+    /// catch-all for terminals that forward wheel ticks outside the
+    /// SGR mouse protocol, and the event-loop arm is a no-op.
     MouseScroll(i32),
-    /// Mouse primary button pressed at terminal cell `(col, row)`.
-    MouseDown { col: u16, row: u16 },
-    /// Mouse drag moved to terminal cell `(col, row)`.
-    MouseDrag { col: u16, row: u16 },
-    /// Mouse primary button released.
-    MouseUp,
 }

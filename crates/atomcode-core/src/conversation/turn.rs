@@ -268,6 +268,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -276,6 +277,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             });
             msgs.push(Message::new(Role::Assistant, &format!("done {}", t)));
         }

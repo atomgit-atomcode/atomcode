@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.1</span>
+    <span class="dhdr-ver">v4.23.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -79,8 +79,7 @@
           <tr><th>命令</th><th>作用</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>/codingplan</code></td><td><strong>推荐</strong> — 一条命令登录 + 申领 AtomGit CodingPlan 免费额度 + 自动根据额度模型列表写好 provider 配置。首次启动最省事的入口</td></tr>
-          <tr><td><code>/login</code></td><td>仅完成 AtomGit OAuth 身份认证,<strong>不动 provider 配置</strong>(给已有 API Key 但想用 <code>/issue</code> 等 AtomGit 集成的用户)</td></tr>
+          <tr><td><code>/login</code></td><td><strong>推荐</strong> — 一条命令完成 AtomGit OAuth + 申领 CodingPlan 免费额度 + 自动根据额度模型列表写好 provider 配置。首次启动最省事的入口;已登录后重跑会幂等地同步最新模型列表。<em>v4.23.3 起 <code>/codingplan</code> 已折进 <code>/login</code>,旧入口已移除</em></td></tr>
           <tr><td><code>/resume</code></td><td>打开会话选择器,恢复任意一个之前的持久化会话(含消息、目录和模型状态)</td></tr>
           <tr><td><code>/session</code></td><td>创建一个全新的、干净的会话</td></tr>
           <tr><td><code>/bg</code></td><td>将当前会话放到后台并打开新的前台会话;子命令: <code>/bg list</code>、<code>/bg &lt;N&gt;</code>、<code>/bg drop &lt;N&gt;</code>、<code>/bg help</code>。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
@@ -176,7 +175,7 @@
           <tr><td><code>/status</code></td><td>显示登录状态、当前 provider、模型、上下文预算、CodingPlan 用量和重置时间</td></tr>
           <tr><td><code>/whoami</code></td><td>显示当前 AtomGit 登录用户的用户名 / 邮箱</td></tr>
           <tr><td><code>/config</code></td><td>显示 <code>~/.atomcode/config.toml</code> 的路径</td></tr>
-          <tr><td><code>/reload</code></td><td>从磁盘热加载 <code>~/.atomcode/config.toml</code>,不需要重启 atomcode 就能让外部修改(或另一个终端的 <code>/codingplan</code> 带来的变更)生效</td></tr>
+          <tr><td><code>/reload</code></td><td>从磁盘热加载 <code>~/.atomcode/config.toml</code>,不需要重启 atomcode 就能让外部修改(或另一个终端的 <code>/login</code> 带来的变更)生效</td></tr>
           <tr><td><code>/language</code></td><td>切换界面语言:自动检测(<code>LC_ALL</code> / <code>LANG</code>)、English、或 简体中文。立即生效并写回 <code>~/.atomcode/config.toml</code></td></tr>
           <tr><td><code>/welcome</code></td><td>重新打开 3 步首次启动向导(欢迎页 → 语言 → 接入方式)。会话非空时会先弹 <code>y/N</code> 二次确认,确认后清屏。语言和默认接入方式都可以从这里再调一次</td></tr>
           <tr><td><code>/logout</code></td><td>清除 AtomGit OAuth token</td></tr>
@@ -198,7 +197,7 @@
       <h2>典型工作流</h2>
 
       <h3>第一次启动 — 一键接入</h3>
-      <pre><code>&gt; /codingplan
+      <pre><code>&gt; /login
   ✔ Logged in as alice (alice, alice@example.com)
   ✔ CodingPlan claimed — CodingPlan Free · expires 2026-05-22 (29d / 30d)
   ✔ 3 models registered as AtomGit-* providers

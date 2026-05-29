@@ -131,11 +131,21 @@ pub fn build_messages(
     // 短距离重读在 keep_recent 保护内又压缩不到。两头不讨好。
     // 正确方案需要更深入设计，不在这里做。
 
-    // Safety: if over 80% (or 60K absolute cap), drop oldest turns.
+    // Safety: if over 80% of budget, drop oldest turns.
     // BUT: skip if cold_summaries exist — that means LLM compression just ran
     // and we're looking at the "keep_full=5" survivor set. Dropping those too
     // would wipe ALL context (the bug that caused sent=0 in audit sessions).
-    let budget_80pct = (token_budget * 80 / 100).min(60000);
+    //
+    // Threshold matches the FINAL BYTE CEILING below (line ~326). Earlier this
+    // line was `min(budget × 80%, 60K)`; the 60K cap is from the pre-1M-context
+    // era and made the drop path fire ~16× sooner than the FINAL BYTE CEILING
+    // on a 1M-window model — turning the LLM-compression main path
+    // (`needs_compression` fires at budget − 13K = 987K on 1M) into a fallback
+    // that almost never ran. User-reported symptom: with `context_window = 1M`
+    // configured, `build_messages` clamped its drop budget to 60K and the
+    // model went blind on conversations that should comfortably fit. See the
+    // 2026-05-27 audit screenshot for the data-flow trace.
+    let budget_80pct = token_budget * 80 / 100;
     let total_tokens: usize = result.iter().map(|m| m.estimate_tokens()).sum();
     let mut dropped_tokens = 0usize;
 
@@ -313,9 +323,9 @@ pub fn build_messages(
     }
 
     // ── FINAL BYTE CEILING (last-line-of-defense) ──
-    // microcompact protects the last 20 messages; the 80% drop cap at
-    // line ~181 skips entirely when `cold_summaries` is populated
-    // (legacy protection against a since-fixed pathology). That
+    // microcompact protects the last 20 messages; the 80% drop path
+    // above skips entirely when `cold_summaries` is populated (legacy
+    // protection against a since-fixed pathology). That
     // leaves the recent window with no byte enforcement, so accumulated
     // mid-sized ToolResults can still blow the budget. Single
     // oldest-first forward pass: condense each ToolResult once only
@@ -467,12 +477,44 @@ pub fn needs_compression(
 /// This operates at MESSAGE level, not turn level, because `turn_tracker`
 /// counts user messages (1 user msg = 1 turn) but a single user message
 /// can produce 15+ LLM calls with 35+ messages.
-pub fn build_compression_content(conv: &Conversation) -> (String, usize) {
-    if conv.messages.len() <= KEEP_MESSAGES {
-        return (String::new(), 0);
-    }
+pub fn build_compression_content(conv: &Conversation, keep_ceiling: usize) -> (String, usize) {
+    // Count-based starting cut: compress everything older than the last
+    // KEEP_MESSAGES. `saturating_sub` (not an early `len <= KEEP_MESSAGES`
+    // bail) because that old guard was a pure *message-count* gate — it let
+    // reasoning-heavy thinking sessions sit at <20 messages yet >>window
+    // tokens (the deepseek-v4 overflow). The token-aware loop below now
+    // drives the decision; we bail at the very end only if nothing needs
+    // dropping (compress_end_idx still 0 after the loop).
+    let mut compress_end_idx = conv.messages.len().saturating_sub(KEEP_MESSAGES);
 
-    let mut compress_end_idx = conv.messages.len() - KEEP_MESSAGES;
+    // ── Token-aware keep-floor ──
+    // KEEP_MESSAGES is a *message-count* floor; on reasoning-heavy thinking
+    // models (deepseek-v4 etc.) the kept tail's `reasoning_content` — which
+    // the API requires echoed back in full and which NO reducer condenses —
+    // can alone exceed the window. So advance the cut FORWARD (drop more old
+    // rounds) until the kept tail fits under `keep_ceiling` tokens. We drop
+    // whole rounds (the only API-legal way to shed echoed reasoning), never
+    // strip reasoning from a kept message. Floor: always keep the final round
+    // so the model still sees its latest action.
+    let last_round_start = conv
+        .messages
+        .iter()
+        .rposition(|m| matches!(m.role, Role::User | Role::Assistant))
+        .unwrap_or(0);
+    while compress_end_idx < last_round_start {
+        let tail_tokens: usize = conv.messages[compress_end_idx..]
+            .iter()
+            .map(|m| m.estimate_tokens())
+            .sum();
+        if tail_tokens <= keep_ceiling {
+            break;
+        }
+        // Advance to the next round boundary (next User/Assistant), bounded
+        // so the final round always survives.
+        compress_end_idx = (compress_end_idx + 1..=last_round_start)
+            .find(|&i| matches!(conv.messages[i].role, Role::User | Role::Assistant))
+            .unwrap_or(last_round_start);
+    }
 
     // ── Pair-preserving snap ──
     // Anthropic API requires every `tool_result` to have its paired
@@ -1284,6 +1326,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: MessageContent::ToolResultRef(big_ref),
+                    synthetic: false,
         };
         // (5 + 10) / 4 + 4 = 7. Pre-fix this was (200000 + 10) / 4 + 4 = 50006.
         assert!(
@@ -1415,6 +1458,167 @@ mod tests {
         assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
         // System prompt must be first
         assert!(matches!(msgs[0].role, Role::System));
+    }
+
+    /// FAITHFUL REPRO + regression guard: same single-turn deepseek-v4 scenario,
+    /// but now with
+    /// the real auto-compression cycle (`maybe_compress_history` in
+    /// agent/mod.rs) simulated after every round — Tier1
+    /// (`compact_old_tool_results_in_place`, keep 3) then Tier2
+    /// (`build_compression_content` + `apply_compression`). This answers the
+    /// question the pure-render repro above cannot: does auto-compaction
+    /// keep the payload under the window?
+    ///
+    /// Hypothesis under test: NO. Compaction drains OLD rounds (reasoning and
+    /// all) into the cold zone, but the keep-floor (last KEEP_MESSAGES=20
+    /// messages ≈ 10 rounds) is preserved at full fidelity — and 10 rounds of
+    /// heavy reasoning_content alone exceed the 128K window. If this asserts
+    /// green, the bug is render-only and compaction already protects prod; if
+    /// red, compaction genuinely cannot bound reasoning-heavy single turns.
+    #[test]
+    fn repro_reasoning_overflow_with_auto_compaction() {
+        use crate::tool::{ToolCall, ToolResult};
+
+        // Mirror maybe_compress_history: single pass, Tier1 then Tier2.
+        fn simulate_compress(conv: &mut Conversation, sys_tokens: usize, budget: usize) {
+            if !needs_compression(conv, sys_tokens, budget) {
+                return;
+            }
+            compact_old_tool_results_in_place(conv, 3);
+            if !needs_compression(conv, sys_tokens, budget) {
+                return;
+            }
+            // Mirror Agent::compaction_keep_ceiling (no tool defs in this test):
+            // window − system − cold-zone − output reserve.
+            let cold_zone: usize = conv.cold_summaries.iter().map(|s| s.len() / 4 + 4).sum();
+            let output_reserve = (budget / 4).clamp(8_000, 16_384);
+            let keep_ceiling = budget
+                .saturating_sub(sys_tokens)
+                .saturating_sub(cold_zone)
+                .saturating_sub(output_reserve)
+                .max(budget / 4);
+            let (content, n) = build_compression_content(conv, keep_ceiling);
+            if !content.is_empty() && n > 0 {
+                conv.apply_compression(n, content);
+            }
+        }
+
+        let window = 128_000usize;
+        let sys = "sys";
+        let sys_tokens = sys.len() / 4 + 4;
+
+        let mut conv = Conversation::new();
+        conv.add_user_message("read the whole repo and explain the architecture");
+
+        for round in 0..15 {
+            let call = ToolCall {
+                id: format!("call_{}", round),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"file_path":"/src/f_{}.rs"}}"#, round),
+            };
+            conv.add_assistant_tool_calls(
+                Some("looking..."),
+                vec![call],
+                Some(&"思考过程".repeat(10_000)),
+            );
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", round),
+                output: "x".repeat(8_000),
+                success: true,
+            });
+            // Auto-compression runs at the TOP of each turn in the real loop.
+            simulate_compress(&mut conv, sys_tokens, window);
+        }
+
+        let (msgs, _stats) = build_messages(&conv, sys, window, "");
+        let total: usize = msgs.iter().map(|m| m.estimate_tokens()).sum();
+
+        assert!(
+            total <= window,
+            "even WITH auto-compaction the payload is {total} tok > {window} \
+             window — the KEEP_MESSAGES=20 keep-floor of reasoning-heavy rounds \
+             can't be compressed (faithful repro of the prod overflow)."
+        );
+    }
+
+    /// Regression for the 1M-ctx drop-too-early bug: with `token_budget`
+    /// = 1_000_000, a ~200K-token conversation should NOT trigger the
+    /// drop-oldest-turns path (200K is comfortably under 80% = 800K).
+    /// Pre-fix the threshold was `min(budget × 80%, 60K)`, so 200K
+    /// > 60K → `dropped_tokens > 0` and the model saw a pruned
+    /// transcript despite the ostensibly huge context window.
+    ///
+    /// Companion to `test_budgeted_drops_oldest_turns_when_over_budget`
+    /// (small budget, drop fires) — together they pin both ends of the
+    /// scaling: drop must fire at the 80% threshold, not at a fixed
+    /// 60K floor.
+    #[test]
+    fn budgeted_does_not_drop_under_80pct_of_1m_budget() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // Build ~200K tokens of conversation: 25 tool results × 8000
+        // tokens each (32000 chars / 4 = 8000). Stays well under 80%
+        // of 1M (= 800K), so no drop should fire.
+        for turn in 0..25 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("call_{}", turn),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"file_path":"/tmp/f_{}.rs"}}"#, turn),
+            };
+            conv.add_assistant_tool_calls(None, vec![call], None);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", turn),
+                output: "x".repeat(32_000),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what?");
+
+        let (_msgs, stats) = build_messages(&conv, "sys", 1_000_000, "");
+        assert_eq!(
+            stats.dropped_tokens, 0,
+            "200K tokens under 1M budget (80%=800K) must not drop \
+             any turns — pre-fix the 60K cap clipped this to 60K and \
+             dropped most of the history despite the 1M window."
+        );
+    }
+
+    /// Companion to the no-drop test above: same 1M budget, but now
+    /// the conversation genuinely exceeds 80% (= 800K). Drop MUST
+    /// fire, otherwise the safety floor is missing.
+    #[test]
+    fn budgeted_drops_when_over_80pct_of_1m_budget() {
+        use crate::tool::{ToolCall, ToolResult};
+        let mut conv = Conversation::new();
+
+        // ~1M tokens of conversation: 32 tool results × ~32K tokens
+        // each (128K chars / 4 = 32K). Total well above 800K.
+        for turn in 0..32 {
+            conv.add_user_message(&format!("task {}", turn));
+            let call = ToolCall {
+                id: format!("call_{}", turn),
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"file_path":"/tmp/f_{}.rs"}}"#, turn),
+            };
+            conv.add_assistant_tool_calls(None, vec![call], None);
+            conv.add_tool_result(ToolResult {
+                call_id: format!("call_{}", turn),
+                output: "x".repeat(128_000),
+                success: true,
+            });
+        }
+        conv.add_user_message("now what?");
+
+        let (msgs, stats) = build_messages(&conv, "sys", 1_000_000, "");
+        assert!(
+            stats.dropped_tokens > 0,
+            "over-800K conversation on 1M budget must trigger the \
+             80% drop floor"
+        );
+        // Latest user message must still survive (HARD FLOOR invariant).
+        assert_eq!(msgs.last().unwrap().text(), Some("now what?"));
     }
 
     #[test]
@@ -1572,6 +1776,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -1580,6 +1785,7 @@ mod tests {
                     output: format!("first line for {}\n{}", name, "x".repeat(4_000)),
                     success: *success,
                 }),
+                            synthetic: false,
             });
         }
 
@@ -1839,6 +2045,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -1847,6 +2054,7 @@ mod tests {
                     output: format!("[elapsed: 0.0s, exit: 0]\n{}", "p".repeat(4_000)),
                     success: true,
                 }),
+                            synthetic: false,
             });
         }
 
@@ -1866,6 +2074,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             });
             msgs.push(Message {
                 role: Role::Tool,
@@ -1874,6 +2083,7 @@ mod tests {
                     output: format!("[elapsed: 0.0s, exit: 0]\n{}", "c".repeat(4_000)),
                     success: true,
                 }),
+                            synthetic: false,
             });
         }
 
@@ -2026,8 +2236,11 @@ mod tests {
 
         // Cold zone should have 1 entry
         assert_eq!(conv.cold_summaries.len(), 1);
-        // Messages should be reduced (first 3 turns removed)
-        assert_eq!(conv.turn_tracker.turns.len(), 5); // 8 - 3
+        // Messages reduced, but the first real User message (task 0) is
+        // carved out and preserved by apply_compression's sacred-set logic
+        // (af3d1ac7), so it survives as its own turn alongside tasks 3-7:
+        // task0 + task3,4,5,6,7 = 6 turns (not a clean 8 - 3 = 5).
+        assert_eq!(conv.turn_tracker.turns.len(), 6);
 
         // Budget check: cold zone should appear in output
         let (msgs, _stats) = build_messages(&conv, "sys", 100000, "");
@@ -2212,6 +2425,7 @@ mod tests {
                     output: "some output".to_string(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message::new(Role::User, "hello"),
         ];
@@ -2240,6 +2454,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2248,6 +2463,7 @@ mod tests {
                     output: "ok".to_string(),
                     success: true,
                 }),
+                            synthetic: false,
             },
         ];
         sanitize_messages(&mut msgs);
@@ -2291,6 +2507,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2299,6 +2516,7 @@ mod tests {
                     output: "ok1".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2307,6 +2525,7 @@ mod tests {
                     output: "ok2".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             // c3 result MISSING — the source of the 400.
             Message::new(Role::User, "second"),
@@ -2346,6 +2565,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2354,6 +2574,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             // a2 missing.
             Message {
@@ -2368,6 +2589,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2376,6 +2598,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
         ];
         sanitize_messages(&mut msgs);
@@ -2417,6 +2640,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2425,6 +2649,7 @@ mod tests {
                     output: "ok".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             // c2 missing, conversation ends here.
         ];
@@ -2462,6 +2687,7 @@ mod tests {
                     reasoning_content: None,
                     thinking_blocks: Vec::new(),
                 },
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2470,6 +2696,7 @@ mod tests {
                     output: "ok1".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message {
                 role: Role::Tool,
@@ -2478,6 +2705,7 @@ mod tests {
                     output: "ok2".into(),
                     success: true,
                 }),
+                            synthetic: false,
             },
             Message::new(Role::Assistant, "done"),
             Message::new(Role::User, "second"),
@@ -2608,6 +2836,7 @@ mod tests {
                         reasoning_content: None,
                         thinking_blocks: Vec::new(),
                     },
+                                    synthetic: false,
                 });
                 msgs.push(Message {
                     role: Role::Tool,
@@ -2616,6 +2845,7 @@ mod tests {
                         output: "x".repeat(1000),
                         success: true,
                     }),
+                                    synthetic: false,
                 });
             }
             msgs
@@ -2749,7 +2979,7 @@ mod tests {
         // Now query the real fn. Fix guarantees the cut index points at
         // a position that is NOT a ToolResult (advanced past trailing
         // ToolResults so no orphan survives).
-        let (_summary, actual_cut) = build_compression_content(&conv);
+        let (_summary, actual_cut) = build_compression_content(&conv, usize::MAX);
 
         if actual_cut < conv.messages.len() {
             let first_survivor = &conv.messages[actual_cut];
@@ -2809,7 +3039,7 @@ mod tests {
             .iter()
             .map(|m| m.estimate_tokens())
             .sum();
-        let (_mechanical_summary, remove_count) = build_compression_content(&conv);
+        let (_mechanical_summary, remove_count) = build_compression_content(&conv, usize::MAX);
         assert!(remove_count > 0, "test conversation should be compressible");
 
         conv.apply_compression(remove_count, "expanded summary ".repeat(2_000));

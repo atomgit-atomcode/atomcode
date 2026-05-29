@@ -88,7 +88,25 @@
   .install-tab .ind{font-size:10px;color:var(--green);opacity:0;transition:opacity .2s}
   .install-tab.active .ind{opacity:1}
   .install-body{padding:18px 18px 14px;position:relative}
-  .install-cmd{font-size:13px;color:#e8e8e8;white-space:pre;overflow-x:auto;line-height:1.5}
+  /* `pre-wrap` + `break-word` lets long install URLs (Windows
+     `irm https://…/install.ps1 | iex` is ~94 chars vs ~520 px
+     container) wrap visually instead of triggering Windows' chunky
+     10-12 px default horizontal scrollbar. JS copy uses the
+     underlying string verbatim, so the wrap is purely visual.
+     `overflow-x:auto` + the thin scrollbar style below stay as a
+     belt-and-suspenders for any pathological token that's longer
+     than the container with no break-opportunity. */
+  /* `overflow-y:hidden` explicit: when only `overflow-x:auto` is
+     set, CSS spec promotes the default `overflow-y:visible` to
+     `auto` (can't mix visible with non-visible on the other axis),
+     which silently spawned a vertical scrollbar on any sub-pixel
+     content overhang. Also zero the default `<pre>` margin so the
+     element fits its container snugly. */
+  .install-cmd{font-size:13px;color:#e8e8e8;white-space:pre-wrap;word-break:break-word;overflow-x:auto;overflow-y:hidden;margin:0;line-height:1.5;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent}
+  .install-cmd::-webkit-scrollbar{height:6px}
+  .install-cmd::-webkit-scrollbar-track{background:transparent}
+  .install-cmd::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:3px}
+  .install-cmd::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.3)}
   .install-cmd .accent{color:var(--accent)}
   .install-cmd .str{color:#9ecbff}
   .install-cmd .com{color:rgba(255,255,255,.4)}
@@ -551,7 +569,7 @@
   <a class="hdr-logo" href="#top">
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span data-scramble>AtomCode</span>
-    <span class="ver" id="verBadge" title="当前版本">v4.23.1</span>
+    <span class="ver" id="verBadge" title="当前版本">v4.23.3</span>
   </a>
   <nav class="hdr-nav" id="hdrNav">
     <a href="#features" data-section="features" data-i18n="nav.features">功能</a>
@@ -874,7 +892,7 @@
           <div class="wiz-body">
             <div class="wiz-step active" data-step="1">
               <div class="tt" data-i18n="wiz.s1.tt">第 1/3 步 · 欢迎</div>
-              <div class="qq" data-i18n="wiz.s1.qq">版本 v4.23.1 · 在终端里运行的 AI 编程代理</div>
+              <div class="qq" data-i18n="wiz.s1.qq">版本 v4.23.3 · 在终端里运行的 AI 编程代理</div>
               <ul class="intro-list">
                 <li data-i18n="wiz.s1.b1">多步骤 agent loop · 内置代码图工具</li>
                 <li data-i18n="wiz.s1.b2">兼容所有 OpenAI 风格 API</li>
@@ -931,7 +949,7 @@ try{
   else LANG=(navigator.language||'').toLowerCase().startsWith('zh')?'zh':'en';
 }catch(e){}
 
-const VERSION='v4.23.1';
+const VERSION='v4.23.3';
 
 const T={
   'nav.features':{zh:'功能',en:'Features'},
