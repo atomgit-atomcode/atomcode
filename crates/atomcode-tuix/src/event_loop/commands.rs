@@ -661,6 +661,14 @@ pub(super) fn execute_slash_command(
         "memory" => {
             ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
         }
+        "webui" => {
+            let msg = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(atomcode_daemon::ensure_server_and_open(13456))
+            });
+            renderer.render(UiLine::CommandOutput(msg));
+            renderer.flush();
+        }
         "login" => {
             run_login_flow(renderer, ctx)?;
         }

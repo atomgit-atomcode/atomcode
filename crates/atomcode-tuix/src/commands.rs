@@ -70,6 +70,7 @@ impl CommandRegistry {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
+    Command { name: "webui",   desc: "Launch the browser webui", needs_args: false },
     Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false },
     Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
@@ -130,6 +131,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
 pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
     use crate::i18n::{t, Msg};
     let msg = match name {
+        "webui" => Msg::CmdDescWebui,
         "setup" => Msg::CmdDescSetup,
         "resume" => Msg::CmdDescResume,
         "rename" => Msg::CmdDescRename,

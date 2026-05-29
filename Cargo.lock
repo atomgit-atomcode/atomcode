@@ -304,6 +304,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "atomcode-core",
+ "atomcode-daemon",
  "atomcode-telemetry",
  "base64",
  "crossterm",

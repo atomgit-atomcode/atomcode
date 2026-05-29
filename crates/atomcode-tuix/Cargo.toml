@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 atomcode-core = { path = "../atomcode-core" }
+atomcode-daemon = { path = "../atomcode-daemon" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }

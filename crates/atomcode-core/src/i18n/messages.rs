@@ -491,6 +491,7 @@ pub enum Msg<'a> {
     SetupAutoReloaded { skills: usize, warnings: usize },
 
     // ── Command descriptions (for help_text dynamic lookup) ──
+    CmdDescWebui,
     CmdDescSetup,
     CmdDescResume,
     CmdDescRename,

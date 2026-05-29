@@ -696,6 +696,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("✓ Setup complete, auto-reloaded: {skills} skill(s), {warnings} warning(s)").into(),
 
         // ── Command descriptions ──
+        Msg::CmdDescWebui => "Launch the browser webui".into(),
 Msg::CmdDescSetup =>
 "Scan project, install seeds, and run setup skill [hooks|mcp|skills|all]".into(),
         Msg::CmdDescResume => "Resume a previous session".into(),
