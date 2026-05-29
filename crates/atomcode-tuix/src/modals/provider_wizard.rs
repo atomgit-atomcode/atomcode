@@ -373,7 +373,9 @@ fn handle_key(
         // ── Text-input states: Enter submits, chars edit buf, others pass through Buffer. ──
         ProviderWizard::Add { step, mut draft, total } => {
             if matches!(code, KeyCode::Enter) {
-                let answer = buf.text.clone();
+                // Expand any folded `[Pasted #N …]` placeholder so the
+                // Template step parses the real pasted content.
+                let answer = buf.expanded_text();
                 // Don't echo the raw paste back for the (multi-line) template
                 // step — `advance_add` prints a "Detected:" summary instead.
                 if !matches!(step, WizardStep::Template) {
@@ -434,7 +436,7 @@ fn handle_key(
             mut draft,
         } => {
             if matches!(code, KeyCode::Enter) {
-                let answer = buf.text.clone();
+                let answer = buf.expanded_text();
                 push(
                     renderer,
                     &format!(
@@ -1118,6 +1120,25 @@ mod tests {
         assert_eq!(p.url.as_deref(), Some("https://api.anthropic.com/v1/messages"));
         assert_eq!(p.api_key.as_deref(), Some("sk-ant-123"));
         assert_eq!(p.model.as_deref(), Some("claude-opus-4"));
+    }
+
+    #[test]
+    fn parse_template_python_requests_snippet() {
+        // Real-world paste: a Python `requests` example. The `Authorization`
+        // header puts it in curl mode; URL / Bearer key / model still resolve.
+        let input = r#"import requests
+API_URL = "https://api-ai.gitcode.com/v1/chat/completions"
+headers = {
+    "Authorization": f"Bearer MWtoCL7zchAZpQGssV6uDdRE",
+}
+chunks = query({
+    "model": "deepseek-ai/DeepSeek-R1",
+    "stream": True,
+})"#;
+        let p = parse_template(input);
+        assert_eq!(p.url.as_deref(), Some("https://api-ai.gitcode.com/v1/chat/completions"));
+        assert_eq!(p.api_key.as_deref(), Some("MWtoCL7zchAZpQGssV6uDdRE"));
+        assert_eq!(p.model.as_deref(), Some("deepseek-ai/DeepSeek-R1"));
     }
 
     #[test]
