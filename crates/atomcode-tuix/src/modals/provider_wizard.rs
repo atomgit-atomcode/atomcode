@@ -1016,7 +1016,22 @@ fn is_placeholder(value: &str) -> bool {
     if v.is_empty() {
         return true;
     }
+    // Shell / env variable reference: `$OPENROUTER_API_KEY`, `${API_KEY}`.
+    if v.starts_with('$') {
+        return true;
+    }
+    // Angle-bracket placeholder: `<API_KEY>`, `<your-key-here>`.
     if v.starts_with('<') && v.ends_with('>') {
+        return true;
+    }
+    // Bare env-var-style name: `OPENROUTER_API_KEY`, `INSERT_TOKEN_HERE`
+    // (all-caps + underscores, mentioning key/token/secret). Real keys are
+    // mixed-case and rarely use this shape.
+    if v.contains('_')
+        && v.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && (v.contains("KEY") || v.contains("TOKEN") || v.contains("SECRET"))
+    {
         return true;
     }
     let lower = v.to_ascii_lowercase();
@@ -1208,6 +1223,36 @@ chunks = query({
     fn is_placeholder_accepts_real_key() {
         assert!(!is_placeholder("sk-ant-abc123def456"));
         assert!(!is_placeholder("9f8c7b6a5"));
+        assert!(!is_placeholder("MWtoCL7zchAZpQGssV6uDdRE"));
+    }
+
+    #[test]
+    fn is_placeholder_detects_shell_var() {
+        assert!(is_placeholder("$OPENROUTER_API_KEY"));
+        assert!(is_placeholder("${OPENROUTER_API_KEY}"));
+        assert!(is_placeholder("$API_KEY"));
+    }
+
+    #[test]
+    fn is_placeholder_detects_env_var_name() {
+        assert!(is_placeholder("OPENROUTER_API_KEY"));
+        assert!(is_placeholder("INSERT_TOKEN_HERE"));
+    }
+
+    #[test]
+    fn advance_template_drops_shell_var_key_and_asks() {
+        let input = r#"curl https://openrouter.ai/api/v1/chat/completions \
+  -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+  -d '{"model":"stepfun/step-3.7-flash"}'"#;
+        let mut d = DraftProvider::default();
+        let existing = std::collections::HashMap::new();
+        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
+        let next = advance_template(&mut d, input, &existing, &mut sink);
+        assert_eq!(d.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(d.model, "stepfun/step-3.7-flash");
+        assert!(d.api_key.is_empty(), "shell-var key must be dropped, got {:?}", d.api_key);
+        assert_eq!(d.name, "openrouter");
+        assert_eq!(next, Some(WizardStep::ApiKey));
     }
 
     #[test]
