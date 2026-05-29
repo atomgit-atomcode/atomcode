@@ -36,6 +36,15 @@ echo "Target: ${TARGET}"
 echo "Architecture: ${ARCH}"
 echo ""
 
+# Build the embedded webui frontend so the binary embeds the latest UI.
+if [ -d webui ] && command -v npm >/dev/null 2>&1; then
+  echo "Building webui frontend..."
+  (cd webui && npm ci && npm run build)
+else
+  echo "warning: skipping webui build (npm not found or webui/ missing); using committed webui/dist" >&2
+fi
+echo ""
+
 # Build
 echo "[1/2] Building ${TARGET} (native)..."
 cargo build --release --target "$TARGET"

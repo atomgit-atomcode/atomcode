@@ -38,3 +38,18 @@ the binary at build time via `rust-embed` (see
 `crates/atomcode-daemon/src/webui.rs`). After changing frontend code, run
 `npm run build` and commit the updated `dist/` so the embedded bundle stays in
 sync.
+
+## Build artifacts
+
+`webui/dist/` is **intentionally committed** to the repository. This allows
+`cargo build` to produce a working binary in any environment without requiring a
+Node.js / npm toolchain — the embedded UI is always available from the committed
+snapshot.
+
+The release scripts (`scripts/release.sh`, `scripts/release-daemon.sh`,
+`scripts/build-official.sh`, `scripts/linux-release-linux.sh`,
+`scripts/macos-release-linux.sh`, `scripts/macos-release-windows.sh`) each
+rebuild `webui/dist/` via `npm ci && npm run build` before invoking `cargo
+build`, so release binaries always embed the latest frontend. If `npm` is not
+available in the build environment, the scripts fall back to the committed
+`webui/dist/` with a warning rather than failing.
