@@ -12,6 +12,7 @@ mod api_config;
 mod api_provider;
 mod telemetry_scope;
 pub mod auth_token;
+pub mod webui;
 
 pub(crate) use telemetry_scope::daemon_scope;
 
@@ -2870,6 +2871,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/auth/logout", post(api_auth::auth_logout))
         // CodingPlan API (P0)
         .route("/codingplan/setup", post(api_codingplan::codingplan_setup))
+        // WebUI static assets + SPA fallback (Task 3/4)
+        .route("/", axum::routing::get(webui::serve_webui))
+        .fallback(webui::serve_webui)
         .with_state(state)
         .layer(axum::middleware::from_fn(activity_tracker_middleware))
         .layer(axum::Extension(last_activity.clone()))
