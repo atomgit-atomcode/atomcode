@@ -11,6 +11,7 @@ mod api_codingplan;
 mod api_config;
 mod api_provider;
 mod telemetry_scope;
+pub mod auth_token;
 
 pub(crate) use telemetry_scope::daemon_scope;
 
