@@ -1234,10 +1234,11 @@ impl TurnRunner {
         // payloads recover first) but BEFORE approval — the unrecoverable
         // remainder is what gets bounced.
         if let Err(reason) = tool.validate_args(&call.arguments) {
-            let msg = format!(
-                "Error: {}. Re-issue {} with a complete JSON object containing all required fields.",
-                reason, call.name
-            );
+            // `reason` already comes from `diagnose_args` (or a sibling
+            // helper) carrying a "Re-issue: <example>" tail. Appending
+            // another "Re-issue {tool} with..." here produced the
+            // double-Re-issue the user saw on the failed WriteFile call.
+            let msg = format!("Error: {}", reason);
             let _ = event_tx.send(TurnEvent::ToolCallResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -1399,9 +1400,14 @@ impl TurnRunner {
         // bash) finish fast enough that interrupting them mid-execution
         // is acceptable — user pressed Ctrl+C knowing they want to stop.
         let start = Instant::now();
+        crate::ctrace!("RNR", "execute_single_tool start name={} cancel_already={}", call.name, cancel.is_cancelled());
         let result = tokio::select! {
-            r = tool.execute(&final_args, &self.context) => r,
+            r = tool.execute(&call.arguments, &self.context) => {
+                crate::ctrace!("RNR", "execute_single_tool tool returned name={} elapsed_ms={} cancel_now={}", call.name, start.elapsed().as_millis(), cancel.is_cancelled());
+                r
+            },
             _ = cancel.cancelled() => {
+                crate::ctrace!("RNR", "execute_single_tool cancel branch fired name={} elapsed_ms={}", call.name, start.elapsed().as_millis());
                 // Clean up event sender
                 self.context.event_tx = None;
                 self.context.current_call_id = None;

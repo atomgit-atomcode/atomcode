@@ -428,7 +428,7 @@ async fn snapshot_workspace_changes(
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = crate::process_utils::decode_subprocess_output(&out.stdout);
     let mut set = std::collections::HashSet::new();
     for line in text.lines() {
         // `git status --porcelain` format: `XY <path>` (2-char status + space
@@ -670,7 +670,8 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
-                            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let chunk =
+                                crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stdout_buf.extend_from_slice(&buf[..n]);
                             has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
                             // Send real-time output chunk
@@ -692,7 +693,8 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
                     match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => {
-                            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let chunk =
+                                crate::process_utils::decode_subprocess_output(&buf[..n]);
                             stderr_buf.extend_from_slice(&buf[..n]);
                             has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
                             // Send real-time output chunk (stderr marked with prefix)
@@ -735,8 +737,8 @@ async fn bash_execute(args: &str, ctx: &ToolContext) -> Result<ToolResult> {
     })
     .await;
 
-    let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
-    let stderr_str = String::from_utf8_lossy(&stderr_buf).to_string();
+    let stdout_str = crate::process_utils::decode_subprocess_output(&stdout_buf);
+    let stderr_str = crate::process_utils::decode_subprocess_output(&stderr_buf);
 
     // Commands with & (backgrounded processes) may return non-zero even on success.
     // pkill returns 1 when no process matched. These shouldn't be marked as failures.

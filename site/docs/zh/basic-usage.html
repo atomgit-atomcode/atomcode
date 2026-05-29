@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.2</span>
+    <span class="dhdr-ver">v4.23.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -208,7 +208,7 @@ atomcode --config ./custom.toml</code></pre>
       <p>当前 active provider 不支持图片输入(比如 DeepSeek-V3 / Kimi 等纯文本模型)时,AtomCode 不会直接拒绝,而是会自动调用一个独立的 <strong>VL preprocessor</strong>(视觉模型,比如 Qwen3-VL / GLM-4V)对图片做 OCR + 描述,把结果作为文本 splice 到用户消息里再发给主模型。这样无论主模型支不支持图片,你都能"贴张截图问问题"。</p>
       <ul>
         <li>preprocessor 用哪个模型?由配置文件里的 <code>vision_preprocessor_provider</code> 决定 — 详见 <a href="./configuration.html#vision-preprocessor">配置文件 · 视觉预处理器</a>。</li>
-        <li><code>/codingplan</code> 流程会自动从模型列表里挑一个 VL/OCR 模型自动设置进去。</li>
+        <li><code>/login</code> 流程会自动从模型列表里挑一个 VL/OCR 模型自动设置进去。</li>
         <li>VL 调用使用<strong>无进展超时</strong>(idle timeout):只要 stream 持续吐 chunk,不限总时长;30 秒没动静才算超时。失败时会以 <em>VL 预处理失败</em> 的警告呈现,图片识别失败但消息照常发。</li>
       </ul>
       <div class="callout callout-tip">

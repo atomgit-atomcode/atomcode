@@ -1,6 +1,64 @@
 // crates/atomcode-tuix/src/width.rs
+use std::sync::OnceLock;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
+
+/// One-shot probe for "use `width_cjk` for ambiguous codepoints?"
+///
+/// `width_cjk` widens East Asian Ambiguous codepoints (◆ ○ ⓘ ✓ × → •, the
+/// box-drawing block, …) from 1 col to 2 cols. The choice has to match
+/// what the user's terminal *actually paints*; getting it wrong leaves
+/// our cell model and the host's rendering off by 1 col per ambiguous
+/// char and downstream cell-diff patches land in the wrong column.
+///
+/// Detection history:
+///
+///   * `LC_ALL`/`LANG` starting with `zh`/`ja`/`ko`/`yue` voted yes —
+///     dropped in 6a1d42e8 after a macOS Terminal.app + `LANG=zh_CN.UTF-8`
+///     user reported `●ddeepwiki__ask_question` char-duplication.
+///     POSIX locale describes text encoding, not rendering geometry.
+///
+///   * Windows `GetACP() ∈ {936, 950, 932, 949}` voted yes on the
+///     assumption (from 6d950270) that conhost in a CJK code page paints
+///     ambiguous at 2 cols. Empirically wrong for the conhost / ConPTY
+///     combo shipping in current Win10/Win11: they paint ambiguous at 1
+///     col regardless of ACP. Forcing `width_cjk` on creates the
+///     symmetric mismatch (model wider than reality) and shows up as
+///     2x-stretched markdown table borders on every Windows host
+///     (cmd / pwsh / VSCode pwsh) and Pondering-spinner left/right
+///     shake on pwsh + ConPTY paths where the cell-diff patches land
+///     1 col off ConPTY's screen buffer. Dropped here.
+///
+/// Final rule: pure opt-in.
+///   * `ATOMCODE_CJK_WIDTH=1` / `=true` → width_cjk on. For users whose
+///     terminal really does paint ambiguous at 2 cols (vintage conhost
+///     configs, specific font/rendering setups, terminal vt mode flags).
+///   * Anything else (default) → off. Matches every modern terminal we
+///     know of: macOS Terminal.app, iTerm2, alacritty, kitty, wezterm,
+///     Windows Terminal, current Win10/Win11 conhost & ConPTY, VSCode
+///     integrated terminal.
+fn is_cjk_locale() -> bool {
+    static CJK: OnceLock<bool> = OnceLock::new();
+    *CJK.get_or_init(|| {
+        std::env::var("ATOMCODE_CJK_WIDTH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Display width of a single code point as our cells should model it. Wraps
+/// `UnicodeWidthChar::width`/`width_cjk` and picks the CJK variant when
+/// [`is_cjk_locale`] votes yes so East Asian Ambiguous codepoints (`◆`,
+/// `○`, `ⓘ`, `✓`, `×`, …) report 2 cols — matching what the user's
+/// terminal actually paints. Keeping model and host on the same width
+/// rule is what stops the direct-write / cell-diff drift described above.
+pub(crate) fn cell_char_width(ch: char) -> Option<usize> {
+    if is_cjk_locale() {
+        UnicodeWidthChar::width_cjk(ch)
+    } else {
+        UnicodeWidthChar::width(ch)
+    }
+}
 
 /// Display width of a single user-perceived character (grapheme cluster).
 ///
@@ -31,10 +89,10 @@ pub(crate) fn cluster_width(g: &str) -> usize {
         return 0;
     };
     if iter.clone().next().is_none() {
-        return UnicodeWidthChar::width(first).unwrap_or(0);
+        return cell_char_width(first).unwrap_or(0);
     }
     let mut has_emoji_marker = false;
-    let mut max_w = UnicodeWidthChar::width(first).unwrap_or(0);
+    let mut max_w = cell_char_width(first).unwrap_or(0);
     for c in std::iter::once(first).chain(iter) {
         match c {
             '\u{200D}' | '\u{FE0F}' => has_emoji_marker = true,
@@ -42,7 +100,7 @@ pub(crate) fn cluster_width(g: &str) -> usize {
             '\u{1F1E6}'..='\u{1F1FF}' => has_emoji_marker = true,
             _ => {}
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = cell_char_width(c).unwrap_or(0);
         if w > max_w {
             max_w = w;
         }

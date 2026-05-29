@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.2</span>
+    <span class="dhdr-ver">v4.23.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -228,7 +228,7 @@ base_url = "https://api.siliconflow.cn/v1"</code></pre>
       <ul>
         <li>这里的 <code>qwen-vl</code> 必须是 <code>[providers.*]</code> 里已经定义过的 key,且对应的模型支持视觉输入(常见的有 <code>Qwen3-VL-*</code> / <code>GLM-4V-*</code> / <code>claude-3+</code> / <code>gpt-4o</code> / <code>gemini-*</code> 等)。</li>
         <li>当前 active provider 自身就支持图片时,<strong>不会</strong>走预处理器,直接发原始图片字节。</li>
-        <li><code>/codingplan</code> 流程会从下发的模型列表中自动挑选一个 VL/OCR 模型并写入这个字段(可在事后手动覆盖)。</li>
+        <li><code>/login</code> 流程会从下发的模型列表中自动挑选一个 VL/OCR 模型并写入这个字段(可在事后手动覆盖)。</li>
         <li>VL 调用使用<strong>无进展超时</strong>(idle timeout):只要 stream 持续吐 chunk 不限总时长;30 秒没动静才超时。失败时主模型仍会收到带 "图片识别失败" 标记的消息,而不是静默吞掉。</li>
       </ul>
       <p>用法层面的细节参见 <a href="./basic-usage.html#image-attach">基本使用 · 图片附件 / 截图</a>。</p>

@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.2</span>
+    <span class="dhdr-ver">v4.23.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -228,7 +228,7 @@ base_url = "https://api.siliconflow.cn/v1"</code></pre>
       <ul>
         <li><code>qwen-vl</code> must be an existing key under <code>[providers.*]</code>, and its model must support vision input (common ones: <code>Qwen3-VL-*</code> / <code>GLM-4V-*</code> / <code>claude-3+</code> / <code>gpt-4o</code> / <code>gemini-*</code>).</li>
         <li>When the active provider can already see images, the preprocessor is <strong>skipped</strong> — the raw image bytes are sent directly.</li>
-        <li>The <code>/codingplan</code> flow auto-picks a VL/OCR model from the granted model list and writes this field for you (you can override afterwards).</li>
+        <li>The <code>/login</code> flow auto-picks a VL/OCR model from the granted model list and writes this field for you (you can override afterwards).</li>
         <li>VL calls use an <strong>idle timeout</strong>: no total cap as long as the stream keeps producing chunks; the request times out after 30 seconds with no activity. On failure the main model still receives a "vision recognition failed" notice rather than a silent drop.</li>
       </ul>
       <p>For usage-level details see <a href="./basic-usage.html#image-attach">Basic Usage · Image attachments / screenshots</a>.</p>

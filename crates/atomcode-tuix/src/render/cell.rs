@@ -99,6 +99,34 @@ impl Cell {
             width: 0,
         }
     }
+
+    /// Sentinel value used only inside `prev_cells` after an invalidate.
+    /// Picked so it can never `==` any cell produced by `push_str_cells` /
+    /// `push_str_cells_sgr` (which never push U+FFFF — the Unicode
+    /// non-character reserved by the standard precisely for in-process
+    /// use like this). Forcing the diff to see "every cell differs" after
+    /// an invalidate means `serialize_patches` re-emits every position in
+    /// the row, including the space cells that previously matched
+    /// `Cell::blank()` and went unpatched. That last branch was the
+    /// orphan-cell leak source: `emit_body_line_inner` did a direct write
+    /// using one width model, the follow-up cell-diff used a slightly
+    /// different one (East Asian Ambiguous wobble on conhost), and the
+    /// space cells the diff skipped left the direct write's stale content
+    /// visible — looked like char-doubling on win10+pwsh7 + zh_CN.
+    ///
+    /// Cost: every invalidated row pays ~1 extra patch per blank trailing
+    /// cell. `serialize_patches`' run-packing folds those into a single
+    /// CUP+space-run, so the wire cost is bounded by the row width, not
+    /// the cell count. Worth it — width-mismatch bugs degrade to "wrong
+    /// glyph in one cell" instead of "every space gets the previous
+    /// char", which is much easier to live with.
+    pub fn sentinel() -> Self {
+        Self {
+            ch: '\u{FFFF}',
+            style: CellStyle::default(),
+            width: 1,
+        }
+    }
 }
 
 /// Fixed soft-tab width — `\t` expands to this many spaces when a
@@ -137,7 +165,7 @@ pub fn push_str_cells(row: &mut Vec<Cell>, s: &str, style: &CellStyle) {
             }
             continue;
         }
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        let w = crate::width::cell_char_width(ch).unwrap_or(1);
         if w == 0 {
             // Zero-width (combining marks, control chars). Caller has
             // already scrubbed real controls; skip here rather than
@@ -213,7 +241,7 @@ pub fn push_str_cells_sgr(
             }
             continue;
         }
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        let w = crate::width::cell_char_width(ch).unwrap_or(1);
         if w == 0 {
             continue;
         }

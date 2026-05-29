@@ -201,23 +201,30 @@ pub async fn run(
         .ok()
         .filter(|v| !v.is_empty())
         .is_some();
-    let _force_retain = std::env::var("ATOMCODE_RETAIN")
+    let force_retain_env = std::env::var("ATOMCODE_RETAIN")
         .ok()
         .filter(|v| !v.is_empty())
         .is_some();
     // Phase 6 routing matrix (append-only retained renderer):
     //   ATOMCODE_PLAIN=1   → PlainRenderer (user opt-in, CI-style baseline)
+    //   ATOMCODE_RETAIN=1  → RetainedRenderer (override sticky non-TTY probe)
     //   tty                → RetainedRenderer (append-only; no DECSTBM)
     //   non-tty            → PlainRenderer
     //
-    // The append-only RetainedRenderer no longer uses DECSTBM scroll
-    // regions, so the JediTerm and Windows-conhost-mode-2 quirks that
-    // previously demanded a second renderer path no longer apply.
-    // `ATOMCODE_ALT` / `ATOMCODE_RETAIN` are accepted but inert (kept
-    // around briefly so users with the vars exported don't get a hard
-    // error). `ATOMCODE_RETAIN` is bound to `_force_retain` only to
-    // silence the unused-result warning.
+    // `ATOMCODE_RETAIN` exists for hosts where `is_terminal()` lies — the
+    // best-known case is pwsh7 on native Win10 conhost: pwsh wraps stdout
+    // in a ConPTY pipe even when the parent host is plain conhost, so
+    // `std::io::stdout().is_terminal()` returns false. Users see the TUI
+    // collapse into PlainRenderer (no input footer) and raw SGR bytes
+    // leak as `[31m...[0m` (raw-mode → VT processing was never enabled).
+    // Setting ATOMCODE_RETAIN=1 forces the retained path and lets the
+    // raw-mode init call SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    // via crossterm, which fixes both symptoms.
+    //
+    // PLAIN beats RETAIN — if both are set the user explicitly asked for
+    // the cooked-mode baseline.
     let force_plain = force_plain_env;
+    let force_retain = force_retain_env && !force_plain;
 
     // Capture whether stdout was a real TTY BEFORE we mutate caps.
     // PlainRenderer needs this to know whether the kernel will echo
@@ -237,6 +244,16 @@ pub async fn run(
         caps.raw_mode = false;
         caps.bracketed_paste = false;
         caps.tty = false;
+    } else if force_retain {
+        // Flip caps positive so TerminalGuard enables raw mode (→
+        // VT processing on Win), the reader thread spawns, and the
+        // renderer-choice branch picks Retained. If the probe lied
+        // about TTY this corrects it; if it didn't lie, this is a
+        // no-op assignment.
+        caps.tty = true;
+        caps.raw_mode = true;
+        caps.bracketed_paste = true;
+        caps.scroll_region = true;
     }
 
     let (_guard, kbd_enhanced) = TerminalGuard::activate(caps)?;
@@ -547,7 +564,7 @@ pub async fn run(
         plugin_job_tx,
         plugin_job_rx,
         pending_new_issue: None,
-        pending_run_codingplan: false,
+        pending_run_login_setup: false,
         pending_open_provider_wizard: false,
         mcp_registry,
         mcp_connect_rx,

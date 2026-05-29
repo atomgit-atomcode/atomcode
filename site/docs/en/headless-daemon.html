@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.2</span>
+    <span class="dhdr-ver">v4.23.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -230,7 +230,7 @@ atomcode-daemon --host 127.0.0.1 --port 13456 \
           <tr><td><code>POST /auth/login/:login_id/poll</code></td><td>Poll for the login result</td></tr>
           <tr><td><code>DELETE /auth/login/:login_id</code></td><td>Cancel an in-flight login</td></tr>
           <tr><td><code>POST /auth/logout</code></td><td>Log out</td></tr>
-          <tr><td><code>POST /codingplan/setup</code></td><td>Claim CodingPlan and write the provider config (equivalent to the CLI <code>atomcode codingplan</code>)</td></tr>
+          <tr><td><code>POST /codingplan/setup</code></td><td>Claim CodingPlan and write the provider config (equivalent to the CLI <code>atomcode login</code>; <code>atomcode codingplan</code> is kept as a hidden alias)</td></tr>
         </tbody>
       </table>
 

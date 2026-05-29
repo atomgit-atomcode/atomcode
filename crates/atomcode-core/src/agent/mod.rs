@@ -1137,11 +1137,13 @@ impl AgentLoop {
         }
 
         while let Some(cmd) = self.cmd_rx.recv().await {
+            crate::ctrace!("AGT", "outer cmd_rx pop: {:?}", std::mem::discriminant(&cmd));
             match cmd {
                 AgentCommand::SendMessage { text, images, image_markers } => {
                     self.handle_send_message(text, images, image_markers).await;
                 }
                 AgentCommand::Cancel => {
+                    crate::ctrace!("AGT", "outer Cancel -> cancel_token.cancel() (was_cancelled={})", self.cancel_token.is_cancelled());
                     self.cancel_token.cancel();
                     self.subagent_cancel_token.cancel();
                     self.cancel_token = CancellationToken::new();
@@ -1228,7 +1230,7 @@ impl AgentLoop {
                                 if is_auth_gap {
                                     self.turn_runner.provider = std::sync::Arc::from(
                                         crate::provider::unavailable_provider(format!(
-                                            "Provider 凭证不可用：{}。请使用 /login 或 /codingplan 完成配置后再试。",
+                                            "Provider 凭证不可用：{}。请使用 /login 完成配置后再试。",
                                             msg
                                         )),
                                     );
@@ -2390,8 +2392,10 @@ impl AgentLoop {
                         }
 
                         Some(cmd) = cmd_rx.recv() => {
+                            crate::ctrace!("AGT", "inner cmd_rx pop: {:?}", std::mem::discriminant(&cmd));
                             match cmd {
                                 AgentCommand::Cancel => {
+                                    crate::ctrace!("AGT", "inner Cancel -> cancel_token.cancel() (was_cancelled={})", cancel_token.is_cancelled());
                                     cancel_token.cancel();
                                     *cancel_token = CancellationToken::new();
                                 }

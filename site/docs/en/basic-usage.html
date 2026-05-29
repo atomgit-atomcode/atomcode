@@ -16,7 +16,7 @@
     <img src="https://cdn-news.gitcode.com/news/atomcode-icon1.png" alt="AtomCode">
     <span>AtomCode</span>
     <span class="dhdr-badge" data-i18n="badge.docs">DOCS</span>
-    <span class="dhdr-ver">v4.23.2</span>
+    <span class="dhdr-ver">v4.23.3</span>
   </a>
   <div class="dhdr-right">
     <button class="search-trigger" data-open-search data-i18n-aria="aria.search" aria-label="搜索文档">
@@ -208,7 +208,7 @@ atomcode --config ./custom.toml</code></pre>
       <p>When the active provider can't take image input (text-only models like DeepSeek-V3 / Kimi), AtomCode doesn't refuse — it routes the image to a separate <strong>VL preprocessor</strong> (a vision model like Qwen3-VL / GLM-4V) for OCR + description, then splices the result into the user message as text before sending to the main model. So you can "drop a screenshot and ask" regardless of the main model.</p>
       <ul>
         <li>Which model does the preprocessor use? Controlled by <code>vision_preprocessor_provider</code> in the config — see <a href="./configuration.html#vision-preprocessor">Configuration · Vision preprocessor</a>.</li>
-        <li>The <code>/codingplan</code> flow auto-picks a VL/OCR model from the granted list and sets the field for you.</li>
+        <li>The <code>/login</code> flow auto-picks a VL/OCR model from the granted list and sets the field for you.</li>
         <li>VL calls use an <strong>idle timeout</strong>: as long as the stream keeps producing chunks there's no total cap; it only times out after 30 seconds of silence. On failure you get a <em>VL preprocess failed</em> warning — image recognition fails but the message still goes through.</li>
       </ul>
       <div class="callout callout-tip">
