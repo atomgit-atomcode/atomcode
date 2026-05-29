@@ -17,8 +17,7 @@ export type SSEEvent =
   | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string }
   | { type: 'stopped' }
-  | { type: 'error'; message: string }
-  | { type: string; [key: string]: unknown };
+  | { type: 'error'; message: string };
 
 export interface StreamChatBody {
   message: string;
