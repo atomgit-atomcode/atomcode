@@ -44,7 +44,10 @@ use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
-use atomcode_core::turn::permission::{ApprovalRequest, InteractivePermissionDecider};
+use atomcode_core::turn::permission::{
+    ApprovalRequest, AutoPermissionDecider, AutoPermissionMode, InteractivePermissionDecider,
+    PermissionDecider,
+};
 use atomcode_core::turn::runner::TurnRunner;
 use atomcode_telemetry::{
     config::{resolve, ProcessEnv},
@@ -1824,6 +1827,7 @@ async fn chat_stream(
     let mcp_cache = state.mcp_cache.clone();
     let telemetry = state.telemetry.clone();
     let pending_permissions = state.pending_permissions.clone();
+    let webui_mode = state.enforce_token;
 
     // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
     // Use the request's working_dir to detect repo_origin dynamically (not the
@@ -1849,6 +1853,7 @@ async fn chat_stream(
                 mcp_cache,
                 telemetry,
                 pending_permissions,
+                webui_mode,
             )
             .await
             {
@@ -1900,6 +1905,7 @@ async fn process_chat_request(
     mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
     pending_permissions: permission_bridge::PermissionResponders,
+    webui_mode: bool,
 ) -> anyhow::Result<()> {
     use atomcode_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
@@ -2081,16 +2087,31 @@ async fn process_chat_request(
     // `/chat/permission`, which is routed back here via `pending_permissions`.
     // The user-facing notification is the `TurnEvent::ApprovalRequested` event
     // forwarded as a `permission_request` SSE event below.
-    let (perm_req_tx, perm_req_rx) =
-        tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
-    let (perm_resp_tx, perm_resp_rx) =
-        tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
-    let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
-        atomcode_core::tool::PermissionStore::new(),
-    ));
-    pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
-    let permission =
-        Box::new(InteractivePermissionDecider::new(perm_req_tx, perm_resp_rx, perm_store));
+    // Only webui mode has a human approver (the browser) reachable via
+    // POST /chat/permission, so only there do we use the blocking
+    // InteractivePermissionDecider + its register/keep-alive/unregister
+    // plumbing. The standalone daemon (VSCode extension, no browser) has no
+    // approver, so it must keep the prior BypassAll behaviour — otherwise any
+    // tool requiring approval would block the turn forever.
+    let (permission, perm_req_rx): (Box<dyn PermissionDecider>, Option<_>) = if webui_mode {
+        let (perm_req_tx, perm_req_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+        let (perm_resp_tx, perm_resp_rx) =
+            tokio::sync::mpsc::unbounded_channel::<atomcode_core::tool::PermissionDecision>();
+        let perm_store = std::sync::Arc::new(std::sync::RwLock::new(
+            atomcode_core::tool::PermissionStore::new(),
+        ));
+        pending_permissions.register(perm_session_key.clone(), perm_resp_tx);
+        (
+            Box::new(InteractivePermissionDecider::new(perm_req_tx, perm_resp_rx, perm_store)),
+            Some(perm_req_rx),
+        )
+    } else {
+        (
+            Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll)),
+            None,
+        )
+    };
     // Same ctx selection as interactive AgentLoop: walk config.providers
     // for the active provider, fallback to synthetic 128K config if absent.
     let daemon_ctx = match config.providers.get(&config.default_provider) {
@@ -2164,8 +2185,10 @@ async fn process_chat_request(
         });
         // Turn never ran — drop the permission registration and the request
         // receiver (the decider/perm_req_tx are owned by `turn_runner`, which is
-        // dropped here too).
-        pending_permissions.unregister(&perm_session_key);
+        // dropped here too). Only registered in webui mode.
+        if webui_mode {
+            pending_permissions.unregister(&perm_session_key);
+        }
         return Ok(());
     }
 
@@ -2182,6 +2205,7 @@ async fn process_chat_request(
         // sender; if this receiver were dropped, every `send` would fail and the
         // decider would auto-deny EVERY tool. We never read from it — the browser
         // notification comes from the forwarded `TurnEvent::ApprovalRequested`.
+        // In standalone (BypassAll) mode there is no channel — this is `None`.
         let _keep_perm_req_rx = perm_req_rx;
         CurrentContext::scope(tel_ctx, || async move {
         let mut conv = conversation_clone.lock().await;
@@ -2407,8 +2431,10 @@ async fn process_chat_request(
     });
     // Turn finished (the forwarding loop above exits when turn_rx closes, i.e.
     // when the turn task and its turn_tx are dropped). Drop the permission
-    // registration so it doesn't leak.
-    pending_permissions.unregister(&perm_session_key);
+    // registration so it doesn't leak. Only registered in webui mode.
+    if webui_mode {
+        pending_permissions.unregister(&perm_session_key);
+    }
     Ok(())
 }
 
