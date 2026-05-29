@@ -3197,8 +3197,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
             // ── /plugin async job result ──
             Some(ev) = ctx.plugin_job_rx.recv() => {
+                // Let an open modal (the interactive /plugin manager) refresh
+                // its cached lists from this job's result first.
+                if let Some(m) = app.active_modal.as_mut() {
+                    m.on_plugin_event(&ev);
+                }
                 handle_plugin_job_event(ev, &mut ctx, &app.state, renderer);
-                if matches!(app.state.phase, UiPhase::Idle) {
+                // The job result rendered to scrollback above; restore the
+                // bottom prompt. Redraw the modal if one is open (else
+                // redraw_idle_plain would paint over it), otherwise the idle box.
+                if let Some(m) = app.active_modal.as_ref() {
+                    m.draw(&app.buf, &app.state, &ctx, renderer);
+                } else if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -3564,8 +3574,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
             // ── /plugin async job result ──
             Some(ev) = ctx.plugin_job_rx.recv() => {
+                // Let an open modal (the interactive /plugin manager) refresh
+                // its cached lists from this job's result first.
+                if let Some(m) = app.active_modal.as_mut() {
+                    m.on_plugin_event(&ev);
+                }
                 handle_plugin_job_event(ev, &mut ctx, &app.state, renderer);
-                if matches!(app.state.phase, UiPhase::Idle) {
+                // The job result rendered to scrollback above; restore the
+                // bottom prompt. Redraw the modal if one is open (else
+                // redraw_idle_plain would paint over it), otherwise the idle box.
+                if let Some(m) = app.active_modal.as_ref() {
+                    m.draw(&app.buf, &app.state, &ctx, renderer);
+                } else if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }

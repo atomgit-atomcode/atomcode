@@ -1431,7 +1431,13 @@ pub(super) fn execute_slash_command(
             }
         }
         "plugin" => {
-            handle_plugin(arg, ctx, renderer);
+            // Bare `/plugin` opens the interactive manager; subcommands
+            // (`marketplace …`, `install x@mp`, …) keep their old behavior.
+            if arg.trim().is_empty() {
+                *active_modal = Some(Box::new(crate::modals::PluginManager::open()));
+            } else {
+                handle_plugin(arg, ctx, renderer);
+            }
         }
         "skills" => {
             // Gateway command. With no arg, list user-invocable skills
