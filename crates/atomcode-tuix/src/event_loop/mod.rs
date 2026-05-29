@@ -1018,6 +1018,14 @@ impl Buffer {
         self.pastes.clear();
     }
 
+    /// Current buffer text with every `[Pasted #N …]` placeholder expanded
+    /// back to its original contents. Modals that consume `text` directly
+    /// (instead of going through the Submit/Commit path, which expands at
+    /// the event loop) use this so a folded paste is seen in full.
+    pub fn expanded_text(&self) -> String {
+        self.expand_pastes(&self.text)
+    }
+
     pub(crate) fn apply(
         &mut self,
         action: Action,
@@ -1314,6 +1322,19 @@ mod buffer_tests {
     fn expand_pastes_is_noop_without_placeholders() {
         let b = Buffer::new();
         assert_eq!(b.expand_pastes("plain text"), "plain text");
+    }
+
+    #[test]
+    fn expanded_text_recovers_folded_paste() {
+        // Modals (e.g. the provider Template step) read `expanded_text()`
+        // instead of `text`, so a folded multi-line paste is seen in full
+        // rather than as the literal `[Pasted #N +M lines]` placeholder.
+        let mut b = Buffer::new();
+        let body = "line\n".repeat(30);
+        b.insert_paste(body.clone());
+        assert!(b.text.contains("[Pasted #"), "should fold to placeholder");
+        assert!(!b.expanded_text().contains("[Pasted #"));
+        assert_eq!(b.expanded_text(), body);
     }
 
     #[test]
