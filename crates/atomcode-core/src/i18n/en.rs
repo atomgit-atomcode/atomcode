@@ -232,6 +232,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderMenuDeleteDesc => "Remove a provider".into(),
         Msg::ProviderMenuSetDefault => "set-default".into(),
         Msg::ProviderMenuSetDefaultDesc => "Switch the default provider".into(),
+        Msg::ProviderImportPrompt =>
+            "Paste a template to auto-detect (curl / JSON / TOML or a Base URL), or Enter to fill manually:".into(),
+        Msg::ProviderImportParsed { name, type_name, model } =>
+            format!("Detected: {name} · {type_name} · {model}").into(),
+        Msg::ProviderImportFailed =>
+            "Couldn't find a Base URL in the template. Paste again or Esc to cancel.".into(),
         Msg::ProviderNoProviders =>
             "No providers configured yet.".into(),
         Msg::ProviderDeleteConfirm { name } =>
@@ -250,7 +256,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepTypeWithHint { current } =>
             format!("Type? [{current}] (openai / claude / ollama, blank to keep)").into(),
         Msg::ProviderStepBaseUrl =>
-            "Base URL? (blank to use provider default)".into(),
+            "Base URL? (e.g. https://api.deepseek.com/v1)".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL? [{current}] (blank to keep)").into(),
         Msg::ProviderDefaultHint => "provider default".into(),
@@ -270,6 +276,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Unknown type. Choose openai / claude / ollama or leave blank.".into(),
         Msg::ProviderModelEmpty => "Model cannot be empty.".into(),
         Msg::ProviderEditKeep => "(keep)".into(),
+        Msg::ProviderTypeInferred { type_name } =>
+            format!("Type: {type_name} (inferred from Base URL)").into(),
+        Msg::ProviderStepNameDefault { default } =>
+            format!("Provider name? [{default}] (blank to use this)").into(),
+        Msg::ProviderStepProgress { current, total } =>
+            format!("({current}/{total})").into(),
 
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>

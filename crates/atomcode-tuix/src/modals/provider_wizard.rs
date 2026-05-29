@@ -22,9 +22,13 @@ pub enum ProviderWizard {
     /// Initial picker: Add / Edit / Delete / Set Default.
     MainMenu { selected: usize },
     /// Sequential `Add` prompts. `draft` accumulates answered fields.
+    /// The flow leads with a `Template` paste step (auto-detect), then only
+    /// asks for the gaps. `total` is the number of gap questions, fixed once
+    /// the template step resolves, and drives the `(x/y)` counter.
     Add {
         step: WizardStep,
         draft: DraftProvider,
+        total: usize,
     },
     /// Pick which provider to edit.
     EditPick {
@@ -52,8 +56,11 @@ pub enum ProviderWizard {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WizardStep {
+    /// Add-only first step: paste a curl / JSON / TOML template (or a bare
+    /// Base URL), or leave blank to fill everything manually.
+    Template,
     Name,
     ProviderType,
     BaseUrl,
@@ -185,18 +192,15 @@ fn handle_key(
                     match ITEMS[selected] {
                         "add" => {
                             let new = ProviderWizard::Add {
-                                step: WizardStep::Name,
+                                step: WizardStep::Template,
                                 draft: DraftProvider::default(),
+                                total: 0,
                             };
-                            show_step_prompt(
-                                WizardStep::Name,
-                                None,
-                                buf,
-                                state,
-                                ctx,
-                                &new,
-                                renderer,
-                            );
+                            if let ProviderWizard::Add { step, draft, total } = &new {
+                                show_add_step_prompt(
+                                    *step, draft, *total, buf, state, ctx, &new, renderer,
+                                );
+                            }
                             *wizard = new;
                         }
                         "edit" | "delete" | "set-default" if providers.is_empty() => {
@@ -367,16 +371,32 @@ fn handle_key(
         }
 
         // ── Text-input states: Enter submits, chars edit buf, others pass through Buffer. ──
-        ProviderWizard::Add { step, mut draft } => {
+        ProviderWizard::Add { step, mut draft, total } => {
             if matches!(code, KeyCode::Enter) {
                 let answer = buf.text.clone();
-                push(renderer, &format!("  ↳ {}", answer));
+                // Don't echo the raw paste back for the (multi-line) template
+                // step — `advance_add` prints a "Detected:" summary instead.
+                if !matches!(step, WizardStep::Template) {
+                    push(renderer, &format!("  ↳ {}", answer));
+                }
                 buf.text.clear();
                 buf.cursor = 0;
-                match advance_add(&mut draft, step, &answer, renderer) {
+                let leaving_template = matches!(step, WizardStep::Template);
+                match advance_add(&mut draft, step, &answer, &ctx.config.providers, renderer) {
                     Some(next) => {
-                        let new = ProviderWizard::Add { step: next, draft };
-                        show_step_prompt(next, None, buf, state, ctx, &new, renderer);
+                        // The gap count is fixed once we leave the Template
+                        // step (and didn't bounce back to it on a parse error).
+                        let total = if leaving_template && next != WizardStep::Template {
+                            remaining_add_steps(&draft).len()
+                        } else {
+                            total
+                        };
+                        let new = ProviderWizard::Add { step: next, draft, total };
+                        if let ProviderWizard::Add { step, draft, total } = &new {
+                            show_add_step_prompt(
+                                *step, draft, *total, buf, state, ctx, &new, renderer,
+                            );
+                        }
                         *wizard = new;
                         return Ok(ModalAction::Continue);
                     }
@@ -403,7 +423,7 @@ fn handle_key(
             }
             // Forward other keys to the buffer so typing / editing works.
             forward_to_buffer(code, _mods, buf, state, ctx);
-            *wizard = ProviderWizard::Add { step, draft };
+            *wizard = ProviderWizard::Add { step, draft, total };
             redraw(buf, state, ctx, wizard, renderer);
             Ok(ModalAction::Continue)
         }
@@ -546,6 +566,7 @@ fn push(renderer: &mut dyn Renderer, text: &str) {
 fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> String {
     use crate::i18n::{t, Msg};
     match (step, existing) {
+        (WizardStep::Template, _) => t(Msg::ProviderImportPrompt).into_owned(),
         (WizardStep::Name, _) => t(Msg::ProviderStepName).into_owned(),
         (WizardStep::ProviderType, None) => t(Msg::ProviderStepType).into_owned(),
         (WizardStep::ProviderType, Some(p)) => {
@@ -572,6 +593,37 @@ fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> Stri
     }
 }
 
+/// Push an Add-flow prompt. Gap steps are prefixed with their
+/// `(current/total)` progress; the `Template` step has no counter (it's the
+/// entry, before the gap count is known). The Name step shows the
+/// auto-derived default; the Template step shows the paste prompt.
+fn show_add_step_prompt(
+    step: WizardStep,
+    draft: &DraftProvider,
+    total: usize,
+    buf: &Buffer,
+    state: &UiState,
+    ctx: &LoopCtx,
+    wizard: &ProviderWizard,
+    renderer: &mut dyn Renderer,
+) {
+    use crate::i18n::{t, Msg};
+    let body = match step {
+        WizardStep::Template => t(Msg::ProviderImportPrompt).into_owned(),
+        WizardStep::Name => t(Msg::ProviderStepNameDefault { default: &draft.name }).into_owned(),
+        other => step_prompt_text(other, None),
+    };
+    if matches!(step, WizardStep::Template) || total == 0 {
+        push(renderer, &body);
+    } else {
+        // current = how many gap questions are done + this one.
+        let current = total - remaining_add_steps(draft).len() + 1;
+        let progress = t(Msg::ProviderStepProgress { current, total });
+        push(renderer, &format!("{progress} {body}"));
+    }
+    redraw(buf, state, ctx, wizard, renderer);
+}
+
 /// Push the prompt for this step into scrollback + redraw footer.
 fn show_step_prompt(
     step: WizardStep,
@@ -588,37 +640,37 @@ fn show_step_prompt(
 
 /// Validate and advance the "Add" sub-flow. Returns the next state, or
 /// None when the wizard has committed / cancelled (caller clears).
+///
+/// The flow leads with the Template paste step: a recognized template (or
+/// bare URL) fills the draft and infers the type, so only the missing fields
+/// are asked. Leaving it blank falls back to manual entry. `existing` is
+/// consulted so derived / entered names don't collide with a provider.
 fn advance_add(
     draft: &mut DraftProvider,
     step: WizardStep,
     answer: &str,
+    existing: &std::collections::HashMap<String, ProviderConfig>,
     renderer: &mut dyn Renderer,
 ) -> Option<WizardStep> {
     let ans = answer.trim();
     match step {
-        WizardStep::Name => {
-            if ans.is_empty() {
-                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderNameEmpty));
-                return Some(WizardStep::Name);
-            }
-            draft.name = ans.to_string();
-            Some(WizardStep::ProviderType)
-        }
+        WizardStep::Template => advance_template(draft, answer, existing, renderer),
         WizardStep::ProviderType => {
             if !["openai", "claude", "ollama"].contains(&ans) {
                 push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType));
                 return Some(WizardStep::ProviderType);
             }
             draft.provider_type = ans.to_string();
-            Some(WizardStep::BaseUrl)
-        }
-        WizardStep::BaseUrl => {
-            draft.base_url = ans.to_string();
             Some(WizardStep::ApiKey)
         }
         WizardStep::ApiKey => {
             draft.api_key = ans.to_string();
-            Some(WizardStep::Model)
+            // Skip Model when the template already supplied one.
+            if draft.model.is_empty() {
+                Some(WizardStep::Model)
+            } else {
+                Some(to_name_step(draft, existing))
+            }
         }
         WizardStep::Model => {
             if ans.is_empty() {
@@ -626,9 +678,135 @@ fn advance_add(
                 return Some(WizardStep::Model);
             }
             draft.model = ans.to_string();
+            Some(to_name_step(draft, existing))
+        }
+        WizardStep::Name => {
+            let chosen = if ans.is_empty() {
+                draft.name.clone()
+            } else {
+                ans.to_string()
+            };
+            draft.name = dedupe_name(&chosen, |n| existing.contains_key(n));
             None // signal: ready to commit
         }
+        // BaseUrl is an Edit-only step; in Add the URL comes via Template.
+        WizardStep::BaseUrl => Some(to_name_step(draft, existing)),
     }
+}
+
+/// Handle the Template paste step. Fills `draft` from a recognized template
+/// (or bare URL) and returns the first gap step, re-prompts on a failed
+/// parse, or falls through to manual entry when left blank.
+fn advance_template(
+    draft: &mut DraftProvider,
+    answer: &str,
+    existing: &std::collections::HashMap<String, ProviderConfig>,
+    renderer: &mut dyn Renderer,
+) -> Option<WizardStep> {
+    use crate::i18n::{t, Msg};
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        // Manual path: no URL, ask the type (base_url stays empty → default).
+        return Some(WizardStep::ProviderType);
+    }
+
+    let parsed = parse_template(answer);
+    if let Some(raw_url) = parsed.url.as_deref() {
+        let ptype = infer_type(raw_url);
+        draft.provider_type = ptype.to_string();
+        draft.base_url = normalize_base_url(raw_url, ptype);
+        if let Some(k) = parsed.api_key {
+            if !is_placeholder(&k) {
+                draft.api_key = k;
+            }
+        }
+        if let Some(m) = parsed.model {
+            if !m.trim().is_empty() {
+                draft.model = m;
+            }
+        }
+        let base = parsed
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| derive_name(&draft.base_url, ptype, |n| existing.contains_key(n)));
+        draft.name = dedupe_name(&base, |n| existing.contains_key(n));
+        let model_disp = if draft.model.is_empty() { "?" } else { &draft.model };
+        push(
+            renderer,
+            &t(Msg::ProviderImportParsed {
+                name: &draft.name,
+                type_name: ptype,
+                model: model_disp,
+            }),
+        );
+        Some(first_gap_after_import(draft))
+    } else if looks_like_template(answer) {
+        // Looked like a template but no URL came out — let the user retry.
+        push(renderer, &t(Msg::ProviderImportFailed));
+        Some(WizardStep::Template)
+    } else {
+        // Plain text with no URL: treat it as the base_url itself.
+        let inferred = infer_type(trimmed);
+        draft.base_url = trimmed.to_string();
+        draft.provider_type = inferred.to_string();
+        push(renderer, &t(Msg::ProviderTypeInferred { type_name: inferred }));
+        Some(WizardStep::ApiKey)
+    }
+}
+
+/// First gap step after an import fills what it can: ask for the API key,
+/// then the model, else go straight to the Name confirmation.
+fn first_gap_after_import(draft: &DraftProvider) -> WizardStep {
+    if draft.api_key.is_empty() {
+        WizardStep::ApiKey
+    } else if draft.model.is_empty() {
+        WizardStep::Model
+    } else {
+        WizardStep::Name
+    }
+}
+
+/// Seed the Name step's default (if not already set) and return it.
+fn to_name_step(
+    draft: &mut DraftProvider,
+    existing: &std::collections::HashMap<String, ProviderConfig>,
+) -> WizardStep {
+    if draft.name.is_empty() {
+        draft.name = derive_name(&draft.base_url, &draft.provider_type, |n| {
+            existing.contains_key(n)
+        });
+    }
+    WizardStep::Name
+}
+
+/// Whether pasted text looks like a template we should parse (vs. a bare URL
+/// or hostname). Used to decide between re-prompting and treating input as a
+/// base_url when no URL was extracted.
+fn looks_like_template(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    lower.contains("curl")
+        || lower.contains("authorization")
+        || lower.contains("x-api-key")
+        || input.contains('{')
+        || lower.contains("[providers")
+}
+
+/// The ordered gap questions still owed for `draft`: Type (if unset), API key
+/// (if unset), Model (if unset), then always the Name confirmation. Drives
+/// the `(x/y)` counter; `total` is this length frozen at the Template step.
+fn remaining_add_steps(draft: &DraftProvider) -> Vec<WizardStep> {
+    let mut steps = Vec::new();
+    if draft.provider_type.is_empty() {
+        steps.push(WizardStep::ProviderType);
+    }
+    if draft.api_key.is_empty() {
+        steps.push(WizardStep::ApiKey);
+    }
+    if draft.model.is_empty() {
+        steps.push(WizardStep::Model);
+    }
+    steps.push(WizardStep::Name);
+    steps
 }
 
 /// Validate and advance the "Edit" sub-flow. Empty answers preserve
@@ -642,7 +820,8 @@ fn advance_edit(
 ) -> Option<WizardStep> {
     let ans = answer.trim();
     match step {
-        WizardStep::Name => {
+        // Template is an Add-only step; Edit never reaches it.
+        WizardStep::Template | WizardStep::Name => {
             // Name isn't editable (it's the key into the provider map).
             Some(WizardStep::ProviderType)
         }
@@ -672,10 +851,494 @@ fn advance_edit(
     }
 }
 
+/// Raw fields pulled out of a pasted template (curl / JSON / TOML) before
+/// any normalization. `url` is the endpoint as written; `api_key` may still
+/// be a placeholder. Type / base_url / name are derived from these later.
+#[derive(Debug, Default, PartialEq)]
+struct ParsedTemplate {
+    url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    name: Option<String>,
+}
+
+/// Extract provider fields from a pasted template. Detects a curl command
+/// (headers + URL + JSON body) or a key/value block (JSON or TOML).
+fn parse_template(input: &str) -> ParsedTemplate {
+    let lower = input.to_ascii_lowercase();
+    let is_curl = lower.contains("curl")
+        || lower.contains("authorization")
+        || lower.contains("x-api-key")
+        || lower.contains(" -h ")
+        || lower.contains("-d ");
+    if is_curl {
+        ParsedTemplate {
+            url: first_url(input),
+            api_key: curl_api_key(input),
+            model: quoted_value_after(input, "model"),
+            name: None,
+        }
+    } else {
+        ParsedTemplate {
+            url: quoted_value_after(input, "base_url")
+                .or_else(|| quoted_value_after(input, "baseurl")),
+            api_key: quoted_value_after(input, "api_key")
+                .or_else(|| quoted_value_after(input, "apikey")),
+            model: quoted_value_after(input, "model"),
+            name: toml_provider_name(input),
+        }
+    }
+}
+
+/// First `http(s)://…` token in the text, read up to the next whitespace,
+/// quote or line-continuation backslash.
+fn first_url(input: &str) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    let start = ["https://", "http://"]
+        .iter()
+        .filter_map(|s| lower.find(s))
+        .min()?;
+    let rest = &input[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\')
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// API key from a curl command: `Authorization: Bearer X` or `x-api-key: X`.
+fn curl_api_key(input: &str) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    if let Some(i) = lower.find("authorization") {
+        let rest = &input[i..];
+        if let Some(b) = lower[i..].find("bearer") {
+            return Some(take_token(&rest[b + "bearer".len()..]));
+        }
+        if let Some(c) = rest.find(':') {
+            return Some(take_token(&rest[c + 1..]));
+        }
+    }
+    if let Some(i) = lower.find("x-api-key") {
+        let rest = &input[i + "x-api-key".len()..];
+        if let Some(c) = rest.find(':') {
+            return Some(take_token(&rest[c + 1..]));
+        }
+    }
+    None
+}
+
+/// Trim leading whitespace then read up to the next whitespace/quote/backslash.
+fn take_token(s: &str) -> String {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\')
+        .unwrap_or(s.len());
+    s[..end].to_string()
+}
+
+/// Value of a `key: "value"` / `key = "value"` pair (JSON or TOML style),
+/// matching the key case-insensitively. Skips the key's own closing quote.
+fn quoted_value_after(input: &str, key: &str) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    let key_l = key.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find(&key_l) {
+        let pos = from + rel + key.len();
+        let rest = &input[pos..];
+        if let Some(sep) = rest.find(|c| c == ':' || c == '=') {
+            // Only quotes/whitespace may sit between the key and its separator.
+            if rest[..sep]
+                .chars()
+                .all(|c| c == '"' || c == '\'' || c.is_whitespace())
+            {
+                let after_sep = &rest[sep + 1..];
+                if let Some(oq) = after_sep.find(|c| c == '"' || c == '\'') {
+                    let quote = after_sep.as_bytes()[oq] as char;
+                    let val_start = &after_sep[oq + 1..];
+                    if let Some(end) = val_start.find(quote) {
+                        return Some(val_start[..end].to_string());
+                    }
+                }
+            }
+        }
+        from = pos;
+    }
+    None
+}
+
+/// Provider name from a TOML `[providers.NAME]` header.
+fn toml_provider_name(input: &str) -> Option<String> {
+    let i = input.find("[providers.")?;
+    let rest = &input[i + "[providers.".len()..];
+    let end = rest.find(']')?;
+    Some(rest[..end].trim().to_string())
+}
+
+/// Normalize a raw endpoint URL into a provider `base_url` per its type:
+/// strip the request path for claude/ollama, strip only the trailing
+/// endpoint segment for openai (keeping prefixes like `/v1`).
+fn normalize_base_url(raw_url: &str, provider_type: &str) -> String {
+    let url = raw_url.trim().trim_end_matches('/');
+    match provider_type {
+        // Claude / Ollama base URLs are just the authority; drop any path.
+        "claude" | "ollama" => match url.find("://") {
+            Some(scheme_end) => {
+                let after = scheme_end + 3;
+                let authority_end = url[after..].find('/').map_or(url.len(), |i| after + i);
+                url[..authority_end].to_string()
+            }
+            None => url.to_string(),
+        },
+        // OpenAI-compatible: keep prefixes like `/v1`, strip the endpoint.
+        _ => {
+            const ENDPOINTS: [&str; 5] = [
+                "/chat/completions",
+                "/completions",
+                "/embeddings",
+                "/responses",
+                "/messages",
+            ];
+            for ep in ENDPOINTS {
+                if let Some(stripped) = url.strip_suffix(ep) {
+                    return stripped.to_string();
+                }
+            }
+            url.to_string()
+        }
+    }
+}
+
+/// Whether an extracted API key is a documentation placeholder (e.g.
+/// `<API_KEY>`, `YOUR_API_KEY`, `sk-xxxx`) rather than a real secret.
+fn is_placeholder(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return true;
+    }
+    if v.starts_with('<') && v.ends_with('>') {
+        return true;
+    }
+    let lower = v.to_ascii_lowercase();
+    if lower.contains("your") && lower.contains("key") {
+        return true;
+    }
+    if matches!(lower.as_str(), "api_key" | "apikey" | "placeholder" | "token") {
+        return true;
+    }
+    // A run of filler chars like `sk-xxxx` or `****`.
+    let bytes = lower.as_bytes();
+    bytes.windows(4).any(|w| w == b"xxxx") || v.as_bytes().windows(4).any(|w| w == b"****")
+}
+
+/// Infer the provider `type` from a pasted base URL. Most third-party
+/// endpoints are OpenAI-compatible, so `openai` is the catch-all.
+fn infer_type(base_url: &str) -> &'static str {
+    let url = base_url.to_ascii_lowercase();
+    if url.contains("anthropic") {
+        "claude"
+    } else if url.contains("ollama") || url.contains("11434") {
+        "ollama"
+    } else {
+        "openai"
+    }
+}
+
+/// Derive a unique provider name from a base URL (falling back to the
+/// provider type when there's no usable host). `is_taken` reports whether
+/// a candidate name already exists, so collisions get a `-N` suffix.
+fn derive_name(base_url: &str, provider_type: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    // host = base_url minus scheme, path and port.
+    let host = base_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    let host = host.trim_start_matches("api.").trim_start_matches("www.");
+    let label = host.split('.').next().unwrap_or("");
+    // No usable host (blank / localhost / loopback) → name after the type.
+    let base = if label.is_empty() || label == "localhost" || host == "127.0.0.1" {
+        provider_type
+    } else {
+        label
+    };
+
+    dedupe_name(base, is_taken)
+}
+
+/// Make `base` unique by appending `-2`, `-3`, … until `is_taken` is false.
+fn dedupe_name(base: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    if !is_taken(base) {
+        return base.to_string();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Route a keystroke into `Buffer::apply` so text-input wizard steps
 /// support the usual editing shortcuts (Backspace / Left / Right / etc).
 fn forward_to_buffer(code: KeyCode, modifiers: KeyModifiers, buf: &mut Buffer, state: &mut UiState, ctx: &LoopCtx) {
     let action = classify(code, modifiers);
     let _ = buf.apply(action, ctx.history.entries(), &ctx.commands);
     crate::event_loop::sync_recalled_attachments(state, buf, ctx.history.entries());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_template_curl_openai() {
+        let input = r#"curl -X POST https://taotoken.net/api/v1/chat/completions \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.7-max","messages":[{"role":"user","content":"你好"}]}'"#;
+        let p = parse_template(input);
+        assert_eq!(p.url.as_deref(), Some("https://taotoken.net/api/v1/chat/completions"));
+        assert_eq!(p.api_key.as_deref(), Some("<API_KEY>"));
+        assert_eq!(p.model.as_deref(), Some("qwen3.7-max"));
+    }
+
+    #[test]
+    fn parse_template_curl_anthropic_x_api_key() {
+        let input = r#"curl https://api.anthropic.com/v1/messages \
+  -H "x-api-key: sk-ant-123" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-opus-4","max_tokens":1024}'"#;
+        let p = parse_template(input);
+        assert_eq!(p.url.as_deref(), Some("https://api.anthropic.com/v1/messages"));
+        assert_eq!(p.api_key.as_deref(), Some("sk-ant-123"));
+        assert_eq!(p.model.as_deref(), Some("claude-opus-4"));
+    }
+
+    #[test]
+    fn parse_template_json_block() {
+        let input = r#"{"type":"openai","base_url":"https://x.ai/v1","api_key":"sk-1","model":"grok-2"}"#;
+        let p = parse_template(input);
+        assert_eq!(p.url.as_deref(), Some("https://x.ai/v1"));
+        assert_eq!(p.api_key.as_deref(), Some("sk-1"));
+        assert_eq!(p.model.as_deref(), Some("grok-2"));
+    }
+
+    #[test]
+    fn parse_template_toml_block() {
+        let input = "[providers.foo]\ntype = \"openai\"\nbase_url = \"https://y.com/v1\"\napi_key = \"sk-2\"\nmodel = \"m2\"";
+        let p = parse_template(input);
+        assert_eq!(p.url.as_deref(), Some("https://y.com/v1"));
+        assert_eq!(p.api_key.as_deref(), Some("sk-2"));
+        assert_eq!(p.model.as_deref(), Some("m2"));
+        assert_eq!(p.name.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn normalize_base_url_openai_strips_endpoint() {
+        assert_eq!(
+            normalize_base_url("https://taotoken.net/api/v1/chat/completions", "openai"),
+            "https://taotoken.net/api/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_openai_keeps_plain() {
+        assert_eq!(normalize_base_url("https://x.ai/v1", "openai"), "https://x.ai/v1");
+    }
+
+    #[test]
+    fn normalize_base_url_claude_strips_path() {
+        assert_eq!(
+            normalize_base_url("https://api.anthropic.com/v1/messages", "claude"),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_ollama_keeps_host_port() {
+        assert_eq!(
+            normalize_base_url("http://localhost:11434/api/chat", "ollama"),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_detects_angle_brackets() {
+        assert!(is_placeholder("<API_KEY>"));
+    }
+
+    #[test]
+    fn is_placeholder_detects_your_api_key() {
+        assert!(is_placeholder("YOUR_API_KEY"));
+    }
+
+    #[test]
+    fn is_placeholder_detects_x_run() {
+        assert!(is_placeholder("sk-xxxxxxxx"));
+    }
+
+    #[test]
+    fn is_placeholder_accepts_real_key() {
+        assert!(!is_placeholder("sk-ant-abc123def456"));
+        assert!(!is_placeholder("9f8c7b6a5"));
+    }
+
+    #[test]
+    fn infer_type_detects_claude() {
+        assert_eq!(infer_type("https://api.anthropic.com"), "claude");
+    }
+
+    #[test]
+    fn infer_type_detects_ollama_by_port() {
+        assert_eq!(infer_type("http://localhost:11434"), "ollama");
+    }
+
+    #[test]
+    fn infer_type_detects_ollama_by_name() {
+        assert_eq!(infer_type("http://my-ollama-host:8080"), "ollama");
+    }
+
+    #[test]
+    fn infer_type_defaults_to_openai() {
+        assert_eq!(infer_type("https://api.deepseek.com/v1"), "openai");
+    }
+
+    #[test]
+    fn infer_type_empty_defaults_to_openai() {
+        assert_eq!(infer_type(""), "openai");
+    }
+
+    #[test]
+    fn derive_name_strips_api_prefix_and_tld() {
+        assert_eq!(derive_name("https://api.deepseek.com/v1", "openai", |_| false), "deepseek");
+    }
+
+    #[test]
+    fn derive_name_handles_cn_tld() {
+        assert_eq!(derive_name("https://api.moonshot.cn/v1", "openai", |_| false), "moonshot");
+    }
+
+    #[test]
+    fn derive_name_handles_no_api_prefix() {
+        assert_eq!(derive_name("https://openrouter.ai/api/v1", "openai", |_| false), "openrouter");
+    }
+
+    #[test]
+    fn derive_name_falls_back_to_type_for_localhost() {
+        assert_eq!(derive_name("http://localhost:11434", "ollama", |_| false), "ollama");
+    }
+
+    #[test]
+    fn derive_name_falls_back_to_type_when_empty() {
+        assert_eq!(derive_name("", "claude", |_| false), "claude");
+    }
+
+    #[test]
+    fn derive_name_suffixes_on_collision() {
+        assert_eq!(
+            derive_name("https://api.deepseek.com/v1", "openai", |n| n == "deepseek"),
+            "deepseek-2"
+        );
+    }
+
+    fn draft_filled(provider_type: &str, api_key: &str, model: &str) -> DraftProvider {
+        DraftProvider {
+            provider_type: provider_type.to_string(),
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remaining_steps_manual_is_four() {
+        // Nothing filled (blank template) → ask type, key, model, name.
+        assert_eq!(
+            remaining_add_steps(&DraftProvider::default()),
+            vec![
+                WizardStep::ProviderType,
+                WizardStep::ApiKey,
+                WizardStep::Model,
+                WizardStep::Name
+            ]
+        );
+    }
+
+    #[test]
+    fn remaining_steps_bare_url_import_is_three() {
+        // Type inferred from URL; key + model still missing.
+        let d = draft_filled("openai", "", "");
+        assert_eq!(
+            remaining_add_steps(&d),
+            vec![WizardStep::ApiKey, WizardStep::Model, WizardStep::Name]
+        );
+    }
+
+    #[test]
+    fn remaining_steps_full_template_is_just_name() {
+        let d = draft_filled("openai", "sk-1", "gpt-4o");
+        assert_eq!(remaining_add_steps(&d), vec![WizardStep::Name]);
+    }
+
+    #[test]
+    fn remaining_steps_skips_filled_model() {
+        let d = draft_filled("openai", "", "gpt-4o");
+        assert_eq!(
+            remaining_add_steps(&d),
+            vec![WizardStep::ApiKey, WizardStep::Name]
+        );
+    }
+
+    #[test]
+    fn advance_template_blank_goes_manual() {
+        let mut d = DraftProvider::default();
+        let existing = std::collections::HashMap::new();
+        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
+        let next = advance_template(&mut d, "", &existing, &mut sink);
+        assert_eq!(next, Some(WizardStep::ProviderType));
+        assert!(d.base_url.is_empty());
+    }
+
+    #[test]
+    fn advance_template_curl_fills_draft_and_asks_for_key() {
+        let input = r#"curl https://taotoken.net/api/v1/chat/completions \
+  -H "Authorization: Bearer <API_KEY>" \
+  -d '{"model":"qwen3.7-max"}'"#;
+        let mut d = DraftProvider::default();
+        let existing = std::collections::HashMap::new();
+        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
+        let next = advance_template(&mut d, input, &existing, &mut sink);
+        assert_eq!(d.provider_type, "openai");
+        assert_eq!(d.base_url, "https://taotoken.net/api/v1");
+        assert_eq!(d.model, "qwen3.7-max");
+        assert!(d.api_key.is_empty(), "placeholder key must be dropped");
+        assert_eq!(d.name, "taotoken");
+        // Key is the only gap → ask for it first.
+        assert_eq!(next, Some(WizardStep::ApiKey));
+    }
+
+    #[test]
+    fn advance_template_bare_url_is_treated_as_base_url() {
+        let mut d = DraftProvider::default();
+        let existing = std::collections::HashMap::new();
+        let mut sink = crate::render::plain::PlainRenderer::with_writer(std::io::sink());
+        let next = advance_template(&mut d, "https://api.deepseek.com/v1", &existing, &mut sink);
+        assert_eq!(d.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(d.provider_type, "openai");
+        assert_eq!(next, Some(WizardStep::ApiKey));
+    }
+
+    #[test]
+    fn derive_name_suffixes_until_free() {
+        assert_eq!(
+            derive_name("https://api.deepseek.com/v1", "openai", |n| n == "deepseek" || n == "deepseek-2"),
+            "deepseek-3"
+        );
+    }
 }
