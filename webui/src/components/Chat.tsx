@@ -11,6 +11,7 @@ interface ToolRow {
   args: string;
   status: 'pending' | 'done' | 'error' | 'waiting_approval';
   duration_ms?: number;
+  output?: string;
 }
 
 interface Message {
@@ -86,12 +87,36 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     if (activeSession?.project_hash) {
       getSession(activeSession.project_hash, sessionId)
         .then((detail) => {
-          // Convert loaded messages to display format (user/assistant only; skip system/tool)
+          // Convert loaded messages to display format. Assistant tool_calls become
+          // tool rows; tool-role messages fold their result into the matching row
+          // (by call_id). System messages are skipped.
           const loaded: Message[] = [];
           for (const msg of detail.messages) {
-            if (msg.role === 'user' || msg.role === 'assistant') {
-              loaded.push({ role: msg.role, text: msg.content, tools: [] });
+            if (msg.role === 'user') {
+              loaded.push({ role: 'user', text: msg.content ?? '', tools: [] });
+            } else if (msg.role === 'assistant') {
+              const tools: ToolRow[] = (msg.tool_calls ?? []).map((tc) => ({
+                id: tc.id,
+                name: tc.name,
+                args: tc.arguments || tc.display || '',
+                status: 'done' as const,
+              }));
+              loaded.push({ role: 'assistant', text: msg.content ?? '', tools });
+            } else if (msg.role === 'tool' && msg.tool_result) {
+              // Fold the tool result into its originating tool row.
+              const result = msg.tool_result;
+              for (let i = loaded.length - 1; i >= 0; i--) {
+                const m = loaded[i];
+                if (m.role !== 'assistant') continue;
+                const row = m.tools.find((t) => t.id === result.call_id);
+                if (row) {
+                  row.output = result.summary;
+                  row.status = result.success ? 'done' : 'error';
+                  break;
+                }
+              }
             }
+            // system messages: skip
           }
           if (loaded.length > 0) {
             setMessages(loaded);
@@ -141,6 +166,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     });
   }
 
+  function appendToolOutput(chunk: string) {
+    setMessages((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      if (last.role !== 'assistant' || last.tools.length === 0) return prev;
+      const tools = last.tools.slice();
+      const lastTool = tools[tools.length - 1];
+      tools[tools.length - 1] = {
+        ...lastTool,
+        output: (lastTool.output ?? '') + chunk,
+      };
+      return [...prev.slice(0, -1), { ...last, tools }];
+    });
+  }
+
   function addToolToLastAssistant(tool: ToolRow) {
     setMessages((prev) => {
       if (prev.length === 0) return prev;
@@ -170,10 +210,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         break;
       }
 
+      case 'tool_output':
+        appendToolOutput(event.chunk);
+        break;
+
       case 'tool_result':
         updateToolInLastAssistant(event.id, {
           status: event.success ? 'done' : 'error',
           duration_ms: event.duration_ms,
+          output: event.output,
         });
         break;
 
@@ -389,6 +434,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
 }
 
 function ToolRowView({ tool }: { tool: ToolRow }) {
+  const [expanded, setExpanded] = useState(false);
+
   let annotation: { cls: string; label: string } | null = null;
   if (tool.status === 'waiting_approval') {
     annotation = { cls: 'waiting', label: '等待批准…' };
@@ -403,15 +450,36 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
     annotation = { cls: 'error', label: '失败' };
   }
 
+  const hasDetail = !!(tool.args || tool.output);
+
   return (
     <div class="tool-body">
-      <div class="tool-header">
+      <div class="tool-header" onClick={() => setExpanded((e) => !e)}>
         <span class="tool-name">{tool.name}</span>
         <span class="tool-name-secondary">{abbreviateArgs(tool.args)}</span>
         {annotation && (
           <span class={'tool-annotation ' + annotation.cls}>{annotation.label}</span>
         )}
+        {hasDetail && (
+          <span class={'tool-chevron' + (expanded ? ' expanded' : '')}>▾</span>
+        )}
       </div>
+      {expanded && hasDetail && (
+        <div class="tool-body-grid">
+          {tool.args && (
+            <div class="tool-body-row">
+              <div class="tool-body-row-label">参数</div>
+              <div class="tool-body-row-content">{tool.args}</div>
+            </div>
+          )}
+          {tool.output && (
+            <div class="tool-body-row">
+              <div class="tool-body-row-label">输出</div>
+              <div class="tool-body-row-content">{tool.output}</div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

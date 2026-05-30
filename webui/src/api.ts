@@ -128,11 +128,26 @@ export interface SessionMetaWithProject extends SessionMeta {
   project_hash: string;
 }
 
+export interface ToolCallInfo {
+  id: string;
+  name: string;
+  arguments: string;
+  display: string;
+}
+
+export interface ToolResultInfo {
+  call_id: string;
+  success: boolean;
+  summary: string;
+  line_count: number;
+}
+
 export interface SessionMessage {
-  role: string;
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
-  tool_calls?: unknown;
-  tool_result?: unknown;
+  tool_calls?: ToolCallInfo[];
+  tool_result?: ToolResultInfo;
+  artifacts?: unknown;
 }
 
 export interface SessionDetail {

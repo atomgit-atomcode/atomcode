@@ -293,9 +293,13 @@ body {
   align-items: center;
   padding: 2px 0;
   gap: 7px;
+  cursor: pointer;
   user-select: none;
   min-width: 0;
 }
+
+.tool-header:hover .tool-name-secondary { color: var(--app-primary-foreground); }
+.tool-header:active { opacity: 0.65; }
 
 .tool-name {
   font-weight: 700;
@@ -679,17 +683,58 @@ body {
   color: var(--app-secondary-foreground);
 }
 
+/* === Tool detail (expanded args + output) === */
+.tool-chevron {
+  font-size: 10px;
+  color: var(--app-secondary-foreground);
+  flex-shrink: 0;
+  transition: transform 0.15s;
+}
+
+.tool-chevron.expanded { transform: rotate(180deg); }
+
+.tool-body-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  margin-top: 8px;
+  border: 0.5px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-tool-background);
+  overflow: hidden;
+}
+
+.tool-body-row {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+  border-top: 0.5px solid var(--app-input-border);
+  padding: 0;
+}
+
+.tool-body-row:first-child { border-top: none; }
+
+.tool-body-row-label {
+  grid-column: 1;
+  color: var(--app-secondary-foreground);
+  opacity: 0.7;
+  font-family: var(--app-monospace-font-family);
+  font-size: 0.85em;
+  padding: 8px 10px;
+  user-select: none;
+  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 35%);
+}
+
 .tool-body-row-content {
-  padding: 10px 12px;
+  grid-column: 2;
+  padding: 8px 10px;
   font-family: var(--app-monospace-font-family);
   font-size: var(--app-monospace-font-size-small);
   color: var(--app-primary-foreground);
   white-space: pre;
   overflow: auto;
-  max-height: 280px;
-  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
-  border: 1px solid var(--app-input-border);
-  border-radius: var(--corner-radius-small);
+  max-height: 320px;
+  width: 100%;
+  min-width: 0;
 }
 
 /* Buttons */
