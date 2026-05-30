@@ -26,10 +26,10 @@ export function ModelSelector({ value, onChange }: { value: string | null; onCha
               key={m.provider}
               class={'model-item' + (m.provider === (value ?? current?.provider) ? ' active' : '')}
               type="button"
+              title={m.provider}
               onClick={() => { onChange(m.provider); setOpen(false); }}
             >
               <span class="model-item-model">{m.model}</span>
-              <span class="model-item-provider">{m.provider}</span>
             </button>
           ))}
         </div>

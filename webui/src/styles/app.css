@@ -1001,10 +1001,10 @@ body {
 
 .model-item {
   display: flex;
-  align-items: flex-start;
-  flex-direction: column;
+  align-items: center;
   gap: 2px;
-  padding: 5px 8px;
+  padding: 7px 10px;
+  line-height: 1.4;
   border: none;
   border-radius: var(--corner-radius-small);
   background: transparent;
@@ -1037,7 +1037,7 @@ body {
 
 .model-item.active {
   background: var(--app-list-active-background);
-  color: var(--app-list-active-foreground, var(--app-primary-foreground));
+  color: var(--app-primary-foreground);
   font-weight: 600;
 }
 
