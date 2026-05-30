@@ -6,8 +6,6 @@ pub mod background;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
 pub mod parallel_edit;
-pub mod guide;
-pub mod sub_agent;
 pub mod subtask_driver;
 
 mod diagnose;
@@ -92,17 +90,6 @@ pub enum AgentCommand {
     /// Result is returned via `AgentEvent::BackgroundComplete`.
     Background {
         task: String,
-    },
-    /// Invoke a named subagent. Result comes back via AgentEvent::GuideComplete.
-    InvokeSubAgent {
-        name: String,
-        task: String,
-    },
-    /// Inject a guide subagent result into the conversation as an assistant
-    /// message. Sent by the TUI after rendering GuideComplete so the LLM
-    /// can reference previous /guide answers in follow-up turns.
-    InjectGuideResult {
-        text: String,
     },
     /// Recompute and re-emit a rich ContextStats snapshot. `/context` sends
     /// this before rendering so the user never sees a stale cache — the
@@ -396,20 +383,6 @@ pub enum AgentEvent {
         /// `handle_send_message` fills this.
         system_prompt: String,
     },
-    /// Subagent activity notification (Q&A event family — distinct from parallel_edit's SubAgentTask*)
-    GuideTurnActivity {
-        subagent: String,
-        message: String,
-    },
-    /// Subagent completed with answer (or was cancelled/errored).
-    GuideComplete {
-        subagent: String,
-        text: String,
-        truncated: bool,
-        /// True when the user cancelled (Ctrl+C) — the TUI shows
-        /// "已取消" instead of "已完成".
-        cancelled: bool,
-    },
 }
 
 /// The current phase of the agent (for UI display).
@@ -529,15 +502,6 @@ pub struct AgentLoop {
     /// ordering so the cleared write is visible to the next dispatcher
     /// check on a different thread.
     background_running: std::sync::Arc<AtomicBool>,
-
-    /// Subagent registry (injected into system prompt after skills)
-    pub subagent_registry: std::sync::Arc<std::sync::RwLock<crate::agent::sub_agent::registry::SubAgentRegistry>>,
-    /// Collected JoinHandles from spawned subagents (aborted on Drop)
-    subagent_handles: Vec<tokio::task::JoinHandle<()>>,
-    /// Cancel token for all running subagents — cancelled on shutdown
-    subagent_cancel_token: CancellationToken,
-    /// Concurrency guard: prevents overlapping subagent invocations
-    subagent_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// Discipline tracking — all counters for loop detection, stagnation,
     /// error streaks, and tool usage patterns. Extracted from AgentLoop to
@@ -749,14 +713,6 @@ impl AgentRuntimeFactory {
     }
 }
 
-impl Drop for AgentLoop {
-    fn drop(&mut self) {
-        self.subagent_cancel_token.cancel();
-        for handle in self.subagent_handles.drain(..) {
-            handle.abort();
-        }
-    }
-}
 
 impl AgentLoop {
     /// Create a new agent loop and its corresponding UI handle.
@@ -996,20 +952,6 @@ impl AgentLoop {
         // before the first turn's system prompt is assembled.
         let env_snapshot = crate::ctx::EnvSnapshot::capture(&working_dir);
 
-        // Initialize subagent registry and register stock subagents
-        let subagent_registry = std::sync::Arc::new(
-            std::sync::RwLock::new(
-                crate::agent::sub_agent::registry::SubAgentRegistry::new()
-            )
-        );
-        // Register atomcode-guide subagent
-        {
-            let reg = subagent_registry.write().unwrap();
-            if let Err(e) = crate::agent::guide::register(&reg) {
-                tracing::warn!("Failed to register atomcode-guide subagent: {}", e);
-            }
-        }
-
         let agent = Self {
             conversation,
             tool_registry: shared_tools.clone(),
@@ -1034,10 +976,6 @@ impl AgentLoop {
             cancel_token: CancellationToken::new(),
             indexer_cancel: CancellationToken::new(),
             background_running: std::sync::Arc::new(AtomicBool::new(false)),
-            subagent_registry,
-            subagent_handles: Vec::new(),
-            subagent_cancel_token: CancellationToken::new(),
-            subagent_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             discipline_state: DisciplineState::default(),
             files_read_this_turn: Vec::new(),
             files_edited_this_turn: Vec::new(),
@@ -1102,19 +1040,6 @@ impl AgentLoop {
                 .await;
         }
 
-        // Register invoke_subagent tool
-        if self.config.subagent.enabled {
-            self.tool_registry
-                .register_arc("invoke_subagent".to_string(), std::sync::Arc::new(crate::tool::agent::AgentTool::new(
-                    self.turn_runner.provider.clone(),
-                    self.config.clone(),
-                    self.event_tx.clone(),
-                    self.subagent_registry.clone(),
-                    self.subagent_cancel_token.clone(),
-                )))
-                .await;
-        }
-
         // Spawn background code graph indexer
         {
             let working_dir = self.turn_runner.context.working_dir.read().await.clone();
@@ -1170,11 +1095,7 @@ impl AgentLoop {
                 AgentCommand::Cancel => {
                     crate::ctrace!("AGT", "outer Cancel -> cancel_token.cancel() (was_cancelled={})", self.cancel_token.is_cancelled());
                     self.cancel_token.cancel();
-                    self.subagent_cancel_token.cancel();
                     self.cancel_token = CancellationToken::new();
-                    self.subagent_cancel_token = CancellationToken::new();
-                    // Drop completed handles to prevent unbounded growth.
-                    self.subagent_handles.retain(|h| !h.is_finished());
                     self.phase = AgentPhase::Idle;
                     // Cancel the current turn — preserve completed content, backfill
                     // (cancelled) for unpaired tool calls, and mark turn as Completed.
@@ -1482,38 +1403,6 @@ impl AgentLoop {
                         });
                     }
                 }
-                AgentCommand::InvokeSubAgent { name, task } => {
-                    self.handle_invoke_subagent(name, task).await;
-                }
-                AgentCommand::InjectGuideResult { text } => {
-                    // Truncate the guide result before injecting into
-                    // conversation history to avoid bloating context.
-                    // Use the same 2-chars-per-token heuristic as the
-                    // sub-agent runner.
-                    let max_chars = 2400usize; // ~1200 tokens
-                    let truncated_text = if text.chars().count() > max_chars {
-                        let end = max_chars.min(text.chars().count());
-                        let prefix: String = text.chars().take(end).collect();
-                        let boundary = prefix
-                            .rfind(|c: char| c == '。' || c == '\n' || c == '.' || c == '!' || c == '?')
-                            .map(|p| p + 1)
-                            .unwrap_or(end);
-                        let mut trimmed: String = text.chars().take(boundary).collect();
-                        trimmed.push_str(&crate::i18n::t(crate::i18n::Msg::GuideTruncatedIndicator));
-                        trimmed
-                    } else {
-                        text.clone()
-                    };
-                    let guarded = crate::i18n::t(
-                        crate::i18n::Msg::GuideResultWrapper { text: &truncated_text }
-                    ).into_owned();
-                    self.conversation.messages.push(
-                        crate::conversation::message::Message::new(
-                            crate::conversation::message::Role::Assistant,
-                            guarded,
-                        ),
-                    );
-                }
                 AgentCommand::RefreshContextStats => {
                     let system_prompt = self.build_system_prompt();
                     let (msgs, _) = self
@@ -1561,118 +1450,6 @@ impl AgentLoop {
                 }
             }
         }
-    }
-
-    async fn handle_invoke_subagent(&mut self, name: String, task: String) {
-        use crate::i18n::t;
-        use crate::i18n::Msg;
-
-        if self.subagent_running.swap(true, std::sync::atomic::Ordering::Acquire) {
-            let _ = self.event_tx.send(AgentEvent::Warning(
-                t(Msg::GuideAlreadyRunning).into_owned()
-            ));
-            return;
-        }
-
-        let registry = self.subagent_registry.clone();
-        let provider = self.turn_runner.provider.clone();
-        let config = std::sync::Arc::new(self.config.clone());
-        let parent_tools = self.turn_runner.tools.clone();
-        let parent_ctx = self.turn_runner.context.clone();
-        let event_tx = self.event_tx.clone();
-        let cancel_token = self.subagent_cancel_token.child_token();
-        let running = self.subagent_running.clone();
-
-        let guard_name = name.clone();
-        let guard_tx = event_tx.clone();
-        let handle = tokio::spawn(async move {
-            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let completed_guard = completed.clone();
-            let _guard = scopeguard::guard((), move |_| {
-                running.store(false, std::sync::atomic::Ordering::Release);
-                if !completed_guard.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = guard_tx.send(AgentEvent::GuideComplete {
-                        subagent: guard_name.clone(),
-                        text: t(Msg::GuideGenericError).into_owned(),
-                        truncated: false,
-                        cancelled: true,
-                    });
-                }
-            });
-
-            let def = {
-                let reg = match registry.read() {
-                    Ok(r) => r,
-                    Err(_) => {
-                        completed.store(true, std::sync::atomic::Ordering::Relaxed);
-                        let _ = event_tx.send(AgentEvent::GuideComplete {
-                            subagent: name,
-                            text: t(Msg::GuideSystemError).into_owned(),
-                            truncated: false,
-                            cancelled: true,
-                        });
-                        return;
-                    }
-                };
-                reg.find(&name)
-            };
-
-            let mut def = match def {
-                Some(d) => d,
-                None => {
-                    completed.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = event_tx.send(AgentEvent::GuideComplete {
-                        subagent: name,
-                        text: t(Msg::GuideNotFound).into_owned(),
-                        truncated: false,
-                        cancelled: true,
-                    });
-                    return;
-                }
-            };
-
-            // Update system prompt based on current locale for guide subagent
-            if def.name == "atomcode-guide" {
-                def.system_prompt = crate::agent::guide::get_guide_system_prompt();
-            }
-
-            let runner = crate::agent::sub_agent::runner::SubAgentRunner::new(
-                provider, config, parent_tools, parent_ctx,
-                event_tx.clone(), cancel_token,
-            );
-
-            let result = runner.run(def, task).await;
-            completed.store(true, std::sync::atomic::Ordering::Relaxed);
-            match result {
-                Ok(output) => {
-                    let _ = event_tx.send(AgentEvent::GuideComplete {
-                        subagent: name,
-                        text: output.text,
-                        truncated: output.truncated,
-                        cancelled: false,
-                    });
-                }
-                Err(e) => {
-                    let friendly = if e.cancelled {
-                        t(Msg::GuideCancelled).into_owned()
-                    } else if e.message.contains("LLM turn failed") {
-                        t(Msg::GuideLlmError).into_owned()
-                    } else if e.message.contains("No default provider") {
-                        t(Msg::GuideNoProvider).into_owned()
-                    } else {
-                        t(Msg::GuideGenericError).into_owned()
-                    };
-                    let _ = event_tx.send(AgentEvent::GuideComplete {
-                        subagent: name,
-                        text: friendly,
-                        truncated: false,
-                        cancelled: e.cancelled,
-                    });
-                }
-            }
-        });
-
-        self.subagent_handles.push(handle);
     }
 
     // -------------------------------------------------------------------------

@@ -256,9 +256,6 @@ pub struct UiState {
     /// event arrives. Mirrors `active_tool_batches` membership; cleared
     /// together.
     pub call_id_to_batch: std::collections::HashMap<String, String>,
-    /// True while a guide subagent is running — keeps the spinner
-    /// ticking even when the main agent is Idle.
-    pub guide_running: bool,
 }
 
 /// Per-batch state for an active `ToolBatchStarted`. Tracks how many
@@ -316,7 +313,6 @@ impl UiState {
             sub_agent_started_at: None,
             active_tool_batches: std::collections::HashMap::new(),
             call_id_to_batch: std::collections::HashMap::new(),
-            guide_running: false,
         }
     }
 

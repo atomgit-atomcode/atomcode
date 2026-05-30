@@ -579,52 +579,6 @@ pub enum Msg<'a> {
     GuideMenuTip,
     /// /guide menu: documentation URL
     GuideMenuDocUrl,
-    /// Knowledge base: "no results found" message
-    GuideKbNoResults { query: &'a str },
-    /// Knowledge base: "Related knowledge" section header
-    GuideKbRelatedHeader,
-    /// Knowledge base: content truncated marker
-    GuideKbTruncated,
-    /// Guide subagent: already running warning
-    GuideAlreadyRunning,
-    /// Guide subagent: system error
-    GuideSystemError,
-    /// Guide subagent: subagent not found
-    GuideNotFound,
-    /// Guide subagent: generic error
-    GuideGenericError,
-    /// Guide subagent: cancelled
-    GuideCancelled,
-    /// Guide subagent: LLM error
-    GuideLlmError,
-    /// Guide subagent: no provider configured
-    GuideNoProvider,
-    /// Guide subagent: querying message
-    GuideQuerying,
-    /// Guide subagent: description for SubAgentDefinition
-    GuideDescription,
-    /// Guide subagent: fallback message when LLM returns empty answer
-    GuideEmptyFallback,
-    /// Guide subagent: tool label — reading file
-    ToolLabelReadFile,
-    /// Guide subagent: tool label — searching code
-    ToolLabelGrep,
-    /// Guide subagent: tool label — searching files
-    ToolLabelGlob,
-    /// Guide subagent: tool label — listing directory
-    ToolLabelListDir,
-    /// Guide subagent: tool label — web search
-    ToolLabelWebSearch,
-    /// Guide subagent: tool label — fetching web page
-    ToolLabelWebFetch,
-    /// Guide subagent: tool label — generic processing
-    ToolLabelProcessing,
-    /// Guide subagent: wrapper for injecting guide result into conversation
-    GuideResultWrapper { text: &'a str },
-    /// Guide subagent: display name for the guide subagent
-    GuideDisplayName,
-    /// Guide subagent: truncated indicator shown after guide answer
-    GuideTruncatedIndicator,
     /// `/guide`: ask skill install already in progress, please wait
     CmdGuideInstalling,
     /// `/guide`: ask skill not installed, triggering auto-install
@@ -635,12 +589,6 @@ pub enum Msg<'a> {
     CmdGuideSkillNotFound,
     /// `/guide`: install failed, suggest manual install
     CmdGuideInstallFailed { error: &'a str },
-    /// invoke_subagent tool: description shown to LLM
-    InvokeSubAgentToolDesc,
-    /// invoke_subagent tool: subagent_name parameter description
-    InvokeSubAgentParamName,
-    /// invoke_subagent tool: task parameter description
-    InvokeSubAgentParamTask,
     /// `/paste` failed because the clipboard holds no image. Shown
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.

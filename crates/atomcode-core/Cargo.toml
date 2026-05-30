@@ -69,7 +69,6 @@ tar = "0.4"
 # with the closed-source overlay and turns the feature on. Off by
 # default — the stub crate is linked only when this feature is enabled,
 # never in standard `cargo build`.
-scopeguard = "1"
 atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional = true }
 
 [features]

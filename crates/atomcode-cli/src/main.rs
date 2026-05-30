@@ -1946,19 +1946,6 @@ async fn run_headless(
             AgentEvent::MessagesSync { .. } => {
                 // Only used by TUI for /bg session persistence; ignore in CLI.
             }
-            AgentEvent::GuideTurnActivity { .. } => {
-                // Subagent is thinking — no output needed in CLI mode.
-                // Final result arrives via GuideComplete.
-            }
-            AgentEvent::GuideComplete {
-                text,
-                truncated,
-                ..
-            } => {
-                close_thinking_line(&mut thinking_line_open);
-                let tag = if truncated { " [truncated]" } else { "" };
-                eprintln!("{}{}", text, tag);
-            }
         }
     }
 

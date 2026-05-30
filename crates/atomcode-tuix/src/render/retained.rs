@@ -399,14 +399,7 @@ pub struct RetainedRenderer<W: Write + Send> {
     /// tool call (rendered via `render_inflight_tool`). Used to replace
     /// those lines on each spinner tick and to clean up on commit.
     inflight_tool_rows: usize,
-    /// Number of body lines occupied by the current GuideStatus row.
-    /// Each GuideStatus emission removes the previous one before pushing,
-    /// so the status line updates in-place without scrollback accumulation.
-    guide_status_rows: usize,
-    /// Current guide subagent status text (None = no guide running).
-    /// The spinner tick loop reads this to animate the running indicator.
-    /// Cleared when GuideStatus carries an empty string from GuideComplete.
-    guide_status_text: Option<String>,
+
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
     /// `UiLine::ToolGroupChildUpdate` events resolve `call_id` →
@@ -536,8 +529,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             live_spinner_active: false,
             inflight_tool: None,
             inflight_tool_rows: 0,
-            guide_status_rows: 0,
-            guide_status_text: None,
             live_group: None,
             #[cfg(windows)]
             prior_console_in_mode,
@@ -770,53 +761,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         }
         self.inflight_tool_rows = n;
-    }
-
-    /// No-op: the main-branch renderer manages scroll regions automatically
-    /// via the diff-based screen pipeline. Kept for compatibility with the
-    /// guide-status in-place replacement code that calls it before CUP writes.
-    fn ensure_scroll_region(&mut self) {}
-
-    /// Render the guide subagent status line with a spinner frame.
-    /// Replaces the previous GuideStatus row in-place. Updates
-    /// `body_lines` so the next `flush_deferred` tick (≤5ms) paints
-    /// the row through the cell-diff path inside `render_diff`'s
-    /// DECSET 2026 + hide-cursor envelope.
-    ///
-    /// Earlier this function did its own direct stdout write
-    /// (`\x1b[{bottom};1H\x1b[2K` + `serialize_row`) followed by a
-    /// `peek_cursor` CUP to re-anchor the caret. That bypassed the
-    /// BSU envelope entirely, so on hosts that ignore BSU/ESU the
-    /// user saw a per-tick cursor hop from input box to spinner row
-    /// and back, perceived as input-box flicker while the guide
-    /// subagent ran.
-    fn render_guide_spinner(&mut self, row: Vec<Cell>) {
-        let prev = self.guide_status_rows;
-        let inplace_ok = prev > 0 && prev == 1;
-        if inplace_ok {
-            self.ensure_scroll_region();
-            let bottom = self.body_bottom_row();
-            if bottom >= 1 {
-                let keep = self.body_lines.len().saturating_sub(prev);
-                self.body_lines.truncate(keep);
-                self.body_lines.push(row);
-                // `render()` sets `self.dirty = true` at end of call;
-                // the next `flush_deferred` tick emits only the
-                // changed cells through the cell-diff path, keeping
-                // the update inside the BSU envelope.
-                return;
-            }
-        }
-        // Fallback: remove old row, push new one
-        if prev > 0 {
-            let remove = prev.min(self.body_lines.len());
-            self.body_lines.truncate(self.body_lines.len() - remove);
-        }
-        // Old spinner rows are gone (truncated above); clear the count so
-        // push_body_row's pop_guide_spinner doesn't also strip content.
-        self.guide_status_rows = 0;
-        self.push_body_row(row);
-        self.guide_status_rows = 1;
     }
 
     /// Pad a partially-built row with blank default-style cells until it
@@ -1676,33 +1620,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         true
     }
 
-    /// Remove the trailing guide-status (spinner) rows from `body_lines` and
-    /// erase them on screen, so a content push lands where the spinner was
-    /// instead of stranding the spinner in scrollback. Only fires for an
-    /// ACTIVE spinner (`guide_status_text` set) — the frozen `⎿` completion
-    /// marker has `guide_status_text == None` and must persist. The text is
-    /// kept, so the next spinner tick re-renders the row below the new
-    /// content. Returns true if rows were removed.
-    fn pop_guide_spinner(&mut self) -> bool {
-        if self.guide_status_text.is_none() || self.guide_status_rows == 0 {
-            return false;
-        }
-        let remove = self.guide_status_rows.min(self.body_lines.len());
-        if remove > 0 {
-            self.ensure_scroll_region();
-            let bottom = self.body_bottom_row();
-            self.body_lines.truncate(self.body_lines.len() - remove);
-            let first = bottom.saturating_sub(remove as u16) + 1;
-            for i in 0..remove {
-                let r = first + i as u16;
-                let seq = format!("\x1b[{};1H\x1b[2K", r);
-                let _ = self.out.write_all(seq.as_bytes());
-            }
-        }
-        self.guide_status_rows = 0;
-        true
-    }
-
     /// Append a fully-cell-formatted body row to history AND emit it
     /// immediately so it enters terminal scrollback. Trims oldest
     /// `body_lines` when over the retention cap (memory-only — rows
@@ -1750,12 +1667,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // remains armed for source-compat with callers that consult
             // it; its decrement path is now a no-op (kept to avoid a
             // bigger refactor in this combined commit).
-            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
-        }
-        // Same for an active guide spinner: a content push (streamed answer,
-        // markdown, etc.) must take the spinner's slot, not push it down into
-        // scrollback. The spinner re-renders below on its next tick.
-        if self.pop_guide_spinner() {
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
         }
         // Append-only: `next_body_emit_row` checks the cap; emit is
@@ -2528,12 +2439,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // and carries the ` · 12s · N queued` metadata; pluck
                 // that suffix off and forward it to render_inflight_tool
                 // so the user gets a time anchor on long bashes.
-                if let Some(status) = self.guide_status_text.clone() {
-                    let meta = spinner_meta_suffix(&label);
-                    let label_with_time = if meta.is_empty() { status } else { format!("{}{}", status, meta) };
-                    let cells = self.build_spinner_body_row(frame, &label_with_time);
-                    self.render_guide_spinner(cells);
-                } else if let Some((_id, name, detail)) = self.inflight_tool.clone() {
+                if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     let meta = spinner_meta_suffix(&label);
                     self.render_inflight_tool(frame, &name, &detail, meta);
                 } else {
@@ -2542,12 +2448,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 }
             }
             UiLine::Spinner { frame, label } => {
-                if let Some(status) = self.guide_status_text.clone() {
-                    let meta = spinner_meta_suffix(&label);
-                    let label_with_time = if meta.is_empty() { status } else { format!("{}{}", status, meta) };
-                    let cells = self.build_spinner_body_row(frame, &label_with_time);
-                    self.render_guide_spinner(cells);
-                } else if let Some((_id, name, detail)) = self.inflight_tool.clone() {
+                if let Some((_id, name, detail)) = self.inflight_tool.clone() {
                     let meta = spinner_meta_suffix(&label);
                     self.render_inflight_tool(frame, &name, &detail, meta);
                 } else {
@@ -3188,119 +3089,6 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // plain renderer streams to stdout.
                 let safe = crate::sanitize::scrub_controls_keep_sgr(&text);
                 self.push_body_text_sgr(&safe);
-            }
-            UiLine::GuideStatus(text) => {
-                // Empty text from GuideComplete: clear spinner state so
-                // subsequent non-guide turns route through the normal
-                // spinner / tool-call rendering paths.
-                if text.is_empty() {
-                    self.guide_status_text = None;
-                    let prev = self.guide_status_rows;
-                    if prev > 0 {
-                        let remove = prev.min(self.body_lines.len());
-                        self.body_lines.truncate(self.body_lines.len() - remove);
-                    }
-                    self.guide_status_rows = 0;
-                    return;
-                }
-
-                // Running state: store text for spinner animation, push
-                // initial row immediately (spinner tick will replace it
-                // in-place with the animated frame glyph on each tick).
-                self.guide_status_text = Some(text.clone());
-
-                let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
-                let mut new_rows: Vec<Vec<Cell>> = Vec::new();
-                if w > 0 {
-                    for phys in text.split('\n') {
-                        for chunk in crate::width::wrap_line_to_width(phys, w) {
-                            let mut row = Vec::new();
-                            push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
-                            let _ = crate::render::cell::push_str_cells_sgr(
-                                &mut row, &chunk, CellStyle::default(),
-                            );
-                            new_rows.push(row);
-                        }
-                    }
-                }
-                let n = new_rows.len();
-                let prev = self.guide_status_rows;
-                let inplace_ok = prev > 0 && n == prev;
-
-                if inplace_ok {
-                    self.ensure_scroll_region();
-                    let bottom = self.body_bottom_row();
-                    if bottom >= n as u16 {
-                        let keep = self.body_lines.len().saturating_sub(prev);
-                        self.body_lines.truncate(keep);
-                        let first = bottom - n as u16 + 1;
-                        for (i, row) in new_rows.iter().enumerate() {
-                            let r = first + i as u16;
-                            let seq = format!("\x1b[{};1H\x1b[2K", r);
-                            let _ = self.out.write_all(seq.as_bytes());
-                            let bytes = serialize_row(row);
-                            let _ = self.out.write_all(&bytes);
-                            self.body_lines.push(row.clone());
-                        }
-                        self.guide_status_rows = n;
-                        return;
-                    }
-                }
-
-                // Empty text: clear the spinner row from terminal.
-                if n == 0 {
-                    self.guide_status_text = None;
-                    if prev > 0 {
-                        self.ensure_scroll_region();
-                        let bottom = self.body_bottom_row();
-                        let remove = prev.min(self.body_lines.len());
-                        self.body_lines.truncate(self.body_lines.len() - remove);
-                        // Erase terminal rows (bottom-up, one per prev row).
-                        let first = bottom.saturating_sub(prev as u16) + 1;
-                        for i in 0..prev {
-                            let r = first + i as u16;
-                            let seq = format!("\x1b[{};1H\x1b[2K", r);
-                            let _ = self.out.write_all(seq.as_bytes());
-                        }
-                    }
-                    self.guide_status_rows = 0;
-                    return;
-                }
-
-                // First render, row count mismatch, or resize — fallback.
-                if prev > 0 {
-                    let remove = prev.min(self.body_lines.len());
-                    self.body_lines.truncate(self.body_lines.len() - remove);
-                }
-                // Old spinner rows are gone (truncated above); clear the count
-                // so push_body_row's pop_guide_spinner doesn't strip content.
-                self.guide_status_rows = 0;
-                for row in new_rows {
-                    self.push_body_row(row);
-                }
-                self.guide_status_rows = n;
-            }
-            UiLine::GuideResult(text) => {
-                // Scrub ANSI control sequences — the guide subagent may
-                // return LLM output influenced by web content. Non-SGR
-                // escapes (clear screen, cursor home, etc.) are stripped
-                // to prevent terminal injection.
-                let safe = crate::sanitize::scrub_controls(&text);
-                let md_width = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
-                let mut md_state = crate::markdown::MdState::new();
-                for line in safe.lines() {
-                    if let Some(rendered) = crate::markdown::render_line_with_width(
-                        line,
-                        &mut md_state,
-                        self.caps,
-                        md_width,
-                    ) {
-                        self.push_markdown_body(&rendered);
-                    }
-                }
-                if let Some(block) = crate::markdown::finalize_with_width(&mut md_state, self.caps, md_width) {
-                    self.push_markdown_body(&block);
-                }
             }
             UiLine::ImageAttachment(n) => {
                 // `└` at col 2, under the `[` of `[Image #N]` in the
@@ -4259,34 +4047,6 @@ mod tests {
 
     fn sample(c: &Arc<AtomicU64>) -> u64 {
         c.load(Ordering::Relaxed)
-    }
-
-    /// Regression: a guide answer streamed while the "Querying guide…"
-    /// spinner is active must NOT strand the spinner row in scrollback.
-    /// The content push pops the spinner (keeping its text so the next tick
-    /// re-renders below) rather than pushing content beneath it.
-    #[test]
-    fn guide_spinner_not_stranded_by_streamed_content() {
-        let (mut r, _buf) = new_capturing(80, 24);
-        r.render(UiLine::GuideStatus("Guide Querying guide… · 1.8s".to_string()));
-        assert!(r.guide_status_rows >= 1, "spinner should occupy a row");
-        assert!(r.guide_status_text.is_some());
-
-        // Streamed answer content arrives while the spinner is still active.
-        r.render(UiLine::GuideResult("hello world".to_string()));
-
-        assert_eq!(
-            r.guide_status_rows, 0,
-            "spinner rows popped before content, not left above it"
-        );
-        assert!(
-            r.guide_status_text.is_some(),
-            "text kept so the next spinner tick re-renders below the content"
-        );
-        let stranded = r.body_lines.iter().any(|row| {
-            row.iter().map(|c| c.ch).collect::<String>().contains("Querying")
-        });
-        assert!(!stranded, "spinner line must not remain in scrollback");
     }
 
     fn status_basic() -> StatusLine {

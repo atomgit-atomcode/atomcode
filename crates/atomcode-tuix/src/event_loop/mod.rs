@@ -2914,11 +2914,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
     deferred_render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     deferred_render_tick.tick().await; // consume the immediate fire
 
-    // Last-draw timestamp — consulted by the post-event pump so we
-    // don't redraw more often than every 100ms even when handlers
-    // fire back-to-back.
-    let mut last_spinner_draw = std::time::Instant::now();
-
     // Last emitted integer percent for the /upgrade download line.
     // Gate on change so we don't spam the renderer with a progress
     // line for every chunk (a 10 MB binary at 64 KiB chunks would be
@@ -2976,9 +2971,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running => {
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                last_spinner_draw = std::time::Instant::now();
             }
 
             // ── Terminal input ──
@@ -3253,11 +3247,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
-                    if matches!(app.state.phase, UiPhase::Streaming) || (app.state.guide_running
-                        && last_spinner_draw.elapsed() >= Duration::from_millis(100))
+                    if matches!(app.state.phase, UiPhase::Streaming)
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                        last_spinner_draw = std::time::Instant::now();
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
                         // Turn just ended — drain the type-ahead queue.
@@ -3307,7 +3299,6 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 match app.state.phase {
                     UiPhase::Streaming => {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                        last_spinner_draw = std::time::Instant::now();
                     }
                     _ => {
                         redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
@@ -3336,7 +3327,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // 2-press confirm because if we got here, the user has no
             // working keyboard route to confirm with anyway.
             Some(()) = win_ctrl_c.recv() => {
-                if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running {
+                if matches!(app.state.phase, UiPhase::Streaming) {
                     // In Streaming phase, Ctrl+C should cancel the
                     // running turn (matching keyboard-path behaviour)
                     // rather than shut down the whole application.
@@ -3358,9 +3349,8 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             }
 
             // ── Spinner tick (from background task) ──
-            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running => {
+            Some(()) = spin_rx.recv(), if matches!(app.state.phase, UiPhase::Streaming) => {
                 draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                last_spinner_draw = std::time::Instant::now();
             }
 
             // ── Terminal input ──
@@ -3630,11 +3620,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if pre_phase != app.state.phase {
                         crate::tuix_trace!("PH", "{:?} -> {:?}", pre_phase, app.state.phase);
                     }
-                    if matches!(app.state.phase, UiPhase::Streaming) || (app.state.guide_running
-                        && last_spinner_draw.elapsed() >= Duration::from_millis(100))
+                    if matches!(app.state.phase, UiPhase::Streaming)
                     {
                         draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
-                        last_spinner_draw = std::time::Instant::now();
                     }
                     if matches!(app.state.phase, UiPhase::Idle) {
                         if let Some(queued) = app.message_queue.pop_front() {
@@ -3794,7 +3782,7 @@ fn attach_image_to_input(
     let marker = format!("[Image #{}]", n);
     app.buf.text.insert_str(app.buf.cursor, &marker);
     app.buf.cursor += marker.len();
-    if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running {
+    if matches!(app.state.phase, UiPhase::Streaming) {
         draw_spinner_now(
             &mut app.state,
             &app.buf,
@@ -3960,7 +3948,7 @@ fn handle_input(
                     return Ok(());
                 }
                 app.buf.insert_paste(text);
-                if matches!(app.state.phase, UiPhase::Streaming) || app.state.guide_running {
+                if matches!(app.state.phase, UiPhase::Streaming) {
                     draw_spinner_now(
                         &mut app.state,
                         &app.buf,
@@ -4763,16 +4751,6 @@ fn handle_idle_key(
 
     let action = classify(code, modifiers);
 
-    // When a guide subagent is running, Ctrl+C should always cancel it
-    // regardless of whether the input buffer is empty or not.
-    if app.state.guide_running && matches!(action, Action::Cancel) {
-        ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
-        app.buf.text.clear();
-        app.buf.cursor = 0;
-        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-        return Ok(());
-    }
-
     let result = app.buf.apply(action, ctx.history.entries(), &ctx.commands);
     sync_recalled_attachments(&mut app.state, &app.buf, ctx.history.entries());
     crate::tuix_trace!(
@@ -4999,26 +4977,19 @@ fn handle_idle_key(
             }
         }
         BufferResult::Exit => {
-            // When a guide subagent is running, Ctrl+C on an empty
-            // buffer cancels the guide instead of triggering exit.
-            if app.state.guide_running {
-                ctx.agent.cmd_tx.send(AgentCommand::Cancel).ok();
-                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
+            let now = std::time::Instant::now();
+            let armed = app
+                .exit_pending
+                .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
+            if armed {
+                ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
             } else {
-                let now = std::time::Instant::now();
-                let armed = app
-                    .exit_pending
-                    .is_some_and(|t| now.duration_since(t) <= CTRL_C_EXIT_WINDOW);
-                if armed {
-                    ctx.agent.cmd_tx.send(AgentCommand::Shutdown).ok();
-                } else {
-                    app.exit_pending = Some(now);
-                    renderer.render(UiLine::CommandOutput(
-                        crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
-                    ));
-                    renderer.flush();
-                    redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
-                }
+                app.exit_pending = Some(now);
+                renderer.render(UiLine::CommandOutput(
+                    crate::i18n::t(crate::i18n::Msg::CtrlCAgainToExit).into_owned(),
+                ));
+                renderer.flush();
+                redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             }
         }
     }
@@ -5856,14 +5827,6 @@ pub(super) fn handle_upgrade_event(
         }
     }
     renderer.flush();
-}
-
-/// Map internal subagent names to user-facing display names.
-fn subagent_display_name(name: &str) -> std::borrow::Cow<'static, str> {
-    match name {
-        "atomcode-guide" => crate::i18n::t(crate::i18n::Msg::GuideDisplayName),
-        _ => std::borrow::Cow::Owned(name.to_string()),
-    }
 }
 
 fn handle_agent_event(
@@ -6766,29 +6729,6 @@ fn handle_agent_event(
                 renderer.render(UiLine::Error(body));
             }
             renderer.flush();
-        }
-        AgentEvent::GuideTurnActivity { subagent, message } => {
-            state.guide_running = true;
-            let display = subagent_display_name(&subagent);
-            renderer.render(UiLine::GuideStatus(
-                format!("{} {}", display, message),
-            ));
-            renderer.flush();
-        }
-        AgentEvent::GuideComplete { text, truncated, cancelled, .. } => {
-            state.guide_running = false;
-            // Clear the spinner row before showing the answer.
-            renderer.render(UiLine::GuideStatus(String::new()));
-            renderer.flush();
-            let mut output = text.clone();
-            if truncated {
-                output.push_str(&crate::i18n::t(crate::i18n::Msg::GuideTruncatedIndicator));
-            }
-            renderer.render(UiLine::GuideResult(output));
-            renderer.flush();
-            if !cancelled && !text.is_empty() {
-                let _ = ctx.agent.cmd_tx.send(AgentCommand::InjectGuideResult { text });
-            }
         }
         AgentEvent::MessagesSync { messages } => {
             // Response to AgentCommand::SyncMessages. Persist the
