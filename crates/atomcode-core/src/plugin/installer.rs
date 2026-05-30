@@ -481,6 +481,55 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
     })
 }
 
+/// Ensure a plugin from a marketplace is fully installed, automatically
+/// recovering from missing marketplace registrations or deleted clones.
+/// This is the single entry-point for `/guide` auto-install and similar
+/// "make this work no matter what" flows.
+pub fn ensure_plugin_installed(
+    plugin: &str,
+    marketplace: &str,
+    marketplace_url: &str,
+) -> Result<InstalledPluginInfo> {
+    // Step 1: Ensure marketplace is registered.
+    let mp_file = paths::marketplaces_file().unwrap();
+    let mp_state = load_marketplaces_file(&mp_file)?;
+    let needs_add = !mp_state.marketplaces.contains_key(marketplace);
+    drop(mp_state);
+
+    if needs_add {
+        match super::marketplace::add_marketplace(marketplace_url) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("already exists") {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // Step 2: Ensure the marketplace clone exists on disk.
+    let mp_root = paths::plugins_root()
+        .unwrap()
+        .join("marketplaces")
+        .join(marketplace);
+    if !mp_root.exists() {
+        let mp_state = load_marketplaces_file(&mp_file)?;
+        let entry = mp_state
+            .marketplaces
+            .get(marketplace)
+            .ok_or_else(|| anyhow!("marketplace `{}` not registered", marketplace))?;
+        let url = entry.source.clone();
+        drop(mp_state);
+
+        super::marketplace::git_clone(&url, &mp_root)
+            .with_context(|| format!("re-clone marketplace `{}`", marketplace))?;
+    }
+
+    // Step 3: Install the plugin.
+    install(plugin, marketplace)
+}
+
 pub fn uninstall(plugin: &str, marketplace: &str) -> Result<()> {
     let plugin_key = sanitize_name(plugin);
     let id = plugin_id(&plugin_key, marketplace);

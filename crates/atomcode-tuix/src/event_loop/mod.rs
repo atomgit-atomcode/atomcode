@@ -3226,7 +3226,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if let Some(m) = app.active_modal.as_mut() {
                     m.on_plugin_event(&ev);
                 }
-                handle_plugin_job_event(ev, &mut ctx, &app.state, renderer);
+                handle_plugin_job_event(ev, &mut ctx, &mut app.state, renderer);
                 // The job result rendered to scrollback above; restore the
                 // bottom prompt. Redraw the modal if one is open (else
                 // redraw_idle_plain would paint over it), otherwise the idle box.
@@ -5627,7 +5627,7 @@ fn handle_approval_key(
 pub(super) fn handle_plugin_job_event(
     ev: atomcode_core::plugin::PluginJobEvent,
     ctx: &mut LoopCtx,
-    state: &crate::state::UiState,
+    state: &mut crate::state::UiState,
     renderer: &mut dyn Renderer,
 ) {
     use atomcode_core::plugin::PluginJobEvent;
@@ -5698,6 +5698,7 @@ pub(super) fn handle_plugin_job_event(
                         .into_owned(),
                     ));
                     renderer.flush();
+                    state.on_submit();
                     ctx.agent
                         .cmd_tx
                         .send(atomcode_core::agent::AgentCommand::SendMessage {
@@ -5738,6 +5739,7 @@ pub(super) fn handle_plugin_job_event(
                         .into_owned(),
                     ));
                     renderer.flush();
+                    state.on_submit();
                     ctx.agent
                         .cmd_tx
                         .send(atomcode_core::agent::AgentCommand::SendMessage {

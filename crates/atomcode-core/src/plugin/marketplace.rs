@@ -142,7 +142,7 @@ pub(super) fn resolve_marketplace_identity(
     }
 }
 
-fn git_clone(url: &str, target: &Path) -> Result<()> {
+pub(super) fn git_clone(url: &str, target: &Path) -> Result<()> {
     let out = Command::new("git")
         .args(["clone", "--depth", "1", url])
         .arg(target)

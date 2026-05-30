@@ -330,9 +330,10 @@ pub(super) fn execute_slash_command(
                     renderer.flush();
 
                     tokio::task::spawn_blocking(move || {
-                        let ev = match atomcode_core::plugin::installer::install(
+                        let ev = match atomcode_core::plugin::installer::ensure_plugin_installed(
                             "atomcode",
                             "atomcode-skills",
+                            "https://atomgit.com/atomgit_atomcode/atomcode-skills.git",
                         ) {
                             Ok(info) => {
                                 atomcode_core::plugin::PluginJobEvent::PluginInstalled(info)
