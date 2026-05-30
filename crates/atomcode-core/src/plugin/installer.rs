@@ -389,6 +389,12 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
     // Resolve plugin source dir relative to marketplace root.
     let mp_root_rel = format!("marketplaces/{}", marketplace);
     let mp_root_abs = paths::plugins_root().unwrap().join(&mp_root_rel);
+    if !mp_root_abs.exists() {
+        bail!(
+            "marketplace `{}` clone is missing — run `/plugin update {marketplace}` to restore it",
+            marketplace
+        );
+    }
     let manifest = super::manifest::load_marketplace_manifest(&mp_root_abs)?;
     let plugin_entry: PluginEntry = match manifest {
         Some(m) => m
@@ -436,12 +442,26 @@ pub fn install(plugin: &str, marketplace: &str) -> Result<InstalledPluginInfo> {
     let installed_path = paths::installed_plugins_file().unwrap();
     let mut installed = load_installed_plugins_file(&installed_path)?;
     if installed.plugins.contains_key(&id) {
-        // Roll back any external clone that we just created so retries work.
-        if plugin_dir_rel.starts_with("installed/") {
-            let abs = paths::plugins_root().unwrap().join(&plugin_dir_rel);
-            std::fs::remove_dir_all(&abs).ok();
+        // If the user manually deleted the plugin directory but the
+        // state file still references it, treat it as a stale entry —
+        // remove it from state and continue with a fresh install.
+        let dir_missing = installed
+            .plugins
+            .get(&id)
+            .map(|e| {
+                let abs = paths::plugins_root().unwrap().join(&e.plugin_dir);
+                !abs.exists()
+            })
+            .unwrap_or(false);
+        if !dir_missing {
+            // Roll back any external clone that we just created so retries work.
+            if plugin_dir_rel.starts_with("installed/") {
+                let abs = paths::plugins_root().unwrap().join(&plugin_dir_rel);
+                std::fs::remove_dir_all(&abs).ok();
+            }
+            return Err(AlreadyInstalledError { id: id.clone() }.into());
         }
-        return Err(AlreadyInstalledError { id: id.clone() }.into());
+        installed.plugins.remove(&id);
     }
     installed.plugins.insert(
         id.clone(),
