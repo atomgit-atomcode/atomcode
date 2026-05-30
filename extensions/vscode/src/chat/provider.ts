@@ -40,6 +40,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _focusedPanelId?: string;
   private _groupLocked = false;
   private _sessionRuntimes = new Map<string, SessionRuntime>();
+  private _pendingMessages = new Map<string, any[]>();
   private _loginId?: string;
   private _loginPoll?: ReturnType<typeof setInterval>;
   private _loginStartedFromCommand = false;
@@ -268,6 +269,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'ready':
           this._markPanelReady(webview);
           await this._sendInitialState(webview, mode);
+          // Flush any messages queued before the webview was ready
+          {
+            let sid: string | undefined;
+            for (const [s, panel] of this._panels) {
+              if (panel.webview === webview) { sid = s; break; }
+            }
+            if (sid) this._flushPendingMessages(sid);
+          }
           break;
         case 'selectModel':
           await this._setDefaultProvider(msg.provider || msg.model);
@@ -440,7 +449,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this._postMessageToPanel(sid, { type: 'clearChat' });
     }
 
-    this._postMessage({ type: 'userMessage', text });
+    this._postOrQueueToPanel(sid!, { type: 'userMessage', text });
     await this._handleSend(text);
   }
 
@@ -463,7 +472,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await this._refreshSessions();
     }
 
-    this._postMessage({
+    this._postOrQueueToPanel(sid, {
       type: 'context',
       filePath: file.path,
       fileName: file.fileName,
@@ -1451,6 +1460,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       selection: !selection.isEmpty ? editor.document.getText(selection) : undefined,
       language: editor.document.languageId,
     };
+  }
+
+  private _postOrQueueToPanel(sessionId: string, msg: any) {
+    if (this._panelReady.get(sessionId)) {
+      this._postMessageToPanel(sessionId, msg);
+      return;
+    }
+    // Panel not ready yet — queue the message until webview sends 'ready'
+    const queue = this._pendingMessages.get(sessionId) || [];
+    queue.push(msg);
+    this._pendingMessages.set(sessionId, queue);
+  }
+
+  private _flushPendingMessages(sessionId: string) {
+    const queue = this._pendingMessages.get(sessionId);
+    if (!queue || queue.length === 0) return;
+    this._pendingMessages.delete(sessionId);
+    for (const msg of queue) {
+      this._postMessageToPanel(sessionId, msg);
+    }
   }
 
   private _postMessage(msg: any, webview?: vscode.Webview) {

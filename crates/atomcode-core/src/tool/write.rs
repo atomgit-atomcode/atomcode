@@ -159,7 +159,9 @@ impl Tool for WriteFileTool {
 
         // Check if overwriting existing file — build appropriate output message
         let overwrite_info = if path.exists() {
-            let old_lines = std::fs::read_to_string(&path)
+            // tokio::fs so a hung filesystem doesn't block the async worker.
+            let old_lines = tokio::fs::read_to_string(&path)
+                .await
                 .map(|c| c.lines().count())
                 .unwrap_or(0);
             Some(old_lines)

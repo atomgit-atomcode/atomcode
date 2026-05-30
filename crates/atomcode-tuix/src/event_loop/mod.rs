@@ -889,6 +889,11 @@ pub struct Buffer {
     pub text: String,
     pub cursor: usize,
     history_idx: Option<usize>,
+    /// One-shot: suppress the slash-command menu for text placed into the
+    /// buffer programmatically (a cancelled message restored on Esc). Without
+    /// this, restoring `/skills foo` would immediately re-pop the command
+    /// list. Cleared on the next key in `apply`, so editing reopens the menu.
+    menu_suppressed: bool,
     stash: String,
     /// Placeholder index → original pasted text. Index 0 = paste #1.
     pastes: Vec<String>,
@@ -914,9 +919,26 @@ impl Buffer {
             text: String::new(),
             cursor: 0,
             history_idx: None,
+            menu_suppressed: false,
             stash: String::new(),
             pastes: Vec::new(),
         }
+    }
+
+    /// Whether the slash-command menu should stay closed for the current
+    /// buffer contents (set by `set_restored_text`, cleared on the next key).
+    pub fn menu_suppressed(&self) -> bool {
+        self.menu_suppressed
+    }
+
+    /// Place `text` into the buffer programmatically (cancelled message
+    /// restored on Esc): cursor at the end, and suppress the slash menu for
+    /// one frame so a restored `/command` doesn't immediately re-pop the list.
+    pub fn set_restored_text(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = text;
+        self.history_idx = None;
+        self.menu_suppressed = true;
     }
 
     /// True while the user is scrolling input history (Up/Down on an
@@ -1037,6 +1059,10 @@ impl Buffer {
         history: &[crate::input::history::HistoryEntry],
         commands: &CommandRegistry,
     ) -> BufferResult {
+        // Any interaction lifts the one-shot menu suppression set by a
+        // restore, so editing / navigating a restored `/command` reopens the
+        // command list as usual.
+        self.menu_suppressed = false;
         match action {
             Action::Insert(c) => {
                 self.text.insert(self.cursor, c);
@@ -1058,7 +1084,15 @@ impl Buffer {
                     self.history_idx = None;
                     return BufferResult::Redraw;
                 }
-                let line = self.text.trim().to_string();
+                let mut line = self.text.trim();
+                // Strip leading shell prompt characters (❯, $, >, #, %, λ)
+                // that users accidentally paste from terminal output.
+                while let Some(rest) = line.strip_prefix(|c: char| {
+                    matches!(c, '❯' | '$' | '>' | '#' | '%' | 'λ')
+                }) {
+                    line = rest.trim_start();
+                }
+                let line = line.to_string();
                 if line.is_empty() {
                     return BufferResult::Redraw;
                 }
@@ -1433,6 +1467,28 @@ mod buffer_tests {
         assert!(matches!(r, BufferResult::Redraw));
         assert_eq!(b.text, "hello\n");
         assert_eq!(b.cursor, b.text.len());
+    }
+
+    #[test]
+    fn set_restored_text_cursor_at_end_and_suppresses_menu() {
+        let mut b = Buffer::new();
+        b.set_restored_text("/provider".to_string());
+        assert_eq!(b.text, "/provider");
+        assert_eq!(b.cursor, "/provider".len(), "cursor at end for edit-and-resend");
+        assert!(b.menu_suppressed(), "restored /command must not pop the menu");
+    }
+
+    #[test]
+    fn restored_menu_suppression_lifts_on_next_key() {
+        let reg = CommandRegistry::builtin();
+        let history: Vec<crate::input::history::HistoryEntry> = Vec::new();
+        let mut b = Buffer::new();
+        b.set_restored_text("/provider".to_string());
+        assert!(b.menu_suppressed());
+        // Any interaction (here: a Backspace edit) lifts the suppression so
+        // the command list reopens as the user edits.
+        b.apply(Action::Backspace, &history, &reg);
+        assert!(!b.menu_suppressed(), "editing reopens the menu");
     }
 
     #[test]
@@ -3149,8 +3205,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
             // ── /plugin async job result ──
             Some(ev) = ctx.plugin_job_rx.recv() => {
+                // Let an open modal (the interactive /plugin manager) refresh
+                // its cached lists from this job's result first.
+                if let Some(m) = app.active_modal.as_mut() {
+                    m.on_plugin_event(&ev);
+                }
                 handle_plugin_job_event(ev, &mut ctx, &app.state, renderer);
-                if matches!(app.state.phase, UiPhase::Idle) {
+                // The job result rendered to scrollback above; restore the
+                // bottom prompt. Redraw the modal if one is open (else
+                // redraw_idle_plain would paint over it), otherwise the idle box.
+                if let Some(m) = app.active_modal.as_ref() {
+                    m.draw(&app.buf, &app.state, &ctx, renderer);
+                } else if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -3516,8 +3582,18 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
             // ── /plugin async job result ──
             Some(ev) = ctx.plugin_job_rx.recv() => {
+                // Let an open modal (the interactive /plugin manager) refresh
+                // its cached lists from this job's result first.
+                if let Some(m) = app.active_modal.as_mut() {
+                    m.on_plugin_event(&ev);
+                }
                 handle_plugin_job_event(ev, &mut ctx, &app.state, renderer);
-                if matches!(app.state.phase, UiPhase::Idle) {
+                // The job result rendered to scrollback above; restore the
+                // bottom prompt. Redraw the modal if one is open (else
+                // redraw_idle_plain would paint over it), otherwise the idle box.
+                if let Some(m) = app.active_modal.as_ref() {
+                    m.draw(&app.buf, &app.state, &ctx, renderer);
+                } else if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
             }
@@ -4320,6 +4396,25 @@ fn build_menu_items(
     }
 }
 
+/// Build the slash / @-mention menu for the current buffer, honoring the
+/// buffer's suppression state: `is_in_history()` (a recalled `/session foo`)
+/// and `menu_suppressed()` (a `/command` restored into the box on Esc-cancel).
+/// All display paths go through this so the menu never pops for text the user
+/// didn't type, regardless of which redraw fires.
+fn menu_for_display(buf: &Buffer, ctx: &LoopCtx) -> Option<Vec<(String, String)>> {
+    if buf.is_in_history() || buf.menu_suppressed() {
+        return None;
+    }
+    build_menu_items(
+        &buf.text,
+        buf.cursor,
+        &ctx.commands,
+        &ctx.custom_commands,
+        Some(&ctx.skill_registry),
+        Some(&ctx.file_index),
+    )
+}
+
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -4328,13 +4423,9 @@ fn handle_idle_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
     // If the menu is active (buf starts with '/'), intercept navigation keys.
-    // Suppress while scrolling history — otherwise a recalled `/se…` from
-    // history immediately re-pops the menu and traps Up inside it.
-    let menu_items = if app.buf.is_in_history() {
-        None
-    } else {
-        build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
-    };
+    // Suppress while scrolling history / right after a restore (see
+    // `menu_for_display`) — otherwise a recalled `/se…` immediately re-pops.
+    let menu_items = menu_for_display(&app.buf, ctx);
     if let Some(items) = &menu_items {
         // Clamp selection in range.
         if app.menu.selected >= items.len() {
@@ -4689,14 +4780,9 @@ fn handle_idle_key(
     match result {
         BufferResult::NoOp => {}
         BufferResult::Redraw => {
-            // Rebuild menu after buf change. Same is_in_history gate
-            // as above so a HistoryPrev that just landed on `/se…`
-            // doesn't immediately re-show the slash menu.
-            let items = if app.buf.is_in_history() {
-                None
-            } else {
-                build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index))
-            };
+            // Rebuild menu after buf change. Same suppression gate as above
+            // (history recall / restored command) via `menu_for_display`.
+            let items = menu_for_display(&app.buf, ctx);
             if let Some(items) = items {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
@@ -4755,6 +4841,11 @@ fn handle_idle_key(
                     text: line.clone(),
                     images: Vec::new(),
                 });
+                // Stash for Esc-restore, same as regular messages. Most slash
+                // commands run synchronously (cleared in the Idle branch
+                // below); the streaming ones (e.g. `/skills <name>` running a
+                // subagent) keep it so cancelling restores the command line.
+                app.state.last_submitted_message = Some(line.clone());
                 if cmd.eq_ignore_ascii_case("paste") {
                     // See `handle_paste_command` — short-circuited
                     // here because the dispatcher signature can't
@@ -4774,6 +4865,9 @@ fn handle_idle_key(
                     )?;
                 }
                 if matches!(app.state.phase, UiPhase::Idle) {
+                    // Finished synchronously — nothing running to cancel, so
+                    // drop the restore stash (avoid a stale command lingering).
+                    app.state.last_submitted_message = None;
                     redraw_after_slash(&app.buf, &app.state, ctx, &app.active_modal, renderer);
                 } else if matches!(app.state.phase, UiPhase::Approval) {
                     // After /bg <N> resume into an approval-waiting session,
@@ -5141,8 +5235,9 @@ pub(crate) fn save_and_reload(ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
 fn restore_cancelled_message_to_buf(app: &mut App, renderer: &mut dyn Renderer, ctx: &LoopCtx) {
     app.message_queue.clear();
     if let Some(msg) = app.state.last_submitted_message.take() {
-        app.buf.text = msg;
-        app.buf.cursor = app.buf.text.len();
+        // Cursor at the end (edit-and-resend), but suppress the slash menu
+        // for one frame so a restored `/command` doesn't re-pop the list.
+        app.buf.set_restored_text(msg);
         app.menu.selected = 0;
         // Force an immediate StreamingBox repaint so the restored
         // text shows in the input box on this frame, not the next
@@ -5223,7 +5318,7 @@ fn handle_streaming_key(
     // so the user can browse candidate commands mid-stream. Execution
     // is still blocked below — Enter falls through to the commit arm,
     // which emits the "disabled while a turn is running" hint.
-    let menu_items = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index));
+    let menu_items = menu_for_display(&app.buf, ctx);
     if let Some(items) = &menu_items {
         if app.menu.selected >= items.len() {
             app.menu.selected = items.len() - 1;
@@ -5317,7 +5412,7 @@ fn handle_streaming_key(
         BufferResult::Redraw => {
             // Menu shape may have changed — reset selection if it
             // now points past the (possibly shorter) list.
-            if let Some(items) = build_menu_items(&app.buf.text, app.buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)) {
+            if let Some(items) = menu_for_display(&app.buf, ctx) {
                 if app.menu.selected >= items.len() {
                     app.menu.selected = 0;
                 }
@@ -6959,7 +7054,7 @@ fn draw_spinner_now(
     let frame = state.tick_spinner();
     let label = format_spinner_label(state, queue_len);
     let status = build_status(state, ctx);
-    let menu = build_menu_items(&buf.text, buf.cursor, &ctx.commands, &ctx.custom_commands, Some(&ctx.skill_registry), Some(&ctx.file_index)).map(|items| {
+    let menu = menu_for_display(buf, ctx).map(|items| {
         let selected = menu_selected.min(items.len().saturating_sub(1));
         let kind = if file_index::detect_at_mention_range(&buf.text, buf.cursor).is_some() {
             crate::render::MenuKind::AtMention

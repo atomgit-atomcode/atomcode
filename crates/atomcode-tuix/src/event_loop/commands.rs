@@ -290,6 +290,9 @@ pub(super) fn execute_slash_command(
                 menu.push_str(&t(Msg::GuideMenuKeybindings));
                 menu.push_str("\n    /guide ");
                 menu.push_str(&t(Msg::GuideMenuConfig));
+                menu.push_str(&t(Msg::GuideMenuTip));
+                menu.push('\n');
+                menu.push_str(&t(Msg::GuideMenuDocUrl));
                 renderer.render(UiLine::CommandOutput(menu));
                 renderer.flush();
             } else {
@@ -1430,7 +1433,13 @@ pub(super) fn execute_slash_command(
             }
         }
         "plugin" => {
-            handle_plugin(arg, ctx, renderer);
+            // Bare `/plugin` opens the interactive manager; subcommands
+            // (`marketplace …`, `install x@mp`, …) keep their old behavior.
+            if arg.trim().is_empty() {
+                *active_modal = Some(Box::new(crate::modals::PluginManager::open()));
+            } else {
+                handle_plugin(arg, ctx, renderer);
+            }
         }
         "skills" => {
             // Gateway command. With no arg, list user-invocable skills

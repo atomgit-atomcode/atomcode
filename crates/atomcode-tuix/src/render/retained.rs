@@ -405,7 +405,7 @@ pub struct RetainedRenderer<W: Write + Send> {
     guide_status_rows: usize,
     /// Current guide subagent status text (None = no guide running).
     /// The spinner tick loop reads this to animate the running indicator.
-    /// Cleared when GuideStatus carries a completion marker ("  ⎿").
+    /// Cleared when GuideStatus carries an empty string from GuideComplete.
     guide_status_text: Option<String>,
     /// Active multi-row "live group" — the tail of `body_lines` is one
     /// header + N child rows for a parallel tool batch. Subsequent
@@ -812,6 +812,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let remove = prev.min(self.body_lines.len());
             self.body_lines.truncate(self.body_lines.len() - remove);
         }
+        // Old spinner rows are gone (truncated above); clear the count so
+        // push_body_row's pop_guide_spinner doesn't also strip content.
+        self.guide_status_rows = 0;
         self.push_body_row(row);
         self.guide_status_rows = 1;
     }
@@ -1644,6 +1647,33 @@ impl<W: Write + Send> RetainedRenderer<W> {
         true
     }
 
+    /// Remove the trailing guide-status (spinner) rows from `body_lines` and
+    /// erase them on screen, so a content push lands where the spinner was
+    /// instead of stranding the spinner in scrollback. Only fires for an
+    /// ACTIVE spinner (`guide_status_text` set) — the frozen `⎿` completion
+    /// marker has `guide_status_text == None` and must persist. The text is
+    /// kept, so the next spinner tick re-renders the row below the new
+    /// content. Returns true if rows were removed.
+    fn pop_guide_spinner(&mut self) -> bool {
+        if self.guide_status_text.is_none() || self.guide_status_rows == 0 {
+            return false;
+        }
+        let remove = self.guide_status_rows.min(self.body_lines.len());
+        if remove > 0 {
+            self.ensure_scroll_region();
+            let bottom = self.body_bottom_row();
+            self.body_lines.truncate(self.body_lines.len() - remove);
+            let first = bottom.saturating_sub(remove as u16) + 1;
+            for i in 0..remove {
+                let r = first + i as u16;
+                let seq = format!("\x1b[{};1H\x1b[2K", r);
+                let _ = self.out.write_all(seq.as_bytes());
+            }
+        }
+        self.guide_status_rows = 0;
+        true
+    }
+
     /// Append a fully-cell-formatted body row to history AND emit it
     /// immediately so it enters terminal scrollback. Trims oldest
     /// `body_lines` when over the retention cap (memory-only — rows
@@ -1691,6 +1721,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // remains armed for source-compat with callers that consult
             // it; its decrement path is now a no-op (kept to avoid a
             // bigger refactor in this combined commit).
+            self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
+        }
+        // Same for an active guide spinner: a content push (streamed answer,
+        // markdown, etc.) must take the spinner's slot, not push it down into
+        // scrollback. The spinner re-renders below on its next tick.
+        if self.pop_guide_spinner() {
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(1);
         }
         // Append-only: `next_body_emit_row` checks the cap; emit is
@@ -2698,7 +2734,17 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // - children: muted (high-frequency rows, not anchors)
                 // - summary: same fix as header (see Summary arm below)
                 let header_style = self.style_bold(Role::Secondary);
-                let muted = self.style_for(Role::Muted);
+                // Children sit under the bold header. On dark themes
+                // `Role::Muted` is SGR 37 (near-white) — the same tier as the
+                // bold header — so the batch reads flat with no hierarchy.
+                // Render children FAINT on dark to dim them to gray, matching
+                // light theme (DarkGrey children under a black bold header) and
+                // the single tool-call `●` fix.
+                let muted = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
                 let screen_w = self.screen.width();
                 let header_row = build_one_row(&header, &header_style, screen_w);
                 self.push_body_row(header_row);
@@ -2757,7 +2803,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     None => return,
                 };
 
-                let muted = self.style_for(Role::Muted);
+                // Match the initial render: faint on dark for hierarchy.
+                let muted = if crate::highlight::theme::is_light_for_render() {
+                    self.style_for(Role::Muted)
+                } else {
+                    self.style_faint(Role::Muted)
+                };
                 let new_row = build_one_row(&new_text, &muted, self.screen.width());
 
                 // Update in-memory.
@@ -3110,50 +3161,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.push_body_text_sgr(&safe);
             }
             UiLine::GuideStatus(text) => {
-                // Completion marker: static frozen line, no further animation.
-                if text.starts_with("  ⎿") {
-                    self.guide_status_text = None;
-                    let body = text.strip_prefix("  ⎿ ").unwrap_or(&text);
-                    let w = (self.screen.width() as usize).saturating_sub(PAD_COL * 2);
-                    let mut new_rows: Vec<Vec<Cell>> = Vec::new();
-                    let prefix_style = self.style_for(Role::Brand);
-                    if w > 0 {
-                        for phys in body.split('\n') {
-                            for chunk in crate::width::wrap_line_to_width(phys, w.saturating_sub(4)) {
-                                let mut row = Vec::new();
-                                push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
-                                push_str_cells(&mut row, "  ⎿ ", &prefix_style);
-                                push_str_cells(&mut row, &chunk, &CellStyle::default());
-                                new_rows.push(row);
-                            }
-                        }
-                    }
-                    if new_rows.is_empty() {
-                        let mut row = Vec::new();
-                        push_str_cells(&mut row, &" ".repeat(PAD_COL), &CellStyle::default());
-                        push_str_cells(&mut row, "  ⎿ ", &prefix_style);
-                        new_rows.push(row);
-                    }
-                    let n = new_rows.len();
-                    let prev = self.guide_status_rows;
-                    if prev > 0 {
-                        let remove = prev.min(self.body_lines.len());
-                        self.body_lines.truncate(self.body_lines.len() - remove);
-                    }
-                    for row in new_rows {
-                        self.push_body_row(row);
-                    }
-                    self.guide_status_rows = n;
-                    return;
-                }
-
                 // Empty text from GuideComplete: clear spinner state so
                 // subsequent non-guide turns route through the normal
-                // spinner / tool-call rendering paths. Without this,
-                // `text.is_empty()` would fall through to the running-
-                // state branch and set `guide_status_text = Some("")`,
-                // causing every future tick to take the guide animation
-                // path and skip tool-call rendering.
+                // spinner / tool-call rendering paths.
                 if text.is_empty() {
                     self.guide_status_text = None;
                     let prev = self.guide_status_rows;
@@ -3233,6 +3243,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     let remove = prev.min(self.body_lines.len());
                     self.body_lines.truncate(self.body_lines.len() - remove);
                 }
+                // Old spinner rows are gone (truncated above); clear the count
+                // so push_body_row's pop_guide_spinner doesn't strip content.
+                self.guide_status_rows = 0;
                 for row in new_rows {
                     self.push_body_row(row);
                 }
@@ -3518,6 +3531,13 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             self.dirty = false;
         }
         self.promote_visible_body_to_scrollback();
+        // Pop Kitty keyboard enhancement flags pushed at startup.
+        // Without this the terminal keeps sending CSI u sequences
+        // (e.g. `9;5:3u`) for every keypress after we exit, and
+        // the parent shell echoes them as literal gibberish.
+        if self.caps.tty {
+            let _ = execute!(self.out, PopKeyboardEnhancementFlags);
+        }
         // Be defensive: re-enable autowrap, release any DECSTBM, then
         // wipe the visible viewport and home the cursor. Without the
         // wipe, the welcome banner + input box survive as garbage that
@@ -3980,13 +4000,16 @@ impl<W: Write + Send> Drop for RetainedRenderer<W> {
     /// same bytes earlier on the graceful path, and the terminal
     /// accepts the duplicates as no-ops.
     fn drop(&mut self) {
-        // Mouse-mode disable + cursor show (DECTCEM) + autowrap on
-        // (DECAWM) + release any DECSTBM scroll region. The latter
-        // three mirror `shutdown()`'s force-restore so a panic mid-
-        // spinner doesn't leak DECTCEM-off into the parent shell.
+        // Mouse-mode disable + Kitty keyboard flag pop + cursor show
+        // (DECTCEM) + autowrap on (DECAWM) + release any DECSTBM
+        // scroll region. The latter three mirror `shutdown()`'s
+        // force-restore so a panic mid-spinner doesn't leak
+        // DECTCEM-off into the parent shell.
+        // \x1b[>1u pops one level of Kitty keyboard enhancement
+        // (same as crossterm's PopKeyboardEnhancementFlags).
         let _ = self
             .out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?7h\x1b[r");
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[>1u\x1b[?25h\x1b[?7h\x1b[r");
         #[cfg(windows)]
         if let Some(prior) = self.prior_console_in_mode.take() {
             crate::render::conhost::restore_conhost_console_in_mode(prior);
@@ -4207,6 +4230,34 @@ mod tests {
 
     fn sample(c: &Arc<AtomicU64>) -> u64 {
         c.load(Ordering::Relaxed)
+    }
+
+    /// Regression: a guide answer streamed while the "Querying guide…"
+    /// spinner is active must NOT strand the spinner row in scrollback.
+    /// The content push pops the spinner (keeping its text so the next tick
+    /// re-renders below) rather than pushing content beneath it.
+    #[test]
+    fn guide_spinner_not_stranded_by_streamed_content() {
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.render(UiLine::GuideStatus("Guide Querying guide… · 1.8s".to_string()));
+        assert!(r.guide_status_rows >= 1, "spinner should occupy a row");
+        assert!(r.guide_status_text.is_some());
+
+        // Streamed answer content arrives while the spinner is still active.
+        r.render(UiLine::GuideResult("hello world".to_string()));
+
+        assert_eq!(
+            r.guide_status_rows, 0,
+            "spinner rows popped before content, not left above it"
+        );
+        assert!(
+            r.guide_status_text.is_some(),
+            "text kept so the next spinner tick re-renders below the content"
+        );
+        let stranded = r.body_lines.iter().any(|row| {
+            row.iter().map(|c| c.ch).collect::<String>().contains("Querying")
+        });
+        assert!(!stranded, "spinner line must not remain in scrollback");
     }
 
     fn status_basic() -> StatusLine {

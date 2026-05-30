@@ -224,8 +224,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderMenuSetDefaultDesc => "切换默认 Provider".into(),
         Msg::ProviderImportPrompt =>
             "粘贴模板自动识别（curl / JSON / TOML），或直接回车手动填写：".into(),
-        Msg::ProviderImportParsed { name, type_name, model } =>
-            format!("已识别：{name} · {type_name} · {model}").into(),
+        Msg::ProviderImportParsed { base_url, type_name, model } =>
+            format!("已识别：{base_url} · {type_name} · {model}").into(),
         Msg::ProviderImportFailed =>
             "未能识别为模板，请重贴 curl / JSON / TOML，或留空回车手动填写。".into(),
         Msg::ProviderNoProviders =>
@@ -246,7 +246,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepTypeWithHint { current } =>
             format!("类型？[{current}]（openai / claude / ollama，留空保持不变）").into(),
         Msg::ProviderStepBaseUrl =>
-            "Base URL？（留空用该类型默认值，例：https://api.deepseek.com/v1）".into(),
+            "Base URL？（例：https://api.deepseek.com/v1）".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL？[{current}]（留空保持不变）").into(),
         Msg::ProviderDefaultHint => "Provider 默认值".into(),
@@ -260,12 +260,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModelWithHint { current } =>
             format!("模型？[{current}]（留空保持不变）").into(),
         Msg::ProviderNameEmpty => "名称不能为空。".into(),
+        Msg::ProviderBaseUrlEmpty => "Base URL 不能为空。".into(),
         Msg::ProviderUnknownType =>
             "未知类型。请选择 openai / claude / ollama。".into(),
         Msg::ProviderUnknownTypeEdit =>
             "未知类型。请选择 openai / claude / ollama 或留空。".into(),
         Msg::ProviderModelEmpty => "模型不能为空。".into(),
         Msg::ProviderEditKeep => "（保持不变）".into(),
+        Msg::ProviderTypeInferred { type_name } =>
+            format!("已识别类型：{type_name}").into(),
         Msg::ProviderStepNameDefault { default } =>
             format!("Provider 名称？[{default}]（留空使用此名）").into(),
         Msg::ProviderStepProgress { current, total } =>
@@ -663,6 +666,21 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("正在安装 `{plugin}@{marketplace}`…").into(),
         Msg::PluginAlreadyInstalled { id } =>
             format!("  插件 `{id}` 已安装。\n  PS: 如需重新安装，请先执行 `/plugin uninstall {id}`，然后再执行 `/plugin install {id}`\n").into(),
+        Msg::PluginMgrBrowse => "浏览并安装".into(),
+        Msg::PluginMgrAdd => "添加市场…".into(),
+        Msg::PluginMgrRemove => "移除市场…".into(),
+        Msg::PluginMgrInstalled { count } => format!("已安装 ({count})").into(),
+        Msg::PluginMgrInstalledMark => "✓ 已安装".into(),
+        Msg::PluginMgrHintNav => "↑/↓ 选择 · ⏎ 进入 · esc 返回".into(),
+        Msg::PluginMgrHintToggle => "⏎ 安装/卸载 · esc 返回".into(),
+        Msg::PluginMgrHintRemove => "⏎ 移除 · esc 返回".into(),
+        Msg::PluginMgrHintUninstall => "⏎ 卸载 · esc 返回".into(),
+        Msg::PluginMgrHintUrl => "输入/粘贴 git URL · ⏎ 添加 · esc 取消".into(),
+        Msg::PluginMgrEmptyMarketplaces => "暂无市场，请选「添加市场…」".into(),
+        Msg::PluginMgrEmptyPlugins => "该市场暂无插件。".into(),
+        Msg::PluginMgrEmptyInstalled => "暂无已安装插件。".into(),
+        Msg::PluginMgrCloning => "正在克隆市场…".into(),
+        Msg::PluginMgrInstalling { plugin } => format!("正在安装 {plugin}…").into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("已卸载 `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
@@ -735,6 +753,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::GuideMenuContext => "怎么管理上下文         /compact /context /cost".into(),
         Msg::GuideMenuKeybindings => "快捷键有哪些           键盘快捷键参考".into(),
         Msg::GuideMenuConfig => "怎么配置               config.toml 配置说明".into(),
+        Msg::GuideMenuTip => "
+  提示：输入 /guide <你的问题> 获取具体回答。
+  例如：/guide 怎么切换模型
+".into(),
+        Msg::GuideMenuDocUrl => "  完整文档：https://atomcode.atomgit.com/docs/zh/".into(),
         Msg::GuideKbNoResults { query } =>
             format!("本地知识库中未找到与「{}」直接相关的条目。\n\n\
                      你可以试试这些常见问题：\n\
@@ -777,6 +800,9 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("[子代理回答]\n{}\n[以上信息由 atomcode-guide 子代理提供]", text).into(),
         Msg::GuideDisplayName => "指南".into(),
         Msg::GuideTruncatedIndicator => "\n*(已截断)*".into(),
+        Msg::InvokeSubAgentToolDesc => "调用子代理执行特定任务。可用的子代理: atomcode-guide (解答 AtomCode 使用问题)".into(),
+        Msg::InvokeSubAgentParamName => "子代理名称".into(),
+        Msg::InvokeSubAgentParamTask => "要执行的任务描述".into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
 
         // ── 配置保存失败 ──

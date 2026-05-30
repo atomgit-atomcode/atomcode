@@ -1394,6 +1394,35 @@ const FEAT=[
   {cat:'price',     catL:{zh:'价格',en:'Price'},   f:{zh:'费用',en:'Pricing'},              a:{zh:'CodingPlan 限免 · 自带 API',en:'CodingPlan free tier · BYO API'}, c:{zh:'订阅 + API',en:'Subscription + API'}, win:'a'},
 ];
 
+/* ========== robust clipboard copy ========== */
+/* The async Clipboard API only exists in a secure context (https / localhost).
+   HarmonyOS ArkWeb, plain http:// pages, and some embedded browsers don't
+   expose `navigator.clipboard`, so the old `navigator.clipboard && writeText`
+   silently no-opped while the UI still flashed "✓ Copied" — paste yielded
+   nothing. Fall back to a hidden <textarea> + execCommand so copy works there. */
+function legacyCopy(text){
+  try{
+    const ta=document.createElement('textarea');
+    ta.value=text;
+    ta.setAttribute('readonly','');
+    ta.style.position='fixed';
+    ta.style.left='-9999px';
+    ta.style.top='0';
+    document.body.appendChild(ta);
+    ta.focus();ta.select();
+    try{ta.setSelectionRange(0,text.length);}catch(e){}
+    const ok=document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  }catch(e){return false;}
+}
+function copyText(text){
+  if(navigator.clipboard&&window.isSecureContext){
+    return navigator.clipboard.writeText(text).catch(()=>legacyCopy(text));
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
 /* ========== hero install — auto-detect OS ========== */
 let HERO_AUTO=true,HERO_OS='mac';
 (function(){
@@ -1403,9 +1432,13 @@ let HERO_AUTO=true,HERO_OS='mac';
   const toast=document.getElementById('toast');
   function detect(){
     const ua=navigator.userAgent||'';
-    if(/Win/.test(ua)) return 'win';
-    if(/Mac/.test(ua)) return 'mac';
-    if(/Harmony|OpenHarmony/i.test(ua)) return 'harmony';
+    // HarmonyOS FIRST: its ArkWeb-based browser sends a UA that also carries a
+    // Windows/Chromium compat token, so testing /Win/ first misdetects ohos as
+    // Windows. Match the HarmonyOS-specific tokens (incl. the ArkWeb engine)
+    // before the looser Win/Mac checks.
+    if(/OpenHarmony|HarmonyOS|Harmony|ArkWeb/i.test(ua)) return 'harmony';
+    if(/Mac/i.test(ua)) return 'mac';
+    if(/Win/i.test(ua)) return 'win';
     return 'linux';
   }
   function highlight(text){
@@ -1422,7 +1455,7 @@ let HERO_AUTO=true,HERO_OS='mac';
   HERO_OS=detect();HERO_AUTO=true;applyHeroInstall();
   tabs.addEventListener('click',e=>{const tb=e.target.closest('.install-tab');if(!tb)return;HERO_OS=tb.dataset.os;HERO_AUTO=false;applyHeroInstall();});
   document.getElementById('copyInstall').addEventListener('click',()=>{
-    navigator.clipboard&&navigator.clipboard.writeText(OS_CMDS[HERO_OS]).catch(()=>{});
+    copyText(OS_CMDS[HERO_OS]);
     const btn=document.getElementById('copyInstall');btn.classList.add('copied');btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
     toast.textContent=t('toast.install.copied');toast.classList.add('show');
     setTimeout(()=>{toast.classList.remove('show')},1800);
@@ -1657,7 +1690,7 @@ window.applyWizardNav=null;
     const btn=e.target.closest('.cp-section');
     if(!btn)return;
     const text=btn.__copy||'';
-    if(navigator.clipboard)navigator.clipboard.writeText(text).catch(()=>{});
+    copyText(text);
     btn.classList.add('copied');
     btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
     toast.textContent=t('toast.copied');toast.classList.add('show');
@@ -1674,7 +1707,7 @@ window.applyWizardNav=null;
       const pre=btn.closest('.pi-item, .pi-steps')?.querySelector('pre');
       if(!pre)return;
       const text=pre.textContent||'';
-      if(navigator.clipboard)navigator.clipboard.writeText(text).catch(()=>{});
+      copyText(text);
       btn.classList.add('copied');
       btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
       toast.textContent=t('toast.copied');toast.classList.add('show');

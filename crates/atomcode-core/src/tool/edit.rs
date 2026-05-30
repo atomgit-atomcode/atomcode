@@ -124,7 +124,10 @@ async fn validate_write_check(
     // is a silent no-op and a stale `store_id` keeps serving pre-edit
     // bytes to the next peek_file call.
     let raw_path = std::path::Path::new(file_path);
-    let canon_path = std::fs::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
+    // tokio::fs so a hung filesystem doesn't block the async worker.
+    let canon_path = tokio::fs::canonicalize(raw_path)
+        .await
+        .unwrap_or_else(|_| raw_path.to_path_buf());
 
     // Notify LSP that file changed (if LSP is enabled).
     ctx.notify_lsp_file_changed(&canon_path, &validated.fixed_content)

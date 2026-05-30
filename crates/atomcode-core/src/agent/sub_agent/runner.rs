@@ -37,7 +37,7 @@ use super::types::*;
 /// 3. Create a fresh [`Conversation`] and inject the user task
 /// 4. Run a turn loop with `CancellationToken` support
 /// 5. Exit early when the model responds with text and no tool calls
-/// 6. Truncate the answer to `max_answer_tokens * 4` chars and return
+/// 6. Truncate the answer to `max_answer_tokens * 2` chars and return
 pub struct SubAgentRunner {
     pub provider: Arc<dyn LlmProvider>,
     pub config: Arc<Config>,
@@ -133,21 +133,14 @@ impl SubAgentRunner {
         }
 
         // ── 5. Inject user task as a User message ──────────────────────
-        // Prepend a language hint based on query character analysis so the
+        // Prepend a language hint based on the current locale so the
         // model has an explicit, hard-to-ignore signal about response language.
         // This supplements the system prompt instruction, which weaker models
         // (e.g. DeepSeek) may not follow reliably.
-        let query_has_cjk = user_task.chars().any(|c| {
-            matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
-        });
-        let query_is_ascii = !user_task.is_empty()
-            && user_task.chars().all(|c| c.is_ascii() || c.is_whitespace());
-        let lang_hint = if query_is_ascii {
+        let lang_hint = if crate::i18n::current_locale() == crate::locale::Locale::En {
             "Please respond in English. "
-        } else if query_has_cjk {
-            "请用中文回答。"
         } else {
-            ""
+            "请用中文回答。"
         };
         let task_with_hint = if lang_hint.is_empty() {
             user_task

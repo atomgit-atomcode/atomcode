@@ -48,19 +48,26 @@ impl AgentTool {
 #[async_trait]
 impl Tool for AgentTool {
     fn definition(&self) -> ToolDef {
+        use crate::i18n::{t, Msg};
+        // Bind Cow<str> values to let-bindings so they outlive the
+        // serde_json::json! macro expansion.  Cow::as_ref() borrows
+        // from the Cow, which must stay alive until json! finishes.
+        let desc = t(Msg::InvokeSubAgentToolDesc);
+        let param_name = t(Msg::InvokeSubAgentParamName);
+        let param_task = t(Msg::InvokeSubAgentParamTask);
         ToolDef {
             name: "invoke_subagent",
-            description: "调用子代理执行特定任务。可用的子代理: atomcode-guide (解答 AtomCode 使用问题)".to_string(),
+            description: desc.into_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "subagent_name": {
                         "type": "string",
-                        "description": "子代理名称"
+                        "description": param_name.as_ref()
                     },
                     "task": {
                         "type": "string",
-                        "description": "要执行的任务描述"
+                        "description": param_task.as_ref()
                     }
                 },
                 "required": ["subagent_name", "task"]

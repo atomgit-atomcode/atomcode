@@ -1,7 +1,7 @@
 ---
 title: Documentation Index
 category: Reference
-keywords: [docs, url, documentation, link, page, pages, site, website, help, faq]
+keywords: [docs, url, documentation, link, page, pages, site, website, help, faq, documentation index, doc-urls, docs index, doc list]
 ---
 
 # Documentation Index

@@ -1,7 +1,7 @@
 ---
 title: AtomCode 概览
 category: 概览
-keywords: [概览, 介绍, 指南, 入门, 使用, 功能, 是什么, 快速开始, 帮助, 安装, 更新, 支持, 系统, 平台, 版本, 终端, 插件, vscode, 快捷键, 键盘, 键位, 日志, 调试, 报错, 错误, 搜索, 钩子, hooks, 思考链, 语言, copilot, 迁移, 术语, token, lsp, mcp, provider, 开源, 社区, 许可证, 免费, 中文, python, windows, 学生, 学习, 啥是]
+keywords: [概览, 介绍, 是什么, 帮助, 系统, 平台, 版本, 终端, copilot, 迁移, 术语, token, 开源, 社区, 许可证, 免费, 学生, 学习, 啥是]
 ---
 
 # AtomCode 使用指南

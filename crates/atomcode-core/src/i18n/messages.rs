@@ -170,7 +170,7 @@ pub enum Msg<'a> {
     ProviderMenuSetDefault,
     ProviderMenuSetDefaultDesc,
     ProviderImportPrompt,
-    ProviderImportParsed { name: &'a str, type_name: &'a str, model: &'a str },
+    ProviderImportParsed { base_url: &'a str, type_name: &'a str, model: &'a str },
     ProviderImportFailed,
     ProviderNoProviders,
     ProviderDeleteConfirm { name: &'a str },
@@ -192,10 +192,12 @@ pub enum Msg<'a> {
     ProviderStepModel,
     ProviderStepModelWithHint { current: &'a str },
     ProviderNameEmpty,
+    ProviderBaseUrlEmpty,
     ProviderUnknownType,
     ProviderUnknownTypeEdit,
     ProviderModelEmpty,
     ProviderEditKeep,
+    ProviderTypeInferred { type_name: &'a str },
     ProviderStepNameDefault { default: &'a str },
     ProviderStepProgress { current: usize, total: usize },
 
@@ -463,6 +465,22 @@ pub enum Msg<'a> {
     PluginMarketplaceListFailed { error: &'a str },
     PluginInstalling { plugin: &'a str, marketplace: &'a str },
     PluginAlreadyInstalled { id: &'a str },
+    // Interactive `/plugin` manager modal.
+    PluginMgrBrowse,
+    PluginMgrAdd,
+    PluginMgrRemove,
+    PluginMgrInstalled { count: usize },
+    PluginMgrInstalledMark,
+    PluginMgrHintNav,
+    PluginMgrHintToggle,
+    PluginMgrHintRemove,
+    PluginMgrHintUninstall,
+    PluginMgrHintUrl,
+    PluginMgrEmptyMarketplaces,
+    PluginMgrEmptyPlugins,
+    PluginMgrEmptyInstalled,
+    PluginMgrCloning,
+    PluginMgrInstalling { plugin: &'a str },
     PluginUninstalled { plugin: &'a str, marketplace: &'a str },
     PluginUninstallFailed { error: &'a str },
     PluginListFailed { error: &'a str },
@@ -557,6 +575,10 @@ pub enum Msg<'a> {
     GuideMenuKeybindings,
     /// `/guide` menu topic: configuration
     GuideMenuConfig,
+    /// /guide menu tip: hint for users to type a question
+    GuideMenuTip,
+    /// /guide menu: documentation URL
+    GuideMenuDocUrl,
     /// Knowledge base: "no results found" message
     GuideKbNoResults { query: &'a str },
     /// Knowledge base: "Related knowledge" section header
@@ -603,6 +625,12 @@ pub enum Msg<'a> {
     GuideDisplayName,
     /// Guide subagent: truncated indicator shown after guide answer
     GuideTruncatedIndicator,
+    /// invoke_subagent tool: description shown to LLM
+    InvokeSubAgentToolDesc,
+    /// invoke_subagent tool: subagent_name parameter description
+    InvokeSubAgentParamName,
+    /// invoke_subagent tool: task parameter description
+    InvokeSubAgentParamTask,
     /// `/paste` failed because the clipboard holds no image. Shown
     /// in scrollback as an error line so the user isn't left
     /// wondering whether the command did anything.

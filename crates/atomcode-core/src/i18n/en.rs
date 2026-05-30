@@ -234,8 +234,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderMenuSetDefaultDesc => "Switch the default provider".into(),
         Msg::ProviderImportPrompt =>
             "Paste a template to auto-detect (curl / JSON / TOML), or Enter to fill manually:".into(),
-        Msg::ProviderImportParsed { name, type_name, model } =>
-            format!("Detected: {name} · {type_name} · {model}").into(),
+        Msg::ProviderImportParsed { base_url, type_name, model } =>
+            format!("Detected: {base_url} · {type_name} · {model}").into(),
         Msg::ProviderImportFailed =>
             "Not recognized as a template. Paste curl / JSON / TOML, or Enter to fill manually.".into(),
         Msg::ProviderNoProviders =>
@@ -256,7 +256,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepTypeWithHint { current } =>
             format!("Type? [{current}] (openai / claude / ollama, blank to keep)").into(),
         Msg::ProviderStepBaseUrl =>
-            "Base URL? (blank for the type's default, e.g. https://api.deepseek.com/v1)".into(),
+            "Base URL? (e.g. https://api.deepseek.com/v1)".into(),
         Msg::ProviderStepBaseUrlWithHint { current } =>
             format!("Base URL? [{current}] (blank to keep)").into(),
         Msg::ProviderDefaultHint => "provider default".into(),
@@ -270,12 +270,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderStepModelWithHint { current } =>
             format!("Model? [{current}] (blank to keep)").into(),
         Msg::ProviderNameEmpty => "Name cannot be empty.".into(),
+        Msg::ProviderBaseUrlEmpty => "Base URL cannot be empty.".into(),
         Msg::ProviderUnknownType =>
             "Unknown type. Choose openai / claude / ollama.".into(),
         Msg::ProviderUnknownTypeEdit =>
             "Unknown type. Choose openai / claude / ollama or leave blank.".into(),
         Msg::ProviderModelEmpty => "Model cannot be empty.".into(),
         Msg::ProviderEditKeep => "(keep)".into(),
+        Msg::ProviderTypeInferred { type_name } =>
+            format!("Detected type: {type_name}").into(),
         Msg::ProviderStepNameDefault { default } =>
             format!("Provider name? [{default}] (blank to use this)").into(),
         Msg::ProviderStepProgress { current, total } =>
@@ -675,6 +678,21 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("installing `{plugin}@{marketplace}`…").into(),
         Msg::PluginAlreadyInstalled { id } =>
             format!("  plugin `{id}` is already installed.\n  PS: To reinstall, first run `/plugin uninstall {id}` then `/plugin install {id}`\n").into(),
+        Msg::PluginMgrBrowse => "Browse & install".into(),
+        Msg::PluginMgrAdd => "Add marketplace…".into(),
+        Msg::PluginMgrRemove => "Remove marketplace…".into(),
+        Msg::PluginMgrInstalled { count } => format!("Installed ({count})").into(),
+        Msg::PluginMgrInstalledMark => "✓ installed".into(),
+        Msg::PluginMgrHintNav => "↑/↓ select · ⏎ open · esc back".into(),
+        Msg::PluginMgrHintToggle => "⏎ install/uninstall · esc back".into(),
+        Msg::PluginMgrHintRemove => "⏎ remove · esc back".into(),
+        Msg::PluginMgrHintUninstall => "⏎ uninstall · esc back".into(),
+        Msg::PluginMgrHintUrl => "type/paste git URL · ⏎ add · esc cancel".into(),
+        Msg::PluginMgrEmptyMarketplaces => "No marketplaces. Pick “Add marketplace…”".into(),
+        Msg::PluginMgrEmptyPlugins => "No plugins in this marketplace.".into(),
+        Msg::PluginMgrEmptyInstalled => "No plugins installed.".into(),
+        Msg::PluginMgrCloning => "Cloning marketplace…".into(),
+        Msg::PluginMgrInstalling { plugin } => format!("Installing {plugin}…").into(),
         Msg::PluginUninstalled { plugin, marketplace } =>
             format!("uninstalled `{plugin}@{marketplace}`").into(),
         Msg::PluginUninstallFailed { error } =>
@@ -747,6 +765,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::GuideMenuContext => "Context management       /compact /context /cost".into(),
         Msg::GuideMenuKeybindings => "Keyboard shortcuts       Keyboard shortcut reference".into(),
         Msg::GuideMenuConfig => "Configuration            config.toml reference".into(),
+        Msg::GuideMenuTip => "
+  Tip: type /guide <your question> for a specific answer.
+  Example: /guide How to switch models
+".into(),
+        Msg::GuideMenuDocUrl => "  Full docs: https://atomcode.atomgit.com/docs/en/".into(),
         Msg::GuideKbNoResults { query } =>
             format!("No entries found matching \"{}\" in the local knowledge base.\n\n\
                      Try these common questions:\n\
@@ -789,6 +812,9 @@ Or visit the docs: https://atomcode.atomgit.com/docs/en/".into(),
             format!("[Sub-agent Answer]\n{}\n[Provided by atomcode-guide sub-agent]", text).into(),
         Msg::GuideDisplayName => "Guide".into(),
         Msg::GuideTruncatedIndicator => "\n*(truncated)*".into(),
+        Msg::InvokeSubAgentToolDesc => "Invoke a sub-agent for a specific task. Available: atomcode-guide (answers AtomCode usage questions)".into(),
+        Msg::InvokeSubAgentParamName => "Sub-agent name".into(),
+        Msg::InvokeSubAgentParamTask => "Task description to execute".into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
 
         // ── config save failed ──

@@ -75,23 +75,24 @@ impl Tool for ListDirTool {
                 });
             }
         };
-        if !dir.exists() {
-            return Ok(ToolResult {
-                call_id: String::new(),
-                output: format!("Directory not found: {}", dir.display()),
-                success: false,
-            });
-        }
-        if !dir.is_dir() {
-            return Ok(ToolResult {
-                call_id: String::new(),
-                output: format!("Not a directory: {}", dir.display()),
-                success: false,
-            });
-        }
-
-        let mut lines = Vec::new();
-        scan_dir(&mut lines, &dir, 0, depth);
+        // The existence/type checks and the recursive `read_dir` traversal are
+        // BLOCKING syscalls. On a hung filesystem they would stall the async
+        // worker and make the turn uncancellable, so run them on the blocking
+        // pool — the executor stays responsive and Esc/cancel aborts promptly.
+        let dir_for_scan = dir.clone();
+        let scan = tokio::task::spawn_blocking(move || list_dir_scan(&dir_for_scan, depth))
+            .await
+            .unwrap_or_else(|_| Err("list_directory: scan task failed".to_string()));
+        let mut lines = match scan {
+            Ok(lines) => lines,
+            Err(msg) => {
+                return Ok(ToolResult {
+                    call_id: String::new(),
+                    output: msg,
+                    success: false,
+                });
+            }
+        };
 
         if lines.len() > 200 {
             lines.truncate(200);
@@ -104,6 +105,22 @@ impl Tool for ListDirTool {
             success: true,
         })
     }
+}
+
+/// Blocking existence/type checks + recursive directory scan, pulled out of
+/// `ListDirTool::execute` so they run inside `tokio::task::spawn_blocking` and
+/// don't stall the async worker on a hung filesystem. Returns Ok(lines) or an
+/// Err message for the not-found / not-a-directory cases.
+fn list_dir_scan(dir: &std::path::Path, depth: usize) -> std::result::Result<Vec<String>, String> {
+    if !dir.exists() {
+        return Err(format!("Directory not found: {}", dir.display()));
+    }
+    if !dir.is_dir() {
+        return Err(format!("Not a directory: {}", dir.display()));
+    }
+    let mut lines = Vec::new();
+    scan_dir(&mut lines, dir, 0, depth);
+    Ok(lines)
 }
 
 fn scan_dir(lines: &mut Vec<String>, dir: &std::path::Path, depth: usize, max_depth: usize) {

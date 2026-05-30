@@ -1461,8 +1461,26 @@ impl AgentLoop {
                     self.handle_invoke_subagent(name, task).await;
                 }
                 AgentCommand::InjectGuideResult { text } => {
+                    // Truncate the guide result before injecting into
+                    // conversation history to avoid bloating context.
+                    // Use the same 2-chars-per-token heuristic as the
+                    // sub-agent runner.
+                    let max_chars = 2400usize; // ~1200 tokens
+                    let truncated_text = if text.chars().count() > max_chars {
+                        let end = max_chars.min(text.chars().count());
+                        let prefix: String = text.chars().take(end).collect();
+                        let boundary = prefix
+                            .rfind(|c: char| c == '。' || c == '\n' || c == '.' || c == '!' || c == '?')
+                            .map(|p| p + 1)
+                            .unwrap_or(end);
+                        let mut trimmed: String = text.chars().take(boundary).collect();
+                        trimmed.push_str(&crate::i18n::t(crate::i18n::Msg::GuideTruncatedIndicator));
+                        trimmed
+                    } else {
+                        text.clone()
+                    };
                     let guarded = crate::i18n::t(
-                        crate::i18n::Msg::GuideResultWrapper { text: &text }
+                        crate::i18n::Msg::GuideResultWrapper { text: &truncated_text }
                     ).into_owned();
                     self.conversation.messages.push(
                         crate::conversation::message::Message::new(

@@ -1,7 +1,7 @@
 ---
 title: AtomCode Overview
 category: Overview
-keywords: [overview, introduction, guide, getting started, about, atomcode, what, is, help, features, terminal, vscode, plugin, extension, hotkey, keybinding, keyboard, shortcut, log, debug, error, bug, search, grep, hooks, thinking, chain, language, languages, copilot, migrate, migration, glossary, term, token, lsp, mcp, provider, open, source, community, license, free, pricing, chinese, python, windows, student, beginner, learn]
+keywords: [overview, introduction, about, what, is, help, terminal, copilot, migrate, migration, glossary, term, token, open, source, community, license, free, student, beginner, learn]
 ---
 
 # AtomCode User Guide

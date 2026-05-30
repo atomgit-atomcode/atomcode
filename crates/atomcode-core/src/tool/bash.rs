@@ -82,19 +82,44 @@ struct BashArgs {
     timeout: Option<u64>,
 }
 
+/// Build the `bash` tool description for the current platform.
+///
+/// The tool keeps the name `bash` (every provider's model is trained to
+/// reach for a `bash` tool), but on Windows it actually executes via
+/// `cmd.exe` (see the spawn in `bash_execute`). Left unsaid, weak models
+/// follow the `bash` name and emit bash-only syntax — heredocs, `$(...)`,
+/// `printf '\n'` — which cmd.exe can't parse, so multi-line commands
+/// (e.g. a multi-line commit message) fail and the model thrashes into a
+/// temp-file workaround. Telling the model the real shell here removes the
+/// contradiction (the prompt's env line already reports `Shell: cmd.exe`).
+fn shell_tool_description(is_windows: bool) -> String {
+    let base = "Execute a shell command. Use for: build, test, git, install deps.\n\
+        Do NOT use for: reading files (use read_file), searching (use grep), editing (use edit_file).\n\
+        Do NOT start servers or long-running processes — the user manages those.\n\
+        Default timeout: 60s. Destructive commands require user confirmation.";
+    if is_windows {
+        format!(
+            "{base}\n\
+            Windows: commands run via cmd.exe, NOT bash. Use cmd.exe syntax — do NOT use \
+            bash-only constructs such as heredocs (<<EOF), command substitution $(...), or \
+            printf '\\n'. Chain steps with &&. For multi-line text (e.g. a multi-line commit \
+            message) write it to a temp file and pass the file (e.g. git commit -F msg.txt)."
+        )
+    } else {
+        base.to_string()
+    }
+}
+
 #[async_trait]
 impl Tool for BashTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "bash",
-            description: "Execute a shell command. Use for: build, test, git, install deps.\n\
-                Do NOT use for: reading files (use read_file), searching (use grep), editing (use edit_file).\n\
-                Do NOT start servers or long-running processes — the user manages those.\n\
-                Default timeout: 60s. Destructive commands require user confirmation.".to_string(),
+            description: shell_tool_description(cfg!(target_os = "windows")),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "The bash command to execute" },
+                    "command": { "type": "string", "description": "The shell command to execute" },
                     "timeout": { "type": "integer", "description": "Max wait seconds (default 60, max 300)" }
                 },
                 "required": ["command"]
@@ -3279,6 +3304,60 @@ fn approval_for_command_paths(
     }
 
     analyze_tokens(&shell_words(command), working_dir)
+}
+
+// ───────────────────────────────────────────────────────────────────
+// tool-definition / shell-priming tests
+// ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod shell_tool_def_tests {
+    use super::*;
+
+    // The `command` parameter must NOT prime the model to write bash:
+    // on Windows the executor runs cmd.exe, so a "bash command" hint makes
+    // weak models emit heredocs / `$(...)` / `printf '\n'` that cmd.exe
+    // can't parse (the multi-line-commit thrash bug). Keep it shell-neutral.
+    #[test]
+    fn command_param_description_is_shell_neutral_not_bash() {
+        let def = BashTool.definition();
+        let desc = def.parameters["properties"]["command"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.to_lowercase().contains("shell"),
+            "command param should say 'shell', got: {desc:?}"
+        );
+        assert!(
+            !desc.to_lowercase().contains("bash"),
+            "command param must not prime bash, got: {desc:?}"
+        );
+    }
+
+    // On Windows the description must explicitly tell the model it's cmd.exe
+    // (not bash) and steer it away from bash-only syntax. On Unix it stays
+    // plain (bash really is the shell there).
+    #[test]
+    fn windows_description_steers_to_cmd_not_bash() {
+        let win = shell_tool_description(true);
+        assert!(win.contains("cmd.exe"), "windows desc must name cmd.exe");
+        let lc = win.to_lowercase();
+        assert!(lc.contains("heredoc"), "windows desc must warn off heredocs");
+        assert!(
+            win.contains("$("),
+            "windows desc must warn off command substitution"
+        );
+        assert!(
+            lc.contains("not bash") || lc.contains("not\u{a0}bash") || lc.contains("cmd.exe, not bash"),
+            "windows desc must say it is not bash"
+        );
+
+        let unix = shell_tool_description(false);
+        assert!(
+            !unix.contains("cmd.exe"),
+            "unix desc must not mention cmd.exe"
+        );
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────

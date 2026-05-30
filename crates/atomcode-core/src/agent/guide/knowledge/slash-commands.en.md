@@ -52,7 +52,7 @@ keywords: [slash, command, commands, list, all, available, /bg, /help, /model, /
 - `/skills` — Browse installed skills
 - `/plugin` — Plugin marketplace (install/uninstall/list)
 - `/mcp` — MCP server status
-- `/paste` — Paste clipboard image
+- `/paste` — Paste an image from the clipboard into the conversation (supports PNG/JPEG/WebP, useful for screenshot analysis)
 
 ## Help
 - `/help` — Show all commands
