@@ -348,6 +348,32 @@ body {
   color: var(--app-primary-foreground);
 }
 
+.code-block-wrapper .copy-button {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  opacity: 0.55;
+  transition: opacity 0.15s, background 0.15s;
+  background: var(--app-secondary-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--app-secondary-foreground);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.code-block-wrapper .copy-button:hover {
+  opacity: 1;
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
+}
+
 /* === Markdown Root === */
 .markdown-root {
   text-wrap: auto;

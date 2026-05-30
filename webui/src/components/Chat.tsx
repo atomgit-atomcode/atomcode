@@ -298,7 +298,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
           const isLast = idx === lastIdx;
           if (msg.role === 'user') {
             return (
-              <div key={idx} class="timeline-message dot-brand user-message-wrapper">
+              <div key={idx} class="user-message-wrapper">
                 <div class="user-message-bubble">{msg.text}</div>
               </div>
             );
