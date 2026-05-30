@@ -3,6 +3,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { streamChat, SSEEvent, getSession, SessionMetaWithProject } from '../api';
+import { Markdown } from './Markdown';
 
 interface ToolRow {
   id: string;
@@ -325,10 +326,17 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
 
               {/* Assistant text — show even if empty while streaming */}
               {(msg.text || streaming) && (
-                <div class={isError ? 'error-message-content' : 'assistant-message-content'}>
-                  {msg.text}
-                  {streaming && <span class="streaming-cursor" />}
-                </div>
+                isError ? (
+                  <div class="error-message-content">
+                    {msg.text}
+                    {streaming && <span class="streaming-cursor" />}
+                  </div>
+                ) : (
+                  <>
+                    <Markdown content={msg.text} />
+                    {streaming && <span class="streaming-cursor" />}
+                  </>
+                )
               )}
             </div>
           );
