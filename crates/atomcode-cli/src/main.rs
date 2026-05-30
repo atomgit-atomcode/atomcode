@@ -500,7 +500,7 @@ struct Cli {
     /// --dangerously-skip-permissions. The TUI shows a yellow ⚠ SKIP
     /// badge while active. Use in CI/CD, eval harnesses, or when you
     /// trust the agent's built-in safety constraints.
-    #[arg(short = 'y', long = "dangerously-skip-permissions", default_value_t = false)]
+    #[arg(long = "dangerously-skip-permissions", visible_aliases = ["skip"], default_value_t = false)]
     pub dangerously_skip_permissions: bool,
 }
 
