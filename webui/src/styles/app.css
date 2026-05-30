@@ -415,6 +415,30 @@ body {
   color: var(--app-primary-foreground);
 }
 .markdown-root pre code { padding: 0; background: none; }
+/* GFM tables */
+.markdown-root table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 0.95em;
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.markdown-root th,
+.markdown-root td {
+  border: 1px solid var(--app-primary-border-color);
+  padding: 5px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.markdown-root th {
+  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+  font-weight: 600;
+}
+.markdown-root tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--app-secondary-background), transparent 55%);
+}
 
 /* === Input === */
 .input-container {
