@@ -1042,11 +1042,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .map(|s| crate::width::display_width(s) + 1) // +1 for the trailing space separator
             .unwrap_or(0);
 
+        // Bypass indicator — right-aligned warning badge when
+        // --dangerously-skip-permissions / -y is active. Rendered in
+        // yellow (Role::Warning) after the hint on the right side so
+        // it does not displace the PLAN mode indicator on the left.
+        let bypass_badge: Option<String> = status
+            .bypass_indicator
+            .as_ref()
+            .map(|s| scrub_controls(s));
+        let bypass_badge_w = bypass_badge
+            .as_ref()
+            .map(|s| crate::width::display_width(s) + 1) // +1 for the leading space separator
+            .unwrap_or(0);
+
         // Hint right-alignment math must reserve space for the mode badge
-        // so the badge never collides with the right-aligned hint when the
-        // status row is wide.
+        // and bypass badge so they never collide with the right-aligned
+        // hint when the status row is wide.
         let max = rule_width.max(1);
-        let left_max = max.saturating_sub(mode_badge_w);
+        let right_reserved = mode_badge_w + bypass_badge_w;
+        let left_max = max.saturating_sub(right_reserved);
 
         // Pre-truncate the cwd so that model + ctx_usage still get space
         // on narrow terminals.  Budget for cwd: subtract model width and
@@ -1105,6 +1119,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         };
 
+        // Helper: emit the bypass badge at the right edge of the row.
+        // Rendered in yellow (Role::Warning) to draw the eye — the user
+        // must always see when tool calls are auto-approved.
+        let warning_style = self.style_for(Role::Warning);
+        let push_bypass = |row: &mut Vec<Cell>| {
+            if let Some(badge) = &bypass_badge {
+                push_str_cells(row, " ", &pad);
+                push_str_cells(row, badge, &warning_style);
+            }
+        };
+
         if let Some((raw_hint, severity)) = status.hint.as_ref() {
             let hint = scrub_controls(raw_hint);
             let hint_w = crate::width::display_width(&hint);
@@ -1112,24 +1137,28 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 crate::render::HintSeverity::Warning => error,
                 crate::render::HintSeverity::Info => secondary.clone(),
             };
-            if hint_w + 1 < left_max {
-                let left_budget = left_max - hint_w - 1;
+            let right_w = hint_w + bypass_badge_w;
+            if right_w + 1 < left_max {
+                let left_budget = left_max - right_w - 1;
                 let left_truncated = crate::width::truncate_to_width(&left, left_budget);
                 let left_w = crate::width::display_width(&left_truncated);
-                let pad_w = max - mode_badge_w - left_w - hint_w;
+                let pad_w = max - right_reserved - left_w - hint_w;
                 push_badge(&mut row);
                 push_str_cells(&mut row, &left_truncated, &secondary);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
                 push_str_cells(&mut row, &hint, &hint_style);
+                push_bypass(&mut row);
             } else {
                 let truncated = crate::width::truncate_to_width(&left, left_max);
                 push_badge(&mut row);
                 push_str_cells(&mut row, &truncated, &secondary);
+                push_bypass(&mut row);
             }
         } else {
             let truncated = crate::width::truncate_to_width(&left, left_max);
             push_badge(&mut row);
             push_str_cells(&mut row, &truncated, &secondary);
+            push_bypass(&mut row);
         }
         row
     }
@@ -4268,6 +4297,7 @@ mod tests {
                 ctx_window: 0,
             hint: None,
             mode_indicator: None,
+            bypass_indicator: None,
             session_name: None,
         }
     }
@@ -4290,6 +4320,7 @@ mod tests {
                 ctx_window: 0,
             hint: None,
             mode_indicator: Some("PLAN".into()),
+            bypass_indicator: None,
             session_name: None,
         };
         let row = r.build_status_row(&status, 60);
@@ -4322,6 +4353,82 @@ mod tests {
         assert!(
             !visible.contains("PLAN"),
             "no mode indicator should produce no PLAN badge; got: {:?}",
+            visible
+        );
+    }
+
+    /// Bypass indicator (--dangerously-skip-permissions) renders on the
+    /// RIGHT side of the status row, after the model · cwd run. It must
+    /// NOT displace the left-aligned PLAN mode indicator.
+    #[test]
+    fn build_status_row_bypass_badge_on_right_side() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            ctx_used: 0,
+            ctx_window: 0,
+            hint: None,
+            mode_indicator: Some("PLAN".into()),
+            bypass_indicator: Some("\u{26a0} SKIP".into()),
+            session_name: None,
+        };
+        let row = r.build_status_row(&status, 60);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        let trimmed = visible.trim_start();
+        // PLAN badge still on the left.
+        assert!(
+            trimmed.starts_with("PLAN "),
+            "PLAN badge must still appear first on the left; got: {:?}",
+            visible
+        );
+        // SKIP badge appears somewhere in the row (right side).
+        assert!(
+            visible.contains("SKIP"),
+            "SKIP badge must appear in the row; got: {:?}",
+            visible
+        );
+        // PLAN comes before SKIP in the rendered row.
+        let plan_pos = visible.find("PLAN").expect("PLAN must be present");
+        let skip_pos = visible.find("SKIP").expect("SKIP must be present");
+        assert!(
+            plan_pos < skip_pos,
+            "PLAN ({}) must precede SKIP ({}); got: {:?}",
+            plan_pos,
+            skip_pos,
+            visible
+        );
+    }
+
+    /// Bypass indicator without a mode indicator (Build + SKIP) — the
+    /// badge still appears on the right, and no PLAN badge leaks.
+    #[test]
+    fn build_status_row_bypass_without_mode_indicator() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            ctx_used: 0,
+            ctx_window: 0,
+            hint: None,
+            mode_indicator: None,
+            bypass_indicator: Some("\u{26a0} SKIP".into()),
+            session_name: None,
+        };
+        let row = r.build_status_row(&status, 60);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.contains("SKIP"),
+            "SKIP badge must appear; got: {:?}",
+            visible
+        );
+        assert!(
+            !visible.contains("PLAN"),
+            "no mode_indicator should produce no PLAN badge; got: {:?}",
             visible
         );
     }

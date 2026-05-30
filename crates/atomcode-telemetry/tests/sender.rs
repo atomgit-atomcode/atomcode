@@ -28,7 +28,7 @@ fn rec() -> Record {
             repo_origin: None,
             mode: None,
         },
-        event: Event::OpenAtomcode,
+        event: Event::OpenAtomcode { dangerously_skip_permissions: false },
     }
 }
 
@@ -134,7 +134,7 @@ async fn track_writes_to_disk_queue() {
         atomcode_dir: d.path().to_path_buf(),
     };
     let tel = Telemetry::init(cfg, "test".into());
-    tel.track(Event::OpenAtomcode);
+    tel.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     tel.shutdown(std::time::Duration::from_millis(500)).await;
 

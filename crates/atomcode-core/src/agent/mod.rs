@@ -763,9 +763,30 @@ impl AgentLoop {
     pub fn new(
         config: Config,
         provider: Box<dyn LlmProvider>,
+        tool_registry: ToolRegistry,
+        tool_context: ToolContext,
+        conversation: Conversation,
+    ) -> (Self, AgentHandle) {
+        Self::new_with_skip_permissions(
+            config,
+            provider,
+            tool_registry,
+            tool_context,
+            conversation,
+            false,
+        )
+    }
+
+    /// Create a new agent loop with an optional `--dangerously-skip-permissions`
+    /// flag. When `skip_permissions` is true, all tool calls are auto-approved
+    /// without prompting the user.
+    pub fn new_with_skip_permissions(
+        config: Config,
+        provider: Box<dyn LlmProvider>,
         mut tool_registry: ToolRegistry,
         tool_context: ToolContext,
         conversation: Conversation,
+        skip_permissions: bool,
     ) -> (Self, AgentHandle) {
         // Load skills from disk and register the use_skill tool.
         let working_dir = tool_context
@@ -836,6 +857,7 @@ impl AgentLoop {
             None,
             tool_context,
             conversation,
+            skip_permissions,
         )
     }
 
@@ -859,6 +881,7 @@ impl AgentLoop {
             runtime_label,
             tool_context,
             conversation,
+            false,
         )
     }
 
@@ -871,6 +894,7 @@ impl AgentLoop {
         runtime_label: Option<String>,
         mut tool_context: ToolContext,
         conversation: Conversation,
+        skip_permissions: bool,
     ) -> (Self, AgentHandle) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -894,10 +918,11 @@ impl AgentLoop {
         let permission_store = std::sync::Arc::new(std::sync::RwLock::new(PermissionStore::new()));
 
         let interactive_permission =
-            Box::new(crate::turn::permission::InteractivePermissionDecider::new(
+            Box::new(crate::turn::permission::InteractivePermissionDecider::new_with_skip_permissions(
                 approval_req_tx,
                 approval_resp_rx,
                 permission_store.clone(),
+                skip_permissions,
             ));
 
         // Hand the registry handle to ToolContext so active-dispatch tools

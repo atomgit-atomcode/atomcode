@@ -3027,7 +3027,7 @@ async fn main() {
                     ..CurrentContext::default()
                 },
                 || async {
-                    telemetry.track(Event::OpenAtomcode);
+                    telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
                 },
             )
             .await;
@@ -3045,7 +3045,7 @@ async fn main() {
             ..CurrentContext::default()
         },
         || async {
-            telemetry.track(Event::OpenAtomcode);
+            telemetry.track(Event::OpenAtomcode { dangerously_skip_permissions: false });
         },
     )
     .await;

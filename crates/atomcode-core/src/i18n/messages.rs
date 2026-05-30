@@ -734,6 +734,16 @@ pub enum Msg<'a> {
     /// is configured. `model` is the current model identifier.
     ModelNoImageSupport { model: &'a str },
 
+    // ── --dangerously-skip-permissions / -y ──
+    /// Scrollback warning banner when --dangerously-skip-permissions is active
+    /// in TUI mode. Includes leading "⚠ " and trailing "\n".
+    BypassWarningBanner,
+    /// Headless-mode stderr warning when --dangerously-skip-permissions is active.
+    BypassWarningHeadless,
+    /// Status-bar badge text shown when --dangerously-skip-permissions is
+    /// active. Typically "⚠ SKIP" — kept short for the status row.
+    BypassBadge,
+
     /// Confirmation hint after the first Ctrl+C on an empty buffer.
     /// "  (press Ctrl+C again to exit)\n" — leading indent + trailing
     /// newline are part of the template.

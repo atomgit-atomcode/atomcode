@@ -835,6 +835,10 @@ pub struct LoopCtx {
     /// run interactive multi-step flows, so first-run falls through to
     /// the existing "no provider configured" status hint.
     pub is_plain_renderer: bool,
+    /// When true, the --dangerously-skip-permissions flag was passed.
+    /// Shown as a yellow "⚠ SKIP" badge in the status line so the
+    /// user is always aware that all tool calls are auto-approved.
+    pub dangerously_skip_permissions: bool,
 }
 
 /// Memoised result of the most recent clipboard probe. The hash is a
@@ -2673,6 +2677,14 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         let current = format!("v{}", env!("CARGO_PKG_VERSION"));
         renderer.render(UiLine::CommandOutput(
             crate::i18n::t(crate::i18n::Msg::UpgradeSuccess { from: &prev, to: &current }).into_owned(),
+        ));
+    }
+    // Warn the user when --dangerously-skip-permissions / -y is active.
+    // The status bar shows a ⚠ SKIP badge, but a scrollback banner
+    // is harder to miss and persists even if the user clears the status row.
+    if ctx.dangerously_skip_permissions {
+        renderer.render(UiLine::CommandOutput(
+            crate::i18n::t(crate::i18n::Msg::BypassWarningBanner).into_owned(),
         ));
     }
     // Same env-var handoff from `atomcode codingplan` (see CLI `run()`):
@@ -7001,6 +7013,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         crate::state::AgentMode::Plan => Some("PLAN".to_string()),
         crate::state::AgentMode::Build => None,
     };
+    // Bypass indicator: right-aligned warning badge when
+    // --dangerously-skip-permissions / -y is active. Placed on the
+    // right side of the status row so it does not displace the PLAN
+    // mode indicator on the left.
+    let bypass_indicator = if ctx.dangerously_skip_permissions {
+        Some(crate::i18n::t(crate::i18n::Msg::BypassBadge).into_owned())
+    } else {
+        None
+    };
     // Pull current ctx usage from the last ContextStats emission. Pre-
     // first-turn `last_context` is None — render shows nothing then.
     // Using `sent_tokens` (what was actually sent to the model on the
@@ -7032,6 +7053,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         ctx_window,
         hint,
         mode_indicator,
+        bypass_indicator,
         session_name,
     }
 }

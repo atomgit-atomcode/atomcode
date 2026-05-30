@@ -177,6 +177,7 @@ pub async fn run(
     mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::mcp::McpConnectEvent>>,
     lsp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_core::lsp::LspConnectEvent>>,
     telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
+    dangerously_skip_permissions: bool,
 ) -> Result<()> {
     let mut caps = TerminalCaps::probe();
 
@@ -582,6 +583,7 @@ pub async fn run(
             crate::event_loop::ClipboardCheckState::default(),
         )),
         is_plain_renderer,
+        dangerously_skip_permissions,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

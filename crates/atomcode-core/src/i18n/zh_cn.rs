@@ -881,6 +881,14 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             model
         )
         .into(),
+        // ── --dangerously-skip-permissions / -y ──
+        Msg::BypassWarningBanner =>
+            "\u{26a0} --dangerously-skip-permissions 已启用：所有工具调用将自动批准（无权限提示）\n".into(),
+        Msg::BypassWarningHeadless =>
+            "[headless] --dangerously-skip-permissions：所有工具调用将自动批准".into(),
+        Msg::BypassBadge =>
+            "\u{26a0} SKIP".into(),
+
         Msg::CtrlCAgainToExit => "  （再次按 Ctrl+C 退出）\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} 多行输入：在行尾加 `\\` 再按 Enter。\n    \

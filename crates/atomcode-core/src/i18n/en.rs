@@ -897,6 +897,14 @@ Or visit the docs: https://atomcode.atomgit.com/docs/en/".into(),
             model
         )
         .into(),
+        // ── --dangerously-skip-permissions / -y ──
+        Msg::BypassWarningBanner =>
+            "\u{26a0} --dangerously-skip-permissions is active: all tool calls are auto-approved (no permission prompts)\n".into(),
+        Msg::BypassWarningHeadless =>
+            "[headless] --dangerously-skip-permissions: all tool calls are auto-approved".into(),
+        Msg::BypassBadge =>
+            "\u{26a0} SKIP".into(),
+
         Msg::CtrlCAgainToExit => "  (press Ctrl+C again to exit)\n".into(),
         Msg::HintMultiLineInput =>
             "  \u{24d8} Multi-line input: end the line with `\\` then press Enter.\n    \
