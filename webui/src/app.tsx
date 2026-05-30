@@ -25,6 +25,15 @@ export function App() {
   const [showConfig, setShowConfig] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sessionListVersion, setSessionListVersion] = useState(0);
+
+  // Chat 完成首条消息后会回传它创建的 session id；若是新 id，刷新侧栏列表。
+  function handleSessionAssigned(id: string) {
+    if (id !== sessionId) {
+      setSessionId(id);
+      setSessionListVersion((v) => v + 1);
+    }
+  }
 
   // ☰：移动端开/关抽屉；桌面端收起/展开侧栏。
   function toggleSidebar() {
@@ -113,6 +122,7 @@ export function App() {
           onNew={handleNewSession}
           open={sidebarOpen}
           collapsed={sidebarCollapsed}
+          reloadKey={sessionListVersion}
         />
         <div
           class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
@@ -122,7 +132,7 @@ export function App() {
         <div class="session-body app-sidebar">
           <Chat
             sessionId={sessionId}
-            onSessionId={setSessionId}
+            onSessionId={handleSessionAssigned}
             cwd={cwd}
             onPermission={setPending}
             activeSession={activeSession}

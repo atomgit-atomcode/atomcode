@@ -11,6 +11,8 @@ interface SidebarProps {
   open?: boolean;
   /** Desktop collapsed (hidden) state */
   collapsed?: boolean;
+  /** Bump to force a session-list reload (e.g. after a new session is created) */
+  reloadKey?: number;
 }
 
 function baseName(p: string): string {
@@ -47,7 +49,7 @@ function shortDir(p: string): string {
   return p;
 }
 
-export function Sidebar({ activeSessionId, onSelect, onNew, open, collapsed }: SidebarProps) {
+export function Sidebar({ activeSessionId, onSelect, onNew, open, collapsed, reloadKey }: SidebarProps) {
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -57,7 +59,7 @@ export function Sidebar({ activeSessionId, onSelect, onNew, open, collapsed }: S
       .then(setSessions)
       .catch(() => setSessions([]))
       .finally(() => setLoading(false));
-  }, []);
+  }, [reloadKey]);
 
   return (
     <aside class={'session-list app-sidebar' + (open ? ' open' : '') + (collapsed ? ' collapsed' : '')}>

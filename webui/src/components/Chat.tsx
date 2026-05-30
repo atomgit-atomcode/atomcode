@@ -69,10 +69,18 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // 当前 Chat 正在显示的会话 id。用于区分「外部切换会话(需重置+加载历史)」
+  // 与「本次新建会话首条消息完成后自己拿到的 id(不应重置)」。
+  const activeIdRef = useRef<string | null>(null);
 
   // When sessionId changes from outside (sidebar switch or new session), reset transcript
   // and try to load session history
   useEffect(() => {
+    // 若 sessionId 正是本 Chat 自己刚产生的（新建会话首条消息完成），不要重置——
+    // 那会清空用户刚看到的对话。仅外部切换/新建按钮才走重置+加载历史。
+    if (sessionId === activeIdRef.current) return;
+    activeIdRef.current = sessionId;
+
     // Abort any in-flight chat
     abortRef.current?.abort();
     setBusy(false);
@@ -249,6 +257,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         break;
 
       case 'done':
+        // 标记这是本 Chat 自己产生的会话 id，避免下面的 useEffect 误把当前对话清空。
+        activeIdRef.current = event.session_id;
         onSessionId(event.session_id);
         setBusy(false);
         break;
