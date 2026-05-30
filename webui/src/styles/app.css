@@ -353,7 +353,28 @@ body {
   text-wrap: auto;
   overflow-x: hidden;
   width: 100%;
+  /* Container must NOT be pre-wrap (the .assistant-message-content class on the
+     wrapper sets pre-wrap, which would render inter-block newlines as gaps). */
+  white-space: normal;
 }
+/* Markdown block elements — class+element specificity beats Tailwind preflight
+   (which resets list-style:none and margins). */
+.markdown-root > :first-child { margin-top: 0; }
+.markdown-root > :last-child { margin-bottom: 0; }
+.markdown-root p { white-space: pre-wrap; margin: 0.1em 0 0.4em; }
+.markdown-root ul { list-style: disc; padding-inline-start: 1.5em; margin: 0.3em 0 0.5em; }
+.markdown-root ol { list-style: decimal; padding-inline-start: 1.5em; margin: 0.3em 0 0.5em; }
+.markdown-root li { margin-bottom: 3px; }
+.markdown-root li::marker { color: var(--app-secondary-foreground); }
+.markdown-root h1, .markdown-root h2, .markdown-root h3, .markdown-root h4 { margin: 0.8em 0 0.3em; font-weight: 600; line-height: 1.3; }
+.markdown-root h1 { font-size: 1.3em; }
+.markdown-root h2 { font-size: 1.15em; }
+.markdown-root h3 { font-size: 1.05em; }
+.markdown-root h4 { font-size: 1em; }
+.markdown-root a { color: var(--app-link-color); text-decoration: none; }
+.markdown-root a:hover { text-decoration: underline; }
+.markdown-root blockquote { border-left: 3px solid var(--app-primary-border-color); padding-left: 12px; margin: 0.3em 0; color: var(--app-secondary-foreground); }
+.markdown-root hr { border: none; border-top: 1px solid var(--app-primary-border-color); margin: 0.6em 0; }
 .markdown-root code {
   font-family: var(--app-monospace-font-family);
   word-break: break-word;
@@ -363,6 +384,7 @@ body {
   background: color-mix(in srgb, var(--app-secondary-background), transparent 40%);
   color: var(--app-primary-foreground);
 }
+.markdown-root pre code { padding: 0; background: none; }
 
 /* === Input === */
 .input-container {
