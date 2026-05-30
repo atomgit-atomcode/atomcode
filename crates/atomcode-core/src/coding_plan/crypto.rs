@@ -154,7 +154,7 @@ pub fn is_atomgit_gateway(base_url: &str) -> bool {
     }
     matches!(
         url.host_str(),
-        Some("pre-llm-api-cce.atomgit.com") | Some("api-ai.gitcode.com")
+        Some("llm-api.atomgit.com") | Some("api-ai.gitcode.com")
     )
 }
 

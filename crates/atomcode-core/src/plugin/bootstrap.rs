@@ -27,17 +27,29 @@
 
 use crate::config::Config;
 
+use super::installer::{install, list_installed};
 use super::marketplace::{add_marketplace, list_marketplaces, update_marketplace};
 use super::PluginJobEvent;
 
-/// Public git URL for the default marketplace — the official AtomCode
-/// plugin registry. The plugin installer dispatches on the SOURCE field
-/// (the URL we cloned from), so this string is the identity of the
-/// bootstrapped "default" entry. The name stays `DEFAULT_SKILLS_URL` for
-/// API stability; it now points at the full plugin registry, not just a
-/// bag of skills.
-pub const DEFAULT_SKILLS_URL: &str =
-    "https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git";
+/// Public git URLs for the default marketplaces — the official AtomCode
+/// plugin registry and the legacy AtomCode skills bag. The plugin
+/// installer dispatches on the SOURCE field (the URL we cloned from),
+/// so each URL here is the identity of a bootstrapped "default" entry.
+/// To add another default marketplace in a future release, append its
+/// URL to the list and bump BOOTSTRAP_MARKER_FILENAME so existing users
+/// re-bootstrap.
+pub const DEFAULT_SKILLS_URLS: &[&str] = &[
+    "https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git",
+    "https://atomgit.com/atomgit_atomcode/atomcode-skills.git",
+];
+
+/// Subset of [`DEFAULT_SKILLS_URLS`]: only plugins from marketplaces
+/// listed here are auto-installed (both on fresh bootstrap and after
+/// post-upgrade `git pull`). `atomcode-plugins-official` is purposely
+/// excluded — it is registered for discoverability, not force-installed.
+const DEFAULT_AUTO_INSTALL_URLS: &[&str] = &[
+    "https://atomgit.com/atomgit_atomcode/atomcode-skills.git",
+];
 
 /// Versioned bootstrap marker. Bumped v1 → v2 when the default
 /// marketplace was repointed from the legacy `atomcode-skills` bag to the
@@ -68,9 +80,7 @@ const UPGRADED_FROM_ENV: &str = "ATOMCODE_UPGRADED_FROM";
 pub fn run_startup_hooks(config: &Config) -> Vec<PluginJobEvent> {
     let mut events = Vec::new();
     if config.plugin.auto_install_default_skills {
-        if let Some(ev) = maybe_install_default_skills() {
-            events.push(ev);
-        }
+        events.extend(maybe_install_default_skills());
     }
     let upgraded = std::env::var(UPGRADED_FROM_ENV).is_ok();
     if upgraded && config.plugin.auto_update_marketplaces {
@@ -99,61 +109,117 @@ fn touch_marker() {
     let _ = std::fs::write(&path, b"");
 }
 
-/// Plan A: clone the official plugin marketplace into
-/// `$ATOMCODE_HOME/plugins/marketplaces/atomcode/` if (a) the
-/// bootstrap marker isn't there yet AND (b) the marketplace isn't
-/// already installed. After this attempt — successful or not — the
-/// marker is written so the next startup doesn't try again.
+fn should_auto_install(source_url: &str) -> bool {
+    DEFAULT_AUTO_INSTALL_URLS
+        .iter()
+        .any(|u| u.eq_ignore_ascii_case(source_url))
+}
+
+/// Plan A: clone the default plugin marketplaces into
+/// `$ATOMCODE_HOME/plugins/marketplaces/<name>/` and install every
+/// plugin listed in their manifests. Iterates [`DEFAULT_SKILLS_URLS`].
+/// After this attempt — successful or not — the marker is written so
+/// the next startup doesn't try again.
 ///
-/// Returns `Some(PluginJobEvent)` when an `add_marketplace` actually
-/// fired (succeeded or failed). `None` for the no-op paths (marker
-/// exists, or the marketplace was already installed manually).
-fn maybe_install_default_skills() -> Option<PluginJobEvent> {
+/// If a marketplace is already installed (from a prior session or a
+/// manual `/plugin marketplace add`) but its plugins haven't been
+/// installed yet, this bootstraps those plugins too — the marketplace
+/// clone is skipped but the install loop still runs.
+///
+/// Returns one `PluginJobEvent` per marketplace/plugin actually
+/// installed, or one `Failed` event per failure.
+fn maybe_install_default_skills() -> Vec<PluginJobEvent> {
     if marker_exists() {
-        return None;
+        return vec![];
     }
 
-    // Marketplace already present from a prior manual `/plugin install`?
-    // Honour it. Just write the marker so we don't try to clone over
-    // it next startup.
-    let already_installed = list_marketplaces()
-        .map(|list| {
-            list.iter()
-                .any(|m| m.source.eq_ignore_ascii_case(DEFAULT_SKILLS_URL))
-        })
-        .unwrap_or(false);
-    if already_installed {
-        touch_marker();
-        return None;
-    }
+    // Fresh clone vs. already-installed marketplace: the latter was
+    // cloned by a prior bootstrap that didn't call `install()` (before
+    // we added the auto-install loop), or by a manual
+    // `/plugin marketplace add`. Either way, the marketplace entry
+    // exists but its plugins may not — we still need to run the install
+    // loop on the already-installed entry.
+    let installed = list_marketplaces().unwrap_or_default();
 
-    let event = match add_marketplace(DEFAULT_SKILLS_URL) {
-        Ok(info) => {
-            eprintln!(
-                "✓ Auto-installed official plugin marketplace `{}` (commit {}).",
-                info.name,
-                short_commit(&info.git_commit)
-            );
-            Some(PluginJobEvent::MarketplaceAdded(info))
+    let mut events = Vec::new();
+
+    for url in DEFAULT_SKILLS_URLS {
+        // Marketplace already installed? Use the existing entry.
+        let already = installed.iter().find(|m| m.source.eq_ignore_ascii_case(url));
+
+        if let Some(mp) = already {
+            if should_auto_install(url) {
+                install_plugins_from_marketplace(&mut events, &mp.name, &mp.plugins);
+            }
+            continue;
         }
-        Err(e) => {
-            let msg = format!(
-                "auto-install of the official plugin marketplace failed: {e}. \
-                 Run `/plugin marketplace add {DEFAULT_SKILLS_URL}` manually when ready."
-            );
-            eprintln!("⚠ {msg}");
-            Some(PluginJobEvent::Failed {
-                op: "auto-install".into(),
-                msg,
-            })
+
+        match add_marketplace(url) {
+            Ok(info) => {
+                let mp_name = info.name.clone();
+                let plugins = info.plugins.clone();
+                eprintln!(
+                    "✓ Auto-installed plugin marketplace `{}` (commit {}).",
+                    mp_name,
+                    short_commit(&info.git_commit)
+                );
+                events.push(PluginJobEvent::MarketplaceAdded(info));
+                if should_auto_install(url) {
+                    install_plugins_from_marketplace(&mut events, &mp_name, &plugins);
+                }
+            }
+            Err(e) => {
+                let msg = format!(
+                    "auto-install of marketplace `{url}` failed: {e}. \
+                     Run `/plugin marketplace add {url}` manually when ready."
+                );
+                eprintln!("⚠ {msg}");
+                events.push(PluginJobEvent::Failed {
+                    op: "auto-install".into(),
+                    msg,
+                });
+            }
         }
-    };
+    }
 
     // Mark the bootstrap as attempted. Even on failure we don't want
     // to retry on every launch — that turns into a flapping network
     // probe. The user can delete the marker to force a retry.
     touch_marker();
-    event
+    events
+}
+
+/// Install each plugin from a marketplace's manifest. Failures for
+/// individual plugins are logged but swallowed so one bad plugin
+/// doesn't block the rest.
+fn install_plugins_from_marketplace(
+    events: &mut Vec<PluginJobEvent>,
+    mp_name: &str,
+    plugins: &[String],
+) {
+    for plugin in plugins {
+        match install(plugin, mp_name) {
+            Ok(pi) => {
+                eprintln!(
+                    "  ✓ Installed plugin `{}@{}` from marketplace `{mp_name}`.",
+                    pi.plugin, pi.marketplace
+                );
+                events.push(PluginJobEvent::PluginInstalled(pi));
+            }
+            Err(e) => {
+                // AlreadyInstalledError is benign — the plugin was
+                // registered during an earlier bootstrap attempt (e.g.
+                // re-run after deleting the marker).
+                let msg =
+                    format!("auto-install of plugin `{plugin}@{mp_name}` failed: {e}");
+                eprintln!("  ⚠ {msg}");
+                events.push(PluginJobEvent::Failed {
+                    op: "auto-install-plugin".into(),
+                    msg,
+                });
+            }
+        }
+    }
 }
 
 /// Plan B: best-effort `git pull --ff-only` on every installed
@@ -185,6 +251,9 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
         match update_marketplace(&entry.name) {
             Ok(info) => {
                 if info.git_commit != entry.git_commit {
+                    let is_auto = should_auto_install(&entry.source);
+                    let name = info.name.clone();
+                    let plugins = info.plugins.clone();
                     eprintln!(
                         "✓ Updated marketplace `{}` ({} → {}).",
                         entry.name,
@@ -192,6 +261,23 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
                         short_commit(&info.git_commit)
                     );
                     events.push(PluginJobEvent::MarketplaceUpdated(info));
+                    if is_auto {
+                        // Only install plugins not already present — avoids
+                        // AlreadyInstalledError noise on every upgrade.
+                        let installed = list_installed().unwrap_or_default();
+                        let installed_names: std::collections::HashSet<&str> =
+                            installed.iter().map(|i| i.plugin.as_str()).collect();
+                        let new_plugins: Vec<String> = plugins
+                            .iter()
+                            .filter(|p| !installed_names.contains(p.as_str()))
+                            .cloned()
+                            .collect();
+                        if !new_plugins.is_empty() {
+                            install_plugins_from_marketplace(
+                                &mut events, &name, &new_plugins,
+                            );
+                        }
+                    }
                 }
             }
             Err(e) => {
