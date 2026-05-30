@@ -298,6 +298,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   }
 
   function handleKeyDown(e: KeyboardEvent) {
+    // 忽略 IME 组字阶段的回车（中文/日文等输入法选词确认），避免误发送。
+    // `isComposing` 为现代浏览器标准属性，覆盖输入法组字状态。
+    if (e.isComposing) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
