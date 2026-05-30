@@ -35,13 +35,9 @@ export function App() {
     }
   }
 
-  // ☰：移动端开/关抽屉；桌面端收起/展开侧栏。
+  // ☰：移动端专用，开/关抽屉。桌面端的收起/展开由侧栏自身的按钮处理。
   function toggleSidebar() {
-    if (window.matchMedia('(max-width: 768px)').matches) {
-      setSidebarOpen((o) => !o);
-    } else {
-      setSidebarCollapsed((c) => !c);
-    }
+    setSidebarOpen((o) => !o);
   }
 
   // Seed cwd from /project on mount
@@ -80,7 +76,7 @@ export function App() {
           class="ghost-btn hamburger-btn"
           onClick={toggleSidebar}
           aria-label="菜单"
-          title="收起/展开会话列表"
+          title="会话列表"
         >
           ☰
         </button>
@@ -122,6 +118,7 @@ export function App() {
           onNew={handleNewSession}
           open={sidebarOpen}
           collapsed={sidebarCollapsed}
+          onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
           reloadKey={sessionListVersion}
         />
         <div

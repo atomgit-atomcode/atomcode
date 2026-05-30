@@ -107,10 +107,8 @@ body {
 }
 .ghost-btn:hover { background: var(--app-ghost-button-hover-background); }
 
-/* ☰ 切换按钮：桌面端收起/展开侧栏、移动端开关抽屉，始终可见。 */
-.hamburger-btn { display: flex; }
-/* 桌面端收起：隐藏侧栏。移动端用抽屉(.open/transform)，下方 media query 中和此规则。 */
-.session-list.collapsed { display: none; }
+/* ☰ 按钮：仅移动端可见，用于开关抽屉。桌面端收起/展开由侧栏自身按钮处理。 */
+.hamburger-btn { display: none; }
 
 .cwd-breadcrumb {
   display: flex;
@@ -548,30 +546,98 @@ body {
   flex-shrink: 0;
 }
 
-.session-list-header {
-  padding: 10px 8px 8px;
-  border-bottom: 0.5px solid var(--app-input-border);
+/* --- Toolbar: collapse button + search input, side by side --- */
+.sidebar-toolbar {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 8px 6px;
 }
 
-.session-new-btn {
-  height: 32px;
-  width: 100%;
+.sidebar-collapse-btn {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
   border: none;
   border-radius: var(--corner-radius-small);
-  background: var(--app-brand-button);
-  color: var(--app-brand-ivory);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+}
+.sidebar-collapse-btn:hover {
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
+}
+
+.sidebar-search {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  background: var(--app-input-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  color: var(--app-input-foreground);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+}
+.sidebar-search:focus { border-color: var(--app-input-active-border, var(--app-brand)); }
+.sidebar-search::placeholder { color: var(--app-input-placeholder-foreground); }
+
+/* --- CC-style new-conversation row --- */
+.sidebar-new-row {
+  padding: 2px 8px 8px;
+  border-bottom: 0.5px solid var(--app-input-border);
+}
+
+.sidebar-new-btn {
+  height: 34px;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-primary-foreground);
   cursor: pointer;
   font-size: 13px;
   font-weight: 500;
+  text-align: left;
 }
-.session-new-btn:hover { filter: brightness(1.1); }
+.sidebar-new-btn:hover { background: var(--app-list-hover-background); }
+.sidebar-new-btn svg { color: var(--app-brand); flex-shrink: 0; }
+
+/* --- Collapsed icon rail (desktop) --- */
+.session-list.collapsed { width: 52px; }
+.sidebar-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 0;
+}
+.rail-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+}
+.rail-btn:hover {
+  background: var(--app-ghost-button-hover-background);
+  color: var(--app-primary-foreground);
+}
 
 .session-list-body {
   flex: 1;
@@ -1064,8 +1130,9 @@ body {
     box-shadow: 2px 0 16px rgba(0, 0, 0, 0.35);
   }
   .session-list.open { transform: translateX(0); }
-  /* 移动端抽屉用 transform，不用 display；中和桌面端的 .collapsed 隐藏。 */
-  .session-list.collapsed { display: flex; }
+  /* 移动端用抽屉(transform)，不存在收起 rail；即便残留 .collapsed 也强制全宽抽屉。 */
+  .session-list.collapsed { display: flex; width: 80vw; max-width: 300px; }
+  .session-list.collapsed .sidebar-rail { display: none; }
   .sidebar-backdrop.show { display: block; }
 
   /* Reduce timeline / input insets */
