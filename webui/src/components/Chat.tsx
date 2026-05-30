@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels } from '../api';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
+import { useT } from '../settings';
 
 interface ToolRow {
   id: string;
@@ -60,6 +61,7 @@ function abbreviateArgs(args: string, maxLen = 60): string {
 }
 
 export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession }: ChatProps) {
+  const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
@@ -131,15 +133,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
           if (loaded.length > 0) {
             setMessages(loaded);
           } else {
-            setHistoryHint(`继续会话 ${sessionId.slice(0, 8)}（历史在 TUI/磁盘中）`);
+            setHistoryHint(t('chat.continueSession', { id: sessionId.slice(0, 8) }));
           }
         })
         .catch(() => {
           // Endpoint exists but failed — show hint
-          setHistoryHint(`继续会话 ${sessionId.slice(0, 8)}（历史在 TUI/磁盘中）`);
+          setHistoryHint(t('chat.continueSession', { id: sessionId.slice(0, 8) }));
         });
     } else {
-      setHistoryHint(`继续会话 ${sessionId.slice(0, 8)}（历史在 TUI/磁盘中）`);
+      setHistoryHint(t('chat.continueSession', { id: sessionId.slice(0, 8) }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
@@ -268,7 +270,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         break;
 
       case 'error':
-        appendToLastAssistant(`\n\n[错误: ${event.message}]`);
+        appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
         setBusy(false);
         break;
 
@@ -283,6 +285,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     if (!text || busy) return;
 
     setInput('');
+    // 重置输入框高度：清空 value 不会复位之前 auto-resize 撑高的内联 height
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setHistoryHint(null);
     setBusy(true);
 
@@ -310,7 +314,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         // User cancelled
       } else {
         const msg = err instanceof Error ? err.message : String(err);
-        appendToLastAssistant(`\n\n[连接错误: ${msg}]`);
+        appendToLastAssistant('\n\n' + t('chat.connError', { msg }));
       }
       setBusy(false);
     } finally {
@@ -349,7 +353,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         {messages.length === 0 && !historyHint && (
           <div class="messages-empty">
             <div>
-              发送消息开始对话…
+              {t('chat.startHint')}
             </div>
           </div>
         )}
@@ -358,7 +362,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
           <div class="messages-empty">
             <div>
               {historyHint}
-              <div class="sub">发送消息继续此会话</div>
+              <div class="sub">{t('chat.continueHint')}</div>
             </div>
           </div>
         )}
@@ -373,14 +377,22 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
             );
           }
 
-          const isError = msg.text.includes('[错误:') || msg.text.includes('[连接错误:');
+          const isError =
+            msg.text.includes('[错误:') ||
+            msg.text.includes('[连接错误:') ||
+            msg.text.includes('[Error:') ||
+            msg.text.includes('[Connection error:');
           const streaming = isLast && busy;
+          // 终条且简短（无工具、单行）时，去掉多余的“时间线末端”橙点，只留一个起始点。
+          const terse =
+            isLast && !streaming && msg.tools.length === 0 && !msg.text.includes('\n');
           const dotClass = isError ? 'dot-error' : 'dot-brand';
           const cls =
             'timeline-message ' +
             dotClass +
             (streaming ? ' dot-blink' : '') +
-            (isLast ? ' is-last' : '');
+            (isLast ? ' is-last' : '') +
+            (terse ? ' is-terse' : '');
 
           return (
             <div key={idx} class={cls}>
@@ -421,7 +433,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
             ref={textareaRef}
             class="message-input"
             rows={1}
-            placeholder="输入消息，Enter 发送，Shift+Enter 换行…"
+            placeholder={t('chat.inputPlaceholder')}
             value={input}
             disabled={busy}
             onInput={handleInput}
@@ -436,7 +448,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
               </span>
             )}
             {busy ? (
-              <button class="btn-stop" onClick={handleStop} title="停止" aria-label="停止">
+              <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
                 <span class="stop-square" />
               </button>
             ) : (
@@ -444,8 +456,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
                 class="btn-send"
                 onClick={sendMessage}
                 disabled={!input.trim()}
-                title="发送"
-                aria-label="发送"
+                title={t('chat.send')}
+                aria-label={t('chat.send')}
               >
                 ↑
               </button>
@@ -458,20 +470,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
 }
 
 function ToolRowView({ tool }: { tool: ToolRow }) {
+  const t = useT();
   const [expanded, setExpanded] = useState(false);
 
   let annotation: { cls: string; label: string } | null = null;
   if (tool.status === 'waiting_approval') {
-    annotation = { cls: 'waiting', label: '等待批准…' };
+    annotation = { cls: 'waiting', label: t('tool.waiting') };
   } else if (tool.status === 'pending') {
-    annotation = { cls: 'pending', label: '运行中…' };
+    annotation = { cls: 'pending', label: t('tool.running') };
   } else if (tool.status === 'done') {
     annotation = {
       cls: 'success',
-      label: tool.duration_ms != null ? `${(tool.duration_ms / 1000).toFixed(2)}s` : '完成',
+      label: tool.duration_ms != null ? `${(tool.duration_ms / 1000).toFixed(2)}s` : t('tool.done'),
     };
   } else if (tool.status === 'error') {
-    annotation = { cls: 'error', label: '失败' };
+    annotation = { cls: 'error', label: t('tool.failed') };
   }
 
   const hasDetail = !!(tool.args || tool.output);
@@ -492,13 +505,13 @@ function ToolRowView({ tool }: { tool: ToolRow }) {
         <div class="tool-body-grid">
           {tool.args && (
             <div class="tool-body-row">
-              <div class="tool-body-row-label">参数</div>
+              <div class="tool-body-row-label">{t('tool.args')}</div>
               <div class="tool-body-row-content">{tool.args}</div>
             </div>
           )}
           {tool.output && (
             <div class="tool-body-row">
-              <div class="tool-body-row-label">输出</div>
+              <div class="tool-body-row-label">{t('tool.output')}</div>
               <div class="tool-body-row-content">{tool.output}</div>
             </div>
           )}

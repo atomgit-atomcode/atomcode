@@ -1,8 +1,10 @@
 /* Browser theme — concrete --app-* values (VSCode design system ported).
-   Dark default; light via prefers-color-scheme. */
+   Dark is the base. Light applies either explicitly (html[data-theme="light"])
+   or via prefers-color-scheme when the theme is "system"/unset. An explicit
+   data-theme="dark" keeps dark even on a light OS. */
 :root {
   --app-brand:#7c3aed; --app-brand-button:#6d28d9; --app-brand-ivory:#faf9f5; --app-brand-slate:#141413;
-  --app-primary-foreground:#cccccc; --app-primary-background:#1f1f1f;
+  --app-primary-foreground:#cccccc; --app-primary-background:#1f1f1f; --app-brand-text:#ffffff;
   --app-secondary-foreground:#9d9d9d; --app-secondary-background:#1e1e1e;
   --app-input-foreground:#cccccc; --app-input-background:#2d2d2d; --app-input-border:#3c3c3c;
   --app-input-active-border:#7c3aed; --app-input-placeholder-foreground:#8a8a8a; --app-input-secondary-background:#252526;
@@ -19,9 +21,22 @@
   --app-monospace-font-family:ui-monospace,'SFMono-Regular','Menlo','Monaco','Courier New',monospace;
   --app-monospace-font-size:12px; --app-monospace-font-size-small:11px;
 }
+/* Light palette, shared by the explicit-light and system-light selectors. */
+:root[data-theme='light'] {
+  --app-primary-foreground:#1f2328; --app-primary-background:#ffffff; --app-brand-text:#000000;
+  --app-secondary-foreground:#57606a; --app-secondary-background:#f6f8fa;
+  --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#d0d7de;
+  --app-input-placeholder-foreground:#8c959f; --app-input-secondary-background:#f6f8fa;
+  --app-ghost-button-hover-background:#0000000d; --app-tool-background:#f6f8fa; --app-header-background:#ffffff;
+  --app-primary-border-color:#d0d7de; --app-list-hover-background:#eef1f4; --app-list-active-background:#dce3ea;
+  --app-menu-background:#ffffff; --app-menu-border:#d0d7de; --app-menu-foreground:#1f2328; --app-menu-selection-background:#ddf4ff;
+  --app-link-color:#0969da; --app-transparent-inner-border:#00000012;
+  --app-spinner-foreground:var(--app-brand-button);
+  --app-diff-deletion-foreground:#cf222e;
+}
 @media (prefers-color-scheme: light) {
-  :root {
-    --app-primary-foreground:#1f2328; --app-primary-background:#ffffff;
+  :root:not([data-theme='dark']):not([data-theme='light']) {
+    --app-primary-foreground:#1f2328; --app-primary-background:#ffffff; --app-brand-text:#000000;
     --app-secondary-foreground:#57606a; --app-secondary-background:#f6f8fa;
     --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#d0d7de;
     --app-input-placeholder-foreground:#8c959f; --app-input-secondary-background:#f6f8fa;

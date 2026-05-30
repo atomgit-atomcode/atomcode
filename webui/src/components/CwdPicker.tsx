@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { listDir, getProjects, setDefaultDir, ProjectInfo } from '../api';
+import { useT } from '../settings';
 
 interface CwdPickerProps {
   current: string;
@@ -44,6 +45,7 @@ function parseBreadcrumb(path: string): { label: string; fullPath: string }[] {
 }
 
 export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
+  const t = useT();
   const [inputPath, setInputPath] = useState(current || '~');
   const [browsePath, setBrowsePath] = useState(current || '~');
   const [dirs, setDirs] = useState<string[]>([]);
@@ -129,14 +131,14 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
       <div class="modal-card">
         <div class="modal-header">
           <span>📁</span>
-          <h3>切换工作目录</h3>
-          <span class="modal-sub" style="margin-left:auto">仅影响当前会话</span>
+          <h3>{t('cwd.title')}</h3>
+          <span class="modal-sub" style="margin-left:auto">{t('cwd.affectsSession')}</span>
         </div>
 
         <div class="modal-body">
           {/* Path input */}
           <div class="field-group">
-            <span class="modal-label">路径</span>
+            <span class="modal-label">{t('cwd.path')}</span>
             <div class="field-row">
               <input
                 ref={inputRef}
@@ -150,11 +152,11 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                 placeholder="~/..."
               />
               <button class="btn btn-primary" onClick={handleJump}>
-                跳转
+                {t('cwd.jump')}
               </button>
             </div>
             <p class="field-hint">
-              支持 <code>~</code> 展开。下方可浏览子目录（GET /fs/list）。
+              {t('cwd.hintBefore')} <code>~</code> {t('cwd.hintAfter')}
             </p>
           </div>
 
@@ -175,10 +177,10 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
             </div>
 
             <div class="dir-list">
-              {dirLoading && <div class="dir-note">加载中…</div>}
+              {dirLoading && <div class="dir-note">{t('cwd.loading')}</div>}
               {dirError && <div class="dir-note error">{dirError}</div>}
               {!dirLoading && !dirError && dirs.length === 0 && (
-                <div class="dir-note">（无子目录）</div>
+                <div class="dir-note">{t('cwd.noSubdirs')}</div>
               )}
               {!dirLoading &&
                 dirs.map((d) => (
@@ -193,7 +195,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
           {/* Recent projects */}
           {projects.length > 0 && (
             <div class="field-group">
-              <span class="modal-label">最近项目</span>
+              <span class="modal-label">{t('cwd.recentProjects')}</span>
               {projects.slice(0, 6).map((p) => {
                 const isCurrent = p.working_dir === browsePath;
                 return (
@@ -203,7 +205,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                     onClick={() => handleProjectClick(p.working_dir)}
                   >
                     <span class="mono">{p.working_dir}</span>
-                    {isCurrent && <span class="badge">● 当前</span>}
+                    {isCurrent && <span class="badge">● {t('cwd.current')}</span>}
                   </button>
                 );
               })}
@@ -220,13 +222,13 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                 setSetAsDefault((e.target as HTMLInputElement).checked)
               }
             />
-            同时设为 daemon 默认目录（POST /cd）
+            {t('cwd.setDefault')}
           </label>
           <button class="btn" onClick={onClose}>
-            取消
+            {t('cwd.cancel')}
           </button>
           <button class="btn btn-primary" onClick={handleConfirm} disabled={confirming}>
-            确定
+            {t('cwd.confirm')}
           </button>
         </div>
       </div>

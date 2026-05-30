@@ -4,10 +4,11 @@
 import { useEffect, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
-import { ConfigPanel } from './components/ConfigPanel';
+import { SettingsPanel } from './components/SettingsPanel';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
 import { getProject, SessionMetaWithProject } from './api';
+import { useT } from './settings';
 
 function cwdDisplay(cwd: string): { prefix: string; name: string } {
   const clean = cwd.replace(/\/+$/, '');
@@ -17,6 +18,7 @@ function cwdDisplay(cwd: string): { prefix: string; name: string } {
 }
 
 export function App() {
+  const t = useT();
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionMetaWithProject | null>(null);
   const [cwd, setCwd] = useState('');
@@ -66,65 +68,64 @@ export function App() {
     setSidebarOpen(false);
   }
 
+  // 切换工作目录：侧栏按新目录过滤会话，并自动进入该目录的新对话。
+  function handlePickCwd(path: string) {
+    setCwd(path);
+    setSessionId(null);
+    setActiveSession(null);
+  }
+
   const { prefix, name } = cwdDisplay(cwd);
 
   return (
     <div class="app">
-      {/* ===== Header ===== */}
-      <header class="header">
-        <button
-          class="ghost-btn hamburger-btn"
-          onClick={toggleSidebar}
-          aria-label="菜单"
-          title="会话列表"
-        >
-          ☰
-        </button>
-        <span class="header-title">▲ atomcode</span>
+      {/* ===== Full-height sidebar (通栏)：品牌 + 收起按钮在其顶部 ===== */}
+      <Sidebar
+        activeSessionId={sessionId}
+        onSelect={handleSelectSession}
+        onNew={handleNewSession}
+        open={sidebarOpen}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
+        onOpenSettings={() => setShowConfig(true)}
+        reloadKey={sessionListVersion}
+        cwd={cwd}
+      />
+      <div
+        class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
+        onClick={() => setSidebarOpen(false)}
+      />
 
-        <span class="header-spacer" />
+      {/* ===== Main column: header (cwd breadcrumb) + chat ===== */}
+      <div class="main-column">
+        <header class="header">
+          <button
+            class="ghost-btn hamburger-btn"
+            onClick={toggleSidebar}
+            aria-label={t('header.menu')}
+            title={t('header.sessionList')}
+          >
+            ☰
+          </button>
 
-        <button
-          class="cwd-breadcrumb"
-          onClick={() => setShowCwd(true)}
-          title="切换工作目录"
-        >
-          {cwd ? (
-            <>
-              <span class="cwd-prefix">{prefix}</span>
-              <span class="cwd-name">{name || cwd}</span>
-            </>
-          ) : (
-            <span class="cwd-prefix">（未设置工作目录）</span>
-          )}
-          <span class="cwd-chevron">▾</span>
-        </button>
+          <span class="header-spacer" />
 
-        <button
-          class="ghost-btn"
-          onClick={() => setShowConfig(true)}
-          aria-label="配置"
-          title="配置"
-        >
-          ⚙
-        </button>
-      </header>
-
-      {/* ===== Body: sidebar + chat ===== */}
-      <div class="session-row">
-        <Sidebar
-          activeSessionId={sessionId}
-          onSelect={handleSelectSession}
-          onNew={handleNewSession}
-          open={sidebarOpen}
-          collapsed={sidebarCollapsed}
-          onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
-          reloadKey={sessionListVersion}
-        />
-        <div
-          class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
-          onClick={() => setSidebarOpen(false)}
-        />
+          <button
+            class="cwd-breadcrumb"
+            onClick={() => setShowCwd(true)}
+            title={t('header.switchCwd')}
+          >
+            {cwd ? (
+              <>
+                <span class="cwd-prefix">{prefix}</span>
+                <span class="cwd-name">{name || cwd}</span>
+              </>
+            ) : (
+              <span class="cwd-prefix">{t('header.noCwd')}</span>
+            )}
+            <span class="cwd-chevron">▾</span>
+          </button>
+        </header>
 
         <div class="session-body app-sidebar">
           <Chat
@@ -141,11 +142,11 @@ export function App() {
       {showCwd && (
         <CwdPicker
           current={cwd}
-          onPick={(p) => setCwd(p)}
+          onPick={handlePickCwd}
           onClose={() => setShowCwd(false)}
         />
       )}
-      {showConfig && <ConfigPanel onClose={() => setShowConfig(false)} />}
+      {showConfig && <SettingsPanel onClose={() => setShowConfig(false)} />}
       {pending && <PermissionCard req={pending} onDone={() => setPending(null)} />}
     </div>
   );

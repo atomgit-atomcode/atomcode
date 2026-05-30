@@ -1,0 +1,196 @@
+// i18n message catalog (zh / en). Values may contain {placeholder} tokens that
+// are interpolated by the `t()` function in settings.tsx.
+
+export type Lang = 'zh' | 'en';
+
+const zh = {
+  // Header
+  'header.menu': '菜单',
+  'header.sessionList': '会话列表',
+  'header.switchCwd': '切换工作目录',
+  'header.noCwd': '（未设置工作目录）',
+
+  // Sidebar
+  'sidebar.expand': '展开侧栏',
+  'sidebar.collapse': '收起侧栏',
+  'sidebar.newChat': '新建对话',
+  'sidebar.search': '搜索会话',
+  'sidebar.searchPlaceholder': '搜索会话…',
+  'sidebar.recent': '最近会话',
+  'sidebar.loading': '加载中…',
+  'sidebar.empty': '暂无会话',
+  'sidebar.emptyInCwd': '该目录暂无会话',
+  'sidebar.noMatch': '无匹配会话',
+  'sidebar.msgCount': '{n} 条',
+  'sidebar.sessionCount': '{n} 个会话',
+  'sidebar.sessionCountFiltered': '{f} / {t} 个会话',
+  'sidebar.noRecords': '无会话记录',
+  'sidebar.settings': '设置',
+
+  // Relative time
+  'time.justNow': '刚刚',
+  'time.minutesAgo': '{n}分钟前',
+  'time.hoursAgo': '{n}小时前',
+  'time.yesterday': '昨天',
+
+  // Model selector
+  'model.label': '模型',
+
+  // Chat
+  'chat.startHint': '发送消息开始对话…',
+  'chat.continueHint': '发送消息继续此会话',
+  'chat.continueSession': '继续会话 {id}（历史在 TUI/磁盘中）',
+  'chat.inputPlaceholder': '输入消息，Enter 发送，Shift+Enter 换行…',
+  'chat.stop': '停止',
+  'chat.send': '发送',
+  'chat.error': '[错误: {msg}]',
+  'chat.connError': '[连接错误: {msg}]',
+
+  // Tool rows
+  'tool.waiting': '等待批准…',
+  'tool.running': '运行中…',
+  'tool.done': '完成',
+  'tool.failed': '失败',
+  'tool.args': '参数',
+  'tool.output': '输出',
+
+  // Settings panel
+  'settings.title': '设置',
+  'settings.theme': '主题',
+  'settings.theme.light': '浅色',
+  'settings.theme.dark': '深色',
+  'settings.theme.system': '跟随系统',
+  'settings.language': '语言',
+  'settings.modelConfig': '模型配置',
+  'settings.close': '关闭',
+  'settings.loadFailed': '加载失败',
+  'settings.loading': '加载中…',
+  'settings.defaultProvider': '默认 Provider',
+  'settings.defaultWorkdir': '默认工作目录',
+  'settings.configFile': '配置文件',
+  'settings.default': '默认',
+  'settings.model': '模型',
+  'settings.contextWindow': '上下文窗口',
+  'settings.apiKey': 'API Key',
+  'settings.configured': '已配置',
+  'settings.notConfigured': '未配置',
+  'settings.providers': 'Providers',
+
+  // CWD picker
+  'cwd.title': '切换工作目录',
+  'cwd.affectsSession': '仅影响当前会话',
+  'cwd.path': '路径',
+  'cwd.jump': '跳转',
+  'cwd.hintBefore': '支持',
+  'cwd.hintAfter': '展开。下方可浏览子目录（GET /fs/list）。',
+  'cwd.loading': '加载中…',
+  'cwd.noSubdirs': '（无子目录）',
+  'cwd.recentProjects': '最近项目',
+  'cwd.current': '当前',
+  'cwd.setDefault': '同时设为 daemon 默认目录（POST /cd）',
+  'cwd.cancel': '取消',
+  'cwd.confirm': '确定',
+
+  // Permission card
+  'perm.title': '工具请求批准',
+  'perm.args': '参数',
+  'perm.deny': '拒绝',
+  'perm.approve': '批准',
+  'perm.alwaysAllow': '本会话总是允许',
+
+  // Common
+  'common.readonly': '只读',
+} as const;
+
+export type MsgKey = keyof typeof zh;
+
+const en: Record<MsgKey, string> = {
+  'header.menu': 'Menu',
+  'header.sessionList': 'Session list',
+  'header.switchCwd': 'Switch working directory',
+  'header.noCwd': '(No working directory)',
+
+  'sidebar.expand': 'Expand sidebar',
+  'sidebar.collapse': 'Collapse sidebar',
+  'sidebar.newChat': 'New chat',
+  'sidebar.search': 'Search sessions',
+  'sidebar.searchPlaceholder': 'Search sessions…',
+  'sidebar.recent': 'Recent',
+  'sidebar.loading': 'Loading…',
+  'sidebar.empty': 'No sessions',
+  'sidebar.emptyInCwd': 'No sessions in this directory',
+  'sidebar.noMatch': 'No matches',
+  'sidebar.msgCount': '{n} msgs',
+  'sidebar.sessionCount': '{n} sessions',
+  'sidebar.sessionCountFiltered': '{f} / {t} sessions',
+  'sidebar.noRecords': 'No session records',
+  'sidebar.settings': 'Settings',
+
+  'time.justNow': 'just now',
+  'time.minutesAgo': '{n} min ago',
+  'time.hoursAgo': '{n} hr ago',
+  'time.yesterday': 'yesterday',
+
+  'model.label': 'Model',
+
+  'chat.startHint': 'Send a message to start a conversation…',
+  'chat.continueHint': 'Send a message to continue this session',
+  'chat.continueSession': 'Continue session {id} (history on TUI/disk)',
+  'chat.inputPlaceholder': 'Type a message — Enter to send, Shift+Enter for newline…',
+  'chat.stop': 'Stop',
+  'chat.send': 'Send',
+  'chat.error': '[Error: {msg}]',
+  'chat.connError': '[Connection error: {msg}]',
+
+  'tool.waiting': 'Awaiting approval…',
+  'tool.running': 'Running…',
+  'tool.done': 'Done',
+  'tool.failed': 'Failed',
+  'tool.args': 'Arguments',
+  'tool.output': 'Output',
+
+  'settings.title': 'Settings',
+  'settings.theme': 'Theme',
+  'settings.theme.light': 'Light',
+  'settings.theme.dark': 'Dark',
+  'settings.theme.system': 'System',
+  'settings.language': 'Language',
+  'settings.modelConfig': 'Model configuration',
+  'settings.close': 'Close',
+  'settings.loadFailed': 'Load failed',
+  'settings.loading': 'Loading…',
+  'settings.defaultProvider': 'Default provider',
+  'settings.defaultWorkdir': 'Default working directory',
+  'settings.configFile': 'Config file',
+  'settings.default': 'Default',
+  'settings.model': 'Model',
+  'settings.contextWindow': 'Context window',
+  'settings.apiKey': 'API Key',
+  'settings.configured': 'Configured',
+  'settings.notConfigured': 'Not configured',
+  'settings.providers': 'Providers',
+
+  'cwd.title': 'Switch working directory',
+  'cwd.affectsSession': 'Affects current session only',
+  'cwd.path': 'Path',
+  'cwd.jump': 'Go',
+  'cwd.hintBefore': 'Supports',
+  'cwd.hintAfter': 'expansion. Browse subdirectories below (GET /fs/list).',
+  'cwd.loading': 'Loading…',
+  'cwd.noSubdirs': '(No subdirectories)',
+  'cwd.recentProjects': 'Recent projects',
+  'cwd.current': 'Current',
+  'cwd.setDefault': 'Also set as daemon default directory (POST /cd)',
+  'cwd.cancel': 'Cancel',
+  'cwd.confirm': 'Confirm',
+
+  'perm.title': 'Tool approval request',
+  'perm.args': 'Arguments',
+  'perm.deny': 'Deny',
+  'perm.approve': 'Approve',
+  'perm.alwaysAllow': 'Always allow this session',
+
+  'common.readonly': 'Read-only',
+};
+
+export const messages: Record<Lang, Record<MsgKey, string>> = { zh, en };

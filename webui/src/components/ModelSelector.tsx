@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { getModels, ModelInfo } from '../api';
+import { useT } from '../settings';
 
 export function ModelSelector({ value, onChange }: { value: string | null; onChange: (p: string) => void }) {
+  const t = useT();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -16,7 +18,7 @@ export function ModelSelector({ value, onChange }: { value: string | null; onCha
   return (
     <div class="model-selector model-selector-up" ref={ref}>
       <button class="model-selector-trigger" onClick={() => setOpen((o) => !o)} type="button">
-        <span class="model-selector-label">{current ? current.model : '模型'}</span>
+        <span class="model-selector-label">{current ? current.model : t('model.label')}</span>
         <span class="model-selector-chevron">▾</span>
       </button>
       {open && (

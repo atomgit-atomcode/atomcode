@@ -25,9 +25,18 @@ body {
 
 .app {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   height: 100dvh;
   width: 100%;
+  overflow: hidden;
+}
+
+/* Right-hand column: header (cwd + config) stacked above the chat body. */
+.main-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
 }
 
@@ -212,6 +221,9 @@ body {
   width: 1px;
   background: var(--app-primary-border-color, var(--app-input-border));
 }
+
+/* 简短的终条回复：去掉冗余的橙色末端点 + 短连接线，只保留起始点。 */
+.timeline-message.is-last.is-terse::after { display: none; }
 
 /* Dot Colors */
 .timeline-message.dot-brand::before { background: var(--app-brand); }
@@ -546,12 +558,29 @@ body {
   flex-shrink: 0;
 }
 
-/* --- Toolbar: collapse button + search input, side by side --- */
-.sidebar-toolbar {
+/* --- Brand row: "atomcode" + collapse button on its right --- */
+.sidebar-brand-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 8px 8px 6px;
+  justify-content: space-between;
+  gap: 8px;
+  height: 40px;
+  padding: 0 8px 0 12px;
+  flex-shrink: 0;
+}
+
+.sidebar-brand {
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+  /* 深色背景白字，浅色背景黑字 */
+  color: var(--app-brand-text);
+}
+
+/* --- Search row (below the new-conversation button) --- */
+.sidebar-search-row {
+  padding: 2px 8px 8px;
 }
 
 .sidebar-collapse-btn {
@@ -685,12 +714,52 @@ body {
 
 .session-empty { padding: 20px; text-align: center; color: var(--app-secondary-foreground); font-size: 12px; }
 
-.session-footer {
-  padding: 8px 10px;
+/* --- Bottom bar: session count + settings entry --- */
+.sidebar-bottom {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 6px 10px;
   border-top: 1px solid var(--app-primary-border-color);
+  flex-shrink: 0;
+}
+
+.session-footer {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
   color: var(--app-secondary-foreground);
   font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-settings-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  font-size: 12px;
   flex-shrink: 0;
+}
+.sidebar-settings-btn:hover {
+  background: var(--app-list-hover-background);
+  color: var(--app-primary-foreground);
+}
+.sidebar-settings-btn svg { flex-shrink: 0; }
+
+/* Settings button at the bottom of the collapsed icon rail. */
+.rail-btn-settings {
+  margin-top: auto;
+  margin-bottom: 6px;
+  align-self: center;
 }
 
 /* === Sidebar drawer (mobile) === */
@@ -703,7 +772,7 @@ body {
   display: none;
 }
 
-/* === Modal / menu (PermissionCard, CwdPicker, ConfigPanel) === */
+/* === Modal / menu (PermissionCard, CwdPicker, SettingsPanel) === */
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -882,6 +951,39 @@ body {
 .field-group { display: flex; flex-direction: column; gap: 6px; }
 .field-hint { font-size: 11px; color: var(--app-secondary-foreground); }
 .field-hint code { font-family: var(--app-monospace-font-family); }
+
+/* --- Segmented control (theme / language pickers in settings) --- */
+.segmented {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--app-input-secondary-background);
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-medium);
+}
+.segmented-btn {
+  flex: 1;
+  min-width: 64px;
+  height: 28px;
+  padding: 0 12px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.segmented-btn:hover { color: var(--app-primary-foreground); }
+.segmented-btn.active {
+  background: var(--app-brand-button);
+  color: var(--app-button-foreground);
+  font-weight: 500;
+}
+
+/* Provider list inside the settings model section. */
+.provider-list { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
 
 /* Directory browser */
 .dir-browser {

@@ -2,6 +2,7 @@
 
 import { useState } from 'preact/hooks';
 import { respondPermission } from '../api';
+import { useT } from '../settings';
 
 interface PermissionRequest {
   session_id: string;
@@ -34,6 +35,7 @@ function formatArgs(args: unknown): string {
 }
 
 export function PermissionCard({ req, onDone }: PermissionCardProps) {
+  const t = useT();
   const [loading, setLoading] = useState(false);
 
   async function decide(decision: 'allow' | 'deny' | 'always_allow') {
@@ -56,27 +58,27 @@ export function PermissionCard({ req, onDone }: PermissionCardProps) {
       <div class="modal-card">
         <div class="modal-header">
           <span>⚠</span>
-          <h3>工具请求批准</h3>
+          <h3>{t('perm.title')}</h3>
           <span class="modal-tag">{req.tool_name}</span>
         </div>
 
         <div class="modal-body">
           {req.reason && <p class="field-hint">{req.reason}</p>}
           <div class="field-group">
-            <span class="modal-label">参数</span>
+            <span class="modal-label">{t('perm.args')}</span>
             <pre class="tool-body-row-content">{argsDisplay}</pre>
           </div>
         </div>
 
         <div class="modal-footer">
           <button class="btn" disabled={loading} onClick={() => decide('deny')}>
-            拒绝
+            {t('perm.deny')}
           </button>
           <button class="btn btn-primary" disabled={loading} onClick={() => decide('allow')}>
-            批准
+            {t('perm.approve')}
           </button>
           <button class="btn btn-success" disabled={loading} onClick={() => decide('always_allow')}>
-            本会话总是允许
+            {t('perm.alwaysAllow')}
           </button>
         </div>
       </div>
