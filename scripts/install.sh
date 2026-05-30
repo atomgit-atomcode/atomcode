@@ -13,8 +13,8 @@
 # the manifest, but binary path / rc-edit format are not checked.
 set -eu
 
-VERSION="${ATOMCODE_VERSION:-v4.23.3}"
 REPO_BASE="https://atomgit.com/atomgit_atomcode/atomcode/releases/download"
+REPO_LATEST_API="https://api.atomgit.com/api/v5/repos/atomgit_atomcode/atomcode/releases/latest"
 
 # --- detect platform ---
 uname_s=$(uname -s)
@@ -32,9 +32,6 @@ case "$uname_m" in
     x86_64|amd64)  arch="x64"   ;;
     *) echo "Unsupported arch: $uname_m"; exit 1 ;;
 esac
-
-BIN_NAME="atomcode-${VERSION}-${os}-${arch}"
-URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"
 
 # --- pick install dir ---
 if [ -n "${ATOMCODE_PREFIX:-}" ]; then
@@ -55,16 +52,29 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 DEST="$TMP/atomcode"
 
-echo "==> Downloading $BIN_NAME"
-echo "    from $URL"
+# Pick download tool
 if command -v curl >/dev/null 2>&1; then
-    curl -fL --progress-bar -o "$DEST" "$URL"
+    _fetch="curl -sL"
+    _down="curl -fL --progress-bar -o"
 elif command -v wget >/dev/null 2>&1; then
-    wget --show-progress -O "$DEST" "$URL"
+    _fetch="wget -qO-"
+    _down="wget --show-progress -O"
 else
-    echo "Error: need curl or wget."
+    echo "Error: need curl or wget." >&2
     exit 1
 fi
+
+if [ -z "${ATOMCODE_VERSION:-}" ]; then
+    VERSION=$($_fetch "$REPO_LATEST_API" | grep tag_name | awk '{print $2}')
+else
+    VERSION="${ATOMCODE_VERSION:-v4.23.3}"
+fi
+
+BIN_NAME="atomcode-${VERSION}-${os}-${arch}"
+URL="${REPO_BASE}/${VERSION}/${BIN_NAME}"
+echo "==> Downloading $BIN_NAME"
+echo "    from $URL"
+$_down "$DEST" "$URL"
 
 # Sanity check: must be a real binary, not an HTML 404 page
 if head -c 4 "$DEST" | grep -q "<" 2>/dev/null; then
