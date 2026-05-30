@@ -52,54 +52,30 @@ export function PermissionCard({ req, onDone }: PermissionCardProps) {
   const argsDisplay = formatArgs(req.arguments);
 
   return (
-    // Overlay
-    <div class="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
-      <div class="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden">
-        {/* Header */}
-        <div class="px-5 py-4 border-b border-slate-200 flex items-center gap-2">
-          <span class="text-amber-500 text-xl">⚠</span>
-          <h3 class="font-semibold text-base">工具请求批准</h3>
-          <span class="ml-auto font-mono text-xs px-2 py-0.5 rounded bg-amber-100 text-amber-700">
-            {req.tool_name}
-          </span>
+    <div class="modal-overlay">
+      <div class="modal-card">
+        <div class="modal-header">
+          <span>⚠</span>
+          <h3>工具请求批准</h3>
+          <span class="modal-tag">{req.tool_name}</span>
         </div>
 
-        {/* Body */}
-        <div class="px-5 py-4 space-y-3">
-          {req.reason && (
-            <p class="text-sm text-slate-600">{req.reason}</p>
-          )}
-          <div>
-            <div class="text-xs font-semibold text-slate-400 uppercase mb-1.5">
-              参数
-            </div>
-            <pre class="bg-slate-900 text-slate-100 rounded-lg p-3 text-xs overflow-x-auto leading-relaxed max-h-64 overflow-y-auto">
-              {argsDisplay}
-            </pre>
+        <div class="modal-body">
+          {req.reason && <p class="field-hint">{req.reason}</p>}
+          <div class="field-group">
+            <span class="modal-label">参数</span>
+            <pre class="tool-body-row-content">{argsDisplay}</pre>
           </div>
         </div>
 
-        {/* Buttons */}
-        <div class="px-5 py-3 bg-slate-50 border-t border-slate-200 flex gap-2 justify-end">
-          <button
-            disabled={loading}
-            onClick={() => decide('deny')}
-            class="px-3.5 py-1.5 rounded-lg bg-white border border-slate-300 text-sm hover:bg-slate-100 disabled:opacity-50"
-          >
+        <div class="modal-footer">
+          <button class="btn" disabled={loading} onClick={() => decide('deny')}>
             拒绝
           </button>
-          <button
-            disabled={loading}
-            onClick={() => decide('allow')}
-            class="px-3.5 py-1.5 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 disabled:opacity-50"
-          >
+          <button class="btn btn-primary" disabled={loading} onClick={() => decide('allow')}>
             批准
           </button>
-          <button
-            disabled={loading}
-            onClick={() => decide('always_allow')}
-            class="px-3.5 py-1.5 rounded-lg bg-emerald-600 text-white text-sm hover:bg-emerald-700 disabled:opacity-50"
-          >
+          <button class="btn btn-success" disabled={loading} onClick={() => decide('always_allow')}>
             本会话总是允许
           </button>
         </div>

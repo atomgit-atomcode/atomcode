@@ -121,133 +121,98 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
 
   return (
     <div
-      class="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50"
+      class="modal-overlay"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div class="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden">
-        {/* Header */}
-        <div class="px-5 py-4 border-b border-slate-200 flex items-center gap-2">
-          <span class="text-xl">📁</span>
-          <h3 class="font-semibold text-base">切换工作目录</h3>
-          <span class="ml-auto text-xs text-slate-400">仅影响当前会话</span>
+      <div class="modal-card">
+        <div class="modal-header">
+          <span>📁</span>
+          <h3>切换工作目录</h3>
+          <span class="modal-sub" style="margin-left:auto">仅影响当前会话</span>
         </div>
 
-        {/* Body */}
-        <div class="px-5 py-4 space-y-4">
+        <div class="modal-body">
           {/* Path input */}
-          <div>
-            <label class="text-xs font-semibold text-slate-400 uppercase">
-              路径
-            </label>
-            <div class="mt-1 flex gap-2">
+          <div class="field-group">
+            <span class="modal-label">路径</span>
+            <div class="field-row">
               <input
                 ref={inputRef}
                 type="text"
+                class="menu-input"
                 value={inputPath}
                 onInput={(e) => setInputPath((e.target as HTMLInputElement).value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') handleJump();
                 }}
-                class="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-indigo-500"
                 placeholder="~/..."
               />
-              <button
-                onClick={handleJump}
-                class="px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700"
-              >
+              <button class="btn btn-primary" onClick={handleJump}>
                 跳转
               </button>
             </div>
-            <p class="mt-1 text-xs text-slate-400">
-              支持 <code class="font-mono">~</code> 展开。下方可浏览子目录（GET /fs/list）。
+            <p class="field-hint">
+              支持 <code>~</code> 展开。下方可浏览子目录（GET /fs/list）。
             </p>
           </div>
 
           {/* Directory browser */}
-          <div class="border border-slate-200 rounded-lg overflow-hidden">
-            {/* Breadcrumb */}
-            <div class="px-3 py-2 bg-slate-50 border-b border-slate-200 text-xs font-mono text-slate-500 flex items-center flex-wrap gap-0.5">
+          <div class="dir-browser">
+            <div class="dir-breadcrumb">
               {crumbs.map((crumb, i) => (
-                <span key={i} class="flex items-center gap-0.5">
+                <span key={i}>
                   <span
                     onClick={() => handleBreadcrumbClick(crumb.fullPath)}
-                    class={
-                      i === crumbs.length - 1
-                        ? 'font-semibold text-slate-700'
-                        : 'hover:text-indigo-600 cursor-pointer'
-                    }
+                    class={'dir-crumb' + (i === crumbs.length - 1 ? ' current' : '')}
                   >
                     {crumb.label}
                   </span>
-                  {i < crumbs.length - 1 && <span>/</span>}
+                  {i < crumbs.length - 1 && <span> / </span>}
                 </span>
               ))}
             </div>
 
-            {/* Subdirectory list */}
-            <div class="max-h-44 overflow-y-auto text-sm">
-              {dirLoading && (
-                <div class="px-3 py-2 text-xs text-slate-400">加载中…</div>
-              )}
-              {dirError && (
-                <div class="px-3 py-2 text-xs text-rose-500">{dirError}</div>
-              )}
+            <div class="dir-list">
+              {dirLoading && <div class="dir-note">加载中…</div>}
+              {dirError && <div class="dir-note error">{dirError}</div>}
               {!dirLoading && !dirError && dirs.length === 0 && (
-                <div class="px-3 py-2 text-xs text-slate-400">（无子目录）</div>
+                <div class="dir-note">（无子目录）</div>
               )}
               {!dirLoading &&
                 dirs.map((d) => (
-                  <div
-                    key={d}
-                    onClick={() => handleSubdirClick(d)}
-                    class="px-3 py-1.5 hover:bg-indigo-50 cursor-pointer flex items-center gap-2"
-                  >
-                    <span class="text-slate-400">📁</span>
+                  <button key={d} class="dir-item" onClick={() => handleSubdirClick(d)}>
+                    <span>📁</span>
                     <span>{d}</span>
-                  </div>
+                  </button>
                 ))}
             </div>
           </div>
 
           {/* Recent projects */}
           {projects.length > 0 && (
-            <div>
-              <label class="text-xs font-semibold text-slate-400 uppercase">
-                最近项目
-              </label>
-              <div class="mt-1 space-y-1">
-                {projects.slice(0, 6).map((p) => {
-                  const isCurrent = p.working_dir === browsePath;
-                  return (
-                    <div
-                      key={p.hash}
-                      onClick={() => handleProjectClick(p.working_dir)}
-                      class={
-                        'px-3 py-2 rounded-lg cursor-pointer text-sm flex items-center justify-between ' +
-                        (isCurrent
-                          ? 'bg-indigo-50 border border-indigo-200'
-                          : 'hover:bg-slate-50')
-                      }
-                    >
-                      <span class="font-mono truncate">{p.working_dir}</span>
-                      {isCurrent && (
-                        <span class="text-xs text-emerald-600 shrink-0 ml-2">
-                          ● 当前
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+            <div class="field-group">
+              <span class="modal-label">最近项目</span>
+              {projects.slice(0, 6).map((p) => {
+                const isCurrent = p.working_dir === browsePath;
+                return (
+                  <button
+                    key={p.hash}
+                    class={'list-row' + (isCurrent ? ' active' : '')}
+                    onClick={() => handleProjectClick(p.working_dir)}
+                  >
+                    <span class="mono">{p.working_dir}</span>
+                    {isCurrent && <span class="badge">● 当前</span>}
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
 
-        {/* Footer */}
-        <div class="px-5 py-3 bg-slate-50 border-t border-slate-200 flex items-center gap-2 justify-end">
-          <label class="mr-auto flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer">
+        <div class="modal-footer">
+          <label class="checkbox-label">
             <input
               type="checkbox"
               checked={setAsDefault}
@@ -255,19 +220,12 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
                 setSetAsDefault((e.target as HTMLInputElement).checked)
               }
             />
-            同时设为 daemon 默认目录（POST /cd，影响所有客户端）
+            同时设为 daemon 默认目录（POST /cd）
           </label>
-          <button
-            onClick={onClose}
-            class="px-3.5 py-1.5 rounded-lg bg-white border border-slate-300 text-sm hover:bg-slate-100"
-          >
+          <button class="btn" onClick={onClose}>
             取消
           </button>
-          <button
-            onClick={handleConfirm}
-            disabled={confirming}
-            class="px-3.5 py-1.5 rounded-lg bg-indigo-600 text-white text-sm hover:bg-indigo-700 disabled:opacity-50"
-          >
+          <button class="btn btn-primary" onClick={handleConfirm} disabled={confirming}>
             确定
           </button>
         </div>

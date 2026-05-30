@@ -270,147 +270,140 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
   }
 
-  return (
-    <div class="flex flex-col h-full">
-      {/* Message area */}
-      <div class="flex-1 overflow-y-auto p-6 space-y-5 min-h-0">
-        {messages.length === 0 && !historyHint && (
-          <div class="flex items-center justify-center h-full text-slate-400 text-sm">
-            发送消息开始对话…
-          </div>
-        )}
+  const lastIdx = messages.length - 1;
 
-        {messages.length === 0 && historyHint && (
-          <div class="flex items-center justify-center h-full">
-            <div class="text-center">
-              <div class="text-slate-400 text-sm">{historyHint}</div>
-              <div class="text-slate-300 text-xs mt-1">发送消息继续此会话</div>
+  return (
+    <>
+      {/* Message timeline */}
+      <div class="messages-container">
+        {messages.length === 0 && !historyHint && (
+          <div class="messages-empty">
+            <div>
+              发送消息开始对话…
             </div>
           </div>
         )}
 
-        {messages.map((msg, idx) => (
-          <div key={idx}>
-            {msg.role === 'user' ? (
-              <div class="flex justify-end">
-                <div class="max-w-2xl px-4 py-2.5 rounded-2xl rounded-br-sm bg-indigo-600 text-white text-sm whitespace-pre-wrap">
-                  {msg.text}
-                </div>
-              </div>
-            ) : (
-              <div class="flex flex-col gap-2">
-                {/* Tool rows */}
-                {msg.tools.map((tool) => (
-                  <div class="flex justify-start" key={tool.id}>
-                    <div class="max-w-2xl w-full">
-                      <ToolRowView tool={tool} />
-                    </div>
-                  </div>
-                ))}
-
-                {/* Assistant text bubble — show even if empty while streaming */}
-                {(msg.text || (idx === messages.length - 1 && busy)) && (
-                  <div class="flex justify-start">
-                    <div class="max-w-2xl px-4 py-3 rounded-2xl rounded-bl-sm bg-white border border-slate-200 text-sm leading-relaxed shadow-sm whitespace-pre-wrap">
-                      {msg.text}
-                      {idx === messages.length - 1 && busy && (
-                        <span class="inline-block w-1.5 h-4 align-middle bg-slate-400 ml-0.5 animate-pulse" />
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
+        {messages.length === 0 && historyHint && (
+          <div class="messages-empty">
+            <div>
+              {historyHint}
+              <div class="sub">发送消息继续此会话</div>
+            </div>
           </div>
-        ))}
+        )}
+
+        {messages.map((msg, idx) => {
+          const isLast = idx === lastIdx;
+          if (msg.role === 'user') {
+            return (
+              <div key={idx} class="timeline-message dot-brand user-message-wrapper">
+                <div class="user-message-bubble">{msg.text}</div>
+              </div>
+            );
+          }
+
+          const isError = msg.text.includes('[错误:') || msg.text.includes('[连接错误:');
+          const streaming = isLast && busy;
+          const dotClass = isError ? 'dot-error' : 'dot-brand';
+          const cls =
+            'timeline-message ' +
+            dotClass +
+            (streaming ? ' dot-blink' : '') +
+            (isLast ? ' is-last' : '');
+
+          return (
+            <div key={idx} class={cls}>
+              {/* Tool rows */}
+              {msg.tools.length > 0 && (
+                <div class="tool-list">
+                  {msg.tools.map((tool) => (
+                    <ToolRowView key={tool.id} tool={tool} />
+                  ))}
+                </div>
+              )}
+
+              {/* Assistant text — show even if empty while streaming */}
+              {(msg.text || streaming) && (
+                <div class={isError ? 'error-message-content' : 'assistant-message-content'}>
+                  {msg.text}
+                  {streaming && <span class="streaming-cursor" />}
+                </div>
+              )}
+            </div>
+          );
+        })}
 
         <div ref={bottomRef} />
       </div>
 
-      {/* Token usage bar */}
-      {tokens && (
-        <div class="px-6 py-1.5 text-xs text-slate-400 flex gap-4 border-t border-slate-100 bg-white/60">
-          <span>↑ {(tokens.prompt / 1000).toFixed(1)}k prompt</span>
-          <span>↓ {(tokens.completion / 1000).toFixed(1)}k completion</span>
-          <span class="ml-auto">总计 {(tokens.total / 1000).toFixed(1)}k tokens</span>
-        </div>
-      )}
-
-      {/* Input bar */}
-      <div class="p-4 border-t border-slate-200 bg-white">
-        <div class="flex items-end gap-2 rounded-xl border border-slate-300 focus-within:border-indigo-500 px-3 py-2">
+      {/* Floating input */}
+      <div class="input-container">
+        <div class="input-box">
           <textarea
             ref={textareaRef}
+            class="message-input"
             rows={1}
-            placeholder="输入消息，Enter 发送…"
-            class="flex-1 resize-none outline-none text-sm bg-transparent"
-            style="min-height: 24px; max-height: 160px;"
+            placeholder="输入消息，Enter 发送，Shift+Enter 换行…"
             value={input}
             disabled={busy}
             onInput={handleInput}
             onKeyDown={handleKeyDown}
           />
-          {busy ? (
-            <button
-              onClick={handleStop}
-              class="shrink-0 px-4 py-1.5 rounded-lg bg-slate-200 text-slate-700 text-sm font-medium hover:bg-slate-300"
-            >
-              停止
-            </button>
-          ) : (
-            <button
-              onClick={sendMessage}
-              disabled={!input.trim()}
-              class="shrink-0 px-4 py-1.5 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              发送
-            </button>
-          )}
-        </div>
-        <div class="mt-1.5 text-xs text-slate-400 flex gap-3">
-          <span>Shift+Enter 换行</span>
-          {cwd && <span class="ml-auto font-mono">cwd: {cwd}</span>}
+          <div class="input-footer">
+            <span class="footer-hint">Shift+Enter 换行</span>
+            <span class="footer-spacer" />
+            {tokens && (
+              <span class="footer-tokens">
+                {(tokens.total / 1000).toFixed(1)}k tokens
+              </span>
+            )}
+            {busy ? (
+              <button class="btn-stop" onClick={handleStop} title="停止" aria-label="停止">
+                <span class="stop-square" />
+              </button>
+            ) : (
+              <button
+                class="btn-send"
+                onClick={sendMessage}
+                disabled={!input.trim()}
+                title="发送"
+                aria-label="发送"
+              >
+                ↑
+              </button>
+            )}
+          </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }
 
 function ToolRowView({ tool }: { tool: ToolRow }) {
+  let annotation: { cls: string; label: string } | null = null;
   if (tool.status === 'waiting_approval') {
-    return (
-      <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-50 border border-amber-300 text-xs font-mono">
-        <span class="text-amber-500 animate-pulse">●</span>
-        <span class="font-semibold text-slate-700">{tool.name}</span>
-        <span class="text-slate-400 truncate">{abbreviateArgs(tool.args)}</span>
-        <span class="ml-auto text-amber-600">等待批准…</span>
-      </div>
-    );
-  }
-
-  if (tool.status === 'pending') {
-    return (
-      <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-100 border border-slate-200 text-xs font-mono">
-        <span class="text-slate-400 animate-spin inline-block">⟳</span>
-        <span class="font-semibold text-slate-700">{tool.name}</span>
-        <span class="text-slate-400 truncate">{abbreviateArgs(tool.args)}</span>
-        <span class="ml-auto text-slate-400">运行中…</span>
-      </div>
-    );
+    annotation = { cls: 'waiting', label: '等待批准…' };
+  } else if (tool.status === 'pending') {
+    annotation = { cls: 'pending', label: '运行中…' };
+  } else if (tool.status === 'done') {
+    annotation = {
+      cls: 'success',
+      label: tool.duration_ms != null ? `${(tool.duration_ms / 1000).toFixed(2)}s` : '完成',
+    };
+  } else if (tool.status === 'error') {
+    annotation = { cls: 'error', label: '失败' };
   }
 
   return (
-    <div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-100 border border-slate-200 text-xs font-mono">
-      <span class={tool.status === 'done' ? 'text-emerald-600' : 'text-rose-500'}>
-        {tool.status === 'done' ? '✓' : '✗'}
-      </span>
-      <span class="font-semibold text-slate-700">{tool.name}</span>
-      <span class="text-slate-400 truncate">{abbreviateArgs(tool.args)}</span>
-      {tool.duration_ms != null && (
-        <span class="ml-auto text-slate-400">
-          耗时 {(tool.duration_ms / 1000).toFixed(2)}s
-        </span>
-      )}
+    <div class="tool-body">
+      <div class="tool-header">
+        <span class="tool-name">{tool.name}</span>
+        <span class="tool-name-secondary">{abbreviateArgs(tool.args)}</span>
+        {annotation && (
+          <span class={'tool-annotation ' + annotation.cls}>{annotation.label}</span>
+        )}
+      </div>
     </div>
   );
 }

@@ -1,4 +1,5 @@
-// Task 15 — Two-column layout: sidebar + chat, header with cwd breadcrumb + config
+// Two-column layout: sidebar + chat, header with cwd breadcrumb + config.
+// VSCode design system: timeline messages, violet brand, floating input.
 
 import { useEffect, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
@@ -9,7 +10,6 @@ import { PermissionCard } from './components/PermissionCard';
 import { getProject, SessionMetaWithProject } from './api';
 
 function cwdDisplay(cwd: string): { prefix: string; name: string } {
-  // Show last component as bold name, rest as muted prefix
   const clean = cwd.replace(/\/+$/, '');
   const idx = clean.lastIndexOf('/');
   if (idx < 0) return { prefix: '', name: cwd };
@@ -23,6 +23,7 @@ export function App() {
   const [pending, setPending] = useState<any | null>(null);
   const [showCwd, setShowCwd] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   // Seed cwd from /project on mount
   useEffect(() => {
@@ -38,68 +39,76 @@ export function App() {
   function handleNewSession() {
     setSessionId(null);
     setActiveSession(null);
-    // cwd stays unchanged
+    setSidebarOpen(false);
   }
 
   function handleSelectSession(session: SessionMetaWithProject) {
     setSessionId(session.id);
     setActiveSession(session);
-    // Update cwd to the session's working dir
     if (session.working_dir) {
       setCwd(session.working_dir);
     }
+    setSidebarOpen(false);
   }
 
   const { prefix, name } = cwdDisplay(cwd);
 
   return (
-    <div class="h-screen flex flex-col bg-slate-50 text-slate-800">
+    <div class="app">
       {/* ===== Header ===== */}
-      <header class="h-12 shrink-0 flex items-center justify-between px-4 border-b border-slate-200 bg-white">
-        <div class="flex items-center gap-2">
-          <span class="font-mono font-bold text-indigo-600">▲ atomcode webui</span>
-        </div>
+      <header class="header">
+        <button
+          class="ghost-btn hamburger-btn"
+          onClick={() => setSidebarOpen(true)}
+          aria-label="菜单"
+          title="会话列表"
+        >
+          ☰
+        </button>
+        <span class="header-title">▲ atomcode</span>
 
-        <div class="flex items-center gap-3 text-sm">
-          {/* CWD breadcrumb button */}
-          <button
-            onClick={() => setShowCwd(true)}
-            class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 font-mono text-xs"
-            title="切换工作目录"
-          >
-            <span class="text-slate-400">📁</span>
-            {cwd ? (
-              <>
-                <span class="text-slate-400">{prefix}</span>
-                <span class="font-semibold text-slate-700">{name || cwd}</span>
-              </>
-            ) : (
-              <span class="text-slate-400">（未设置）</span>
-            )}
-            <span class="text-slate-400">▾</span>
-          </button>
+        <span class="header-spacer" />
 
-          <span class="text-slate-300">|</span>
+        <button
+          class="cwd-breadcrumb"
+          onClick={() => setShowCwd(true)}
+          title="切换工作目录"
+        >
+          {cwd ? (
+            <>
+              <span class="cwd-prefix">{prefix}</span>
+              <span class="cwd-name">{name || cwd}</span>
+            </>
+          ) : (
+            <span class="cwd-prefix">（未设置工作目录）</span>
+          )}
+          <span class="cwd-chevron">▾</span>
+        </button>
 
-          {/* Config button */}
-          <button
-            onClick={() => setShowConfig(true)}
-            class="text-slate-500 hover:text-slate-800"
-          >
-            ⚙ 配置
-          </button>
-        </div>
+        <button
+          class="ghost-btn"
+          onClick={() => setShowConfig(true)}
+          aria-label="配置"
+          title="配置"
+        >
+          ⚙
+        </button>
       </header>
 
       {/* ===== Body: sidebar + chat ===== */}
-      <div class="flex-1 flex min-h-0">
+      <div class="session-row">
         <Sidebar
           activeSessionId={sessionId}
           onSelect={handleSelectSession}
           onNew={handleNewSession}
+          open={sidebarOpen}
+        />
+        <div
+          class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
+          onClick={() => setSidebarOpen(false)}
         />
 
-        <main class="flex-1 flex flex-col min-w-0 bg-slate-50">
+        <div class="session-body app-sidebar">
           <Chat
             sessionId={sessionId}
             onSessionId={setSessionId}
@@ -107,7 +116,7 @@ export function App() {
             onPermission={setPending}
             activeSession={activeSession}
           />
-        </main>
+        </div>
       </div>
 
       {/* ===== Modals ===== */}
