@@ -2,8 +2,9 @@
 // Task 15 — sessionId + cwd lifted to App
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject } from '../api';
+import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels } from '../api';
 import { Markdown } from './Markdown';
+import { ModelSelector } from './ModelSelector';
 
 interface ToolRow {
   id: string;
@@ -64,6 +65,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   const [busy, setBusy] = useState(false);
   const [tokens, setTokens] = useState<TokenUsage | null>(null);
   const [historyHint, setHistoryHint] = useState<string | null>(null);
+  const [provider, setProvider] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -133,6 +135,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
+
+  // Initialize provider from default model
+  useEffect(() => {
+    getModels().then((ms) => {
+      const def = ms.find((m) => m.is_default) ?? ms[0];
+      if (def) setProvider((p) => p ?? def.provider);
+    }).catch(() => {});
+  }, []);
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -281,6 +291,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
         message: text,
         ...(sessionId ? { session_id: sessionId } : {}),
         ...(cwd ? { working_dir: cwd } : {}),
+        ...(provider ? { provider } : {}),
       };
 
       await streamChat(body, handleEvent, controller.signal);
@@ -407,7 +418,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
             onKeyDown={handleKeyDown}
           />
           <div class="input-footer">
-            <span class="footer-hint">Shift+Enter 换行</span>
+            <ModelSelector value={provider} onChange={setProvider} />
             <span class="footer-spacer" />
             {tokens && (
               <span class="footer-tokens">

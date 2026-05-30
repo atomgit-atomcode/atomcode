@@ -19,10 +19,23 @@ export type SSEEvent =
   | { type: 'stopped' }
   | { type: 'error'; message: string };
 
+export interface ModelInfo {
+  provider: string;
+  model: string;
+  provider_type: string;
+  is_default: boolean;
+}
+
+export async function getModels(): Promise<ModelInfo[]> {
+  const r = await fetch('/models', { headers: authHeaders() });
+  return r.json();
+}
+
 export interface StreamChatBody {
   message: string;
   session_id?: string;
   working_dir?: string;
+  provider?: string;
 }
 
 export async function streamChat(

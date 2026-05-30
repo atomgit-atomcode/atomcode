@@ -605,8 +605,9 @@ body {
 }
 .session-item:hover { background: var(--app-list-hover-background); }
 .session-item.active {
+  /* 用主色前景，保证亮/暗主题下都有对比；不强制白色（亮色主题会看不见）。 */
   background: var(--app-list-active-background);
-  color: var(--app-list-active-foreground);
+  color: var(--app-primary-foreground);
 }
 
 .session-item-name { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
@@ -918,6 +919,124 @@ body {
 
 .modal-error { color: var(--app-error-foreground); font-size: 12px; }
 .modal-loading { color: var(--app-secondary-foreground); font-size: 12px; }
+
+/* === Model Selector === */
+.model-selector {
+  position: relative;
+  min-width: 0;
+}
+
+.model-selector-trigger {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: 1px solid var(--app-input-border);
+  border-radius: var(--corner-radius-small);
+  padding: 2px 8px;
+  cursor: pointer;
+  color: var(--app-primary-foreground);
+  font-size: 12px;
+  max-width: 220px;
+  min-width: 0;
+  height: 24px;
+}
+
+.model-selector-trigger:hover { background: var(--app-ghost-button-hover-background); }
+.model-selector-chevron { font-size: 8px; opacity: 0.6; flex-shrink: 0; }
+
+.model-selector-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.input-footer .model-selector {
+  max-width: min(260px, 55%);
+  flex-shrink: 1;
+}
+
+.input-footer .model-selector-trigger {
+  height: 22px;
+  color: var(--app-secondary-foreground);
+  background: transparent;
+  font-size: 11px;
+  padding: 2px 7px;
+}
+
+/* Dropdown — opens upward when used in the input footer */
+.model-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  min-width: 200px;
+  max-width: min(360px, calc(100vw - 32px));
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--app-menu-background);
+  border: 1px solid var(--app-menu-border);
+  border-radius: var(--corner-radius-medium, 6px);
+  box-shadow: 0 4px 12px #0000004d;
+  z-index: 100;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Up variant — used inside the input footer so dropdown opens above */
+.model-selector-up .model-dropdown {
+  top: auto;
+  bottom: 100%;
+  margin-top: 0;
+  margin-bottom: 4px;
+  left: 0;
+  transform: none;
+}
+
+.model-item {
+  display: flex;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: var(--corner-radius-small);
+  background: transparent;
+  color: var(--app-menu-foreground, var(--app-primary-foreground));
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+  width: 100%;
+  min-height: 32px;
+}
+
+.model-item-model {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.model-item-provider {
+  color: var(--app-secondary-foreground);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.model-item:hover { background: var(--app-list-hover-background); }
+
+.model-item.active {
+  background: var(--app-list-active-background);
+  color: var(--app-list-active-foreground, var(--app-primary-foreground));
+  font-weight: 600;
+}
 
 /* === Mobile adaptation (≤768px) === */
 @media (max-width: 768px) {
