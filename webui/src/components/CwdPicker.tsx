@@ -1,7 +1,7 @@
 // Task 15b — Working directory picker modal
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { listDir, getProjects, setDefaultDir, ProjectInfo } from '../api';
+import { listDir, getProjects, changeDir, ProjectInfo } from '../api';
 import { useT } from '../settings';
 
 interface CwdPickerProps {
@@ -105,9 +105,8 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
     if (!finalPath) return;
     setConfirming(true);
     try {
-      if (setAsDefault) {
-        await setDefaultDir(finalPath);
-      }
+      // 始终同步到 daemon 的当前项目（刷新后保持）；勾选框只决定是否写回 config 默认。
+      await changeDir(finalPath, setAsDefault);
       onPick(finalPath);
       onClose();
     } catch {

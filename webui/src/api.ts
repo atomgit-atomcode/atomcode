@@ -178,6 +178,33 @@ export async function listSessions(): Promise<SessionMetaWithProject[]> {
   return resp.json();
 }
 
+export async function renameSession(
+  projectHash: string,
+  sessionId: string,
+  name: string,
+): Promise<void> {
+  const resp = await fetch(
+    `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/rename`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ name }),
+    },
+  );
+  if (!resp.ok) throw new Error(`rename failed: ${resp.status}`);
+}
+
+export async function deleteSession(
+  projectHash: string,
+  sessionId: string,
+): Promise<void> {
+  const resp = await fetch(
+    `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE', headers: authHeaders() },
+  );
+  if (!resp.ok) throw new Error(`delete failed: ${resp.status}`);
+}
+
 // --- Config types ---
 
 export interface ProviderInfo {
@@ -233,6 +260,29 @@ export async function getProject(): Promise<ProjectState> {
   return resp.json();
 }
 
+// --- New-chat landing suggestions ---
+
+export interface Suggestion {
+  /** Short button label (2-6 chars). */
+  label: string;
+  /** Full first message inserted into the input on click. */
+  prompt: string;
+}
+
+export interface SuggestionsResponse {
+  working_dir: string;
+  suggestions: Suggestion[];
+}
+
+/** Fetch dynamic project-based suggestions for the current working dir.
+ *  `refresh` bypasses the server-side per-dir cache. */
+export async function getSuggestions(refresh = false): Promise<SuggestionsResponse> {
+  const resp = await fetch('/project/suggestions' + (refresh ? '?refresh=true' : ''), {
+    headers: authHeaders(),
+  });
+  return resp.json();
+}
+
 // --- Filesystem browsing ---
 
 export interface FsListResult {
@@ -247,7 +297,7 @@ export async function listDir(path: string): Promise<FsListResult> {
   return resp.json();
 }
 
-// --- Change default directory ---
+// --- Change working directory ---
 
 export interface CdResponse {
   success: boolean;
@@ -256,14 +306,17 @@ export interface CdResponse {
   project_hash: string;
 }
 
-export async function setDefaultDir(path: string): Promise<CdResponse> {
+/** Switch the daemon's current working directory.
+ *  Always updates the live project state (so a webui switch survives refresh);
+ *  `setDefault` also persists it as the configured default (across restarts). */
+export async function changeDir(path: string, setDefault = false): Promise<CdResponse> {
   const resp = await fetch('/cd', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, set_default: setDefault }),
   });
   return resp.json();
 }

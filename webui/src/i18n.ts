@@ -17,6 +17,10 @@ const zh = {
   'sidebar.search': '搜索会话',
   'sidebar.searchPlaceholder': '搜索会话…',
   'sidebar.recent': '最近会话',
+  'sidebar.group': '分组',
+  'sidebar.groupBy': '分组方式',
+  'sidebar.groupNone': '默认',
+  'sidebar.groupDate': '日期',
   'sidebar.loading': '加载中…',
   'sidebar.empty': '暂无会话',
   'sidebar.emptyInCwd': '该目录暂无会话',
@@ -26,6 +30,19 @@ const zh = {
   'sidebar.sessionCountFiltered': '{f} / {t} 个会话',
   'sidebar.noRecords': '无会话记录',
   'sidebar.settings': '设置',
+  'sidebar.itemMenu': '更多操作',
+  'sidebar.rename': '重命名',
+  'sidebar.delete': '删除',
+
+  // Rename dialog
+  'rename.title': '重命名会话',
+  'rename.placeholder': '会话名称',
+  'rename.confirm': '保存',
+
+  // Delete dialog
+  'delete.title': '删除会话',
+  'delete.confirm': '删除',
+  'delete.body': '确定删除会话「{name}」吗？此操作不可撤销。',
 
   // Relative time
   'time.justNow': '刚刚',
@@ -45,6 +62,18 @@ const zh = {
   'chat.send': '发送',
   'chat.error': '[错误: {msg}]',
   'chat.connError': '[连接错误: {msg}]',
+
+  // New-chat landing
+  'landing.refresh': '刷新建议',
+  'landing.loading': '正在分析项目…',
+  'landing.fallback.readLabel': '读懂代码',
+  'landing.fallback.readPrompt': '带我快速了解这个项目的整体结构和核心模块。',
+  'landing.fallback.bugLabel': '修复 Bug',
+  'landing.fallback.bugPrompt': '帮我排查并修复一个 Bug，我先描述现象：',
+  'landing.fallback.testLabel': '补测试',
+  'landing.fallback.testPrompt': '为这个项目里我指定的模块补充单元测试。',
+  'landing.fallback.explainLabel': '解释项目',
+  'landing.fallback.explainPrompt': '解释这个项目是做什么的，技术栈和关键目录分别是什么。',
 
   // Tool rows
   'tool.waiting': '等待批准…',
@@ -75,6 +104,9 @@ const zh = {
   'settings.configured': '已配置',
   'settings.notConfigured': '未配置',
   'settings.providers': 'Providers',
+  'settings.menuTheme': '主题设置',
+  'settings.menuLang': '语言设置',
+  'settings.menuModel': '模型配置',
 
   // CWD picker
   'cwd.title': '切换工作目录',
@@ -87,7 +119,7 @@ const zh = {
   'cwd.noSubdirs': '（无子目录）',
   'cwd.recentProjects': '最近项目',
   'cwd.current': '当前',
-  'cwd.setDefault': '同时设为 daemon 默认目录（POST /cd）',
+  'cwd.setDefault': '设为默认目录（重启后仍生效）',
   'cwd.cancel': '取消',
   'cwd.confirm': '确定',
 
@@ -100,6 +132,7 @@ const zh = {
 
   // Common
   'common.readonly': '只读',
+  'common.cancel': '取消',
 } as const;
 
 export type MsgKey = keyof typeof zh;
@@ -116,6 +149,10 @@ const en: Record<MsgKey, string> = {
   'sidebar.search': 'Search sessions',
   'sidebar.searchPlaceholder': 'Search sessions…',
   'sidebar.recent': 'Recent',
+  'sidebar.group': 'Group',
+  'sidebar.groupBy': 'Group by',
+  'sidebar.groupNone': 'None',
+  'sidebar.groupDate': 'Date',
   'sidebar.loading': 'Loading…',
   'sidebar.empty': 'No sessions',
   'sidebar.emptyInCwd': 'No sessions in this directory',
@@ -125,6 +162,17 @@ const en: Record<MsgKey, string> = {
   'sidebar.sessionCountFiltered': '{f} / {t} sessions',
   'sidebar.noRecords': 'No session records',
   'sidebar.settings': 'Settings',
+  'sidebar.itemMenu': 'More actions',
+  'sidebar.rename': 'Rename',
+  'sidebar.delete': 'Delete',
+
+  'rename.title': 'Rename session',
+  'rename.placeholder': 'Session name',
+  'rename.confirm': 'Save',
+
+  'delete.title': 'Delete session',
+  'delete.confirm': 'Delete',
+  'delete.body': 'Delete session “{name}”? This cannot be undone.',
 
   'time.justNow': 'just now',
   'time.minutesAgo': '{n} min ago',
@@ -141,6 +189,18 @@ const en: Record<MsgKey, string> = {
   'chat.send': 'Send',
   'chat.error': '[Error: {msg}]',
   'chat.connError': '[Connection error: {msg}]',
+
+  // New-chat landing
+  'landing.refresh': 'Refresh suggestions',
+  'landing.loading': 'Analyzing project…',
+  'landing.fallback.readLabel': 'Understand code',
+  'landing.fallback.readPrompt': 'Give me a quick tour of this project — its overall structure and core modules.',
+  'landing.fallback.bugLabel': 'Fix a bug',
+  'landing.fallback.bugPrompt': 'Help me track down and fix a bug. Here is what I am seeing: ',
+  'landing.fallback.testLabel': 'Add tests',
+  'landing.fallback.testPrompt': 'Add unit tests for a module I will point you to in this project.',
+  'landing.fallback.explainLabel': 'Explain project',
+  'landing.fallback.explainPrompt': 'Explain what this project does, its tech stack, and what the key directories are.',
 
   'tool.waiting': 'Awaiting approval…',
   'tool.running': 'Running…',
@@ -169,6 +229,9 @@ const en: Record<MsgKey, string> = {
   'settings.configured': 'Configured',
   'settings.notConfigured': 'Not configured',
   'settings.providers': 'Providers',
+  'settings.menuTheme': 'Theme settings',
+  'settings.menuLang': 'Language settings',
+  'settings.menuModel': 'Model configuration',
 
   'cwd.title': 'Switch working directory',
   'cwd.affectsSession': 'Affects current session only',
@@ -180,7 +243,7 @@ const en: Record<MsgKey, string> = {
   'cwd.noSubdirs': '(No subdirectories)',
   'cwd.recentProjects': 'Recent projects',
   'cwd.current': 'Current',
-  'cwd.setDefault': 'Also set as daemon default directory (POST /cd)',
+  'cwd.setDefault': 'Set as default directory (persists across restarts)',
   'cwd.cancel': 'Cancel',
   'cwd.confirm': 'Confirm',
 
@@ -191,6 +254,7 @@ const en: Record<MsgKey, string> = {
   'perm.alwaysAllow': 'Always allow this session',
 
   'common.readonly': 'Read-only',
+  'common.cancel': 'Cancel',
 };
 
 export const messages: Record<Lang, Record<MsgKey, string>> = { zh, en };

@@ -542,6 +542,9 @@ enum Commands {
         /// 端口（默认 13456）
         #[arg(long, default_value = "13456")]
         port: u16,
+        /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
     },
     /// Telemetry controls
     Telemetry {
@@ -969,9 +972,9 @@ async fn run() -> Result<i32> {
                     }
                 }
             }
-            Commands::Webui { port } => {
+            Commands::Webui { port, host } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
-                let msg = atomcode_daemon::ensure_server_and_open(port).await;
+                let msg = atomcode_daemon::ensure_server_and_open(&host, port).await;
                 eprintln!("{msg}");
                 // server 是后台 task；保持进程存活直到用户 Ctrl+C
                 let _ = tokio::signal::ctrl_c().await;

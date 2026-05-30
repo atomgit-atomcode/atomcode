@@ -132,6 +132,12 @@ async fn main() {
         idle_timeout_secs,
         startup_mode,
         webui_tokens: None,
+        // 独立二进制：保留完整启动横幅。
+        quiet: false,
+        // 独立二进制 / VSCode：沿用 config 的 default_workdir，不覆盖。
+        working_dir_override: None,
+        // 独立二进制自行 bind host:port，不预绑定。
+        prebound_listener: None,
     })
     .await
     {

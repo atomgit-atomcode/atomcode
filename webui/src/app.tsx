@@ -1,14 +1,15 @@
 // Two-column layout: sidebar + chat, header with cwd breadcrumb + config.
 // VSCode design system: timeline messages, violet brand, floating input.
 
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
-import { SettingsPanel } from './components/SettingsPanel';
+import { ThemeDialog, LanguageDialog, ModelConfigDialog } from './components/SettingsDialogs';
+import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { PermissionCard } from './components/PermissionCard';
 import { getProject, SessionMetaWithProject } from './api';
-import { useT } from './settings';
+import { useT, SettingsSection } from './settings';
 
 function cwdDisplay(cwd: string): { prefix: string; name: string } {
   const clean = cwd.replace(/\/+$/, '');
@@ -24,10 +25,25 @@ export function App() {
   const [cwd, setCwd] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [showCwd, setShowCwd] = useState(false);
-  const [showConfig, setShowConfig] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sessionListVersion, setSessionListVersion] = useState(0);
+  const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  const [headerDialog, setHeaderDialog] = useState<'rename' | 'delete' | null>(null);
+  const headerMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close the header session menu on outside click.
+  useEffect(() => {
+    if (!headerMenuOpen) return;
+    const h = (e: MouseEvent) => {
+      if (headerMenuRef.current && !headerMenuRef.current.contains(e.target as Node)) {
+        setHeaderMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [headerMenuOpen]);
 
   // Chat 完成首条消息后会回传它创建的 session id；若是新 id，刷新侧栏列表。
   function handleSessionAssigned(id: string) {
@@ -75,6 +91,21 @@ export function App() {
     setActiveSession(null);
   }
 
+  // 删除会话：若删的是当前打开的会话，回到空白新对话。
+  function handleSessionDeleted(id: string) {
+    if (id === sessionId) {
+      setSessionId(null);
+      setActiveSession(null);
+    }
+  }
+
+  // 重命名会话：若是当前会话，同步更新标题。
+  function handleSessionRenamed(id: string, name: string) {
+    if (id === sessionId) {
+      setActiveSession((prev) => (prev ? { ...prev, name } : prev));
+    }
+  }
+
   const { prefix, name } = cwdDisplay(cwd);
 
   return (
@@ -87,9 +118,11 @@ export function App() {
         open={sidebarOpen}
         collapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
-        onOpenSettings={() => setShowConfig(true)}
+        onOpenSettings={(section) => setSettingsSection(section)}
         reloadKey={sessionListVersion}
         cwd={cwd}
+        onSessionRenamed={handleSessionRenamed}
+        onSessionDeleted={handleSessionDeleted}
       />
       <div
         class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
@@ -107,6 +140,56 @@ export function App() {
           >
             ☰
           </button>
+
+          {activeSession?.name && (
+            <div class="header-session" ref={headerMenuRef}>
+              <button
+                class="header-session-name"
+                title={activeSession.name}
+                onClick={() => setHeaderMenuOpen((o) => !o)}
+              >
+                <span class="header-session-text">{activeSession.name}</span>
+                <svg
+                  class="header-session-chevron"
+                  width="11"
+                  height="11"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M4 6l4 4 4-4"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </button>
+              {headerMenuOpen && (
+                <div class="item-menu header-session-menu">
+                  <button
+                    class="item-menu-row"
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      setHeaderDialog('rename');
+                    }}
+                  >
+                    <span>{t('sidebar.rename')}</span>
+                  </button>
+                  <button
+                    class="item-menu-row danger"
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      setHeaderDialog('delete');
+                    }}
+                  >
+                    <span>{t('sidebar.delete')}</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
 
           <span class="header-spacer" />
 
@@ -146,8 +229,36 @@ export function App() {
           onClose={() => setShowCwd(false)}
         />
       )}
-      {showConfig && <SettingsPanel onClose={() => setShowConfig(false)} />}
+      {settingsSection === 'theme' && (
+        <ThemeDialog onClose={() => setSettingsSection(null)} />
+      )}
+      {settingsSection === 'language' && (
+        <LanguageDialog onClose={() => setSettingsSection(null)} />
+      )}
+      {settingsSection === 'model' && (
+        <ModelConfigDialog onClose={() => setSettingsSection(null)} />
+      )}
       {pending && <PermissionCard req={pending} onDone={() => setPending(null)} />}
+      {headerDialog === 'rename' && activeSession && (
+        <RenameDialog
+          session={activeSession}
+          onClose={() => setHeaderDialog(null)}
+          onDone={(name) => {
+            handleSessionRenamed(activeSession.id, name);
+            setSessionListVersion((v) => v + 1);
+          }}
+        />
+      )}
+      {headerDialog === 'delete' && activeSession && (
+        <DeleteDialog
+          session={activeSession}
+          onClose={() => setHeaderDialog(null)}
+          onDone={() => {
+            handleSessionDeleted(activeSession.id);
+            setSessionListVersion((v) => v + 1);
+          }}
+        />
+      )}
     </div>
   );
 }

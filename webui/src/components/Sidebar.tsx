@@ -4,15 +4,17 @@
 
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { listSessions, SessionMetaWithProject } from '../api';
-import { useT } from '../settings';
+import { useT, SettingsSection } from '../settings';
 import { MsgKey } from '../i18n';
+import { RenameDialog, DeleteDialog } from './SessionDialogs';
+import { LoginButton } from './LoginButton';
 
 interface SidebarProps {
   activeSessionId: string | null;
   onSelect: (session: SessionMetaWithProject) => void;
   onNew: () => void;
-  /** Open the settings modal */
-  onOpenSettings: () => void;
+  /** Open a specific settings dialog (theme / language / model). */
+  onOpenSettings: (section: SettingsSection) => void;
   /** Mobile drawer open state */
   open?: boolean;
   /** Desktop collapsed (icon rail) state */
@@ -23,15 +25,35 @@ interface SidebarProps {
   reloadKey?: number;
   /** Only show sessions whose working_dir matches this path (empty = show all) */
   cwd?: string;
-}
-
-function baseName(p: string): string {
-  const clean = p.replace(/\/+$/, '');
-  const idx = clean.lastIndexOf('/');
-  return idx >= 0 ? clean.slice(idx + 1) : clean;
+  /** Called after a session is renamed (id + new name). */
+  onSessionRenamed?: (id: string, name: string) => void;
+  /** Called after a session is deleted. */
+  onSessionDeleted?: (id: string) => void;
 }
 
 type Translate = (key: MsgKey, params?: Record<string, string | number>) => string;
+
+type GroupBy = 'none' | 'date';
+
+const GROUP_KEY = 'atomcode.sidebarGroupBy';
+
+function readGroupBy(): GroupBy {
+  try {
+    const v = localStorage.getItem(GROUP_KEY);
+    if (v === 'date' || v === 'none') return v;
+  } catch {
+    /* ignore */
+  }
+  return 'none';
+}
+
+/** 把时间戳格式化为 YYYY-MM-DD（本地时区），用作日期分组标题。 */
+function dateKey(ts: number): string {
+  const ms = ts < 1e12 ? ts * 1000 : ts;
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
 
 /** 把 unix 时间戳（秒或毫秒）格式化为相对时间。 */
 function formatTime(ts: number, t: Translate): string {
@@ -89,6 +111,54 @@ function SearchIcon() {
   );
 }
 
+/** Sliders / "group by" glyph (vertical faders). */
+function SlidersIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <line x1="5" y1="2.5" x2="5" y2="13.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+      <line x1="11" y1="2.5" x2="11" y2="13.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+      <circle cx="5" cy="5.5" r="1.9" fill="var(--app-primary-background)" stroke="currentColor" stroke-width="1.2" />
+      <circle cx="11" cy="10.5" r="1.9" fill="var(--app-primary-background)" stroke="currentColor" stroke-width="1.2" />
+    </svg>
+  );
+}
+
+/** Checkmark glyph for the active menu item. */
+function CheckIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+/** Kebab (vertical three-dot) glyph for the per-session menu. */
+function KebabIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+      <circle cx="8" cy="3" r="1.4" />
+      <circle cx="8" cy="8" r="1.4" />
+      <circle cx="8" cy="13" r="1.4" />
+    </svg>
+  );
+}
+
+function PencilIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M10.8 2.6l2.6 2.6-7.3 7.3-3 .7.7-3z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M3 4.5h10M6.2 4.5V3h3.6v1.5M4.8 4.5l.6 8.5h5.2l.6-8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
 /** Gear / settings glyph. */
 function GearIcon() {
   return (
@@ -104,6 +174,36 @@ function GearIcon() {
   );
 }
 
+/** Theme glyph (half-filled circle = light/dark contrast). */
+function ThemeGlyph() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.2" />
+      <path d="M8 2.5a5.5 5.5 0 0 0 0 11z" fill="currentColor" />
+    </svg>
+  );
+}
+
+/** Language glyph (globe with meridians). */
+function LangGlyph() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.2" />
+      <path d="M2.6 8h10.8M8 2.5c2 2 2 9 0 11M8 2.5c-2 2-2 9 0 11" stroke="currentColor" stroke-width="1.2" />
+    </svg>
+  );
+}
+
+/** Model glyph (chip). */
+function ModelGlyph() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="4" y="4" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1.2" />
+      <path d="M6.5 1.5v1.8M9.5 1.5v1.8M6.5 12.7v1.8M9.5 12.7v1.8M1.5 6.5h1.8M1.5 9.5h1.8M12.7 6.5h1.8M12.7 9.5h1.8" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+    </svg>
+  );
+}
+
 export function Sidebar({
   activeSessionId,
   onSelect,
@@ -114,20 +214,170 @@ export function Sidebar({
   onToggleCollapse,
   reloadKey,
   cwd,
+  onSessionRenamed,
+  onSessionDeleted,
 }: SidebarProps) {
   const t = useT();
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
+  const [groupBy, setGroupBy] = useState<GroupBy>(readGroupBy);
+  const [groupMenuOpen, setGroupMenuOpen] = useState(false);
+  // Per-session kebab menu: which session, and where to anchor the fixed menu.
+  const [menuFor, setMenuFor] = useState<string | null>(null);
+  const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<SessionMetaWithProject | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<SessionMetaWithProject | null>(null);
+  // Settings menu (3 entries → each opens its own dialog), fixed-anchored above the button.
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const [settingsMenuPos, setSettingsMenuPos] = useState<{ left: number; bottom: number } | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const groupRef = useRef<HTMLDivElement | null>(null);
+  const itemMenuRef = useRef<HTMLDivElement | null>(null);
+  const settingsMenuRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
+  function loadSessions() {
     setLoading(true);
     listSessions()
       .then(setSessions)
       .catch(() => setSessions([]))
       .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    loadSessions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadKey]);
+
+  // Close the group-by menu on outside click.
+  useEffect(() => {
+    if (!groupMenuOpen) return;
+    const h = (e: MouseEvent) => {
+      if (groupRef.current && !groupRef.current.contains(e.target as Node)) {
+        setGroupMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [groupMenuOpen]);
+
+  // The kebab menu is fixed-positioned (so the list's overflow can't clip it);
+  // close it on outside click, scroll, or resize since it won't track anchors.
+  useEffect(() => {
+    if (!menuFor) return;
+    const close = () => setMenuFor(null);
+    const onDown = (e: MouseEvent) => {
+      const el = e.target as HTMLElement;
+      if (itemMenuRef.current?.contains(el)) return;
+      // Clicks on a kebab button are handled by its own toggle.
+      if (el.closest?.('.session-item-kebab')) return;
+      close();
+    };
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [menuFor]);
+
+  function selectGroupBy(g: GroupBy) {
+    setGroupBy(g);
+    try {
+      localStorage.setItem(GROUP_KEY, g);
+    } catch {
+      /* ignore */
+    }
+    setGroupMenuOpen(false);
+  }
+
+  function openItemMenu(e: MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    if (menuFor === id) {
+      setMenuFor(null);
+      return;
+    }
+    setMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+    setMenuFor(id);
+  }
+
+  function handleRenamed(id: string, name: string) {
+    loadSessions();
+    onSessionRenamed?.(id, name);
+  }
+
+  function handleDeleted(id: string) {
+    loadSessions();
+    onSessionDeleted?.(id);
+  }
+
+  // Settings menu: fixed-anchored above its button; close on outside/scroll/resize.
+  useEffect(() => {
+    if (!settingsMenuOpen) return;
+    const close = () => setSettingsMenuOpen(false);
+    const onDown = (e: MouseEvent) => {
+      const el = e.target as HTMLElement;
+      if (settingsMenuRef.current?.contains(el)) return;
+      // Clicks on a settings trigger are handled by its own toggle.
+      if (el.closest?.('.sidebar-settings-btn, .rail-btn-settings')) return;
+      close();
+    };
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [settingsMenuOpen]);
+
+  function toggleSettingsMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (settingsMenuOpen) {
+      setSettingsMenuOpen(false);
+      return;
+    }
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    // Anchor the menu's bottom just above the button (it opens upward).
+    setSettingsMenuPos({ left: rect.left, bottom: window.innerHeight - rect.top + 4 });
+    setSettingsMenuOpen(true);
+  }
+
+  function chooseSettings(section: SettingsSection) {
+    setSettingsMenuOpen(false);
+    onOpenSettings(section);
+  }
+
+  // The settings popup (3 entries). Fixed-positioned so the sidebar overflow
+  // can't clip it; rendered inside both the rail and expanded layouts.
+  const renderSettingsMenu = () =>
+    settingsMenuOpen && settingsMenuPos ? (
+      <div
+        class="item-menu settings-menu"
+        ref={settingsMenuRef}
+        style={{ left: `${settingsMenuPos.left}px`, bottom: `${settingsMenuPos.bottom}px` }}
+      >
+        <div class="group-by-menu-title">{t('sidebar.settings')}</div>
+        <button class="item-menu-row" onClick={() => chooseSettings('theme')}>
+          <ThemeGlyph />
+          <span>{t('settings.menuTheme')}</span>
+        </button>
+        <button class="item-menu-row" onClick={() => chooseSettings('language')}>
+          <LangGlyph />
+          <span>{t('settings.menuLang')}</span>
+        </button>
+        <button class="item-menu-row" onClick={() => chooseSettings('model')}>
+          <ModelGlyph />
+          <span>{t('settings.menuModel')}</span>
+        </button>
+      </div>
+    ) : null;
 
   // 先按当前工作目录收窄，再按搜索词过滤。
   const normDir = (p: string) => (p || '').replace(/\/+$/, '');
@@ -144,6 +394,55 @@ export function Sidebar({
           s.id.toLowerCase().startsWith(q),
       )
     : inCwd;
+
+  // 日期分组：列表本就按 updated_at 倒序，同一天的会话天然相邻，按日期切段即可。
+  const dateGroups: { key: string; items: SessionMetaWithProject[] }[] = [];
+  if (groupBy === 'date') {
+    for (const s of filtered) {
+      const key = dateKey(s.updated_at || s.created_at);
+      const last = dateGroups[dateGroups.length - 1];
+      if (last && last.key === key) {
+        last.items.push(s);
+      } else {
+        dateGroups.push({ key, items: [s] });
+      }
+    }
+  }
+
+  const renderItem = (s: SessionMetaWithProject) => {
+    const active = s.id === activeSessionId;
+    const label = s.name || s.id.slice(0, 8);
+    const dir = shortDir(s.working_dir);
+    return (
+      <div
+        key={s.id}
+        class={
+          'session-item' +
+          (active ? ' active' : '') +
+          (menuFor === s.id ? ' menu-open' : '')
+        }
+      >
+        <button class="session-item-main" onClick={() => onSelect(s)} title={dir}>
+          <span class="session-item-name">{label}</span>
+          <span class="session-item-meta">
+            {formatTime(s.updated_at || s.created_at, t)}
+          </span>
+        </button>
+        <button
+          class="session-item-kebab"
+          onClick={(e) => openItemMenu(e as unknown as MouseEvent, s.id)}
+          title={t('sidebar.itemMenu')}
+          aria-label={t('sidebar.itemMenu')}
+        >
+          <KebabIcon />
+        </button>
+      </div>
+    );
+  };
+
+  const menuSession = menuFor
+    ? filtered.find((s) => s.id === menuFor) ?? sessions.find((s) => s.id === menuFor) ?? null
+    : null;
 
   // Rail (collapsed desktop): a narrow icon rail instead of hiding the sidebar.
   if (collapsed) {
@@ -182,12 +481,13 @@ export function Sidebar({
         </nav>
         <button
           class="rail-btn rail-btn-settings"
-          onClick={onOpenSettings}
+          onClick={(e) => toggleSettingsMenu(e as unknown as MouseEvent)}
           title={t('sidebar.settings')}
           aria-label={t('sidebar.settings')}
         >
           <GearIcon />
         </button>
+        {renderSettingsMenu()}
       </aside>
     );
   }
@@ -195,7 +495,7 @@ export function Sidebar({
   return (
     <aside class={'session-list app-sidebar' + (open ? ' open' : '')}>
       <div class="sidebar-brand-row">
-        <span class="sidebar-brand">atomcode</span>
+        <span class="sidebar-brand">AtomCode</span>
         <button
           class="sidebar-collapse-btn"
           onClick={onToggleCollapse}
@@ -224,7 +524,38 @@ export function Sidebar({
         />
       </div>
 
-      <div class="session-group-label">{t('sidebar.recent')}</div>
+      <div class="session-group-header">
+        <span class="session-group-label">{t('sidebar.recent')}</span>
+        <div class="group-by-control" ref={groupRef}>
+          <button
+            class={'group-by-btn' + (groupBy !== 'none' ? ' on' : '')}
+            onClick={() => setGroupMenuOpen((o) => !o)}
+            title={t('sidebar.group')}
+            aria-label={t('sidebar.group')}
+          >
+            <SlidersIcon />
+          </button>
+          {groupMenuOpen && (
+            <div class="group-by-menu">
+              <div class="group-by-menu-title">{t('sidebar.groupBy')}</div>
+              <button
+                class={'group-by-item' + (groupBy === 'none' ? ' active' : '')}
+                onClick={() => selectGroupBy('none')}
+              >
+                <span>{t('sidebar.groupNone')}</span>
+                {groupBy === 'none' && <CheckIcon />}
+              </button>
+              <button
+                class={'group-by-item' + (groupBy === 'date' ? ' active' : '')}
+                onClick={() => selectGroupBy('date')}
+              >
+                <span>{t('sidebar.groupDate')}</span>
+                {groupBy === 'date' && <CheckIcon />}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
 
       <div class="session-list-body">
         {loading && <div class="session-empty">{t('sidebar.loading')}</div>}
@@ -234,46 +565,74 @@ export function Sidebar({
         {!loading && inCwd.length > 0 && filtered.length === 0 && (
           <div class="session-empty">{t('sidebar.noMatch')}</div>
         )}
-        {filtered.map((s) => {
-          const active = s.id === activeSessionId;
-          const label = s.name || s.id.slice(0, 8);
-          const dir = shortDir(s.working_dir);
-          const dirBase = baseName(s.working_dir);
-          return (
-            <button
-              key={s.id}
-              class={'session-item' + (active ? ' active' : '')}
-              onClick={() => onSelect(s)}
-              title={dir}
-            >
-              <span class="session-item-name">{label}</span>
-              <span class="session-item-meta">
-                {formatTime(s.updated_at || s.created_at, t)} ·{' '}
-                {t('sidebar.msgCount', { n: s.message_count })} · {dirBase}
-              </span>
-            </button>
-          );
-        })}
+        {!loading && groupBy === 'date'
+          ? dateGroups.map((g) => (
+              <div key={g.key} class="session-date-group">
+                <div class="session-date-label">{g.key}</div>
+                {g.items.map(renderItem)}
+              </div>
+            ))
+          : filtered.map(renderItem)}
       </div>
 
       <div class="sidebar-bottom">
+        <LoginButton />
         <button
           class="sidebar-settings-btn"
-          onClick={onOpenSettings}
+          onClick={(e) => toggleSettingsMenu(e as unknown as MouseEvent)}
           title={t('sidebar.settings')}
           aria-label={t('sidebar.settings')}
         >
           <GearIcon />
           <span>{t('sidebar.settings')}</span>
         </button>
-        <span class="session-footer">
-          {inCwd.length > 0
-            ? q
-              ? t('sidebar.sessionCountFiltered', { f: filtered.length, t: inCwd.length })
-              : t('sidebar.sessionCount', { n: inCwd.length })
-            : t('sidebar.noRecords')}
-        </span>
       </div>
+      {renderSettingsMenu()}
+
+      {/* Per-session actions menu (fixed, so the scroll container can't clip it). */}
+      {menuSession && menuPos && (
+        <div
+          class="item-menu"
+          ref={itemMenuRef}
+          style={{ top: `${menuPos.top}px`, right: `${menuPos.right}px` }}
+        >
+          <button
+            class="item-menu-row"
+            onClick={() => {
+              setRenameTarget(menuSession);
+              setMenuFor(null);
+            }}
+          >
+            <PencilIcon />
+            <span>{t('sidebar.rename')}</span>
+          </button>
+          <button
+            class="item-menu-row danger"
+            onClick={() => {
+              setDeleteTarget(menuSession);
+              setMenuFor(null);
+            }}
+          >
+            <TrashIcon />
+            <span>{t('sidebar.delete')}</span>
+          </button>
+        </div>
+      )}
+
+      {renameTarget && (
+        <RenameDialog
+          session={renameTarget}
+          onClose={() => setRenameTarget(null)}
+          onDone={(name) => handleRenamed(renameTarget.id, name)}
+        />
+      )}
+      {deleteTarget && (
+        <DeleteDialog
+          session={deleteTarget}
+          onClose={() => setDeleteTarget(null)}
+          onDone={() => handleDeleted(deleteTarget.id)}
+        />
+      )}
     </aside>
   );
 }

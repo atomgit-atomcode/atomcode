@@ -662,13 +662,36 @@ pub(super) fn execute_slash_command(
             ctx.agent.cmd_tx.send(AgentCommand::ShowMemory).ok();
         }
         "webui" => {
-            let msg = if arg.trim() == "stop" {
+            let a = arg.trim();
+            let msg = if a == "stop" {
                 // 同步停止，无需 block_on。
                 atomcode_daemon::stop_server()
             } else {
+                // 解析绑定地址：默认 127.0.0.1；支持 `--host <addr>` / `--host=<addr>`，
+                // 以及快捷词 `lan`（= 0.0.0.0，暴露到局域网/外网）。
+                fn parse_host(a: &str) -> String {
+                    if a == "lan" || a == "0.0.0.0" {
+                        return "0.0.0.0".to_string();
+                    }
+                    let toks: Vec<&str> = a.split_whitespace().collect();
+                    for (i, tok) in toks.iter().enumerate() {
+                        if let Some(v) = tok.strip_prefix("--host=") {
+                            if !v.is_empty() {
+                                return v.to_string();
+                            }
+                        }
+                        if *tok == "--host" {
+                            if let Some(v) = toks.get(i + 1) {
+                                return v.to_string();
+                            }
+                        }
+                    }
+                    "127.0.0.1".to_string()
+                }
+                let host = parse_host(a);
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(atomcode_daemon::ensure_server_and_open(13456))
+                        .block_on(atomcode_daemon::ensure_server_and_open(&host, 13456))
                 })
             };
             renderer.render(UiLine::CommandOutput(msg));

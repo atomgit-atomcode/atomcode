@@ -10,6 +10,7 @@ mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
+mod api_suggestions;
 mod telemetry_scope;
 pub mod auth_token;
 pub mod permission_bridge;
@@ -159,6 +160,12 @@ pub struct ProjectState {
 pub struct ChangeDirRequest {
     /// New working directory path, or "-" to go back
     pub path: String,
+    /// Also persist this as the daemon's `default_workdir` in config (survives
+    /// restart). When false (default), only the live in-memory project state is
+    /// updated — so a webui switch sticks across page refresh but does not
+    /// rewrite the configured default.
+    #[serde(default)]
+    pub set_default: bool,
 }
 
 /// Response after changing directory
@@ -262,6 +269,8 @@ pub struct AppState {
     pub enforce_token: bool,
     /// webui 交互式权限：session_id -> decider response 发送端
     pub pending_permissions: permission_bridge::PermissionResponders,
+    /// 新对话落地页的动态项目建议缓存（按 working_dir）
+    pub suggestions_cache: api_suggestions::SuggestionsCache,
 }
 
 /// Cached MCP registry for a specific project directory.
@@ -279,26 +288,36 @@ fn default_working_dir() -> PathBuf {
 }
 
 /// Initialize project state from config or default
-fn init_project_state() -> ProjectState {
-    let config_path = Config::default_path();
-    if let Ok(config) = Config::load(&config_path) {
-        if let Some(ref workdir) = config.default_workdir {
-            let path = PathBuf::from(workdir);
-            if path.exists() {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "project".to_string());
-                return ProjectState {
-                    working_dir: path,
-                    previous_dir: None,
-                    recent_dirs: vec![],
-                    name,
-                };
-            }
+/// Decide the initial working directory.
+///
+/// Precedence: an explicit launch-time override (if it exists) wins over the
+/// configured `default_workdir` (if it exists), which wins over the process
+/// cwd. The override exists so the in-process `atomcode webui` launcher can
+/// pin the daemon to the directory the user actually ran the command from,
+/// rather than inheriting a stale `default_workdir` (e.g. a leftover `/tmp`).
+fn resolve_initial_working_dir(
+    override_dir: Option<PathBuf>,
+    config_default: Option<PathBuf>,
+    cwd: PathBuf,
+) -> PathBuf {
+    if let Some(o) = override_dir {
+        if o.exists() {
+            return o;
         }
     }
-    let path = default_working_dir();
+    if let Some(d) = config_default {
+        if d.exists() {
+            return d;
+        }
+    }
+    cwd
+}
+
+fn init_project_state(override_dir: Option<PathBuf>) -> ProjectState {
+    let config_default = Config::load(&Config::default_path())
+        .ok()
+        .and_then(|c| c.default_workdir.map(PathBuf::from));
+    let path = resolve_initial_working_dir(override_dir, config_default, default_working_dir());
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1114,11 +1133,15 @@ async fn change_dir(
         project.recent_dirs.insert(0, new_path.clone());
         project.recent_dirs.truncate(5);
 
-        // Persist to config
-        let config_path = Config::default_path();
-        if let Ok(mut config) = Config::load(&config_path) {
-            config.default_workdir = Some(new_path.to_string_lossy().to_string());
-            let _ = config.save(&config_path);
+        // Persist to config only when explicitly requested. The live in-memory
+        // state above is always updated (so a webui switch survives refresh);
+        // rewriting the configured default is gated behind `set_default`.
+        if req.set_default {
+            let config_path = Config::default_path();
+            if let Ok(mut config) = Config::load(&config_path) {
+                config.default_workdir = Some(new_path.to_string_lossy().to_string());
+                let _ = config.save(&config_path);
+            }
         }
 
         let hash = hash_path(&new_path);
@@ -2848,77 +2871,167 @@ struct WebuiHandle {
     tokens: auth_token::WebuiTokenStore,
     /// server 绑定的端口。
     port: u16,
+    /// server 绑定的地址（如 `127.0.0.1` / `0.0.0.0`）；换绑前需先 stop。
+    host: String,
     /// server task 的 abort handle；用于 `/webui stop` 停止。
     abort: tokio::task::AbortHandle,
 }
 
 static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
 
+/// 从 `start_port` 起尝试绑定 `host`，遇 `AddrInUse` 递增端口，直到成功或试满
+/// `max_tries` 个端口。返回已绑定的监听器与其真实端口（取自 `local_addr`，
+/// 故 `start_port == 0` 时也会回填 OS 分配的端口）。其他绑定错误立即返回。
+async fn bind_scanning(
+    host: &str,
+    start_port: u16,
+    max_tries: u16,
+) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
+    let mut last_err: Option<std::io::Error> = None;
+    for offset in 0..max_tries {
+        let Some(port) = start_port.checked_add(offset) else {
+            break; // 触及 u16 上限
+        };
+        let addr = format!("{host}:{port}");
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                let actual = listener.local_addr()?.port();
+                return Ok((listener, actual));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                last_err = Some(e);
+                continue;
+            }
+            // 非"端口占用"错误（权限、地址非法等）无法靠换端口解决，立即返回。
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no free port in [{}, {}){}",
+        start_port,
+        start_port.saturating_add(max_tries),
+        last_err
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default()
+    ))
+}
+
+/// 探测本机主用的非回环 IPv4（用 UDP connect 选路，不实际发包）。绑定非回环地址
+/// 时用于给出可供其它设备访问的 URL 提示；拿不到则返回 None。
+fn primary_lan_ipv4() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // connect 仅让内核按路由表选定出口网卡，不会真的发包。
+    sock.connect("8.8.8.8:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => {
+            Some(v4.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token，开浏览器。
 ///
 /// 返回给用户展示的状态串。在 `atomcode` 主程序（已有 tokio runtime）内调用。
-/// `port` 由调用方决定（CLI 子命令可自定义；TUI 传 13456）。
-pub async fn ensure_server_and_open(port: u16) -> String {
-    // 持锁判定是否需要新起 server。注意：std Mutex guard 不能跨 .await 持有，
-    // 故在此作用域内 clone 出所需数据（tokens / port）后立即 drop guard，再 await。
-    let (tokens, actual_port, just_started) = {
-        let mut guard = WEBUI.lock().unwrap();
+/// `host` 为绑定地址（默认 `127.0.0.1`；`0.0.0.0` 暴露到局域网/外网）。
+/// `port` 为首选端口（CLI 子命令可自定义；TUI 传 13456）；被占用时自动向上扫描。
+///
+/// 不再轮询等待绑定：先在本函数内同步绑定端口（亚毫秒级，且借此拿到真实端口、
+/// 支持动态端口），再把已绑定的 listener 交给后台 `run_server`。浏览器随即打开，
+/// 页面靠 SPA 自带 loading 态在 server bootstrap 完成前过渡。
+pub async fn ensure_server_and_open(host: &str, port: u16) -> String {
+    // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
+    //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
+    let reuse = {
+        let guard = WEBUI.lock().unwrap();
         match guard.as_ref() {
-            // 复用仍在运行的 server。
             Some(handle) if !handle.abort.is_finished() => {
-                (handle.tokens.clone(), handle.port, false)
+                Some((handle.tokens.clone(), handle.port, handle.host.clone()))
             }
-            // 无句柄或上一个 task 已结束（被 stop 或异常退出）：新起一个。
-            _ => {
-                let tokens = auth_token::WebuiTokenStore::new();
-                let opts = ServerOpts {
-                    host: "127.0.0.1".to_string(),
-                    port,
-                    // 与 parse_daemon_args 的“无 --no-telemetry”默认一致。
-                    cli_override: CliOverride::default(),
-                    // 0 = 关闭 idle 看门狗（见 spawn_idle_timeout_task：idle_timeout_secs==0 直接 return）。
-                    // 进程内 webui 应随主程序常驻，不能自行 idle 关停。
-                    idle_timeout_secs: 0,
-                    // 与 parse_daemon_args 的默认 client mode 一致（无 --client 标志时为 Ide）。
-                    startup_mode: SessionMode::Ide,
-                    // 传入同一 store：server 进入 webui 模式（enforce_token=true）并用它校验 token。
-                    webui_tokens: Some(tokens.clone()),
-                };
-                let task = tokio::spawn(async move {
-                    if let Err(e) = run_server(opts).await {
-                        eprintln!("webui server error: {e}");
-                    }
-                });
-                *guard = Some(WebuiHandle {
-                    tokens: tokens.clone(),
-                    port,
-                    abort: task.abort_handle(),
-                });
-                (tokens, port, true)
-            }
+            _ => None,
         }
-        // guard 在此 drop（作用域结束），后续 await 不持锁。
     };
 
-    // 仅首次启动时等待 bind 就绪，避免浏览器先于 server 打开。
-    if just_started {
-        for _ in 0..40 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", actual_port))
-                .await
-                .is_ok()
-            {
-                break;
+    let (tokens, actual_port, bound_host) = if let Some((tokens, p, h)) = reuse {
+        (tokens, p, h)
+    } else {
+        // 2) 预绑定端口：首选 `port`，被占则递增扫描（拿到真实端口）。按请求的 host 绑定。
+        let (listener, actual_port) = match bind_scanning(host, port, 100).await {
+            Ok(v) => v,
+            Err(e) => {
+                return format!("webui 启动失败：{host}:{port} 起的端口绑定失败（{e}）");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let tokens = auth_token::WebuiTokenStore::new();
+        let opts = ServerOpts {
+            host: host.to_string(),
+            port: actual_port,
+            // 与 parse_daemon_args 的“无 --no-telemetry”默认一致。
+            cli_override: CliOverride::default(),
+            // 0 = 关闭 idle 看门狗（见 spawn_idle_timeout_task：idle_timeout_secs==0 直接 return）。
+            // 进程内 webui 应随主程序常驻，不能自行 idle 关停。
+            idle_timeout_secs: 0,
+            // 与 parse_daemon_args 的默认 client mode 一致（无 --client 标志时为 Ide）。
+            startup_mode: SessionMode::Ide,
+            // 传入同一 store：server 进入 webui 模式（enforce_token=true）并用它校验 token。
+            webui_tokens: Some(tokens.clone()),
+            // 进程内启动：抑制启动横幅，避免污染 TUI 画面。
+            quiet: true,
+            // `atomcode webui` 的初始目录应是用户运行命令的目录，而非 config 默认。
+            working_dir_override: std::env::current_dir().ok(),
+            // 预绑定的监听器：run_server 直接复用，跳过内部 bind。
+            prebound_listener: Some(listener),
+        };
+        let task = tokio::spawn(async move {
+            if let Err(e) = run_server(opts).await {
+                eprintln!("webui server error: {e}");
+            }
+        });
+        {
+            let mut guard = WEBUI.lock().unwrap();
+            *guard = Some(WebuiHandle {
+                tokens: tokens.clone(),
+                port: actual_port,
+                host: host.to_string(),
+                abort: task.abort_handle(),
+            });
         }
-    }
+        (tokens, actual_port, host.to_string())
+    };
 
     let token = tokens.mint();
-    let url = format!("http://127.0.0.1:{}/?token={}", actual_port, token);
-    match atomcode_core::auth::oauth::open_browser(&url) {
-        Ok(()) => format!("已在浏览器打开 webui：{url}"),
-        Err(_) => format!("请手动在浏览器打开：{url}"),
+    // 本机始终用 127.0.0.1 打开浏览器（即便绑定 0.0.0.0，回环也在监听内）。
+    let local_url = format!("http://127.0.0.1:{}/?token={}", actual_port, token);
+    let opened = atomcode_core::auth::oauth::open_browser(&local_url).is_ok();
+    let mut msg = if opened {
+        format!("已在浏览器打开 webui：{local_url}")
+    } else {
+        format!("请手动在浏览器打开：{local_url}")
+    };
+
+    // 复用了一个绑定地址不同的运行实例：提示如何换绑。
+    if bound_host.as_str() != host {
+        msg.push_str(&format!(
+            "\n（webui 已在运行，绑定 {bound_host}；如需改绑 {host}，请先 /webui stop 再重试）"
+        ));
     }
+
+    // 绑定了非回环地址：给出可供其它设备访问的 URL + 安全提示。
+    if !is_loopback_authority(&bound_host) {
+        let ext_host = if bound_host == "0.0.0.0" || bound_host == "::" {
+            primary_lan_ipv4()
+        } else {
+            Some(bound_host.clone())
+        };
+        if let Some(ip) = ext_host {
+            msg.push_str(&format!("\n外部访问：http://{ip}:{actual_port}/?token={token}"));
+        }
+        msg.push_str(
+            "\n⚠️ 已绑定非回环地址：凡能访问该地址者凭此 token 即可进入，请仅在可信网络使用（无 TLS）。",
+        );
+    }
+
+    msg
 }
 
 /// 停止进程内 webui server（若在运行）。返回状态串。
@@ -3028,6 +3141,17 @@ pub struct ServerOpts {
     pub startup_mode: SessionMode,
     /// webui token 存储；进程内启动器传入以共享同一 store，独立二进制传 None。
     pub webui_tokens: Option<auth_token::WebuiTokenStore>,
+    /// 启动时的工作目录覆盖。进程内 `atomcode webui` 传入其启动 cwd，使 daemon
+    /// 初始项目目录为用户实际运行命令的目录，而非 config 里陈旧的 default_workdir。
+    /// 独立二进制 / VSCode 传 None（沿用 config 默认）。
+    pub working_dir_override: Option<PathBuf>,
+    /// 安静模式：不向 stdout/stderr 打印启动横幅（telemetry 状态、监听地址、API
+    /// 端点清单等）。TUI 内 `/webui` 进程内启动时为 true，避免污染 ratatui 画面；
+    /// 独立二进制为 false，保留完整启动信息。
+    pub quiet: bool,
+    /// 预绑定的监听器。进程内 webui 启动器先绑定端口（拿到真实端口、支持动态端口）
+    /// 再传入，`run_server` 直接复用、跳过内部 bind。独立二进制传 None，照旧自行 bind。
+    pub prebound_listener: Option<tokio::net::TcpListener>,
 }
 
 /// Build and run the axum server until a shutdown signal is received.
@@ -3050,6 +3174,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         idle_timeout_secs,
         startup_mode,
         webui_tokens,
+        quiet,
+        working_dir_override,
+        prebound_listener,
     } = opts;
 
     // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default
@@ -3064,10 +3191,14 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
     let resolved = resolve(&cfg_telemetry, &cli_override, Config::config_dir(), &ProcessEnv);
 
-    // Step 3: Print telemetry status line (R2.6)
-    match &resolved.state {
-        TelemetryState::Enabled => println!("Telemetry: enabled"),
-        TelemetryState::Disabled(reason) => println!("Telemetry: disabled (reason: {})", reason),
+    // Step 3: Print telemetry status line (R2.6) — suppressed in quiet (TUI) mode.
+    if !quiet {
+        match &resolved.state {
+            TelemetryState::Enabled => println!("Telemetry: enabled"),
+            TelemetryState::Disabled(reason) => {
+                println!("Telemetry: disabled (reason: {})", reason)
+            }
+        }
     }
 
     // Step 4: Initialize telemetry runtime (R1.3, R1.6)
@@ -3080,7 +3211,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // Use the project working directory (from config or cwd) rather than the
     // raw process cwd, because VS Code may spawn the daemon with a cwd that
     // is not inside a git repository (e.g. the extension install directory).
-    let project_state = init_project_state();
+    let project_state = init_project_state(working_dir_override);
     let repo_origin = detect_repo_origin(&project_state.working_dir);
 
     // Step 6: Seed account_id from stored auth (R4.3)
@@ -3110,6 +3241,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         enforce_token: webui_tokens.is_some(),
         webui_tokens: webui_tokens.unwrap_or_default(),
         pending_permissions: permission_bridge::PermissionResponders::new(),
+        suggestions_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
 
     // 公开路由（无需 token）：仅页面 + 静态资源 + 健康检查。
@@ -3131,6 +3263,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/sessions/search", get(search_sessions))
         // Current project state (working directory)
         .route("/project", get(get_project_state))
+        .route(
+            "/project/suggestions",
+            get(api_suggestions::get_project_suggestions),
+        )
         .route("/cd", post(change_dir))
         // Historical projects (from sessions directory)
         .route("/projects", get(get_projects))
@@ -3204,10 +3340,12 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         active_connections,
         shutdown_tx,
     );
-    if idle_timeout_secs > 0 {
-        println!("Idle timeout: {} minutes", idle_timeout_secs / 60);
-    } else {
-        println!("Idle timeout: disabled");
+    if !quiet {
+        if idle_timeout_secs > 0 {
+            println!("Idle timeout: {} minutes", idle_timeout_secs / 60);
+        } else {
+            println!("Idle timeout: disabled");
+        }
     }
 
     // Default to loopback-only for security. The daemon hosts chat / file-edit /
@@ -3220,6 +3358,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // non-loopback address, a security warning is printed. For production use,
     // consider running a reverse proxy in front instead.
     let addr = format!("{host}:{port}");
+    // 非 loopback 的安全警告即便在 quiet 模式也应输出（仅独立二进制可能触发，
+    // 进程内 webui 恒为 127.0.0.1）。
     if host != "127.0.0.1" && host != "localhost" && host != "::1" {
         eprintln!(
             "Warning: binding to non-loopback address '{}'. \
@@ -3228,69 +3368,78 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             host
         );
     }
-    println!("AtomCode API server listening on http://{}", addr);
     if dangerous_tools_enabled() {
         eprintln!(
             "Warning: {}=1 enables bash and write-capable daemon tools.",
             DANGEROUS_TOOLS_ENV
         );
     }
-    println!("\nAPI endpoints:");
-    println!("  GET    /health                        - Health check");
-    println!("  GET    /project                        - Get current working directory");
-    println!(
-        "  POST   /cd                             - Change working directory (like /cd command)"
-    );
-    println!("  GET    /projects                       - List historical projects");
-    println!("  GET    /projects/:hash/sessions        - List sessions in a project");
-    println!("  GET    /projects/:hash/sessions/:id    - Get session detail");
-    println!("  DELETE /projects/:hash/sessions/:id    - Delete a session");
-    println!("  PATCH  /projects/:hash/sessions/:id/rename - Rename a session");
-    println!("  GET    /sessions                       - List all sessions (cross-project)");
-    println!("  GET    /sessions/search?q=<keyword>    - Search sessions by name");
-    println!("  GET    /models                         - List available models");
-    println!("  POST   /chat                           - Stream chat response (SSE)");
-    println!("  GET    /config                         - Get sanitized config");
-    println!("  POST   /config/reload                  - Reload config from disk");
-    println!("  GET    /providers                      - List providers");
-    println!("  POST   /providers                      - Create/replace provider");
-    println!("  PATCH  /providers/:name                - Partially update provider");
-    println!("  DELETE /providers/:name                - Delete provider");
-    println!("  POST   /providers/:name/default        - Set default provider");
-    println!("  PATCH  /providers/:name/thinking       - Update thinking settings");
-    println!("  GET    /skills                         - List user-invocable skills");
-    println!("  GET    /auth/status                    - Auth status");
-    println!("  POST   /auth/login/start               - Start OAuth login");
-    println!("  POST   /auth/login/:login_id/poll      - Poll login session");
-    println!("  DELETE /auth/login/:login_id           - Cancel login session");
-    println!("  POST   /auth/logout                    - Logout");
-    println!("  POST   /codingplan/setup               - Run CodingPlan setup");
-    println!("\nChange directory body:");
-    println!("  {{\"path\": \"/path/to/project\"}}  or {{\"path\": \"-\"}} to go back");
-    println!("\nChat request body:");
-    println!("  {{\"message\": \"your question\", \"provider\": \"optional\"}}");
+    // 启动横幅（监听地址 + API 端点清单）仅在非 quiet 模式打印。TUI 内 `/webui`
+    // 走 quiet 路径，由 ensure_server_and_open 单独返回一行干净的浏览器地址。
+    if !quiet {
+        println!("AtomCode API server listening on http://{}", addr);
+        println!("\nAPI endpoints:");
+        println!("  GET    /health                        - Health check");
+        println!("  GET    /project                        - Get current working directory");
+        println!(
+            "  POST   /cd                             - Change working directory (like /cd command)"
+        );
+        println!("  GET    /projects                       - List historical projects");
+        println!("  GET    /projects/:hash/sessions        - List sessions in a project");
+        println!("  GET    /projects/:hash/sessions/:id    - Get session detail");
+        println!("  DELETE /projects/:hash/sessions/:id    - Delete a session");
+        println!("  PATCH  /projects/:hash/sessions/:id/rename - Rename a session");
+        println!("  GET    /sessions                       - List all sessions (cross-project)");
+        println!("  GET    /sessions/search?q=<keyword>    - Search sessions by name");
+        println!("  GET    /models                         - List available models");
+        println!("  POST   /chat                           - Stream chat response (SSE)");
+        println!("  GET    /config                         - Get sanitized config");
+        println!("  POST   /config/reload                  - Reload config from disk");
+        println!("  GET    /providers                      - List providers");
+        println!("  POST   /providers                      - Create/replace provider");
+        println!("  PATCH  /providers/:name                - Partially update provider");
+        println!("  DELETE /providers/:name                - Delete provider");
+        println!("  POST   /providers/:name/default        - Set default provider");
+        println!("  PATCH  /providers/:name/thinking       - Update thinking settings");
+        println!("  GET    /skills                         - List user-invocable skills");
+        println!("  GET    /auth/status                    - Auth status");
+        println!("  POST   /auth/login/start               - Start OAuth login");
+        println!("  POST   /auth/login/:login_id/poll      - Poll login session");
+        println!("  DELETE /auth/login/:login_id           - Cancel login session");
+        println!("  POST   /auth/logout                    - Logout");
+        println!("  POST   /codingplan/setup               - Run CodingPlan setup");
+        println!("\nChange directory body:");
+        println!("  {{\"path\": \"/path/to/project\"}}  or {{\"path\": \"-\"}} to go back");
+        println!("\nChat request body:");
+        println!("  {{\"message\": \"your question\", \"provider\": \"optional\"}}");
+    }
 
-    // Step 9: Bind listener (R4.1 gate)
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Fatal: failed to bind to {}: {}", addr, e);
-            // Step 12: On bind failure, still emit OpenAtomcode (R4.4) then exit
-            CurrentContext::scope(
-                CurrentContext {
-                    mode: Some(startup_mode),
-                    repo_origin: Some(repo_origin.clone()),
-                    session_id: None,
-                    ..CurrentContext::default()
-                },
-                || async {
-                    telemetry.track(Event::OpenAtomcode);
-                },
-            )
-            .await;
-            telemetry.shutdown(Duration::from_millis(500)).await;
-            std::process::exit(1);
-        }
+    // Step 9: Bind listener (R4.1 gate). 进程内 webui 已预先绑定并传入 listener
+    // （拿到真实端口、支持动态端口），此处直接复用、跳过内部 bind；独立二进制
+    // 走 bind 分支，bind 失败仍按 R4.4 发 OpenAtomcode 再退出。
+    let listener = match prebound_listener {
+        Some(l) => l,
+        None => match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Fatal: failed to bind to {}: {}", addr, e);
+                // Step 12: On bind failure, still emit OpenAtomcode (R4.4) then exit
+                CurrentContext::scope(
+                    CurrentContext {
+                        mode: Some(startup_mode),
+                        repo_origin: Some(repo_origin.clone()),
+                        session_id: None,
+                        ..CurrentContext::default()
+                    },
+                    || async {
+                        telemetry.track(Event::OpenAtomcode);
+                    },
+                )
+                .await;
+                telemetry.shutdown(Duration::from_millis(500)).await;
+                std::process::exit(1);
+            }
+        },
     };
 
     // Steps 10-11: Enter CurrentContext scope and emit OpenAtomcode (R4.1, R4.2)
@@ -3367,6 +3516,69 @@ mod tests {
         assert!(origin_is_allowed("http://127.0.0.1:3000"));
         assert!(origin_is_allowed("http://[::1]:3000"));
         assert!(origin_is_allowed("https://localhost"));
+    }
+
+    #[test]
+    fn initial_workdir_override_wins_over_config_default() {
+        // `atomcode webui` launch dir (override) must beat a stale config default.
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let resolved = resolve_initial_working_dir(
+            Some(here.clone()),
+            Some(PathBuf::from("/tmp")),
+            PathBuf::from("/nonexistent_atomcode_cwd"),
+        );
+        assert_eq!(resolved, here);
+    }
+
+    #[test]
+    fn initial_workdir_falls_back_to_config_then_cwd() {
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // No override → existing config default wins.
+        assert_eq!(
+            resolve_initial_working_dir(None, Some(here.clone()), PathBuf::from("/x")),
+            here
+        );
+        // No override, nonexistent config default → cwd.
+        assert_eq!(
+            resolve_initial_working_dir(
+                None,
+                Some(PathBuf::from("/nonexistent_atomcode_default")),
+                here.clone()
+            ),
+            here
+        );
+    }
+
+    #[test]
+    fn initial_workdir_ignores_nonexistent_override() {
+        // A bogus override is skipped, falling through to the config default.
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let resolved = resolve_initial_working_dir(
+            Some(PathBuf::from("/nonexistent_atomcode_override")),
+            Some(here.clone()),
+            PathBuf::from("/x"),
+        );
+        assert_eq!(resolved, here);
+    }
+
+    #[tokio::test]
+    async fn bind_scanning_returns_a_free_port() {
+        // start_port=0 → OS assigns; actual port is filled from local_addr (non-zero).
+        let (listener, port) = bind_scanning("127.0.0.1", 0, 1).await.unwrap();
+        assert_ne!(port, 0);
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test]
+    async fn bind_scanning_skips_occupied_port() {
+        // Hold a port, then scan starting at it → must skip to a higher free port.
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy = occupied.local_addr().unwrap().port();
+        let (listener, port) = bind_scanning("127.0.0.1", busy, 50).await.unwrap();
+        assert_ne!(port, busy);
+        assert!(port > busy);
+        drop(listener);
+        drop(occupied);
     }
 
     #[test]

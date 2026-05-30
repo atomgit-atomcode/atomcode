@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels } from '../api';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
+import { Suggestions } from './Suggestions';
 import { useT } from '../settings';
 
 interface ToolRow {
@@ -344,7 +345,91 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
   }
 
+  // 落地页建议点击：把完整 prompt 填入输入框并聚焦（用户可编辑后再发送）。
+  function fillInput(prompt: string) {
+    setInput(prompt);
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+      const len = ta.value.length;
+      ta.setSelectionRange(len, len);
+    });
+  }
+
   const lastIdx = messages.length - 1;
+
+  // 新对话落地态：无会话、无消息、无历史提示 → claude.ai 风格的居中落地页。
+  const landing = !sessionId && messages.length === 0 && !historyHint;
+
+  // 落地页副标题：项目名 + 缩写路径。
+  const cleanCwd = cwd.replace(/\/+$/, '');
+  const cwdIdx = cleanCwd.lastIndexOf('/');
+  const projName = cwdIdx >= 0 ? cleanCwd.slice(cwdIdx + 1) : cleanCwd;
+  const projPath =
+    cleanCwd.startsWith('/Users/') || cleanCwd.startsWith('/home/')
+      ? '~/' + cleanCwd.split('/').slice(3).join('/')
+      : cleanCwd;
+
+  // 输入框只渲染一份，按落地/常规两处择一挂载（避免两个 textarea 抢同一 ref）。
+  const inputBox = (
+    <div class="input-box">
+      <textarea
+        ref={textareaRef}
+        class="message-input"
+        rows={2}
+        placeholder={t('chat.inputPlaceholder')}
+        value={input}
+        disabled={busy}
+        onInput={handleInput}
+        onKeyDown={handleKeyDown}
+      />
+      <div class="input-footer">
+        <ModelSelector value={provider} onChange={setProvider} />
+        <span class="footer-spacer" />
+        {tokens && (
+          <span class="footer-tokens">
+            {(tokens.total / 1000).toFixed(1)}k tokens
+          </span>
+        )}
+        {busy ? (
+          <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
+            <span class="stop-square" />
+          </button>
+        ) : (
+          <button
+            class="btn-send"
+            onClick={sendMessage}
+            disabled={!input.trim()}
+            title={t('chat.send')}
+            aria-label={t('chat.send')}
+          >
+            ↑
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
+  if (landing) {
+    return (
+      <div class="chat-landing">
+        <div class="landing-inner">
+          <div class="landing-brand">AtomCode</div>
+          {cwd && (
+            <div class="landing-subtitle">
+              <span class="landing-project">{projName}</span>
+              <span class="landing-path">{projPath}</span>
+            </div>
+          )}
+          {inputBox}
+          <Suggestions cwd={cwd} onPick={fillInput} />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -427,44 +512,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
       </div>
 
       {/* Floating input */}
-      <div class="input-container">
-        <div class="input-box">
-          <textarea
-            ref={textareaRef}
-            class="message-input"
-            rows={1}
-            placeholder={t('chat.inputPlaceholder')}
-            value={input}
-            disabled={busy}
-            onInput={handleInput}
-            onKeyDown={handleKeyDown}
-          />
-          <div class="input-footer">
-            <ModelSelector value={provider} onChange={setProvider} />
-            <span class="footer-spacer" />
-            {tokens && (
-              <span class="footer-tokens">
-                {(tokens.total / 1000).toFixed(1)}k tokens
-              </span>
-            )}
-            {busy ? (
-              <button class="btn-stop" onClick={handleStop} title={t('chat.stop')} aria-label={t('chat.stop')}>
-                <span class="stop-square" />
-              </button>
-            ) : (
-              <button
-                class="btn-send"
-                onClick={sendMessage}
-                disabled={!input.trim()}
-                title={t('chat.send')}
-                aria-label={t('chat.send')}
-              >
-                ↑
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
+      <div class="input-container">{inputBox}</div>
     </>
   );
 }
