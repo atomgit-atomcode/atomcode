@@ -107,7 +107,10 @@ body {
 }
 .ghost-btn:hover { background: var(--app-ghost-button-hover-background); }
 
-.hamburger-btn { display: none; }
+/* ☰ 切换按钮：桌面端收起/展开侧栏、移动端开关抽屉，始终可见。 */
+.hamburger-btn { display: flex; }
+/* 桌面端收起：隐藏侧栏。移动端用抽屉(.open/transform)，下方 media query 中和此规则。 */
+.session-list.collapsed { display: none; }
 
 .cwd-breadcrumb {
   display: flex;
@@ -1061,6 +1064,8 @@ body {
     box-shadow: 2px 0 16px rgba(0, 0, 0, 0.35);
   }
   .session-list.open { transform: translateX(0); }
+  /* 移动端抽屉用 transform，不用 display；中和桌面端的 .collapsed 隐藏。 */
+  .session-list.collapsed { display: flex; }
   .sidebar-backdrop.show { display: block; }
 
   /* Reduce timeline / input insets */

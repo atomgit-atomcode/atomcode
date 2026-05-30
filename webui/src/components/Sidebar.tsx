@@ -9,12 +9,32 @@ interface SidebarProps {
   onNew: () => void;
   /** Mobile drawer open state */
   open?: boolean;
+  /** Desktop collapsed (hidden) state */
+  collapsed?: boolean;
 }
 
 function baseName(p: string): string {
   const clean = p.replace(/\/+$/, '');
   const idx = clean.lastIndexOf('/');
   return idx >= 0 ? clean.slice(idx + 1) : clean;
+}
+
+/** 把 unix 时间戳（秒或毫秒）格式化为相对时间。 */
+function formatTime(ts: number): string {
+  if (!ts) return '';
+  const ms = ts < 1e12 ? ts * 1000 : ts;
+  const now = Date.now();
+  const diff = now - ms;
+  const MIN = 60000, HOUR = 3600000, DAY = 86400000;
+  if (diff < MIN) return '刚刚';
+  if (diff < HOUR) return `${Math.floor(diff / MIN)}分钟前`;
+  if (diff < DAY) return `${Math.floor(diff / HOUR)}小时前`;
+  if (diff < 2 * DAY) return '昨天';
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const sameYear = d.getFullYear() === new Date(now).getFullYear();
+  const md = `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return sameYear ? md : `${d.getFullYear()}-${md}`;
 }
 
 function shortDir(p: string): string {
@@ -27,7 +47,7 @@ function shortDir(p: string): string {
   return p;
 }
 
-export function Sidebar({ activeSessionId, onSelect, onNew, open }: SidebarProps) {
+export function Sidebar({ activeSessionId, onSelect, onNew, open, collapsed }: SidebarProps) {
   const [sessions, setSessions] = useState<SessionMetaWithProject[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -40,7 +60,7 @@ export function Sidebar({ activeSessionId, onSelect, onNew, open }: SidebarProps
   }, []);
 
   return (
-    <aside class={'session-list app-sidebar' + (open ? ' open' : '')}>
+    <aside class={'session-list app-sidebar' + (open ? ' open' : '') + (collapsed ? ' collapsed' : '')}>
       <div class="session-list-header">
         <button class="session-new-btn" onClick={onNew}>
           ＋ 新建会话
@@ -68,7 +88,7 @@ export function Sidebar({ activeSessionId, onSelect, onNew, open }: SidebarProps
             >
               <span class="session-item-name">{label}</span>
               <span class="session-item-meta">
-                {dirBase} · {s.message_count} 条
+                {formatTime(s.updated_at || s.created_at)} · {s.message_count} 条 · {dirBase}
               </span>
             </button>
           );

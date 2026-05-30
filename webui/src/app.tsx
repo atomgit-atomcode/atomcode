@@ -24,6 +24,16 @@ export function App() {
   const [showCwd, setShowCwd] = useState(false);
   const [showConfig, setShowConfig] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
+  // ☰：移动端开/关抽屉；桌面端收起/展开侧栏。
+  function toggleSidebar() {
+    if (window.matchMedia('(max-width: 768px)').matches) {
+      setSidebarOpen((o) => !o);
+    } else {
+      setSidebarCollapsed((c) => !c);
+    }
+  }
 
   // Seed cwd from /project on mount
   useEffect(() => {
@@ -59,9 +69,9 @@ export function App() {
       <header class="header">
         <button
           class="ghost-btn hamburger-btn"
-          onClick={() => setSidebarOpen(true)}
+          onClick={toggleSidebar}
           aria-label="菜单"
-          title="会话列表"
+          title="收起/展开会话列表"
         >
           ☰
         </button>
@@ -102,6 +112,7 @@ export function App() {
           onSelect={handleSelectSession}
           onNew={handleNewSession}
           open={sidebarOpen}
+          collapsed={sidebarCollapsed}
         />
         <div
           class={'sidebar-backdrop' + (sidebarOpen ? ' show' : '')}
