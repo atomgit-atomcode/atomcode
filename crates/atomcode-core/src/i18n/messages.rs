@@ -625,6 +625,16 @@ pub enum Msg<'a> {
     GuideDisplayName,
     /// Guide subagent: truncated indicator shown after guide answer
     GuideTruncatedIndicator,
+    /// `/guide`: ask skill install already in progress, please wait
+    CmdGuideInstalling,
+    /// `/guide`: ask skill not installed, triggering auto-install
+    CmdGuideAutoInstall,
+    /// `/guide`: auto-invoke completed, now answering
+    CmdGuideAutoInvoke { topic: &'a str },
+    /// `/guide`: install succeeded but ask skill still not found
+    CmdGuideSkillNotFound,
+    /// `/guide`: install failed, suggest manual install
+    CmdGuideInstallFailed { error: &'a str },
     /// invoke_subagent tool: description shown to LLM
     InvokeSubAgentToolDesc,
     /// invoke_subagent tool: subagent_name parameter description

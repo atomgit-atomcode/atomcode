@@ -800,6 +800,14 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("[子代理回答]\n{}\n[以上信息由 atomcode-guide 子代理提供]", text).into(),
         Msg::GuideDisplayName => "指南".into(),
         Msg::GuideTruncatedIndicator => "\n*(已截断)*".into(),
+        Msg::CmdGuideInstalling => "正在安装 ask skill，请稍候...".into(),
+        Msg::CmdGuideAutoInstall => "ask skill 未安装，正在自动安装 atomcode@atomcode-skills...".into(),
+        Msg::CmdGuideAutoInvoke { topic } =>
+            format!("ask skill 安装完成，正在回答: {}", topic).into(),
+        Msg::CmdGuideSkillNotFound =>
+            "安装完成但未找到 ask skill，请运行 /plugin reload 后重试".into(),
+        Msg::CmdGuideInstallFailed { error } =>
+            format!("安装 ask skill 失败: {}. 请手动运行 /plugin install atomcode@atomcode-skills", error).into(),
         Msg::InvokeSubAgentToolDesc => "调用子代理执行特定任务。可用的子代理: atomcode-guide (解答 AtomCode 使用问题)".into(),
         Msg::InvokeSubAgentParamName => "子代理名称".into(),
         Msg::InvokeSubAgentParamTask => "要执行的任务描述".into(),

@@ -296,10 +296,65 @@ pub(super) fn execute_slash_command(
                 renderer.render(UiLine::CommandOutput(menu));
                 renderer.flush();
             } else {
-                ctx.agent.cmd_tx.send(AgentCommand::InvokeSubAgent {
-                    name: "atomcode-guide".to_string(),
-                    task: arg.to_string(),
-                }).ok();
+                // Try expanding the "ask" skill inline first (fast path).
+                if let Some(rendered) = expand_skill(ctx, "ask", arg) {
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                    state.on_submit();
+                } else {
+                    // "ask" skill is not installed — trigger async install
+                    // and stash the topic so handle_plugin_job_event can
+                    // auto-invoke once the install completes.
+                    let topic = arg.to_string();
+
+                    if ctx.pending_guide_topic.is_some() {
+                        renderer.render(UiLine::CommandOutput(
+                            t(Msg::CmdGuideInstalling).into_owned(),
+                        ));
+                        renderer.flush();
+                        return Ok(());
+                    }
+
+                    ctx.pending_guide_topic = Some(topic);
+
+                    let tx = ctx.plugin_job_tx.clone();
+                    renderer.render(UiLine::CommandOutput(
+                        t(Msg::CmdGuideAutoInstall).into_owned(),
+                    ));
+                    renderer.flush();
+
+                    tokio::task::spawn_blocking(move || {
+                        let ev = match atomcode_core::plugin::installer::install(
+                            "atomcode",
+                            "atomcode-skills",
+                        ) {
+                            Ok(info) => {
+                                atomcode_core::plugin::PluginJobEvent::PluginInstalled(info)
+                            }
+                            Err(e) => {
+                                if let Some(_aie) = e.downcast_ref::<
+                                    atomcode_core::plugin::installer::AlreadyInstalledError,
+                                >() {
+                                    atomcode_core::plugin::PluginJobEvent::PluginAlreadyInstalled {
+                                        id: _aie.id.clone(),
+                                    }
+                                } else {
+                                    atomcode_core::plugin::PluginJobEvent::Failed {
+                                        op: "install".into(),
+                                        msg: format!("{:#}", e),
+                                    }
+                                }
+                            }
+                        };
+                        let _ = tx.send(ev);
+                    });
+                }
             }
         }
         "keys" => {
@@ -1658,7 +1713,7 @@ pub(super) fn execute_slash_command(
 /// Look up a user-invocable skill by name and expand it with the current
 /// session id. Returns the rendered prompt to send as a user message, or
 /// `None` if no matching skill exists.
-fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<String> {
+pub(super) fn expand_skill(ctx: &LoopCtx, name: &str, arg: &str) -> Option<String> {
     let reg = ctx.skill_registry.read().ok()?;
     let skill = reg.get(name)?;
     if !skill.user_invocable {

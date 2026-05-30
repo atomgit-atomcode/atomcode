@@ -569,6 +569,21 @@ fn is_sensitive_path(path: &Path) -> bool {
         })
 }
 
+/// Returns `true` when `path` is under a directory that AtomCode owns and
+/// populates itself (installed plugins, local skills, etc.).  Reads from
+/// those directories are trusted so they don't prompt for approval every
+/// time a skill loads its bundled documentation index.
+fn is_atomcode_owned_path(path: &Path) -> bool {
+    let Some(home) = real_home_dir() else { return false };
+    let trusted_roots: &[PathBuf] = &[
+        home.join(".atomcode").join("plugins"),
+        home.join(".atomcode").join("skills"),
+    ];
+    trusted_roots
+        .iter()
+        .any(|root| path == root.as_path() || path.starts_with(root))
+}
+
 pub fn approval_for_path(
     raw_path: &str,
     working_dir: &Path,
@@ -576,6 +591,11 @@ pub fn approval_for_path(
 ) -> Result<ApprovalRequirement> {
     let access = inspect_path_access(raw_path, working_dir)?;
     if access.within_workspace {
+        return Ok(ApprovalRequirement::AutoApprove);
+    }
+    // AtomCode-owned directories (plugins, skills) are trusted —
+    // reading from them shouldn't require interactive approval.
+    if action != ExternalPathAction::Write && is_atomcode_owned_path(&access.path) {
         return Ok(ApprovalRequirement::AutoApprove);
     }
 

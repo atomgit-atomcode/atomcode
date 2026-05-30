@@ -839,6 +839,10 @@ pub struct LoopCtx {
     /// Shown as a yellow "⚠ SKIP" badge in the status line so the
     /// user is always aware that all tool calls are auto-approved.
     pub dangerously_skip_permissions: bool,
+    /// When `/guide <topic>` triggers auto-install of the "ask" skill,
+    /// the topic is stashed here so `handle_plugin_job_event` can
+    /// auto-invoke the skill once installation completes.
+    pub pending_guide_topic: Option<String>,
 }
 
 /// Memoised result of the most recent clipboard probe. The hash is a
@@ -5682,11 +5686,68 @@ pub(super) fn handle_plugin_job_event(
                 })
                 .into_owned(),
             ));
+
+            // If `/guide <topic>` was waiting for this install, auto-invoke
+            // the "ask" skill with the stashed topic.
+            if let Some(topic) = ctx.pending_guide_topic.take() {
+                if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke {
+                            topic: &topic,
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    ctx.agent
+                        .cmd_tx
+                        .send(atomcode_core::agent::AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                } else {
+                    renderer.render(UiLine::Error(
+                        crate::i18n::t(crate::i18n::Msg::CmdGuideSkillNotFound).into_owned(),
+                    ));
+                    renderer.flush();
+                }
+            }
         }
         PluginJobEvent::Failed { op, msg } => {
+            // Clean up pending guide topic so future /guide commands work.
+            if ctx.pending_guide_topic.take().is_some() {
+                renderer.render(UiLine::Error(
+                    crate::i18n::t(crate::i18n::Msg::CmdGuideInstallFailed { error: &msg })
+                        .into_owned(),
+                ));
+                renderer.flush();
+            }
             renderer.render(UiLine::Error(format!("{}: {}", op, msg)));
         }
         PluginJobEvent::PluginAlreadyInstalled { id } => {
+            // Stale install? Try reload + expand so the user still
+            // gets an answer if the plugin was installed but not loaded.
+            if let Some(topic) = ctx.pending_guide_topic.take() {
+                let _ = reload_plugins(ctx);
+                if let Some(rendered) = commands::expand_skill(ctx, "ask", &topic) {
+                    renderer.render(UiLine::CommandOutput(
+                        crate::i18n::t(crate::i18n::Msg::CmdGuideAutoInvoke {
+                            topic: &topic,
+                        })
+                        .into_owned(),
+                    ));
+                    renderer.flush();
+                    ctx.agent
+                        .cmd_tx
+                        .send(atomcode_core::agent::AgentCommand::SendMessage {
+                            text: rendered,
+                            images: vec![],
+                            image_markers: vec![],
+                        })
+                        .ok();
+                }
+            }
             renderer.render(UiLine::CommandOutput(
                 crate::i18n::t(crate::i18n::Msg::PluginAlreadyInstalled { id: &id }).into_owned(),
             ));

@@ -812,6 +812,14 @@ Or visit the docs: https://atomcode.atomgit.com/docs/en/".into(),
             format!("[Sub-agent Answer]\n{}\n[Provided by atomcode-guide sub-agent]", text).into(),
         Msg::GuideDisplayName => "Guide".into(),
         Msg::GuideTruncatedIndicator => "\n*(truncated)*".into(),
+        Msg::CmdGuideInstalling => "Installing ask skill, please wait...".into(),
+        Msg::CmdGuideAutoInstall => "ask skill not installed — auto-installing atomcode@atomcode-skills...".into(),
+        Msg::CmdGuideAutoInvoke { topic } =>
+            format!("ask skill installed, now answering: {}", topic).into(),
+        Msg::CmdGuideSkillNotFound =>
+            "Installation complete but ask skill not found — run /plugin reload and try again".into(),
+        Msg::CmdGuideInstallFailed { error } =>
+            format!("ask skill install failed: {}. Run /plugin install atomcode@atomcode-skills manually", error).into(),
         Msg::InvokeSubAgentToolDesc => "Invoke a sub-agent for a specific task. Available: atomcode-guide (answers AtomCode usage questions)".into(),
         Msg::InvokeSubAgentParamName => "Sub-agent name".into(),
         Msg::InvokeSubAgentParamTask => "Task description to execute".into(),
