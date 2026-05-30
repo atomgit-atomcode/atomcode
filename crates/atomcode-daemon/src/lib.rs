@@ -2933,6 +2933,32 @@ pub fn stop_server() -> String {
 }
 
 // ============================================================================
+// GET /skills — 列出 user-invocable 技能（webui 技能选择器）
+// ============================================================================
+
+/// Skill info for API response.
+#[derive(serde::Serialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// GET /skills - List user-invocable skills for the current project.
+async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    let mut registry = atomcode_core::skill::SkillRegistry::new();
+    registry.reload(&working_dir);
+    let skills: Vec<SkillInfo> = registry
+        .user_invocable()
+        .map(|s| SkillInfo {
+            name: s.name.clone(),
+            description: s.description.clone(),
+        })
+        .collect();
+    Json(skills)
+}
+
+// ============================================================================
 // GET /fs/list — 目录列举端点（Task 15a）
 // ============================================================================
 
@@ -3121,6 +3147,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/chat/stop", post(stop_chat))
         .route("/chat/active", get(active_chat_sessions))
         .route("/chat/permission", post(chat_permission))
+        // Skills API
+        .route("/skills", get(get_skills))
         // Filesystem API
         .route("/fs/list", get(fs_list))
         // MCP API
@@ -3230,6 +3258,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     println!("  DELETE /providers/:name                - Delete provider");
     println!("  POST   /providers/:name/default        - Set default provider");
     println!("  PATCH  /providers/:name/thinking       - Update thinking settings");
+    println!("  GET    /skills                         - List user-invocable skills");
     println!("  GET    /auth/status                    - Auth status");
     println!("  POST   /auth/login/start               - Start OAuth login");
     println!("  POST   /auth/login/:login_id/poll      - Poll login session");
