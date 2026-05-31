@@ -11,6 +11,7 @@ mod api_codingplan;
 mod api_config;
 mod api_provider;
 pub(crate) mod live_api;
+pub use live_api::current_live_session;
 mod telemetry_scope;
 pub mod auth_token;
 pub mod permission_bridge;

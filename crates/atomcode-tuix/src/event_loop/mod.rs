@@ -826,6 +826,10 @@ pub struct LoopCtx {
     /// stays current without thrashing the system clipboard on every
     /// redraw. Refreshed lazily inside `build_status`.
     pub clipboard_check: std::sync::Arc<std::sync::Mutex<ClipboardCheckState>>,
+    /// 同步模式：Some 时输入投 LiveSession、渲染来自 live_sync 转发任务。None=独立（默认）。
+    pub sync_session: Option<std::sync::Arc<atomcode_core::live::LiveSession>>,
+    /// live 转发任务句柄（分离同步时 abort）。
+    pub sync_forwarder: Option<tokio::task::JoinHandle<()>>,
     /// `true` when the TUI was launched with `PlainRenderer` (CI / pipe
     /// / non-TTY). The onboarding wizard checks this — plain mode can't
     /// run interactive multi-step flows, so first-run falls through to
@@ -3153,14 +3157,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         // fire in order on subsequent completions.
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            renderer.render(UiLine::User(queued.text.clone()));
-                            renderer.flush();
-                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                                text: queued.text,
-                                images: queued.images,
-                                image_markers: queued.image_markers,
-                            }).ok();
-                            app.state.on_submit();
+                            if let Some(live) = &ctx.sync_session {
+                                // 同步模式：投 LiveSession，不本地渲染用户行。
+                                use atomcode_core::live::UserInput;
+                                live.send_input(UserInput { text: queued.text, images: queued.images });
+                                app.state.on_submit();
+                            } else {
+                                // —— 原有逻辑，原样保留 ——
+                                renderer.render(UiLine::User(queued.text.clone()));
+                                renderer.flush();
+                                ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                    text: queued.text,
+                                    images: queued.images,
+                                    image_markers: queued.image_markers,
+                                }).ok();
+                                app.state.on_submit();
+                            }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
@@ -3515,14 +3527,22 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                     if matches!(app.state.phase, UiPhase::Idle) {
                         if let Some(queued) = app.message_queue.pop_front() {
                             crate::tuix_trace!("QUE", "pop_front remaining={}", app.message_queue.len());
-                            renderer.render(UiLine::User(queued.text.clone()));
-                            renderer.flush();
-                            ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
-                                text: queued.text,
-                                images: queued.images,
-                                image_markers: queued.image_markers,
-                            }).ok();
-                            app.state.on_submit();
+                            if let Some(live) = &ctx.sync_session {
+                                // 同步模式：投 LiveSession，不本地渲染用户行。
+                                use atomcode_core::live::UserInput;
+                                live.send_input(UserInput { text: queued.text, images: queued.images });
+                                app.state.on_submit();
+                            } else {
+                                // —— 原有逻辑，原样保留 ——
+                                renderer.render(UiLine::User(queued.text.clone()));
+                                renderer.flush();
+                                ctx.agent.cmd_tx.send(AgentCommand::SendMessage {
+                                    text: queued.text,
+                                    images: queued.images,
+                                    image_markers: queued.image_markers,
+                                }).ok();
+                                app.state.on_submit();
+                            }
                             draw_spinner_now(&mut app.state, &app.buf, &ctx, renderer, app.message_queue.len(), app.menu.selected);
                         } else {
                             crate::tuix_trace!("PH", "turn_end -> Idle, queue empty, redraw_idle");
@@ -4761,7 +4781,11 @@ fn handle_idle_key(
                 for n in hydrate_recalled_attachments(&mut app.state, &mut line, &cache_dir) {
                     renderer.render(UiLine::Warning(n));
                 }
-                renderer.render(UiLine::User(line.clone()));
+                // 同步模式：不在本地渲染用户行；等 LiveEvent::UserMessage →
+                // AgentEvent::UserEcho 回灌，保证两端一致。非同步模式原样渲染。
+                if ctx.sync_session.is_none() {
+                    renderer.render(UiLine::User(line.clone()));
+                }
                 let expanded = app.buf.expand_pastes(&line);
                 // Pastes have now been substituted into `expanded`;
                 // safe to drop the registry. Doing it any earlier
@@ -4811,32 +4835,40 @@ fn handle_idle_key(
                     text: line.clone(),
                     images: kept_refs,
                 });
-                ctx.agent
-                    .cmd_tx
-                    .send(AgentCommand::SendMessage {
-                        text: expanded,
-                        images,
-                        image_markers: kept_markers,
-                    })
-                    .ok();
-                app.state.on_submit();
-                // CodingPlan drift check — fire before every turn sent
-                // to a CodingPlan-managed provider, gated by a 15-min
-                // cooldown so rapid-fire messages don't spam the API.
-                // Non-CodingPlan users skip entirely (zero network).
-                if monitor::is_codingplan_provider(&ctx.config.default_provider) {
-                    let cooled = ctx
-                        .monitor_last_check_at
-                        .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
-                        .unwrap_or(true);
-                    if cooled {
-                        ctx.monitor_last_check_at = Some(std::time::Instant::now());
-                        monitor::spawn_check(
-                            ctx.config.clone(),
-                            ctx.model_name.clone(),
-                            ctx.monitor_warning.clone(),
-                            ctx.wake_tx.clone(),
-                        );
+                if let Some(live) = &ctx.sync_session {
+                    // 同步模式：投递到 LiveSession。
+                    use atomcode_core::live::UserInput;
+                    live.send_input(UserInput { text: expanded, images });
+                    app.state.on_submit();
+                } else {
+                    // —— 原有逻辑，原样保留 ——
+                    ctx.agent
+                        .cmd_tx
+                        .send(AgentCommand::SendMessage {
+                            text: expanded,
+                            images,
+                            image_markers: kept_markers,
+                        })
+                        .ok();
+                    app.state.on_submit();
+                    // CodingPlan drift check — fire before every turn sent
+                    // to a CodingPlan-managed provider, gated by a 15-min
+                    // cooldown so rapid-fire messages don't spam the API.
+                    // Non-CodingPlan users skip entirely (zero network).
+                    if monitor::is_codingplan_provider(&ctx.config.default_provider) {
+                        let cooled = ctx
+                            .monitor_last_check_at
+                            .map(|t| t.elapsed() >= monitor::CHECK_COOLDOWN)
+                            .unwrap_or(true);
+                        if cooled {
+                            ctx.monitor_last_check_at = Some(std::time::Instant::now());
+                            monitor::spawn_check(
+                                ctx.config.clone(),
+                                ctx.model_name.clone(),
+                                ctx.monitor_warning.clone(),
+                                ctx.wake_tx.clone(),
+                            );
+                        }
                     }
                 }
             }
@@ -6543,8 +6575,14 @@ fn handle_agent_event(
             renderer.render(UiLine::User(text));
             renderer.flush();
         }
-        AgentEvent::PeerBusy(_running) => {
-            // Live-sync: Task 5 will drive input-disable; no-op render for now.
+        AgentEvent::PeerBusy(running) => {
+            // Live-sync: mirror the peer's busy state so TUI input is
+            // visually disabled while the other side's turn is running.
+            if running {
+                state.on_submit();
+            } else {
+                state.on_turn_complete();
+            }
         }
     }
 }

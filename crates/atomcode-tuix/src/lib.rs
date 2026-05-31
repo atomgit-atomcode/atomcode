@@ -581,6 +581,8 @@ pub async fn run(
             crate::event_loop::ClipboardCheckState::default(),
         )),
         is_plain_renderer,
+        sync_session: None,
+        sync_forwarder: None,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

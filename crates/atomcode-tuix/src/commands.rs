@@ -75,6 +75,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // launch) — lets the user append a subcommand (stop / lan / --host <addr>)
     // before Enter. A bare `/webui ` + Enter still launches on 127.0.0.1.
     Command { name: "webui",   desc: "Launch the browser webui (subcommands: stop, lan, --host <addr>)", needs_args: true },
+    Command { name: "sync",    desc: "Attach to live webui session (/sync off to detach)", needs_args: false },
     Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true },
     Command { name: "resume",  desc: "Resume a previous session", needs_args: false },
     Command { name: "rename",  desc: "Rename current session", needs_args: true },
