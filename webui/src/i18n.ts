@@ -166,6 +166,11 @@ const zh = {
   'perm.approve': '批准',
   'perm.alwaysAllow': '本会话总是允许',
 
+  // Sync toggle
+  'sync.toggle': '同步当前会话',
+  'sync.on': '已同步（多端实时）',
+  'sync.off': '独立会话',
+
   // Common
   'common.readonly': '只读',
   'common.cancel': '取消',
@@ -321,6 +326,11 @@ const en: Record<MsgKey, string> = {
   'perm.deny': 'Deny',
   'perm.approve': 'Approve',
   'perm.alwaysAllow': 'Always allow this session',
+
+  // Sync toggle
+  'sync.toggle': 'Sync current session',
+  'sync.on': 'Synced (live)',
+  'sync.off': 'Independent',
 
   'common.readonly': 'Read-only',
   'common.cancel': 'Cancel',

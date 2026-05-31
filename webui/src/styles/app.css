@@ -581,6 +581,25 @@ body {
 .btn-stop:hover { border-color: var(--app-primary-foreground); color: var(--app-primary-foreground); }
 .btn-stop .stop-square { width: 9px; height: 9px; border-radius: 2px; background: currentColor; }
 
+.btn-sync {
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 4px;
+  border: 1px solid var(--app-input-border);
+  background: transparent;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.btn-sync:hover { background: var(--app-ghost-button-hover-background); color: var(--app-primary-foreground); }
+.btn-sync.active { background: color-mix(in srgb, var(--app-brand) 15%, transparent); border-color: var(--app-brand); color: var(--app-brand); }
+
 /* === Sidebar / session list === */
 .session-list {
   width: 240px;

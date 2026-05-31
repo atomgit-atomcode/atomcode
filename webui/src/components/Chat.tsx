@@ -2,7 +2,7 @@
 // Task 15 — sessionId + cwd lifted to App
 
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData } from '../api';
+import { streamChat, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, LiveWireEvent, SessionMessage } from '../api';
 import { Markdown } from './Markdown';
 import { ModelSelector } from './ModelSelector';
 import { AttachMenu } from './AttachMenu';
@@ -100,7 +100,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   const [provider, setProvider] = useState<string | null>(null);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pendingImages, setPendingImages] = useState<ImageData[]>([]);
+  const [sync, setSync] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const liveAbortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // 当前 Chat 正在显示的会话 id。用于区分「外部切换会话(需重置+加载历史)」
@@ -144,42 +146,8 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
       .then((detail) => {
         // 加载期间用户可能已切走，确保结果仍对应当前会话。
         if (activeIdRef.current !== loadId) return;
-        // Convert loaded messages to display format. Assistant tool_calls become
-        // tool rows; tool-role messages fold their result into the matching row
-        // (by call_id). System messages are skipped.
-        const loaded: Message[] = [];
-        for (const msg of detail.messages) {
-          if (msg.role === 'user') {
-            loaded.push({
-              role: 'user',
-              text: msg.content ?? '',
-              tools: [],
-              images: msg.images && msg.images.length ? msg.images : undefined,
-            });
-          } else if (msg.role === 'assistant') {
-            const tools: ToolRow[] = (msg.tool_calls ?? []).map((tc) => ({
-              id: tc.id,
-              name: tc.name,
-              args: tc.arguments || tc.display || '',
-              status: 'done' as const,
-            }));
-            loaded.push({ role: 'assistant', text: msg.content ?? '', tools });
-          } else if (msg.role === 'tool' && msg.tool_result) {
-            // Fold the tool result into its originating tool row.
-            const result = msg.tool_result;
-            for (let i = loaded.length - 1; i >= 0; i--) {
-              const m = loaded[i];
-              if (m.role !== 'assistant') continue;
-              const row = m.tools.find((t) => t.id === result.call_id);
-              if (row) {
-                row.output = result.summary;
-                row.status = result.success ? 'done' : 'error';
-                break;
-              }
-            }
-          }
-          // system messages: skip
-        }
+        // Convert loaded messages to display format (reuses sessionMessagesToDisplay).
+        const loaded = sessionMessagesToDisplay(detail.messages);
         if (loaded.length > 0) {
           setMessages(loaded);
           setHistoryHint(null);
@@ -209,6 +177,108 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, tokens]);
+
+  // ── Shared history → display conversion (reused by session load AND live snapshot) ──
+  function sessionMessagesToDisplay(msgs: SessionMessage[]): Message[] {
+    const loaded: Message[] = [];
+    for (const msg of msgs) {
+      if (msg.role === 'user') {
+        loaded.push({
+          role: 'user',
+          text: msg.content ?? '',
+          tools: [],
+          images: msg.images && msg.images.length ? msg.images : undefined,
+        });
+      } else if (msg.role === 'assistant') {
+        const tools: ToolRow[] = (msg.tool_calls ?? []).map((tc) => ({
+          id: tc.id,
+          name: tc.name,
+          args: tc.arguments || tc.display || '',
+          status: 'done' as const,
+        }));
+        loaded.push({ role: 'assistant', text: msg.content ?? '', tools });
+      } else if (msg.role === 'tool' && msg.tool_result) {
+        const result = msg.tool_result;
+        for (let i = loaded.length - 1; i >= 0; i--) {
+          const m = loaded[i];
+          if (m.role !== 'assistant') continue;
+          const row = m.tools.find((t) => t.id === result.call_id);
+          if (row) {
+            row.output = result.summary;
+            row.status = result.success ? 'done' : 'error';
+            break;
+          }
+        }
+      }
+      // system messages: skip
+    }
+    return loaded;
+  }
+
+  // ── Live SSE adapter: map LiveWireEvent → SSEEvent (for variants that overlap) ──
+  function liveToSSE(e: LiveWireEvent): SSEEvent | null {
+    switch (e.type) {
+      case 'text': return { type: 'text', content: e.content };
+      case 'reasoning': return { type: 'reasoning', content: e.content };
+      case 'tool_start': return { type: 'tool_start', id: e.id, name: e.name, arguments: e.arguments };
+      case 'tool_output': return { type: 'tool_output', chunk: e.chunk };
+      case 'tool_result': return { type: 'tool_result', id: e.id, name: e.name, output: e.output, success: e.success, duration_ms: e.duration_ms };
+      case 'tokens': return { type: 'tokens', prompt: e.prompt, completion: e.completion, total: e.total };
+      case 'error': return { type: 'error', message: e.message };
+      default: return null;
+    }
+  }
+
+  // ── Live event handler ──
+  function onLiveEvent(e: LiveWireEvent) {
+    switch (e.type) {
+      case 'snapshot': {
+        const loaded = sessionMessagesToDisplay(e.messages);
+        setMessages(loaded.length > 0 ? loaded : []);
+        setHistoryHint(null);
+        break;
+      }
+      case 'user': {
+        // Append the peer's user message + empty assistant placeholder
+        setMessages((prev) => [
+          ...prev,
+          { role: 'user', text: e.text, tools: [], images: e.images && e.images.length ? e.images : undefined },
+          { role: 'assistant', text: '', tools: [] },
+        ]);
+        break;
+      }
+      case 'state': {
+        setBusy(e.running);
+        break;
+      }
+      default: {
+        const mapped = liveToSSE(e);
+        if (mapped) handleEvent(mapped);
+        break;
+      }
+    }
+  }
+
+  // ── Sync toggle: start / stop the live stream ──
+  function toggleSync() {
+    setSync((prev) => {
+      const next = !prev;
+      if (next) {
+        // Start live stream
+        const controller = new AbortController();
+        liveAbortRef.current = controller;
+        streamLive(onLiveEvent, controller.signal).catch(() => {
+          // Stream ended or errored; turn sync back off
+          setSync(false);
+        });
+      } else {
+        // Stop live stream
+        liveAbortRef.current?.abort();
+        liveAbortRef.current = null;
+      }
+      return next;
+    });
+  }
 
   function appendToLastAssistant(content: string) {
     setMessages((prev) => {
@@ -343,6 +413,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
     // 重置输入框高度：清空 value 不会复位之前 auto-resize 撑高的内联 height
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setHistoryHint(null);
+
+    if (sync) {
+      // ── Sync path: send to /live/message; do NOT locally append (the user
+      //    event will arrive back via the live stream, keeping all tabs in sync).
+      await postLiveMessage(text, images.length ? images : undefined);
+      return;
+    }
+
+    // ── Normal path (unchanged) ──
     setBusy(true);
 
     // Push user message + empty assistant placeholder
@@ -514,6 +593,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, activeSession 
           onPickFile={() => setShowFilePicker(true)}
           onAddImages={addImageFiles}
         />
+        <button
+          class={'btn-sync' + (sync ? ' active' : '')}
+          onClick={toggleSync}
+          title={t('sync.toggle')}
+          aria-label={t('sync.toggle')}
+          aria-pressed={sync}
+        >
+          ⇄
+        </button>
         <span class="footer-spacer" />
         {tokens && (
           <span class="footer-tokens">

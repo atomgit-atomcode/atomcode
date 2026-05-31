@@ -401,3 +401,50 @@ export async function getSession(
   });
   return resp.json();
 }
+
+// --- Live session (multi-tab real-time sync) ---
+
+export type LiveWireEvent =
+  | { type: 'snapshot'; messages: SessionMessage[] }
+  | { type: 'user'; text: string; images?: ImageData[] }
+  | { type: 'text'; content: string }
+  | { type: 'reasoning'; content: string }
+  | { type: 'tool_start'; id: string; name: string; arguments: string }
+  | { type: 'tool_output'; chunk: string }
+  | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
+  | { type: 'tokens'; prompt: number; completion: number; total: number }
+  | { type: 'state'; running: boolean }
+  | { type: 'error'; message: string };
+
+export async function streamLive(
+  onEvent: (e: LiveWireEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const resp = await fetch('/live', { headers: authHeaders(), signal });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const reader = resp.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+    for (const part of parts) {
+      const line = part.split('\n').find((l) => l.startsWith('data:'));
+      if (!line) continue;
+      const json = line.slice('data:'.length).trim();
+      if (!json) continue;
+      try { onEvent(JSON.parse(json) as LiveWireEvent); } catch { /* ignore keepalive */ }
+    }
+  }
+}
+
+export async function postLiveMessage(message: string, images?: ImageData[]): Promise<void> {
+  await fetch('/live/message', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ message, ...(images && images.length ? { images } : {}) }),
+  });
+}
